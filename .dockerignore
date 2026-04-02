@@ -1,0 +1,40 @@
+# 虚拟环境
+myenv/
+QQBot/.venv/
+QQBot/venv/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 日志
+logs/
+QQBot/logs/
+*.log
+
+# 数据缓存
+data/
+QQBot/data/
+
+# 临时文件
+*.png
+*.tmp
+qr-*.png
+
+# Lagrange 遗留文件
+lagrange*/
+keystore.json
+appsettings.json
+device.json
+
+# 文档
+README.md
+LICENSE
+
+# 测试
+test_env.py

@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  qqbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qqbot
+    restart: unless-stopped
+
+    # GPU 配置
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # 端口映射
+    ports:
+      - "8080:8080"   # Napcat WebSocket
+      - "8081:8081"   # NoneBot HTTP
+      - "8000:8000"   # vLLM 推理服务
+
+    # 环境变量
+    environment:
+      - QQ_ACCOUNT=971561405
+      - QQ_PASSWORD=
+      - NAPCAT_ACCESS_TOKEN=3((oY)?_-$jne##5
+      # vLLM 配置
+      - VLLM_MODEL=Qwen/Qwen2.5-3B-Instruct
+      - VLLM_MAX_MODEL_LEN=8192
+      - VLLM_TENSOR_PARALLEL_SIZE=1
+      - VLLM_GPU_MEMORY_UTILIZATION=0.8
+
+    # 数据持久化
+    volumes:
+      # 模型目录（建议挂载到 SSD）
+      - qqbot_models:/app/models
+      # NoneBot 数据
+      - qqbot_data:/app/QQBot/data
+      # 日志
+      - ./logs:/app/logs
+      # Napcat 配置
+      - qqbot_napcat:/root/.config/QQ
+
+    # 资源限制
+    shm_size: '2gb'
+
+volumes:
+  qqbot_models:
+    driver: local
+  qqbot_data:
+    driver: local
+  qqbot_napcat:
+    driver: local

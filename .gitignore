@@ -1,0 +1,29 @@
+# 数据和日志
+data
+logs
+con.env
+
+# 虚拟环境
+myenv
+QQBot/.venv
+venv/
+
+# NoneBot 配置
+QQBot/data
+QQBot/logs
+QQBot/.env.prod
+QQBot/device.json
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 临时文件
+*.log
+*.tmp

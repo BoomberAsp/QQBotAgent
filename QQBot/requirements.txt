@@ -1,0 +1,20 @@
+# NoneBot2 核心
+nonebot2>=2.4.0
+nonebot-adapter-onebot>=2.4.0
+nonebot2[fastapi]
+
+# HTTP 客户端
+httpx
+aiohttp
+websockets
+
+# vLLM 推理引擎
+vllm>=0.6.0
+
+# Transformers 模型库
+transformers>=4.40.0
+accelerate>=0.27.0
+
+# 工具库
+python-dotenv
+pydantic>=2.0.0

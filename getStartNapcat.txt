@@ -1,0 +1,12 @@
+screen -S napcat # 启动会话
+
+xvfb-run -a $HOME/Napcat/opt/QQ/qq --no-sandbox # 启动qq（Napcat）
+
+脱离（Detach）当前screen会话：
+按下 Ctrl + A，然后按 D。这样NapCatQQ就会在后台继续运行。
+
+重新连接（Attach）到napcat会话：
+screen -r napcat
+
+结束napcat会话：
+先通过 screen -r napcat 进入会话，然后按 Ctrl + C 结束QQ进程，最后输入 exit 退出并关闭会话
