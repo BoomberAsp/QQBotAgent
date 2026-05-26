@@ -178,7 +178,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 |------|------|
 | `build_system_prompt()` | 拼接 SOUL + IDENTITY + AGENTS + 当前时间，结果缓存 |
 | `reload_configs()` | 清空缓存，重新加载所有配置文件 |
-| `run(user_message, user_id, client=None)` | **主入口**。执行完整 Think→Act→Observe→Respond 循环。可选 `client` 参数支持运行时模型切换 (ModelRouter) |
+| `run(user_message, user_id, client=None, progress_callback=None)` | **主入口**。执行完整 Think→Act→Observe→Respond 循环。可选 `client` 参数支持运行时模型切换 (ModelRouter)。可选 `progress_callback` 在每轮工具执行前推送进度消息 (如 "⏳ 正在搜索...") |
 | `_build_messages(session, user_message)` | 构建 LLM 请求消息列表 (system + profile + memories + history + current)。历史消息中的 `reasoning_content` 自动保留以支持 thinking mode 模型 |
 | `_execute_tool_calls(tool_calls, session)` | 通过 ToolRegistry 执行 LLM 返回的工具调用 |
 | `_maybe_remember(user_id, msg, response)` | 启发式记忆保存 (对话 >300 字符时触发) |
@@ -991,7 +991,7 @@ v2.4 基础上增加:
   ├── 超时清理: 5 分钟无消息自动过期, 静默清理
   └── 防重复: continuous_router 检查 is_tome() 避免与 agent_router 重复处理
 
-### v2.6 — reasoning_content 全链路保留 (当前)
+### v2.6 — reasoning_content 全链路保留
 
 ```
 v2.5 基础上增加:
@@ -1004,6 +1004,20 @@ v2.5 基础上增加:
 **解决问题**: DeepSeek v4 pro / Qwen 等 thinking mode 模型要求 reasoning_content
 必须在后续请求中原样回传, 否则返回 HTTP 400:
 "The reasoning_content in the thinking mode must be passed back to the API."
+
+### v2.7 — 实时进度推送 (当前)
+
+```
+v2.6 基础上增加:
+  ├── Agent.run(): 新增 progress_callback 可选参数
+  ├── 触发时机: 每轮工具执行前, 发送 "⏳ 正在{tool_names}..."
+  ├── 去重逻辑: 相邻轮次相同工具集不重复推送
+  ├── 轮次感知: 第3轮起追加 "⏳ 第{n}轮: 正在..."
+  └── 容错: callback 异常不影响 Agent 主循环
+
+**设计原则**: Agent 不依赖 QQ 层, progress_callback 由 agent_router
+通过 _safe_send 包装后注入。失败时静默忽略, 不影响消息处理。
+```
 
 **影响链路**: API 响应 → _parse_response → Agent 循环内消息 → session.context
 → 下次 _build_messages → API 请求。全链路 reasoning_content 不丢失。

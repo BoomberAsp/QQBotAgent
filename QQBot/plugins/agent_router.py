@@ -376,8 +376,10 @@ async def handle_agent_message(event: MessageEvent):
             client = None  # Use default client for special commands
 
         # Run the agent loop with timeout
+        async def _progress(msg: str):
+            await _safe_send(msg)
         response = await asyncio.wait_for(
-            agent.run(augmented_message, user_id, client=client),
+            agent.run(augmented_message, user_id, client=client, progress_callback=_progress),
             timeout=200.0,  # Slightly more than thinking_timeout
         )
 
@@ -480,7 +482,8 @@ async def handle_continuous_message(event: MessageEvent):
             client = _model_router.reasoning_client
 
         response = await asyncio.wait_for(
-            agent.run(augmented_message, user_id, client=client),
+            agent.run(augmented_message, user_id, client=client,
+                       progress_callback=lambda msg: _safe_send(msg, matcher=continuous_router)),
             timeout=200.0,
         )
 

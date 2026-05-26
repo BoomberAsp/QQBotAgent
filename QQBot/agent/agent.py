@@ -9,7 +9,7 @@ import asyncio
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .tool_registry import ToolRegistry
 from .session import Session, SessionManager
@@ -114,6 +114,7 @@ class Agent:
         user_message: str,
         user_id: str,
         client=None,
+        progress_callback: Optional[Callable[[str], Any]] = None,
     ) -> str:
         """Process a user message through the agent loop.
 
@@ -122,6 +123,9 @@ class Agent:
             user_id: Unique QQ user ID.
             client: Optional DeepSeekClient override for model routing.
                     When None, uses self.client (the default client).
+            progress_callback: Optional async/sync callback to report
+                               progress before each tool execution round.
+                               Receives a short status string (e.g. "正在搜索...").
 
         Returns:
             The agent's final response string.
@@ -131,6 +135,9 @@ class Agent:
 
         # Build messages: system prompt + history + current message
         messages = self._build_messages(session, user_message)
+
+        # Track tool names for deduplication across iterations
+        _last_reported_tools: Optional[frozenset] = None
 
         # Agent loop
         for iteration in range(self.max_tool_iterations):
@@ -144,6 +151,24 @@ class Agent:
 
             # Check if the response contains tool calls
             if response.get("tool_calls"):
+                # ── Report progress (with deduplication) ────────────
+                if progress_callback:
+                    tool_names = [tc["function"]["name"] for tc in response["tool_calls"]]
+                    tool_set = frozenset(tool_names)
+                    if tool_set != _last_reported_tools:
+                        _last_reported_tools = tool_set
+                        names = "、".join(tool_names)
+                        if iteration >= 3:
+                            msg = f"⏳ 第{iteration + 1}轮: 正在{names}..."
+                        else:
+                            msg = f"⏳ 正在{names}..."
+                        try:
+                            ret = progress_callback(msg)
+                            if asyncio.iscoroutine(ret):
+                                await ret
+                        except Exception:
+                            pass  # Progress failures must not break the agent
+
                 # ACT: Execute tools
                 tool_results = await self._execute_tool_calls(
                     response["tool_calls"], session
