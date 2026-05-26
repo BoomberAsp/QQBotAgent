@@ -1,6 +1,30 @@
 version: '3.8'
 
 services:
+  # ── SearXNG Search Engine ────────────────────────────────────
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8082/
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── QQBot Main Service ──────────────────────────────────────
   qqbot:
     build:
       context: .
@@ -19,9 +43,10 @@ services:
 
     # 端口映射
     ports:
-      - "8080:8080"   # Napcat WebSocket
+      - "8080:8080"   # Napcat WebSocket (反向连接 NoneBot)
       - "8081:8081"   # NoneBot HTTP
       - "8000:8000"   # vLLM 推理服务
+      - "6099:6099"   # Napcat WebUI
 
     # 环境变量
     environment:
@@ -33,6 +58,8 @@ services:
       - VLLM_MAX_MODEL_LEN=8192
       - VLLM_TENSOR_PARALLEL_SIZE=1
       - VLLM_GPU_MEMORY_UTILIZATION=0.8
+      # SearXNG 搜索端点
+      - SEARXNG_ENDPOINT=http://searxng:8080
 
     # 数据持久化
     volumes:

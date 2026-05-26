@@ -1,0 +1,17 @@
+# SearXNG rate limiter configuration for QQBot
+# Since SearXNG is only accessed by the local QQBot agent,
+# we use permissive settings.
+
+[botdetection.ip_limit]
+# Disable IP-based rate limiting — only local bot uses this
+enabled = false
+link_token = false
+
+[botdetection.ip_lists]
+pass_ip = [
+  "127.0.0.0/8",
+  "::1/128",
+  "172.16.0.0/12",
+  "10.0.0.0/8",
+  "192.168.0.0/16",
+]

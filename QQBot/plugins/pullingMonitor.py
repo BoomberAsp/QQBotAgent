@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from nb_cli.cli.commands import self
 from nonebot.internal.matcher import Matcher
-from nonebot.plugin import on_message, on_command, on_notice
+# on_message, on_command, on_notice imports removed (handlers disabled)
 from nonebot.adapters.onebot.v11 import (
     GroupMessageEvent,
     Message,
@@ -38,23 +38,29 @@ def fix_image_path(filename):
     return MessageSegment.image(f"file://{file_path}")
 
 
-# 修正后的图片消息段
-pull_1 = fix_image_path("pull_1.png")
-blue_end = fix_image_path("blue_end.png")
-blue_middle = fix_image_path("blue_middle.png")
-blue_or_purple_spaceship_close = fix_image_path("blue_or_purple_spaceship_close.png")
-blue_spaceship_open = fix_image_path("blue_spaceship_open.png")
-gold_spaceship_close = fix_image_path("gold_spaceship_close.png")
-gold_spaceship_open = fix_image_path("gold_spaceship_open.png")
-golden_end = fix_image_path("golden_end.png")
-purple_middle = fix_image_path("purple_middle.png")
-purple_end = fix_image_path("purple_end.png")
-purple_spaceship_open = fix_image_path("purple_spaceship_open.png")
-red_end = fix_image_path("red_end.png")
-red_spaceship_close = fix_image_path("red_spaceship_close.png")
-red_spaceship_open = fix_image_path("red_spaceship_open.png")
-single_pull_start = fix_image_path("single_pull_start.png")
-ten_pull_start = fix_image_path("ten_pull_start.png")
+# 修正后的图片消息段 (graceful fallback if images missing)
+def _safe_image(filename):
+    try:
+        return fix_image_path(filename)
+    except FileNotFoundError:
+        return None
+
+pull_1 = _safe_image("pull_1.png")
+blue_end = _safe_image("blue_end.png")
+blue_middle = _safe_image("blue_middle.png")
+blue_or_purple_spaceship_close = _safe_image("blue_or_purple_spaceship_close.png")
+blue_spaceship_open = _safe_image("blue_spaceship_open.png")
+gold_spaceship_close = _safe_image("gold_spaceship_close.png")
+gold_spaceship_open = _safe_image("gold_spaceship_open.png")
+golden_end = _safe_image("golden_end.png")
+purple_middle = _safe_image("purple_middle.png")
+purple_end = _safe_image("purple_end.png")
+purple_spaceship_open = _safe_image("purple_spaceship_open.png")
+red_end = _safe_image("red_end.png")
+red_spaceship_close = _safe_image("red_spaceship_close.png")
+red_spaceship_open = _safe_image("red_spaceship_open.png")
+single_pull_start = _safe_image("single_pull_start.png")
+ten_pull_start = _safe_image("ten_pull_start.png")
 
 
 # 三色五星角色
@@ -156,9 +162,12 @@ PROBABILITIES = {
         "光暗三星角色": 70.0
     }
 }
-# from utils import group_command_rule
-ten_draws = on_command("十连抽", priority=5, rule=to_me())
-draw = on_command("单抽", priority=5, rule=to_me())
+# DEPRECATED: on_command handlers disabled. Gacha pulls are now routed
+# through agent_router.py via the gacha_pull tool in tools/legacy_tools.py.
+# Utility functions (drawing_cards, format_result, pulling_anime, etc.) remain.
+#
+# ten_draws = on_command("十连抽", priority=5, rule=to_me())
+# draw = on_command("单抽", priority=5, rule=to_me())
 
 
 def drawing_cards(pool_type: str, upper_character: str = None):
@@ -394,334 +403,24 @@ def drawing_cards(pool_type: str, upper_character: str = None):
     return result
 
 
-@draw.handle()
-async def handle_draw(event: Union[MessageEvent, GroupMessageEvent], matcher: Matcher, state: T_State,
-                      args: Message = CommandArg()):
-    # 存储用户信息用于后续验证
-    if isinstance(event, GroupMessageEvent):
-        state["user_id"] = event.user_id
-        state["group_id"] = event.group_id
-    else:
-        state["user_id"] = event.user_id
-
-    user_input = args.extract_plain_text().strip()
-    state["pool_type"] = None
-    state["upper_character"] = None
-    if not user_input:
-        print("无输入")
-        await matcher.pause(Message([MessageSegment.text("请选择卡池：\n"
-                                                         "1. 常规招募\n"
-                                                         "2. 神秘招募[空格]角色名\n"
-                                                         "3. up招募[空格]角色名\n"
-                                                         "4. 银河招募\n"
-                                                         "在下一条消息中选择一个池子告诉我吧~\n"
-                                                         "不必再@我哟，我等你~"),
-                                     MessageSegment.at(event.user_id)]))
-
-    # 确定卡池类型
-    user_input_seg = user_input.split(" ")
-    if user_input_seg[0] in ["普池", "常规招募", "普通", "普通池", "三色池", "三色", "1", "1."]:
-        state["pool_type"] = "常规招募"
-    elif user_input_seg[0] in ["神秘", "光暗", "神秘招募", "光暗招募", "特殊招募", "光暗池", "神秘池", "2", "2."]:
-        state["pool_type"] = "神秘招募"
-        if len(user_input_seg) >= 2:
-            state["upper_character"] = user_input_seg[1]
-    elif user_input_seg[0] in ["银河", "银河招募", "4", "4."]:
-        state["pool_type"] = "银河招募"
-    elif user_input_seg[0] in SPECIAL_THREE_COLOR_FIVE_STAR or user_input_seg[0] in THREE_COLOR_FIVE_STAR:
-        state["pool_type"] = "几率up招募"
-        state["upper_character"] = user_input_seg[0]
-    elif user_input_seg[0] in ["几率up招募", "up", "up招募", "3", "3."]:
-        state["pool_type"] = "几率up招募"
-        if len(user_input_seg) >= 2:
-            state["upper_character"] = user_input_seg[1]
-    elif user_input_seg[0] in SPECIAL_FIVE_STAR:
-        state["pool_type"] = "神秘招募"
-        state["upper_character"] = user_input_seg[0]
-    else:  # 无效输入
-        await matcher.reject(
-            Message([MessageSegment.text(f"无效的卡池或角色: \"{user_input_seg[0]}\"，请使用有效的卡池名称或UP角色名\n"
-                                         f"请选择卡池：\n"
-                                         "1. 常规招募\n"
-                                         "2. 神秘招募[空格]角色名\n"
-                                         "3. up招募[空格]角色名\n"
-                                         "4. 银河招募\n"
-                                         "在下一条消息中选择一个池子告诉我吧~\n"
-                                         "不必再@我哟，我等你~"),
-                     MessageSegment.at(event.user_id)]))
-
-    # 需要额外信息的情况
-    if state["pool_type"] in ["几率up招募", "神秘招募"] and not state["upper_character"]:
-        if state["pool_type"] == "几率up招募":
-            await matcher.reject(Message([MessageSegment.text("请指定UP角色名，例如：厄德莱雅 或者 圣诞的蜜拉贝儿\n"
-                                                              "我会自动识别角色是什么类型的哟。"),
-                                          MessageSegment.at(event.user_id)]))
-        else:  # 神秘招募
-            await matcher.reject(Message([MessageSegment.text("请指定光暗UP角色名，例如：蝶子 或者 守护者艾瑞儿\n"
-                                                              "我会自动识别角色是什么类型的哟。"),
-                                          MessageSegment.at(event.user_id)]))
-
-    # 执行抽卡
-    if state["upper_character"]:
-        await matcher.send(f"{state["upper_character"]} 招募概率提高！")
-    else:
-        await matcher.send(f"{state["pool_type"]}")
-    await matcher.send("正在抽卡……")
-    result = drawing_cards(state["pool_type"], state.get("upper_character"))
-    t, star = format_result(result, 1)
-    if event.group_id != "1032070842" and event.group_id != 1032070842:
-        await pulling_anime(matcher, star, True)
-    else:
-        await single_pulling_anime(matcher, star)
-
-    text = Message([t, MessageSegment.at(event.user_id)])
-    await matcher.finish(text)
+# @draw.handle()
+# async def handle_draw(...):
+#     [DEPRECATED] Gacha draw handler — superseded by agent gacha_pull tool.
 
 
-@draw.handle()
-async def handle_secondary_input(
-        event: Union[MessageEvent, GroupMessageEvent],
-        matcher: Matcher,
-        state: T_State
-):
-    # 验证用户身份
-    if isinstance(event, GroupMessageEvent):
-        if state["user_id"] != event.user_id or state["group_id"] != event.group_id:
-            return
-    else:
-        if state["user_id"] != event.user_id:
-            return
-
-    # 获取用户输入
-    user_input = event.get_plaintext().strip()
-
-    # 处理取消命令
-    if user_input in ["取消", "退出", "cancel", "exit", "0"]:
-        await matcher.finish("已取消模拟抽卡")
-    else:
-        user_input_seg = user_input.split(" ")
-        if user_input_seg[0] in ["普池", "常规招募", "普通", "普通池", "三色池", "三色", "1", "1."]:
-            state["pool_type"] = "常规招募"
-        elif user_input_seg[0] in ["神秘", "光暗", "神秘招募", "光暗招募", "特殊招募", "光暗池", "神秘池", "2", "2."]:
-            state["pool_type"] = "神秘招募"
-            if len(user_input_seg) >= 2:
-                state["upper_character"] = user_input_seg[1]
-        elif user_input_seg[0] in ["银河", "银河招募", "4", "4."]:
-            state["pool_type"] = "银河招募"
-        elif user_input_seg[0] in SPECIAL_THREE_COLOR_FIVE_STAR or user_input_seg[0] in THREE_COLOR_FIVE_STAR:
-            state["pool_type"] = "几率up招募"
-            state["upper_character"] = user_input_seg[0]
-        elif user_input_seg[0] in ["几率up招募", "up", "up招募", "3", "3."]:
-            state["pool_type"] = "几率up招募"
-            if len(user_input_seg) >= 2:
-                state["upper_character"] = user_input_seg[1]
-        elif user_input_seg[0] in SPECIAL_FIVE_STAR:
-            state["pool_type"] = "神秘招募"
-            state["upper_character"] = user_input_seg[0]
-        else:  # 无效输入
-            await matcher.reject(
-                Message(
-                    [MessageSegment.text(f"无效的卡池或角色: \"{user_input_seg[0]}\"，请使用有效的卡池名称或UP角色名\n"
-                                         f"请选择卡池：\n"
-                                         "1. 常规招募\n"
-                                         "2. 神秘招募[空格]角色名\n"
-                                         "3. up招募[空格]角色名\n"
-                                         "4. 银河招募\n"
-                                         "在下一条消息中选择一个池子告诉我吧~\n"
-                                         "不必再@我哟，我等你~"),
-                     MessageSegment.at(event.user_id)]))
-
-        # 需要额外信息的情况
-        if state["pool_type"] in ["几率up招募", "神秘招募"] and not state["upper_character"]:
-            if state["pool_type"] == "几率up招募":
-                await matcher.reject(Message([MessageSegment.text("请指定UP角色名，例如：厄德莱雅 或者 圣诞的蜜拉贝儿\n"
-                                                                  "我会自动识别角色是什么类型的哟。"),
-                                              MessageSegment.at(event.user_id)]))
-            else:  # 神秘招募
-                await matcher.reject(Message([MessageSegment.text("请指定光暗UP角色名，例如：蝶子 或者 守护者艾瑞儿\n"
-                                                                  "我会自动识别角色是什么类型的哟。"),
-                                              MessageSegment.at(event.user_id)]))
-
-        # 执行抽卡
-        if state["upper_character"]:
-            await matcher.send(f"{state["upper_character"]} 招募概率提高！")
-        else:
-            await matcher.send(f"{state["pool_type"]}")
-        await matcher.send("正在抽卡……")
-        result = drawing_cards(state["pool_type"], state.get("upper_character"))
-        t, star = format_result(result, 1)
-        if event.group_id != "1032070842" and event.group_id != 1032070842:
-            await pulling_anime(matcher, star, True)
-        else:
-            await single_pulling_anime(matcher, star)
-        text = Message([t, MessageSegment.at(event.user_id)])
-        await matcher.finish(text)
+# @draw.handle()
+# async def handle_secondary_input(...):
+#     [DEPRECATED] Gacha draw secondary input — superseded by agent gacha_pull tool.
 
 
-
-@ten_draws.handle()
-async def handle_ten_draws(event: Union[MessageEvent, GroupMessageEvent], matcher: Matcher, state: T_State,
-                           args: Message = CommandArg()):
-    # 存储用户信息用于后续验证
-    if isinstance(event, GroupMessageEvent):
-        state["user_id"] = event.user_id
-        state["group_id"] = event.group_id
-    else:
-        state["user_id"] = event.user_id
-
-    user_input = args.extract_plain_text().strip()
-    state["pool_type"] = None
-    state["upper_character"] = None
-    if not user_input:
-        print("无输入")
-        await matcher.pause(Message([MessageSegment.text("请选择卡池：\n"
-                                                         "1. 常规招募\n"
-                                                         "2. 神秘招募[空格]角色名\n"
-                                                         "3. up招募[空格]角色名\n"
-                                                         "4. 银河招募\n"
-                                                         "在下一条消息中选择一个池子告诉我吧~\n"
-                                                         "不必再@我哟，我等你~"),
-                                     MessageSegment.at(event.user_id)]))
-
-    # 确定卡池类型
-    user_input_seg = user_input.split(" ")
-    if user_input_seg[0] in ["普池", "常规招募", "普通", "普通池", "三色池", "三色", "1", "1."]:
-        state["pool_type"] = "常规招募"
-    elif user_input_seg[0] in ["神秘", "光暗", "神秘招募", "光暗招募", "特殊招募", "光暗池", "神秘池", "2", "2."]:
-        state["pool_type"] = "神秘招募"
-        if len(user_input_seg) >= 2:
-            state["upper_character"] = user_input_seg[1]
-    elif user_input_seg[0] in ["银河", "银河招募", "4", "4."]:
-        state["pool_type"] = "银河招募"
-    elif user_input_seg[0] in SPECIAL_THREE_COLOR_FIVE_STAR or user_input_seg[0] in THREE_COLOR_FIVE_STAR:
-        state["pool_type"] = "几率up招募"
-        state["upper_character"] = user_input_seg[0]
-    elif user_input_seg[0] in ["几率up招募", "up", "up招募", "3", "3."]:
-        state["pool_type"] = "几率up招募"
-        if len(user_input_seg) >= 2:
-            state["upper_character"] = user_input_seg[1]
-    elif user_input_seg[0] in SPECIAL_FIVE_STAR:
-        state["pool_type"] = "神秘招募"
-        state["upper_character"] = user_input_seg[0]
-    else:  # 无效输入
-        await matcher.reject(
-            Message([MessageSegment.text(f"无效的卡池或角色: \"{user_input_seg[0]}\"，请使用有效的卡池名称或UP角色名\n"
-                                         f"请选择卡池：\n"
-                                         "1. 常规招募\n"
-                                         "2. 神秘招募[空格]角色名\n"
-                                         "3. up招募[空格]角色名\n"
-                                         "4. 银河招募\n"
-                                         "在下一条消息中选择一个池子告诉我吧~\n"
-                                         "不必再@我哟，我等你~"),
-                     MessageSegment.at(event.user_id)]))
-
-    # 需要额外信息的情况
-    if state["pool_type"] in ["几率up招募", "神秘招募"] and not state["upper_character"]:
-        if state["pool_type"] == "几率up招募":
-            await matcher.reject(Message([MessageSegment.text("请指定UP角色名，例如：厄德莱雅 或者 圣诞的蜜拉贝儿\n"
-                                                              "我会自动识别角色是什么类型的哟。"),
-                                          MessageSegment.at(event.user_id)]))
-        else:  # 神秘招募
-            await matcher.reject(Message([MessageSegment.text("请指定光暗UP角色名，例如：蝶子 或者 守护者艾瑞儿\n"
-                                                              "我会自动识别角色是什么类型的哟。"),
-                                          MessageSegment.at(event.user_id)]))
+# @ten_draws.handle()
+# async def handle_ten_draws(...):
+#     [DEPRECATED] Ten-draw handler — superseded by agent gacha_pull tool.
 
 
-    # 执行十连抽
-    if state["upper_character"]:
-        await matcher.send(f"{state["upper_character"]} 招募概率提高！")
-    else:
-        await matcher.send(f"{state["pool_type"]}")
-    await matcher.send("正在抽卡……")
-    results = [drawing_cards(state["pool_type"], state.get("upper_character")) for _ in range(10)]
-    t, star = format_result(results, 10)
-    if event.group_id != "1032070842" and event.group_id != 1032070842:
-        await pulling_anime(matcher, star, False)
-    else:
-        await single_pulling_anime(matcher, star)
-    text = Message([t, MessageSegment.at(event.user_id)])
-    await matcher.finish(text)
-
-
-@ten_draws.handle()
-async def handle_secondary_input(
-        event: Union[MessageEvent, GroupMessageEvent],
-        matcher: Matcher,
-        state: T_State
-):
-
-    # 验证用户身份
-    if isinstance(event, GroupMessageEvent):
-        if state["user_id"] != event.user_id or state["group_id"] != event.group_id:
-            return
-    else:
-        if state["user_id"] != event.user_id:
-            return
-
-    # 获取用户输入
-    user_input = event.get_plaintext().strip()
-
-    # 处理取消命令
-    if user_input in ["取消", "退出", "cancel", "exit", "0"]:
-        await matcher.finish("已取消模拟抽卡")
-    else:
-        user_input_seg = user_input.split(" ")
-        if user_input_seg[0] in ["普池", "常规招募", "普通", "普通池", "三色池", "三色", "1", "1."]:
-            state["pool_type"] = "常规招募"
-        elif user_input_seg[0] in ["神秘", "光暗", "神秘招募", "光暗招募", "特殊招募", "光暗池", "神秘池", "2", "2."]:
-            state["pool_type"] = "神秘招募"
-            if len(user_input_seg) >= 2:
-                state["upper_character"] = user_input_seg[1]
-        elif user_input_seg[0] in ["银河", "银河招募", "4", "4."]:
-            state["pool_type"] = "银河招募"
-        elif user_input_seg[0] in SPECIAL_THREE_COLOR_FIVE_STAR or user_input_seg[0] in THREE_COLOR_FIVE_STAR:
-            state["pool_type"] = "几率up招募"
-            state["upper_character"] = user_input_seg[0]
-        elif user_input_seg[0] in ["几率up招募", "up", "up招募", "3", "3."]:
-            state["pool_type"] = "几率up招募"
-            if len(user_input_seg) >= 2:
-                state["upper_character"] = user_input_seg[1]
-        elif user_input_seg[0] in SPECIAL_FIVE_STAR:
-            state["pool_type"] = "神秘招募"
-            state["upper_character"] = user_input_seg[0]
-        else:  # 无效输入
-            await matcher.reject(
-                Message(
-                    [MessageSegment.text(f"无效的卡池或角色: \"{user_input_seg[0]}\"，请使用有效的卡池名称或UP角色名\n"
-                                         f"请选择卡池：\n"
-                                         "1. 常规招募\n"
-                                         "2. 神秘招募[空格]角色名\n"
-                                         "3. up招募[空格]角色名\n"
-                                         "4. 银河招募\n"
-                                         "在下一条消息中选择一个池子告诉我吧~\n"
-                                         "不必再@我哟，我等你~"),
-                     MessageSegment.at(event.user_id)]))
-
-        # 需要额外信息的情况
-        if state["pool_type"] in ["几率up招募", "神秘招募"] and not state["upper_character"]:
-            if state["pool_type"] == "几率up招募":
-                await matcher.reject(Message([MessageSegment.text("请指定UP角色名，例如：厄德莱雅 或者 圣诞的蜜拉贝儿\n"
-                                                                  "我会自动识别角色是什么类型的哟。"),
-                                              MessageSegment.at(event.user_id)]))
-            else:  # 神秘招募
-                await matcher.reject(Message([MessageSegment.text("请指定光暗UP角色名，例如：蝶子 或者 守护者艾瑞儿\n"
-                                                                  "我会自动识别角色是什么类型的哟。"),
-                                              MessageSegment.at(event.user_id)]))
-
-        # 执行十连抽
-        if state["upper_character"]:
-            await matcher.send(f"{state["upper_character"]} 招募概率提高！")
-        else:
-            await matcher.send(f"{state["pool_type"]}")
-        await matcher.send("正在抽卡……")
-        results = [drawing_cards(state["pool_type"], state.get("upper_character")) for _ in range(10)]
-        t, star = format_result(results, 10)
-        if event.group_id != "1032070842" and event.group_id != 1032070842:
-            await pulling_anime(matcher, star, False)
-        else:
-            await single_pulling_anime(matcher, star)
-        text = Message([t, MessageSegment.at(event.user_id)])
-        await matcher.finish(text)
+# @ten_draws.handle()
+# async def handle_secondary_input(...):
+#     [DEPRECATED] Ten-draw secondary input — superseded by agent gacha_pull tool.
 
 
 def format_result(result, count):

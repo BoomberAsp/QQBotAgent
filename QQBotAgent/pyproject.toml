@@ -1,0 +1,40 @@
+[project]
+name = "QQBotAgent"
+version = "0.1.0"
+description = "QQBotAgent"
+readme = "README.md"
+requires-python = ">=3.10, <4.0"
+dependencies = [
+    "nonebot2[fastapi,httpx,websockets]>=2.5.0",
+    "nonebot-adapter-onebot>=2.4.6",
+    "nonebot-adapter-feishu>=2.7.2",
+    "nonebot-adapter-qq>=1.7.1",
+    "nonebot-adapter-minecraft>=1.8.1",
+    "nonebot-adapter-wxclaw>=0.2.1"
+]
+
+[tool.nonebot]
+plugin_dirs = []
+builtin_plugins = []
+
+[tool.nonebot.adapters]
+nonebot-adapter-onebot = [
+    { name = "OneBot V11", module_name = "nonebot.adapters.onebot.v11" },
+    { name = "OneBot V12", module_name = "nonebot.adapters.onebot.v12" }
+]
+nonebot-adapter-feishu = [
+    { name = "飞书", module_name = "nonebot.adapters.feishu" }
+]
+nonebot-adapter-qq = [
+    { name = "QQ", module_name = "nonebot.adapters.qq" }
+]
+nonebot-adapter-minecraft = [
+    { name = "Minecraft", module_name = "nonebot.adapters.minecraft" }
+]
+nonebot-adapter-wxclaw = [
+    { name = "WxClaw", module_name = "nonebot.adapters.wxclaw" }
+]
+"@local" = []
+
+[tool.nonebot.plugins]
+"@local" = []

@@ -13,6 +13,8 @@ QQBot/data
 QQBot/logs
 QQBot/.env.prod
 QQBot/device.json
+QQBot/config/multimodal.json
+QQBot/config/models_settings.json
 
 # IDE
 .idea/

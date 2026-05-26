@@ -1,0 +1,46 @@
+# SearXNG configuration for QQBot Agent
+# Optimized for access from mainland China
+
+use_default_settings: true
+
+general:
+  instance_name: "QQBot Search"
+
+search:
+  safe_search: 1
+  autocomplete: ""
+  default_lang: "zh-CN"
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "qqbot-agent-searxng-secret-change-in-production"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false
+  image_proxy: false
+  # Allow search API access from any host (internal service)
+  public_instance: false
+
+ui:
+  static_use_hash: true
+  default_theme: simple
+  default_locale: zh-Hans-CN
+
+# Engines: only enable Bing (accessible from mainland China)
+# Default engines (google, duckduckgo, wikipedia, brave, startpage) are blocked
+engines:
+  - name: bing
+    engine: bing
+    shortcut: bi
+    disabled: false
+
+  - name: bing news
+    engine: bing_news
+    shortcut: bin
+    disabled: false
+
+outgoing:
+  request_timeout: 15.0
+  max_request_timeout: 20.0
