@@ -47,6 +47,8 @@ install_system_deps() {
                 libcairo2 libdrm2 fonts-liberation fonts-noto-color-emoji \
                 git docker.io docker-compose-v2
             ;;
+#        *)  echo -e "Try to update apt first. Use sudo apt update"
+#            ;;
         arch|manjaro)
             sudo pacman -S --noconfirm --needed \
                 python python-pip python-virtualenv \

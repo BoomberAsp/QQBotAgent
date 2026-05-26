@@ -451,7 +451,7 @@ function check_root_for_shell_install() {
         echo ""
         echo -e "${YELLOW}Shell 安装会将 Napcat 安装到当前用户的 HOME 目录:${NC}"
         echo -e "  当前 HOME: ${RED}${HOME}${NC} (root 的家目录)"
-        echo -e "  预期 HOME: ${GREEN}/home/windows11${NC}"
+        echo -e "  预期 HOME: ${GREEN}/home/<your_user_name>${NC}"
         echo ""
         echo -e "${YELLOW}请执行以下操作:${NC}"
         echo -e "  1. 退出 root: ${CYAN}exit${NC}"
