@@ -446,19 +446,31 @@ function check_root_for_shell_install() {
     if [[ $EUID -eq 0 ]]; then
         echo ""
         echo -e "${RED}╔══════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${RED}║  错误: 请勿使用 root 用户进行 Shell (Rootless) 安装！  ║${NC}"
+        echo -e "${RED}║  警告: 请勿使用 root 用户进行 Shell (Rootless) 安装！     ║${NC}"
         echo -e "${RED}╚══════════════════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "${YELLOW}Shell 安装会将 Napcat 安装到当前用户的 HOME 目录:${NC}"
         echo -e "  当前 HOME: ${RED}${HOME}${NC} (root 的家目录)"
         echo -e "  预期 HOME: ${GREEN}/home/<your_user_name>${NC}"
         echo ""
-        echo -e "${YELLOW}请执行以下操作:${NC}"
+        echo -e "${YELLOW}请选择操作:${NC}"
         echo -e "  1. 退出 root: ${CYAN}exit${NC}"
         echo -e "  2. 切换到普通用户后重新运行: ${CYAN}bash napcat.sh${NC}"
+        echo -e "  (2.5. 直接切换到普通用户: ${CYAN}su <your_user_name>${NC})"
         echo -e "  3. 如需先卸载旧版本:  ${CYAN}sudo bash napcat.sh --uninstall${NC}"
+        echo -e "  4. 强制安装: 我知道风险，继续以 root 身份安装到 ${HOME}"
         echo ""
-        exit 1
+        read -p "请输入选项 (1/2/3/4): " root_choice
+        case "${root_choice}" in
+        4)
+            log "警告: 以 root 用户强制安装 Napcat 到 ${HOME}..."
+            return 0
+            ;;
+        *)
+            log "已取消安装。请按提示操作后重新运行。"
+            exit 1
+            ;;
+        esac
     fi
 }
 
