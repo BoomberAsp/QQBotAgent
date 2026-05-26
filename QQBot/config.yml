@@ -1,7 +1,7 @@
-# go-cqhttp 默认配置文件
+# go-cqhttp 默认配置文件（已弃用）
 
 account: # 账号相关
-  uin: 971561405 # QQ账号
+  uin:  # QQ账号
   password: '' # 密码为空时使用扫码登录
   encrypt: false  # 是否开启密码加密
   status: 0      # 在线状态 请参考 https://docs.go-cqhttp.org/guide/config.html#在线状态
@@ -34,7 +34,7 @@ account: # 账号相关
   sign-servers: 
     - url: 'http://127.0.0.1:8080'  # 主签名服务器地址， 必填
       key: '114514'  # 签名服务器所需要的apikey, 如果签名服务器的版本在1.1.0及以下则此项无效
-      authorization: 'BoomberAsp'   # authorization 内容, 依服务端设置，如 'Bearer xxxx'
+      authorization: ''   # authorization 内容, 依服务端设置，如 'Bearer xxxx'
     - url: '-'  # 备用
       key: '114514'  
       authorization: '-'
