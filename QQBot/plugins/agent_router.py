@@ -284,8 +284,9 @@ def _build_tool_registry() -> ToolRegistry:
     registry.register(
         "gacha_pull", gacha_pull,
         "模拟游戏抽卡/招募。支持单抽和十连抽，四种卡池类型。"
-        "只返回文字结果。如果用户想看抽卡动画，在得到文字结果后，告诉用户可以直接要求播放动画，"
-        "然后调用 play_gacha_animation 工具并传入对应星级。",
+        "重要：调用前必须先询问用户是否要播放抽卡动画！不要直接给出结果。"
+        "如果用户选择播放动画，先调用 play_gacha_animation 播放动画，再给出文字结果。"
+        "如果用户选择跳过动画，直接调用此工具给出文字结果。",
         {
             "type": "object",
             "properties": {
@@ -302,8 +303,8 @@ def _build_tool_registry() -> ToolRegistry:
     )
     registry.register(
         "play_gacha_animation", play_gacha_animation,
-        "播放抽卡动画。在用户看完文字抽卡结果后，如果用户想看动画效果，调用此工具。"
-        "传入最高星级（3=蓝色, 4=紫色, 5=金色, 6=红色）和是否为单抽。动画会直接发送到QQ聊天窗口。",
+        "播放抽卡动画。传入最高星级（3=蓝色, 4=紫色, 5=金色, 6=红色）和是否为单抽。"
+        "动画会直接发送到QQ聊天窗口。应该在给出文字抽卡结果之前调用此工具。",
         {
             "type": "object",
             "properties": {

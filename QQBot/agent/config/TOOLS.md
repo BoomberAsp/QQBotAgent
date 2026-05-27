@@ -261,7 +261,7 @@ This document defines all tools available to the agent. Each tool has a name, de
 }
 ```
 
-**Important**: This tool only returns **text** results. If the user wants to see the pull animation, tell them you can play it and call `play_gacha_animation` with the star level from the pull result.
+**Important**: This tool only returns **text** results. Before calling this tool, you MUST first ask the user whether they want to see the pull animation. Do NOT call this tool directly without asking.
 
 ---
 
@@ -269,7 +269,7 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 **Description**: Play gacha pull animation images directly in the QQ chat. Sends a sequence of animation frames with 0.75s intervals.
 
-**When to use**: AFTER `gacha_pull` has returned text results, and the user explicitly asks to see the animation (e.g. "看看动画", "播放动画", "我要看"). Do NOT call this before showing text results.
+**When to use**: BEFORE showing text gacha results, when the user has agreed to see the animation. Always ask first: "要先看抽卡动画还是直接看结果？"
 
 **Parameters**:
 ```json
@@ -291,10 +291,10 @@ This document defines all tools available to the agent. Each tool has a name, de
 }
 ```
 
-**Workflow example**:
-1. User: "帮我抽卡" → Call `gacha_pull` → Get text results
-2. Tell user: "抽到了 金色【角色名】... 要看抽卡动画吗？"
-3. User: "要"/"看" → Call `play_gacha_animation(star_level=5, is_single=false)` → Animation plays in chat
+**Workflow**:
+1. User: "帮我抽卡" → Ask: "要先看抽卡动画，还是直接看结果？"
+2. User chooses animation → Call `gacha_pull` and `play_gacha_animation` → Animation plays → Show text results
+3. User skips animation → Call `gacha_pull` only → Show text results directly
 
 ---
 
