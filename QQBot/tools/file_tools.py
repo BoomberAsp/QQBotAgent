@@ -11,7 +11,7 @@ All file access is validated by _validate_path (workspace boundary enforcement).
 
 import os
 
-from ..lib.multimodal_client import multimodal_client
+from lib.multimodal_client import multimodal_client
 
 # Reuse security helpers and workspace paths from builtin_tools
 from .builtin_tools import (

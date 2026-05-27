@@ -392,6 +392,98 @@ Docker Compose 包含：
 
 ## 常见问题
 
+### Docker 安装失败（国内云服务器）
+
+**现象**：在腾讯云、阿里云等国内云服务器上执行 `bash napcat.sh --docker y` 或 `get-docker.sh` 时，出现 `Connection reset by peer` 或下载超时。
+
+**原因**：Docker 官方安装脚本从 `download.docker.com`（AWS/Akamai 海外 CDN）下载 GPG 密钥和软件包，国内云服务器的网络出口受 GFW 限制，TCP 连接会被重置。
+
+**解决方法（任选一种）**：
+
+方法一：直接使用系统包管理器安装（推荐）
+```bash
+# Ubuntu/Debian（腾讯云 apt 镜像已包含 Docker）
+sudo apt-get install -y docker.io docker-compose-v2
+sudo systemctl enable docker --now
+```
+
+方法二：使用 Aliyun 镜像安装
+```bash
+sudo curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh --mirror Aliyun
+```
+
+方法三：手动配置 Docker 镜像源
+```bash
+# 先通过 apt 安装 docker，再配置国内镜像加速
+sudo apt-get install -y docker.io
+sudo tee /etc/docker/daemon.json <<EOF
+{
+  "registry-mirrors": [
+    "https://docker.1ms.run",
+    "https://docker.xuanyuan.me"
+  ]
+}
+EOF
+sudo systemctl restart docker
+```
+
+> **注意**：`napcat.sh` 对 Docker Hub 镜像拉取（`docker pull`）已内置代理测速（`docker.1ms.run` 等），但 Docker 本身的安装步骤（`get-docker.sh`）未走代理。如果遇到安装失败，先用上述方法手动安装 Docker，再运行 `napcat.sh`。
+
+---
+
+### NapCat 反向 WebSocket 403 错误
+
+**现象**：
+- NoneBot 日志：`WebSocket /` 返回 403
+- NapCat 报错：`ws://localhost:8081` 连接失败 (403)
+
+**原因分析**：
+
+1. **路径不匹配（首要原因）**：NoneBot 的 OneBot 适配器将反向 WebSocket 端点注册在 `/onebot/v11/ws/`，而非根路径 `/`。NapCat 如果配置为 `ws://localhost:8081`（即请求 `/`），FastAPI 找不到对应路由，返回 403。
+
+2. **Access Token 未传递或错误**：即使路径正确，如果 NapCat 没有携带 `ONEBOT_ACCESS_TOKEN`（通过 `Authorization: Bearer <token>` 请求头或 `?access_token=<token>` 查询参数），NoneBot 也会因鉴权失败返回 403。
+
+**解决方法**：
+
+**步骤 1**：修改 NapCat 的反向 WebSocket 地址为正确路径
+```
+ws://127.0.0.1:8081/onebot/v11/ws/
+```
+
+**步骤 2**：在 URL 中携带 access token（两种方式任选一种）
+
+方式 A — 查询参数：
+```
+ws://127.0.0.1:8081/onebot/v11/ws/?access_token=你的ONEBOT_ACCESS_TOKEN
+```
+
+方式 B — 单独配置 token 字段（如果 NapCat WebUI 支持）：
+- WebSocket 地址：`ws://127.0.0.1:8081/onebot/v11/ws/`
+- Access Token：与 `.env` 中 `ONEBOT_ACCESS_TOKEN` 一致
+
+**步骤 3**：确认 NoneBot 已加载 OneBot 适配器
+```bash
+nb plugin list
+```
+应能看到 `nonebot_adapter_onebot`。检查 `bot.py` 确保已注册适配器：
+```python
+from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
+driver.register_adapter(OneBotV11Adapter)
+```
+
+**步骤 4**：检查 NoneBot 启动日志
+成功加载适配器后，启动日志应打印：
+```
+OneBot V11 | WebSocket Server listening on ws://0.0.0.0:8081/onebot/v11/ws/
+```
+确保 NapCat 的地址与此日志中的路径完全一致。
+
+**步骤 5**：验证 Token 一致性
+确保 `QQBot/.env` 中的 `ONEBOT_ACCESS_TOKEN` 与 NapCat 配置的 token **完全一致**（注意无多余空格、换行）。Token 中的 `~` 等特殊字符在 URL 中是安全的，直接使用即可。
+
+---
+
 **SearXNG 无法搜索？**
 ```bash
 # 检查容器状态
@@ -403,11 +495,6 @@ curl "http://localhost:8082/search?format=json&q=test"
 **QQ 消息发送超时 (retcode 1200)？**
 - 已内置重试机制 + 智能拆分（300 字符 / 块 + 1s 间隔）
 - 如仍出现，增大 `.env` 中的间隔时间或减小 chunk 大小
-
-**NapCat 连接不上？**
-- 检查反向 WebSocket 地址是否正确：`ws://127.0.0.1:8081/onebot/v11/ws`
-- 检查 Access Token 与 `.env` 一致
-- 查看 NoneBot 日志：`tail -f QQBot/logs/*.log`
 
 **模型路由不生效？**
 - 检查 `QQBot/config/models_settings.json` 中 model 字段非空

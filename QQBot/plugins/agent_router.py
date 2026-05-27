@@ -18,18 +18,18 @@ from nonebot import on_message
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageEvent, Message, ActionFailed
 from nonebot.rule import to_me
 
-from ..agent.agent import Agent
-from ..agent.continuous_session import ContinuousSessionManager
-from ..agent.tool_registry import ToolRegistry
-from ..agent.session import SessionManager
-from ..agent.memory import MemorySystem
-from ..agent.profile import ProfileManager
-from ..lib.deepseek_client import deepseek_client as _global_client, DeepSeekClient as _DeepSeekClient
-from ..lib.model_router import ModelRouter
+from agent.agent import Agent
+from agent.continuous_session import ContinuousSessionManager
+from agent.tool_registry import ToolRegistry
+from agent.session import SessionManager
+from agent.memory import MemorySystem
+from agent.profile import ProfileManager
+from lib.deepseek_client import deepseek_client as _global_client, DeepSeekClient as _DeepSeekClient
+from lib.model_router import ModelRouter
 
 # Handle case where NoneBot is not running (testing)
 deepseek_client = _global_client if _global_client is not None else _DeepSeekClient()
-from ..tools.builtin_tools import (
+from tools.builtin_tools import (
     execute_code,
     get_time,
     search_web,
@@ -38,8 +38,8 @@ from ..tools.builtin_tools import (
     WORKSPACE_UPLOADS,
     _ensure_workspace_dirs,
 )
-from ..tools.file_tools import read_file
-from ..tools.legacy_tools import (
+from tools.file_tools import read_file
+from tools.legacy_tools import (
     calculate_speed,
     compare_speed_probability,
     explain_code_tool,

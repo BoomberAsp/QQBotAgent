@@ -36,16 +36,40 @@ install_system_deps() {
     case "$OS" in
         ubuntu|debian)
             sudo apt-get update -qq
-            sudo apt-get install -y -qq \
-                python3.12 python3.12-venv python3-pip \
+
+            # Static packages (no t64 variants)
+            STATIC_PKGS="python3.12 python3.12-venv python3-pip \
                 xvfb xauth curl jq \
-                libnss3 libgbm1 libglib2.0-0 \
-                libatk1.0-0 libatspi2.0-0 libgtk-3-0 \
-                libasound2 libxss1 libxrandr2 libxcomposite1 \
+                libnss3 libgbm1 libxss1 libxrandr2 libxcomposite1 \
                 libxcursor1 libxdamage1 libxfixes3 libxext6 \
-                libxrender1 libxkbcommon0 libpango-1.0-0 \
-                libcairo2 libdrm2 fonts-liberation fonts-noto-color-emoji \
-                git docker.io docker-compose-v2
+                libxrender1 libxkbcommon0 libcairo2 libdrm2 \
+                fonts-liberation fonts-noto-color-emoji \
+                git docker.io docker-compose-v2"
+
+            # Packages that may have t64 variants on Ubuntu 24.04+
+            PKGS_TO_CHECK=(
+                "libglib2.0-0"
+                "libatk1.0-0"
+                "libatspi2.0-0"
+                "libgtk-3-0"
+                "libasound2"
+                "libpango-1.0-0"
+            )
+
+            echo -e "${GREEN}[INFO]${NC} 检测系统库版本 (t64)..."
+            RESOLVED_PKGS=""
+            for pkg_base in "${PKGS_TO_CHECK[@]}"; do
+                t64_variant="${pkg_base}t64"
+                if apt-cache show "${t64_variant}" >/dev/null 2>&1; then
+                    echo -e "${GREEN}[INFO]${NC}   使用 ${t64_variant}"
+                    RESOLVED_PKGS="${RESOLVED_PKGS} ${t64_variant}"
+                else
+                    echo -e "${GREEN}[INFO]${NC}   使用 ${pkg_base}"
+                    RESOLVED_PKGS="${RESOLVED_PKGS} ${pkg_base}"
+                fi
+            done
+
+            sudo apt-get install -y -qq ${STATIC_PKGS} ${RESOLVED_PKGS}
             ;;
 #        *)  echo -e "Try to update apt first. Use sudo apt update"
 #            ;;
@@ -113,9 +137,9 @@ PORT=8081
 ONEBOT_ACCESS_TOKEN=请修改为你的Token
 SUPERUSERS=["你的QQ号"]
 COMMAND_START=["/", ""]
-COMMAND_SEP=[" ",]
-DEEPSEEK_API_KEY=请修改为你的DeepSeek API Key
-DEEPSEEK_API_BASE=https://api.deepseek.com
+COMMAND_SEP=[" "]
+DEEPSEEK_API_KEY=请修改为你的DeepSeek API Key （或其它厂商提供的LLM API key，记得删除括号）
+DEEPSEEK_API_BASE=https://api.deepseek.com （或其它厂商提供的LLM base url，记得删除括号）
 SEARXNG_ENDPOINT=http://localhost:8082
 EOF
         echo -e "${GREEN}[OK]${NC} .env 模板已创建"
