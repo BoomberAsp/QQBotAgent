@@ -3,13 +3,14 @@ Built-in Agent Tools — Core tools for information, code, and utility tasks.
 
 These tools are registered with the agent on bootstrap:
 1. Search for information (search_web) — SearXNG JSON API (covers weather/news/knowledge)
-2. Write and return executable code (execute_code)
-3. Summarize PDF (summarize_pdf)
-4. Download a repository (download_repo)
-5. Get current time (get_time)
+2. Fetch web page content (web_fetch) — HTTPS URL fetcher with HTML-to-text extraction
+3. Write and return executable code (execute_code)
+4. Summarize PDF (summarize_pdf)
+5. Download a repository (download_repo)
+6. Get current time (get_time)
 
 Note: check_weather has been removed. Weather queries are handled by
-search_web — the Agent searches for weather info and synthesizes it via LLM.
+the get_weather tool (Amap API) or search_web as a fallback.
 
 All file operations are confined to WORKSPACE_ROOT.
 Security constraints are defined in agent/config/WORKSPACE.md.
@@ -285,6 +286,116 @@ def search_web(query: str, num_results: int = 5) -> str:
             f"[Search] 搜索 '{query}' 时出现意外错误: {e}\n\n"
             f"建议: 自行搜索 https://www.google.com/search?q={quote(query)}"
         )
+
+
+# ── Web Fetch ────────────────────────────────────────────────────
+
+# Maximum response size for web_fetch (2 MB)
+_MAX_FETCH_SIZE = 2 * 1024 * 1024
+# Maximum text output for web_fetch (characters)
+_MAX_FETCH_OUTPUT = 8000
+_FETCH_TIMEOUT = 30.0
+
+
+def _html_to_text(html: str) -> str:
+    """Strip HTML tags and extract readable text."""
+    from html.parser import HTMLParser
+
+    class TextExtractor(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.parts = []
+            self.skip_tags = {"script", "style", "noscript", "head"}
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("br", "p", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "div", "section", "article"):
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in ("br", "p", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "div", "section", "article"):
+                self.parts.append("\n")
+
+        def handle_data(self, data):
+            self.parts.append(data)
+
+    extractor = TextExtractor()
+    extractor.feed(html)
+    text = "".join(extractor.parts)
+    # Collapse whitespace
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n +", "\n", text)
+    return text.strip()
+
+
+async def web_fetch(url: str) -> str:
+    """Fetch content from a URL and return the extracted text.
+
+    Only HTTPS URLs are accepted. HTML pages are parsed and converted
+    to plain text. Non-HTML content is returned as-is (truncated).
+
+    Args:
+        url: The URL to fetch (HTTPS only).
+    """
+    import httpx
+
+    url = url.strip()
+    if not url:
+        return "[WebFetch] 请提供 URL。"
+
+    # HTTPS only
+    if not url.startswith("https://"):
+        return f"[WebFetch] 仅支持 HTTPS 协议。不支持的协议: {url.split('://')[0] if '://' in url else 'unknown'}"
+
+    # Reject dangerous characters
+    dangerous = [";", "|", "`", "$(", "${", "&&", "||"]
+    for char in dangerous:
+        if char in url:
+            return f"[WebFetch] URL 包含非法字符: '{char}'"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                url,
+                headers={
+                    "User-Agent": "QQBot-Agent/2.0",
+                    "Accept": "text/html,text/plain,application/json,*/*",
+                    "Accept-Language": "zh-CN,en;q=0.9",
+                },
+                timeout=_FETCH_TIMEOUT,
+                follow_redirects=True,
+            )
+            response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "").lower()
+            content = response.content[:_MAX_FETCH_SIZE]
+            truncated = len(response.content) > _MAX_FETCH_SIZE
+
+            if "text/html" in content_type:
+                text = _html_to_text(content.decode("utf-8", errors="replace"))
+            elif "text/plain" in content_type or "application/json" in content_type:
+                text = content.decode("utf-8", errors="replace")
+            else:
+                text = f"(非文本内容: {content_type}, 大小: {len(content)} 字节)"
+
+            if truncated:
+                text += f"\n\n... (内容已截断，原大小 {len(response.content)} 字节，限制 {_MAX_FETCH_SIZE} 字节)"
+
+            if len(text) > _MAX_FETCH_OUTPUT:
+                text = text[:_MAX_FETCH_OUTPUT] + f"\n\n... (输出已截断至 {_MAX_FETCH_OUTPUT} 字符)"
+
+            return text or "(页面内容为空)"
+
+    except httpx.ConnectTimeout:
+        return f"[WebFetch] 连接超时 ({_FETCH_TIMEOUT}秒): {url}"
+    except httpx.ReadTimeout:
+        return f"[WebFetch] 读取超时 ({_FETCH_TIMEOUT}秒): {url}"
+    except httpx.HTTPStatusError as e:
+        return f"[WebFetch] HTTP 错误 ({e.response.status_code}): {url}"
+    except httpx.InvalidURL:
+        return f"[WebFetch] 无效的 URL: {url}"
+    except Exception as e:
+        return f"[WebFetch] 抓取失败: {type(e).__name__}: {e}"
 
 
 # ── Code Execution ───────────────────────────────────────────────

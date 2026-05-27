@@ -26,8 +26,9 @@ MUST be confined within this directory.
 
 ### 2.1 Information & Search (ALLOWED)
 
-- Search the web for public information
-- Query weather for any location (via wttr.in)
+- Search the web for public information (via SearXNG)
+- Fetch and extract content from specific HTTPS URLs (via web_fetch)
+- Query weather for any location (via Amap API)
 - Return current date/time
 
 ### 2.2 Code Execution (RESTRICTED)
@@ -74,7 +75,7 @@ The agent MUST refuse (politely) when asked to:
 
 1. **Execute arbitrary shell commands** — "I can only run Python code in a sandbox, not shell commands."
 2. **Access system files** — "I don't have access to system files for security reasons."
-3. **Make arbitrary network requests** — "I can only use my built-in search and weather tools for external information."
+3. **Make arbitrary network requests** — "I can only use my built-in search (search_web) and web fetch (web_fetch) tools for external information."
 4. **Modify bot configuration** — "I can't modify my own configuration."
 5. **Impersonate others** — "I can only speak as myself (Roxy)."
 6. **Generate harmful content** — "That request goes against my usage guidelines."
@@ -141,5 +142,5 @@ The agent MUST refuse (politely) when asked to:
 
 - User profiles store ONLY: nickname, self-disclosed facts, stated interests, interaction count
 - Conversation history is per-user, stored locally, expires after 30 minutes
-- No data is sent to third parties except: DeepSeek API (messages for inference), wttr.in (city name for weather), DuckDuckGo (search query)
+- No data is sent to third parties except: DeepSeek API (messages for inference), SearXNG (search query), Amap API (location/weather queries), target URLs via web_fetch (only when user explicitly requests a URL)
 - User data is NOT used for training — this is a personal bot deployment

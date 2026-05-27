@@ -37,6 +37,7 @@ from tools.builtin_tools import (
     get_system_load,
     get_time,
     search_web,
+    web_fetch,
     download_repo,
     shell_exec,
     summarize_pdf,
@@ -169,6 +170,17 @@ def _build_tool_registry() -> ToolRegistry:
                 "num_results": {"type": "integer", "description": "返回结果数量，默认5条", "default": 5},
             },
             "required": ["query"],
+        },
+    )
+    registry.register(
+        "web_fetch", web_fetch,
+        "抓取指定网页URL的内容并提取纯文本。仅支持HTTPS。当搜索无结果或需要完整页面内容时使用。",
+        {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "要抓取的网页URL（必须是HTTPS链接）"},
+            },
+            "required": ["url"],
         },
     )
     registry.register(

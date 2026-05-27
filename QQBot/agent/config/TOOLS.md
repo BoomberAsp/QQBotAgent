@@ -37,6 +37,39 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ---
 
+## Tool: web_fetch
+
+**Description**: Fetch and extract text content from a specified URL. Only HTTPS is allowed. HTML pages are automatically converted to plain text. When SearXNG can't find results for a specific URL, this tool can fetch the page directly.
+
+**When to use**:
+- SearXNG search returns no results for a known URL
+- Need the full content of a specific web page (not just search snippets)
+- User explicitly provides a URL and asks you to read or summarize its content
+- Following up on a search result to get more details
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "The HTTPS URL to fetch"
+    }
+  },
+  "required": ["url"]
+}
+```
+
+**Limits**:
+- Protocol: HTTPS only (HTTP, FTP, etc. are rejected)
+- Max response size: 2 MB (larger responses are truncated)
+- Max text output: 8000 characters
+- Timeout: 30 seconds
+- Content types: HTML (converted to text), plain text, JSON. Other types return metadata only.
+
+---
+
 ## Tool: get_weather
 
 **Description**: Query real-time weather or 4-day forecast for a city via Amap API. Returns temperature, humidity, wind direction, and weather conditions.

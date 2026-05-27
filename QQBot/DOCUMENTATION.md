@@ -8,7 +8,7 @@
 - **运行框架**: NoneBot2 (Python)
 - **QQ 协议适配**: NapCat (OneBot V11 反向 WebSocket)
 - **AI 后端**: DeepSeek API (OpenAI 兼容 Function Calling) + 多模型路由 (FLASH/REASONING/MULTIMODAL)
-- **搜索引擎**: SearXNG (Docker 自托管，聚合 Google/Bing/DDG/Wikipedia)
+- **搜索引擎**: SearXNG (Docker 自托管，聚合 Bing/DDG) + `web_fetch` 直接抓取网页
 - **特殊会话**: 每用户至多 3 个持久化会话，百万 token 上下文，快照+增量存储
 - **用户工作区**: 每用户独立文件空间，配额管理，跨会话隔离
 - **部署方式**: Docker Compose（含 NVIDIA GPU 支持）或手动部署
@@ -51,7 +51,7 @@ QQBotAgent/
     │       ├── SOUL.md      #     人格定义 & 行为规则
     │       ├── IDENTITY.md  #     身份声明 (名称/版本/能力/安全模型)
     │       ├── AGENTS.md    #     编排规则 (工具选择/错误处理/工作区约束)
-    │       ├── TOOLS.md     #     工具文档参考 (全部 18 个工具)
+    │       ├── TOOLS.md     #     工具文档参考 (全部 20 个工具)
     │       ├── WORKSPACE.md #     工作区约束 & 能力边界 (硬性规则)
     │       ├── BOOTSTRAP.md #     启动序列 & 健康检查
     │       ├── SESSION.md   #     会话参数配置
@@ -74,7 +74,7 @@ QQBotAgent/
     │   └── utils.py         #   工具函数 (全部注释)
     │
     ├── tools/               # Agent 工具实现
-    │   ├── builtin_tools.py #   6 个内置工具 (搜索/代码/Shell/PDF/Git/时间)
+    │   ├── builtin_tools.py #   7 个内置工具 (搜索/抓取/代码/Shell/PDF/Git/时间)
     │   ├── file_tools.py    #   文件读取工具 (文本/PDF/图片分析)
     │   ├── map_tools.py     #   地图工具 (地理编码/逆编码/天气/POI/路径)
     │   └── legacy_tools.py  #   6 个游戏/娱乐工具 (抽卡/动画/测速/乱速/解释/翻译)
@@ -425,14 +425,15 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
             └── >300 字符 → _split_text() 句子边界拆分 → 逐块 _safe_send() (1s 间隔)
 ```
 
-#### 已注册工具 (19 个)
+#### 已注册工具 (20 个)
 
-**内置工具 (8 个)**:
+**内置工具 (9 个)**:
 
 | 工具名 | 来源 | 说明 |
 |--------|------|------|
 | `get_time` | builtin_tools | 获取当前日期和时间 (含中文星期) |
 | `search_web` | builtin_tools | SearXNG 聚合搜索 — 覆盖天气/新闻/百科/知识 |
+| `web_fetch` | builtin_tools | 直接抓取 HTTPS 网页内容并提取纯文本 |
 | `execute_code` | builtin_tools | 执行 Python 代码，自动捕获并发送生成的图表 |
 | `shell_exec` | builtin_tools | 执行只读 shell 命令（白名单+管道，40+命令） |
 | `download_repo` | builtin_tools | Git clone 代码仓库 (HTTPS only, 命令注入防护) |
@@ -461,7 +462,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 | `explain_code` | legacy_tools | LLM 中文解释代码功能和原理 |
 | `translate_text` | legacy_tools | LLM 多语言翻译 |
 
-**注**: `check_weather` 已移除。天气查询通过 `search_web` → SearXNG 搜索 + LLM 合成结果实现。
+**注**: `check_weather` 已移除。天气查询通过 `get_weather` (Amap API) 或 `search_web` → SearXNG 搜索 + LLM 合成结果实现。`web_fetch` 用于直接抓取搜索结果中无法索引的网页。
 
 ### 2.8 `lib/model_router.py` — 多模型路由器
 
@@ -581,7 +582,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 | `IDENTITY.md` | 身份声明: 名称/版本/技术栈/能力列表/安全模型/联系方式 |
 | `AGENTS.md` | 编排规则: Think→Act→Observe→Respond 循环、工具选择标准、错误处理、工作区约束引用 |
 | `WORKSPACE.md` | 工作区约束: CAN/CANNOT 表、硬性拒绝规则、中文拒绝模板、资源限制、隐私策略 |
-| `TOOLS.md` | 工具文档参考: 全部 11 个工具的功能/参数/使用场景 |
+| `TOOLS.md` | 工具文档参考: 全部 20 个工具的功能/参数/使用场景 |
 | `BOOTSTRAP.md` | 启动序列: 初始化步骤、健康检查规则 |
 | `SESSION.md` | 会话配置: 最大消息数、超时时间、最大工具调用次数 |
 | `USER.md` | 用户画像模板: 新用户默认画像、隐私声明 |
@@ -600,12 +601,13 @@ Agent 必须在以下情况拒绝 (礼貌):
 
 ## 五、工具实现
 
-### 5.1 `tools/builtin_tools.py` — 内置工具 (6 个)
+### 5.1 `tools/builtin_tools.py` — 内置工具 (7 个)
 
 | 函数 | 说明 | 实现方式 |
 |------|------|----------|
 | `get_time()` | 返回当前日期时间 (含中文星期) | `datetime.now().strftime` |
 | `search_web(query, num_results=5)` | SearXNG 聚合搜索 (覆盖天气/新闻/百科) | `urllib.request` → SearXNG JSON API (`/search?format=json`)，15s 超时，安全搜索开启，中文优先 |
+| `web_fetch(url)` | 异步，抓取 HTTPS 网页并提取纯文本 | `httpx` → HTML→文本转换 (`html.parser`)，HTTPS only，2MB/8000字符/30s 限制 |
 | `execute_code(code, timeout=30)` | 异步，执行 Python 代码 + 自动发送图表 | `subprocess.run` (独立 tmpdir)，扫描 .png/.svg 等图片 → 拷贝到 output/ → QQ 发送 |
 | `shell_exec(command, timeout=15)` | 异步，执行只读 shell 命令 (白名单+管道) | `subprocess.run(["bash", "-c", cmd])`，40+ 白名单命令，管道解析验证，危险字符拦截 |
 | `download_repo(repo_url)` | Git clone 仓库 (HTTPS only) | `subprocess.run(["git", "clone", url, path])`，已存在则 pull，120s 超时 |
@@ -667,7 +669,10 @@ Napcat (QQ NT → OneBot V11 WebSocket, 端口 8080)
        │ 反向 WebSocket 连接
        ▼
 SearXNG (Docker, 端口 8082)  ←── search_web 工具调用
-       │                              (聚合 Google/Bing/DDG/Wikipedia)
+       │                              (聚合 Bing/DDG)
+       ▼
+web_fetch (HTTPS 直接抓取)    ←── web_fetch 工具调用
+       │                              (搜索无结果时的 fallback)
        ▼
 NoneBot2 (FastAPI, 端口 8081)
        │
@@ -717,11 +722,14 @@ Agent search_web(query)
 SearXNG JSON API  ←── Docker 容器 (searxng/searxng:latest)
   http://localhost:8082/search?format=json&q=...
        │
-       ├── bing ────────── 国内可访问，主要搜索引擎
+       ├── bing ────────── 主要搜索引擎
        ├── bing news ───── 新闻搜索
-       ├── google ───────── 国内不稳定，偶有超时
-       ├── duckduckgo ───── 同上
-       └── wikipedia ────── 百科 (初始化可能超时)
+       ├── duckduckgo ──── 备用引擎
+       └── mwmbl ───────── 备用引擎
+
+  → 搜索有结果 → LLM 基于摘要作答
+  → 搜索无结果 → 若有已知 URL → web_fetch(url) → 抓取完整页面文本
+  → 搜索无结果 + 无已知 URL → 告知用户无法获取
 ```
 
 ### 7.2 配置文件
@@ -900,7 +908,7 @@ python -m pytest test_agent.py -v
 6. **配置 `.env`**: 设置 `DRIVER=~fastapi`, `HOST=0.0.0.0`, `PORT=8081`, `ONEBOT_ACCESS_TOKEN`, `SUPERUSERS`, `SEARXNG_ENDPOINT`
 7. **启动 NoneBot**: `cd QQBot && nb run`
 8. **启动 Napcat**: `xvfb-run -a /path/to/qq --no-sandbox`
-9. **验证**: 发送 `@Roxy /status` 确认 11 个工具已注册、SearXNG 可连通
+9. **验证**: 发送 `@Roxy /status` 确认 20 个工具已注册、SearXNG 可连通
 10. **配置多模型 (可选)**: 编辑 `QQBot/config/models_settings.json` 填入各模型的 API 信息，参考 `models_settings_example.json` 格式
 
 ### Docker 部署
@@ -1211,4 +1219,18 @@ v2.12 基础上增加:
   └── .env 更新: 新增 USER_DATA_ROOT / MAX_SPECIAL_SESSIONS / USER_WORKSPACE_QUOTA_MB
 
 工具数量: 18 → 19
+```
+
+### v2.14 — web_fetch 网页抓取工具 (2026-05-27)
+```
+v2.13 基础上增加:
+  ├── web_fetch(url): 直接抓取 HTTPS 网页并提取纯文本
+  ├── HTML→文本转换: html.parser 剥离标签, 保留段落结构
+  ├── 安全限制: HTTPS only, 2MB 响应上限, 8000 字符输出, 30s 超时
+  ├── 搜索协作: SearXNG 搜索 → 返回 URL → web_fetch 抓取完整内容
+  ├── explain_code_tool / translate_text: 改用 model_router.flash_client
+  │   (修复 DeepSeek API 401 认证错误, 使用 models_settings.json 配置的 Flash 模型)
+  └── 文档更新: TOOLS.md + WORKSPACE.md + DOCUMENTATION.md
+
+工具数量: 19 → 20
 ```

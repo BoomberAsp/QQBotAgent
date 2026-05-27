@@ -6,8 +6,10 @@
 
 - **智能体架构** — Markdown 配置驱动，OpenAI 兼容 Function Calling，最多 5 轮工具调用
 - **多模型路由** — 轻量 FLASH 模型处理简单任务，强力 REASONING 模型处理复杂推理，MULTIMODAL 模型理解图片
+- **特殊会话** — 每用户至多 3 个持久化会话，百万 token 上下文窗口，快照+增量双层存储
+- **用户工作区** — 每用户独立文件空间，配额管理（3 级策略），跨会话隔离
 - **流式交互** — 群聊连续对话模式：@一次后 5 分钟内免 @，消息自动续期
-- **自托管搜索** — SearXNG 聚合搜索（Bing + 多引擎），无需外部搜索 API Key
+- **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制）
 - **文件阅读** — 支持文本 / PDF / 图片（多模态 AI 分析）
 - **用户系统** — 长期记忆（Markdown 存储）+ LLM 驱动用户画像提取
@@ -64,6 +66,9 @@ DEEPSEEK_API_KEY=sk-xxxxxxxx
 DEEPSEEK_API_BASE=https://api.deepseek.com
 SEARXNG_ENDPOINT=http://localhost:8082
 AMAP_API_KEY=你的高德Key  # 可选，用于地图工具
+USER_DATA_ROOT=data/users_store/  # 用户数据根目录
+MAX_SPECIAL_SESSIONS=3  # 每用户最大特殊会话数
+USER_WORKSPACE_QUOTA_MB=500  # 每用户工作区配额 (MB)
 ```
 
 **多模型配置（可选）**：编辑 `QQBot/config/models_settings.json` 配置三种模型，留空则回退到 `.env` 默认配置。参考 `QQBot/config/models_settings_example.json` 格式。
@@ -101,6 +106,22 @@ bash start.sh
 
 应返回已注册的工具列表和机器人状态。
 
+### 特殊会话命令
+
+在 QQ 聊天中 @机器人 使用以下命令：
+
+| 命令 | 说明 |
+|------|------|
+| `/新会话 [名称]` | 创建特殊会话 (留空由 LLM 自动命名) |
+| `/切换会话 <编号>` | 切换到指定会话 |
+| `/我的会话` | 列出所有特殊会话 |
+| `/重命名会话 <编号> <名称>` | 重命名会话 |
+| `/删除会话 <编号>` | 删除会话 (确认码保护) |
+| `/激活会话` | 查看当前会话状态 |
+| `/退出会话` | 退出特殊会话，回到临时模式 |
+| `/clear` / `清除上下文` | 清除当前会话上下文 |
+| `/status` | 查看 Agent 状态 |
+
 ## 启动脚本
 
 | 脚本 | 用途 |
@@ -136,8 +157,12 @@ QQBotAgent/
     ├── agent/              # 智能体核心
     │   ├── agent.py        #   主循环: Think→Act→Observe→Respond
     │   ├── tool_registry.py#   工具注册（OpenAI JSON Schema）
-    │   ├── session.py      #   会话管理（per-user, 持久化）
+    │   ├── session.py      #   会话管理（临时会话, per-user, 持久化）
+    │   ├── special_session.py  # 特殊会话（百万 token, 快照+增量, 最多3个）
     │   ├── continuous_session.py  # 群聊连续对话窗口（5分钟免@）
+    │   ├── hardware.py     #   硬件自动检测 & 动态任务拒绝
+    │   ├── workspace.py    #   用户工作区隔离 & 配额管理
+    │   ├── context.py      #   执行上下文（contextvars, 工具→QQ图片）
     │   ├── memory.py       #   长期记忆（Markdown 文件）
     │   ├── profile.py      #   用户画像（LLM 自动提取）
     │   └── config/         #   智能体配置（10 个 Markdown）
@@ -146,8 +171,9 @@ QQBotAgent/
     │   └── agent_router.py #   ★ 统一消息入口（所有交互的唯一处理器）
     │
     ├── tools/              # Agent 工具实现
-    │   ├── builtin_tools.py#   搜索 / 代码执行 / Git / PDF / 时间
+    │   ├── builtin_tools.py#   搜索 / 抓取 / 代码执行 / Shell / Git / PDF / 时间
     │   ├── file_tools.py   #   文件读取（文本 / PDF / 图片分析）
+    │   ├── map_tools.py    #   地图工具（地理编码 / 天气 / POI / 路径）
     │   └── legacy_tools.py #   游戏工具（抽卡 / 测速 / 翻译）
     │
     ├── lib/                # 库
@@ -281,11 +307,12 @@ class ContinuousSessionManager:
 | `MemorySystem` | `memory.py` | 长期记忆（Markdown 文件），关键词搜索，最多返回 3 条 |
 | `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣，持久化到 `data/users/` |
 
-## 已注册工具（18 个）
+## 已注册工具（20 个）
 
 | 工具 | 说明 |
 |------|------|
 | `search_web` | SearXNG 聚合搜索（天气 / 新闻 / 百科） |
+| `web_fetch` | 直接抓取 HTTPS 网页内容（搜索无结果时的 fallback） |
 | `execute_code` | Python 沙盒执行（支持图表输出） |
 | `shell_exec` | Shell 命令执行（白名单+管道） |
 | `get_time` | 当前日期时间 |
