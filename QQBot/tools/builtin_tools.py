@@ -15,6 +15,8 @@ All file operations are confined to WORKSPACE_ROOT.
 Security constraints are defined in agent/config/WORKSPACE.md.
 """
 
+import asyncio
+import glob
 import os
 import re
 import shutil
@@ -295,8 +297,11 @@ def _check_code_safety(code: str) -> str | None:
     return None
 
 
-def execute_code(code: str, timeout: int = 30) -> str:
+async def execute_code(code: str, timeout: int = 30) -> str:
     """Execute Python code in an isolated workspace and return output.
+
+    Generated image files (charts, plots) are detected, saved to the output
+    directory, and sent to the QQ chat automatically.
 
     Security:
     - Runs in a temporary directory under /data/workspace/code/
@@ -353,6 +358,10 @@ def execute_code(code: str, timeout: int = 30) -> str:
         "LANG": "en_US.UTF-8",
     }
 
+    # Image extensions to detect from generated output
+    _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".pdf"}
+
+    saved_images = []
     try:
         result = subprocess.run(
             ["python3", "-I", code_file],  # -I = isolated mode (ignore PYTHON* env vars, no site-packages)
@@ -379,6 +388,38 @@ def execute_code(code: str, timeout: int = 30) -> str:
         # Include exit code if non-zero
         if result.returncode != 0:
             output += f"\n(退出码: {result.returncode})"
+
+        # ── Detect generated image files ──────────────────────────
+        for filename in sorted(os.listdir(work_dir)):
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in _IMAGE_EXTS and filename != "script.py":
+                src = os.path.join(work_dir, filename)
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                dest_name = f"chart_{timestamp}_{filename}"
+                dest = os.path.join(WORKSPACE_OUTPUT, dest_name)
+                shutil.copy2(src, dest)
+                saved_images.append(dest)
+
+        # ── Send images to QQ chat if context variable is set ─────
+        if saved_images:
+            try:
+                from agent.context import _send_msg
+                from nonebot.adapters.onebot.v11 import MessageSegment
+
+                send = _send_msg.get()
+                if send is not None:
+                    for img_path in saved_images:
+                        try:
+                            await send(MessageSegment.image(f"file://{img_path}"))
+                            await asyncio.sleep(0.3)  # Small delay between images
+                        except Exception:
+                            pass  # Image send failed, continue with other images
+            except ImportError:
+                pass  # Not in QQ context, skip image sending
+
+            # Append image paths to output
+            img_list = "\n".join(f"  → {os.path.basename(p)}" for p in saved_images)
+            output += f"\n\n📊 生成的图表 ({len(saved_images)} 个):\n{img_list}"
 
         return output.strip()
 

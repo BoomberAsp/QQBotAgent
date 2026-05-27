@@ -923,20 +923,22 @@ class TestBuiltinTools:
         print_pass("get_time tool returns valid time string")
 
     def test_execute_code_success(self):
+        import asyncio
         from tools.builtin_tools import execute_code
 
-        result = execute_code("print('Hello World')")
+        result = asyncio.run(execute_code("print('Hello World')"))
         assert "Hello World" in result
         print_pass("execute_code runs Python and captures output")
 
-        result = execute_code("print(1 + 1)")
+        result = asyncio.run(execute_code("print(1 + 1)"))
         assert "2" in result
         print_pass("execute_code handles calculations")
 
     def test_execute_code_error(self):
+        import asyncio
         from tools.builtin_tools import execute_code
 
-        result = execute_code("1/0")
+        result = asyncio.run(execute_code("1/0"))
         assert "ZeroDivisionError" in result or "Error" in result
         print_pass("execute_code handles runtime errors")
 

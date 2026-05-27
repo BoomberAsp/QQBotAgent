@@ -385,7 +385,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 |--------|------|------|
 | `get_time` | builtin_tools | 获取当前日期和时间 (含中文星期) |
 | `search_web` | builtin_tools | SearXNG 聚合搜索 — 覆盖天气/新闻/百科/知识 |
-| `execute_code` | builtin_tools | 执行 Python 代码 (subprocess, 工作区隔离, 模式匹配安全检查) |
+| `execute_code` | builtin_tools | 执行 Python 代码，自动捕获并发送生成的图表 |
 | `download_repo` | builtin_tools | Git clone 代码仓库 (HTTPS only, 命令注入防护) |
 | `summarize_pdf` | builtin_tools | 提取并总结 PDF 内容 (PyPDF2, 路径验证) |
 | `read_file` | file_tools | 读取用户上传的文件 (文本/PDF/图片, 图片可 AI 分析) |
@@ -556,7 +556,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 |------|------|----------|
 | `get_time()` | 返回当前日期时间 (含中文星期) | `datetime.now().strftime` |
 | `search_web(query, num_results=5)` | SearXNG 聚合搜索 (覆盖天气/新闻/百科) | `urllib.request` → SearXNG JSON API (`/search?format=json`)，15s 超时，安全搜索开启，中文优先 |
-| `execute_code(code, timeout=30)` | 执行 Python 代码 (三层安全防护) | `subprocess.run(["python3", "-I", code_file])`，独立 temp dir，清洁 env，60s 上限 |
+| `execute_code(code, timeout=30)` | 异步，执行 Python 代码 + 自动发送图表 | `subprocess.run` (独立 tmpdir)，扫描 .png/.svg 等图片 → 拷贝到 output/ → QQ 发送 |
 | `download_repo(repo_url)` | Git clone 仓库 (HTTPS only) | `subprocess.run(["git", "clone", url, path])`，已存在则 pull，120s 超时 |
 | `summarize_pdf(file_path)` | 提取 PDF 文本 (前 8000 字符) | PyPDF2 → 逐页提取 → 截断，路径验证 |
 
@@ -1101,4 +1101,21 @@ v2.7 基础上增加:
   - 动态池标记 (up_character, up_bond, non_up_bonds_five_star, up_character_special) 在代码中处理
   - 添加/修改角色只需编辑 JSON, 无需改 Python 代码
   - 文件: config/gacha_data.json (新增), plugins/pullingMonitor.py (重构)
+```
+
+### v2.11 — 代码执行图表输出 + 高负载任务拒绝 (2026-05-27)
+```
+1. execute_code 支持图表输出:
+  - execute_code 改为 async, 执行后扫描工作目录中的生成图片 (.png/.jpg/.svg/.gif/.webp/.pdf)
+  - 图片拷贝到 data/workspace/output/ 持久化保存
+  - 通过 _send_msg contextvar 自动发送到 QQ 聊天窗口
+  - 文本结果中列出生成的图表路径
+
+2. 高负载任务拒绝:
+  - WORKSPACE.md 新增 §4: 服务器硬件规格 (2核/4GB/50GB+50GB/无GPU)
+  - 必须拒绝: 训练 ML 模型、视频处理、>50MB 数据、本地 LLM 推理、编译大型项目、大规模爬虫
+  - 警告后执行: 10-50MB 数据、3-10 张图表
+  - SOUL.md 新增 "高负载任务" 拒绝规则 + "服务器硬件上下文" 说明
+
+文件: tools/builtin_tools.py (修改), agent/config/WORKSPACE.md (修改), agent/config/SOUL.md (修改)
 ```

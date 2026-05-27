@@ -286,7 +286,7 @@ class ContinuousSessionManager:
 | 工具 | 说明 |
 |------|------|
 | `search_web` | SearXNG 聚合搜索（天气 / 新闻 / 百科） |
-| `execute_code` | Python 沙盒执行（三层隔离） |
+| `execute_code` | Python 沙盒执行（支持图表输出） |
 | `get_time` | 当前日期时间 |
 | `read_file` | 读取文件（文本 / PDF / 图片 AI 分析） |
 | `summarize_pdf` | PDF 提取 + 总结 |
