@@ -63,7 +63,7 @@ QQBotAgent/
     │   ├── deepseek_tools.py   # [已废弃] 全部注释
     │   ├── group.py         #   [已废弃] 仅保留 parse_speed_data/compute_speed_results
     │   ├── speed.py         #   [已废弃] 仅保留 compute_prob 工具函数
-    │   ├── pullingMonitor.py#   [已废弃] 仅保留抽卡相关工具函数
+    │   ├── pullingMonitor.py#   [已废弃] 仅保留抽卡工具函数, 数据从 gacha_data.json 加载
     │   ├── photos.py        #   图片工具 (无活跃处理程序)
     │   ├── character.py     #   角色数据 (空文件)
     │   └── utils.py         #   工具函数 (全部注释)
@@ -74,10 +74,11 @@ QQBotAgent/
     │   ├── map_tools.py     #   地图工具 (地理编码/逆编码/天气/POI/路径)
     │   └── legacy_tools.py  #   6 个游戏/娱乐工具 (抽卡/动画/测速/乱速/解释/翻译)
     │
-    ├── config/              # 敏感配置文件 (git-ignored)
+    ├── config/              # 配置文件
     │   ├── multimodal.json  #   多模态 LLM 配置 (已被 models_settings.json 取代)
     │   ├── models_settings.json  #   多模型配置 (REASONING/FLASH/MULTIMODAL)
-    │   └── models_settings_example.json  #   多模型配置示例模板
+    │   ├── models_settings_example.json  #   多模型配置示例模板
+    │   └── gacha_data.json  #   抽卡数据 (角色/羁绊/概率, 由 pullingMonitor 加载)
     │
     ├── lib/                 # 自定义库
     │   ├── deepseek_client.py  # DeepSeek API 客户端 (OpenAI 兼容 Function Calling)
@@ -1088,4 +1089,16 @@ v2.7 基础上增加:
   - 文件: agent/context.py (新增), tools/legacy_tools.py (修改), plugins/agent_router.py (修改)
 
 工具数量: 16 → 17
+```
+
+### v2.10 — 抽卡数据外部化 (2026-05-27)
+```
+重构: pullingMonitor.py + gacha_data.json
+  - 80 行硬编码数据 (10 个数据结构) 迁移至 config/gacha_data.json
+  - JSON 结构: pools (角色/羁绊池) + banners (卡池概率配置)
+  - 五星羁绊池 (bonds_five_star_all/tricolor) 由加载器从角色数据自动派生
+  - drawing_cards() 重写为数据驱动: 遍历 banner.categories, 按 pool 引用分发
+  - 动态池标记 (up_character, up_bond, non_up_bonds_five_star, up_character_special) 在代码中处理
+  - 添加/修改角色只需编辑 JSON, 无需改 Python 代码
+  - 文件: config/gacha_data.json (新增), plugins/pullingMonitor.py (重构)
 ```

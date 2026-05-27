@@ -11,7 +11,7 @@
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制）
 - **文件阅读** — 支持文本 / PDF / 图片（多模态 AI 分析）
 - **用户系统** — 长期记忆（Markdown 存储）+ LLM 驱动用户画像提取
-- **游戏工具** — 抽卡模拟、战斗测速、乱速概率计算
+- **游戏工具** — 抽卡模拟（数据 JSON 可配置）、战斗测速、乱速概率计算
 - **地图服务** — 地址↔坐标转换、实时天气、POI搜索、路线规划（高德地图）
 - **安全设计** — 工作区隔离、路径验证防穿越、Git URL 注入防护
 
@@ -293,7 +293,7 @@ class ContinuousSessionManager:
 | `download_repo` | Git clone 仓库（HTTPS only） |
 | `translate_text` | 多语言翻译 |
 | `explain_code` | 代码解释 |
-| `gacha_pull` | 抽卡模拟（4 种卡池） |
+| `gacha_pull` | 抽卡模拟（4 种卡池，数据 JSON 可配） |
 | `play_gacha_animation` | 抽卡动画播放（图片序列） |
 | `calculate_speed` | 游戏战斗测速 |
 | `compare_speed_probability` | 乱速概率计算 |
