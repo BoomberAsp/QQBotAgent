@@ -416,6 +416,23 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ---
 
+## Tool: get_system_load
+
+**Description**: Get real-time server system load information — CPU load average, memory usage, disk usage. Provides an overall assessment of whether the server can handle resource-intensive tasks.
+
+**When to use**: Before executing CPU/memory/disk intensive tasks. If the load is high, politely refuse or defer the task. Use this to make informed decisions about task refusal beyond the static hardware profile.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {},
+  "required": []
+}
+```
+
+---
+
 ## Tool: read_file
 
 **Description**: Read and analyze files that users upload in QQ messages. Supports text files (code, logs, configs, etc. — returns full content), PDF files (returns extracted text), and image files (returns metadata + AI analysis if multimodal LLM configured).

@@ -32,6 +32,15 @@ from urllib.parse import quote
 # Production workspace root. Override via environment variable.
 # Default uses the project's data directory for dev/portability.
 def _get_workspace_root() -> str:
+    # Check for per-user workspace override (set by agent_router via contextvar)
+    try:
+        from agent.context import _current_user_workspace
+        user_ws = _current_user_workspace.get()
+        if user_ws:
+            return user_ws
+    except ImportError:
+        pass
+
     env_ws = os.environ.get("QQBOT_WORKSPACE", "")
     if env_ws:
         return env_ws
@@ -829,3 +838,82 @@ async def shell_exec(command: str, timeout: int = 15) -> str:
         )
     except Exception as e:
         return f"[Shell] 命令执行失败: {e}"
+
+
+# ── System Load ──────────────────────────────────────────────────
+
+def get_system_load() -> str:
+    """Get real-time system load information (CPU, memory, disk).
+
+    Reads from /proc/loadavg, free, and df to provide current resource
+    usage. Use this before executing resource-intensive tasks to check
+    if the server has sufficient capacity.
+    """
+    lines = ["系统实时负载:"]
+
+    # ── CPU load ──────────────────────────────────────────────
+    try:
+        with open("/proc/loadavg", "r") as f:
+            parts = f.read().strip().split()
+            load1, load5, load15 = float(parts[0]), float(parts[1]), float(parts[2])
+            nproc = os.cpu_count() or 1
+            lines.append(
+                f"  CPU: 1分钟负载 {load1:.2f} / 5分钟 {load5:.2f} / 15分钟 {load15:.2f}"
+                f" ({nproc}核)"
+            )
+    except Exception:
+        lines.append("  CPU: 无法获取")
+
+    # ── Memory ────────────────────────────────────────────────
+    try:
+        result = subprocess.run(
+            ["free", "-b"], capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().split("\n"):
+            if line.startswith("Mem:"):
+                parts = line.split()
+                total_gb = int(parts[1]) / (1024 ** 3)
+                used_gb = int(parts[2]) / (1024 ** 3)
+                pct = (used_gb / total_gb * 100) if total_gb > 0 else 0
+                lines.append(
+                    f"  内存: 已用 {used_gb:.1f} GB / 总计 {total_gb:.1f} GB ({pct:.0f}%)"
+                )
+                break
+    except Exception:
+        lines.append("  内存: 无法获取")
+
+    # ── Disk ──────────────────────────────────────────────────
+    for mount_point, label in [("/", "系统盘"), ("/data", "数据盘")]:
+        try:
+            result = subprocess.run(
+                ["df", "-B1", mount_point],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.strip().split("\n")[1:]:
+                parts = line.split()
+                if len(parts) >= 4:
+                    total_gb = int(parts[1]) / (1024 ** 3)
+                    used_gb = int(parts[2]) / (1024 ** 3)
+                    pct = (used_gb / total_gb * 100) if total_gb > 0 else 0
+                    lines.append(
+                        f"  {label}: 已用 {used_gb:.0f} GB / 总计 {total_gb:.0f} GB ({pct:.0f}%)"
+                    )
+                    break
+        except Exception:
+            pass
+
+    # ── Assessment ─────────────────────────────────────────────
+    try:
+        with open("/proc/loadavg", "r") as f:
+            load1 = float(f.read().strip().split()[0])
+        nproc = os.cpu_count() or 1
+        if load1 < nproc * 0.5:
+            lines.append("\n  评估: 负载较轻，可正常执行任务")
+        elif load1 < nproc * 0.8:
+            lines.append("\n  评估: 负载适中，建议避免高负载任务")
+        else:
+            lines.append("\n  评估: 负载较高，建议拒绝计算密集型任务")
+    except Exception:
+        pass
+
+    return "\n".join(lines)

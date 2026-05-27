@@ -15,6 +15,9 @@ from .tool_registry import ToolRegistry
 from .session import Session, SessionManager
 from .memory import MemorySystem, MemoryEntry
 from .profile import ProfileManager
+from .hardware import HardwareDetector, HardwareProfile
+from .workspace import UserWorkspaceManager
+from .special_session import SpecialSessionManager, SpecialSession
 
 
 class Agent:
@@ -39,6 +42,9 @@ class Agent:
         session_manager: Optional[SessionManager] = None,
         memory_system: Optional[MemorySystem] = None,
         profile_manager: Optional[ProfileManager] = None,
+        hardware_detector: Optional[HardwareDetector] = None,
+        workspace_manager: Optional[UserWorkspaceManager] = None,
+        special_session_manager: Optional[SpecialSessionManager] = None,
         max_tool_iterations: int = 5,
         thinking_timeout: float = 180.0,
     ):
@@ -48,6 +54,10 @@ class Agent:
         self.sessions = session_manager or SessionManager()
         self.memory = memory_system
         self.profiles = profile_manager
+        self.hardware_detector = hardware_detector
+        self.hardware: Optional[HardwareProfile] = None
+        self.workspaces = workspace_manager
+        self.special_sessions = special_session_manager
         self.max_tool_iterations = max_tool_iterations
         self.thinking_timeout = thinking_timeout
 
@@ -98,6 +108,11 @@ class Agent:
         # Current time context
         parts.append(f"\n## Current Context\n\nCurrent time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
+        # Hardware context (dynamically detected, replaces hardcoded WORKSPACE.md §4)
+        if self.hardware:
+            parts.append(self.hardware.get_prompt_context())
+            parts.append(self.hardware.get_task_refusal_context())
+
         self._system_prompt = "\n\n".join(parts)
         return self._system_prompt
 
@@ -115,6 +130,7 @@ class Agent:
         user_id: str,
         client=None,
         progress_callback: Optional[Callable[[str], Any]] = None,
+        session_type: str = "temporary",
     ) -> str:
         """Process a user message through the agent loop.
 
@@ -125,23 +141,28 @@ class Agent:
                     When None, uses self.client (the default client).
             progress_callback: Optional async/sync callback to report
                                progress before each tool execution round.
-                               Receives a short status string (e.g. "正在搜索...").
+            session_type: "temporary", "special", or "continuous".
 
         Returns:
             The agent's final response string.
         """
-        # Get or create session
+        # Determine which session to use
+        if session_type == "special" and self.special_sessions:
+            special_session = self.special_sessions.get_active(user_id)
+        else:
+            special_session = None
+
+        # Get or create temporary session (always — used as fallback)
         session = self.sessions.get_or_create(user_id)
 
         # Build messages: system prompt + history + current message
-        messages = self._build_messages(session, user_message)
+        messages = self._build_messages(session, user_message, special_session)
 
         # Track tool names for deduplication across iterations
         _last_reported_tools: Optional[frozenset] = None
 
         # Agent loop
         for iteration in range(self.max_tool_iterations):
-            # THINK: Send to LLM (use routed client if provided)
             llm_client = client or self.client
             response = await llm_client.chat_completion_with_tools(
                 messages=messages,
@@ -149,7 +170,6 @@ class Agent:
                 timeout=self.thinking_timeout,
             )
 
-            # Check if the response contains tool calls
             if response.get("tool_calls"):
                 # ── Report progress (with deduplication) ────────────
                 if progress_callback:
@@ -167,14 +187,12 @@ class Agent:
                             if asyncio.iscoroutine(ret):
                                 await ret
                         except Exception:
-                            pass  # Progress failures must not break the agent
+                            pass
 
-                # ACT: Execute tools
                 tool_results = await self._execute_tool_calls(
                     response["tool_calls"], session
                 )
 
-                # Append assistant message (with tool_calls) to messages
                 assistant_msg = {
                     "role": "assistant",
                     "content": response.get("content"),
@@ -184,24 +202,27 @@ class Agent:
                     assistant_msg["reasoning_content"] = response["reasoning_content"]
                 messages.append(assistant_msg)
 
-                # OBSERVE: Append tool results
                 for tr in tool_results:
                     messages.append(tr)
 
-                continue  # Back to THINK
+                continue
 
             else:
-                # RESPOND: Final response, no tool calls
+                # RESPOND: Final response
                 final_content = response.get("content", "")
+                reasoning = response.get("reasoning_content")
 
-                # Update session
-                session.add_message("user", user_message)
-                session.add_message(
-                    "assistant", final_content,
-                    reasoning_content=response.get("reasoning_content"),
-                )
-                session.trim(self.sessions.max_context_messages)
-                self.sessions.update(user_id, session)
+                # ── Persist to session ───────────────────────────
+                if special_session:
+                    self.special_sessions.add_message(user_id, "user", user_message)
+                    self.special_sessions.add_message(
+                        user_id, "assistant", final_content, reasoning,
+                    )
+                else:
+                    session.add_message("user", user_message)
+                    session.add_message("assistant", final_content, reasoning_content=reasoning)
+                    session.trim(self.sessions.max_context_messages)
+                    self.sessions.update(user_id, session)
 
                 # Save substantive interactions to long-term memory
                 await self._maybe_remember(user_id, user_message, final_content)
@@ -217,53 +238,117 @@ class Agent:
     # ── Message Building ──────────────────────────────────────────
 
     def _build_messages(
-        self, session: Session, user_message: str
+        self,
+        session: Session,
+        user_message: str,
+        special_session: Optional[SpecialSession] = None,
     ) -> List[Dict[str, Any]]:
         """Build the full message list for the LLM.
 
         Structure:
         1. Global system prompt (SOUL + IDENTITY + AGENTS)
-        2. User profile context (from ProfileManager, per user_id)
-        3. Relevant long-term memories (keyword search from MemorySystem)
-        4. Conversation history (from Session)
-        5. Current user message
+        2. Session type marker (special/temporary/continuous)
+        3. User profile context (from ProfileManager)
+        4. Workspace quota context (if in special session)
+        5. Relevant long-term memories (from MemorySystem)
+        6. Conversation history (from Session or SpecialSession)
+        7. Current user message
         """
         messages = []
 
         # 1. Global system prompt
-        messages.append({
-            "role": "system",
-            "content": self.build_system_prompt(),
-        })
+        system_content = self.build_system_prompt()
+        user_id = special_session.user_id if special_session else session.user_id
 
-        # 2. User profile context (injected into system role to save tokens)
+        # 2. Session type marker
+        if special_session:
+            system_content += (
+                f"\n\n## 特殊会话模式\n"
+                f"当前会话名称: {special_session.name}\n"
+                f"会话消息数: {special_session.total_messages}\n"
+                f"会话创建于: {time.strftime('%Y-%m-%d %H:%M', time.localtime(special_session.created_at))}\n"
+                f"工作区: {self.workspaces.get_workspace(user_id) if self.workspaces else '默认'}\n\n"
+                f"你处于特殊会话模式，拥有完整的对话上下文记忆。"
+                f"可以使用用户工作区存储文件。"
+                f"如果任务已完成，可以建议用户使用 /结束会话 退出特殊会话模式。"
+            )
+
+            # Quota context
+            if self.workspaces:
+                quota_ctx = self.workspaces.get_quota_context(user_id)
+                if quota_ctx:
+                    system_content += f"\n{quota_ctx}"
+
+        messages.append({"role": "system", "content": system_content})
+
+        # 3. User profile context
         if self.profiles:
-            profile = self.profiles.get(session.user_id)
+            profile = self.profiles.get(user_id)
             profile_context = profile.to_prompt_context()
             if profile_context:
-                # Append to the same system message to keep the message count low
-                system_text = messages[0]["content"] + "\n\n" + profile_context
-                messages[0]["content"] = system_text
+                messages[0]["content"] += "\n\n" + profile_context
 
-        # 3. Relevant long-term memories
+        # 4. Relevant long-term memories
         if self.memory:
             memories = self.memory.search(user_message)
             if memories:
-                # Keep top 3 most relevant
                 mem_lines = ["\n## Relevant Past Interactions"]
                 for m in memories[:3]:
                     snippet = m.content[:200].replace("\n", " ")
                     mem_lines.append(f"- {m.description}: {snippet}")
-                # Append to system message as well
                 messages[0]["content"] += "\n".join(mem_lines)
 
-        # 4. Conversation history
-        messages.extend(session.context)
+        # 5. Conversation history
+        if special_session:
+            # Special session: full untrimmed context with layered compression
+            context = self._compress_context(special_session.context)
+            messages.extend(context)
+        else:
+            # Temporary session: trimmed context
+            messages.extend(session.context)
 
-        # 5. Current user message
+        # 6. Current user message
         messages.append({"role": "user", "content": user_message})
 
         return messages
+
+    # ── Context Compression ────────────────────────────────────────
+
+    @staticmethod
+    def _compress_context(context: List[Dict], recent_full: int = 20) -> List[Dict]:
+        """Compress older tool results in context to save tokens.
+
+        Layer 1 (last `recent_full` messages): keep full original.
+        Layer 2 (before that): compress tool results to first line only.
+        Layer 3: Progressive summary not yet implemented — all messages
+                before Layer 1 are kept but with compressed tool results.
+
+        This preserves the full conversation flow while reducing token
+        consumption from verbose tool outputs.
+        """
+        if len(context) <= recent_full:
+            return list(context)
+
+        compressed = []
+        for i, msg in enumerate(context):
+            idx_from_end = len(context) - i
+            if idx_from_end <= recent_full:
+                # Layer 1: keep as-is
+                compressed.append(msg)
+            else:
+                # Layer 2: compress tool results
+                if msg.get("role") == "tool":
+                    content = msg.get("content", "")
+                    first_line = content.split("\n")[0][:200]
+                    compressed.append({
+                        "role": "tool",
+                        "tool_call_id": msg.get("tool_call_id", ""),
+                        "content": first_line + ("..." if len(content) > 200 else ""),
+                    })
+                else:
+                    compressed.append(msg)
+
+        return compressed
 
     # ── Tool Execution ────────────────────────────────────────────
 
@@ -343,8 +428,26 @@ class Agent:
             "tool_count": len(self.tools),
             "tools": self.tools.list_tools(),
             "configs_loaded": list(self._configs.keys()),
+            "hardware": None,
             "errors": [],
         }
+
+        # Hardware detection (before API check — doesn't need network)
+        if self.hardware_detector:
+            try:
+                self.hardware = self.hardware_detector.load_or_detect()
+                status["hardware"] = {
+                    "cpu_cores": self.hardware.cpu_cores,
+                    "memory_gb": self.hardware.memory_gb,
+                    "disk_system_gb": self.hardware.disk_system_gb,
+                    "disk_data_gb": self.hardware.disk_data_gb,
+                    "has_gpu": self.hardware.has_gpu,
+                    "detected_at": self.hardware.detected_at,
+                }
+                # Invalidate system prompt cache so hardware info is included
+                self._system_prompt = None
+            except Exception as e:
+                status["errors"].append(f"Hardware detection: {e}")
 
         # Verify DeepSeek API
         try:

@@ -11,6 +11,7 @@ intelligent entry point.
 import asyncio
 import os
 import re
+import time
 import uuid
 
 import httpx
@@ -20,11 +21,14 @@ from nonebot.rule import to_me
 
 from agent.agent import Agent
 from agent.continuous_session import ContinuousSessionManager
-from agent.context import _send_msg
+from agent.context import _send_msg, _current_user_workspace
+from agent.hardware import HardwareDetector
+from agent.special_session import SpecialSessionManager
 from agent.tool_registry import ToolRegistry
 from agent.session import SessionManager
 from agent.memory import MemorySystem
 from agent.profile import ProfileManager
+from agent.workspace import UserWorkspaceManager
 from lib.deepseek_client import deepseek_client as _global_client, DeepSeekClient as _DeepSeekClient
 from lib.model_router import ModelRouter
 
@@ -32,6 +36,7 @@ from lib.model_router import ModelRouter
 deepseek_client = _global_client if _global_client is not None else _DeepSeekClient()
 from tools.builtin_tools import (
     execute_code,
+    get_system_load,
     get_time,
     search_web,
     download_repo,
@@ -62,6 +67,7 @@ from tools.legacy_tools import (
 _AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CONFIG_DIR = os.path.join(_AGENT_DIR, "agent", "config")
 _DATA_DIR = os.path.join(_AGENT_DIR, "data")
+_USER_DATA_ROOT = os.environ.get("USER_DATA_ROOT", os.path.join(_AGENT_DIR, "data", "users_store"))
 
 # ── Workspace Initialization ─────────────────────────────────────
 
@@ -373,6 +379,19 @@ def _build_tool_registry() -> ToolRegistry:
         },
     )
 
+    # ── System Load ─────────────────────────────────────────────
+    registry.register(
+        "get_system_load", get_system_load,
+        "获取服务器实时负载信息（CPU/内存/磁盘使用率）。"
+        "在执行高负载任务之前调用此工具，判断服务器是否有足够资源。"
+        "返回 CPU 负载、内存使用量、磁盘剩余空间及负载评估。",
+        {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    )
+
     return registry
 
 
@@ -391,10 +410,31 @@ _memory_system = MemorySystem(
 )
 
 _profile_manager = ProfileManager(
-    base_dir=os.path.join(_DATA_DIR, "users"),
+    base_dir=_USER_DATA_ROOT,
 )
 # The client is set after agent creation since agent owns the validated client
 _profile_manager.set_client(deepseek_client)
+
+_hardware_detector = HardwareDetector(cache_dir=_USER_DATA_ROOT)
+
+_user_workspace_quota_mb = int(os.environ.get("USER_WORKSPACE_QUOTA_MB", "500"))
+_workspace_manager = UserWorkspaceManager(
+    user_data_root=_USER_DATA_ROOT,
+    quota_mb=_user_workspace_quota_mb,
+)
+
+_max_special_sessions = int(os.environ.get("MAX_SPECIAL_SESSIONS", "3"))
+_special_sessions = SpecialSessionManager(
+    user_data_root=_USER_DATA_ROOT,
+    max_per_user=_max_special_sessions,
+    llm_client=deepseek_client,
+)
+
+# Track sessions pending LLM auto-naming: user_id -> True
+_pending_naming: dict = {}
+
+# Track pending deletion confirmations: user_id -> (session_name, expiry_timestamp)
+_pending_delete_confirm: dict = {}
 
 agent = Agent(
     deepseek_client=deepseek_client,
@@ -403,6 +443,9 @@ agent = Agent(
     session_manager=_session_manager,
     memory_system=_memory_system,
     profile_manager=_profile_manager,
+    hardware_detector=_hardware_detector,
+    workspace_manager=_workspace_manager,
+    special_session_manager=_special_sessions,
     max_tool_iterations=5,
     thinking_timeout=180.0,
 )
@@ -422,7 +465,18 @@ agent_router = on_message(priority=1, block=False, rule=to_me())
 async def handle_agent_message(event: MessageEvent):
     """Route incoming QQ messages through the Agent."""
     user_id = str(event.user_id)
+
+    # Set user workspace for tool scoping
+    _workspace_manager.ensure_dirs(user_id)
+    _current_user_workspace.set(_workspace_manager.get_workspace(user_id))
+
     text_content = event.get_plaintext().strip()
+
+    # ── Handle session management commands ──────────────────────────
+    if text_content.startswith("/") or text_content.startswith("#"):
+        cmd_handled = await _handle_session_command(text_content, user_id)
+        if cmd_handled:
+            return
 
     # ── Detect and download file/image attachments ─────────────────
     file_context_parts = []
@@ -490,16 +544,36 @@ async def handle_agent_message(event: MessageEvent):
         async def _send_image(seg):
             await _safe_send(seg)
         token = _send_msg.set(_send_image)
+
+        # Detect session type
+        active_special = _special_sessions.get_active(user_id)
+        session_type = "special" if active_special else "temporary"
+
         try:
             response = await asyncio.wait_for(
-                agent.run(augmented_message, user_id, client=client, progress_callback=_progress),
-                timeout=200.0,  # Slightly more than thinking_timeout
+                agent.run(
+                    augmented_message, user_id,
+                    client=client,
+                    progress_callback=_progress,
+                    session_type=session_type,
+                ),
+                timeout=200.0,
             )
         finally:
             _send_msg.reset(token)
 
         # Send response (split long messages)
         await _send_response(response)
+
+        # Auto-name special session after first interaction
+        if session_type == "special" and _pending_naming.pop(user_id, False):
+            try:
+                first_msg = augmented_message[:200]
+                asyncio.create_task(
+                    _special_sessions.auto_name(user_id, first_msg, response)
+                )
+            except Exception:
+                pass
 
         # Start continuous session window for group chats (5 min)
         if isinstance(event, GroupMessageEvent):
@@ -640,6 +714,190 @@ async def _safe_send(message, max_retries: int = 2, matcher=None):
     if last_error:
         from nonebot import logger
         logger.warning(f"Failed to send message after {max_retries} retries: {last_error.info}")
+
+
+async def _handle_session_command(text: str, user_id: str) -> bool:
+    """Handle special session management commands.
+
+    Returns True if the command was handled (should skip agent processing).
+    """
+    cmd, _, args = text.partition(" ")
+    args = args.strip()
+
+    # ── /新会话 [名称] ─────────────────────────────────────────
+    if cmd in ("/新会话", "#新会话"):
+        try:
+            name = args if args else None
+            session = _special_sessions.create(user_id, name)
+            if args:
+                await _safe_send(
+                    f"已创建特殊会话「{session.name}」。\n"
+                    f"当前处于特殊会话模式，上下文将持续保存。\n"
+                    f"使用 /结束会话 退出，/会话列表 查看所有会话。\n"
+                    f"当前特殊会话: {len(_special_sessions.list_sessions(user_id))}/{_max_special_sessions}"
+                )
+            else:
+                _pending_naming[user_id] = True
+                await _safe_send(
+                    f"已创建特殊会话「{session.name}」（名称待精炼）。\n"
+                    f"首次交互后会自动生成更贴切的名称。\n"
+                    f"当前处于特殊会话模式，上下文将持续保存。\n"
+                    f"当前特殊会话: {len(_special_sessions.list_sessions(user_id))}/{_max_special_sessions}"
+                )
+        except ValueError as e:
+            await _safe_send(str(e))
+        return True
+
+    # ── /会话列表 ──────────────────────────────────────────────
+    if cmd in ("/会话列表", "#会话列表", "/会话", "#会话"):
+        sessions = _special_sessions.list_sessions(user_id)
+        if not sessions:
+            await _safe_send(
+                "你目前没有特殊会话。\n"
+                f"使用 /新会话 [名称] 创建一个（最多 {_max_special_sessions} 个）。"
+            )
+            return True
+
+        active_name = _special_sessions._load_index(user_id).get("active_session")
+        lines = ["你的特殊会话:"]
+        for s in sessions:
+            marker = " ← 当前" if s["name"] == active_name else ""
+            created = time.strftime("%m/%d %H:%M", time.localtime(s["created_at"]))
+            lines.append(
+                f"  {s['name']}{marker}\n"
+                f"    创建: {created} | 消息数: {s['total_messages']}"
+            )
+        lines.append(f"\n共 {len(sessions)}/{_max_special_sessions} 个会话")
+        await _safe_send("\n".join(lines))
+        return True
+
+    # ── /切换会话 <名称> ───────────────────────────────────────
+    if cmd in ("/切换会话", "#切换会话"):
+        if not args:
+            await _safe_send("用法: /切换会话 <会话名称>")
+            return True
+        try:
+            session = _special_sessions.switch_to(user_id, args)
+            await _safe_send(
+                f"已切换到特殊会话「{session.name}」"
+                f"（{session.total_messages} 条消息）。"
+            )
+        except ValueError as e:
+            await _safe_send(str(e))
+        return True
+
+    # ── /重命名会话 <旧名> <新名> ──────────────────────────────
+    if cmd in ("/重命名会话", "#重命名会话"):
+        parts = args.split(maxsplit=1)
+        if len(parts) < 2:
+            await _safe_send("用法: /重命名会话 <旧名称> <新名称>")
+            return True
+        try:
+            session = _special_sessions.rename(user_id, parts[0], parts[1])
+            await _safe_send(f"已将会话「{parts[0]}」重命名为「{session.name}」。")
+        except ValueError as e:
+            await _safe_send(str(e))
+        return True
+
+    # ── /删除会话 <名称> ───────────────────────────────────────
+    if cmd in ("/删除会话", "#删除会话"):
+        if not args:
+            await _safe_send("用法: /删除会话 <会话名称>")
+            return True
+
+        # Check for confirmation
+        confirm_key = f"确认删除 {args}"
+        if text == confirm_key:
+            # Check pending confirmation
+            pending = _pending_delete_confirm.get(user_id)
+            if pending and pending[0] == args:
+                if time.time() < pending[1]:
+                    try:
+                        _special_sessions.delete(user_id, args)
+                        _pending_delete_confirm.pop(user_id, None)
+                        sessions = _special_sessions.list_sessions(user_id)
+                        await _safe_send(
+                            f"已删除特殊会话「{args}」。\n"
+                            f"当前特殊会话: {len(sessions)}/{_max_special_sessions}"
+                        )
+                    except ValueError as e:
+                        await _safe_send(str(e))
+                    return True
+                else:
+                    _pending_delete_confirm.pop(user_id, None)
+                    await _safe_send("确认已超时（60秒），请重新发起 /删除会话。")
+                    return True
+
+        # First call — request confirmation
+        sessions = _special_sessions.list_sessions(user_id)
+        if not any(s["name"] == args for s in sessions):
+            await _safe_send(f"会话「{args}」不存在。")
+            return True
+
+        _pending_delete_confirm[user_id] = (args, time.time() + 60)
+        await _safe_send(
+            f"确认删除特殊会话「{args}」？此操作不可撤销。\n"
+            f"请回复「确认删除 {args}」来执行（60秒内有效）。"
+        )
+        return True
+
+    # ── /结束会话 ──────────────────────────────────────────────
+    if cmd in ("/结束会话", "#结束会话", "/临时会话", "#临时会话"):
+        active = _special_sessions.get_active(user_id)
+        if active:
+            _special_sessions.end_active(user_id)
+            await _safe_send(
+                f"已退出特殊会话「{active.name}」，回到临时会话模式。\n"
+                f"特殊会话内容已保存，随时可以用 /切换会话 {active.name} 恢复。"
+            )
+        else:
+            await _safe_send("当前没有活跃的特殊会话。")
+        return True
+
+    # ── /保存为会话 <名称> ─────────────────────────────────────
+    if cmd in ("/保存为会话", "#保存为会话"):
+        active = _special_sessions.get_active(user_id)
+        if active:
+            await _safe_send("你已经在特殊会话中。请先 /结束会话 再使用此命令。")
+            return True
+
+        temp_session = _session_manager.get(user_id)
+        if not temp_session or not temp_session.context:
+            await _safe_send("临时会话中没有可保存的上下文。")
+            return True
+
+        name = args if args else None
+        try:
+            session = _special_sessions.create(user_id, name)
+        except ValueError as e:
+            await _safe_send(str(e))
+            return True
+
+        # Copy temporary session context to the new special session
+        for msg in temp_session.context[-20:]:  # Last 20 messages max
+            _special_sessions.add_message(
+                user_id,
+                msg["role"],
+                msg["content"],
+                msg.get("reasoning_content"),
+            )
+        # Force name update (user specified name)
+        if name and session.name == name:
+            pass  # Already named
+        elif not name:
+            _pending_naming[user_id] = True
+
+        sessions = _special_sessions.list_sessions(user_id)
+        await _safe_send(
+            f"已将当前临时会话（最近 {min(len(temp_session.context), 20)} 条消息）"
+            f"保存为特殊会话「{session.name}」。\n"
+            f"现在处于特殊会话模式，后续对话将持续保存。\n"
+            f"当前特殊会话: {len(sessions)}/{_max_special_sessions}"
+        )
+        return True
+
+    # Not a session command
+    return False
 
 
 async def _handle_special_command(command: str, user_id: str):

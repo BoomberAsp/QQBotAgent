@@ -161,6 +161,7 @@ class ProfileManager:
         self._cache[profile.user_id] = profile
         path = self._path(profile.user_id)
         try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(profile.to_dict(), f, ensure_ascii=False, indent=2)
         except Exception:
@@ -248,18 +249,45 @@ class ProfileManager:
 
     def _path(self, user_id: str) -> str:
         safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in user_id)
+        # New layout: {base_dir}/{safe_user_id}/profile.json
+        return os.path.join(self.base_dir, safe_id, "profile.json")
+
+    def _old_path(self, user_id: str) -> str:
+        """Legacy path used before per-user workspace migration."""
+        safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in user_id)
         return os.path.join(self.base_dir, f"{safe_id}.json")
 
     def _load(self, user_id: str) -> Optional[UserProfile]:
         path = self._path(user_id)
-        if not os.path.exists(path):
-            return None
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return UserProfile.from_dict(data)
-        except Exception:
-            return None
+
+        # Check new path first
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return UserProfile.from_dict(data)
+            except Exception:
+                return None
+
+        # Auto-migrate from old path (flat file layout)
+        old_path = self._old_path(user_id)
+        if os.path.exists(old_path):
+            try:
+                with open(old_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                profile = UserProfile.from_dict(data)
+                # Save to new location
+                self.save(profile)
+                # Remove old file
+                try:
+                    os.remove(old_path)
+                except Exception:
+                    pass
+                return profile
+            except Exception:
+                return None
+
+        return None
 
     @staticmethod
     def _parse_json(text: str) -> Optional[dict]:
