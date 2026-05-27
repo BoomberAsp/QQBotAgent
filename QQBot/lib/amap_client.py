@@ -19,15 +19,26 @@ BASE_URL = "https://restapi.amap.com/v3"
 
 
 def _get_api_key() -> str:
-    """Read the Amap API key from environment, with a fallback to NoneBot config."""
+    """Read the Amap API key from NoneBot config, with fallbacks.
+
+    NoneBot2 loads .env into its config object but does NOT push values
+    to os.environ. We try config first (same approach as deepseek_client.py),
+    then os.environ (for non-NoneBot contexts e.g. testing).
+    """
+    # 1. NoneBot config (primary — this is where .env values actually live)
+    try:
+        from nonebot import get_driver
+        key = getattr(get_driver().config, ENV_AMAP_KEY, "").strip()
+        if key:
+            return key
+    except Exception:
+        pass
+
+    # 2. os.environ (non-NoneBot contexts — testing / direct invocation)
     key = os.environ.get(ENV_AMAP_KEY, "").strip()
     if key:
         return key
-    try:
-        from nonebot import get_driver
-        return getattr(get_driver().config, ENV_AMAP_KEY, "").strip()
-    except Exception:
-        pass
+
     return ""
 
 
