@@ -18,6 +18,10 @@ services:
       - CHOWN
       - SETGID
       - SETUID
+    # 使用腾讯云内网 DNS，确保容器出站域名解析稳定
+    dns:
+      - 183.60.83.19
+      - 183.60.82.98
     logging:
       driver: "json-file"
       options:

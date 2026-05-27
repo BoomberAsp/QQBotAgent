@@ -28,19 +28,37 @@ ui:
   default_theme: simple
   default_locale: zh-Hans-CN
 
-# Engines: only enable Bing (accessible from mainland China)
-# Default engines (google, duckduckgo, wikipedia, brave, startpage) are blocked
+# Engines: prioritized for access from mainland China
+# - bing / bing_news: primary, stable from China
+# - duckduckgo: fallback, intermittent (short timeout)
+# - mwmbl: independent index, no API key, small but free
 engines:
   - name: bing
     engine: bing
     shortcut: bi
     disabled: false
+    timeout: 10.0
 
   - name: bing news
     engine: bing_news
     shortcut: bin
     disabled: false
+    timeout: 10.0
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+    timeout: 6.0
+
+  - name: mwmbl
+    engine: mwmbl
+    shortcut: mw
+    disabled: false
+    timeout: 5.0
 
 outgoing:
-  request_timeout: 15.0
-  max_request_timeout: 20.0
+  request_timeout: 10.0
+  max_request_timeout: 15.0
+  # Retry once on upstream failure (catches intermittent Bing timeouts)
+  retries: 1

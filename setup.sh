@@ -174,18 +174,93 @@ setup_models() {
     fi
 }
 
-# ── 6. 启动 SearXNG ──────────────────────────────────────────
+# ── 6. 配置 Docker 国内镜像源 ──────────────────────────────────
+setup_docker_mirror() {
+    echo -e "\n${YELLOW}[可选]${NC} 配置 Docker 国内镜像源..."
+
+    if ! command -v docker &> /dev/null || ! docker info &> /dev/null 2>&1; then
+        echo -e "${YELLOW}[INFO]${NC} Docker 不可用，跳过镜像源配置"
+        return
+    fi
+
+    DOCKER_CONFIG="/etc/docker/daemon.json"
+    MIRROR_URL="https://mirror.ccs.tencentyun.com"
+
+    if [ -f "$DOCKER_CONFIG" ]; then
+        # Check if already has registry-mirrors
+        if grep -q "registry-mirrors" "$DOCKER_CONFIG" 2>/dev/null; then
+            echo -e "${GREEN}[INFO]${NC} Docker 镜像源已配置，跳过"
+            return
+        fi
+        # Merge: add registry-mirrors to existing config
+        echo -e "${GREEN}[INFO]${NC} 更新现有 Docker 配置..."
+        # Use python to merge JSON (reliable across platforms)
+        sudo python3 -c "
+import json
+with open('$DOCKER_CONFIG') as f:
+    cfg = json.load(f)
+cfg['registry-mirrors'] = ['$MIRROR_URL']
+with open('$DOCKER_CONFIG', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+    else
+        echo -e "${GREEN}[INFO]${NC} 创建 Docker 镜像源配置..."
+        sudo mkdir -p /etc/docker
+        sudo tee "$DOCKER_CONFIG" > /dev/null << EOF
+{
+  "registry-mirrors": ["$MIRROR_URL"]
+}
+EOF
+    fi
+
+    # Restart Docker to apply
+    sudo systemctl restart docker 2>/dev/null && \
+        echo -e "${GREEN}[OK]${NC} Docker 镜像源已配置: $MIRROR_URL" || \
+        echo -e "${YELLOW}[WARN]${NC} Docker 配置已写入但重启失败，请手动重启 docker 服务"
+}
+
+# ── 7. 启动 SearXNG ──────────────────────────────────────────
 start_searxng() {
     echo -e "\n${YELLOW}[可选]${NC} 启动 SearXNG 搜索引擎..."
 
-    if command -v docker &> /dev/null && docker info &> /dev/null 2>&1; then
-        cd "$SCRIPT_DIR"
-        docker compose up -d searxng 2>/dev/null && \
-            echo -e "${GREEN}[OK]${NC} SearXNG 已启动 (http://localhost:8082)" || \
-            echo -e "${YELLOW}[WARN]${NC} SearXNG 启动失败，搜索功能将降级"
-    else
+    if ! command -v docker &> /dev/null || ! docker info &> /dev/null 2>&1; then
         echo -e "${YELLOW}[WARN]${NC} Docker 不可用，跳过 SearXNG 启动"
+        return
     fi
+
+    cd "$SCRIPT_DIR"
+
+    # Pull image (may use configured mirror)
+    echo -e "${GREEN}[INFO]${NC} 拉取 SearXNG 镜像..."
+    docker pull searxng/searxng:latest 2>/dev/null && \
+        echo -e "${GREEN}[OK]${NC} 镜像拉取完成" || \
+        echo -e "${YELLOW}[WARN]${NC} 镜像拉取失败，将尝试使用本地缓存"
+
+    # Start container
+    docker compose up -d searxng 2>/dev/null && \
+        echo -e "${GREEN}[OK]${NC} SearXNG 容器已启动" || {
+        echo -e "${RED}[ERROR]${NC} SearXNG 启动失败，搜索功能将不可用"
+        return
+    }
+
+    # Verify SearXNG is responding
+    echo -e "${GREEN}[INFO]${NC} 验证 SearXNG 连接 (最多等待 30s)..."
+    for i in $(seq 1 15); do
+        STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8082/search?format=json&q=test" 2>/dev/null || echo "000")
+        if [ "$STATUS" = "200" ] || [ "$STATUS" = "403" ]; then
+            echo -e "${GREEN}[OK]${NC} SearXNG 响应正常 (HTTP $STATUS, http://localhost:8082)"
+            return
+        fi
+        sleep 2
+    done
+
+    echo -e "${RED}[ERROR]${NC} SearXNG 启动后无响应"
+    echo ""
+    echo -e "${YELLOW}排查建议:${NC}"
+    echo "  1. 查看容器日志: docker logs searxng --tail 30"
+    echo "  2. 检查 settings.yml 语法: docker exec searxng cat /etc/searxng/settings.yml"
+    echo "  3. 测试容器内出站网络: docker exec searxng curl -I https://www.bing.com"
+    echo "  4. 如果 DNS 解析失败, 检查 docker-compose.yml 中的 dns 配置"
 }
 
 # ── Main ─────────────────────────────────────────────────────
@@ -197,6 +272,7 @@ main() {
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         install_system_deps
+        setup_docker_mirror
         start_searxng
     fi
 
