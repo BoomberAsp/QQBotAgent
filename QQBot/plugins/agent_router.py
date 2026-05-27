@@ -57,7 +57,7 @@ _DATA_DIR = os.path.join(_AGENT_DIR, "data")
 
 def _init_workspace():
     """Create workspace directories if they don't exist."""
-    from ..tools.builtin_tools import _ensure_workspace_dirs
+    from tools.builtin_tools import _ensure_workspace_dirs
     _ensure_workspace_dirs()
 
 _init_workspace()
