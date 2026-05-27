@@ -17,8 +17,6 @@ import uuid
 import httpx
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageEvent, Message, ActionFailed
-from nonebot.rule import to_me
-
 from agent.agent import Agent
 from agent.continuous_session import ContinuousSessionManager
 from agent.context import _send_msg, _current_user_workspace
@@ -446,7 +444,7 @@ agent = Agent(
     hardware_detector=_hardware_detector,
     workspace_manager=_workspace_manager,
     special_session_manager=_special_sessions,
-    max_tool_iterations=5,
+    max_tool_iterations=8,
     thinking_timeout=180.0,
 )
 
@@ -457,14 +455,26 @@ _continuous_sessions = ContinuousSessionManager(timeout_minutes=5.0)
 
 # ── Message Handlers ─────────────────────────────────────────────
 
-# Catch ALL messages directed at the bot (requires @mention)
-agent_router = on_message(priority=1, block=False, rule=to_me())
+# Catch ALL messages. For group messages, we manually check for @mentions
+# instead of relying on to_me() rule, which depends on NapCat setting
+# the "to_me" field in the raw event data (which may not always happen).
+agent_router = on_message(priority=1, block=False)
 
 
 @agent_router.handle()
 async def handle_agent_message(event: MessageEvent):
     """Route incoming QQ messages through the Agent."""
     user_id = str(event.user_id)
+
+    # Manual @mention check for group messages (more reliable than to_me())
+    if isinstance(event, GroupMessageEvent):
+        bot_qq = str(event.self_id)
+        is_at_bot = any(
+            seg.type == "at" and seg.data.get("qq") == bot_qq
+            for seg in event.message
+        )
+        if not is_at_bot and not event.is_tome():
+            return  # Not directed at bot, skip silently
 
     # Set user workspace for tool scoping
     _workspace_manager.ensure_dirs(user_id)
@@ -604,6 +614,9 @@ async def handle_continuous_message(event: MessageEvent):
     # Skip messages that @ the bot — agent_router (priority=1) already handled them
     if event.is_tome():
         return
+    bot_qq = str(event.self_id)
+    if any(seg.type == "at" and seg.data.get("qq") == bot_qq for seg in event.message):
+        return  # agent_router will handle this (manual @mention detection)
 
     # Check if user is in continuous mode
     if not _continuous_sessions.is_active(group_id, user_id):
@@ -708,8 +721,10 @@ async def _safe_send(message, max_retries: int = 2, matcher=None):
             last_error = e
             if attempt < max_retries - 1:
                 await asyncio.sleep(1.0 * (attempt + 1))  # Exponential backoff
-        except Exception:
-            return  # Non-retryable errors (connection lost, etc.)
+        except Exception as e:
+            from nonebot import logger
+            logger.warning(f"Send failed with non-retryable error: {e}")
+            return
     # All retries exhausted — log but don't crash
     if last_error:
         from nonebot import logger
