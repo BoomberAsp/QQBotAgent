@@ -130,6 +130,7 @@ setup_env() {
         echo "  DEEPSEEK_API_KEY=<你的DeepSeek API Key>"
         echo "  DEEPSEEK_API_BASE=https://api.deepseek.com"
         echo "  SEARXNG_ENDPOINT=http://localhost:8082"
+        echo "  AMAP_API_KEY=<你的高德地图Key> (可选, 用于地图工具)"
     else
         cat > "$ENV_FILE" << 'EOF'
 DRIVER=~fastapi
@@ -142,6 +143,8 @@ COMMAND_SEP=[" "]
 DEEPSEEK_API_KEY=请修改为你的DeepSeek API Key （或其它厂商提供的LLM API key，记得删除括号）
 DEEPSEEK_API_BASE=https://api.deepseek.com （或其它厂商提供的LLM base url，记得删除括号）
 SEARXNG_ENDPOINT=http://localhost:8082
+# 高德地图 (可选, 用于地图/天气/路径规划)
+AMAP_API_KEY=
 EOF
         echo -e "${GREEN}[OK]${NC} .env 模板已创建"
         echo -e "${RED}[!!!]${NC} 请编辑 QQBot/.env 填入你的配置:"

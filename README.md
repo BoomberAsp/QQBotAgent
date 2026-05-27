@@ -12,6 +12,7 @@
 - **文件阅读** — 支持文本 / PDF / 图片（多模态 AI 分析）
 - **用户系统** — 长期记忆（Markdown 存储）+ LLM 驱动用户画像提取
 - **游戏工具** — 抽卡模拟、战斗测速、乱速概率计算
+- **地图服务** — 地址↔坐标转换、实时天气、POI搜索、路线规划（高德地图）
 - **安全设计** — 工作区隔离、路径验证防穿越、Git URL 注入防护
 
 ## 技术栈
@@ -62,6 +63,7 @@ SUPERUSERS=["你的QQ号"]
 DEEPSEEK_API_KEY=sk-xxxxxxxx
 DEEPSEEK_API_BASE=https://api.deepseek.com
 SEARXNG_ENDPOINT=http://localhost:8082
+AMAP_API_KEY=你的高德Key  # 可选，用于地图工具
 ```
 
 **多模型配置（可选）**：编辑 `QQBot/config/models_settings.json` 配置三种模型，留空则回退到 `.env` 默认配置。参考 `QQBot/config/models_settings_example.json` 格式。
@@ -279,7 +281,7 @@ class ContinuousSessionManager:
 | `MemorySystem` | `memory.py` | 长期记忆（Markdown 文件），关键词搜索，最多返回 3 条 |
 | `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣，持久化到 `data/users/` |
 
-## 已注册工具（11 个）
+## 已注册工具（16 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -294,6 +296,11 @@ class ContinuousSessionManager:
 | `gacha_pull` | 抽卡模拟（4 种卡池） |
 | `calculate_speed` | 游戏战斗测速 |
 | `compare_speed_probability` | 乱速概率计算 |
+| `geocode` | 地址 → 经纬度坐标查询 |
+| `reverse_geocode` | 经纬度 → 详细地址反查 |
+| `get_weather` | 实时天气 / 4天预报（高德） |
+| `search_poi` | 周边POI搜索（餐厅、地铁等） |
+| `plan_route` | 驾车/步行/公交路线规划 |
 
 ## 智能体配置
 

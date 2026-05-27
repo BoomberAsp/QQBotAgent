@@ -33,7 +33,145 @@ This document defines all tools available to the agent. Each tool has a name, de
 }
 ```
 
-**Note**: The separate `check_weather` tool has been removed. Weather queries are handled through this unified search tool — the Agent searches for weather information and synthesizes the results via LLM reasoning.
+**Note**: The separate `check_weather` tool has been removed. Weather queries are handled through the dedicated `get_weather` tool (Amap API) or this unified search tool as a fallback.
+
+---
+
+## Tool: get_weather
+
+**Description**: Query real-time weather or 4-day forecast for a city via Amap API. Returns temperature, humidity, wind direction, and weather conditions.
+
+**When to use**: When the user asks about current weather or forecast for a specific city. Much more accurate than searching.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "city": {
+      "type": "string",
+      "description": "City name or adcode, e.g. '深圳', '北京'"
+    },
+    "forecast": {
+      "type": "boolean",
+      "description": "False = real-time weather, True = 4-day forecast",
+      "default": false
+    }
+  },
+  "required": ["city"]
+}
+```
+
+---
+
+## Tool: geocode
+
+**Description**: Convert an address or place name into geographic coordinates (longitude/latitude). Returns coordinates and formatted address.
+
+**When to use**: When the user asks "xxx在哪里", or needs coordinates for route planning.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "address": {
+      "type": "string",
+      "description": "Address or place name, e.g. '深圳南山科技园', '天安门'"
+    },
+    "city": {
+      "type": "string",
+      "description": "Optional city name to narrow the search scope"
+    }
+  },
+  "required": ["address"]
+}
+```
+
+---
+
+## Tool: reverse_geocode
+
+**Description**: Convert coordinates (longitude/latitude) into a human-readable address. Returns detailed address, nearby POIs, and administrative region.
+
+**When to use**: When given coordinates and asked where that location is, or after geocoding a series of points.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "location": {
+      "type": "string",
+      "description": "Coordinates in 'lon,lat' format, e.g. '113.952,22.542'"
+    }
+  },
+  "required": ["location"]
+}
+```
+
+---
+
+## Tool: search_poi
+
+**Description**: Search for Points of Interest — restaurants, subway stations, banks, malls, attractions, etc. Returns name, address, coordinates, and distance.
+
+**When to use**: When the user asks about nearby places ("附近的餐厅", "地铁站在哪"), or searches for specific locations.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "keywords": {
+      "type": "string",
+      "description": "Search keywords, e.g. '餐厅', '地铁站', '北京大学'"
+    },
+    "city": {
+      "type": "string",
+      "description": "Optional city name to limit search scope"
+    },
+    "num_results": {
+      "type": "integer",
+      "description": "Number of results (default 5)",
+      "default": 5
+    }
+  },
+  "required": ["keywords"]
+}
+```
+
+---
+
+## Tool: plan_route
+
+**Description**: Calculate a route between two points. Supports driving, walking, and transit modes. Returns distance, duration, and step-by-step instructions.
+
+**When to use**: When the user asks how to get from A to B, distance, travel time, or route directions.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "origin": {
+      "type": "string",
+      "description": "Starting point — coordinates ('113.95,22.54') or address"
+    },
+    "destination": {
+      "type": "string",
+      "description": "End point — same format as origin"
+    },
+    "mode": {
+      "type": "string",
+      "description": "Travel mode: 'driving', 'walking', or 'transit' (公交)",
+      "enum": ["driving", "walking", "transit"],
+      "default": "driving"
+    }
+  },
+  "required": ["origin", "destination"]
+}
+```
 
 ---
 

@@ -70,6 +70,7 @@ QQBotAgent/
     ├── tools/               # Agent 工具实现
     │   ├── builtin_tools.py #   5 个内置工具 (搜索/代码/PDF/Git/时间)
     │   ├── file_tools.py    #   文件读取工具 (文本/PDF/图片分析)
+    │   ├── map_tools.py     #   地图工具 (地理编码/逆编码/天气/POI/路径)
     │   └── legacy_tools.py  #   5 个游戏/娱乐工具 (抽卡/测速/乱速/解释/翻译)
     │
     ├── config/              # 敏感配置文件 (git-ignored)
@@ -80,7 +81,8 @@ QQBotAgent/
     ├── lib/                 # 自定义库
     │   ├── deepseek_client.py  # DeepSeek API 客户端 (OpenAI 兼容 Function Calling)
     │   ├── multimodal_client.py # 多模态 LLM 客户端 (图片理解)
-    │   └── model_router.py  #   多模型路由器 (复杂度分类 + 模型调度)
+    │   ├── model_router.py  #   多模型路由器 (复杂度分类 + 模型调度)
+    │   └── amap_client.py   #   高德地图 API 客户端
     │
     ├── data/                # Agent 运行时数据
     │   ├── sessions/        #   会话持久化 (JSON)
@@ -386,6 +388,16 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 | `summarize_pdf` | builtin_tools | 提取并总结 PDF 内容 (PyPDF2, 路径验证) |
 | `read_file` | file_tools | 读取用户上传的文件 (文本/PDF/图片, 图片可 AI 分析) |
 
+**地图工具 (5 个)**:
+
+| 工具名 | 来源 | 说明 |
+|--------|------|------|
+| `geocode` | map_tools | 地址 → 经纬度坐标 |
+| `reverse_geocode` | map_tools | 经纬度 → 详细地址 + 周边 |
+| `get_weather` | map_tools | 实时天气 / 4天预报 (替代搜索方式) |
+| `search_poi` | map_tools | POI搜索 (餐厅/地铁/银行等) |
+| `plan_route` | map_tools | 路径规划 (驾车/步行/公交) |
+
 **娱乐工具 (5 个)**:
 
 | 工具名 | 来源 | 说明 |
@@ -560,6 +572,30 @@ Agent 必须在以下情况拒绝 (礼貌):
 | `compare_speed_probability(speed_1, speed_2)` | 乱速概率计算 | `speed.compute_prob` |
 | `explain_code_tool(code)` | LLM 代码解释 | `deepseek_client.chat_completion` |
 | `translate_text(text, target_language)` | LLM 多语言翻译 | `deepseek_client.chat_completion` |
+
+### 5.4 `tools/map_tools.py` — 地图工具 (5 个)
+
+所有工具通过 `lib/amap_client.py` 共享 HTTP 客户端调用高德地图 Web Services API。API Key 通过环境变量 `AMAP_API_KEY` 配置。
+
+| 函数 | 说明 | 高德 API |
+|------|------|----------|
+| `geocode(address, city=None)` | 地址 → 经纬度坐标 + 规范化地址 | `/v3/geocode/geo` |
+| `reverse_geocode(location)` | 经纬度 → 详细地址 + 周边 + 行政区划 | `/v3/geocode/regeo` |
+| `get_weather(city, forecast=False)` | 实时天气 (温度/湿度/风向) 或 4天预报 | `/v3/weather/weatherInfo` |
+| `search_poi(keywords, city=None, num_results=5)` | POI搜索 (餐厅/地铁/银行等) | `/v3/place/text` |
+| `plan_route(origin, destination, mode="driving")` | 路径规划 (驾车/步行/公交) | `/v3/direction/...` |
+
+**安全设计**:
+- API Key 存储在服务端 `.env`，Agent 代理所有请求，用户无法直接访问
+- 建议在高德控制台开启 IP 白名单，限制为云服务器公网 IP
+- 免费额度 5000 次/天，满足个人机器人使用
+
+### 5.5 `lib/amap_client.py` — 高德地图 API 客户端
+
+| 函数 | 说明 |
+|------|------|
+| `_get_api_key()` | 从环境变量 `AMAP_API_KEY` 读取 Key，支持 NoneBot config 回退 |
+| `_amap_get(endpoint, params, timeout=10.0)` | 通用 GET 请求封装。自动注入 key，统一错误格式 `[地图] ...` |
 
 ---
 
@@ -1005,7 +1041,7 @@ v2.5 基础上增加:
 必须在后续请求中原样回传, 否则返回 HTTP 400:
 "The reasoning_content in the thinking mode must be passed back to the API."
 
-### v2.7 — 实时进度推送 (当前)
+### v2.7 — 实时进度推送
 
 ```
 v2.6 基础上增加:
@@ -1019,6 +1055,19 @@ v2.6 基础上增加:
 通过 _safe_send 包装后注入。失败时静默忽略, 不影响消息处理。
 ```
 
-**影响链路**: API 响应 → _parse_response → Agent 循环内消息 → session.context
-→ 下次 _build_messages → API 请求。全链路 reasoning_content 不丢失。
+### v2.8 — 地图 & 位置服务 (当前)
+
+```
+v2.7 基础上增加:
+  ├── lib/amap_client.py: 高德地图 API 共享客户端 (GET + 错误处理)
+  ├── tools/map_tools.py: 5 个地图工具
+  │   ├── geocode: 地址 → 经纬度
+  │   ├── reverse_geocode: 经纬度 → 地址 + 周边
+  │   ├── get_weather: 实时天气 / 4天预报 (替代搜索方式)
+  │   ├── search_poi: POI 搜索 (餐厅/地铁/银行等)
+  │   └── plan_route: 路径规划 (驾车/步行/公交)
+  └── 配置: .env 中新增 AMAP_API_KEY
+
+**API**: 高德地图 Web Services, 免费 5000 次/天, 无需实名。
+工具数量: 11 → 16
 ```

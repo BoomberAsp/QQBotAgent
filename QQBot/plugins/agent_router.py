@@ -39,6 +39,13 @@ from tools.builtin_tools import (
     _ensure_workspace_dirs,
 )
 from tools.file_tools import read_file
+from tools.map_tools import (
+    geocode,
+    reverse_geocode,
+    get_weather as map_get_weather,
+    search_poi,
+    plan_route,
+)
 from tools.legacy_tools import (
     calculate_speed,
     compare_speed_probability,
@@ -200,6 +207,74 @@ def _build_tool_registry() -> ToolRegistry:
                 },
             },
             "required": ["file_path"],
+        },
+    )
+
+    # Map / location tools (Amap API)
+    registry.register(
+        "geocode", geocode,
+        "将地址转换为经纬度坐标。输入地址（如'深圳南山科技园'）返回坐标和规范化地址。",
+        {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "要查询的地址或地名"},
+                "city": {"type": "string", "description": "可选城市名，用于缩小搜索范围"},
+            },
+            "required": ["address"],
+        },
+    )
+    registry.register(
+        "reverse_geocode", reverse_geocode,
+        "将经纬度坐标转换为地址。输入坐标（格式'经度,纬度'）返回详细地址、周边POI和行政区划。",
+        {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "经纬度坐标，格式'经度,纬度'，如'113.952,22.542'"},
+            },
+            "required": ["location"],
+        },
+    )
+    registry.register(
+        "get_weather", map_get_weather,
+        "查询指定城市的天气。支持实时天气和4天预报。比搜索更精准。",
+        {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "城市名称或行政区划代码，如'深圳'、'北京'"},
+                "forecast": {"type": "boolean", "description": "是否查询预报。false=实时天气，true=4天预报", "default": False},
+            },
+            "required": ["city"],
+        },
+    )
+    registry.register(
+        "search_poi", search_poi,
+        "搜索地点/Poi。查找餐厅、地铁站、银行、商场、景点等。",
+        {
+            "type": "object",
+            "properties": {
+                "keywords": {"type": "string", "description": "搜索关键词，如'餐厅'、'地铁站'、'北京大学'"},
+                "city": {"type": "string", "description": "可选城市名，用于限定搜索范围"},
+                "num_results": {"type": "integer", "description": "返回结果数量，默认5条", "default": 5},
+            },
+            "required": ["keywords"],
+        },
+    )
+    registry.register(
+        "plan_route", plan_route,
+        "规划两点之间的出行路线。支持驾车、步行、公交三种方式。返回距离、时间和步骤。",
+        {
+            "type": "object",
+            "properties": {
+                "origin": {"type": "string", "description": "起点。可以是坐标（'113.95,22.54'）或地址"},
+                "destination": {"type": "string", "description": "终点。格式同起点"},
+                "mode": {
+                    "type": "string",
+                    "description": "出行方式",
+                    "enum": ["driving", "walking", "transit"],
+                    "default": "driving",
+                },
+            },
+            "required": ["origin", "destination"],
         },
     )
 
