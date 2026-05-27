@@ -21,6 +21,7 @@
 #
 # if __name__ == "__main__":
 #     nonebot.run()
+import os
 import nonebot
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 from nonebot.rule import command
@@ -28,9 +29,10 @@ from nonebot.rule import command
 
 def init():
     # 初始化 NoneBot
+    # DeepSeek API key from environment variable (set in QQBot/.env)
     nonebot.init(command_start={"/", ""}, command_sep={" ",},
-                 DEEPSEEK_API_KEY="sk-f4861354ed3b48c7b9d3ae4f9ed4507b",
-DEEPSEEK_API_BASE="https://api.deepseek.com/v1")
+                 DEEPSEEK_API_KEY=os.getenv("DEEPSEEK_API_KEY"),
+                 DEEPSEEK_API_BASE=os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1"))
 
     # 获取驱动器并注册适配器
     driver = nonebot.get_driver()

@@ -11,6 +11,7 @@ venv/
 # NoneBot 配置
 QQBot/data
 QQBot/logs
+QQBot/.env
 QQBot/.env.prod
 QQBot/device.json
 QQBot/config/multimodal.json
