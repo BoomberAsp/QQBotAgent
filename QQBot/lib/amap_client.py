@@ -8,24 +8,49 @@ Docs: https://lbs.amap.com/api/webservice/summary
 """
 
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import quote
 
 import httpx
 
-# Environment variable name for the API key
 ENV_AMAP_KEY = "AMAP_API_KEY"
 BASE_URL = "https://restapi.amap.com/v3"
 
+# Resolve the project .env path at module load time
+_PROJECT_DIR = Path(__file__).resolve().parent.parent  # QQBot/
+_ENV_FILE = _PROJECT_DIR / ".env"
+
+
+def _parse_dotenv(path: Path) -> Dict[str, str]:
+    """Minimal .env parser — read KEY=VALUE pairs, stripping quotes."""
+    result: Dict[str, str] = {}
+    if not path.is_file():
+        return result
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        # Strip surrounding quotes (single or double)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        result[key] = value
+    return result
+
 
 def _get_api_key() -> str:
-    """Read the Amap API key from NoneBot config, with fallbacks.
+    """Read the Amap API key with multiple fallback strategies."""
+    # 1. Parse .env file directly (most reliable — bypasses NoneBot config quirks)
+    dotenv = _parse_dotenv(_ENV_FILE)
+    key = dotenv.get(ENV_AMAP_KEY, "").strip()
+    if key:
+        return key
 
-    NoneBot2 loads .env into its config object but does NOT push values
-    to os.environ. We try config first (same approach as deepseek_client.py),
-    then os.environ (for non-NoneBot contexts e.g. testing).
-    """
-    # 1. NoneBot config (primary — this is where .env values actually live)
+    # 2. NoneBot config (used by deepseek_client.py — works in running bot)
     try:
         from nonebot import get_driver
         key = getattr(get_driver().config, ENV_AMAP_KEY, "").strip()
@@ -34,7 +59,7 @@ def _get_api_key() -> str:
     except Exception:
         pass
 
-    # 2. os.environ (non-NoneBot contexts — testing / direct invocation)
+    # 3. os.environ (standalone / testing)
     key = os.environ.get(ENV_AMAP_KEY, "").strip()
     if key:
         return key
