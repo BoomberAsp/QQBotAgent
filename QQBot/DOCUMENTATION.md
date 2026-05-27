@@ -2,13 +2,15 @@
 
 ## 项目概述
 
-**QQBot** 是基于 [NapCat](https://github.com/NapNeko/NapCatQQ) + [NoneBot2](https://nonebot.dev/) 构建的 **LLM Agent 智能体**，采用 Markdown 驱动的现代智能体架构，支持工具调用（Tool Calling）、用户画像与长期记忆。AI 后端使用 DeepSeek API。
+**QQBot** 是基于 [NapCat](https://github.com/NapNeko/NapCatQQ) + [NoneBot2](https://nonebot.dev/) 构建的 **LLM Agent 智能体**，采用 Markdown 驱动的现代智能体架构，支持工具调用（Tool Calling）、用户画像、长期记忆、特殊会话（百万 token 上下文）与用户工作区隔离。AI 后端使用 DeepSeek API。
 
 - **智能体架构**: Think→Act→Observe→Respond 循环，Markdown 配置文件驱动
 - **运行框架**: NoneBot2 (Python)
 - **QQ 协议适配**: NapCat (OneBot V11 反向 WebSocket)
 - **AI 后端**: DeepSeek API (OpenAI 兼容 Function Calling) + 多模型路由 (FLASH/REASONING/MULTIMODAL)
 - **搜索引擎**: SearXNG (Docker 自托管，聚合 Google/Bing/DDG/Wikipedia)
+- **特殊会话**: 每用户至多 3 个持久化会话，百万 token 上下文，快照+增量存储
+- **用户工作区**: 每用户独立文件空间，配额管理，跨会话隔离
 - **部署方式**: Docker Compose（含 NVIDIA GPU 支持）或手动部署
 
 ---
@@ -38,7 +40,10 @@ QQBotAgent/
     │   ├── agent.py         #   主循环: Think→Act→Observe→Respond
     │   ├── tool_registry.py #   工具注册表 (OpenAI JSON Schema 生成)
     │   ├── session.py       #   会话管理 (per-user, timeout, trim, 持久化)
+    │   ├── special_session.py #  特殊会话管理 (百万 token, 快照+增量存储, 最多3个)
     │   ├── continuous_session.py # 群聊连续对话窗口管理 (5分钟免@)
+    │   ├── hardware.py      #   硬件自动检测 & 动态任务拒绝
+    │   ├── workspace.py     #   用户工作区隔离 & 配额管理
     │   ├── context.py       #   执行上下文传递 (contextvars, 工具→QQ图片)
     │   ├── memory.py        #   长期记忆系统 (Markdown 文件存储)
     │   ├── profile.py       #   用户画像 (LLM 驱动背景事实提取)
@@ -175,6 +180,9 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 | `session_manager` | `SessionManager` | None | 会话管理 (可选) |
 | `memory_system` | `MemorySystem` | None | 长期记忆 (可选) |
 | `profile_manager` | `ProfileManager` | None | 用户画像 (可选) |
+| `hardware_detector` | `HardwareDetector` | None | 硬件检测器 (可选) |
+| `workspace_manager` | `UserWorkspaceManager` | None | 用户工作区管理 (可选) |
+| `special_session_manager` | `SpecialSessionManager` | None | 特殊会话管理 (可选) |
 | `max_tool_iterations` | `int` | 5 | 最大工具调用轮数 |
 | `thinking_timeout` | `float` | 180.0 | LLM 思考超时秒数 |
 
@@ -182,8 +190,9 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 |------|------|
 | `build_system_prompt()` | 拼接 SOUL + IDENTITY + AGENTS + 当前时间，结果缓存 |
 | `reload_configs()` | 清空缓存，重新加载所有配置文件 |
-| `run(user_message, user_id, client=None, progress_callback=None)` | **主入口**。执行完整 Think→Act→Observe→Respond 循环。可选 `client` 参数支持运行时模型切换 (ModelRouter)。可选 `progress_callback` 在每轮工具执行前推送进度消息 (如 "⏳ 正在搜索...") |
-| `_build_messages(session, user_message)` | 构建 LLM 请求消息列表 (system + profile + memories + history + current)。历史消息中的 `reasoning_content` 自动保留以支持 thinking mode 模型 |
+| `run(user_message, user_id, client=None, progress_callback=None, session_type="temporary")` | **主入口**。执行完整 Think→Act→Observe→Respond 循环。可选 `client` 参数支持运行时模型切换 (ModelRouter)。可选 `progress_callback` 在每轮工具执行前推送进度消息 (如 "⏳ 正在搜索...")。`session_type` 参数支持 `"temporary"` (30min 超时) 和 `"special"` (百万 token 持久化) 两种模式 |
+| `_build_messages(session, user_message, optional_special_session=None)` | 构建 LLM 请求消息列表 (system + profile + memories + history + current)。支持特殊会话上下文注入 (session marker + quota context)。历史消息中的 `reasoning_content` 自动保留以支持 thinking mode 模型 |
+| `_compress_context(messages)` | 双层上下文压缩: Layer 1 保留最近 20 条完整消息, Layer 2 压缩旧消息中 tool result 为摘要首行 |
 | `_execute_tool_calls(tool_calls, session)` | 通过 ToolRegistry 执行 LLM 返回的工具调用 |
 | `_maybe_remember(user_id, msg, response)` | 启发式记忆保存 (对话 >300 字符时触发) |
 | `_schedule_profile_update(user_id, msg, response)` | `asyncio.create_task()` 后台更新用户画像，不阻塞回复 |
@@ -241,6 +250,38 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 | `active_count()` | 活跃会话数量 |
 | `cleanup_expired()` | 清理所有过期会话 |
 
+#### 类: `SpecialSessionManager` (v2.13)
+
+管理持久化的「特殊会话」——每用户至多 3 个，百万 token 上下文窗口，快照 + 增量双层存储。
+
+| 构造参数 | 类型 | 默认值 | 说明 |
+|----------|------|--------|------|
+| `user_data_root` | `str` | (必填) | 用户数据根目录 |
+| `max_per_user` | `int` | 3 | 每用户最大会话数 |
+| `llm_client` | `DeepSeekClient` | None | LLM 客户端 (用于自动命名) |
+
+| 方法 | 说明 |
+|------|------|
+| `create(user_id, name=None)` | 创建特殊会话。name 为 None 时自动生成临时名，首次交互后 LLM 异步命名 |
+| `get_active(user_id)` | 获取用户当前激活的特殊会话 (同一时间仅一个激活) |
+| `list_sessions(user_id)` | 列出用户所有特殊会话 (名称/创建时间/消息数) |
+| `switch_to(user_id, index)` | 切换到指定会话 (按列表索引) |
+| `rename(user_id, index, new_name)` | 重命名会话 |
+| `delete(user_id, index, confirm_code)` | 删除会话 (需 60s 有效期的确认码) |
+| `add_message(user_id, role, content, reasoning=None)` | 追加消息: 写入 JSONL 增量日志，每 50 条触发快照 |
+| `auto_name(user_id)` | 异步: LLM 根据首次对话内容自动总结会话名 |
+
+**存储结构**:
+```
+{USER_DATA_ROOT}/{safe_id}/special_sessions/
+├── session_1/
+│   ├── snapshot.json     # 最近一次完整快照
+│   └── delta.jsonl       # 快照后的增量消息
+├── session_2/
+│   └── ...
+└── _active_session       # 当前激活的会话 ID
+```
+
 ### 2.4 `agent/memory.py` — 长期记忆系统
 
 #### 类: `MemoryEntry`
@@ -292,7 +333,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 | 方法 | 说明 |
 |------|------|
 | `get(user_id)` | 获取或创建用户画像 (内存缓存 + 文件加载) |
-| `save(profile)` | 持久化画像到 `data/users/{user_id}.json` |
+| `save(profile)` | 持久化画像到 `{USER_DATA_ROOT}/{safe_id}/profile.json` (v2.13 迁移: 从旧版扁平路径自动迁移) |
 | `set_client(client)` | 设置 LLM 客户端 (懒初始化) |
 | `extract_and_update(user_id, msg, response)` | **异步后台任务**: 调用 LLM 提取新事实/兴趣/偏好，不阻塞回复 |
 
@@ -334,8 +375,15 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 
 | 命令 | 操作 |
 |------|------|
-| `/clear`, `清除上下文`, `新对话` | 清除当前用户会话上下文 |
+| `/clear`, `清除上下文`, `新对话` | 清除当前用户会话上下文 (临时会话) |
 | `/status` | 显示 Agent 状态 (活跃会话数、已注册工具列表) |
+| `/新会话 [名称]` | 创建特殊会话。可选名称，留空由 LLM 自动命名 |
+| `/切换会话 <编号>` | 切换到指定特殊会话。编号从 `/我的会话` 获取 |
+| `/我的会话` | 列出所有特殊会话及状态 (名称/消息数/创建时间) |
+| `/重命名会话 <编号> <新名称>` | 重命名指定特殊会话 |
+| `/删除会话 <编号>` | 删除指定特殊会话 (输出 6 位确认码, 60s 有效期) |
+| `/激活会话` | 显示当前激活的特殊会话信息 |
+| `/退出会话` | 退出特殊会话模式，回到临时会话 |
 
 #### 消息发送辅助函数
 
@@ -377,9 +425,9 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
             └── >300 字符 → _split_text() 句子边界拆分 → 逐块 _safe_send() (1s 间隔)
 ```
 
-#### 已注册工具 (18 个)
+#### 已注册工具 (19 个)
 
-**内置工具 (7 个)**:
+**内置工具 (8 个)**:
 
 | 工具名 | 来源 | 说明 |
 |--------|------|------|
@@ -389,6 +437,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 | `shell_exec` | builtin_tools | 执行只读 shell 命令（白名单+管道，40+命令） |
 | `download_repo` | builtin_tools | Git clone 代码仓库 (HTTPS only, 命令注入防护) |
 | `summarize_pdf` | builtin_tools | 提取并总结 PDF 内容 (PyPDF2, 路径验证) |
+| `get_system_load` | builtin_tools | 获取服务器实时系统负载 (CPU/内存/磁盘, 用于任务预检) |
 | `read_file` | file_tools | 读取用户上传的文件 (文本/PDF/图片, 图片可 AI 分析) |
 
 **地图工具 (5 个)**:
@@ -551,7 +600,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 
 ## 五、工具实现
 
-### 5.1 `tools/builtin_tools.py` — 内置工具 (5 个)
+### 5.1 `tools/builtin_tools.py` — 内置工具 (6 个)
 
 | 函数 | 说明 | 实现方式 |
 |------|------|----------|
@@ -561,6 +610,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 | `shell_exec(command, timeout=15)` | 异步，执行只读 shell 命令 (白名单+管道) | `subprocess.run(["bash", "-c", cmd])`，40+ 白名单命令，管道解析验证，危险字符拦截 |
 | `download_repo(repo_url)` | Git clone 仓库 (HTTPS only) | `subprocess.run(["git", "clone", url, path])`，已存在则 pull，120s 超时 |
 | `summarize_pdf(file_path)` | 提取 PDF 文本 (前 8000 字符) | PyPDF2 → 逐页提取 → 截断，路径验证 |
+| `get_system_load()` | 获取服务器实时负载 (CPU/内存/磁盘) | 读取 `/proc/loadavg`, `free`, `df` → 返回格式化评估 (低/中/高负载) |
 
 ### 5.2 `tools/file_tools.py` — 文件读取工具 (1 个)
 
@@ -624,11 +674,13 @@ NoneBot2 (FastAPI, 端口 8081)
        ▼
 agent_router.py: on_message(priority=1, rule=to_me())
        │
-       ├── 特殊命令 → /clear, /status (直接处理，不经过 Agent)
+       ├── 特殊命令 → /clear, /status, 8 个会话命令 (直接处理，不经过 Agent)
        │
-       └── 自然语言 → Agent.run(message, user_id)
+       ├── session_type 检测 → active_special ? "special" : "temporary"
+       │
+       └── 自然语言 → Agent.run(message, user_id, session_type=session_type)
                          │
-                         ├── SessionManager.get_or_create(user_id)
+                         ├── _current_user_workspace.set(workspace_path) (工作区隔离)
                          ├── ProfileManager.get(user_id) → to_prompt_context()
                          ├── MemorySystem.search(message) → top 3 memories
                          ├── build_system_prompt() → SOUL+IDENTITY+AGENTS+时间
@@ -1134,4 +1186,29 @@ v2.7 基础上增加:
   - 验证函数与执行函数分离, 便于测试
 
 工具数量: 17 → 18
+```
+
+### v2.13 — 特殊会话 + 用户工作区 + 硬件检测 (2026-05-27)
+```
+v2.12 基础上增加:
+  ├── agent/hardware.py: 硬件自动检测 (CPU/内存/磁盘/GPU/OS)，首次启动缓存到 .hardware.json
+  ├── agent/workspace.py: 用户工作区隔离 (per-user 目录, contextvars 传递), 配额管理 (3 级策略)
+  ├── agent/special_session.py: 特殊会话 (百万 token 上下文, 快照+增量双层存储, 最多 3 个)
+  ├── agent/agent.py 更新:
+  │   ├── build_system_prompt(): 动态注入硬件上下文 (替换硬编码规格表)
+  │   ├── run(): 新增 session_type 参数 → 路由到 SpecialSessionManager
+  │   └── _build_messages(): 注入 session marker + quota context
+  ├── agent/profile.py 更新: 画像存储路径迁移到 {USER_DATA_ROOT}/{safe_id}/profile.json (自动迁移旧路径)
+  ├── plugins/agent_router.py 更新:
+  │   ├── _handle_session_command(): 8 个特殊会话管理命令
+  │   ├── session_type 检测: active_special → "special", 否则 → "temporary"
+  │   └── contextvars 工作区隔离: 每次请求前 set 用户工作区路径
+  ├── tools/builtin_tools.py 更新:
+  │   ├── get_system_load(): 实时系统负载查询 (CPU/内存/磁盘评估)
+  │   └── _get_workspace_root(): 优先检查 _current_user_workspace contextvar
+  ├── agent/config/WORKSPACE.md 更新: 硬件规格改为动态检测引用
+  ├── agent/config/TOOLS.md 更新: 新增 get_system_load 工具文档
+  └── .env 更新: 新增 USER_DATA_ROOT / MAX_SPECIAL_SESSIONS / USER_WORKSPACE_QUOTA_MB
+
+工具数量: 18 → 19
 ```

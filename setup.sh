@@ -131,6 +131,9 @@ setup_env() {
         echo "  DEEPSEEK_API_BASE=https://api.deepseek.com"
         echo "  SEARXNG_ENDPOINT=http://localhost:8082"
         echo "  AMAP_API_KEY=<你的高德地图Key> (可选, 用于地图工具)"
+        echo "  USER_DATA_ROOT=/data/qqbot/users (用户数据根目录)"
+        echo "  MAX_SPECIAL_SESSIONS=3 (每用户最大特殊会话数)"
+        echo "  USER_WORKSPACE_QUOTA_MB=500 (每用户工作区配额)"
     else
         cat > "$ENV_FILE" << 'EOF'
 DRIVER=~fastapi
@@ -145,6 +148,10 @@ DEEPSEEK_API_BASE=https://api.deepseek.com （或其它厂商提供的LLM base u
 SEARXNG_ENDPOINT=http://localhost:8082
 # 高德地图 (可选, 用于地图/天气/路径规划)
 AMAP_API_KEY=
+# ── 用户数据 & 特殊会话 (v2.13) ──
+USER_DATA_ROOT=/data/qqbot/users
+MAX_SPECIAL_SESSIONS=3
+USER_WORKSPACE_QUOTA_MB=500
 EOF
         echo -e "${GREEN}[OK]${NC} .env 模板已创建"
         echo -e "${RED}[!!!]${NC} 请编辑 QQBot/.env 填入你的配置:"
