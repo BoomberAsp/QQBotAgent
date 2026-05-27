@@ -83,11 +83,17 @@ async def reverse_geocode(location: str) -> str:
 
     # Administrative hierarchy
     comp_parts = []
-    for key, label in [("province", ""), ("city", ""), ("district", ""),
-                        ("township", ""), ("streetNumber", "")]:
+    for key in ("province", "city", "district", "township"):
         val = addr_comp.get(key, "")
-        if val and val != "[]":
+        if isinstance(val, str) and val and val != "[]":
             comp_parts.append(val)
+    # streetNumber is a dict like {"street":"学苑大道","number":"1088号"}
+    sn = addr_comp.get("streetNumber", {})
+    if isinstance(sn, dict) and sn:
+        street = sn.get("street", "")
+        num = sn.get("number", "")
+        if street or num:
+            comp_parts.append(f"{street}{num}")
     if comp_parts:
         parts.append(f"  区域: {' '.join(comp_parts)}")
 
@@ -268,8 +274,8 @@ async def plan_route(
     lines = [f"从 {orig} 到 {dest} 的{mode_label}路线:"]
 
     for i, path in enumerate(paths[:2]):
-        dist_m = path.get("distance", 0)
-        dur_s = path.get("duration", 0)
+        dist_m = int(path.get("distance", 0))
+        dur_s = int(path.get("duration", 0))
 
         if dist_m >= 1000:
             dist_str = f"{dist_m / 1000:.1f} 公里"
@@ -289,7 +295,7 @@ async def plan_route(
         steps = path.get("steps", [])
         for step in steps[:4]:
             instruction = step.get("instruction", "").strip()
-            step_dist = step.get("distance", 0)
+            step_dist = int(step.get("distance", 0))
             if instruction:
                 if step_dist >= 1000:
                     lines.append(f"      {instruction} ({step_dist / 1000:.1f}km)")
