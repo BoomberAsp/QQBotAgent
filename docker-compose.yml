@@ -52,7 +52,7 @@ services:
     environment:
       - QQ_ACCOUNT=971561405
       - QQ_PASSWORD=
-      - NAPCAT_ACCESS_TOKEN=3((oY)?_-$jne##5
+      - NAPCAT_ACCESS_TOKEN=3((oY)?_-$$jne##5
       # vLLM 配置
       - VLLM_MODEL=Qwen/Qwen2.5-3B-Instruct
       - VLLM_MAX_MODEL_LEN=8192

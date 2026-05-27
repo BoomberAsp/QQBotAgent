@@ -70,6 +70,7 @@ install_system_deps() {
             done
 
             sudo apt-get install -y -qq ${STATIC_PKGS} ${RESOLVED_PKGS}
+            sudo systemctl enable docker --now
             ;;
 #        *)  echo -e "Try to update apt first. Use sudo apt update"
 #            ;;

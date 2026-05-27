@@ -484,13 +484,60 @@ OneBot V11 | WebSocket Server listening on ws://0.0.0.0:8081/onebot/v11/ws/
 
 ---
 
-**SearXNG 无法搜索？**
+### SearXNG 容器启动 / 搜索失败
+
+**现象一：`docker pull searxng/searxng:latest` 超时或 `Connection reset by peer`**
+
+**原因**：与 Docker 安装类似，GFW 阻断了对 Docker Hub（海外 CDN）的访问。
+
+**解决**：给 Docker 配置镜像加速器（任选一种）：
+
+方案 A — 全局配置 registry-mirrors（推荐，一劳永逸）：
+```bash
+sudo tee /etc/docker/daemon.json <<'EOF'
+{
+  "registry-mirrors": [
+    "https://docker.1ms.run",
+    "https://docker.xuanyuan.me",
+    "https://docker.mybacc.com",
+    "https://dytt.online"
+  ]
+}
+EOF
+sudo systemctl restart docker
+```
+配置后直接 `docker pull searxng/searxng:latest` 即可，Docker 会自动按顺序重试各个镜像。
+
+方案 B — 手动通过代理拉取：
+```bash
+docker pull docker.xuanyuan.me/searxng/searxng:latest && \
+docker tag docker.xuanyuan.me/searxng/searxng:latest searxng/searxng:latest
+```
+
+> **注意**：单个代理（如 `docker.1ms.run`）可能没缓存特定镜像，换一个试试。如果都不行，用方案 A 让 Docker 自动重试。
+
+**现象二：容器运行中但搜索无结果 / 超时**
+
 ```bash
 # 检查容器状态
-docker logs searxng --tail 20
+docker logs searxng --tail 50
+
 # 测试 API
 curl "http://localhost:8082/search?format=json&q=test"
 ```
+
+**原因**：SearXNG 默认引擎（Google / DuckDuckGo / Wikipedia 等）在国内全部不可用，`settings.yml` 中已只启用 Bing。但 Bing 在国内有时也会间歇性超时。
+
+**解决**：等几分钟重试；或者编辑 `searxng/settings.yml` 添加国内可用的搜索引擎（如百度），然后 `docker compose restart searxng`。
+
+**现象三：容器退出 / 反复重启**
+
+```bash
+docker compose up searxng   # 前台运行看报错
+docker compose run --rm searxng cat /etc/searxng/settings.yml  # 验证挂载
+```
+
+常见原因：`settings.yml` YAML 格式错误（缩进必须用空格不能用 tab）、端口 8082 被占用。
 
 **QQ 消息发送超时 (retcode 1200)？**
 - 已内置重试机制 + 智能拆分（300 字符 / 块 + 1s 间隔）
