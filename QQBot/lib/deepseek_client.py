@@ -8,6 +8,7 @@ Supports:
 """
 
 import json
+import os
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -23,8 +24,17 @@ class DeepSeekClient:
 
     def __init__(self, api_key=None, api_base=None, model=None):
         config = get_driver().config
-        self.api_key = api_key or config.DEEPSEEK_API_KEY
-        self.api_base = api_base or config.DEEPSEEK_API_BASE
+        # Three-tier fallback: constructor arg → NoneBot config → env variable
+        self.api_key = (
+            api_key
+            or getattr(config, "DEEPSEEK_API_KEY", None)
+            or os.getenv("DEEPSEEK_API_KEY")
+        )
+        self.api_base = (
+            api_base
+            or getattr(config, "DEEPSEEK_API_BASE", None)
+            or os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
+        )
         self.model = model or "deepseek-chat"
 
     # ── Simple Chat Completion (backward compatible) ──────────────
