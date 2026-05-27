@@ -19,6 +19,7 @@ import asyncio
 import glob
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -556,3 +557,275 @@ def download_repo(repo_url: str, target_dir: str = None) -> str:
         return "[Git Error] 服务器未安装 git。请先安装: apt-get install git"
     except Exception as e:
         return f"[Git Error] 下载仓库时出错: {e}"
+
+
+# ── Shell Command Execution ───────────────────────────────────────
+
+# Whitelist: commands allowed in shell_exec
+_SHELL_WHITELIST = {
+    # File listing & metadata
+    "ls", "find", "tree", "file", "stat", "realpath", "readlink",
+    "basename", "dirname", "pwd",
+    # Content viewing (read-only)
+    "cat", "head", "tail", "zcat", "bzcat", "xzcat",
+    # Text processing
+    "grep", "wc", "sort", "uniq", "cut", "tr", "awk", "sed",
+    "echo", "printf", "diff", "cmp", "paste", "join", "column",
+    # System info (read-only)
+    "date", "which", "df", "free", "uptime", "uname", "ps", "nproc",
+    # Hashes
+    "md5sum", "sha1sum", "sha256sum", "sha512sum",
+    # Size & disk
+    "du",
+    # Binary inspection
+    "xxd", "hexdump", "od", "strings",
+    # Python one-liners
+    "python3",
+}
+
+# Commands with subcommand-level restrictions
+_SHELL_SUBCOMMAND_WHITELIST = {
+    "git": {
+        "status", "log", "show", "diff", "branch", "tag",
+        "rev-parse", "ls-files", "describe", "rev-list",
+        "shortlog", "stash", "remote", "config", "ls-remote",
+        "for-each-ref", "name-rev", "merge-base", "cherry",
+    },
+    "pip": {
+        "list", "show", "freeze",
+    },
+}
+
+# Sed flags blocked (can write files)
+_SED_BLOCKED_FLAGS = {"-i", "--in-place"}
+
+# Shell redirects — reject output/input redirects
+_REDIRECT_RE = re.compile(
+    r'(?<![=<>\-])\s*\d?>>?\s*\S|'    # > file, >> file, 2> file
+    r'(?<![=<>\-])\s*<(?![<=])'        # < file (but not <<< heredoc or <=)
+)
+
+# Max output for shell commands
+_MAX_SHELL_OUTPUT = 102400  # 100 KB
+_MAX_SHELL_TIMEOUT = 30  # seconds
+
+
+def _split_pipeline(cmd: str) -> list[str]:
+    """Split a command on unquoted pipe characters only.
+
+    Pipes inside single/double quotes are treated as literal data,
+    not as pipeline separators. Consecutive pipes (||) are NOT split —
+    they are shell logic operators, not pipeline separators.
+    """
+    segments = []
+    current = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        # Handle backslash escapes
+        if ch == '\\' and i + 1 < len(cmd):
+            current.append(ch)
+            current.append(cmd[i + 1])
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == '|' and not in_single and not in_double:
+            # Don't split on || (OR operator) or | at start of command
+            if i + 1 < len(cmd) and cmd[i + 1] == '|':
+                current.append('||')
+                i += 2
+                continue
+            segments.append(''.join(current).strip())
+            current = []
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    if current:
+        segments.append(''.join(current).strip())
+    return segments
+
+
+def _validate_shell_command(command: str) -> str | None:
+    """Validate a shell command against the whitelist and safety rules.
+
+    Uses shlex.split() for proper shell quoting handling: text inside
+    quotes (single, double) is treated as literal data, not syntax.
+
+    Returns an error message string, or None if the command is safe.
+    """
+    if not command or not command.strip():
+        return "命令为空。"
+
+    cmd = command.strip()
+
+    # ── Check for redirects (>/>>/<) ───────────────────────────
+    if _REDIRECT_RE.search(cmd):
+        return "[Shell] 不允许重定向 (> / >> / <)。请使用管道 (|) 代替。"
+
+    # ── Split pipeline on unquoted | and validate each segment ─
+    pipeline = _split_pipeline(cmd)
+    for segment in pipeline:
+        if not segment:
+            return "[Shell] 管道语法错误: 空命令。"
+
+        try:
+            tokens = shlex.split(segment)
+        except ValueError as e:
+            return f"[Shell] 命令解析错误: {e}"
+
+        if not tokens:
+            return "[Shell] 管道语法错误: 空命令。"
+
+        cmd_name = os.path.basename(tokens[0])  # Strip path if present (e.g. /usr/bin/ls)
+
+        # ── Check for dangerous operators ────────────────────
+        # Standalone operators (correctly spaced): ; && || &
+        # Suffix-attached operators (no space before): /etc/passwd; ls
+        # Embedded operators (no-space chaining): cat /etc/passwd;ls
+        # Commands whose arguments may legitimately contain ; (scripts/patterns)
+        _SEMICOLON_SAFE_COMMANDS = {"awk", "sed", "echo", "printf", "grep"}
+        for i, tok in enumerate(tokens):
+            if tok in (";", "&&", "||", "&"):
+                return f"[Shell] 不允许命令链接符号: {tok}"
+            # Catch ; or & attached to preceding argument: "/etc/passwd; ls"
+            if tok.endswith(";") or (tok.endswith("&") and not tok.endswith("&&")):
+                return f"[Shell] 不允许命令链接符号 (在 '{tok}' 中检测到 ';' 或 '&' 后缀)"
+            # Catch ; embedded mid-token: "/etc/passwd;ls"
+            if ";" in tok:
+                is_python_code = (
+                    cmd_name == "python3"
+                    and any(tokens[j] == "-c" for j in range(i))
+                )
+                if not is_python_code and cmd_name not in _SEMICOLON_SAFE_COMMANDS:
+                    return f"[Shell] 不允许命令链接符号 (在 '{tok}' 中检测到 ';')"
+            # Catch && / || embedded anywhere (no-space chaining or inside args)
+            if "&&" in tok or "||" in tok:
+                return f"[Shell] 不允许命令链接符号 (在 '{tok}' 中检测到 '&&' 或 '||')"
+            # Check for backtick command substitution
+            if tok.startswith("`") and tok.endswith("`"):
+                return "[Shell] 不允许反引号命令替换 (``)。"
+            # Check for $(...) pattern
+            if tok.startswith("$(") or "${" in tok:
+                return "[Shell] 不允许命令替换 $(...) 或变量展开 ${...}。"
+
+        # ── Check command whitelist ──────────────────────────
+        if cmd_name in _SHELL_SUBCOMMAND_WHITELIST:
+            # Validate subcommand
+            allowed_subs = _SHELL_SUBCOMMAND_WHITELIST[cmd_name]
+            if len(tokens) < 2:
+                return f"[Shell] {cmd_name} 需要子命令。允许: {', '.join(sorted(allowed_subs))}"
+            sub = tokens[1]
+            # Skip flags before subcommand (e.g. git --no-pager log)
+            if sub.startswith("-"):
+                for t in tokens[1:]:
+                    if not t.startswith("-"):
+                        sub = t
+                        break
+            if sub not in allowed_subs:
+                return (
+                    f"[Shell] 不允许的 {cmd_name} 子命令: {sub}。\n"
+                    f"允许: {', '.join(sorted(allowed_subs))}"
+                )
+
+        elif cmd_name not in _SHELL_WHITELIST:
+            return (
+                f"[Shell] 不允许的命令: {cmd_name}。\n"
+                f"允许的命令 ({len(_SHELL_WHITELIST)} 个): "
+                f"{', '.join(sorted(_SHELL_WHITELIST))}\n"
+                f"带限制的命令: {', '.join(sorted(_SHELL_SUBCOMMAND_WHITELIST.keys()))}"
+            )
+
+        # ── Block sed -i (inline edit) ────────────────────────
+        if cmd_name == "sed":
+            if any(flag in tokens for flag in _SED_BLOCKED_FLAGS):
+                return "[Shell] sed 不允许使用 -i (文件内编辑)。只能进行只读文本处理。"
+
+        # ── Block python3 without -c ──────────────────────────
+        if cmd_name == "python3":
+            if "-c" not in tokens:
+                return "[Shell] python3 仅允许 -c 单行执行模式。"
+
+    return None  # Safe
+
+
+async def shell_exec(command: str, timeout: int = 15) -> str:
+    """Execute a shell command in the workspace directory (read-only, whitelist-gated).
+
+    Supports pipes (|) for chaining commands. Each command in the pipeline
+    is individually validated against a whitelist.
+
+    Blocked: redirects (> / >> / <), command substitution ($() / ``),
+    background execution (&), command chaining (; / && / ||), sed -i, git push.
+
+    Args:
+        command: Shell command to execute (e.g. "ls -la | wc -l").
+        timeout: Max execution time in seconds (max 30, default 15).
+    """
+    if not command or not command.strip():
+        return "[Shell] 请提供要执行的命令。"
+
+    # Validate
+    error = _validate_shell_command(command)
+    if error:
+        return error
+
+    timeout = min(max(timeout, 1), _MAX_SHELL_TIMEOUT)
+
+    # Ensure workspace exists
+    _ensure_workspace_dirs()
+
+    try:
+        result = subprocess.run(
+            ["bash", "-c", command],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=WORKSPACE_ROOT,
+            env={
+                "PATH": "/usr/bin:/usr/local/bin:/bin",
+                "HOME": WORKSPACE_ROOT,
+                "LANG": "en_US.UTF-8",
+                "LC_ALL": "C",
+            },
+        )
+
+        output = ""
+        if result.stdout:
+            stdout = result.stdout[:_MAX_SHELL_OUTPUT]
+            if len(result.stdout) > _MAX_SHELL_OUTPUT:
+                stdout += "\n... (输出过长，已截断)"
+            output += stdout
+        if result.stderr:
+            stderr = result.stderr[:_MAX_SHELL_OUTPUT // 2]
+            if len(result.stderr) > _MAX_SHELL_OUTPUT // 2:
+                stderr += "\n... (错误输出过长，已截断)"
+            if output:
+                output += f"\n--- stderr ---\n{stderr}"
+            else:
+                output = stderr
+
+        if result.returncode != 0:
+            output += f"\n(退出码: {result.returncode})"
+
+        return output.strip() or "(命令执行完成，无输出)"
+
+    except subprocess.TimeoutExpired:
+        return (
+            f"[Shell] 命令执行超时 ({timeout}秒)。\n"
+            f"命令: {command}\n"
+            f"如需更长时间，请使用更大 timeout 参数 (最大 {_MAX_SHELL_TIMEOUT}秒)"
+        )
+    except FileNotFoundError:
+        return (
+            f"[Shell] 命令未找到。可能是工具未安装。\n"
+            f"命令: {command}\n"
+            f"允许的命令: {', '.join(sorted(_SHELL_WHITELIST))}"
+        )
+    except Exception as e:
+        return f"[Shell] 命令执行失败: {e}"

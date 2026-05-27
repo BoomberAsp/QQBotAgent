@@ -46,7 +46,7 @@ QQBotAgent/
     │       ├── SOUL.md      #     人格定义 & 行为规则
     │       ├── IDENTITY.md  #     身份声明 (名称/版本/能力/安全模型)
     │       ├── AGENTS.md    #     编排规则 (工具选择/错误处理/工作区约束)
-    │       ├── TOOLS.md     #     工具文档参考 (全部 17 个工具)
+    │       ├── TOOLS.md     #     工具文档参考 (全部 18 个工具)
     │       ├── WORKSPACE.md #     工作区约束 & 能力边界 (硬性规则)
     │       ├── BOOTSTRAP.md #     启动序列 & 健康检查
     │       ├── SESSION.md   #     会话参数配置
@@ -69,7 +69,7 @@ QQBotAgent/
     │   └── utils.py         #   工具函数 (全部注释)
     │
     ├── tools/               # Agent 工具实现
-    │   ├── builtin_tools.py #   5 个内置工具 (搜索/代码/PDF/Git/时间)
+    │   ├── builtin_tools.py #   6 个内置工具 (搜索/代码/Shell/PDF/Git/时间)
     │   ├── file_tools.py    #   文件读取工具 (文本/PDF/图片分析)
     │   ├── map_tools.py     #   地图工具 (地理编码/逆编码/天气/POI/路径)
     │   └── legacy_tools.py  #   6 个游戏/娱乐工具 (抽卡/动画/测速/乱速/解释/翻译)
@@ -377,15 +377,16 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
             └── >300 字符 → _split_text() 句子边界拆分 → 逐块 _safe_send() (1s 间隔)
 ```
 
-#### 已注册工具 (17 个)
+#### 已注册工具 (18 个)
 
-**内置工具 (6 个)**:
+**内置工具 (7 个)**:
 
 | 工具名 | 来源 | 说明 |
 |--------|------|------|
 | `get_time` | builtin_tools | 获取当前日期和时间 (含中文星期) |
 | `search_web` | builtin_tools | SearXNG 聚合搜索 — 覆盖天气/新闻/百科/知识 |
 | `execute_code` | builtin_tools | 执行 Python 代码，自动捕获并发送生成的图表 |
+| `shell_exec` | builtin_tools | 执行只读 shell 命令（白名单+管道，40+命令） |
 | `download_repo` | builtin_tools | Git clone 代码仓库 (HTTPS only, 命令注入防护) |
 | `summarize_pdf` | builtin_tools | 提取并总结 PDF 内容 (PyPDF2, 路径验证) |
 | `read_file` | file_tools | 读取用户上传的文件 (文本/PDF/图片, 图片可 AI 分析) |
@@ -557,6 +558,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 | `get_time()` | 返回当前日期时间 (含中文星期) | `datetime.now().strftime` |
 | `search_web(query, num_results=5)` | SearXNG 聚合搜索 (覆盖天气/新闻/百科) | `urllib.request` → SearXNG JSON API (`/search?format=json`)，15s 超时，安全搜索开启，中文优先 |
 | `execute_code(code, timeout=30)` | 异步，执行 Python 代码 + 自动发送图表 | `subprocess.run` (独立 tmpdir)，扫描 .png/.svg 等图片 → 拷贝到 output/ → QQ 发送 |
+| `shell_exec(command, timeout=15)` | 异步，执行只读 shell 命令 (白名单+管道) | `subprocess.run(["bash", "-c", cmd])`，40+ 白名单命令，管道解析验证，危险字符拦截 |
 | `download_repo(repo_url)` | Git clone 仓库 (HTTPS only) | `subprocess.run(["git", "clone", url, path])`，已存在则 pull，120s 超时 |
 | `summarize_pdf(file_path)` | 提取 PDF 文本 (前 8000 字符) | PyPDF2 → 逐页提取 → 截断，路径验证 |
 
@@ -1118,4 +1120,18 @@ v2.7 基础上增加:
   - SOUL.md 新增 "高负载任务" 拒绝规则 + "服务器硬件上下文" 说明
 
 文件: tools/builtin_tools.py (修改), agent/config/WORKSPACE.md (修改), agent/config/SOUL.md (修改)
+```
+
+### v2.12 — Shell 命令执行工具 (2026-05-27)
+```
+新增: shell_exec
+  - 白名单制: 40+ 命令 (ls/find/cat/grep/wc/du/df/free/git/pip/python3 -c 等)
+  - 子命令限制: git (status/log/show/diff/branch/...), pip (list/show/freeze)
+  - 管道支持: 每个管道段独立验证
+  - 安全拦截: 重定向 (>/>>/<)、命令替换 ($()/``)、链式执行 (;/&&/||)、后台 (&)、sed -i
+  - 工作区锁定: cwd 固定在 WORKSPACE_ROOT, 干净环境变量
+  - 输出截断: 100KB, 超时 30s
+  - 验证函数与执行函数分离, 便于测试
+
+工具数量: 17 → 18
 ```

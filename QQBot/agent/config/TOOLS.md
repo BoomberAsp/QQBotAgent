@@ -202,6 +202,37 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ---
 
+## Tool: shell_exec
+
+**Description**: Execute read-only shell commands in the server workspace. Supports pipes (`|`) for chaining. Every command is validated against a whitelist before execution. 40+ commands available.
+
+**When to use**: When you need quick system info (disk, memory), file metadata, text processing via shell pipes, directory exploration, or git repo inspection. Not for tasks that Python can handle more clearly.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string",
+      "description": "Shell command with optional pipes. E.g. 'ls -la | wc -l', 'df -h', 'grep -r TODO . | head -20'"
+    },
+    "timeout": {
+      "type": "integer",
+      "description": "Max execution time in seconds (default: 15, max: 30)",
+      "default": 15
+    }
+  },
+  "required": ["command"]
+}
+```
+
+**Allowed commands**: `ls`, `find`, `tree`, `cat`, `head`, `tail`, `grep`, `wc`, `sort`, `uniq`, `cut`, `tr`, `awk`, `sed` (no -i), `du`, `df`, `free`, `ps`, `file`, `stat`, `diff`, `md5sum`, `sha256sum`, `xxd`, `strings`, `python3 -c`, `git` (status/log/show/diff/branch/...), `pip` (list/show/freeze), and more.
+
+**Blocked**: Redirects (`>` / `>>` / `<`), command substitution (`$()` / backticks), background (`&`), chaining (`;` / `&&` / `||`), sed `-i`, git push.
+
+---
+
 ## Tool: translate_text
 
 **Description**: Translate text between languages. Supports multiple language pairs.

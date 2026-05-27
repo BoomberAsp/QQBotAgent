@@ -35,6 +35,7 @@ from tools.builtin_tools import (
     get_time,
     search_web,
     download_repo,
+    shell_exec,
     summarize_pdf,
     WORKSPACE_UPLOADS,
     _ensure_workspace_dirs,
@@ -176,6 +177,21 @@ def _build_tool_registry() -> ToolRegistry:
                 "timeout": {"type": "integer", "description": "超时秒数，默认30", "default": 30},
             },
             "required": ["code"],
+        },
+    )
+    registry.register(
+        "shell_exec", shell_exec,
+        "在服务器上执行只读 shell 命令。支持管道 (|) 串联多个命令，每个命令必须属于白名单。"
+        "允许的命令包括: ls/find/cat/head/tail/grep/wc/sort/uniq/du/df/free/file/stat/python3 -c 等。"
+        "禁止: 重定向 (>/>>/<)、命令替换 ($()/``)、后台运行 (&)、链接执行 (;/&&/||)、sed -i。"
+        "适合: 查看目录结构、统计文件行数、检查磁盘内存、快速文本处理、git log/status。",
+        {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要执行的 shell 命令。支持管道，如 'ls -la | wc -l'"},
+                "timeout": {"type": "integer", "description": "超时秒数，默认15", "default": 15},
+            },
+            "required": ["command"],
         },
     )
     registry.register(

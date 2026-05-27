@@ -281,12 +281,13 @@ class ContinuousSessionManager:
 | `MemorySystem` | `memory.py` | 长期记忆（Markdown 文件），关键词搜索，最多返回 3 条 |
 | `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣，持久化到 `data/users/` |
 
-## 已注册工具（17 个）
+## 已注册工具（18 个）
 
 | 工具 | 说明 |
 |------|------|
 | `search_web` | SearXNG 聚合搜索（天气 / 新闻 / 百科） |
 | `execute_code` | Python 沙盒执行（支持图表输出） |
+| `shell_exec` | Shell 命令执行（白名单+管道） |
 | `get_time` | 当前日期时间 |
 | `read_file` | 读取文件（文本 / PDF / 图片 AI 分析） |
 | `summarize_pdf` | PDF 提取 + 总结 |
