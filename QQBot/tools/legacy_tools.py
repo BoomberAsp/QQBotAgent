@@ -5,6 +5,7 @@ These tools bridge the existing game/entertainment features
 (gacha, speed calc, translation) into the agent tool system.
 """
 
+import asyncio
 import sys
 import os
 
@@ -39,6 +40,78 @@ def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -> str:
     results = [drawing_cards(pool_type, up_character) for _ in range(count)]
     text_segment, _ = format_result(results, count)
     return str(text_segment)
+
+
+async def play_gacha_animation(star_level: int, is_single: bool = False) -> str:
+    """Play gacha pull animation frames in QQ chat.
+
+    Reads animation images and sends them sequentially (0.75s intervals).
+    Uses the _send_msg context variable set by agent_router to send images.
+
+    Args:
+        star_level: Highest star level (3=blue, 4=purple, 5=gold, 6=red).
+        is_single: True for single pull, False for ten-pull.
+    """
+    from agent.context import _send_msg
+    from plugins.pullingMonitor import (
+        pull_1, blue_end, blue_middle, blue_or_purple_spaceship_close,
+        blue_spaceship_open, gold_spaceship_close, gold_spaceship_open,
+        golden_end, purple_middle, purple_end, purple_spaceship_open,
+        red_end, red_spaceship_close, red_spaceship_open,
+        single_pull_start, ten_pull_start,
+    )
+    from nonebot.adapters.onebot.v11 import MessageSegment
+
+    send = _send_msg.get()
+    if send is None:
+        return "[Gacha] 当前环境不支持发送图片（非QQ聊天上下文）。"
+
+    if star_level not in (3, 4, 5, 6):
+        return f"[Gacha] 无效的星级: {star_level}。可选: 3(蓝), 4(紫), 5(金), 6(红)"
+
+    # ── Build animation sequence ─────────────────────────────────
+    frames = []
+
+    # First frame: start animation
+    if is_single:
+        frames.append(single_pull_start)
+    else:
+        frames.append(ten_pull_start)
+
+    # Second frame: pull action
+    frames.append(pull_1)
+
+    # Middle + End + Spaceship sequence per star level
+    if star_level == 3:
+        frames.extend([blue_middle, blue_end,
+                       blue_or_purple_spaceship_close, blue_spaceship_open])
+    elif star_level == 4:
+        frames.extend([blue_middle, purple_end,
+                       blue_or_purple_spaceship_close, purple_spaceship_open])
+    elif star_level == 5:
+        frames.extend([purple_middle, golden_end,
+                       gold_spaceship_close, gold_spaceship_open])
+    elif star_level == 6:
+        frames.extend([purple_middle, red_end,
+                       red_spaceship_close, red_spaceship_open])
+
+    # ── Play frames ─────────────────────────────────────────────
+    sent_count = 0
+    for frame in frames:
+        if frame is None:
+            continue  # Image file missing, skip silently
+        try:
+            await send(frame)
+            sent_count += 1
+            await asyncio.sleep(0.75)
+        except Exception:
+            pass  # One frame failed, continue with the rest
+
+    if sent_count == 0:
+        return "[Gacha] 动画播放失败: 所有图片资源缺失。"
+
+    star_label = {3: "蓝色", 4: "紫色", 5: "金色", 6: "红色"}.get(star_level, str(star_level))
+    return f"[Gacha] {star_label}抽卡动画已播放 ({sent_count}/{len(frames)} 帧)。"
 
 
 # ── Speed Calculation ────────────────────────────────────────────

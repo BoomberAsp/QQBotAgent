@@ -39,13 +39,14 @@ QQBotAgent/
     │   ├── tool_registry.py #   工具注册表 (OpenAI JSON Schema 生成)
     │   ├── session.py       #   会话管理 (per-user, timeout, trim, 持久化)
     │   ├── continuous_session.py # 群聊连续对话窗口管理 (5分钟免@)
+    │   ├── context.py       #   执行上下文传递 (contextvars, 工具→QQ图片)
     │   ├── memory.py        #   长期记忆系统 (Markdown 文件存储)
     │   ├── profile.py       #   用户画像 (LLM 驱动背景事实提取)
     │   └── config/          #   智能体配置文件 (12 个)
     │       ├── SOUL.md      #     人格定义 & 行为规则
     │       ├── IDENTITY.md  #     身份声明 (名称/版本/能力/安全模型)
     │       ├── AGENTS.md    #     编排规则 (工具选择/错误处理/工作区约束)
-    │       ├── TOOLS.md     #     工具文档参考 (全部 11 个工具)
+    │       ├── TOOLS.md     #     工具文档参考 (全部 17 个工具)
     │       ├── WORKSPACE.md #     工作区约束 & 能力边界 (硬性规则)
     │       ├── BOOTSTRAP.md #     启动序列 & 健康检查
     │       ├── SESSION.md   #     会话参数配置
@@ -71,7 +72,7 @@ QQBotAgent/
     │   ├── builtin_tools.py #   5 个内置工具 (搜索/代码/PDF/Git/时间)
     │   ├── file_tools.py    #   文件读取工具 (文本/PDF/图片分析)
     │   ├── map_tools.py     #   地图工具 (地理编码/逆编码/天气/POI/路径)
-    │   └── legacy_tools.py  #   5 个游戏/娱乐工具 (抽卡/测速/乱速/解释/翻译)
+    │   └── legacy_tools.py  #   6 个游戏/娱乐工具 (抽卡/动画/测速/乱速/解释/翻译)
     │
     ├── config/              # 敏感配置文件 (git-ignored)
     │   ├── multimodal.json  #   多模态 LLM 配置 (已被 models_settings.json 取代)
@@ -375,7 +376,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
             └── >300 字符 → _split_text() 句子边界拆分 → 逐块 _safe_send() (1s 间隔)
 ```
 
-#### 已注册工具 (11 个)
+#### 已注册工具 (17 个)
 
 **内置工具 (6 个)**:
 
@@ -398,11 +399,12 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 | `search_poi` | map_tools | POI搜索 (餐厅/地铁/银行等) |
 | `plan_route` | map_tools | 路径规划 (驾车/步行/公交) |
 
-**娱乐工具 (5 个)**:
+**娱乐工具 (6 个)**:
 
 | 工具名 | 来源 | 说明 |
 |--------|------|------|
 | `gacha_pull` | legacy_tools | 模拟游戏抽卡 (4 种卡池, 单抽/十连) |
+| `play_gacha_animation` | legacy_tools | 播放抽卡动画 (根据星级发送图片序列) |
 | `calculate_speed` | legacy_tools | 根据战斗行动值数据计算敌方速度 |
 | `compare_speed_probability` | legacy_tools | 计算两个速度值的乱速概率 |
 | `explain_code` | legacy_tools | LLM 中文解释代码功能和原理 |
@@ -563,15 +565,18 @@ Agent 必须在以下情况拒绝 (礼貌):
 |------|------|----------|
 | `read_file(file_path)` | 读取并分析文件 (文本/PDF/图片) | 扩展名检测 → 文本直接读取 (UTF-8, 50KB cap) / PDF→PyPDF2 / 图片→PIL 元数据 + 多模态 LLM 分析 |
 
-### 5.3 `tools/legacy_tools.py` — 游戏/娱乐工具 (5 个)
+### 5.3 `tools/legacy_tools.py` — 游戏/娱乐工具 (6 个)
 
 | 函数 | 说明 | 依赖 |
 |------|------|------|
 | `gacha_pull(pool_type, count, up_character)` | 模拟抽卡 (4 种卡池) | `pullingMonitor.drawing_cards` + `format_result` |
+| `play_gacha_animation(star_level, is_single)` | 播放抽卡动画 (图片序列) | `pullingMonitor` 图片资源 + `_send_msg` contextvar |
 | `calculate_speed(battle_data)` | 敌方速度计算 | `group.parse_speed_data` + `compute_speed_results` |
 | `compare_speed_probability(speed_1, speed_2)` | 乱速概率计算 | `speed.compute_prob` |
 | `explain_code_tool(code)` | LLM 代码解释 | `deepseek_client.chat_completion` |
 | `translate_text(text, target_language)` | LLM 多语言翻译 | `deepseek_client.chat_completion` |
+
+`play_gacha_animation` 通过 `agent/context.py` 中的 `contextvars.ContextVar` 获取图片发送回调，直接向 QQ 聊天窗口发送 `MessageSegment.image`。无需修改 Agent → ToolRegistry → Tool 的中间层签名。
 
 ### 5.4 `tools/map_tools.py` — 地图工具 (5 个)
 
@@ -1070,4 +1075,17 @@ v2.7 基础上增加:
 
 **API**: 高德地图 Web Services, 免费 5000 次/天, 无需实名。
 工具数量: 11 → 16
+```
+
+### v2.9 — 抽卡动画工具 (2026-05-27)
+```
+新增: play_gacha_animation
+  - 拆分为两个工具: gacha_pull (文字结果) + play_gacha_animation (图片动画)
+  - 通过 contextvars 实现工具→QQ 图片发送, 无需修改中间层签名
+  - agent/context.py: _send_msg ContextVar, agent_router 在执行前 set, 执行后 reset
+  - _safe_send 签名扩展: 同时接受 str 和 MessageSegment
+  - 动画帧: 6~7 张图片, 0.75s 间隔, 根据星级和单/十连选择动画分支
+  - 文件: agent/context.py (新增), tools/legacy_tools.py (修改), plugins/agent_router.py (修改)
+
+工具数量: 16 → 17
 ```

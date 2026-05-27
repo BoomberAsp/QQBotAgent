@@ -20,6 +20,7 @@ from nonebot.rule import to_me
 
 from agent.agent import Agent
 from agent.continuous_session import ContinuousSessionManager
+from agent.context import _send_msg
 from agent.tool_registry import ToolRegistry
 from agent.session import SessionManager
 from agent.memory import MemorySystem
@@ -51,6 +52,7 @@ from tools.legacy_tools import (
     compare_speed_probability,
     explain_code_tool,
     gacha_pull,
+    play_gacha_animation,
     translate_text,
 )
 
@@ -281,7 +283,9 @@ def _build_tool_registry() -> ToolRegistry:
     # Legacy tools (game features)
     registry.register(
         "gacha_pull", gacha_pull,
-        "模拟游戏抽卡/招募。支持单抽和十连抽，四种卡池类型。",
+        "模拟游戏抽卡/招募。支持单抽和十连抽，四种卡池类型。"
+        "只返回文字结果。如果用户想看抽卡动画，在得到文字结果后，告诉用户可以直接要求播放动画，"
+        "然后调用 play_gacha_animation 工具并传入对应星级。",
         {
             "type": "object",
             "properties": {
@@ -294,6 +298,19 @@ def _build_tool_registry() -> ToolRegistry:
                 "up_character": {"type": "string", "description": "UP角色名(几率up招募和神秘招募需要)", "default": None},
             },
             "required": ["pool_type", "count"],
+        },
+    )
+    registry.register(
+        "play_gacha_animation", play_gacha_animation,
+        "播放抽卡动画。在用户看完文字抽卡结果后，如果用户想看动画效果，调用此工具。"
+        "传入最高星级（3=蓝色, 4=紫色, 5=金色, 6=红色）和是否为单抽。动画会直接发送到QQ聊天窗口。",
+        {
+            "type": "object",
+            "properties": {
+                "star_level": {"type": "integer", "description": "最高星级。3=蓝色, 4=紫色, 5=金色, 6=红色", "enum": [3, 4, 5, 6]},
+                "is_single": {"type": "boolean", "description": "是否为单抽。true=单抽, false=十连", "default": False},
+            },
+            "required": ["star_level", "is_single"],
         },
     )
     registry.register(
@@ -453,10 +470,16 @@ async def handle_agent_message(event: MessageEvent):
         # Run the agent loop with timeout
         async def _progress(msg: str):
             await _safe_send(msg)
-        response = await asyncio.wait_for(
-            agent.run(augmented_message, user_id, client=client, progress_callback=_progress),
-            timeout=200.0,  # Slightly more than thinking_timeout
-        )
+        async def _send_image(seg):
+            await _safe_send(seg)
+        token = _send_msg.set(_send_image)
+        try:
+            response = await asyncio.wait_for(
+                agent.run(augmented_message, user_id, client=client, progress_callback=_progress),
+                timeout=200.0,  # Slightly more than thinking_timeout
+            )
+        finally:
+            _send_msg.reset(token)
 
         # Send response (split long messages)
         await _send_response(response)
@@ -556,11 +579,17 @@ async def handle_continuous_message(event: MessageEvent):
         else:
             client = _model_router.reasoning_client
 
-        response = await asyncio.wait_for(
-            agent.run(augmented_message, user_id, client=client,
-                       progress_callback=lambda msg: _safe_send(msg, matcher=continuous_router)),
-            timeout=200.0,
-        )
+        async def _send_image(seg):
+            await _safe_send(seg, matcher=continuous_router)
+        token = _send_msg.set(_send_image)
+        try:
+            response = await asyncio.wait_for(
+                agent.run(augmented_message, user_id, client=client,
+                           progress_callback=lambda msg: _safe_send(msg, matcher=continuous_router)),
+                timeout=200.0,
+            )
+        finally:
+            _send_msg.reset(token)
 
         await _send_response(response, matcher=continuous_router)
 
@@ -570,11 +599,11 @@ async def handle_continuous_message(event: MessageEvent):
         await _safe_send(f"处理消息时出现错误: {str(e)}", matcher=continuous_router)
 
 
-async def _safe_send(message: str, max_retries: int = 2, matcher=None):
-    """Send a message with retry on timeout.
+async def _safe_send(message, max_retries: int = 2, matcher=None):
+    """Send a message (str or MessageSegment) with retry on timeout.
 
     Args:
-        message: Message text to send.
+        message: Message text (str) or MessageSegment (e.g. image).
         max_retries: Number of retry attempts on ActionFailed.
         matcher: Optional matcher to use for sending. Defaults to agent_router.
     """

@@ -281,7 +281,7 @@ class ContinuousSessionManager:
 | `MemorySystem` | `memory.py` | 长期记忆（Markdown 文件），关键词搜索，最多返回 3 条 |
 | `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣，持久化到 `data/users/` |
 
-## 已注册工具（16 个）
+## 已注册工具（17 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -294,6 +294,7 @@ class ContinuousSessionManager:
 | `translate_text` | 多语言翻译 |
 | `explain_code` | 代码解释 |
 | `gacha_pull` | 抽卡模拟（4 种卡池） |
+| `play_gacha_animation` | 抽卡动画播放（图片序列） |
 | `calculate_speed` | 游戏战斗测速 |
 | `compare_speed_probability` | 乱速概率计算 |
 | `geocode` | 地址 → 经纬度坐标查询 |

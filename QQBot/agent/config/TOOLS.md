@@ -261,6 +261,41 @@ This document defines all tools available to the agent. Each tool has a name, de
 }
 ```
 
+**Important**: This tool only returns **text** results. If the user wants to see the pull animation, tell them you can play it and call `play_gacha_animation` with the star level from the pull result.
+
+---
+
+## Tool: play_gacha_animation
+
+**Description**: Play gacha pull animation images directly in the QQ chat. Sends a sequence of animation frames with 0.75s intervals.
+
+**When to use**: AFTER `gacha_pull` has returned text results, and the user explicitly asks to see the animation (e.g. "看看动画", "播放动画", "我要看"). Do NOT call this before showing text results.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "star_level": {
+      "type": "integer",
+      "description": "Highest star level from the pull: 3=blue, 4=purple, 5=gold, 6=red",
+      "enum": [3, 4, 5, 6]
+    },
+    "is_single": {
+      "type": "boolean",
+      "description": "Whether the pull was a single pull (true) or ten-pull (false)",
+      "default": false
+    }
+  },
+  "required": ["star_level", "is_single"]
+}
+```
+
+**Workflow example**:
+1. User: "帮我抽卡" → Call `gacha_pull` → Get text results
+2. Tell user: "抽到了 金色【角色名】... 要看抽卡动画吗？"
+3. User: "要"/"看" → Call `play_gacha_animation(star_level=5, is_single=false)` → Animation plays in chat
+
 ---
 
 ## Tool: calculate_speed
