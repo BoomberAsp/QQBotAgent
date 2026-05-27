@@ -180,13 +180,10 @@ async def explain_code_tool(code: str) -> str:
     Args:
         code: Code snippet to explain.
     """
-    from lib.deepseek_client import deepseek_client as _dc
-    if _dc is None:
-        from lib.deepseek_client import DeepSeekClient
-        _dc = DeepSeekClient()
+    from lib.model_router import model_router
 
     prompt = f"请解释以下代码：\n```\n{code}\n```\n请用中文详细解释这段代码的功能和作用。"
-    return await _dc.chat_completion(prompt)
+    return await model_router.flash_client.chat_completion(prompt)
 
 
 # ── Translation ──────────────────────────────────────────────────
@@ -198,10 +195,7 @@ async def translate_text(text: str, target_language: str = "Chinese") -> str:
         text: Text to translate.
         target_language: Target language (default: Chinese).
     """
-    from lib.deepseek_client import deepseek_client as _dc
-    if _dc is None:
-        from lib.deepseek_client import DeepSeekClient
-        _dc = DeepSeekClient()
+    from lib.model_router import model_router
 
     prompt = f"请将以下内容翻译成{target_language}：\n{text}"
-    return await _dc.chat_completion(prompt)
+    return await model_router.flash_client.chat_completion(prompt)

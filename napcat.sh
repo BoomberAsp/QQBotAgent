@@ -446,7 +446,7 @@ function check_root_for_shell_install() {
     if [[ $EUID -eq 0 ]]; then
         echo ""
         echo -e "${RED}╔══════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${RED}║  警告: 请勿使用 root 用户进行 Shell (Rootless) 安装！     ║${NC}"
+        echo -e "${RED}║  警告: 请勿使用 root 用户进行 Shell (Rootless) 安装！    ║${NC}"
         echo -e "${RED}╚══════════════════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "${YELLOW}Shell 安装会将 Napcat 安装到当前用户的 HOME 目录:${NC}"
