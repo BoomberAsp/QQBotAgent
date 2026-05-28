@@ -94,6 +94,11 @@ async def _download_and_save_file(url: str, filename: str, max_size_mb: int = 50
     if not url:
         return None, "文件 URL 为空，无法下载。"
 
+    # Resolve relative URLs (e.g. voice message /api/get_record) to full URLs
+    if not url.startswith(("http://", "https://")):
+        napcat_base = os.environ.get("NAPCAT_HTTP_BASE", "http://127.0.0.1:6099")
+        url = napcat_base.rstrip("/") + "/" + url.lstrip("/")
+
     max_size_bytes = max_size_mb * 1024 * 1024
 
     # Ensure the uploads directory exists

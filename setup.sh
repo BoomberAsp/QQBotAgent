@@ -131,6 +131,7 @@ setup_env() {
         echo "  DEEPSEEK_API_BASE=https://api.deepseek.com"
         echo "  SEARXNG_ENDPOINT=http://localhost:8082"
         echo "  AMAP_API_KEY=<你的高德地图Key> (可选, 用于地图工具)"
+        echo "  NAPCAT_HTTP_BASE=http://127.0.0.1:6099 (NapCat HTTP服务地址, 用于下载语音消息)"
         echo "  USER_DATA_ROOT=/data/qqbot/users (用户数据根目录)"
         echo "  MAX_SPECIAL_SESSIONS=3 (每用户最大特殊会话数)"
         echo "  USER_WORKSPACE_QUOTA_MB=500 (每用户工作区配额)"
@@ -152,6 +153,8 @@ AMAP_API_KEY=
 USER_DATA_ROOT=/data/qqbot/users
 MAX_SPECIAL_SESSIONS=3
 USER_WORKSPACE_QUOTA_MB=500
+# ── NapCat HTTP 服务地址 (用于下载语音/图片/文件) ──
+NAPCAT_HTTP_BASE=http://127.0.0.1:6099
 EOF
         echo -e "${GREEN}[OK]${NC} .env 模板已创建"
         echo -e "${RED}[!!!]${NC} 请编辑 QQBot/.env 填入你的配置:"
