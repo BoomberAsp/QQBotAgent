@@ -405,21 +405,19 @@ class MultimodalClient:
             src_size = os.path.getsize(audio_path)
             wav_size = os.path.getsize(converted_path)
 
+            # Read WAV file for data URI (both paths use this now)
+            with open(converted_path, "rb") as f:
+                audio_data = f.read()
+            encoded = base64.b64encode(audio_data).decode("utf-8")
+            data_uri = f"data:audio/wav;base64,{encoded}"
+
             if is_dashscope:
-                # DashScope native API: raw PCM base64, no container
-                raw_pcm = self._extract_raw_pcm(converted_path)
-                audio_b64 = base64.b64encode(raw_pcm).decode("utf-8")
                 debug_info = (
                     f"[DEBUG] 源文件: {src_size}B, WAV: {wav_size}B, "
-                    f"PCM: {len(raw_pcm)}B, base64: {len(audio_b64)}字符, "
-                    f"前80字符: {audio_b64[:80]}"
+                    f"data_uri长度: {len(data_uri)}, "
+                    f"前80字符: {data_uri[:80]}"
                 )
             else:
-                # Generic API: data URI (video_url fallback)
-                with open(converted_path, "rb") as f:
-                    audio_data = f.read()
-                encoded = base64.b64encode(audio_data).decode("utf-8")
-                data_uri = f"data:audio/wav;base64,{encoded}"
                 debug_info = (
                     f"[DEBUG] 源文件: {src_size}B, WAV: {wav_size}B, "
                     f"data_uri长度: {len(data_uri)}, "
@@ -443,12 +441,16 @@ class MultimodalClient:
 
         if is_dashscope:
             # ── DashScope native multimodal API ────────────────────
-            # Uses input.audios with raw PCM base64 (no data URI).
+            # Audio goes in message content as {"audio": data_uri},
+            # same pattern as {"image": data_uri} for images.
             # Compatible-mode /chat/completions does NOT support audio.
             messages = [
                 {
                     "role": "user",
-                    "content": [{"text": prompt}],
+                    "content": [
+                        {"text": prompt},
+                        {"audio": data_uri},
+                    ],
                 }
             ]
 
@@ -456,7 +458,6 @@ class MultimodalClient:
                 "model": model,
                 "input": {
                     "messages": messages,
-                    "audios": [audio_b64],
                 },
                 "parameters": {
                     "max_tokens": max_tokens,
