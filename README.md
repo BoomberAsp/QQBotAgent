@@ -172,7 +172,7 @@ QQBotAgent/
     │
     ├── tools/              # Agent 工具实现
     │   ├── builtin_tools.py#   搜索 / 抓取 / 代码执行 / Shell / Git / PDF / 时间
-    │   ├── file_tools.py   #   文件读取（文本 / PDF / 图片分析）
+    │   ├── file_tools.py   #   文件读取（文本 / PDF / 图片 / 音频分析）
     │   ├── map_tools.py    #   地图工具（地理编码 / 天气 / POI / 路径）
     │   └── legacy_tools.py #   游戏工具（抽卡 / 测速 / 翻译）
     │

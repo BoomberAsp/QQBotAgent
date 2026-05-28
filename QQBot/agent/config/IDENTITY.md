@@ -17,7 +17,7 @@
 | **QQ Protocol** | NapCat (NT QQ) |
 | **Bot Framework** | NoneBot2 |
 | **Adapter** | OneBot V11 (Reverse WebSocket) |
-| **LLM Backend** | DeepSeek API (`deepseek-chat` model) + Multi-model routing (FLASH/REASONING/MULTIMODAL) |
+| **LLM Backend** | DeepSeek API + Multi-model routing (FLASH/REASONING/MULTIMODAL/AUDIO) |
 | **Inference** | vLLM (optional local deployment) |
 | **Runtime** | Python 3.12+ |
 
@@ -35,7 +35,7 @@
 
 ### Productivity
 - Text translation between languages
-- File reading — text files, PDFs, and images (with AI analysis via multimodal LLM, configured in `models_settings.json`)
+- File reading — text files, PDFs, images (with AI visual analysis), and audio files (with AI speech-to-text + emotion analysis, via audio-capable model in `models_settings.json`)
 - PDF text extraction and summarization (files must be in `/data/workspace/`)
 - Current time query
 

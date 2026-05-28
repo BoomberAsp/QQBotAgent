@@ -1,10 +1,11 @@
 """
-File Tools — Read and analyze uploaded files (text, PDF, images).
+File Tools — Read and analyze uploaded files (text, PDF, images, audio).
 
-The `read_file` tool handles three file types:
+The `read_file` tool handles four file types:
 1. Text files — read and return contents (UTF-8, capped at 50KB)
 2. PDF files — extract text via PyPDF2
 3. Image files — return metadata, plus AI analysis if multimodal LLM configured
+4. Audio files — return metadata, plus AI analysis if audio model configured
 
 All file access is validated by _validate_path (workspace boundary enforcement).
 """
@@ -35,6 +36,11 @@ _TEXT_EXTENSIONS = {
 
 _IMAGE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+}
+
+_AUDIO_EXTENSIONS = {
+    ".amr", ".silk", ".wav", ".mp3", ".ogg",
+    ".m4a", ".aac", ".flac", ".opus", ".wma", ".aiff",
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -107,13 +113,18 @@ async def read_file(file_path: str) -> str:
     if ext in _IMAGE_EXTENSIONS:
         return await _read_image_file(safe_path)
 
+    # ── Audio Files ─────────────────────────────────────────────────
+    if ext in _AUDIO_EXTENSIONS:
+        return await _read_audio_file(safe_path)
+
     # ── Unsupported ─────────────────────────────────────────────────
-    supported = sorted(_TEXT_EXTENSIONS | _IMAGE_EXTENSIONS | {".pdf"})
+    supported = sorted(_TEXT_EXTENSIONS | _IMAGE_EXTENSIONS | _AUDIO_EXTENSIONS | {".pdf"})
     return (
         f"[ReadFile] 不支持的文件类型: {ext}\n\n"
         f"支持的文件类型:\n"
         f"  文本: {', '.join(ext for ext in sorted(_TEXT_EXTENSIONS)[:15])} ...\n"
         f"  图片: {', '.join(sorted(_IMAGE_EXTENSIONS))}\n"
+        f"  音频: {', '.join(sorted(_AUDIO_EXTENSIONS))}\n"
         f"  PDF: .pdf"
     )
 
@@ -241,6 +252,48 @@ async def _read_image_file(path: str) -> str:
         lines.append(
             "提示: 配置多模态 LLM 后可以自动分析图片内容。\n"
             "请编辑 QQBot/config/multimodal.json 并重启机器人。"
+        )
+
+    return "\n".join(lines)
+
+
+async def _read_audio_file(path: str) -> str:
+    """Analyze an audio file — metadata + optional AI analysis."""
+    metadata = multimodal_client._get_audio_metadata(path)
+
+    lines = [
+        f"[文件信息] {os.path.basename(path)}",
+    ]
+
+    if metadata.get("error"):
+        lines.append(f"  错误: {metadata['error']}")
+    else:
+        duration = metadata.get("duration_seconds", 0)
+        duration_str = (
+            f"{int(duration // 60)}分{int(duration % 60)}秒"
+            if duration > 0 else "未知"
+        )
+        lines.extend([
+            f"  类型: 音频 ({metadata.get('codec', 'unknown').upper()})",
+            f"  时长: {duration_str}",
+            f"  采样率: {metadata.get('sample_rate', '?')} Hz",
+            f"  声道: {metadata.get('channels', '?')}",
+            f"  文件大小: {_format_size(metadata.get('file_size', 0))}",
+        ])
+
+    lines.append("")
+
+    if multimodal_client.is_audio_available():
+        lines.append(f"{'─' * 40}")
+        lines.append("[AI 音频分析]")
+        lines.append("")
+        analysis = await multimodal_client.analyze_audio(path)
+        lines.append(analysis)
+    else:
+        lines.append(
+            "提示: 配置支持音频的多模态 LLM 后可以自动分析音频内容。\n"
+            "请编辑 QQBot/config/models_settings.json 的 AUDIO_MODEL 部分\n"
+            "（或 MULTIMODAL_MODEL 如果该模型也支持音频）并重启机器人。"
         )
 
     return "\n".join(lines)

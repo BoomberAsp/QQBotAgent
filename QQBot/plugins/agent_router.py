@@ -523,13 +523,26 @@ async def handle_agent_message(event: MessageEvent):
                 elif error:
                     file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
 
+        elif seg.type == "record":
+            url = seg.data.get("url", "")
+            file_id = seg.data.get("file", "")
+            if url:
+                saved_path, error = await _download_and_save_file(url, f"voice-{file_id}")
+                if saved_path:
+                    file_context_parts.append(
+                        f"[用户发送了语音消息，已保存至: {saved_path}]\n"
+                        f"用户发送了语音消息，可以使用 read_file 工具分析音频内容。"
+                    )
+                elif error:
+                    file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
+
     # ── Build augmented message ────────────────────────────────────
     if file_context_parts:
         file_context = "\n".join(file_context_parts)
         if text_content:
             augmented_message = f"{file_context}\n用户说: {text_content}"
         else:
-            augmented_message = f"{file_context}\n用户发送了文件，请使用 read_file 工具查看文件内容。"
+            augmented_message = f"{file_context}\n用户发送了文件或语音消息，请使用 read_file 工具查看内容。"
     else:
         augmented_message = text_content
 
@@ -671,6 +684,19 @@ async def handle_continuous_message(event: MessageEvent):
                     file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
                 elif error:
                     file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
+
+        elif seg.type == "record":
+            url = seg.data.get("url", "")
+            file_id = seg.data.get("file", "")
+            if url:
+                saved_path, error = await _download_and_save_file(url, f"voice-{file_id}")
+                if saved_path:
+                    file_context_parts.append(
+                        f"[用户发送了语音消息，已保存至: {saved_path}]\n"
+                        f"用户发送了语音消息，可以使用 read_file 工具分析音频内容。"
+                    )
+                elif error:
+                    file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
 
     # Build augmented message with continuous mode context
     if file_context_parts:

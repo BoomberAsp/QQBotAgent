@@ -468,9 +468,9 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: read_file
 
-**Description**: Read and analyze files that users upload in QQ messages. Supports text files (code, logs, configs, etc. — returns full content), PDF files (returns extracted text), and image files (returns metadata + AI analysis if multimodal LLM configured).
+**Description**: Read and analyze files that users upload in QQ messages. Supports text files (code, logs, configs, etc. — returns full content), PDF files (returns extracted text), image files (returns metadata + AI analysis if multimodal LLM configured), and audio files (returns metadata + AI transcription/emotion/context analysis if audio model configured).
 
-**When to use**: When a user has uploaded a file or image in the current message, and you need to read its contents. The file path is auto-generated and provided in the message context (e.g. `[用户上传了文件 report.pdf，已保存至: data/workspace/uploads/xxx-report.pdf]`).
+**When to use**: When a user has uploaded a file, image, or voice message in the current message, and you need to read its contents. The file path is auto-generated and provided in the message context (e.g. `[用户上传了文件 report.pdf，已保存至: data/workspace/uploads/xxx-report.pdf]`).
 
 **Parameters**:
 ```json
@@ -490,5 +490,6 @@ This document defines all tools available to the agent. Each tool has a name, de
 - Text: `.txt`, `.md`, `.py`, `.json`, `.csv`, `.log`, `.yml`, `.yaml`, `.toml`, `.xml`, `.html`, `.css`, `.js`, `.ts`, `.sh`, `.bat`, `.c`, `.cpp`, `.h`, `.java`, `.go`, `.rs`, `.sql`, and more — returned as plain text (capped at 50KB)
 - PDF: `.pdf` — text extracted via PyPDF2 (capped at 8KB)
 - Image: `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp` — returns dimensions/format/size metadata, plus AI visual analysis (if multimodal LLM configured in `QQBot/config/models_settings.json` MULTIMODAL_MODEL section)
+- Audio: `.amr`, `.silk`, `.wav`, `.mp3`, `.ogg`, `.m4a`, `.aac`, `.flac`, `.opus` — returns duration/codec/sample-rate metadata, plus AI transcription + emotion + background analysis (if audio model configured in `QQBot/config/models_settings.json` AUDIO_MODEL section; falls back to MULTIMODAL_MODEL if that model supports audio)
 
-**Note**: If the multimodal LLM is not configured, image analysis falls back to metadata-only mode with setup instructions. Text and PDF files work without any additional configuration.
+**Note**: If the multimodal LLM is not configured, image/audio analysis falls back to metadata-only mode with setup instructions. Text and PDF files work without any additional configuration.

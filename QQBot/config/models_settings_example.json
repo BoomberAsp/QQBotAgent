@@ -29,12 +29,22 @@
     "temperature": 0.7
   },
 
+  "AUDIO_MODEL": {
+    "_comment": "Audio-capable model for voice message understanding. Must support OpenAI-compatible input_audio content type. Examples: gpt-4o-audio-preview, gemini-2.0-flash. Falls back to MULTIMODAL_MODEL if left empty.",
+    "api_key": "",
+    "api_base": "",
+    "model": "",
+    "max_tokens": 20480,
+    "temperature": 0.7
+  },
+
   "task_routing": {
-    "_comment": "Task routing rules — which model handles which task type. triage = model used for complexity classification. simple_task = model for simple conversations. complex_task = model for complex reasoning. image_analysis = model for multimodal image understanding.",
+    "_comment": "Task routing rules — which model handles which task type. triage = model used for complexity classification. simple_task = model for simple conversations. complex_task = model for complex reasoning. image_analysis = model for multimodal image understanding. audio_analysis = model for audio/voice understanding.",
     "triage": "FLASH_MODEL",
     "simple_task": "FLASH_MODEL",
     "complex_task": "REASONING_MODEL",
     "image_analysis": "MULTIMODAL_MODEL",
+    "audio_analysis": "AUDIO_MODEL",
     "triage_prompt": "请判断以下用户消息的复杂度，只回复一个词'simple'或'complex'。\n\n判断标准：\n- simple: 简单问候、闲聊、已知事实询问、无需工具调用的常识问题\n- complex: 需要搜索、需要执行代码、需要读取文件、需要多步推理、涉及专业知识\n\n用户消息: {user_message}\n\n复杂度:"
   }
 }

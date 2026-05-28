@@ -75,7 +75,7 @@ QQBotAgent/
     │
     ├── tools/               # Agent 工具实现
     │   ├── builtin_tools.py #   7 个内置工具 (搜索/抓取/代码/Shell/PDF/Git/时间)
-    │   ├── file_tools.py    #   文件读取工具 (文本/PDF/图片分析)
+    │   ├── file_tools.py    #   文件读取工具 (文本/PDF/图片/音频分析)
     │   ├── map_tools.py     #   地图工具 (地理编码/逆编码/天气/POI/路径)
     │   └── legacy_tools.py  #   6 个游戏/娱乐工具 (抽卡/动画/测速/乱速/解释/翻译)
     │
@@ -87,7 +87,7 @@ QQBotAgent/
     │
     ├── lib/                 # 自定义库
     │   ├── deepseek_client.py  # DeepSeek API 客户端 (OpenAI 兼容 Function Calling)
-    │   ├── multimodal_client.py # 多模态 LLM 客户端 (图片理解)
+    │   ├── multimodal_client.py # 多模态 LLM 客户端 (图片+音频理解)
     │   ├── model_router.py  #   多模型路由器 (复杂度分类 + 模型调度)
     │   └── amap_client.py   #   高德地图 API 客户端
     │
@@ -439,7 +439,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 | `download_repo` | builtin_tools | Git clone 代码仓库 (HTTPS only, 命令注入防护) |
 | `summarize_pdf` | builtin_tools | 提取并总结 PDF 内容 (PyPDF2, 路径验证) |
 | `get_system_load` | builtin_tools | 获取服务器实时系统负载 (CPU/内存/磁盘, 用于任务预检) |
-| `read_file` | file_tools | 读取用户上传的文件 (文本/PDF/图片, 图片可 AI 分析) |
+| `read_file` | file_tools | 读取用户上传的文件 (文本/PDF/图片/音频, 图片和音频可 AI 分析) |
 
 **地图工具 (5 个)**:
 
@@ -614,11 +614,11 @@ Agent 必须在以下情况拒绝 (礼貌):
 | `summarize_pdf(file_path)` | 提取 PDF 文本 (前 8000 字符) | PyPDF2 → 逐页提取 → 截断，路径验证 |
 | `get_system_load()` | 获取服务器实时负载 (CPU/内存/磁盘) | 读取 `/proc/loadavg`, `free`, `df` → 返回格式化评估 (低/中/高负载) |
 
-### 5.2 `tools/file_tools.py` — 文件读取工具 (1 个)
+### 5.2 `tools/file_tools.py` — 文件读取工具 (1 个，支持 4 种文件类型)
 
 | 函数 | 说明 | 实现方式 |
 |------|------|----------|
-| `read_file(file_path)` | 读取并分析文件 (文本/PDF/图片) | 扩展名检测 → 文本直接读取 (UTF-8, 50KB cap) / PDF→PyPDF2 / 图片→PIL 元数据 + 多模态 LLM 分析 |
+| `read_file(file_path)` | 读取并分析文件 (文本/PDF/图片/音频) | 扩展名检测 → 文本直接读取 (UTF-8, 50KB cap) / PDF→PyPDF2 / 图片→PIL 元数据 + 多模态 LLM 分析 / 音频→ffprobe 元数据 + 多模态 LLM 转录分析 |
 
 ### 5.3 `tools/legacy_tools.py` — 游戏/娱乐工具 (6 个)
 
@@ -1233,4 +1233,20 @@ v2.13 基础上增加:
   └── 文档更新: TOOLS.md + WORKSPACE.md + DOCUMENTATION.md
 
 工具数量: 19 → 20
+```
+
+### v2.15 — 音频理解工具 (2026-05-28)
+```
+v2.14 基础上增加:
+  ├── MultimodalClient 扩展: analyze_audio() + is_audio_available() + _convert_audio_format()
+  ├── 音频格式转换: ffmpeg 将 QQ 的 .amr/.silk 转为 16kHz mono WAV
+  ├── 多模态音频分析: speech-to-text + 语气/情绪 + 声线特征 + 背景音 + 场景描述
+  ├── OpenAI input_audio 格式: 兼容 GPT-4o-audio 等支持音频的多模态模型
+  ├── agent_router: 检测 seg.type == "record" → 下载音频 → 注入上下文
+  ├── read_file 扩展: 支持 11 种音频格式 (.amr/.silk/.wav/.mp3/.ogg 等)
+  ├── 配置: models_settings.json 新增 AUDIO_MODEL 层级, 回退到 MULTIMODAL_MODEL
+  ├── SOUL.md: 新增语言匹配规则 (回复语言跟随用户)
+  └── 文档更新: TOOLS.md + IDENTITY.md + DOCUMENTATION.md
+
+工具数量: 20 (不变, read_file 功能扩展)
 ```
