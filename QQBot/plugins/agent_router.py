@@ -80,25 +80,49 @@ _init_workspace()
 
 # ── File Download Helper ──────────────────────────────────────────
 
-async def _download_voice(bot, file_id: str, max_size_mb: int = 50) -> tuple:
-    """Download a QQ voice message via OneBot get_record API.
+async def _download_voice(bot, seg_data: dict, max_size_mb: int = 50) -> tuple:
+    """Download a QQ voice message, preferring local file over API.
 
-    Voice message URLs expire quickly (HTTP 404 on delayed requests),
-    so we use the official OneBot API which fetches the file on demand.
+    NapCat stores voice files locally on the same machine as the bot.
+    The message segment includes a ``path`` field pointing to the local
+    file, so we copy it directly when available. Falls back to the
+    OneBot ``get_record`` API when path is not accessible.
 
     Args:
         bot: NoneBot2 OneBot V11 Bot instance.
-        file_id: The ``file`` field from the record message segment.
+        seg_data: The ``data`` dict from the record message segment.
         max_size_mb: Maximum file size in MB.
 
     Returns:
         (saved_path, error_message) — one is None, the other is not.
     """
+    file_id = seg_data.get("file", "")
     if not file_id:
         return None, "语音文件 ID 为空，无法下载。"
 
+    max_size_bytes = max_size_mb * 1024 * 1024
+    _ensure_workspace_dirs()
+    save_path = os.path.join(
+        WORKSPACE_UPLOADS,
+        f"{uuid.uuid4().hex[:8]}-{file_id}"
+    )
+
+    # ── Try local file first ──────────────────────────────────────
+    local_path = seg_data.get("path", "")
+    if local_path and os.path.isfile(local_path):
+        try:
+            file_size = os.path.getsize(local_path)
+            if file_size > max_size_bytes:
+                return None, f"语音文件过大 ({file_size / 1024 / 1024:.1f} MB)，无法处理。"
+            import shutil
+            shutil.copy2(local_path, save_path)
+            return save_path, None
+        except (IOError, OSError) as e:
+            pass  # Fall through to API
+
+    # ── Fallback: OneBot get_record API ────────────────────────────
     try:
-        result = await bot.call_api("get_record", file=file_id)
+        result = await bot.call_api("get_record", file_id=file_id)
     except Exception as e:
         return None, f"调用 get_record API 失败: {e}"
 
@@ -110,13 +134,6 @@ async def _download_voice(bot, file_id: str, max_size_mb: int = 50) -> tuple:
 
     if not url_or_data:
         return None, "get_record API 返回了空数据。"
-
-    max_size_bytes = max_size_mb * 1024 * 1024
-    _ensure_workspace_dirs()
-    save_path = os.path.join(
-        WORKSPACE_UPLOADS,
-        f"{uuid.uuid4().hex[:8]}-voice-{file_id}.amr"
-    )
 
     try:
         if url_or_data.startswith(("http://", "https://")):
@@ -587,16 +604,14 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
                     file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
 
         elif seg.type == "record":
-            file_id = seg.data.get("file", "")
-            if file_id:
-                saved_path, error = await _download_voice(bot, file_id)
-                if saved_path:
-                    file_context_parts.append(
-                        f"[用户发送了语音消息，已保存至: {saved_path}]\n"
-                        f"用户发送了语音消息，可以使用 read_file 工具分析音频内容。"
-                    )
-                elif error:
-                    file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
+            saved_path, error = await _download_voice(bot, seg.data)
+            if saved_path:
+                file_context_parts.append(
+                    f"[用户发送了语音消息，已保存至: {saved_path}]\n"
+                    f"用户发送了语音消息，可以使用 read_file 工具分析音频内容。"
+                )
+            elif error:
+                file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
 
     # ── Build augmented message ────────────────────────────────────
     if file_context_parts:
@@ -748,16 +763,14 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
                     file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
 
         elif seg.type == "record":
-            file_id = seg.data.get("file", "")
-            if file_id:
-                saved_path, error = await _download_voice(bot, file_id)
-                if saved_path:
-                    file_context_parts.append(
-                        f"[用户发送了语音消息，已保存至: {saved_path}]\n"
-                        f"用户发送了语音消息，可以使用 read_file 工具分析音频内容。"
-                    )
-                elif error:
-                    file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
+            saved_path, error = await _download_voice(bot, seg.data)
+            if saved_path:
+                file_context_parts.append(
+                    f"[用户发送了语音消息，已保存至: {saved_path}]\n"
+                    f"用户发送了语音消息，可以使用 read_file 工具分析音频内容。"
+                )
+            elif error:
+                file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
 
     # Build augmented message with continuous mode context
     if file_context_parts:
