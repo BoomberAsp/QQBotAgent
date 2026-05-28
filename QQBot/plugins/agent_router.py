@@ -80,6 +80,69 @@ _init_workspace()
 
 # ── File Download Helper ──────────────────────────────────────────
 
+async def _download_voice(bot, file_id: str, max_size_mb: int = 50) -> tuple:
+    """Download a QQ voice message via OneBot get_record API.
+
+    Voice message URLs expire quickly (HTTP 404 on delayed requests),
+    so we use the official OneBot API which fetches the file on demand.
+
+    Args:
+        bot: NoneBot2 OneBot V11 Bot instance.
+        file_id: The ``file`` field from the record message segment.
+        max_size_mb: Maximum file size in MB.
+
+    Returns:
+        (saved_path, error_message) — one is None, the other is not.
+    """
+    if not file_id:
+        return None, "语音文件 ID 为空，无法下载。"
+
+    try:
+        result = await bot.call_api("get_record", file=file_id)
+    except Exception as e:
+        return None, f"调用 get_record API 失败: {e}"
+
+    # get_record returns a dict: {"file": <url-or-base64>, ...} or just a string
+    if isinstance(result, dict):
+        url_or_data = result.get("file", "") or str(result)
+    else:
+        url_or_data = str(result)
+
+    if not url_or_data:
+        return None, "get_record API 返回了空数据。"
+
+    max_size_bytes = max_size_mb * 1024 * 1024
+    _ensure_workspace_dirs()
+    save_path = os.path.join(
+        WORKSPACE_UPLOADS,
+        f"{uuid.uuid4().hex[:8]}-voice-{file_id}.amr"
+    )
+
+    try:
+        if url_or_data.startswith(("http://", "https://")):
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url_or_data, timeout=120.0, follow_redirects=True)
+                response.raise_for_status()
+                data = response.content
+        else:
+            import base64
+            data = base64.b64decode(url_or_data)
+
+        if len(data) > max_size_bytes:
+            return None, f"语音文件过大 ({len(data) / 1024 / 1024:.1f} MB)，无法处理。"
+
+        with open(save_path, "wb") as f:
+            f.write(data)
+        return save_path, None
+
+    except httpx.HTTPStatusError as e:
+        return None, f"语音下载失败 (HTTP {e.response.status_code})"
+    except httpx.TimeoutException:
+        return None, "语音下载超时 (120秒)"
+    except Exception as e:
+        return None, f"语音下载失败: {e}"
+
+
 async def _download_and_save_file(url: str, filename: str, max_size_mb: int = 50) -> tuple:
     """Download a file from QQ and save to workspace uploads.
 
@@ -93,11 +156,6 @@ async def _download_and_save_file(url: str, filename: str, max_size_mb: int = 50
     """
     if not url:
         return None, "文件 URL 为空，无法下载。"
-
-    # Resolve relative URLs (e.g. voice message /api/get_record) to full URLs
-    if not url.startswith(("http://", "https://")):
-        napcat_base = os.environ.get("NAPCAT_HTTP_BASE", "http://127.0.0.1:6099")
-        url = napcat_base.rstrip("/") + "/" + url.lstrip("/")
 
     max_size_bytes = max_size_mb * 1024 * 1024
 
@@ -529,10 +587,10 @@ async def handle_agent_message(event: MessageEvent):
                     file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
 
         elif seg.type == "record":
-            url = seg.data.get("url", "")
             file_id = seg.data.get("file", "")
-            if url:
-                saved_path, error = await _download_and_save_file(url, f"voice-{file_id}")
+            if file_id:
+                bot = event.get_bot()
+                saved_path, error = await _download_voice(bot, file_id)
                 if saved_path:
                     file_context_parts.append(
                         f"[用户发送了语音消息，已保存至: {saved_path}]\n"
@@ -691,10 +749,10 @@ async def handle_continuous_message(event: MessageEvent):
                     file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
 
         elif seg.type == "record":
-            url = seg.data.get("url", "")
             file_id = seg.data.get("file", "")
-            if url:
-                saved_path, error = await _download_and_save_file(url, f"voice-{file_id}")
+            if file_id:
+                bot = event.get_bot()
+                saved_path, error = await _download_voice(bot, file_id)
                 if saved_path:
                     file_context_parts.append(
                         f"[用户发送了语音消息，已保存至: {saved_path}]\n"
