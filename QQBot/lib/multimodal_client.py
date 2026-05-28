@@ -362,7 +362,10 @@ class MultimodalClient:
             }
             audio_format = format_map.get(ext, "wav")
 
+            # Build data URI (DashScope-compatible format, same pattern as image_url)
+            mime_type = f"audio/{audio_format}"
             encoded = base64.b64encode(audio_data).decode("utf-8")
+            data_uri = f"data:{mime_type};base64,{encoded}"
 
             # Clean up converted file
             if converted_path != audio_path:
@@ -381,13 +384,7 @@ class MultimodalClient:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": encoded,
-                            "format": audio_format,
-                        },
-                    },
+                    {"type": "audio_url", "audio_url": {"url": data_uri}},
                 ],
             }
         ]
