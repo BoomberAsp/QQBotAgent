@@ -44,7 +44,7 @@ install_system_deps() {
                 libxcursor1 libxdamage1 libxfixes3 libxext6 \
                 libxrender1 libxkbcommon0 libcairo2 libdrm2 \
                 fonts-liberation fonts-noto-color-emoji \
-                git docker.io docker-compose-v2"
+                git docker.io docker-compose-v2 ffmpeg"
 
             # Packages that may have t64 variants on Ubuntu 24.04+
             PKGS_TO_CHECK=(
@@ -77,7 +77,7 @@ install_system_deps() {
         arch|manjaro)
             sudo pacman -S --noconfirm --needed \
                 python python-pip python-virtualenv \
-                xvfb curl jq git docker docker-compose
+                xvfb curl jq git docker docker-compose ffmpeg
             ;;
         *)
             echo -e "${YELLOW}[WARN]${NC} 未识别的系统，请手动安装: python3.12, xvfb, curl, git, docker"
