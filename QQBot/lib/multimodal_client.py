@@ -401,16 +401,30 @@ class MultimodalClient:
         try:
             is_dashscope = "dashscope.aliyuncs.com" in api_base
 
+            # DEBUG: file sizes
+            src_size = os.path.getsize(audio_path)
+            wav_size = os.path.getsize(converted_path)
+
             if is_dashscope:
                 # DashScope native API: raw PCM base64, no container
                 raw_pcm = self._extract_raw_pcm(converted_path)
                 audio_b64 = base64.b64encode(raw_pcm).decode("utf-8")
+                debug_info = (
+                    f"[DEBUG] 源文件: {src_size}B, WAV: {wav_size}B, "
+                    f"PCM: {len(raw_pcm)}B, base64: {len(audio_b64)}字符, "
+                    f"前80字符: {audio_b64[:80]}"
+                )
             else:
                 # Generic API: data URI (video_url fallback)
                 with open(converted_path, "rb") as f:
                     audio_data = f.read()
                 encoded = base64.b64encode(audio_data).decode("utf-8")
                 data_uri = f"data:audio/wav;base64,{encoded}"
+                debug_info = (
+                    f"[DEBUG] 源文件: {src_size}B, WAV: {wav_size}B, "
+                    f"data_uri长度: {len(data_uri)}, "
+                    f"前100字符: {data_uri[:100]}"
+                )
 
             # Clean up converted file
             if converted_path != audio_path:
@@ -470,7 +484,11 @@ class MultimodalClient:
                     output = result.get("output", {})
                     choices = output.get("choices", [])
                     if not choices:
-                        return f"[音频分析] API 返回了空结果: {json.dumps(result, ensure_ascii=False)[:300]}"
+                        return (
+                            f"{debug_info}\n"
+                            f"[音频分析] API 返回了空结果: "
+                            f"{json.dumps(result, ensure_ascii=False)[:500]}"
+                        )
                     message = choices[0].get("message", {})
                     raw_content = message.get("content", "")
 
@@ -480,21 +498,21 @@ class MultimodalClient:
                             if isinstance(block, dict) and "text" in block:
                                 text_parts.append(block["text"])
                         if text_parts:
-                            return "\n".join(text_parts)
-                        return json.dumps(raw_content, ensure_ascii=False)
+                            return debug_info + "\n\n" + "\n".join(text_parts)
+                        return f"{debug_info}\n[音频分析] 返回非文本内容: {json.dumps(raw_content, ensure_ascii=False)[:300]}"
                     elif isinstance(raw_content, str) and raw_content:
-                        return raw_content
+                        return debug_info + "\n\n" + raw_content
                     else:
-                        return f"[音频分析] API 返回了无法识别的格式: {str(raw_content)[:300]}"
+                        return f"{debug_info}\n[音频分析] 无法识别的格式: {str(raw_content)[:300]}"
 
                 except httpx.ConnectTimeout:
-                    return f"[音频分析] 连接超时 ({timeout}秒)。音频可能过大，请压缩后重试。"
+                    return f"{debug_info}\n[音频分析] 连接超时 ({timeout}秒)"
                 except httpx.ReadTimeout:
-                    return f"[音频分析] 响应超时 ({timeout}秒)。音频可能过长，请缩短后重试。"
+                    return f"{debug_info}\n[音频分析] 响应超时 ({timeout}秒)"
                 except httpx.HTTPStatusError as e:
-                    return f"[音频分析] API HTTP 错误 ({e.response.status_code}): {e.response.text[:300]}"
+                    return f"{debug_info}\n[音频分析] API HTTP {e.response.status_code}: {e.response.text[:300]}"
                 except Exception as e:
-                    return f"[音频分析] 调用 API 时出错: {str(e)}"
+                    return f"{debug_info}\n[音频分析] 调用异常: {str(e)}"
 
         else:
             # ── Generic OpenAI-compatible API ──────────────────────
@@ -539,18 +557,18 @@ class MultimodalClient:
                     if reasoning:
                         content = f"[思考]\n{reasoning}\n\n[回复]\n{content}"
 
-                    return content
+                    return debug_info + "\n\n" + content
 
                 except httpx.ConnectTimeout:
-                    return f"[音频分析] 连接超时 ({timeout}秒)。音频可能过大，请压缩后重试。"
+                    return f"{debug_info}\n[音频分析] 连接超时 ({timeout}秒)"
                 except httpx.ReadTimeout:
-                    return f"[音频分析] 响应超时 ({timeout}秒)。音频可能过长，请缩短后重试。"
+                    return f"{debug_info}\n[音频分析] 响应超时 ({timeout}秒)"
                 except httpx.HTTPStatusError as e:
-                    return f"[音频分析] API HTTP 错误 ({e.response.status_code}): {e.response.text[:300]}"
+                    return f"{debug_info}\n[音频分析] API HTTP {e.response.status_code}: {e.response.text[:300]}"
                 except httpx.InvalidURL:
-                    return f"[音频分析] 无效的 API 地址: {api_base}\n请检查 AUDIO_MODEL 的 api_base 配置。"
+                    return f"{debug_info}\n[音频分析] 无效 API 地址: {api_base}"
                 except Exception as e:
-                    return f"[音频分析] 调用 API 时出错: {str(e)}"
+                    return f"{debug_info}\n[音频分析] 调用异常: {str(e)}"
 
     def _build_audio_not_configured(self) -> str:
         """Return setup instructions for audio analysis."""
