@@ -230,29 +230,52 @@ class MultimodalClient:
 
     @staticmethod
     def _convert_audio_format(input_path: str) -> str:
-        """Convert audio to 16kHz mono WAV (PCM S16LE) via ffmpeg.
+        """Convert audio to 16kHz mono WAV (PCM S16LE).
 
-        QQ voice messages use .amr or .silk codecs. DashScope native
-        API requires raw PCM. This always converts to a uniform WAV
-        so downstream code can extract raw PCM reliably.
+        QQ voice messages use SILK_V3 codec (misnamed as .amr by NapCat).
+        SILK is decoded via pilk, then all audio goes through ffmpeg to
+        guarantee PCM S16LE 16kHz mono.
 
         Returns path to converted WAV file.
         Raises RuntimeError if conversion fails.
         """
-        ext = os.path.splitext(input_path)[1].lower()
-        # Always re-encode to guarantee PCM S16LE 16kHz mono,
-        # even for formats that are "supported" in other contexts.
+        work_path = input_path
+
+        # ── SILK_V3 detection (QQ voice, misnamed .amr) ──────────
+        try:
+            with open(input_path, "rb") as f:
+                header = f.read(16)
+            if b"#!SILK_V3" in header:
+                import pilk
+                silk_wav = os.path.splitext(input_path)[0] + "_silk.wav"
+                pilk.silk_to_wav(input_path, silk_wav, rate=16000)
+                if os.path.exists(silk_wav) and os.path.getsize(silk_wav) > 0:
+                    work_path = silk_wav
+                else:
+                    raise RuntimeError("pilk SILK 解码后输出文件为空")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"SILK 解码失败: {e}")
+
+        # ── ffmpeg: ensure PCM S16LE 16kHz mono ──────────────────
         output_path = os.path.splitext(input_path)[0] + "_pcm.wav"
         try:
             result = subprocess.run(
                 [
-                    "ffmpeg", "-y", "-i", input_path,
+                    "ffmpeg", "-y", "-i", work_path,
                     "-acodec", "pcm_s16le",
                     "-ar", "16000", "-ac", "1",
                     output_path,
                 ],
                 capture_output=True, text=True, timeout=30,
             )
+            # Clean up intermediate SILK-decoded WAV
+            if work_path != input_path and work_path != output_path:
+                try:
+                    os.remove(work_path)
+                except Exception:
+                    pass
             if result.returncode != 0:
                 stderr_tail = result.stderr.strip().split("\n")[-3:]
                 raise RuntimeError(
