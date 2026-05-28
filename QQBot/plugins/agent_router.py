@@ -648,7 +648,7 @@ agent = Agent(
     hardware_detector=_hardware_detector,
     workspace_manager=_workspace_manager,
     special_session_manager=_special_sessions,
-    max_tool_iterations=8,
+    max_tool_iterations=12,
     thinking_timeout=180.0,
 )
 
@@ -781,7 +781,7 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
                     progress_callback=_progress,
                     session_type=session_type,
                 ),
-                timeout=200.0,
+                timeout=300.0,
             )
         finally:
             _send_msg.reset(token)
@@ -914,7 +914,7 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
             response = await asyncio.wait_for(
                 agent.run(augmented_message, user_id, client=client,
                            progress_callback=lambda msg: _safe_send(msg, matcher=continuous_router)),
-                timeout=200.0,
+                timeout=300.0,
             )
         finally:
             _send_msg.reset(token)
