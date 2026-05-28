@@ -384,7 +384,7 @@ class MultimodalClient:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "audio_url", "audio_url": {"url": data_uri}},
+                    {"type": "video_url", "video_url": {"url": data_uri}},
                 ],
             }
         ]
