@@ -81,12 +81,12 @@ _init_workspace()
 # ── File Download Helper ──────────────────────────────────────────
 
 async def _download_voice(bot, seg_data: dict, max_size_mb: int = 50) -> tuple:
-    """Download a QQ voice message, preferring local file over API.
+    """Download a QQ voice message.
 
-    NapCat stores voice files locally on the same machine as the bot.
-    The message segment includes a ``path`` field pointing to the local
-    file, so we copy it directly when available. Falls back to the
-    OneBot ``get_record`` API when path is not accessible.
+    NapCat stores voice files locally — unlike images/files whose ``url`` is
+    an HTTP URL, the record segment's ``url`` and ``path`` fields both point
+    to a local filesystem path.  We try local copy first, then fall back to
+    the OneBot ``get_record`` API.
 
     Args:
         bot: NoneBot2 OneBot V11 Bot instance.
@@ -107,28 +107,35 @@ async def _download_voice(bot, seg_data: dict, max_size_mb: int = 50) -> tuple:
         f"{uuid.uuid4().hex[:8]}-{file_id}"
     )
 
-    # ── Try local file first ──────────────────────────────────────
-    local_path = seg_data.get("path", "")
-    if local_path and os.path.isfile(local_path):
-        try:
-            file_size = os.path.getsize(local_path)
-            if file_size > max_size_bytes:
-                return None, f"语音文件过大 ({file_size / 1024 / 1024:.1f} MB)，无法处理。"
-            import shutil
-            shutil.copy2(local_path, save_path)
-            return save_path, None
-        except (IOError, OSError) as e:
-            pass  # Fall through to API
+    # ── Strategy 1: local file copy ───────────────────────────────
+    # In NapCat, both ``path`` and ``url`` are local filesystem paths
+    # for record segments (this is NOT true for image/file segments).
+    import shutil
 
-    # ── Fallback: OneBot get_record API ────────────────────────────
+    for field in ("path", "url"):
+        local = seg_data.get(field, "")
+        if local and os.path.isfile(local):
+            try:
+                file_size = os.path.getsize(local)
+                if file_size > max_size_bytes:
+                    return None, f"语音文件过大 ({file_size / 1024 / 1024:.1f} MB)，无法处理。"
+                shutil.copy2(local, save_path)
+                return save_path, None
+            except (IOError, OSError):
+                continue  # Try next field / fall through to API
+
+    # ── Strategy 2: OneBot get_record API ──────────────────────────
+    # NapCat uses the go-cqhttp-compatible parameter name ``file``,
+    # NOT the OneBot V11 standard ``file_id``.
     try:
-        result = await bot.call_api("get_record", file_id=file_id)
+        result = await bot.call_api("get_record", file=file_id)
     except Exception as e:
         return None, f"调用 get_record API 失败: {e}"
 
-    # get_record returns a dict: {"file": <url-or-base64>, ...} or just a string
+    # Response may be: {"file": "/local/path"}, {"file": "base64://..."},
+    # {"file": "http://..."}, or just a plain string.
     if isinstance(result, dict):
-        url_or_data = result.get("file", "") or str(result)
+        url_or_data = result.get("file", "") or result.get("path", "") or str(result)
     else:
         url_or_data = str(result)
 
@@ -136,14 +143,24 @@ async def _download_voice(bot, seg_data: dict, max_size_mb: int = 50) -> tuple:
         return None, "get_record API 返回了空数据。"
 
     try:
-        if url_or_data.startswith(("http://", "https://")):
+        # base64-encoded (NapCat enableLocalFile2Url mode)
+        if url_or_data.startswith("base64://"):
+            import base64
+            data = base64.b64decode(url_or_data[len("base64://"):])
+        elif url_or_data.startswith(("http://", "https://")):
             async with httpx.AsyncClient() as client:
                 response = await client.get(url_or_data, timeout=120.0, follow_redirects=True)
                 response.raise_for_status()
                 data = response.content
+        elif os.path.isfile(url_or_data):
+            # get_record returned a local file path — just copy it
+            file_size = os.path.getsize(url_or_data)
+            if file_size > max_size_bytes:
+                return None, f"语音文件过大 ({file_size / 1024 / 1024:.1f} MB)，无法处理。"
+            shutil.copy2(url_or_data, save_path)
+            return save_path, None
         else:
-            import base64
-            data = base64.b64decode(url_or_data)
+            return None, f"无法处理 get_record 返回的数据格式: {url_or_data[:100]}"
 
         if len(data) > max_size_bytes:
             return None, f"语音文件过大 ({len(data) / 1024 / 1024:.1f} MB)，无法处理。"
