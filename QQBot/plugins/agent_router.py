@@ -83,10 +83,11 @@ _init_workspace()
 async def _download_voice(bot, seg_data: dict, max_size_mb: int = 50) -> tuple:
     """Download a QQ voice message.
 
-    NapCat stores voice files locally — unlike images/files whose ``url`` is
-    an HTTP URL, the record segment's ``url`` and ``path`` fields both point
-    to a local filesystem path.  We try local copy first, then fall back to
-    the OneBot ``get_record`` API.
+    NapCat stores voice files locally on the same machine as the bot.
+    We first try to read the file directly from the local path (both
+    ``path`` and ``url`` fields in the record segment are local paths
+    for NapCat).  Falls back to the OneBot ``get_record`` API only
+    when the local file is genuinely unreachable.
 
     Args:
         bot: NoneBot2 OneBot V11 Bot instance.
@@ -107,74 +108,106 @@ async def _download_voice(bot, seg_data: dict, max_size_mb: int = 50) -> tuple:
         f"{uuid.uuid4().hex[:8]}-{file_id}"
     )
 
-    # ── Strategy 1: local file copy ───────────────────────────────
-    # In NapCat, both ``path`` and ``url`` are local filesystem paths
-    # for record segments (this is NOT true for image/file segments).
+    # ── Strategy 1: read local file directly ──────────────────────
     import shutil
 
     for field in ("path", "url"):
         local = seg_data.get(field, "")
-        if local and os.path.isfile(local):
-            try:
-                file_size = os.path.getsize(local)
-                if file_size > max_size_bytes:
-                    return None, f"语音文件过大 ({file_size / 1024 / 1024:.1f} MB)，无法处理。"
-                shutil.copy2(local, save_path)
-                return save_path, None
-            except (IOError, OSError):
-                continue  # Try next field / fall through to API
+        if not local:
+            continue
+        # Try to open and read the file — more reliable than os.path.isfile
+        # in case of symlinks, special files, or race conditions.
+        try:
+            with open(local, "rb") as src:
+                data = src.read()
+            if len(data) > max_size_bytes:
+                return None, f"语音文件过大 ({len(data) / 1024 / 1024:.1f} MB)，无法处理。"
+            if len(data) == 0:
+                continue  # Empty file — try next field
+            with open(save_path, "wb") as dst:
+                dst.write(data)
+            return save_path, None
+        except FileNotFoundError:
+            continue
+        except (IOError, OSError, PermissionError):
+            continue
 
     # ── Strategy 2: OneBot get_record API ──────────────────────────
-    # NapCat uses the go-cqhttp-compatible parameter name ``file``,
-    # NOT the OneBot V11 standard ``file_id``.
-    try:
-        result = await bot.call_api("get_record", file=file_id)
-    except Exception as e:
-        return None, f"调用 get_record API 失败: {e}"
+    # Try both parameter conventions: NapCat uses ``file`` (go-cqhttp
+    # compat), standard OneBot V11 uses ``file_id``.
 
-    # Response may be: {"file": "/local/path"}, {"file": "base64://..."},
-    # {"file": "http://..."}, or just a plain string.
-    if isinstance(result, dict):
-        url_or_data = result.get("file", "") or result.get("path", "") or str(result)
-    else:
-        url_or_data = str(result)
+    for param_name in ("file", "file_id"):
+        try:
+            result = await bot.call_api("get_record", **{param_name: file_id})
+        except Exception:
+            continue  # Try next param name
 
-    if not url_or_data:
-        return None, "get_record API 返回了空数据。"
-
-    try:
-        # base64-encoded (NapCat enableLocalFile2Url mode)
-        if url_or_data.startswith("base64://"):
-            import base64
-            data = base64.b64decode(url_or_data[len("base64://"):])
-        elif url_or_data.startswith(("http://", "https://")):
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url_or_data, timeout=120.0, follow_redirects=True)
-                response.raise_for_status()
-                data = response.content
-        elif os.path.isfile(url_or_data):
-            # get_record returned a local file path — just copy it
-            file_size = os.path.getsize(url_or_data)
-            if file_size > max_size_bytes:
-                return None, f"语音文件过大 ({file_size / 1024 / 1024:.1f} MB)，无法处理。"
-            shutil.copy2(url_or_data, save_path)
-            return save_path, None
+        if isinstance(result, dict):
+            url_or_data = result.get("file", "") or result.get("path", "") or str(result)
         else:
-            return None, f"无法处理 get_record 返回的数据格式: {url_or_data[:100]}"
+            url_or_data = str(result)
 
-        if len(data) > max_size_bytes:
-            return None, f"语音文件过大 ({len(data) / 1024 / 1024:.1f} MB)，无法处理。"
+        if not url_or_data:
+            continue
 
-        with open(save_path, "wb") as f:
-            f.write(data)
-        return save_path, None
+        # Handle different response formats
+        try:
+            if url_or_data.startswith("base64://"):
+                import base64
+                data = base64.b64decode(url_or_data[len("base64://"):])
+            elif url_or_data.startswith(("http://", "https://")):
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(url_or_data, timeout=120.0, follow_redirects=True)
+                    response.raise_for_status()
+                    data = response.content
+            elif os.path.isfile(url_or_data):
+                # API returned a local path — read it
+                with open(url_or_data, "rb") as src:
+                    data = src.read()
+            else:
+                # Not a recognised format — try next param
+                continue
 
-    except httpx.HTTPStatusError as e:
-        return None, f"语音下载失败 (HTTP {e.response.status_code})"
-    except httpx.TimeoutException:
-        return None, "语音下载超时 (120秒)"
-    except Exception as e:
-        return None, f"语音下载失败: {e}"
+            if len(data) > max_size_bytes:
+                return None, f"语音文件过大 ({len(data) / 1024 / 1024:.1f} MB)，无法处理。"
+
+            with open(save_path, "wb") as dst:
+                dst.write(data)
+            return save_path, None
+
+        except (httpx.HTTPStatusError, httpx.TimeoutException):
+            continue
+        except Exception:
+            continue
+
+    # ── Strategy 3: NapCat HTTP API (direct request, bypasses OneBot) ─
+    napcat_base = os.environ.get("NAPCAT_HTTP_BASE", "http://127.0.0.1:6099")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{napcat_base.rstrip('/')}/api/get_record",
+                json={"file": file_id},
+                timeout=30.0,
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                file_data = result.get("data", {}).get("file", "") or result.get("file", "")
+                if file_data and file_data.startswith("base64://"):
+                    import base64
+                    data = base64.b64decode(file_data[len("base64://"):])
+                elif file_data and os.path.isfile(file_data):
+                    with open(file_data, "rb") as src:
+                        data = src.read()
+                else:
+                    raise ValueError(f"Unexpected NapCat HTTP response: {file_data[:100]}")
+                if len(data) <= max_size_bytes:
+                    with open(save_path, "wb") as dst:
+                        dst.write(data)
+                    return save_path, None
+    except Exception:
+        pass
+
+    return None, "语音消息下载失败：本地文件不存在且所有 API 方式均不可用。"
 
 
 async def _download_and_save_file(url: str, filename: str, max_size_mb: int = 50) -> tuple:
