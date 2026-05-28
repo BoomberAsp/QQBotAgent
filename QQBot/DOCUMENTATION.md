@@ -144,11 +144,11 @@ User Message (@Bot)
 ```
 
 **关键参数**:
-- `max_tool_iterations=5` — 最多 5 轮工具调用，防止死循环
+- `max_tool_iterations=12` — 最多 12 轮工具调用，防止死循环
 - `thinking_timeout=180.0s` — LLM 思考超时
 - `max_context_messages=20` — 每会话保留最近 20 条上下文
 - `session_timeout=1800.0s` — 会话 30 分钟无活动自动过期
-- `message_handler_timeout=200.0s` — 单次消息处理总超时
+- `message_handler_timeout=300.0s` — 单次消息处理总超时
 
 ### 1.2 系统提示词结构
 
@@ -183,7 +183,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 | `hardware_detector` | `HardwareDetector` | None | 硬件检测器 (可选) |
 | `workspace_manager` | `UserWorkspaceManager` | None | 用户工作区管理 (可选) |
 | `special_session_manager` | `SpecialSessionManager` | None | 特殊会话管理 (可选) |
-| `max_tool_iterations` | `int` | 5 | 最大工具调用轮数 |
+| `max_tool_iterations` | `int` | 12 | 最大工具调用轮数 |
 | `thinking_timeout` | `float` | 180.0 | LLM 思考超时秒数 |
 
 | 方法 | 说明 |
@@ -419,7 +419,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
   ├── 特殊命令 → /clear, /status (直接处理)
   └── 自然语言
        ├── _safe_send("Roxy 正在思考...")  ← 非阻塞，失败不影响后续
-       ├── Agent.run(message, user_id)    ← 最多 200s 超时
+       ├── Agent.run(message, user_id)    ← 最多 300s 超时
        └── _send_response(response)       ← 重试 + 智能拆分
             ├── ≤300 字符 → _safe_send() 直接发送
             └── >300 字符 → _split_text() 句子边界拆分 → 逐块 _safe_send() (1s 间隔)
@@ -562,8 +562,8 @@ Agent 必须在以下情况拒绝 (礼貌):
 
 | 资源 | 限制 |
 |------|------|
-| 最大工具调用轮数 | 5 |
-| 单次消息处理总超时 | 200 秒 |
+| 最大工具调用轮数 | 12 |
+| 单次消息处理总超时 | 300 秒 |
 | LLM 思考超时 | 180 秒 |
 | 响应消息长度 | 2000 字符 (智能拆分为 300 字符片段, 1s 发送间隔) |
 | 会话生命周期 | 30 分钟无活动后过期 |
@@ -618,7 +618,11 @@ Agent 必须在以下情况拒绝 (礼貌):
 
 | 函数 | 说明 | 实现方式 |
 |------|------|----------|
-| `read_file(file_path)` | 读取并分析文件 (文本/PDF/图片/音频) | 扩展名检测 → 文本直接读取 (UTF-8, 50KB cap) / PDF→PyPDF2 / 图片→PIL 元数据 + 多模态 LLM 分析 / 音频→ffprobe 元数据 + 多模态 LLM 转录分析 |
+| `read_file(file_path)` | 读取并分析文件 (文本/PDF/图片/音频) | 扩展名检测 → 文本直接读取 (UTF-8, 50KB cap) / PDF→PyPDF2 / 图片→PIL 元数据 + 多模态 LLM 分析 / 音频→ffprobe 元数据 + 多模态 LLM 转录+情绪分析 |
+
+**支持的音频格式**: `.amr`, `.silk`, `.wav`, `.mp3`, `.ogg`, `.m4a`, `.aac`, `.flac`, `.opus`, `.wma`, `.aiff`
+
+**音频分析流程**: SILK 检测 (`#!SILK_V3` 文件头) → pilk 解码 → ffmpeg 转 16kHz mono WAV → DashScope 原生 API / 通用兼容 API → 语音转文字 + 语气情绪 + 声线特征 + 背景音分析
 
 ### 5.3 `tools/legacy_tools.py` — 游戏/娱乐工具 (6 个)
 
@@ -690,7 +694,7 @@ agent_router.py: on_message(priority=1, rule=to_me())
                          ├── MemorySystem.search(message) → top 3 memories
                          ├── build_system_prompt() → SOUL+IDENTITY+AGENTS+时间
                          │
-                         └── Think→Act→Observe→Respond Loop (max 5)
+                         └── Think→Act→Observe→Respond Loop (max 12)
                               │
                               ├── chat_completion_with_tools(messages, tools)
                               ├── has tool_calls?
@@ -796,34 +800,38 @@ docker logs searxng --tail 20
 
 ### 8.1 架构
 
-当用户发送图片时，Agent 自动下载并保存到工作区，然后通过 `read_file` 工具分析。若配置了多模态 LLM，图片会发给视觉模型进行 AI 分析。
+当用户发送图片或语音时，Agent 自动下载并保存到工作区，然后通过 `read_file` 工具分析。若配置了多模态 LLM，图片会发给视觉模型进行 AI 分析，音频会发给音频模型进行语音转文字+情绪分析。
 
 ```
-QQ 用户发送图片
+QQ 用户发送图片/语音
        │
        ▼
-agent_router: 检测 seg.type == "image"
+agent_router: 检测 seg.type == "image" / seg.type == "record"
+       │
+       ├── 图片: _download_and_save_file(url) → data/workspace/uploads/{uuid}-image.png
+       ├── 语音: _download_voice(bot, seg_data, message_id)
+       │          ├── 策略1: 本地文件读取 (path/url 字段)
+       │          ├── 策略2: OneBot API (get_record/get_file + 多参数名)
+       │          └── 策略3: NapCat HTTP API (多端点+多方法)
        │
        ▼
-_download_and_save_file(url) → data/workspace/uploads/{uuid}-image.png
+augmented_message = "[用户发送了语音消息，已保存至: .../voice.amr]\n用户发送了语音消息，可以使用 read_file 工具分析音频内容。"
        │
        ▼
-augmented_message = "[用户上传了图片，已保存至: .../image.png]\n用户说: 这张图里有什么？"
+Agent calls read_file(".../voice.amr")
        │
-       ▼
-Agent calls read_file(".../image.png")
+       ├── ffprobe: 元数据 (格式/时长/采样率/声道)
        │
-       ├── PIL: 1920×1080, PNG, 245KB
-       │
-       ├── Multimodal configured?
-       │   YES → base64 encode → POST to API → "这是一张包含..."
+       ├── Audio configured?
+       │   YES → SILK检测 → pilk解码 → ffmpeg转WAV → DashScope原生API /
+       │          通用video_url API → "转写: ... 情绪: ... 背景: ..."
        │   NO  → 返回元数据 + 配置指引
        │
        ▼
 Agent synthesizes response
 ```
 
-### 8.2 配置文件
+### 8.2 图片分析
 
 多模态配置统一存储在 `QQBot/config/models_settings.json` (git-ignored) 的 `MULTIMODAL_MODEL` 部分。旧版 `multimodal.json` 仍作为向后兼容的回退。
 
@@ -853,13 +861,51 @@ Agent synthesizes response
 
 **Thinking Mode 兼容**: 若多模态模型返回 `reasoning_content`（如 Qwen thinking mode），客户端会在回复中保留并以 `[思考]...[回复]...` 格式呈现。由于多模态调用为单轮请求（无对话历史），reasoning_content 无需回传，不会触发 API 400 错误。
 
-### 8.3 支持的文件类型
+### 8.3 音频分析
 
-| 类型 | 扩展名 | 无需配置 | 需配置多模态 |
-|------|--------|----------|-------------|
-| 文本文件 | `.txt`, `.md`, `.py`, `.json`, `.csv`, `.log`, `.yml`, `.yaml`, `.toml`, `.xml`, `.html`, `.css`, `.js`, `.ts`, `.sh`, `.bat`, `.c`, `.cpp`, `.h`, `.java`, `.go`, `.rs`, `.sql` 等 | 是 | 否 |
-| PDF 文件 | `.pdf` | 是 | 否 |
-| 图片文件 | `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp` | 元数据 | AI 分析 |
+音频分析通过 `AUDIO_MODEL` 配置实现，支持 DashScope 原生多模态 API 和通用 OpenAI 兼容 API 两种模式。
+
+```json
+{
+  "AUDIO_MODEL": {
+    "api_key": "your-dashscope-key",
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model": "qwen3-omni-flash",
+    "max_tokens": 20480,
+    "temperature": 0.7
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `api_key` | API 密钥 (留空则禁用音频分析) |
+| `api_base` | API 端点。DashScope 地址会自动走原生多模态 API；其他地址走通用 video_url fallback |
+| `model` | 支持音频的多模态模型 (如 qwen3-omni-flash, GPT-4o-audio-preview) |
+| `max_tokens` | 最大输出 token 数 (默认 2048) |
+| `temperature` | 采样温度 (默认 0.7) |
+
+**音频处理流程**:
+
+```
+QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV PCM S16LE
+  → base64(data:audio/wav;base64,...）
+  → DashScope原生API ({"audio": data_uri} in message content)
+  → 返回: 语音转文字 + 语气/情绪 + 声线特征 + 背景音 + 场景描述
+```
+
+**关键依赖**:
+- `ffmpeg`: 音频格式转换（AMR/SILK → WAV），已包含在 setup.sh
+- `pilk`: Python SILK_V3 解码库（`#!SILK_V3` 文件头检测 + silk_to_wav），已加入 requirements.txt
+- DashScope 原生 multimodal-generation API endpoint: `/api/v1/services/aigc/multimodal-generation/generation`
+
+**API 路径选择**:
+| api_base 特征 | 使用的 API | content type |
+|--------------|-----------|-------------|
+| 包含 `dashscope.aliyuncs.com` | DashScope 原生多模态 API | `{"audio": data_uri}` |
+| 其他 | OpenAI 兼容 `/chat/completions` | `{"video_url": {"url": data_uri}}` |
+
+**无配置时的降级行为**: 音频分析仅返回元数据 (格式/时长/采样率/声道/文件大小) + 配置指引信息。
 
 ---
 
@@ -993,7 +1039,8 @@ docker compose up -d
 | 部分模型配置留空 | 已配置的模型使用指定 API，未配置的回退到默认 |
 | 复杂度分类失败 | 回退到 "complex" → REASONING_MODEL (安全优先) |
 | `models_settings.json` 不存在 | multimodal_client 回退到 `multimodal.json` |
-| `multimodal.json` 也不存在 | 多模态不可用，图片仅返回元数据 |
+| `multimodal.json` 也不存在 | 图片仅返回元数据，音频返回元数据+配置指引 |
+| AUDIO_MODEL 未配置 | 音频分析回退到 MULTIMODAL_MODEL（若支持音频），否则仅返回元数据 |
 
 ### 11.5 Token 优化效果
 
@@ -1032,7 +1079,7 @@ docker compose up -d
 用户消息 → on_message(to_me) → Agent 统一入口
   ├── LLM 理解意图
   ├── 自主选择工具 (OpenAI Function Calling)
-  ├── 多轮 Think→Act→Observe→Respond (最多 5 轮)
+  ├── 多轮 Think→Act→Observe→Respond (最多 12 轮)
   └── 智能回复 + 用户画像 + 长期记忆
 ```
 
@@ -1238,15 +1285,40 @@ v2.13 基础上增加:
 ### v2.15 — 音频理解工具 (2026-05-28)
 ```
 v2.14 基础上增加:
-  ├── MultimodalClient 扩展: analyze_audio() + is_audio_available() + _convert_audio_format()
-  ├── 音频格式转换: ffmpeg 将 QQ 的 .amr/.silk 转为 16kHz mono WAV
-  ├── 多模态音频分析: speech-to-text + 语气/情绪 + 声线特征 + 背景音 + 场景描述
-  ├── OpenAI input_audio 格式: 兼容 GPT-4o-audio 等支持音频的多模态模型
-  ├── agent_router: 检测 seg.type == "record" → 下载音频 → 注入上下文
-  ├── read_file 扩展: 支持 11 种音频格式 (.amr/.silk/.wav/.mp3/.ogg 等)
-  ├── 配置: models_settings.json 新增 AUDIO_MODEL 层级, 回退到 MULTIMODAL_MODEL
-  ├── SOUL.md: 新增语言匹配规则 (回复语言跟随用户)
-  └── 文档更新: TOOLS.md + IDENTITY.md + DOCUMENTATION.md
+  ├── QQ语音消息处理:
+  │   ├── agent_router 新增 _download_voice(): 3 层 fallback 策略
+  │   │   (本地文件 → OneBot API (4 action × 2 param) → HTTP API (5 endpoint))
+  │   ├── 检测 seg.type == "record" → 下载语音 → 注入上下文
+  │   └── NoneBot2 依赖注入: bot: Bot 参数获取 OneBot API
+  │
+  ├── SILK_V3 解码:
+  │   ├── QQ 语音实际格式为 SILK_V3 (NapCat 误导性标签为 .amr)
+  │   ├── pilk (Python SILK 解码库): 检测 #!SILK_V3 文件头 → silk_to_wav(rate=16000)
+  │   └── requirements.txt 新增 pilk 依赖, setup.sh ffmpeg 已包含
+  │
+  ├── MultimodalClient 音频分析 (analyze_audio):
+  │   ├── _convert_audio_format(): 始终通过 ffmpeg 转 16kHz mono WAV PCM S16LE
+  │   ├── _extract_raw_pcm(): wave 模块提取裸 PCM 采样
+  │   ├── DashScope 原生多模态 API (qwen3-omni-flash):
+  │   │   └── endpoint: /api/v1/services/aigc/multimodal-generation/generation
+  │   │   └── audio 嵌入消息 content: {"audio": "data:audio/wav;base64,..."}
+  │   ├── 通用兼容模式 fallback: video_url content type
+  │   └── 分析内容: 语音转文字 + 语气/情绪 + 声线特征 + 背景音 + 场景描述
+  │
+  ├── file_tools.py 扩展:
+  │   ├── _read_audio_file(): ffprobe 元数据 + MultimodalClient AI 分析
+  │   ├── 支持 11 种音频格式 (.amr/.wav/.mp3/.ogg/.m4a/.aac/.flac/.opus/.wma/.aiff/.silk)
+  │   └── read_file 工具描述更新: 提及音频/语音支持
+  │
+  ├── 配置:
+  │   ├── models_settings.json 新增 AUDIO_MODEL 层级 (api_key/api_base/model)
+  │   ├── is_audio_available(): 优先 AUDIO_MODEL, 回退 MULTIMODAL_MODEL
+  │   ├── .env 新增 NAPCAT_HTTP_BASE=http://127.0.0.1:6099
+  │   └── AUDIO_MODEL 未配置时返回元数据 + 配置指引
+  │
+  └── Agent 循环放宽:
+      ├── max_tool_iterations: 8 → 12
+      └── asyncio.wait_for timeout: 200s → 300s
 
 工具数量: 20 (不变, read_file 功能扩展)
 ```

@@ -4,14 +4,14 @@
 
 ## 特性
 
-- **智能体架构** — Markdown 配置驱动，OpenAI 兼容 Function Calling，最多 5 轮工具调用
-- **多模型路由** — 轻量 FLASH 模型处理简单任务，强力 REASONING 模型处理复杂推理，MULTIMODAL 模型理解图片
+- **智能体架构** — Markdown 配置驱动，OpenAI 兼容 Function Calling，最多 12 轮工具调用
+- **多模型路由** — 轻量 FLASH 模型处理简单任务，强力 REASONING 模型处理复杂推理，MULTIMODAL 模型理解图片，AUDIO 模型分析语音
 - **特殊会话** — 每用户至多 3 个持久化会话，百万 token 上下文窗口，快照+增量双层存储
 - **用户工作区** — 每用户独立文件空间，配额管理（3 级策略），跨会话隔离
 - **流式交互** — 群聊连续对话模式：@一次后 5 分钟内免 @，消息自动续期
 - **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制）
-- **文件阅读** — 支持文本 / PDF / 图片（多模态 AI 分析）
+- **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
 - **用户系统** — 长期记忆（Markdown 存储）+ LLM 驱动用户画像提取
 - **游戏工具** — 抽卡模拟（数据 JSON 可配置）、战斗测速、乱速概率计算
 - **地图服务** — 地址↔坐标转换、实时天气、POI搜索、路线规划（高德地图）
@@ -24,7 +24,7 @@
 | QQ 协议 | NapCat (NT QQ) |
 | 机器人框架 | NoneBot2 + FastAPI |
 | 协议适配 | OneBot V11 (反向 WebSocket) |
-| AI 后端 | DeepSeek API + 多模型路由 |
+| AI 后端 | DeepSeek API + 多模型路由（含多模态音频） |
 | 搜索引擎 | SearXNG (Docker 自托管) |
 | 运行时 | Python 3.12+ |
 
@@ -179,7 +179,7 @@ QQBotAgent/
     ├── lib/                # 库
     │   ├── deepseek_client.py   # DeepSeek API 客户端
     │   ├── model_router.py      # 多模型路由器
-    │   └── multimodal_client.py # 多模态客户端（图片理解）
+    │   └── multimodal_client.py # 多模态客户端（图片理解 + 音频分析）
     │
     ├── config/             # 敏感配置 ⚠ git-ignored
     │   ├── models_settings.json         # 多模型配置
@@ -203,14 +203,14 @@ User Message → agent_router
        ├── ModelRouter.classify_complexity(message)
        │     FLASH_MODEL → "simple" 或 "complex"
        ├── Build Messages (System + Profile + Memory + History)
-       └── Think→Act→Observe→Respond 循环（最多 5 轮）
+       └── Think→Act→Observe→Respond 循环（最多 12 轮）
             ├── think: LLM 分析，决定是否调用工具
             ├── act: 执行工具（搜索 / 代码 / 文件等）
             ├── observe: 工具结果注入对话
             └── respond: 无工具调用时 → 回复用户
 ```
 
-**关键参数**：`max_tool_iterations=5`, `thinking_timeout=180s`, `session_timeout=30min`
+**关键参数**：`max_tool_iterations=12`, `thinking_timeout=180s`, `total_timeout=300s`, `session_timeout=30min`
 
 ### 多模型路由
 
@@ -224,7 +224,7 @@ User Message → agent_router
   ├── simple → FLASH_MODEL 直接回复（低成本）
   └── complex → REASONING_MODEL + 工具调用（强力推理）
   │
-  └── 图片 → MULTIMODAL_MODEL（视觉理解）
+  └── 图片/音频 → MULTIMODAL_MODEL / AUDIO_MODEL（多模态理解）
 ```
 
 配置在 `QQBot/config/models_settings.json`，留空自动回退到 `.env` 默认。
@@ -247,7 +247,7 @@ class Agent:
     # 构造
     def __init__(self, deepseek_client, tool_registry, config_dir,
                  session_manager=None, memory_system=None, profile_manager=None,
-                 max_tool_iterations=5, thinking_timeout=180.0)
+                 max_tool_iterations=12, thinking_timeout=180.0)
 
     # 核心方法
     async def run(self, user_message, user_id, client=None) -> str
@@ -316,7 +316,7 @@ class ContinuousSessionManager:
 | `execute_code` | Python 沙盒执行（支持图表输出） |
 | `shell_exec` | Shell 命令执行（白名单+管道） |
 | `get_time` | 当前日期时间 |
-| `read_file` | 读取文件（文本 / PDF / 图片 AI 分析） |
+| `read_file` | 读取文件（文本 / PDF / 图片 AI 分析 / 音频 AI 分析） |
 | `summarize_pdf` | PDF 提取 + 总结 |
 | `download_repo` | Git clone 仓库（HTTPS only） |
 | `translate_text` | 多语言翻译 |
@@ -587,6 +587,12 @@ docker compose run --rm searxng cat /etc/searxng/settings.yml  # 验证挂载
 - 编辑 `models_settings.json` 的 `MULTIMODAL_MODEL` 部分
 - 填入支持 OpenAI 兼容 vision API 的服务（如 GPT-4V, Claude Vision）
 - 未配置时图片仅返回尺寸 / 格式等基本信息
+
+**音频/语音分析不可用？**
+- 编辑 `models_settings.json` 的 `AUDIO_MODEL` 部分
+- 配置支持音频的多模态模型（如 qwen3-omni-flash，通过 DashScope 原生 API）
+- 需要 `ffmpeg` 和 `pilk`（SILK 解码）已安装
+- 未配置时音频仅返回元数据（格式/时长/采样率）
 
 ## 📖 扩展阅读
 
