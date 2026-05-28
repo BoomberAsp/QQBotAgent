@@ -230,21 +230,19 @@ class MultimodalClient:
 
     @staticmethod
     def _convert_audio_format(input_path: str) -> str:
-        """Convert audio to a widely-supported format using ffmpeg.
+        """Convert audio to 16kHz mono WAV (PCM S16LE) via ffmpeg.
 
-        QQ voice messages use .amr or .silk codecs which most multimodal
-        models don't support. This converts them to 16kHz mono WAV.
+        QQ voice messages use .amr or .silk codecs. DashScope native
+        API requires raw PCM. This always converts to a uniform WAV
+        so downstream code can extract raw PCM reliably.
 
-        Returns path to converted file, or original path if conversion
-        is not needed or fails.
+        Returns path to converted WAV file.
+        Raises RuntimeError if conversion fails.
         """
         ext = os.path.splitext(input_path)[1].lower()
-        widely_supported = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".aac"}
-
-        if ext in widely_supported:
-            return input_path
-
-        output_path = os.path.splitext(input_path)[0] + ".wav"
+        # Always re-encode to guarantee PCM S16LE 16kHz mono,
+        # even for formats that are "supported" in other contexts.
+        output_path = os.path.splitext(input_path)[0] + "_pcm.wav"
         try:
             result = subprocess.run(
                 [
@@ -255,11 +253,21 @@ class MultimodalClient:
                 ],
                 capture_output=True, text=True, timeout=30,
             )
-            if result.returncode == 0 and os.path.exists(output_path):
-                return output_path
-            return input_path
-        except Exception:
-            return input_path
+            if result.returncode != 0:
+                stderr_tail = result.stderr.strip().split("\n")[-3:]
+                raise RuntimeError(
+                    f"ffmpeg 转换失败 (exit {result.returncode}): "
+                    + "; ".join(stderr_tail)
+                )
+            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                raise RuntimeError("ffmpeg 转换后输出文件为空或不存在")
+            return output_path
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ffmpeg 转换超时 (30秒)")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"ffmpeg 转换异常: {e}")
 
     # ── Audio Metadata ───────────────────────────────────────────────
 
@@ -360,33 +368,26 @@ class MultimodalClient:
         if not os.path.exists(audio_path):
             return f"[音频分析] 文件不存在: {audio_path}"
 
-        # Convert audio format if needed (amr/silk → wav)
-        converted_path = self._convert_audio_format(audio_path)
-
+        # Always convert to 16kHz mono WAV first (QQ uses AMR/SILK)
         try:
-            # ── Encode audio for API ───────────────────────────────
-            # DashScope native API needs raw PCM base64 (no container).
-            # Generic OpenAI-compatible APIs need a data URI (video_url).
+            converted_path = self._convert_audio_format(audio_path)
+        except RuntimeError as e:
+            return f"[音频分析] 音频格式转换失败: {e}"
+
+        # ── Encode audio for API ───────────────────────────────────
+        try:
             is_dashscope = "dashscope.aliyuncs.com" in api_base
 
             if is_dashscope:
-                # Extract raw PCM from WAV for native multimodal API
+                # DashScope native API: raw PCM base64, no container
                 raw_pcm = self._extract_raw_pcm(converted_path)
                 audio_b64 = base64.b64encode(raw_pcm).decode("utf-8")
             else:
-                # Build data URI for generic OpenAI-compatible API
+                # Generic API: data URI (video_url fallback)
                 with open(converted_path, "rb") as f:
                     audio_data = f.read()
-                ext = os.path.splitext(converted_path)[1].lower().lstrip(".")
-                format_map = {
-                    "wav": "wav", "mp3": "mp3", "m4a": "mp4",
-                    "ogg": "ogg", "flac": "flac", "aac": "aac",
-                    "amr": "amr", "opus": "opus",
-                }
-                audio_format = format_map.get(ext, "wav")
-                mime_type = f"audio/{audio_format}"
                 encoded = base64.b64encode(audio_data).decode("utf-8")
-                data_uri = f"data:{mime_type};base64,{encoded}"
+                data_uri = f"data:audio/wav;base64,{encoded}"
 
             # Clean up converted file
             if converted_path != audio_path:
