@@ -13,6 +13,7 @@ import base64
 import json
 import os
 import subprocess
+import wave
 from typing import Dict, Optional
 
 import httpx
@@ -297,6 +298,18 @@ class MultimodalClient:
         except Exception as e:
             return {"error": str(e)}
 
+    # ── Raw PCM Extraction ────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_raw_pcm(wav_path: str) -> bytes:
+        """Extract raw PCM samples from a WAV file.
+
+        DashScope native multimodal API expects raw PCM base64
+        (no WAV container, no data URI prefix).
+        """
+        with wave.open(wav_path, "rb") as wf:
+            return wf.readframes(wf.getnframes())
+
     # ── Audio Analysis ───────────────────────────────────────────────
 
     async def analyze_audio(
@@ -351,21 +364,29 @@ class MultimodalClient:
         converted_path = self._convert_audio_format(audio_path)
 
         try:
-            with open(converted_path, "rb") as f:
-                audio_data = f.read()
+            # ── Encode audio for API ───────────────────────────────
+            # DashScope native API needs raw PCM base64 (no container).
+            # Generic OpenAI-compatible APIs need a data URI (video_url).
+            is_dashscope = "dashscope.aliyuncs.com" in api_base
 
-            ext = os.path.splitext(converted_path)[1].lower().lstrip(".")
-            format_map = {
-                "wav": "wav", "mp3": "mp3", "m4a": "mp4",
-                "ogg": "ogg", "flac": "flac", "aac": "aac",
-                "amr": "amr", "opus": "opus",
-            }
-            audio_format = format_map.get(ext, "wav")
-
-            # Build data URI (DashScope-compatible format, same pattern as image_url)
-            mime_type = f"audio/{audio_format}"
-            encoded = base64.b64encode(audio_data).decode("utf-8")
-            data_uri = f"data:{mime_type};base64,{encoded}"
+            if is_dashscope:
+                # Extract raw PCM from WAV for native multimodal API
+                raw_pcm = self._extract_raw_pcm(converted_path)
+                audio_b64 = base64.b64encode(raw_pcm).decode("utf-8")
+            else:
+                # Build data URI for generic OpenAI-compatible API
+                with open(converted_path, "rb") as f:
+                    audio_data = f.read()
+                ext = os.path.splitext(converted_path)[1].lower().lstrip(".")
+                format_map = {
+                    "wav": "wav", "mp3": "mp3", "m4a": "mp4",
+                    "ogg": "ogg", "flac": "flac", "aac": "aac",
+                    "amr": "amr", "opus": "opus",
+                }
+                audio_format = format_map.get(ext, "wav")
+                mime_type = f"audio/{audio_format}"
+                encoded = base64.b64encode(audio_data).decode("utf-8")
+                data_uri = f"data:{mime_type};base64,{encoded}"
 
             # Clean up converted file
             if converted_path != audio_path:
@@ -379,75 +400,133 @@ class MultimodalClient:
         except Exception as e:
             return f"[音频分析] 编码音频时出错: {e}"
 
-        # ── Build request (unified OpenAI-compatible format) ──────────
-        # DashScope compatible-mode supports audio_url for Omni models
-        # (qwen3-omni-flash, qwen3.5-omni-plus, etc.). Generic providers
-        # use video_url as fallback since chat/completions lacks audio_url.
-        is_dashscope = "dashscope.aliyuncs.com" in api_base
-        content_type = "audio_url" if is_dashscope else "video_url"
-        type_field = "audio_url" if is_dashscope else "video_url"
-
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": content_type, type_field: {"url": data_uri}},
-                ],
-            }
-        ]
-
         max_tokens = audio_config.get("max_tokens", 2048)
         temperature = audio_config.get("temperature", 0.7)
 
-        data = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
+        if is_dashscope:
+            # ── DashScope native multimodal API ────────────────────
+            # Uses input.audios with raw PCM base64 (no data URI).
+            # Compatible-mode /chat/completions does NOT support audio.
+            messages = [
+                {
+                    "role": "user",
+                    "content": [{"text": prompt}],
+                }
+            ]
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+            request_body = {
+                "model": model,
+                "input": {
+                    "messages": messages,
+                    "audios": [audio_b64],
+                },
+                "parameters": {
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+            }
 
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    f"{api_base}/chat/completions",
-                    headers=headers,
-                    json=data,
-                    timeout=timeout,
-                )
-                response.raise_for_status()
-                result = response.json()
-                message = result["choices"][0]["message"]
-                content = message.get("content", "") or "[音频分析] API 返回了空内容。"
+            endpoint = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 
-                reasoning = message.get("reasoning_content", "")
-                if reasoning:
-                    content = f"[思考]\n{reasoning}\n\n[回复]\n{content}"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
 
-                return content
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.post(
+                        endpoint,
+                        headers=headers,
+                        json=request_body,
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    output = result.get("output", {})
+                    choices = output.get("choices", [])
+                    if not choices:
+                        return f"[音频分析] API 返回了空结果: {json.dumps(result, ensure_ascii=False)[:300]}"
+                    message = choices[0].get("message", {})
+                    raw_content = message.get("content", "")
 
-            except httpx.ConnectTimeout:
-                return f"[音频分析] 连接超时 ({timeout}秒)。音频可能过大，请压缩后重试。"
-            except httpx.ReadTimeout:
-                return f"[音频分析] 响应超时 ({timeout}秒)。音频可能过长，请缩短后重试。"
-            except httpx.HTTPStatusError as e:
-                error_text = e.response.text[:300]
-                return (
-                    f"[音频分析] API HTTP 错误 ({e.response.status_code}): "
-                    f"{error_text}"
-                )
-            except httpx.InvalidURL:
-                return (
-                    f"[音频分析] 无效的 API 地址: {api_base}\n"
-                    "请检查 QQBot/config/models_settings.json 中 AUDIO_MODEL 的 api_base 配置。"
-                )
-            except Exception as e:
-                return f"[音频分析] 调用 API 时出错: {str(e)}"
+                    if isinstance(raw_content, list):
+                        text_parts = []
+                        for block in raw_content:
+                            if isinstance(block, dict) and "text" in block:
+                                text_parts.append(block["text"])
+                        if text_parts:
+                            return "\n".join(text_parts)
+                        return json.dumps(raw_content, ensure_ascii=False)
+                    elif isinstance(raw_content, str) and raw_content:
+                        return raw_content
+                    else:
+                        return f"[音频分析] API 返回了无法识别的格式: {str(raw_content)[:300]}"
+
+                except httpx.ConnectTimeout:
+                    return f"[音频分析] 连接超时 ({timeout}秒)。音频可能过大，请压缩后重试。"
+                except httpx.ReadTimeout:
+                    return f"[音频分析] 响应超时 ({timeout}秒)。音频可能过长，请缩短后重试。"
+                except httpx.HTTPStatusError as e:
+                    return f"[音频分析] API HTTP 错误 ({e.response.status_code}): {e.response.text[:300]}"
+                except Exception as e:
+                    return f"[音频分析] 调用 API 时出错: {str(e)}"
+
+        else:
+            # ── Generic OpenAI-compatible API ──────────────────────
+            # Uses video_url as fallback since chat/completions lacks
+            # a standard audio content type.
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "video_url", "video_url": {"url": data_uri}},
+                    ],
+                }
+            ]
+
+            data = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.post(
+                        f"{api_base}/chat/completions",
+                        headers=headers,
+                        json=data,
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    message = result["choices"][0]["message"]
+                    content = message.get("content", "") or "[音频分析] API 返回了空内容。"
+
+                    reasoning = message.get("reasoning_content", "")
+                    if reasoning:
+                        content = f"[思考]\n{reasoning}\n\n[回复]\n{content}"
+
+                    return content
+
+                except httpx.ConnectTimeout:
+                    return f"[音频分析] 连接超时 ({timeout}秒)。音频可能过大，请压缩后重试。"
+                except httpx.ReadTimeout:
+                    return f"[音频分析] 响应超时 ({timeout}秒)。音频可能过长，请缩短后重试。"
+                except httpx.HTTPStatusError as e:
+                    return f"[音频分析] API HTTP 错误 ({e.response.status_code}): {e.response.text[:300]}"
+                except httpx.InvalidURL:
+                    return f"[音频分析] 无效的 API 地址: {api_base}\n请检查 AUDIO_MODEL 的 api_base 配置。"
+                except Exception as e:
+                    return f"[音频分析] 调用 API 时出错: {str(e)}"
 
     def _build_audio_not_configured(self) -> str:
         """Return setup instructions for audio analysis."""
