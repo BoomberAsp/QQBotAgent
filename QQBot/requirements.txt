@@ -1,20 +1,39 @@
-# NoneBot2 核心
+# QQBot Agent — Python Dependencies
+# Install: pip install -r requirements.txt
+
+# ── NoneBot2 Core ────────────────────────────────────────────────
 nonebot2>=2.4.0
 nonebot-adapter-onebot>=2.4.0
 nonebot2[fastapi]
+nb-cli>=0.7.0
 
-# HTTP 客户端
+# ── HTTP & WebSocket ─────────────────────────────────────────────
 httpx
 aiohttp
 websockets
 
-# vLLM 推理引擎
-vllm>=0.6.0
+# ── Data Processing ─────────────────────────────────────────────
+pandas
+numpy
 
-# Transformers 模型库
-transformers>=4.40.0
-accelerate>=0.27.0
-
-# 工具库
-python-dotenv
+# ── Data Validation ──────────────────────────────────────────────
 pydantic>=2.0.0
+python-dotenv
+
+# ── Image Processing ─────────────────────────────────────────────
+Pillow
+
+# ── Audio Processing ─────────────────────────────────────────────
+pilk
+
+# ── PDF Processing ───────────────────────────────────────────────
+PyPDF2
+
+# ── Testing ──────────────────────────────────────────────────────
+pytest>=7.0.0
+
+# ── Optional: Local GPU Inference ────────────────────────────────
+# Uncomment if you want to run vLLM locally:
+# vllm>=0.6.0
+# transformers>=4.40.0
+# accelerate>=0.27.0

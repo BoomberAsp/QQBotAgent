@@ -1,292 +1,602 @@
-<p align="center">
-  <a href="https://ishkong.github.io/go-cqhttp-docs/">
-    <img src="winres/icon.png" width="200" height="200" alt="go-cqhttp">
-  </a>
-</p>
+# QQBot Agent
 
-<div align="center">
+基于 **NapCat + NoneBot2** 构建的智能 QQ 机器人，采用 **LLM Agent 架构**（Think → Act → Observe → Respond），支持工具调用、用户画像与长期记忆。
 
-# go-cqhttp
+## 特性
 
-_✨ 基于 [Mirai](https://github.com/mamoe/mirai) 以及 [MiraiGo](https://github.com/Mrs4s/MiraiGo) 的 [OneBot](https://github.com/howmanybots/onebot/blob/master/README.md) Golang 原生实现 ✨_  
+- **智能体架构** — Markdown 配置驱动，OpenAI 兼容 Function Calling，最多 12 轮工具调用
+- **多模型路由** — 轻量 FLASH 模型处理简单任务，强力 REASONING 模型处理复杂推理，MULTIMODAL 模型理解图片，AUDIO 模型分析语音
+- **特殊会话** — 每用户至多 3 个持久化会话，百万 token 上下文窗口，快照+增量双层存储
+- **用户工作区** — 每用户独立文件空间，配额管理（3 级策略），跨会话隔离
+- **流式交互** — 群聊连续对话模式：@一次后 5 分钟内免 @，消息自动续期
+- **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）
+- **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制）
+- **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
+- **用户系统** — 长期记忆（Markdown 存储）+ LLM 驱动用户画像提取
+- **游戏工具** — 抽卡模拟（数据 JSON 可配置）、战斗测速、乱速概率计算
+- **地图服务** — 地址↔坐标转换、实时天气、POI搜索、路线规划（高德地图）
+- **安全设计** — 工作区隔离、路径验证防穿越、Git URL 注入防护
 
+## 技术栈
 
-</div>
+| 层 | 技术 |
+|---|---|
+| QQ 协议 | NapCat (NT QQ) |
+| 机器人框架 | NoneBot2 + FastAPI |
+| 协议适配 | OneBot V11 (反向 WebSocket) |
+| AI 后端 | DeepSeek API + 多模型路由（含多模态音频） |
+| 搜索引擎 | SearXNG (Docker 自托管) |
+| 运行时 | Python 3.12+ |
 
-<p align="center">
-  <a href="https://raw.githubusercontent.com/Mrs4s/go-cqhttp/master/LICENSE">
-    <img src="https://img.shields.io/github/license/Mrs4s/go-cqhttp" alt="license">
-  </a>
-  <a href="https://github.com/Mrs4s/go-cqhttp/releases">
-    <img src="https://img.shields.io/github/v/release/Mrs4s/go-cqhttp?color=blueviolet&include_prereleases" alt="release">
-  </a>
-<a href="https://app.fossa.com/projects/git%2Bgithub.com%2FMrs4s%2Fgo-cqhttp?ref=badge_shield" alt="FOSSA Status"><img src="https://app.fossa.com/api/projects/git%2Bgithub.com%2FMrs4s%2Fgo-cqhttp.svg?type=shield"/></a>
-  <a href="https://github.com/howmanybots/onebot/blob/master/README.md">
-    <img src="https://img.shields.io/badge/OneBot-v11-blue?style=flat&logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAIVBMVEUAAAAAAAADAwMHBwceHh4UFBQNDQ0ZGRkoKCgvLy8iIiLWSdWYAAAAAXRSTlMAQObYZgAAAQVJREFUSMftlM0RgjAQhV+0ATYK6i1Xb+iMd0qgBEqgBEuwBOxU2QDKsjvojQPvkJ/ZL5sXkgWrFirK4MibYUdE3OR2nEpuKz1/q8CdNxNQgthZCXYVLjyoDQftaKuniHHWRnPh2GCUetR2/9HsMAXyUT4/3UHwtQT2AggSCGKeSAsFnxBIOuAggdh3AKTL7pDuCyABcMb0aQP7aM4AnAbc/wHwA5D2wDHTTe56gIIOUA/4YYV2e1sg713PXdZJAuncdZMAGkAukU9OAn40O849+0ornPwT93rphWF0mgAbauUrEOthlX8Zu7P5A6kZyKCJy75hhw1Mgr9RAUvX7A3csGqZegEdniCx30c3agAAAABJRU5ErkJggg==" alt="cqhttp">
-  </a>
-  <a href="https://github.com/Mrs4s/go-cqhttp/actions">
-    <img src="https://github.com/Mrs4s/go-cqhttp/workflows/CI/badge.svg" alt="action">
-  </a>
-  <a href="https://goreportcard.com/report/github.com/Mrs4s/go-cqhttp">
-  <img src="https://goreportcard.com/badge/github.com/Mrs4s/go-cqhttp" alt="GoReportCard">
-  </a>
-</p>
+## 快速开始
 
-<p align="center">
-  <a href="https://docs.go-cqhttp.org/">文档</a>
-  ·
-  <a href="https://github.com/Mrs4s/go-cqhttp/releases">下载</a>
-  ·
-  <a href="https://docs.go-cqhttp.org/guide/quick_start.html">开始使用</a>
-  ·
-  <a href="https://github.com/Mrs4s/go-cqhttp/blob/master/CONTRIBUTING.md">参与贡献</a>
-</p>
+### 前置条件
 
-## 重要信息
-由于QQ官方针对协议库的围追堵截, 不断更新加密方案, 我们已无力继续维护此项目.
-建议Bot开发者尽快迁移至无头NTQQ项目 -> https://chronocat.vercel.app/blog/0050
-参考issue: https://github.com/Mrs4s/go-cqhttp/issues/2471
+- Ubuntu 22.04+ / Debian 12+（其他 Linux 发行版需手动安装依赖）
+- Python 3.12+
+- Docker（用于 SearXNG 搜索服务）
+- QQ 账号
 
-## 兼容性
-go-cqhttp 兼容 [OneBot-v11](https://github.com/botuniverse/onebot-11) 绝大多数内容，并在其基础上做了一些扩展，详情请看 go-cqhttp 的文档。
+### 1. 克隆项目
 
-### 接口
+```bash
+git clone <repo-url>
+cd QQBotAgent
+```
 
-- [x] HTTP API
-- [x] 反向 HTTP POST
-- [x] 正向 WebSocket
-- [x] 反向 WebSocket
+### 2. 一键安装
 
-### 拓展支持
+```bash
+bash setup.sh
+```
 
-> 拓展 API 可前往 [文档](docs/cqhttp.md) 查看
+脚本会自动完成：系统依赖安装 → Python 虚拟环境创建 → pip 包安装 → `.env` 模板创建 → SearXNG 容器启动。
 
-- [x] HTTP POST 多点上报
-- [x] 反向 WS 多点连接
-- [x] 修改群名
-- [x] 消息撤回事件
-- [x] 解析/发送 回复消息
-- [x] 解析/发送 合并转发
-- [x] 使用代理请求网络图片
+### 3. 配置密钥
 
-### 实现
+编辑 `QQBot/.env`，填入你的配置：
 
-<details>
-<summary>已实现 CQ 码</summary>
+```ini
+DRIVER=~fastapi
+HOST=0.0.0.0
+PORT=8081
+ONEBOT_ACCESS_TOKEN=你的Token
+SUPERUSERS=["你的QQ号"]
+DEEPSEEK_API_KEY=sk-xxxxxxxx
+DEEPSEEK_API_BASE=https://api.deepseek.com
+SEARXNG_ENDPOINT=http://localhost:8082
+AMAP_API_KEY=你的高德Key  # 可选，用于地图工具
+USER_DATA_ROOT=data/users_store/  # 用户数据根目录
+MAX_SPECIAL_SESSIONS=3  # 每用户最大特殊会话数
+USER_WORKSPACE_QUOTA_MB=500  # 每用户工作区配额 (MB)
+```
 
-#### 符合 OneBot 标准的 CQ 码
+**多模型配置（可选）**：编辑 `QQBot/config/models_settings.json` 配置三种模型，留空则回退到 `.env` 默认配置。参考 `QQBot/config/models_settings_example.json` 格式。
 
-| CQ 码        | 功能                        |
-| ------------ | --------------------------- |
-| [CQ:face]    | [QQ 表情]                   |
-| [CQ:record]  | [语音]                      |
-| [CQ:video]   | [短视频]                    |
-| [CQ:at]      | [@某人]                     |
-| [CQ:share]   | [链接分享]                  |
-| [CQ:music]   | [音乐分享] [音乐自定义分享] |
-| [CQ:reply]   | [回复]                      |
-| [CQ:forward] | [合并转发]                  |
-| [CQ:node]    | [合并转发节点]              |
-| [CQ:xml]     | [XML 消息]                  |
-| [CQ:json]    | [JSON 消息]                 |
+### 4. 安装 NapCat（QQ 协议适配）
 
-[qq 表情]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#qq-%E8%A1%A8%E6%83%85
-[语音]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#%E8%AF%AD%E9%9F%B3
-[短视频]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#%E7%9F%AD%E8%A7%86%E9%A2%91
-[@某人]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#%E6%9F%90%E4%BA%BA
-[链接分享]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#%E9%93%BE%E6%8E%A5%E5%88%86%E4%BA%AB
-[音乐分享]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#%E9%9F%B3%E4%B9%90%E5%88%86%E4%BA%AB-
-[音乐自定义分享]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#%E9%9F%B3%E4%B9%90%E8%87%AA%E5%AE%9A%E4%B9%89%E5%88%86%E4%BA%AB-
-[回复]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#%E5%9B%9E%E5%A4%8D
-[合并转发]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#%E5%90%88%E5%B9%B6%E8%BD%AC%E5%8F%91-
-[合并转发节点]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#%E5%90%88%E5%B9%B6%E8%BD%AC%E5%8F%91%E8%8A%82%E7%82%B9-
-[xml 消息]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#xml-%E6%B6%88%E6%81%AF
-[json 消息]: https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#json-%E6%B6%88%E6%81%AF
+```bash
+bash napcat.sh --docker n
+```
 
-#### 拓展 CQ 码及与 OneBot 标准有略微差异的 CQ 码
+或参考 [NapCat 官方文档](https://github.com/NapNeko/NapCatQQ) 手动安装。
 
-| 拓展 CQ 码     | 功能                              |
-| -------------- | --------------------------------- |
-| [CQ:image]     | [图片]                            |
-| [CQ:redbag]    | [红包]                            |
-| [CQ:poke]      | [戳一戳]                          |
-| [CQ:node]      | [合并转发消息节点]                |
-| [CQ:cardimage] | [一种 xml 的图片消息（装逼大图）] |
-| [CQ:tts]       | [文本转语音]                      |
+**关键配置**：在 NapCat WebUI（`http://localhost:6099`）中设置：
+- 反向 WebSocket 地址：`ws://127.0.0.1:8081/onebot/v11/ws`
+- Access Token：与 `.env` 中的 `ONEBOT_ACCESS_TOKEN` 一致
 
-[图片]: https://docs.go-cqhttp.org/cqcode/#%E5%9B%BE%E7%89%87
-[红包]: https://docs.go-cqhttp.org/cqcode/#%E7%BA%A2%E5%8C%85
-[戳一戳]: https://docs.go-cqhttp.org/cqcode/#%E6%88%B3%E4%B8%80%E6%88%B3
-[合并转发消息节点]: https://docs.go-cqhttp.org/cqcode/#%E5%90%88%E5%B9%B6%E8%BD%AC%E5%8F%91%E6%B6%88%E6%81%AF%E8%8A%82%E7%82%B9
-[一种 xml 的图片消息（装逼大图）]: https://docs.go-cqhttp.org/cqcode/#cardimage
-[文本转语音]: https://docs.go-cqhttp.org/cqcode/#%E6%96%87%E6%9C%AC%E8%BD%AC%E8%AF%AD%E9%9F%B3
+### 5. 启动
 
-</details>
+```bash
+bash start.sh
+```
 
-<details>
-<summary>已实现 API</summary>
+启动后：
+- NoneBot API：`http://localhost:8081`
+- SearXNG 搜索：`http://localhost:8082`
+- NapCat WebUI：`http://localhost:6099`
 
-#### 符合 OneBot 标准的 API
+### 6. 验证
 
-| API                      | 功能                   |
-| ------------------------ | ---------------------- |
-| /send_private_msg        | [发送私聊消息]         |
-| /send_group_msg          | [发送群消息]           |
-| /send_msg                | [发送消息]             |
-| /delete_msg              | [撤回信息]             |
-| /set_group_kick          | [群组踢人]             |
-| /set_group_ban           | [群组单人禁言]         |
-| /set_group_whole_ban     | [群组全员禁言]         |
-| /set_group_admin         | [群组设置管理员]       |
-| /set_group_card          | [设置群名片（群备注）] |
-| /set_group_name          | [设置群名]             |
-| /set_group_leave         | [退出群组]             |
-| /set_group_special_title | [设置群组专属头衔]     |
-| /set_friend_add_request  | [处理加好友请求]       |
-| /set_group_add_request   | [处理加群请求/邀请]    |
-| /get_login_info          | [获取登录号信息]       |
-| /get_stranger_info       | [获取陌生人信息]       |
-| /get_friend_list         | [获取好友列表]         |
-| /get_group_info          | [获取群信息]           |
-| /get_group_list          | [获取群列表]           |
-| /get_group_member_info   | [获取群成员信息]       |
-| /get_group_member_list   | [获取群成员列表]       |
-| /get_group_honor_info    | [获取群荣誉信息]       |
-| /can_send_image          | [检查是否可以发送图片] |
-| /can_send_record         | [检查是否可以发送语音] |
-| /get_version_info        | [获取版本信息]         |
-| /set_restart             | [重启 go-cqhttp]       |
-| /.handle_quick_operation | [对事件执行快速操作]   |
+在 QQ 群聊或私聊中发送：
 
-[发送私聊消息]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#send_private_msg-%E5%8F%91%E9%80%81%E7%A7%81%E8%81%8A%E6%B6%88%E6%81%AF
-[发送群消息]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#send_group_msg-%E5%8F%91%E9%80%81%E7%BE%A4%E6%B6%88%E6%81%AF
-[发送消息]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#send_msg-%E5%8F%91%E9%80%81%E6%B6%88%E6%81%AF
-[撤回信息]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#delete_msg-%E6%92%A4%E5%9B%9E%E6%B6%88%E6%81%AF
-[群组踢人]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#set_group_kick-%E7%BE%A4%E7%BB%84%E8%B8%A2%E4%BA%BA
-[群组单人禁言]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#set_group_ban-%E7%BE%A4%E7%BB%84%E5%8D%95%E4%BA%BA%E7%A6%81%E8%A8%80
-[群组全员禁言]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#set_group_whole_ban-%E7%BE%A4%E7%BB%84%E5%85%A8%E5%91%98%E7%A6%81%E8%A8%80
-[群组设置管理员]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#set_group_admin-%E7%BE%A4%E7%BB%84%E8%AE%BE%E7%BD%AE%E7%AE%A1%E7%90%86%E5%91%98
-[设置群名片（群备注）]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#set_group_card-%E8%AE%BE%E7%BD%AE%E7%BE%A4%E5%90%8D%E7%89%87%E7%BE%A4%E5%A4%87%E6%B3%A8
-[设置群名]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#set_group_name-%E8%AE%BE%E7%BD%AE%E7%BE%A4%E5%90%8D
-[退出群组]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#set_group_leave-%E9%80%80%E5%87%BA%E7%BE%A4%E7%BB%84
-[设置群组专属头衔]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#set_group_special_title-%E8%AE%BE%E7%BD%AE%E7%BE%A4%E7%BB%84%E4%B8%93%E5%B1%9E%E5%A4%B4%E8%A1%94
-[处理加好友请求]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#set_friend_add_request-%E5%A4%84%E7%90%86%E5%8A%A0%E5%A5%BD%E5%8F%8B%E8%AF%B7%E6%B1%82
-[处理加群请求/邀请]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#set_group_add_request-%E5%A4%84%E7%90%86%E5%8A%A0%E7%BE%A4%E8%AF%B7%E6%B1%82%E9%82%80%E8%AF%B7
-[获取登录号信息]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#get_login_info-%E8%8E%B7%E5%8F%96%E7%99%BB%E5%BD%95%E5%8F%B7%E4%BF%A1%E6%81%AF
-[获取陌生人信息]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#get_stranger_info-%E8%8E%B7%E5%8F%96%E9%99%8C%E7%94%9F%E4%BA%BA%E4%BF%A1%E6%81%AF
-[获取好友列表]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#get_friend_list-%E8%8E%B7%E5%8F%96%E5%A5%BD%E5%8F%8B%E5%88%97%E8%A1%A8
-[获取群信息]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#get_group_info-%E8%8E%B7%E5%8F%96%E7%BE%A4%E4%BF%A1%E6%81%AF
-[获取群列表]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#get_group_list-%E8%8E%B7%E5%8F%96%E7%BE%A4%E5%88%97%E8%A1%A8
-[获取群成员信息]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#get_group_member_info-%E8%8E%B7%E5%8F%96%E7%BE%A4%E6%88%90%E5%91%98%E4%BF%A1%E6%81%AF
-[获取群成员列表]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#get_group_member_list-%E8%8E%B7%E5%8F%96%E7%BE%A4%E6%88%90%E5%91%98%E5%88%97%E8%A1%A8
-[获取群荣誉信息]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#get_group_honor_info-%E8%8E%B7%E5%8F%96%E7%BE%A4%E8%8D%A3%E8%AA%89%E4%BF%A1%E6%81%AF
-[检查是否可以发送图片]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#can_send_image-%E6%A3%80%E6%9F%A5%E6%98%AF%E5%90%A6%E5%8F%AF%E4%BB%A5%E5%8F%91%E9%80%81%E5%9B%BE%E7%89%87
-[检查是否可以发送语音]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#can_send_record-%E6%A3%80%E6%9F%A5%E6%98%AF%E5%90%A6%E5%8F%AF%E4%BB%A5%E5%8F%91%E9%80%81%E8%AF%AD%E9%9F%B3
-[获取版本信息]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#get_version_info-%E8%8E%B7%E5%8F%96%E7%89%88%E6%9C%AC%E4%BF%A1%E6%81%AF
-[重启 go-cqhttp]: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#set_restart-%E9%87%8D%E5%90%AF-onebot-%E5%AE%9E%E7%8E%B0
-[对事件执行快速操作]: https://github.com/botuniverse/onebot-11/blob/master/api/hidden.md#handle_quick_operation-%E5%AF%B9%E4%BA%8B%E4%BB%B6%E6%89%A7%E8%A1%8C%E5%BF%AB%E9%80%9F%E6%93%8D%E4%BD%9C
+```
+@Roxy /status
+```
 
-#### 拓展 API 及与 OneBot 标准有略微差异的 API
+应返回已注册的工具列表和机器人状态。
 
-| 拓展 API                    | 功能                   |
-| --------------------------- | ---------------------- |
-| /set_group_portrait         | [设置群头像]           |
-| /get_image                  | [获取图片信息]         |
-| /get_msg                    | [获取消息]             |
-| /get_forward_msg            | [获取合并转发内容]     |
-| /send_group_forward_msg     | [发送合并转发(群)]     |
-| /.get_word_slices           | [获取中文分词]         |
-| /.ocr_image                 | [图片 OCR]             |
-| /get_group_system_msg       | [获取群系统消息]       |
-| /get_group_file_system_info | [获取群文件系统信息]   |
-| /get_group_root_files       | [获取群根目录文件列表] |
-| /get_group_files_by_folder  | [获取群子目录文件列表] |
-| /get_group_file_url         | [获取群文件资源链接]   |
-| /get_status                 | [获取状态]             |
+### 特殊会话命令
 
-[设置群头像]: https://docs.go-cqhttp.org/api/#%E8%AE%BE%E7%BD%AE%E7%BE%A4%E5%A4%B4%E5%83%8F
-[获取图片信息]: https://docs.go-cqhttp.org/api/#%E8%8E%B7%E5%8F%96%E5%9B%BE%E7%89%87%E4%BF%A1%E6%81%AF
-[获取消息]: https://docs.go-cqhttp.org/api/#%E8%8E%B7%E5%8F%96%E6%B6%88%E6%81%AF
-[获取合并转发内容]: https://docs.go-cqhttp.org/api/#%E8%8E%B7%E5%8F%96%E5%90%88%E5%B9%B6%E8%BD%AC%E5%8F%91%E5%86%85%E5%AE%B9
-[发送合并转发(群)]: https://docs.go-cqhttp.org/api/#%E5%8F%91%E9%80%81%E5%90%88%E5%B9%B6%E8%BD%AC%E5%8F%91-%E7%BE%A4
-[获取中文分词]: https://docs.go-cqhttp.org/api/#%E8%8E%B7%E5%8F%96%E4%B8%AD%E6%96%87%E5%88%86%E8%AF%8D-%E9%9A%90%E8%97%8F-api
-[图片 ocr]: https://docs.go-cqhttp.org/api/#%E5%9B%BE%E7%89%87-ocr
-[获取群系统消息]: https://docs.go-cqhttp.org/api/#%E8%8E%B7%E5%8F%96%E7%BE%A4%E7%B3%BB%E7%BB%9F%E6%B6%88%E6%81%AF
-[获取群文件系统信息]: https://docs.go-cqhttp.org/api/#%E8%8E%B7%E5%8F%96%E7%BE%A4%E6%96%87%E4%BB%B6%E7%B3%BB%E7%BB%9F%E4%BF%A1%E6%81%AF
-[获取群根目录文件列表]: https://docs.go-cqhttp.org/api/#%E8%8E%B7%E5%8F%96%E7%BE%A4%E6%A0%B9%E7%9B%AE%E5%BD%95%E6%96%87%E4%BB%B6%E5%88%97%E8%A1%A8
-[获取群子目录文件列表]: https://docs.go-cqhttp.org/api/#%E8%8E%B7%E5%8F%96%E7%BE%A4%E5%AD%90%E7%9B%AE%E5%BD%95%E6%96%87%E4%BB%B6%E5%88%97%E8%A1%A8
-[获取群文件资源链接]: https://docs.go-cqhttp.org/api/#%E8%8E%B7%E5%8F%96%E7%BE%A4%E6%96%87%E4%BB%B6%E8%B5%84%E6%BA%90%E9%93%BE%E6%8E%A5
-[获取状态]: https://docs.go-cqhttp.org/api/#%E8%8E%B7%E5%8F%96%E7%8A%B6%E6%80%81
+在 QQ 聊天中 @机器人 使用以下命令：
 
-</details>
+| 命令 | 说明 |
+|------|------|
+| `/新会话 [名称]` | 创建特殊会话 (留空由 LLM 自动命名) |
+| `/切换会话 <编号>` | 切换到指定会话 |
+| `/我的会话` | 列出所有特殊会话 |
+| `/重命名会话 <编号> <名称>` | 重命名会话 |
+| `/删除会话 <编号>` | 删除会话 (确认码保护) |
+| `/激活会话` | 查看当前会话状态 |
+| `/退出会话` | 退出特殊会话，回到临时模式 |
+| `/clear` / `清除上下文` | 清除当前会话上下文 |
+| `/status` | 查看 Agent 状态 |
 
-<details>
-<summary>已实现 Event</summary>
+## 启动脚本
 
-#### 符合 OneBot 标准的 Event（部分 Event 比 OneBot 标准多上报几个字段，不影响使用）
+| 脚本 | 用途 |
+|------|------|
+| `setup.sh` | 一键安装所有依赖（系统库 + Python 环境 + SearXNG） |
+| `start.sh` | 启动所有服务（SearXNG + NoneBot + NapCat 检查） |
+| `stop.sh` | 停止所有服务（NoneBot + SearXNG） |
+| `start_bot.sh` | 仅启动 NoneBot（SearXNG & NapCat 已运行时使用） |
+| `test.sh` | 运行 38 项单元测试 |
 
-| 事件类型 | Event            |
-| -------- | ---------------- |
-| 消息事件 | [私聊信息]       |
-| 消息事件 | [群消息]         |
-| 通知事件 | [群文件上传]     |
-| 通知事件 | [群管理员变动]   |
-| 通知事件 | [群成员减少]     |
-| 通知事件 | [群成员增加]     |
-| 通知事件 | [群禁言]         |
-| 通知事件 | [好友添加]       |
-| 通知事件 | [群消息撤回]     |
-| 通知事件 | [好友消息撤回]   |
-| 通知事件 | [群内戳一戳]     |
-| 通知事件 | [群红包运气王]   |
-| 通知事件 | [群成员荣誉变更] |
-| 请求事件 | [加好友请求]     |
-| 请求事件 | [加群请求/邀请]  |
+## 目录结构
 
-[私聊信息]: https://github.com/botuniverse/onebot-11/blob/master/event/message.md#%E7%A7%81%E8%81%8A%E6%B6%88%E6%81%AF
-[群消息]: https://github.com/botuniverse/onebot-11/blob/master/event/message.md#%E7%BE%A4%E6%B6%88%E6%81%AF
-[群文件上传]: https://github.com/botuniverse/onebot-11/blob/master/event/notice.md#%E7%BE%A4%E6%96%87%E4%BB%B6%E4%B8%8A%E4%BC%A0
-[群管理员变动]: https://github.com/botuniverse/onebot-11/blob/master/event/notice.md#%E7%BE%A4%E7%AE%A1%E7%90%86%E5%91%98%E5%8F%98%E5%8A%A8
-[群成员减少]: https://github.com/botuniverse/onebot-11/blob/master/event/notice.md#%E7%BE%A4%E6%88%90%E5%91%98%E5%87%8F%E5%B0%91
-[群成员增加]: https://github.com/botuniverse/onebot-11/blob/master/event/notice.md#%E7%BE%A4%E6%88%90%E5%91%98%E5%A2%9E%E5%8A%A0
-[群禁言]: https://github.com/botuniverse/onebot-11/blob/master/event/notice.md#%E7%BE%A4%E7%A6%81%E8%A8%80
-[好友添加]: https://github.com/botuniverse/onebot-11/blob/master/event/notice.md#%E5%A5%BD%E5%8F%8B%E6%B7%BB%E5%8A%A0
-[群消息撤回]: https://github.com/botuniverse/onebot-11/blob/master/event/notice.md#%E7%BE%A4%E6%B6%88%E6%81%AF%E6%92%A4%E5%9B%9E
-[好友消息撤回]: https://github.com/botuniverse/onebot-11/blob/master/event/notice.md#%E5%A5%BD%E5%8F%8B%E6%B6%88%E6%81%AF%E6%92%A4%E5%9B%9E
-[群内戳一戳]: https://github.com/botuniverse/onebot-11/blob/master/event/notice.md#%E7%BE%A4%E5%86%85%E6%88%B3%E4%B8%80%E6%88%B3
-[群红包运气王]: https://github.com/botuniverse/onebot-11/blob/master/event/notice.md#%E7%BE%A4%E7%BA%A2%E5%8C%85%E8%BF%90%E6%B0%94%E7%8E%8B
-[群成员荣誉变更]: https://github.com/botuniverse/onebot-11/blob/master/event/notice.md#%E7%BE%A4%E6%88%90%E5%91%98%E8%8D%A3%E8%AA%89%E5%8F%98%E6%9B%B4
-[加好友请求]: https://github.com/botuniverse/onebot-11/blob/master/event/request.md#%E5%8A%A0%E5%A5%BD%E5%8F%8B%E8%AF%B7%E6%B1%82
-[加群请求/邀请]: https://github.com/botuniverse/onebot-11/blob/master/event/request.md#%E5%8A%A0%E7%BE%A4%E8%AF%B7%E6%B1%82%E9%82%80%E8%AF%B7
+```
+QQBotAgent/
+├── setup.sh                # 一键安装脚本
+├── start.sh / stop.sh      # 启动 / 停止脚本
+├── test.sh                 # 测试脚本
+├── bot.py                  # NoneBot 入口（备用）
+├── docker-compose.yml      # Docker 编排 (SearXNG + QQBot + vLLM)
+├── Dockerfile              # Docker 镜像构建
+├── docker-entrypoint.sh    # Docker 容器入口
+├── napcat.sh               # NapCat 安装脚本
+├── vllm-start.sh           # vLLM 推理服务启动
+├── searxng/                # SearXNG 搜索配置
+│   └── settings.yml        #   搜索引擎配置 (Bing / 国内优化)
+│
+└── QQBot/                  # NoneBot 机器人主体
+    ├── .env                # 环境变量（密钥 / 服务配置）⚠ git-ignored
+    ├── requirements.txt    # Python 依赖
+    ├── pyproject.toml      # NoneBot 项目配置
+    ├── test_agent.py       # 测试套件（38 项测试）
+    │
+    ├── agent/              # 智能体核心
+    │   ├── agent.py        #   主循环: Think→Act→Observe→Respond
+    │   ├── tool_registry.py#   工具注册（OpenAI JSON Schema）
+    │   ├── session.py      #   会话管理（临时会话, per-user, 持久化）
+    │   ├── special_session.py  # 特殊会话（百万 token, 快照+增量, 最多3个）
+    │   ├── continuous_session.py  # 群聊连续对话窗口（5分钟免@）
+    │   ├── hardware.py     #   硬件自动检测 & 动态任务拒绝
+    │   ├── workspace.py    #   用户工作区隔离 & 配额管理
+    │   ├── context.py      #   执行上下文（contextvars, 工具→QQ图片）
+    │   ├── memory.py       #   长期记忆（Markdown 文件）
+    │   ├── profile.py      #   用户画像（LLM 自动提取）
+    │   └── config/         #   智能体配置（10 个 Markdown）
+    │
+    ├── plugins/            # NoneBot 插件
+    │   └── agent_router.py #   ★ 统一消息入口（所有交互的唯一处理器）
+    │
+    ├── tools/              # Agent 工具实现
+    │   ├── builtin_tools.py#   搜索 / 抓取 / 代码执行 / Shell / Git / PDF / 时间
+    │   ├── file_tools.py   #   文件读取（文本 / PDF / 图片 / 音频分析）
+    │   ├── map_tools.py    #   地图工具（地理编码 / 天气 / POI / 路径）
+    │   └── legacy_tools.py #   游戏工具（抽卡 / 测速 / 翻译）
+    │
+    ├── lib/                # 库
+    │   ├── deepseek_client.py   # DeepSeek API 客户端
+    │   ├── model_router.py      # 多模型路由器
+    │   └── multimodal_client.py # 多模态客户端（图片理解 + 音频分析）
+    │
+    ├── config/             # 敏感配置 ⚠ git-ignored
+    │   ├── models_settings.json         # 多模型配置
+    │   └── models_settings_example.json # 配置模板
+    │
+    └── data/               # 运行时数据
+        ├── sessions/       #   会话持久化
+        ├── memory/         #   长期记忆
+        ├── users/          #   用户画像
+        └── workspace/      #   工作区（代码执行 / 仓库 / 上传 / 输出）
+```
 
-#### 拓展 Event
+## 核心架构
 
-| 事件类型 | 拓展 Event       |
-| -------- | ---------------- |
-| 通知事件 | [好友戳一戳]     |
-| 通知事件 | [群内戳一戳]     |
-| 通知事件 | [群成员名片更新] |
-| 通知事件 | [接收到离线文件] |
+### Agent 主循环
 
-[好友戳一戳]: https://docs.go-cqhttp.org/event/#%E5%A5%BD%E5%8F%8B%E6%88%B3%E4%B8%80%E6%88%B3
-[群内戳一戳]: https://docs.go-cqhttp.org/event/#%E7%BE%A4%E5%86%85%E6%88%B3%E4%B8%80%E6%88%B3
-[群成员名片更新]: https://docs.go-cqhttp.org/event/#%E7%BE%A4%E6%88%90%E5%91%98%E5%90%8D%E7%89%87%E6%9B%B4%E6%96%B0
-[接收到离线文件]: https://docs.go-cqhttp.org/event/#%E6%8E%A5%E6%94%B6%E5%88%B0%E7%A6%BB%E7%BA%BF%E6%96%87%E4%BB%B6
+```
+User Message → agent_router
+  ├── 特殊命令 (/clear, /status) → 直接处理
+  └── 自然语言
+       ├── ModelRouter.classify_complexity(message)
+       │     FLASH_MODEL → "simple" 或 "complex"
+       ├── Build Messages (System + Profile + Memory + History)
+       └── Think→Act→Observe→Respond 循环（最多 12 轮）
+            ├── think: LLM 分析，决定是否调用工具
+            ├── act: 执行工具（搜索 / 代码 / 文件等）
+            ├── observe: 工具结果注入对话
+            └── respond: 无工具调用时 → 回复用户
+```
 
-</details>
+**关键参数**：`max_tool_iterations=12`, `thinking_timeout=180s`, `total_timeout=300s`, `session_timeout=30min`
 
-## 关于 ISSUE
+### 多模型路由
 
-以下 ISSUE 会被直接关闭
+参考 Claude Code 的模型分层策略：
 
-- 提交 BUG 不使用 Template
-- 询问已知问题
-- 提问找不到重点
-- 重复提问
+```
+用户消息
+  │
+  ├── FLASH_MODEL 分类: "simple" 或 "complex"
+  │
+  ├── simple → FLASH_MODEL 直接回复（低成本）
+  └── complex → REASONING_MODEL + 工具调用（强力推理）
+  │
+  └── 图片/音频 → MULTIMODAL_MODEL / AUDIO_MODEL（多模态理解）
+```
 
-> 请注意, 开发者并没有义务回复您的问题. 您应该具备基本的提问技巧。  
-> 有关如何提问，请阅读[《提问的智慧》](https://github.com/ryanhanwu/How-To-Ask-Questions-The-Smart-Way/blob/main/README-zh_CN.md)
+配置在 `QQBot/config/models_settings.json`，留空自动回退到 `.env` 默认。
 
-## 性能
+### 群聊连续对话
 
-在关闭数据库的情况下, 加载 25 个好友 128 个群运行 24 小时后内存使用为 15MB 左右. 开启数据库后内存使用将根据消息量增加 10-20MB, 如果系统内存小于 128M 建议关闭数据库使用.
+```
+@Roxy "帮我分析数据"   → agent_router (to_me) → 自动开启 5 分钟窗口
+"这个字段是什么" (无@)  → continuous_router       → Agent 处理 + 续期
+"/取消" (无@)          → continuous_router       → 关闭窗口
+5 分钟无消息            → 自动过期清理
+```
+
+## 核心类
+
+### Agent (`agent/agent.py`)
+
+```python
+class Agent:
+    # 构造
+    def __init__(self, deepseek_client, tool_registry, config_dir,
+                 session_manager=None, memory_system=None, profile_manager=None,
+                 max_tool_iterations=12, thinking_timeout=180.0)
+
+    # 核心方法
+    async def run(self, user_message, user_id, client=None) -> str
+    def build_system_prompt(self) -> str                      # SOUL + IDENTITY + AGENTS
+    def get_status(self) -> dict                              # 运行状态
+    def clear_user_session(self, user_id)                     # 清除会话
+```
+
+- `client` 参数支持运行时模型切换（ModelRouter 传入不同 `DeepSeekClient`）
+- `run()` 返回最终回复文本，内部自动管理 Session / Memory / Profile
+
+### DeepSeekClient (`lib/deepseek_client.py`)
+
+```python
+class DeepSeekClient:
+    def __init__(self, api_key=None, api_base=None, model=None)
+    async def chat_completion(self, message, history, timeout=180.0) -> str
+    async def chat_completion_with_tools(self, messages, tools, timeout=180.0) -> dict
+```
+
+可选参数支持多实例（不同模型不同端点），用于 ModelRouter。
+
+### ModelRouter (`lib/model_router.py`)
+
+```python
+class ModelRouter:
+    async def classify_complexity(self, user_message) -> str   # "simple" | "complex"
+    def get_client(self, task_type) -> DeepSeekClient           # triage/simple/complex/multimodal
+    @property reasoning_client / flash_client / multimodal_client
+```
+
+### ToolRegistry (`agent/tool_registry.py`)
+
+```python
+class ToolRegistry:
+    def register(self, name, func, description, parameters)    # 注册工具
+    def get_schemas(self) -> list                              # OpenAI Function Calling JSON
+    async def execute(self, name, arguments) -> str            # 执行工具
+```
+
+### ContinuousSessionManager (`agent/continuous_session.py`)
+
+```python
+class ContinuousSessionManager:
+    def __init__(self, timeout_minutes=5.0)
+    def start(self, group_id, user_id)                         # 开启窗口
+    def is_active(self, group_id, user_id) -> bool             # 检查 + 自动清理
+    def touch(self, group_id, user_id)                         # 续期
+    def end(self, group_id, user_id)                           # 手动关闭
+```
+
+### Session / Memory / Profile
+
+| 类 | 文件 | 功能 |
+|---|---|---|
+| `Session` | `session.py` | per-user 对话上下文（最多 20 条），持久化到 `data/sessions/` |
+| `MemorySystem` | `memory.py` | 长期记忆（Markdown 文件），关键词搜索，最多返回 3 条 |
+| `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣，持久化到 `data/users/` |
+
+## 已注册工具（20 个）
+
+| 工具 | 说明 |
+|------|------|
+| `search_web` | SearXNG 聚合搜索（天气 / 新闻 / 百科） |
+| `web_fetch` | 直接抓取 HTTPS 网页内容（搜索无结果时的 fallback） |
+| `execute_code` | Python 沙盒执行（支持图表输出） |
+| `shell_exec` | Shell 命令执行（白名单+管道） |
+| `get_time` | 当前日期时间 |
+| `read_file` | 读取文件（文本 / PDF / 图片 AI 分析 / 音频 AI 分析） |
+| `summarize_pdf` | PDF 提取 + 总结 |
+| `download_repo` | Git clone 仓库（HTTPS only） |
+| `translate_text` | 多语言翻译 |
+| `explain_code` | 代码解释 |
+| `gacha_pull` | 抽卡模拟（4 种卡池，数据 JSON 可配） |
+| `play_gacha_animation` | 抽卡动画播放（图片序列） |
+| `calculate_speed` | 游戏战斗测速 |
+| `compare_speed_probability` | 乱速概率计算 |
+| `geocode` | 地址 → 经纬度坐标查询 |
+| `reverse_geocode` | 经纬度 → 详细地址反查 |
+| `get_weather` | 实时天气 / 4天预报（高德） |
+| `search_poi` | 周边POI搜索（餐厅、地铁等） |
+| `plan_route` | 驾车/步行/公交路线规划 |
+
+## 智能体配置
+
+所有配置文件在 `QQBot/agent/config/`：
+
+| 文件 | 用途 |
+|------|------|
+| `SOUL.md` | 人格定义（Roxy）& 行为规则 |
+| `IDENTITY.md` | 身份声明 & 技术栈 & 能力 |
+| `AGENTS.md` | 编排规则 & 工具选择 & 连续对话模式 |
+| `WORKSPACE.md` | 工作区约束 & 安全边界 |
+| `TOOLS.md` | 全部工具的参数文档 |
+| `BOOTSTRAP.md` | 启动健康检查 |
+| `SESSION.md` | 会话参数 |
+
+修改这些文件会**即时影响 Agent 行为**，无需重启即可生效（`reload_configs()`）。
+
+## 添加新工具
+
+在 `QQBot/tools/` 下创建新的工具函数，然后在 `agent_router.py` 的 `_build_tool_registry()` 中注册：
+
+```python
+async def my_tool(param: str) -> str:
+    # 工具逻辑
+    return result
+
+# 在 _build_tool_registry() 中:
+registry.register(
+    "my_tool", my_tool,
+    "工具描述（中文）",
+    {
+        "type": "object",
+        "properties": {
+            "param": {"type": "string", "description": "参数描述"},
+        },
+        "required": ["param"],
+    },
+)
+```
+
+同时更新 `TOOLS.md` 添加工具文档。
+
+## 测试
+
+```bash
+bash test.sh
+# 或
+cd QQBot && python test_agent.py
+```
+
+7 个测试套件，38 项测试：
+1. **ToolRegistry** — 注册 / Schema / 同步异步执行 / 错误
+2. **SessionManager** — CRUD / 超时 / 裁剪 / 持久化
+3. **MemorySystem** — 保存 / 搜索 / 遗忘 / 列出
+4. **AgentCore** — 启动 / 提示词 / 工具循环 / 迭代上限 / 画像注入
+5. **UserProfile** — 创建 / 事实去重 / 持久化
+6. **DeepSeekClient** — 响应解析（纯文本 / 工具调用 / 混合）
+7. **BuiltinTools** — get_time / execute_code / search_web
+
+## 安全模型
+
+| 边界 | 规则 |
+|------|------|
+| 代码执行 | `python3 -I` 隔离 + 模式匹配（15 个禁止模式）+ 60s / 100KB 限制 |
+| 文件访问 | 仅在 `/data/workspace/`，拒绝路径遍历（`..`, `~`, `/etc/`） |
+| 网络 | 仅通过预定义工具（search, download_repo HTTPS only） |
+| 隐私 | per-user 隔离，本地存储，不上传第三方（除 API 调用外） |
+
+详见 `QQBot/agent/config/WORKSPACE.md`。
+
+## 安装 NapCat（详细）
+
+```bash
+bash napcat.sh --docker n     # Rootless Shell 安装（推荐）
+bash napcat.sh --docker y     # Docker 安装
+```
+
+安装后：
+1. 在 NapCat WebUI 登录 QQ
+2. 配置反向 WebSocket：`ws://127.0.0.1:8081/onebot/v11/ws`
+3. 设置 Access Token 与 `.env` 一致
+
+## Docker 部署
+
+```bash
+# 完整栈（SearXNG + QQBot + vLLM）
+docker compose up -d
+
+# 仅 SearXNG
+docker compose up -d searxng
+```
+
+Docker Compose 包含：
+- `searxng` — 搜索引擎 (port 8082)
+- `qqbot` — 主服务，含 NapCat + NoneBot + vLLM（port 8080/8081/6099/8000）
+
+## 常见问题
+
+### Docker 安装失败（国内云服务器）
+
+**现象**：在腾讯云、阿里云等国内云服务器上执行 `bash napcat.sh --docker y` 或 `get-docker.sh` 时，出现 `Connection reset by peer` 或下载超时。
+
+**原因**：Docker 官方安装脚本从 `download.docker.com`（AWS/Akamai 海外 CDN）下载 GPG 密钥和软件包，国内云服务器的网络出口受 GFW 限制，TCP 连接会被重置。
+
+**解决方法（任选一种）**：
+
+方法一：直接使用系统包管理器安装（推荐）
+```bash
+# Ubuntu/Debian（腾讯云 apt 镜像已包含 Docker）
+sudo apt-get install -y docker.io docker-compose-v2
+sudo systemctl enable docker --now
+```
+
+方法二：使用 Aliyun 镜像安装
+```bash
+sudo curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh --mirror Aliyun
+```
+
+方法三：手动配置 Docker 镜像源
+```bash
+# 先通过 apt 安装 docker，再配置国内镜像加速
+sudo apt-get install -y docker.io
+sudo tee /etc/docker/daemon.json <<EOF
+{
+  "registry-mirrors": [
+    "https://docker.1ms.run",
+    "https://docker.xuanyuan.me"
+  ]
+}
+EOF
+sudo systemctl restart docker
+```
+
+> **注意**：`napcat.sh` 对 Docker Hub 镜像拉取（`docker pull`）已内置代理测速（`docker.1ms.run` 等），但 Docker 本身的安装步骤（`get-docker.sh`）未走代理。如果遇到安装失败，先用上述方法手动安装 Docker，再运行 `napcat.sh`。
+
+---
+
+### NapCat 反向 WebSocket 403 错误
+
+**现象**：
+- NoneBot 日志：`WebSocket /` 返回 403
+- NapCat 报错：`ws://localhost:8081` 连接失败 (403)
+
+**原因分析**：
+
+1. **路径不匹配（首要原因）**：NoneBot 的 OneBot 适配器将反向 WebSocket 端点注册在 `/onebot/v11/ws/`，而非根路径 `/`。NapCat 如果配置为 `ws://localhost:8081`（即请求 `/`），FastAPI 找不到对应路由，返回 403。
+
+2. **Access Token 未传递或错误**：即使路径正确，如果 NapCat 没有携带 `ONEBOT_ACCESS_TOKEN`（通过 `Authorization: Bearer <token>` 请求头或 `?access_token=<token>` 查询参数），NoneBot 也会因鉴权失败返回 403。
+
+**解决方法**：
+
+**步骤 1**：修改 NapCat 的反向 WebSocket 地址为正确路径
+```
+ws://127.0.0.1:8081/onebot/v11/ws/
+```
+
+**步骤 2**：在 URL 中携带 access token（两种方式任选一种）
+
+方式 A — 查询参数：
+```
+ws://127.0.0.1:8081/onebot/v11/ws/?access_token=你的ONEBOT_ACCESS_TOKEN
+```
+
+方式 B — 单独配置 token 字段（如果 NapCat WebUI 支持）：
+- WebSocket 地址：`ws://127.0.0.1:8081/onebot/v11/ws/`
+- Access Token：与 `.env` 中 `ONEBOT_ACCESS_TOKEN` 一致
+
+**步骤 3**：确认 NoneBot 已加载 OneBot 适配器
+```bash
+nb plugin list
+```
+应能看到 `nonebot_adapter_onebot`。检查 `bot.py` 确保已注册适配器：
+```python
+from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
+driver.register_adapter(OneBotV11Adapter)
+```
+
+**步骤 4**：检查 NoneBot 启动日志
+成功加载适配器后，启动日志应打印：
+```
+OneBot V11 | WebSocket Server listening on ws://0.0.0.0:8081/onebot/v11/ws/
+```
+确保 NapCat 的地址与此日志中的路径完全一致。
+
+**步骤 5**：验证 Token 一致性
+确保 `QQBot/.env` 中的 `ONEBOT_ACCESS_TOKEN` 与 NapCat 配置的 token **完全一致**（注意无多余空格、换行）。Token 中的 `~` 等特殊字符在 URL 中是安全的，直接使用即可。
+
+---
+
+### SearXNG 容器启动 / 搜索失败
+
+**现象一：`docker pull searxng/searxng:latest` 超时或 `Connection reset by peer`**
+
+**原因**：与 Docker 安装类似，GFW 阻断了对 Docker Hub（海外 CDN）的访问。
+
+**解决**：给 Docker 配置镜像加速器（任选一种）：
+
+方案 A — 全局配置 registry-mirrors（推荐，一劳永逸）：
+```bash
+sudo tee /etc/docker/daemon.json <<'EOF'
+{
+  "registry-mirrors": [
+    "https://docker.1ms.run",
+    "https://docker.xuanyuan.me",
+    "https://docker.mybacc.com",
+    "https://dytt.online"
+  ]
+}
+EOF
+sudo systemctl restart docker
+```
+配置后直接 `docker pull searxng/searxng:latest` 即可，Docker 会自动按顺序重试各个镜像。
+
+方案 B — 手动通过代理拉取：
+```bash
+docker pull docker.xuanyuan.me/searxng/searxng:latest && \
+docker tag docker.xuanyuan.me/searxng/searxng:latest searxng/searxng:latest
+```
+
+> **注意**：单个代理（如 `docker.1ms.run`）可能没缓存特定镜像，换一个试试。如果都不行，用方案 A 让 Docker 自动重试。
+
+**现象二：容器运行中但搜索无结果 / 超时**
+
+```bash
+# 检查容器状态
+docker logs searxng --tail 50
+
+# 测试 API
+curl "http://localhost:8082/search?format=json&q=test"
+```
+
+**原因**：SearXNG 默认引擎（Google / DuckDuckGo / Wikipedia 等）在国内全部不可用，`settings.yml` 中已只启用 Bing。但 Bing 在国内有时也会间歇性超时。
+
+**解决**：等几分钟重试；或者编辑 `searxng/settings.yml` 添加国内可用的搜索引擎（如百度），然后 `docker compose restart searxng`。
+
+**现象三：容器退出 / 反复重启**
+
+```bash
+docker compose up searxng   # 前台运行看报错
+docker compose run --rm searxng cat /etc/searxng/settings.yml  # 验证挂载
+```
+
+常见原因：`settings.yml` YAML 格式错误（缩进必须用空格不能用 tab）、端口 8082 被占用。
+
+**QQ 消息发送超时 (retcode 1200)？**
+- 已内置重试机制 + 智能拆分（300 字符 / 块 + 1s 间隔）
+- 如仍出现，增大 `.env` 中的间隔时间或减小 chunk 大小
+
+**模型路由不生效？**
+- 检查 `QQBot/config/models_settings.json` 中 model 字段非空
+- 留空则所有模型回退到 `.env` 的 DeepSeek 默认配置
+
+**图片分析不可用？**
+- 编辑 `models_settings.json` 的 `MULTIMODAL_MODEL` 部分
+- 填入支持 OpenAI 兼容 vision API 的服务（如 GPT-4V, Claude Vision）
+- 未配置时图片仅返回尺寸 / 格式等基本信息
+
+**音频/语音分析不可用？**
+- 编辑 `models_settings.json` 的 `AUDIO_MODEL` 部分
+- 配置支持音频的多模态模型（如 qwen3-omni-flash，通过 DashScope 原生 API）
+- 需要 `ffmpeg` 和 `pilk`（SILK 解码）已安装
+- 未配置时音频仅返回元数据（格式/时长/采样率）
+
+## 📖 扩展阅读
+
+- [DOCUMENTATION.md](QQBot/DOCUMENTATION.md) — 完整的项目文档（架构 / 数据流 / SearXNG / 多模态 / 多模型 / 演进历史）
+- [PLAN.md](QQBot/PLAN.md) — Agent 架构设计决策记录
+- [WORKSPACE.md](QQBot/agent/config/WORKSPACE.md) — 安全模型与能力边界
+- [AGENTS.md](QQBot/agent/config/AGENTS.md) — Agent 编排规则

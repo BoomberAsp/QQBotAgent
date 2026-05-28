@@ -4,7 +4,7 @@ from typing import Union
 import pandas as pd
 import numpy as np
 from nonebot.internal.matcher import Matcher
-from nonebot.plugin import on_message, on_command, on_notice
+# on_message, on_command, on_notice imports removed (handlers disabled)
 from nonebot.adapters.onebot.v11 import (
     GroupMessageEvent,
     Message,
@@ -17,16 +17,20 @@ from nonebot.params import CommandArg
 from nonebot.rule import to_me
 # from utils import group_command_rule
 
-# 全局定义命令响应器
-hello = on_command("hello",priority=5, aliases={"介绍", "Hello", "你是谁"}, rule=to_me())
-group_info = on_command("群信息", aliases={"groupinfo", "/ginfo"}, priority=5, rule=to_me())
-speed_test = on_command(
-    "测速",
-    aliases={"测个速", "compute speed", "cesu"},
-    priority=5,
-    state={"expire_time": timedelta(minutes=5)},
-    rule=to_me()
-)
+# DEPRECATED: on_command and on_message handlers disabled. All commands
+# are now routed through agent_router.py via the agent's tool system.
+# Utility functions (parse_speed_data, compute_speed_results) remain
+# for use by tools/legacy_tools.py.
+#
+# hello = on_command("hello",priority=5, aliases={"介绍", "Hello", "你是谁"}, rule=to_me())
+# group_info = on_command("群信息", aliases={"groupinfo", "/ginfo"}, priority=5, rule=to_me())
+# speed_test = on_command(
+#     "测速",
+#     aliases={"测个速", "compute speed", "cesu"},
+#     priority=5,
+#     state={"expire_time": timedelta(minutes=5)},
+#     rule=to_me()
+# )
 
 help_msg = (
             "我是基于NoneBot的机器人Roxy~"
@@ -43,8 +47,7 @@ help_msg = (
             "（开发中）输入 查询团战信息 查询团战信息\n"
         )
 
-# 全局消息响应器
-group_msg = on_message(priority=100, block=False, rule=to_me())
+# group_msg = on_message(priority=100, block=False, rule=to_me())
 
 # 测速格式说明（全局常量）
 SPEED_TEST_FORMAT = (
@@ -214,98 +217,19 @@ async def compute_and_send_results(matcher: Matcher, state: T_State):
     await matcher.finish(result_msg)
 
 
-# =============== 命令处理函数 ===============
-
-@hello.handle()
-async def handle_hello(event: MessageEvent):
-
-    await hello.finish(Message("你好！我是由Lagrange.OneBot驱动的机器人Roxy"))
-
-
-@group_info.handle()
-async def handle_group_info(event: GroupMessageEvent):
-    # 获取群信息
-    group_id = event.group_id
-    group_name = "神仙到此也生淫"  # 实际应用中可能需要调用API获取
-
-    # 构造回复消息
-    reply = Message([
-        MessageSegment.text(f"群号: {group_id}\n"),
-        MessageSegment.text(f"群名: {group_name}\n"),
-        MessageSegment.text(f"成员数: 待获取"),
-        MessageSegment.at(event.user_id)  # @发送者
-    ])
-
-    await group_info.finish(reply)
-
-
-@speed_test.handle()
-async def handle_first_receive(
-        event: MessageEvent,
-        matcher: Matcher,
-        state: T_State,
-        args: Message = CommandArg()
-):
-    # 存储用户信息用于后续验证
-    if isinstance(event, GroupMessageEvent):
-        state["user_id"] = event.user_id
-        state["group_id"] = event.group_id
-    else:
-        state["user_id"] = event.user_id
-
-    # 获取用户输入
-    user_input = args.extract_plain_text().strip()
-
-    if user_input:
-        # 尝试解析输入
-        data, error = parse_speed_data(user_input)
-        if error:
-            await matcher.reject(f"{error}\n{SPEED_TEST_FORMAT}")
-        else:
-            allies, enemies = data
-            state["allies"] = allies
-            state["enemies"] = enemies
-            await matcher.send("数据解析成功！开始计算...")
-            await compute_and_send_results(matcher, state)
-    else:
-        # 无输入时发送帮助信息
-        await matcher.send(SPEED_TEST_FORMAT)
-        await matcher.pause("请按照上述格式输入战斗数据：")
-
-
-
-
-@speed_test.handle()
-async def handle_secondary_input(
-        event: Union[MessageEvent, GroupMessageEvent],
-        matcher: Matcher,
-        state: T_State
-):
-    # 验证用户身份
-    if isinstance(event, GroupMessageEvent):
-        if state["user_id"] != event.user_id or state["group_id"] != event.group_id:
-            return
-    else:
-        if state["user_id"] != event.user_id:
-            return
-
-    # 获取用户输入
-    user_input = event.get_plaintext().strip()
-
-    # 处理取消命令
-    if user_input in ["取消", "退出", "cancel", "exit", "0"]:
-        await matcher.finish("已取消测速操作")
-
-    # 尝试解析输入
-    data, error = parse_speed_data(user_input)
-    if error:
-        await matcher.reject(f"{error}\n请重新输入或发送 '取消' 退出：")
-    else:
-        allies, enemies = data
-        state["allies"] = allies
-        state["enemies"] = enemies
-        await matcher.send("数据解析成功！开始计算...")
-        await compute_and_send_results(matcher, state)
+# =============== 命令处理函数 (DEPRECATED) ===============
+#
+# @hello.handle()
+# async def handle_hello(event: MessageEvent): ...
+#
+# @group_info.handle()
+# async def handle_group_info(event: GroupMessageEvent): ...
+#
+# @speed_test.handle()
+# async def handle_first_receive(...): ...
+#
+# @speed_test.handle()
+# async def handle_secondary_input(...): ...
 
 
 
@@ -326,37 +250,8 @@ async def handle_secondary_input(
 #         await speed_test.finish(msg)
 
 
-# =============== 消息处理函数 ==============
-
-
-@group_msg.handle()
-async def handle_group_msg(event: GroupMessageEvent):
-    # 记录消息
-    message = str(event.get_message())
-    print(f"收到群消息: 群{event.group_id} | 用户{event.user_id}: {message}")
-
-    if "帮助" in message or "怎么用" in message or "指南" in message:
-        await group_msg.finish(Message([MessageSegment.text(help_msg), MessageSegment.at(event.user_id)]))
-        # 当有人提到"状态"时回复
-    elif "状态" in message or "在线" in message or "在吗" in message:
-        await group_msg.finish("我在哟")
-        # 当有人提到"感谢"时回复
-    elif "感谢" in message or "谢谢" in message:
-        await group_msg.finish(MessageSegment.at(event.user_id) + " 太客气了吧")
-    elif "介绍" in message or "你是谁" in message or "hello" in message or "Hello" in message:
-        await group_msg.finish("我是基于NoneBot的机器人Roxy~")
-    elif "/" in message:
-        if "/来点美图" in message or "/来点铯土" in message or "/查询团战信息" in message:
-            await group_msg.finish("该功能开发中……")
-        elif not ("/测速" in message or "/hello" in message or "/单抽" in message or "/十连抽" in message):
-            await group_msg.finish(Message([MessageSegment.text("未知的命令，请查看帮助文档：\n"),
-                                            MessageSegment.text(help_msg),
-                                            MessageSegment.at(user_id=event.user_id)]))
-    elif "测速" in message or "hello" in message or "单抽" in message or "十连抽" in message or "luansu" in message or "乱速" in message:
-        pass
-    elif message.startswith(("ds","deepseek","chat","思考","聊天","对话","DS","DeepSeek","clear","清除上下文","新对话")):
-        pass
-    else:
-        await group_msg.finish(Message([MessageSegment.text("未知的命令，请查看帮助文档：\n"),
-                                        MessageSegment.text(help_msg),
-                                        MessageSegment.at(user_id=event.user_id)]))
+# =============== 消息处理函数 (DEPRECATED) ==============
+#
+# @group_msg.handle()
+# async def handle_group_msg(event: GroupMessageEvent):
+#     [DEPRECATED] Group message handler — superseded by agent_router.py.

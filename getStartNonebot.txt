@@ -1,8 +1,8 @@
 screen -S nonebot # 启动会话
 
 如果没有进入虚拟环境：
-source /home/hadoop/PycharmProjects/qqBot/myenv/bin/activate # 绝对路径
-source myenv/bin/activate # 相对路径
+source /home/windows11/.virtualenvs/QQBotAgent/bin/activate # 绝对路径
+# source myenv/bin/activate # 相对路径
 
 已经进入了虚拟环境：
 nb run

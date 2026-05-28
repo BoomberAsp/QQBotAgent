@@ -101,7 +101,8 @@ RUN chmod +x /app/docker-entrypoint.sh /app/vllm-start.sh
 # 8080: Napcat WebSocket 反向连接端口
 # 8081: NoneBot HTTP API 端口
 # 8000: vLLM 推理服务端口
-EXPOSE 8080 8081 8000
+# 6099: Napcat WebUI
+EXPOSE 8080 8081 8000 6099
 
 # 设置入口点
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

@@ -319,40 +319,158 @@ function enable_dnf_repos_and_cache() {
 
 function uninstall_old_version() {
     log "正在检查旧版本安装..."
-    # 旧版本的特征是/opt/QQ下存在napcat目录
+
+    local found_old=false
+
+    # 1. 检查系统级安装 (/opt/QQ)
     if [ -d "/opt/QQ/resources/app/app_launcher/napcat" ]; then
-        log "检测到旧版本, 准备自动卸载..."
-        
-        echo -e "${YELLOW}警告: 检测到系统级安装的旧版本Napcat。接下来的操作将使用包管理器卸载 'linuxqq' 并彻底删除 '/opt/QQ' 目录。${NC}"
-        echo -e "${YELLOW}请确保您不再需要旧版本的任何配置文件。${NC}"
-        read -p "是否继续彻底删除旧版本? (y/N): " confirm_delete
-        
+        found_old=true
+        log "检测到系统级旧版本 (/opt/QQ)"
+    fi
+
+    # 2. 检查 root 用户下的安装
+    if [ -d "/root/Napcat/opt/QQ/resources/app/app_launcher/napcat" ]; then
+        found_old=true
+        log "检测到 root 用户下的旧版本 (/root/Napcat)"
+    fi
+
+    # 3. 检查 root 用户下的 QQ 配置
+    if [ -d "/root/.config/QQ" ]; then
+        found_old=true
+        log "检测到 root 用户下的 QQ 配置 (/root/.config/QQ)"
+    fi
+
+    if [ "$found_old" = true ]; then
+        log "准备清理所有旧版本安装..."
+        echo ""
+        echo -e "${YELLOW}将清理以下位置（需要 sudo 权限）:${NC}"
+        [ -d "/opt/QQ" ] && echo -e "  - ${RED}/opt/QQ${NC} (系统级安装)"
+        [ -d "/root/Napcat" ] && echo -e "  - ${RED}/root/Napcat${NC} (root 用户安装)"
+        [ -d "/root/.config/QQ" ] && echo -e "  - ${RED}/root/.config/QQ${NC} (root 用户 QQ 配置)"
+        echo ""
+
+        read -p "是否继续彻底删除以上所有旧版本? (y/N): " confirm_delete
+
         if [[ ! "${confirm_delete}" =~ ^[Yy]$ ]]; then
-            log "取消操作"
-            exit 1
+            log "跳过旧版本清理（可能导致新安装冲突）。"
+            return
         fi
 
+        # 尝试卸载包管理器的 linuxqq
         detect_package_manager
         if [ "${package_manager}" = "apt-get" ]; then
-            execute_command "sudo apt-get remove -y -qq linuxqq" "卸载旧版 linuxqq"
+            sudo apt-get remove -y -qq linuxqq 2>/dev/null && log "卸载 linuxqq (apt) 成功" || log "跳过: linuxqq 未通过 apt 安装"
         elif [ "${package_manager}" = "dnf" ]; then
-            execute_command "sudo dnf remove -y linuxqq" "卸载旧版 linuxqq"
+            sudo dnf remove -y linuxqq 2>/dev/null && log "卸载 linuxqq (dnf) 成功" || log "跳过: linuxqq 未通过 dnf 安装"
         fi
 
-        # 增加强制删除残留目录的逻辑
+        # 删除系统级目录
         if [ -d "/opt/QQ" ]; then
-            execute_command "sudo rm -rf /opt/QQ" "彻底清理旧版QQ目录"
+            sudo rm -rf /opt/QQ && log "已删除 /opt/QQ" || log "删除 /opt/QQ 失败"
         fi
-        log "旧版本卸载完成。"
+
+        # 删除 root 用户的安装
+        if [ -d "/root/Napcat" ]; then
+            sudo rm -rf /root/Napcat && log "已删除 /root/Napcat" || log "删除 /root/Napcat 失败"
+        fi
+
+        # 删除 root 用户的 QQ 配置
+        if [ -d "/root/.config/QQ" ]; then
+            sudo rm -rf /root/.config/QQ && log "已删除 /root/.config/QQ" || log "删除 /root/.config/QQ 失败"
+        fi
+
+        log "旧版本清理完成。"
     else
         log "未检测到旧版本, 跳过卸载。"
     fi
 }
 
+
+function uninstall_current_user() {
+    """
+    卸载当前用户 ($(whoami)) 下的 Napcat 安装。
+    不会删除其他用户或系统级的安装。
+    """
+    log "正在卸载当前用户 ($(whoami)) 下的 Napcat..."
+
+    local cleaned=0
+
+    if [ -d "${INSTALL_BASE_DIR}" ]; then
+        log "删除 ${INSTALL_BASE_DIR} ..."
+        rm -rf "${INSTALL_BASE_DIR}"
+        ((cleaned++))
+    fi
+
+    if [ -d "${HOME}/.config/QQ" ]; then
+        log "删除 ${HOME}/.config/QQ ..."
+        rm -rf "${HOME}/.config/QQ"
+        ((cleaned++))
+    fi
+
+    # 清理临时文件
+    rm -f ./QQ.deb ./QQ.rpm ./NapCat.Shell.zip 2>/dev/null
+    [ -d "./NapCat" ] && rm -rf ./NapCat
+
+    if [ $cleaned -gt 0 ]; then
+        log "当前用户的 Napcat 已卸载。"
+    else
+        log "当前用户没有 Napcat 安装，无需卸载。"
+    fi
+}
+
+
+function full_uninstall() {
+    """
+    完整卸载：清理系统级 + 所有用户的 Napcat 安装。
+    """
+    log "========================================="
+    log "Napcat 完整卸载"
+    log "========================================="
+    log "当前用户: $(whoami)"
+    log "安装目录: ${INSTALL_BASE_DIR}"
+    log "========================================="
+
+    # 1. 卸载当前用户的安装
+    uninstall_current_user
+
+    # 2. 检查并清理系统级/root 安装
+    detect_package_manager 2>/dev/null || true
+    uninstall_old_version
+
+    log "========================================="
+    log "卸载完成。可以重新运行脚本进行安装。"
+    log "========================================="
+}
+
 function check_root_for_shell_install() {
     if [[ $EUID -eq 0 ]]; then
-        log "警告: 您正在使用root权限执行本脚本（不推荐），脚本会在适当的地方向您申请sudo。"
-        echo -e "${YELLOW}[$(date +"%Y-%m-%d %H:%M:%S")]: 如果您正在使用旧版本的tui执行升级，那么会持续导致这个问题。请使用您首次安装 napcat 时的指令重新安装并且重装 tui${NC}"
+        echo ""
+        echo -e "${RED}╔══════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║  警告: 请勿使用 root 用户进行 Shell (Rootless) 安装！    ║${NC}"
+        echo -e "${RED}╚══════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${YELLOW}Shell 安装会将 Napcat 安装到当前用户的 HOME 目录:${NC}"
+        echo -e "  当前 HOME: ${RED}${HOME}${NC} (root 的家目录)"
+        echo -e "  预期 HOME: ${GREEN}/home/<your_user_name>${NC}"
+        echo ""
+        echo -e "${YELLOW}请选择操作:${NC}"
+        echo -e "  1. 退出 root: ${CYAN}exit${NC}"
+        echo -e "  2. 切换到普通用户后重新运行: ${CYAN}bash napcat.sh${NC}"
+        echo -e "  (2.5. 直接切换到普通用户: ${CYAN}su <your_user_name>${NC})"
+        echo -e "  3. 如需先卸载旧版本:  ${CYAN}sudo bash napcat.sh --uninstall${NC}"
+        echo -e "  4. 强制安装: 我知道风险，继续以 root 身份安装到 ${HOME}"
+        echo ""
+        read -p "请输入选项 (1/2/3/4): " root_choice
+        case "${root_choice}" in
+        4)
+            log "警告: 以 root 用户强制安装 Napcat 到 ${HOME}..."
+            return 0
+            ;;
+        *)
+            log "已取消安装。请按提示操作后重新运行。"
+            exit 1
+            ;;
+        esac
     fi
 }
 
@@ -1043,6 +1161,7 @@ function shell_help() {
     echo -e "  ${CYAN}--docker${NC} [${GREEN}y${NC}/${RED}n${NC}]            选择安装方式 (${GREEN}y${NC}: Docker, ${RED}n${NC}: Shell)"
     echo -e "  ${CYAN}--cli${NC} [${GREEN}y${NC}/${RED}n${NC}]               (Shell安装时) 是否安装 TUI-CLI 工具 (${YELLOW}推荐${NC})"
     echo -e "  ${CYAN}--force${NC}                   (Shell安装时) 强制重装 LinuxQQ 和 NapCat"
+    echo -e "  ${CYAN}--uninstall${NC}                 卸载当前用户 + 系统级的 Napcat 安装并退出"
     echo -e "  ${CYAN}--proxy${NC} [${BLUE}0-n${NC}]             指定下载代理序号 (${BLUE}0${NC}: 不使用, ${BLUE}1-n${NC}: 内置列表)"
     echo -e "  ${CYAN}--qq${NC} \"<号码>\"             (Docker安装时) 指定 QQ 号码"
     echo -e "  ${CYAN}--mode${NC} [${BLUE}ws${NC}|${BLUE}reverse_ws${NC}|...] (Docker安装时) 指定运行模式"
@@ -1054,6 +1173,9 @@ function shell_help() {
     echo ""
     echo -e "  ${BLUE}# Docker 安装 (指定 QQ, 模式, 代理, 并跳过确认):${NC}"
     echo -e "  ${CYAN}bash napcat.sh --docker y --qq \"123456789\" --mode ws --proxy 1 --confirm y${NC}"
+    echo ""
+    echo -e "  ${BLUE}# 卸载所有旧版本 (系统级 + 当前用户):${NC}"
+    echo -e "  ${CYAN}bash napcat.sh --uninstall${NC}"
     echo ""
     echo -e "  ${BLUE}# Shell (Rootless) 安装 (不装 TUI-CLI, 不用代理, 强制重装):${NC}"
     echo -e "  ${CYAN}bash napcat.sh --docker n --cli n --proxy 0 --force${NC}"
@@ -1168,6 +1290,10 @@ while [[ $# -gt 0 ]]; do
         use_cli="$2"
         shift 2
         ;;
+    --uninstall)
+        do_uninstall="y"
+        shift
+        ;;
     --help | -h)
         logo
         shell_help
@@ -1184,6 +1310,13 @@ done
 # 2. 初始化
 clear
 logo
+
+# 处理卸载请求（最高优先级）
+if [ "${do_uninstall}" = "y" ]; then
+    full_uninstall
+    exit 0
+fi
+
 print_introduction
 check_sudo
 #  Root check is moved to be conditional 
