@@ -379,67 +379,135 @@ class MultimodalClient:
         except Exception as e:
             return f"[音频分析] 编码音频时出错: {e}"
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "video_url", "video_url": {"url": data_uri}},
-                ],
+        # Detect provider: DashScope native multimodal API uses a different
+        # format than OpenAI-compatible chat/completions (which lacks audio).
+        is_dashscope = "dashscope.aliyuncs.com" in api_base
+
+        if is_dashscope:
+            # ── DashScope native multimodal API ────────────────────────
+            # Audio is passed as {"audio": "data:audio/wav;base64,..."}
+            # in the content array, alongside text.
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"text": prompt},
+                        {"audio": data_uri},
+                    ],
+                }
+            ]
+            max_tokens = audio_config.get("max_tokens", 2048)
+            temperature = audio_config.get("temperature", 0.7)
+
+            request_body = {
+                "model": model,
+                "input": {"messages": messages},
+                "parameters": {
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
             }
-        ]
 
-        max_tokens = audio_config.get("max_tokens", 2048)
-        temperature = audio_config.get("temperature", 0.7)
+            # Use DashScope native multimodal endpoint (not compatible-mode)
+            endpoint = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 
-        data = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.post(
+                        endpoint,
+                        headers=headers,
+                        json=request_body,
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    # Native API response: output.choices[0].message
+                    output = result.get("output", {})
+                    choices = output.get("choices", [])
+                    if not choices:
+                        return f"[音频分析] API 返回了空结果: {json.dumps(result, ensure_ascii=False)[:300]}"
+                    message = choices[0].get("message", {})
+                    content = message.get("content", "") or "[音频分析] API 返回了空内容。"
+                    return content
 
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    f"{api_base}/chat/completions",
-                    headers=headers,
-                    json=data,
-                    timeout=timeout,
-                )
-                response.raise_for_status()
-                result = response.json()
-                message = result["choices"][0]["message"]
-                content = message.get("content", "") or "[音频分析] API 返回了空内容。"
+                except httpx.ConnectTimeout:
+                    return f"[音频分析] 连接超时 ({timeout}秒)。音频可能过大，请压缩后重试。"
+                except httpx.ReadTimeout:
+                    return f"[音频分析] 响应超时 ({timeout}秒)。音频可能过长，请缩短后重试。"
+                except httpx.HTTPStatusError as e:
+                    error_text = e.response.text[:300]
+                    return f"[音频分析] API HTTP 错误 ({e.response.status_code}): {error_text}"
+                except Exception as e:
+                    return f"[音频分析] 调用 API 时出错: {str(e)}"
 
-                reasoning = message.get("reasoning_content", "")
-                if reasoning:
-                    content = f"[思考]\n{reasoning}\n\n[回复]\n{content}"
+        else:
+            # ── Generic OpenAI-compatible API ──────────────────────────
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "video_url", "video_url": {"url": data_uri}},
+                    ],
+                }
+            ]
 
-                return content
+            max_tokens = audio_config.get("max_tokens", 2048)
+            temperature = audio_config.get("temperature", 0.7)
 
-            except httpx.ConnectTimeout:
-                return f"[音频分析] 连接超时 ({timeout}秒)。音频可能过大，请压缩后重试。"
-            except httpx.ReadTimeout:
-                return f"[音频分析] 响应超时 ({timeout}秒)。音频可能过长，请缩短后重试。"
-            except httpx.HTTPStatusError as e:
-                error_text = e.response.text[:300]
-                return (
-                    f"[音频分析] API HTTP 错误 ({e.response.status_code}): "
-                    f"{error_text}"
-                )
-            except httpx.InvalidURL:
-                return (
-                    f"[音频分析] 无效的 API 地址: {api_base}\n"
-                    "请检查 QQBot/config/models_settings.json 中 AUDIO_MODEL 的 api_base 配置。"
-                )
-            except Exception as e:
-                return f"[音频分析] 调用 API 时出错: {str(e)}"
+            data = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.post(
+                        f"{api_base}/chat/completions",
+                        headers=headers,
+                        json=data,
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    message = result["choices"][0]["message"]
+                    content = message.get("content", "") or "[音频分析] API 返回了空内容。"
+
+                    reasoning = message.get("reasoning_content", "")
+                    if reasoning:
+                        content = f"[思考]\n{reasoning}\n\n[回复]\n{content}"
+
+                    return content
+
+                except httpx.ConnectTimeout:
+                    return f"[音频分析] 连接超时 ({timeout}秒)。音频可能过大，请压缩后重试。"
+                except httpx.ReadTimeout:
+                    return f"[音频分析] 响应超时 ({timeout}秒)。音频可能过长，请缩短后重试。"
+                except httpx.HTTPStatusError as e:
+                    error_text = e.response.text[:300]
+                    return (
+                        f"[音频分析] API HTTP 错误 ({e.response.status_code}): "
+                        f"{error_text}"
+                    )
+                except httpx.InvalidURL:
+                    return (
+                        f"[音频分析] 无效的 API 地址: {api_base}\n"
+                        "请检查 QQBot/config/models_settings.json 中 AUDIO_MODEL 的 api_base 配置。"
+                    )
+                except Exception as e:
+                    return f"[音频分析] 调用 API 时出错: {str(e)}"
 
     def _build_audio_not_configured(self) -> str:
         """Return setup instructions for audio analysis."""
