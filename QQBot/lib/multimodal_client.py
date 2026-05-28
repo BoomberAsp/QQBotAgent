@@ -432,8 +432,24 @@ class MultimodalClient:
                     if not choices:
                         return f"[音频分析] API 返回了空结果: {json.dumps(result, ensure_ascii=False)[:300]}"
                     message = choices[0].get("message", {})
-                    content = message.get("content", "") or "[音频分析] API 返回了空内容。"
-                    return content
+                    raw_content = message.get("content", "")
+
+                    # DashScope native API returns content as a list of blocks
+                    # e.g. [{"text": "..."}, {"audio": "data:..."}]
+                    if isinstance(raw_content, list):
+                        text_parts = []
+                        for block in raw_content:
+                            if isinstance(block, dict):
+                                if "text" in block:
+                                    text_parts.append(block["text"])
+                        if text_parts:
+                            return "\n".join(text_parts)
+                        # If only audio returned, show metadata
+                        return json.dumps(raw_content, ensure_ascii=False)
+                    elif isinstance(raw_content, str) and raw_content:
+                        return raw_content
+                    else:
+                        return f"[音频分析] API 返回了无法识别的格式: {str(raw_content)[:300]}"
 
                 except httpx.ConnectTimeout:
                     return f"[音频分析] 连接超时 ({timeout}秒)。音频可能过大，请压缩后重试。"
