@@ -16,7 +16,7 @@ import uuid
 
 import httpx
 from nonebot import on_message
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageEvent, Message, ActionFailed
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageEvent, Message, ActionFailed
 from agent.agent import Agent
 from agent.continuous_session import ContinuousSessionManager
 from agent.context import _send_msg, _current_user_workspace
@@ -537,7 +537,7 @@ agent_router = on_message(priority=1, block=False)
 
 
 @agent_router.handle()
-async def handle_agent_message(event: MessageEvent):
+async def handle_agent_message(bot: Bot, event: MessageEvent):
     """Route incoming QQ messages through the Agent."""
     user_id = str(event.user_id)
 
@@ -589,7 +589,6 @@ async def handle_agent_message(event: MessageEvent):
         elif seg.type == "record":
             file_id = seg.data.get("file", "")
             if file_id:
-                bot = event.get_bot()
                 saved_path, error = await _download_voice(bot, file_id)
                 if saved_path:
                     file_context_parts.append(
@@ -690,7 +689,7 @@ continuous_router = on_message(priority=2, block=False)
 
 
 @continuous_router.handle()
-async def handle_continuous_message(event: MessageEvent):
+async def handle_continuous_message(bot: Bot, event: MessageEvent):
     """Route messages from group users in continuous mode to the Agent."""
     # Only applies to group chats
     if not isinstance(event, GroupMessageEvent):
@@ -751,7 +750,6 @@ async def handle_continuous_message(event: MessageEvent):
         elif seg.type == "record":
             file_id = seg.data.get("file", "")
             if file_id:
-                bot = event.get_bot()
                 saved_path, error = await _download_voice(bot, file_id)
                 if saved_path:
                     file_context_parts.append(
