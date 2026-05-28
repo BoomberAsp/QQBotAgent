@@ -327,8 +327,8 @@ def _build_tool_registry() -> ToolRegistry:
     )
     registry.register(
         "read_file", read_file,
-        "读取用户上传的文件内容。支持文本文件（代码、日志、配置等）、PDF文件和图片。"
-        "文本和PDF返回文字内容，图片返回基础信息+AI分析（如果多模态LLM已配置且可用）。",
+        "读取用户上传的文件内容。支持文本文件（代码、日志、配置等）、PDF文件、图片和语音/音频消息。"
+        "文本和PDF返回文字内容，图片返回基础信息+AI分析，音频返回元数据+AI转录和情绪分析（需配置音频模型）。",
         {
             "type": "object",
             "properties": {
