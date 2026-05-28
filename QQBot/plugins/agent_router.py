@@ -136,86 +136,137 @@ async def _download_voice(bot, seg_data: dict, message_id: str = "", max_size_mb
     if message_id:
         base_params["message_id"] = message_id
 
-    for param_name in ("file", "file_id"):
-        params = {param_name: file_id, **base_params}
-        try:
-            result = await bot.call_api("get_record", **params)
-        except Exception as e:
-            diag.append(f"[get_record {param_name}=] call_api 异常: {e}")
-            continue
-
-        if isinstance(result, dict):
-            url_or_data = result.get("file", "") or result.get("path", "") or ""
-        elif isinstance(result, str):
-            url_or_data = result
-        else:
-            diag.append(f"[get_record {param_name}=] 返回类型异常: {type(result).__name__}: {str(result)[:120]}")
-            continue
-
-        if not url_or_data:
-            diag.append(f"[get_record {param_name}=] 返回体无 file/path 字段: {json.dumps(result, ensure_ascii=False)[:200]}")
-            continue
-
-        try:
-            if url_or_data.startswith("base64://"):
-                import base64
-                data = base64.b64decode(url_or_data[len("base64://"):])
-            elif url_or_data.startswith(("http://", "https://")):
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(url_or_data, timeout=120.0, follow_redirects=True)
-                    response.raise_for_status()
-                    data = response.content
-            elif os.path.isfile(url_or_data):
-                with open(url_or_data, "rb") as src:
-                    data = src.read()
-            else:
-                diag.append(f"[get_record {param_name}=] 无法识别的返回格式: {url_or_data[:120]}")
+    # NapCat may use non-standard action/param names — try combinations
+    for action in ("get_record", "get_file", "getRecord", "download_file"):
+        for param_name in ("file", "file_id"):
+            params = {param_name: file_id, **base_params}
+            try:
+                result = await bot.call_api(action, **params)
+            except Exception as e:
+                diag.append(f"[API {action} {param_name}=] 异常: {e}")
                 continue
 
-            if len(data) > max_size_bytes:
-                return None, f"语音文件过大 ({len(data) / 1024 / 1024:.1f} MB)，无法处理。"
+            if isinstance(result, dict):
+                url_or_data = result.get("file", "") or result.get("path", "") or ""
+            elif isinstance(result, str):
+                url_or_data = result
+            else:
+                diag.append(f"[API {action} {param_name}=] 返回类型异常: {type(result).__name__}")
+                continue
 
-            with open(save_path, "wb") as dst:
-                dst.write(data)
-            return save_path, None
+            if not url_or_data:
+                diag.append(f"[API {action} {param_name}=] 无 file/path 字段: {json.dumps(result, ensure_ascii=False)[:200]}")
+                continue
 
-        except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
-            diag.append(f"[get_record {param_name}=] 下载失败: {e}")
-            continue
-        except Exception as e:
-            diag.append(f"[get_record {param_name}=] 处理返回值时出错: {e}")
-            continue
+            try:
+                if url_or_data.startswith("base64://"):
+                    import base64
+                    data = base64.b64decode(url_or_data[len("base64://"):])
+                elif url_or_data.startswith(("http://", "https://")):
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get(url_or_data, timeout=120.0, follow_redirects=True)
+                        response.raise_for_status()
+                        data = response.content
+                elif os.path.isfile(url_or_data):
+                    with open(url_or_data, "rb") as src:
+                        data = src.read()
+                else:
+                    diag.append(f"[API {action} {param_name}=] 无法识别返回格式: {url_or_data[:120]}")
+                    continue
+
+                if len(data) > max_size_bytes:
+                    return None, f"语音文件过大 ({len(data) / 1024 / 1024:.1f} MB)，无法处理。"
+
+                with open(save_path, "wb") as dst:
+                    dst.write(data)
+                return save_path, None
+
+            except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+                diag.append(f"[API {action} {param_name}=] 下载失败: {e}")
+                continue
+            except Exception as e:
+                diag.append(f"[API {action} {param_name}=] 处理返回值出错: {e}")
+                continue
 
     # ── Strategy 3: NapCat HTTP API ────────────────────────────────
     napcat_base = os.environ.get("NAPCAT_HTTP_BASE", "http://127.0.0.1:6099")
-    for endpoint in ("/api/get_record", "/api/getRecord", "/api/record"):
+    http_endpoints = (
+        ("POST", "/api/get_record"),
+        ("POST", "/api/getRecord"),
+        ("POST", "/api/record"),
+        ("POST", "/api/onebot/get_record"),
+        ("GET",  "/api/get_record"),
+    )
+    for method, endpoint in http_endpoints:
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{napcat_base.rstrip('/')}{endpoint}",
-                    json={"file": file_id},
-                    timeout=10.0,
-                )
-                if resp.status_code == 200:
-                    result = resp.json()
-                    file_data = result.get("data", {}).get("file", "") or result.get("file", "")
-                    if file_data and file_data.startswith("base64://"):
-                        import base64
-                        data = base64.b64decode(file_data[len("base64://"):])
-                    elif file_data and os.path.isfile(file_data):
-                        with open(file_data, "rb") as src:
-                            data = src.read()
-                    else:
-                        diag.append(f"[HTTP {endpoint}] 无法识别的 file_data: {str(file_data)[:100]}")
-                        continue
-                    if len(data) <= max_size_bytes:
-                        with open(save_path, "wb") as dst:
-                            dst.write(data)
-                        return save_path, None
+                if method == "GET":
+                    resp = await client.get(
+                        f"{napcat_base.rstrip('/')}{endpoint}",
+                        params={"file": file_id},
+                        timeout=10.0,
+                    )
                 else:
-                    diag.append(f"[HTTP {endpoint}] HTTP {resp.status_code}")
+                    resp = await client.post(
+                        f"{napcat_base.rstrip('/')}{endpoint}",
+                        json={"file": file_id},
+                        timeout=10.0,
+                    )
+                if resp.status_code != 200:
+                    diag.append(f"[HTTP {method} {endpoint}] HTTP {resp.status_code}")
+                    continue
+
+                # Try to extract file data from various response shapes
+                body = resp.text
+                result = None
+                try:
+                    result = resp.json()
+                except Exception:
+                    pass
+
+                file_data = ""
+                if isinstance(result, dict):
+                    file_data = (
+                        result.get("file", "") or
+                        result.get("data", {}).get("file", "") if isinstance(result.get("data"), dict) else "" or
+                        result.get("result", {}).get("file", "") if isinstance(result.get("result"), dict) else "" or
+                        str(result)
+                    )
+                elif isinstance(result, str):
+                    file_data = result
+
+                if file_data and file_data.startswith("base64://"):
+                    import base64
+                    data = base64.b64decode(file_data[len("base64://"):])
+                elif file_data and os.path.isfile(str(file_data)):
+                    with open(str(file_data), "rb") as src:
+                        data = src.read()
+                elif file_data and len(file_data) > 100:
+                    # Might be raw base64 (without the base64:// prefix)
+                    try:
+                        import base64
+                        data = base64.b64decode(file_data)
+                    except Exception:
+                        # Also try raw binary response
+                        if resp.content and len(resp.content) > 10:
+                            data = resp.content
+                        else:
+                            diag.append(f"[HTTP {method} {endpoint}] 无法解析响应: {body[:120]}")
+                            continue
+                elif resp.content and len(resp.content) > 10:
+                    # Response might be raw binary (the audio file itself)
+                    data = resp.content
+                else:
+                    diag.append(f"[HTTP {method} {endpoint}] 无法解析响应: {body[:120]}")
+                    continue
+
+                if len(data) <= max_size_bytes:
+                    with open(save_path, "wb") as dst:
+                        dst.write(data)
+                    return save_path, None
+
         except Exception as e:
-            diag.append(f"[HTTP {endpoint}] 异常: {e}")
+            diag.append(f"[HTTP {method} {endpoint}] 异常: {e}")
             continue
 
     return None, f"语音下载失败。诊断: {'; '.join(diag)}"
