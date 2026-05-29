@@ -846,10 +846,16 @@ def _build_reply_context(event: MessageEvent) -> str:
 
         return "\n".join(parts) if parts else ""
 
-    # ── Fallback: parse [reply:id=XXX] from plain text ────────────
+    # ── Fallback: parse [reply:id=XXX] from raw message ──────────
     import re as _re
+    # Try str(message) first (includes CQ codes), then plaintext
+    raw_msg = str(event.message)
     text = event.get_plaintext()
-    m = _re.match(r'^\[reply:id=(\d+)\]', text)
+    print(f"[REPLY_DIAG] fallback: raw={raw_msg!r}  plaintext={text!r}", file=sys.stderr, flush=True)
+    # Search raw message for reply id
+    m = _re.search(r'\[reply:id=(\d+)\]', raw_msg)
+    if not m:
+        m = _re.match(r'^\[reply:id=(\d+)\]', text)
     if m:
         reply_id = m.group(1)
         print(f"[REPLY_DIAG] text fallback: reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
