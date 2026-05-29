@@ -798,9 +798,13 @@ def _build_reply_context(event: MessageEvent) -> str:
 
         # Check if the replied-to message had files
         if reply_id and reply_id in _recent_files:
-            for f in _recent_files[reply_id]:
+            files = _recent_files[reply_id]
+            for f in files:
                 parts.append(
-                    f"[被引用消息中包含文件 {f['name']}，已保存至: {f['path']}]"
+                    f"[用户引用了文件 \"{f['name']}\"。"
+                    f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                    f"忽略对话历史中关于其他文件的提及。"
+                    f"文件路径: {f['path']}]"
                 )
 
         return "\n".join(parts) if parts else ""
