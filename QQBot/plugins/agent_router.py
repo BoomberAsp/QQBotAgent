@@ -338,6 +338,22 @@ async def _download_and_save_file(
 
     max_size_bytes = max_size_mb * 1024 * 1024
 
+    # ── Helper: detect file type from magic bytes ─────────────────
+    def _magic_ext(data: bytes) -> str:
+        if data[:4] == b'%PDF':
+            return ".pdf"
+        if data[:4] == b'\x89PNG':
+            return ".png"
+        if data[:3] == b'\xff\xd8\xff':
+            return ".jpg"
+        if data[:6] in (b'GIF87a', b'GIF89a'):
+            return ".gif"
+        if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+            return ".webp"
+        if data[:2] == b'BM':
+            return ".bmp"
+        return ""
+
     # ── Strategy 1: direct URL download ──────────────────────────
     if url:
         try:
@@ -352,7 +368,7 @@ async def _download_and_save_file(
                         f"超过限制 ({max_size_mb} MB)。请压缩后重试。"
                     )
 
-                # Determine actual extension from Content-Type if possible
+                # Determine actual extension: Content-Type first, then magic bytes
                 content_type = response.headers.get("content-type", "")
                 ct_map = {
                     "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
@@ -363,6 +379,11 @@ async def _download_and_save_file(
                     if ct_prefix in content_type and not save_path.endswith(ct_ext):
                         save_path = save_path + ct_ext
                         break
+                else:
+                    # Content-Type didn't match — try magic bytes
+                    magic_ext = _magic_ext(response.content)
+                    if magic_ext and not save_path.endswith(magic_ext):
+                        save_path = save_path + magic_ext
 
                 with open(save_path, "wb") as f:
                     f.write(response.content)
@@ -424,6 +445,14 @@ async def _download_and_save_file(
 
                     with open(save_path, "wb") as f:
                         f.write(data)
+
+                    # Fix extension from magic bytes if missing
+                    magic_ext = _magic_ext(data)
+                    if magic_ext and not save_path.endswith(magic_ext):
+                        new_path = save_path + magic_ext
+                        os.rename(save_path, new_path)
+                        save_path = new_path
+
                     return save_path, None
 
                 except Exception as e:
@@ -1017,7 +1046,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
-            name = seg.data.get("name", "file")
+            name = seg.data.get("name") or seg.data.get("filename") or seg.data.get("file_name") or seg.data.get("title") or "file"
             file_id = seg.data.get("file", "")
             saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
             if saved_path:
@@ -1223,7 +1252,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
-            name = seg.data.get("name", "file")
+            name = seg.data.get("name") or seg.data.get("filename") or seg.data.get("file_name") or seg.data.get("title") or "file"
             file_id = seg.data.get("file", "")
             saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
             if saved_path:
