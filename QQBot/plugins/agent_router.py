@@ -819,6 +819,9 @@ def _build_reply_context(event: MessageEvent) -> str:
         reply_id = str(seg.data.get("id", ""))
         reply_text = seg.data.get("text", "") or seg.data.get("message", "") or ""
 
+        # ── Diagnostic: log reply lookup ──────────────────────────
+        print(f"[REPLY_DIAG] reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}")
+
         parts = []
         if reply_text:
             parts.append(f"[用户引用了消息: \"{reply_text}\"]")
@@ -1029,6 +1032,8 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
     # ── Detect reply/quote context ─────────────────────────────────
     reply_context = _build_reply_context(event)
+    if reply_context:
+        print(f"[REPLY_DIAG] reply_context built ({len(reply_context)} chars): {reply_context[:300]}")
 
     # ── Detect and download file/image attachments ─────────────────
     file_context_parts = []
@@ -1236,6 +1241,8 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
     # These run BEFORE the text guard so files are always saved and
     # recorded, even for file-only messages that may be replied to later.
     reply_context = _build_reply_context(event)
+    if reply_context:
+        print(f"[REPLY_DIAG] continuous reply_context built ({len(reply_context)} chars): {reply_context[:300]}")
 
     file_context_parts = []
     msg_id = str(event.message_id)
