@@ -8,13 +8,22 @@ This replaces the old distributed on_command architecture with a single
 intelligent entry point.
 """
 
+# ── Load .env into os.environ BEFORE any module-level reads ──────
+# NoneBot2 (nb run) loads .env into its own pydantic config only, NOT
+# into os.environ. Downstream module-level reads of os.environ (e.g.
+# USER_DATA_ROOT, quota, session limits) would silently get defaults.
+# This load_dotenv call must be the very first thing in this module.
+from pathlib import Path
+from dotenv import load_dotenv as _load_dotenv
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+_load_dotenv(_ENV_FILE)
+
 import asyncio
 import json
 import os
 import re
 import time
 import uuid
-from pathlib import Path
 
 import httpx
 from nonebot import on_message
