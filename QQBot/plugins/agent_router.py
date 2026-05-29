@@ -673,6 +673,11 @@ _continuous_sessions = ContinuousSessionManager(timeout_minutes=5.0)
 
 _perm_manager = PermissionManager()
 
+# Per-user busy flag — prevents concurrent message processing for the
+# same user. When a user's message is being processed, subsequent
+# messages from that user are rejected with a brief "busy" reply.
+_user_busy: set = set()
+
 
 # ── User Info Tool ─────────────────────────────────────────────────
 
@@ -828,6 +833,20 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
         )
         if not is_at_bot and not event.is_tome():
             return  # Not directed at bot, skip silently
+
+    # ── Per-user concurrency guard ──
+    if user_id in _user_busy:
+        await _safe_send("Roxy 正在处理你的上一条消息，请稍等~")
+        return
+    _user_busy.add(user_id)
+    try:
+        return await _handle_agent_message_impl(bot, event, user_id)
+    finally:
+        _user_busy.discard(user_id)
+
+
+async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str):
+    """Inner implementation — called under per-user busy guard."""
 
     # Set user workspace for tool scoping
     _workspace_manager.ensure_dirs(user_id)
@@ -1002,6 +1021,20 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
     # Check if user is in continuous mode
     if not _continuous_sessions.is_active(group_id, user_id):
         return
+
+    # ── Per-user concurrency guard ──
+    if user_id in _user_busy:
+        await _safe_send("Roxy 正在处理你的上一条消息，请稍等~", matcher=continuous_router)
+        return
+    _user_busy.add(user_id)
+    try:
+        return await _handle_continuous_message_impl(bot, event, user_id, group_id)
+    finally:
+        _user_busy.discard(user_id)
+
+
+async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id: str, group_id: str):
+    """Inner implementation — called under per-user busy guard."""
 
     text_content = event.get_plaintext().strip()
 
