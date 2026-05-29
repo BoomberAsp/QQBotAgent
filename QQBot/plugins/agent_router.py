@@ -20,7 +20,11 @@ from nonebot import on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageEvent, Message, ActionFailed
 from agent.agent import Agent
 from agent.continuous_session import ContinuousSessionManager
-from agent.context import _send_msg, _current_user_workspace
+from agent.context import (
+    _send_msg, _current_user_workspace,
+    _current_user_role, _current_code_limits,
+)
+from agent.permissions import PermissionManager
 from agent.hardware import HardwareDetector
 from agent.special_session import SpecialSessionManager
 from agent.tool_registry import ToolRegistry
@@ -656,6 +660,8 @@ _model_router = ModelRouter()
 
 _continuous_sessions = ContinuousSessionManager(timeout_minutes=5.0)
 
+_perm_manager = PermissionManager()
+
 
 # ── Message Handlers ─────────────────────────────────────────────
 
@@ -773,6 +779,16 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
         active_special = _special_sessions.get_active(user_id)
         session_type = "special" if active_special else "temporary"
 
+        # Resolve user permissions
+        role = _perm_manager.get_role(user_id)
+        allowed_tools = _perm_manager.get_allowed_tools(role)
+        code_limits = _perm_manager.get_code_limits(role)
+
+        # Set permission contextvars for downstream tools
+        _current_user_role.set(role.value)
+        if code_limits:
+            _current_code_limits.set(code_limits.to_dict())
+
         try:
             response = await asyncio.wait_for(
                 agent.run(
@@ -780,6 +796,8 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
                     client=client,
                     progress_callback=_progress,
                     session_type=session_type,
+                    allowed_tools=allowed_tools,
+                    user_role=role.value,
                 ),
                 timeout=300.0,
             )
@@ -911,9 +929,19 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
             await _safe_send(seg, matcher=continuous_router)
         token = _send_msg.set(_send_image)
         try:
+            # Resolve user permissions
+            role = _perm_manager.get_role(user_id)
+            allowed_tools = _perm_manager.get_allowed_tools(role)
+            code_limits = _perm_manager.get_code_limits(role)
+            _current_user_role.set(role.value)
+            if code_limits:
+                _current_code_limits.set(code_limits.to_dict())
+
             response = await asyncio.wait_for(
                 agent.run(augmented_message, user_id, client=client,
-                           progress_callback=lambda msg: _safe_send(msg, matcher=continuous_router)),
+                           progress_callback=lambda msg: _safe_send(msg, matcher=continuous_router),
+                           allowed_tools=allowed_tools,
+                           user_role=role.value),
                 timeout=300.0,
             )
         finally:

@@ -138,6 +138,8 @@ class Agent:
         client=None,
         progress_callback: Optional[Callable[[str], Any]] = None,
         session_type: str = "temporary",
+        allowed_tools: Optional[set] = None,
+        user_role: Optional[str] = None,
     ) -> str:
         """Process a user message through the agent loop.
 
@@ -163,7 +165,7 @@ class Agent:
         session = self.sessions.get_or_create(user_id)
 
         # Build messages: system prompt + history + current message
-        messages = self._build_messages(session, user_message, special_session)
+        messages = self._build_messages(session, user_message, special_session, role_hint=user_role)
 
         # Track tool names for deduplication across iterations
         _last_reported_tools: Optional[frozenset] = None
@@ -171,9 +173,14 @@ class Agent:
         # Agent loop
         for iteration in range(self.max_tool_iterations):
             llm_client = client or self.client
+            schemas = (
+                self.tools.get_schemas_for(allowed_tools)
+                if allowed_tools
+                else self.tools.get_schemas()
+            )
             response = await llm_client.chat_completion_with_tools(
                 messages=messages,
-                tools=self.tools.get_schemas(),
+                tools=schemas,
                 timeout=self.thinking_timeout,
             )
 
@@ -197,7 +204,7 @@ class Agent:
                             pass
 
                 tool_results = await self._execute_tool_calls(
-                    response["tool_calls"], session, user_id
+                    response["tool_calls"], session, user_id, allowed_tools
                 )
 
                 assistant_msg = {
@@ -249,6 +256,7 @@ class Agent:
         session: Session,
         user_message: str,
         special_session: Optional[SpecialSession] = None,
+        role_hint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Build the full message list for the LLM.
 
@@ -257,9 +265,10 @@ class Agent:
         2. Session type marker (special/temporary/continuous)
         3. User profile context (from ProfileManager)
         4. Workspace quota context (if in special session)
-        5. Relevant long-term memories (from MemorySystem)
-        6. Conversation history (from Session or SpecialSession)
-        7. Current user message
+        5. Permission role context (if not admin)
+        6. Relevant long-term memories (from MemorySystem)
+        7. Conversation history (from Session or SpecialSession)
+        8. Current user message
         """
         messages = []
 
@@ -300,7 +309,17 @@ class Agent:
             if profile_context:
                 messages[0]["content"] += "\n\n" + profile_context
 
-        # 4. Relevant long-term memories (scoped to user_id)
+        # 4. Permission role context (for non-admin users)
+        if role_hint and role_hint != "admin":
+            messages[0]["content"] += (
+                f"\n\n## 当前会话权限\n"
+                f"你的工具列表已由系统根据当前用户身份自动过滤。"
+                f"你只能看到和使用当前可用的工具。"
+                f"如果用户的请求需要使用你无法访问的工具（如 shell 命令、网页抓取等），"
+                f"请礼貌地说明当前权限不支持此操作，并建议用户联系管理员获取更高权限。"
+            )
+
+        # 5. Relevant long-term memories (scoped to user_id)
         if self.memory:
             memories = self.memory.search(user_message, user_id=user_id)
             if memories:
@@ -365,7 +384,8 @@ class Agent:
     # ── Tool Execution ────────────────────────────────────────────
 
     async def _execute_tool_calls(
-        self, tool_calls: List[dict], session: Session, user_id: str = ""
+        self, tool_calls: List[dict], session: Session, user_id: str = "",
+        allowed_tools: Optional[set] = None,
     ) -> List[Dict[str, str]]:
         """Execute tool calls from the LLM response.
 
@@ -379,10 +399,18 @@ class Agent:
             except json.JSONDecodeError:
                 arguments = {}
 
-            result_text = await self.tools.execute(tool_name, arguments)
+            # Hard-reject: defense-in-depth against disallowed tools
+            if allowed_tools is not None and tool_name not in allowed_tools:
+                result_text = (
+                    f"[Permission] 工具 '{tool_name}' 超出当前用户权限范围，"
+                    f"此调用已被系统拦截。如果你确实需要此功能，请联系管理员。"
+                )
+            else:
+                result_text = await self.tools.execute(tool_name, arguments)
+
             session.tool_call_count += 1
 
-            # Audit log: record every tool invocation
+            # Audit log: record every tool invocation (including blocked ones)
             self._write_audit_log(user_id, tool_name, arguments, result_text)
 
             results.append({

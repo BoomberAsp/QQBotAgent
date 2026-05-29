@@ -38,11 +38,15 @@ def _get_workspace_root() -> str:
     # Check for per-user workspace override (set by agent_router via contextvar)
     try:
         from agent.context import _current_user_workspace
+    except ImportError:
+        try:
+            from QQBot.agent.context import _current_user_workspace
+        except ImportError:
+            _current_user_workspace = None
+    if _current_user_workspace:
         user_ws = _current_user_workspace.get()
         if user_ws:
             return user_ws
-    except ImportError:
-        pass
 
     env_ws = os.environ.get("QQBOT_WORKSPACE", "")
     if env_ws:
@@ -614,6 +618,23 @@ def _get_attr_root(node) -> str | None:
     return None
 
 
+def _get_code_limits() -> dict:
+    """Read tiered code execution limits from permission context.
+
+    Returns a dict with max_timeout (seconds), max_output (bytes),
+    and max_memory_mb. If the contextvar is not set, returns empty
+    dict and the callers use their defaults.
+    """
+    try:
+        from agent.context import _current_code_limits
+    except ImportError:
+        try:
+            from QQBot.agent.context import _current_code_limits
+        except ImportError:
+            return {}
+    return _current_code_limits.get({})
+
+
 async def execute_code(code: str, timeout: int = 30) -> str:
     """Execute Python code in an isolated workspace and return output.
 
@@ -646,8 +667,13 @@ async def execute_code(code: str, timeout: int = 30) -> str:
     if ast_error:
         return ast_error
 
-    # Clamp timeout
-    timeout = min(max(timeout, 1), MAX_RUNTIME)
+    # Read tiered limits from permission context (default: full access)
+    limits = _get_code_limits()
+    max_timeout = limits.get("max_timeout", MAX_RUNTIME)
+    max_output = limits.get("max_output", MAX_OUTPUT_SIZE)
+
+    # Clamp timeout to role-specific max
+    timeout = min(max(timeout, 1), max_timeout)
 
     # Ensure workspace exists
     _ensure_workspace_dirs()
@@ -695,13 +721,13 @@ async def execute_code(code: str, timeout: int = 30) -> str:
         )
         output = ""
         if result.stdout:
-            stdout = result.stdout[:MAX_OUTPUT_SIZE]
-            if len(result.stdout) > MAX_OUTPUT_SIZE:
+            stdout = result.stdout[:max_output]
+            if len(result.stdout) > max_output:
                 stdout += "\n... (输出过长，已截断)"
             output += f"标准输出:\n{stdout}\n"
         if result.stderr:
-            stderr = result.stderr[:MAX_OUTPUT_SIZE]
-            if len(result.stderr) > MAX_OUTPUT_SIZE:
+            stderr = result.stderr[:max_output]
+            if len(result.stderr) > max_output:
                 stderr += "\n... (错误输出过长，已截断)"
             output += f"标准错误:\n{stderr}\n"
         if not output:
