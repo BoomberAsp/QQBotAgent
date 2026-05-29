@@ -846,12 +846,12 @@ def _build_reply_context(event: MessageEvent) -> str:
 
         return "\n".join(parts) if parts else ""
 
-    # ── Fallback: parse [reply:id=XXX] from raw message ──────────
+    # ── Fallback: parse [reply:id=XXX] from multiple sources ─────
     import re as _re
-    # Try str(message) first (includes CQ codes), then plaintext
-    raw_msg = str(event.message)
+    # Try raw_message (OneBot V11 wire-level field)
+    raw_msg = getattr(event, 'raw_message', '') or str(event.message)
     text = event.get_plaintext()
-    print(f"[REPLY_DIAG] fallback: raw={raw_msg!r}  plaintext={text!r}", file=sys.stderr, flush=True)
+    print(f"[REPLY_DIAG] fallback: raw={raw_msg!r}  plaintext={text!r}  event_attrs={[a for a in dir(event) if 'reply' in a.lower()]}", file=sys.stderr, flush=True)
     # Search raw message for reply id
     m = _re.search(r'\[reply:id=(\d+)\]', raw_msg)
     if not m:
