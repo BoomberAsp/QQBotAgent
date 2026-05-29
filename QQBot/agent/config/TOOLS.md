@@ -466,6 +466,30 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ---
 
+## Tool: get_user_info
+
+**Description**: 返回当前用户的系统信息快照，包括权限级别、特殊会话列表（数量/名称/消息数）、工作区磁盘用量、可用工具范围及分类、代码执行限制（如有）。此工具零推理 token 消耗，直接读取系统状态。
+
+**When to use**: 当用户询问以下任一问题时必须调用：
+- 「我的设置」「我的信息」「我的账号」
+- 「我有什么权限」「我能用什么工具」「我的功能范围」
+- 「我的工作区」「我的空间」「我的配额」
+- 「我的会话」「我有几个特殊会话」「会话列表」
+- 任何涉及用户自身系统状态的问题
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {},
+  "required": []
+}
+```
+
+**返回内容**: 用户 ID、权限级别、特殊会话列表（含当前激活标记）、工作区路径及用量百分比、可用工具按分类陈列、代码执行限制（如有）。
+
+---
+
 ## Tool: read_file
 
 **Description**: Read and analyze files that users upload in QQ messages. Supports text files (code, logs, configs, etc. — returns full content), PDF files (returns extracted text), image files (returns metadata + AI analysis if multimodal LLM configured), and audio files (returns metadata + AI transcription/emotion/context analysis if audio model configured).
