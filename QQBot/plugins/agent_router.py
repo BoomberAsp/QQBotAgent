@@ -23,6 +23,7 @@ from agent.continuous_session import ContinuousSessionManager
 from agent.context import (
     _send_msg, _current_user_workspace,
     _current_user_role, _current_code_limits,
+    _current_user_id,
 )
 from agent.permissions import PermissionManager
 from agent.hardware import HardwareDetector
@@ -663,6 +664,99 @@ _continuous_sessions = ContinuousSessionManager(timeout_minutes=5.0)
 _perm_manager = PermissionManager()
 
 
+# ── User Info Tool ─────────────────────────────────────────────────
+
+def _get_user_info() -> str:
+    """返回当前用户的系统信息快照（权限、会话、工作区），零推理 token 消耗。
+
+    适用场景：用户询问「我的设置」「我有什么权限」「我的工作区」「我的会话」等。
+
+    此工具直接读取系统状态，无需 LLM 推理即可返回结构化信息。
+    """
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "无法获取用户信息：当前请求未设置用户上下文。"
+
+    role = _perm_manager.get_role(user_id)
+    role_label = {"admin": "管理员", "vip": "会员", "regular": "普通用户"}[role.value]
+
+    lines = [f"用户信息快照", f"", f"用户 ID: {user_id}", f"权限级别: {role_label} ({role.value})"]
+
+    # ── 特殊会话 ──
+    sessions = _special_sessions.list_sessions(user_id)
+    active = _special_sessions.get_active(user_id)
+    max_sessions = _perm_manager.get_max_special_sessions(role)
+    lines.append(f"")
+    lines.append(f"特殊会话 ({len(sessions)}/{max_sessions}):")
+    if sessions:
+        for s in sessions:
+            marker = " ★ 当前" if active and s["name"] == active.name else ""
+            lines.append(f"  · {s['name']}{marker} — {s['total_messages']} 条消息")
+    else:
+        lines.append(f"  (无特殊会话)")
+
+    # ── 工作区 ──
+    ws_path = _workspace_manager.get_workspace(user_id)
+    ws_size = _workspace_manager.get_size(user_id)
+    ws_quota_mb = _perm_manager.get_workspace_quota_mb(role)
+    ws_usage_mb = ws_size / (1024 * 1024)
+    pct = (ws_size / (ws_quota_mb * 1024 * 1024)) * 100 if ws_quota_mb > 0 else 0
+    lines.append(f"")
+    lines.append(f"工作区:")
+    lines.append(f"  路径: {ws_path}")
+    lines.append(f"  用量: {ws_usage_mb:.1f} MB / {ws_quota_mb} MB ({pct:.1f}%)")
+
+    # ── 权限范围 ──
+    allowed = _perm_manager.get_allowed_tools(role)
+    code_limits = _perm_manager.get_code_limits(role)
+
+    lines.append(f"")
+    lines.append(f"可用工具: {len(allowed)} 个")
+
+    # Categorize tools
+    info_tools = {"search_web", "get_time", "get_weather", "read_file", "summarize_pdf",
+                  "geocode", "reverse_geocode", "search_poi", "plan_route"}
+    dev_tools = {"execute_code", "shell_exec", "web_fetch", "download_repo", "get_system_load"}
+    fun_tools = {"gacha_pull", "play_gacha_animation", "calculate_speed",
+                 "compare_speed_probability", "explain_code", "translate_text"}
+    misc = allowed - info_tools - dev_tools - fun_tools
+
+    sections = [
+        ("信息查询", sorted(allowed & info_tools)),
+        ("开发工具", sorted(allowed & dev_tools)),
+        ("娱乐工具", sorted(allowed & fun_tools)),
+    ]
+    if misc:
+        sections.append(("其他", sorted(misc)))
+
+    for label, tools in sections:
+        if tools:
+            lines.append(f"  [{label}] {', '.join(tools)}")
+        else:
+            lines.append(f"  [{label}] (无)")
+
+    if code_limits:
+        lines.append(f"")
+        lines.append(f"代码执行限制:")
+        lines.append(f"  超时: {code_limits.max_timeout}s")
+        lines.append(f"  输出上限: {code_limits.max_output // 1024}KB")
+        lines.append(f"  内存: {code_limits.max_memory_mb}MB")
+
+    return "\n".join(lines)
+
+
+# Register user info tool (must happen after _get_user_info definition and after
+# singletons like _workspace_manager, _special_sessions are initialized)
+_tool_registry.register(
+    "get_user_info", _get_user_info,
+    "获取当前用户的系统信息，包括：权限级别、特殊会话列表、工作区用量、可用工具范围、"
+    "代码执行限制（如有）。当用户询问「我的设置」「我的权限」「我的工作区」「我的会话」"
+    "「我能用什么工具」或类似用户自身信息相关问题时，应调用此工具。此工具返回结构化"
+    "系统数据，可避免 LLM 在系统信息类问题上浪费推理 token。",
+    {"type": "object", "properties": {}, "required": []},
+)
+
+
 # ── Message Handlers ─────────────────────────────────────────────
 
 # Catch ALL messages. For group messages, we manually check for @mentions
@@ -785,6 +879,7 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
         code_limits = _perm_manager.get_code_limits(role)
 
         # Set permission contextvars for downstream tools
+        _current_user_id.set(user_id)
         _current_user_role.set(role.value)
         if code_limits:
             _current_code_limits.set(code_limits.to_dict())
@@ -933,6 +1028,7 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
             role = _perm_manager.get_role(user_id)
             allowed_tools = _perm_manager.get_allowed_tools(role)
             code_limits = _perm_manager.get_code_limits(role)
+            _current_user_id.set(user_id)
             _current_user_role.set(role.value)
             if code_limits:
                 _current_code_limits.set(code_limits.to_dict())
