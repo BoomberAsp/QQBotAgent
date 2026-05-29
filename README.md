@@ -62,6 +62,7 @@ HOST=0.0.0.0
 PORT=8081
 ONEBOT_ACCESS_TOKEN=你的Token
 SUPERUSERS=["你的QQ号"]
+VIP_USERS=["会员QQ号"]
 DEEPSEEK_API_KEY=sk-xxxxxxxx
 DEEPSEEK_API_BASE=https://api.deepseek.com
 SEARXNG_ENDPOINT=http://localhost:8082
@@ -393,12 +394,25 @@ cd QQBot && python test_agent.py
 
 | 边界 | 规则 |
 |------|------|
-| 代码执行 | `python3 -I` 隔离 + 模式匹配（15 个禁止模式）+ 60s / 100KB 限制 |
+| 权限系统 | 三层权限 (管理员/会员/普通用户)，环境变量配置 (`SUPERUSERS` / `VIP_USERS`)，schema 过滤 + 硬拦截纵深防御 |
+| 代码执行 | `python3 -I` 隔离 + 正则匹配 + AST 白名单三层过滤，分级限制 (管理员 60s/100KB，会员 15s/50KB) |
 | 文件访问 | 仅在 `/data/workspace/`，拒绝路径遍历（`..`, `~`, `/etc/`） |
-| 网络 | 仅通过预定义工具（search, download_repo HTTPS only） |
-| 隐私 | per-user 隔离，本地存储，不上传第三方（除 API 调用外） |
+| 网络 | 仅通过预定义工具（search, download_repo HTTPS only），`web_fetch` 内置 SSRF 防护 |
+| 隐私 | per-user 隔离，本地存储，不上传第三方（除 API 调用外），审计日志 (JSONL) |
 
-详见 `QQBot/agent/config/WORKSPACE.md`。
+### 权限系统
+
+通过 `SUPERUSERS` 和 `VIP_USERS` 环境变量配置用户层级：
+
+| 角色 | 配置方式 | 权限范围 |
+|------|---------|---------|
+| **管理员** | `SUPERUSERS` 环境变量 | 全部工具（含 `shell_exec`），完整 `execute_code`（60s/100KB/256MB），2GB 工作区，10 个特殊会话 |
+| **会员** | `VIP_USERS` 环境变量 | 大部分工具（含 `web_fetch`、`download_repo`、受限 `execute_code`），500MB 工作区，3 个特殊会话 |
+| **普通用户** | 默认 | 基础工具（搜索/天气/地图/文件阅读/娱乐），100MB 工作区，1 个特殊会话 |
+
+工具权限通过请求时 **schema 过滤** 控制（LLM 只看到允许调用的工具），`_execute_tool_calls()` 中的硬拦截作为纵深防御。
+
+详见 `QQBot/agent/config/WORKSPACE.md` 与 `QQBot/agent/config/AGENTS.md`。
 
 ## 安装 NapCat（详细）
 

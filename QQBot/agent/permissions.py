@@ -86,13 +86,11 @@ class PermissionManager:
     """
 
     def __init__(self):
-        raw_superusers = os.environ.get("SUPERUSERS", "")
-        raw_vip = os.environ.get("VIP_USERS", "")
+        # NOTE: We do NOT cache SUPERUSERS/VIP_USERS in __init__ because
+        # NoneBot2 may load .env lazily (after plugin imports). Instead,
+        # env vars are re-read on every get_role() call.
 
-        self._admins: Set[str] = self._parse_qq_list(raw_superusers)
-        self._vip: Set[str] = self._parse_qq_list(raw_vip)
-
-        # Pre-compute tool sets per role
+        # Pre-compute tool sets per role (static — does not depend on env)
         self._role_tools: Dict[UserRole, Set[str]] = {
             UserRole.ADMIN: _PUBLIC_TOOLS | _VIP_TOOLS | _ADMIN_TOOLS,
             UserRole.VIP: _PUBLIC_TOOLS | _VIP_TOOLS,
@@ -147,10 +145,17 @@ class PermissionManager:
         return ids
 
     def get_role(self, user_id: str) -> UserRole:
-        """Determine the user's role. Admin takes precedence over VIP."""
-        if user_id in self._admins:
+        """Determine the user's role. Admin takes precedence over VIP.
+
+        Env vars are re-read on every call (not cached at init time)
+        because NoneBot2 may load .env after plugin imports.
+        """
+        # Read env vars lazily to handle NoneBot2's deferred .env loading
+        admins = self._parse_qq_list(os.environ.get("SUPERUSERS", ""))
+        if user_id in admins:
             return UserRole.ADMIN
-        if user_id in self._vip:
+        vips = self._parse_qq_list(os.environ.get("VIP_USERS", ""))
+        if user_id in vips:
             return UserRole.VIP
         return UserRole.REGULAR
 

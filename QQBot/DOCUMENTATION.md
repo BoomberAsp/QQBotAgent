@@ -45,6 +45,7 @@ QQBotAgent/
     │   ├── hardware.py      #   硬件自动检测 & 动态任务拒绝
     │   ├── workspace.py     #   用户工作区隔离 & 配额管理
     │   ├── context.py       #   执行上下文传递 (contextvars, 工具→QQ图片)
+    │   ├── permissions.py   #   三层权限系统 (PermissionManager, UserRole)
     │   ├── memory.py        #   长期记忆系统 (Markdown 文件存储)
     │   ├── profile.py       #   用户画像 (LLM 驱动背景事实提取)
     │   └── config/          #   智能体配置文件 (12 个)
@@ -343,7 +344,102 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 - 无新信息时返回空 `{}`
 - JSON 解析支持裸 JSON、Markdown 代码块、正则兜底
 
-### 2.6 `lib/deepseek_client.py` — DeepSeek API 客户端
+### 2.6 `agent/permissions.py` — 三层权限系统 (v2.16)
+
+权限系统实现管理员 (admin)、会员 (vip)、普通用户 (regular) 三层权限体系。通过 **请求时 schema 过滤** 作为主要防线，LLM 只能看到当前角色允许调用的工具；`_execute_tool_calls()` 中的硬拦截作为纵深防御。
+
+#### 类: `UserRole`
+
+```python
+class UserRole(Enum):
+    ADMIN = "admin"      # 管理员 — 全部工具可用
+    VIP = "vip"          # 会员 — 大部分工具 + 受限 execute_code
+    REGULAR = "regular"  # 普通用户 — 基础工具
+```
+
+#### 类: `CodeLimits`
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `max_timeout` | `int` | 最大执行超时 (秒) |
+| `max_output` | `int` | 最大输出大小 (字节) |
+| `max_memory_mb` | `int` | 最大内存限制 (MB) |
+
+#### 类: `PermissionManager`
+
+| 构造参数 | 类型 | 说明 |
+|----------|------|------|
+| (无) | — | 从环境变量 `SUPERUSERS` 和 `VIP_USERS` 读取配置 |
+
+| 方法 | 说明 |
+|------|------|
+| `get_role(user_id)` | 根据 QQ 号解析用户角色 |
+| `get_allowed_tools(role)` | 返回该角色可用的工具名称集合 |
+| `can_use(user_id, tool_name)` | 检查指定用户能否使用某工具 |
+| `get_code_limits(role)` | 返回该角色的 `CodeLimits` (execute_code 分级限制) |
+| `get_workspace_quota_mb(role)` | 返回工作区磁盘配额 (MB) |
+| `get_max_special_sessions(role)` | 返回最大特殊会话数量 |
+
+#### 工具权限矩阵
+
+| 工具 | 管理员 | 会员 | 普通用户 |
+|------|:---:|:---:|:---:|
+| `search_web`, `get_time`, `get_weather` | ✅ | ✅ | ✅ |
+| `read_file` (文本/PDF) | ✅ | ✅ | ✅ |
+| `summarize_pdf` | ✅ | ✅ | ✅ |
+| `geocode`, `reverse_geocode`, `search_poi`, `plan_route` | ✅ | ✅ | ✅ |
+| 游戏/娱乐工具 (抽卡/测速/翻译等) | ✅ | ✅ | ✅ |
+| `get_system_load` | ✅ | ✅ | ❌ |
+| `web_fetch` | ✅ | ✅ | ❌ |
+| `download_repo` | ✅ | ✅ | ❌ |
+| `read_file` (图片/音频 AI 分析) | ✅ | ✅ | ❌ |
+| `execute_code` | ✅ 完整 | ✅ 受限 | ❌ |
+| `shell_exec` | ✅ | ❌ | ❌ |
+
+#### execute_code 分级限制
+
+| 参数 | 管理员 | 会员 |
+|------|:---:|:---:|
+| 最大超时 | 60s | 15s |
+| 输出上限 | 100KB | 50KB |
+| 内存上限 | 256MB | 128MB |
+
+#### 资源配额
+
+| 资源 | 管理员 | 会员 | 普通用户 |
+|------|:---:|:---:|:---:|
+| 工作区磁盘配额 | 2 GB | 500 MB | 100 MB |
+| 最大特殊会话数 | 10 | 3 | 1 |
+
+#### 身份识别
+
+- **管理员**: `SUPERUSERS` 环境变量 (QQ 号逗号分隔列表)
+- **会员**: `VIP_USERS` 环境变量 (QQ 号逗号分隔列表)
+- **普通用户**: 不在以上两列表中的所有用户
+
+#### 权限传递机制
+
+权限信息通过 `contextvars` 在请求处理链路中传递：
+
+```
+agent_router.py
+  ├── PermissionManager.get_role(user_id) → UserRole
+  ├── _current_user_role.set(role.value)          ← contextvar
+  ├── _current_code_limits.set(limits_dict)        ← contextvar
+  └── agent.run(message, user_id, allowed_tools=..., user_role=...)
+        ├── get_schemas_for(allowed_tools)         ← LLM 只看到允许的工具
+        └── _execute_tool_calls()                  ← 硬拦截二次校验
+              └── execute_code() → _get_code_limits() ← 读取 contextvar 应用分级限制
+```
+
+#### 设计原则
+
+1. **Schema 过滤为主**: LLM 看不到越权工具就不会调用，从根源避免权限违规
+2. **硬拦截为纵深防御**: `_execute_tool_calls()` 中检查 `allowed_tools`，即使 schema 过滤出现 bug 也能兜底
+3. **环境变量认证**: 仅通过 `SUPERUSERS` / `VIP_USERS` 环境变量识别身份，无 QQ 命令提权路径，防止社会工程攻击
+4. **权限不足不暴露系统能力**: Agent 被告知权限受限时应说明"当前账户权限不支持"，而非"系统没有此功能"
+
+### 2.7 `lib/deepseek_client.py` — DeepSeek API 客户端
 
 #### 类: `DeepSeekClient`
 
@@ -361,7 +457,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 
 **全局实例**: `deepseek_client` — 模块级单例，try/except 创建，兼容测试环境。通过可选构造参数支持多模型实例化。
 
-### 2.7 `plugins/agent_router.py` — 统一消息入口
+### 2.8 `plugins/agent_router.py` — 统一消息入口
 
 **这是当前唯一活跃的 QQ 消息处理插件**。所有旧的 `on_command` / `on_message` 处理程序已禁用。
 
@@ -464,7 +560,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 
 **注**: `check_weather` 已移除。天气查询通过 `get_weather` (Amap API) 或 `search_web` → SearXNG 搜索 + LLM 合成结果实现。`web_fetch` 用于直接抓取搜索结果中无法索引的网页。
 
-### 2.8 `lib/model_router.py` — 多模型路由器
+### 2.9 `lib/model_router.py` — 多模型路由器
 
 #### 类: `ModelRouter`
 
@@ -1321,4 +1417,38 @@ v2.14 基础上增加:
       └── asyncio.wait_for timeout: 200s → 300s
 
 工具数量: 20 (不变, read_file 功能扩展)
+```
+
+### v2.16 — 三层权限系统 (2026-05-29)
+```
+v2.14 基础上增加:
+  ├── agent/permissions.py: UserRole 枚举 + CodeLimits 数据类 + PermissionManager
+  │   ├── 身份识别: SUPERUSERS 环境变量 → admin, VIP_USERS → vip, 默认 → regular
+  │   ├── 工具权限矩阵: _PUBLIC_TOOLS (15), _VIP_TOOLS (4), _ADMIN_TOOLS (shell_exec)
+  │   └── 资源配额: 工作区磁盘 (admin=2GB, vip=500MB, regular=100MB), 特殊会话数 (10/3/1)
+  │
+  ├── agent/context.py: 新增 _current_user_role + _current_code_limits contextvars
+  │   └── 权限信息在请求链路中通过 contextvars 传递，无需修改工具函数签名
+  │
+  ├── agent/tool_registry.py: 新增 get_schemas_for(allowed_names)
+  │   └── 根据用户角色过滤工具 schema，LLM 只看到允许调用的工具
+  │
+  ├── agent/agent.py 修改:
+  │   ├── run(): 新增 allowed_tools + user_role 参数
+  │   ├── LLM 调用使用 get_schemas_for() 过滤 schema (schema 过滤防线)
+  │   └── _execute_tool_calls(): 硬拦截非允许工具调用 (纵深防御)
+  │
+  ├── tools/builtin_tools.py: execute_code 读取 _current_code_limits contextvar
+  │   └── 按角色应用分级限制: admin (60s/100KB/256MB), vip (15s/50KB/128MB)
+  │
+  ├── plugins/agent_router.py: 集成 PermissionManager
+  │   ├── 请求入口解析角色 → 设置 contextvars → 传递 allowed_tools 给 agent.run()
+  │   └── 权限不足处理: 礼貌说明，建议联系管理员，不暴露系统完整能力
+  │
+  └── agent/config/AGENTS.md: 新增权限系统文档段
+      ├── 用户层级表 (角色/识别方式/权限范围)
+      ├── 权限不足处理原则 (5 条)
+      └── Permission 错误拦截说明
+
+设计原则: Schema 过滤为主, 硬拦截为纵深防御, 环境变量认证, 权限不足不暴露系统能力
 ```
