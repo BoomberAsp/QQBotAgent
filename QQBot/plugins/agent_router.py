@@ -14,6 +14,7 @@ import os
 import re
 import time
 import uuid
+from pathlib import Path
 
 import httpx
 from nonebot import on_message
@@ -705,6 +706,45 @@ def _get_user_info() -> str:
     lines.append(f"工作区:")
     lines.append(f"  路径: {ws_path}")
     lines.append(f"  用量: {ws_usage_mb:.1f} MB / {ws_quota_mb} MB ({pct:.1f}%)")
+
+    # ── 工作区目录快照 ──
+    lines.append(f"")
+    lines.append(f"  目录快照:")
+    ws = Path(ws_path)
+    if ws.is_dir():
+        for subdir_name in ["code", "output", "projects", "uploads"]:
+            subdir = ws / subdir_name
+            if not subdir.is_dir():
+                continue
+            try:
+                entries = sorted(subdir.iterdir(), key=lambda e: e.name.lower())
+            except PermissionError:
+                lines.append(f"    {subdir_name}/ (无权限访问)")
+                continue
+
+            if not entries:
+                lines.append(f"    {subdir_name}/ (空)")
+            else:
+                lines.append(f"    {subdir_name}/ ({len(entries)} 项)")
+                for entry in entries[:20]:  # cap at 20 entries per dir
+                    if entry.is_symlink():
+                        lines.append(f"      {entry.name} -> (符号链接)")
+                    elif entry.is_dir():
+                        item_count = sum(1 for _ in entry.rglob("*"))
+                        lines.append(f"      {entry.name}/ ({item_count} 项)")
+                    else:
+                        size = entry.stat().st_size
+                        if size < 1024:
+                            size_str = f"{size} B"
+                        elif size < 1024 * 1024:
+                            size_str = f"{size / 1024:.1f} KB"
+                        else:
+                            size_str = f"{size / (1024 * 1024):.1f} MB"
+                        lines.append(f"      {entry.name} ({size_str})")
+                if len(entries) > 20:
+                    lines.append(f"      ... 还有 {len(entries) - 20} 项未显示")
+    else:
+        lines.append(f"    (工作区目录不存在)")
 
     # ── 权限范围 ──
     allowed = _perm_manager.get_allowed_tools(role)
