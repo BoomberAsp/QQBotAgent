@@ -17,6 +17,7 @@ Tool categories:
 import os
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Dict, Set
 
 
@@ -118,11 +119,15 @@ class PermissionManager:
             UserRole.REGULAR: 1,
         }
 
+    # Resolve the project .env path at module load time
+    # permissions.py is at QQBot/agent/permissions.py, so parent.parent = QQBot/
+    _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
     # ── Identity Resolution ───────────────────────────────────────
 
     @staticmethod
     def _parse_qq_list(raw: str) -> Set[str]:
-        """Parse a comma/space-separated list of QQ IDs from environment.
+        """Parse a comma/space-separated list of QQ IDs.
 
         Handles JSON-like formats: ["123", "456"] or plain: 123,456
         """
@@ -145,17 +150,44 @@ class PermissionManager:
                 ids.add(part)
         return ids
 
+    @classmethod
+    def _read_env(cls, key: str) -> str:
+        """Read a value from the .env file directly.
+
+        NoneBot2 may not load .env values into os.environ (it uses its
+        own pydantic config model instead). Reading the file directly
+        ensures we always get the configured values, regardless of when
+        or how NoneBot initializes.
+
+        Falls back to os.environ for Docker/secrets-manager setups where
+        env vars are injected without a .env file.
+        """
+        path = cls._ENV_FILE
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() == key:
+                    v = v.strip()
+                    # Strip surrounding quotes
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                        v = v[1:-1]
+                    return v
+        # Fall back to os.environ (for Docker / production deployments)
+        return os.environ.get(key, "")
+
     def get_role(self, user_id: str) -> UserRole:
         """Determine the user's role. Admin takes precedence over VIP.
 
-        Env vars are re-read on every call (not cached at init time)
-        because NoneBot2 may load .env after plugin imports.
+        Reads .env file directly on every call — NoneBot2 may not expose
+        .env values through os.environ.
         """
-        # Read env vars lazily to handle NoneBot2's deferred .env loading
-        admins = self._parse_qq_list(os.environ.get("SUPERUSERS", ""))
+        admins = self._parse_qq_list(self._read_env("SUPERUSERS"))
         if user_id in admins:
             return UserRole.ADMIN
-        vips = self._parse_qq_list(os.environ.get("VIP_USERS", ""))
+        vips = self._parse_qq_list(self._read_env("VIP_USERS"))
         if user_id in vips:
             return UserRole.VIP
         return UserRole.REGULAR
