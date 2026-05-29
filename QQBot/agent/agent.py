@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .tool_registry import ToolRegistry
@@ -60,6 +61,12 @@ class Agent:
         self.special_sessions = special_session_manager
         self.max_tool_iterations = max_tool_iterations
         self.thinking_timeout = thinking_timeout
+
+        # Audit logging
+        self._audit_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "audit",
+        )
 
         # Load configs
         self._configs: Dict[str, str] = {}
@@ -190,7 +197,7 @@ class Agent:
                             pass
 
                 tool_results = await self._execute_tool_calls(
-                    response["tool_calls"], session
+                    response["tool_calls"], session, user_id
                 )
 
                 assistant_msg = {
@@ -293,9 +300,9 @@ class Agent:
             if profile_context:
                 messages[0]["content"] += "\n\n" + profile_context
 
-        # 4. Relevant long-term memories
+        # 4. Relevant long-term memories (scoped to user_id)
         if self.memory:
-            memories = self.memory.search(user_message)
+            memories = self.memory.search(user_message, user_id=user_id)
             if memories:
                 mem_lines = ["\n## Relevant Past Interactions"]
                 for m in memories[:3]:
@@ -358,7 +365,7 @@ class Agent:
     # ── Tool Execution ────────────────────────────────────────────
 
     async def _execute_tool_calls(
-        self, tool_calls: List[dict], session: Session
+        self, tool_calls: List[dict], session: Session, user_id: str = ""
     ) -> List[Dict[str, str]]:
         """Execute tool calls from the LLM response.
 
@@ -375,6 +382,9 @@ class Agent:
             result_text = await self.tools.execute(tool_name, arguments)
             session.tool_call_count += 1
 
+            # Audit log: record every tool invocation
+            self._write_audit_log(user_id, tool_name, arguments, result_text)
+
             results.append({
                 "role": "tool",
                 "tool_call_id": tc.get("id", f"call_{tool_name}"),
@@ -382,6 +392,44 @@ class Agent:
             })
 
         return results
+
+    # ── Audit Logging ────────────────────────────────────────────
+
+    def _write_audit_log(
+        self, user_id: str, tool_name: str,
+        arguments: dict, result_text: str,
+    ):
+        """Write a JSONL audit log entry for a tool invocation.
+
+        Each entry records: timestamp, user_id, tool_name, arguments,
+        success/error status, and a result summary (first 200 chars).
+        Logs are written to daily files under data/audit/.
+        """
+        try:
+            os.makedirs(self._audit_dir, exist_ok=True)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            log_path = os.path.join(self._audit_dir, f"tool_calls_{today}.jsonl")
+
+            # Determine if the tool returned an error
+            is_error = result_text.startswith("[") and any(
+                result_text.startswith(f"[{prefix}]") or result_text.startswith(f"[{prefix} ")
+                for prefix in ["Search", "WebFetch", "Shell", "Code Error",
+                               "Security", "PDF Error", "Git Error", "SSRF"]
+            )
+
+            entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "user_id": user_id,
+                "tool": tool_name,
+                "arguments": arguments,
+                "success": not is_error,
+                "result_summary": result_text[:200].replace("\n", " "),
+            }
+
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass  # Audit logging must never break the main flow
 
     # ── Memory ────────────────────────────────────────────────────
 
@@ -401,6 +449,7 @@ class Agent:
                 name=f"interaction_{user_id}_{int(time.time())}",
                 description=f"Conversation with {user_id}: {summary}",
                 type="user",
+                user_id=user_id,
                 content=f"## User Message\n{user_message}\n\n## Agent Response\n{agent_response[:500]}",
             )
             self.memory.save(entry)

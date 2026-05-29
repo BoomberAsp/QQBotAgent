@@ -18,15 +18,17 @@ Security constraints are defined in agent/config/WORKSPACE.md.
 
 import asyncio
 import glob
+import ipaddress
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 # ── Workspace Configuration ────────────────────────────────────────
 
@@ -296,6 +298,64 @@ _MAX_FETCH_SIZE = 2 * 1024 * 1024
 _MAX_FETCH_OUTPUT = 8000
 _FETCH_TIMEOUT = 30.0
 
+# Private/special-use networks blocked for SSRF prevention
+_SSRF_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),       # Loopback
+    ipaddress.ip_network("10.0.0.0/8"),        # Private (Class A)
+    ipaddress.ip_network("172.16.0.0/12"),     # Private (Class B)
+    ipaddress.ip_network("192.168.0.0/16"),    # Private (Class C)
+    ipaddress.ip_network("169.254.0.0/16"),    # Link-local (APIPA)
+    ipaddress.ip_network("0.0.0.0/8"),         # "This" network
+    ipaddress.ip_network("100.64.0.0/10"),     # CGNAT (RFC 6598)
+    ipaddress.ip_network("198.18.0.0/15"),     # Benchmarking (RFC 2544)
+    ipaddress.ip_network("224.0.0.0/4"),       # Multicast
+    ipaddress.ip_network("240.0.0.0/4"),       # Reserved
+    ipaddress.ip_network("::1/128"),           # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),          # IPv6 unique local
+    ipaddress.ip_network("fe80::/10"),         # IPv6 link-local
+]
+
+
+def _check_ssrf(url: str) -> str | None:
+    """Check if a URL targets a private/internal IP (SSRF prevention).
+
+    Resolves the hostname and checks all returned IPs against blocked
+    network ranges. Returns an error message string if any IP is private,
+    or None if the URL is safe.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return f"[SSRF] 无法从 URL 中提取主机名: {url}"
+
+        # Resolve hostname to IPs
+        try:
+            addrinfo = socket.getaddrinfo(hostname, None)
+        except socket.gaierror:
+            return f"[SSRF] 无法解析主机名: {hostname}"
+
+        # Check every resolved IP
+        for info in addrinfo:
+            ip_str = info[4][0]  # (family, type, proto, canonname, sockaddr)
+            try:
+                ip_addr = ipaddress.ip_address(ip_str)
+            except ValueError:
+                continue
+
+            for network in _SSRF_BLOCKED_NETWORKS:
+                if ip_addr in network:
+                    return (
+                        f"[SSRF] 拒绝访问内部/私有地址: {ip_str} "
+                        f"(网段: {network}, 主机: {hostname})。"
+                        f"仅允许访问公网地址。"
+                    )
+
+        return None  # Safe
+
+    except Exception as e:
+        return f"[SSRF] 安全检查失败: {type(e).__name__}: {e}"
+
 
 def _html_to_text(html: str) -> str:
     """Strip HTML tags and extract readable text."""
@@ -352,6 +412,11 @@ async def web_fetch(url: str) -> str:
     for char in dangerous:
         if char in url:
             return f"[WebFetch] URL 包含非法字符: '{char}'"
+
+    # SSRF check: resolve DNS and verify target is not a private IP
+    ssrf_error = _check_ssrf(url)
+    if ssrf_error:
+        return ssrf_error
 
     try:
         async with httpx.AsyncClient() as client:
@@ -418,6 +483,137 @@ def _check_code_safety(code: str) -> str | None:
     return None
 
 
+# ── AST-Level Code Safety ──────────────────────────────────────────
+
+# Allowed import modules (same as _ALLOWED_IMPORTS_HINT)
+_AST_ALLOWED_IMPORTS = {
+    "math", "random", "datetime", "collections", "itertools",
+    "functools", "json", "csv", "re", "string", "statistics",
+    "dataclasses", "typing", "decimal", "fractions", "hashlib",
+    "base64", "textwrap", "heapq", "bisect", "copy",
+    # Sub-modules of allowed packages
+    "collections.abc", "typing.re",
+}
+
+# Built-in functions that are always safe to call
+_AST_SAFE_BUILTINS = {
+    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
+    "callable", "chr", "classmethod", "complex", "copyright", "credits",
+    "dict", "dir", "divmod", "enumerate", "filter", "float", "format",
+    "frozenset", "getattr", "hasattr", "hash", "help", "hex", "id",
+    "input", "int", "isinstance", "issubclass", "iter", "len", "license",
+    "list", "locals", "map", "max", "memoryview", "min", "next",
+    "object", "oct", "ord", "pow", "print", "property", "range",
+    "repr", "reversed", "round", "set", "setattr", "slice", "sorted",
+    "staticmethod", "str", "sum", "super", "tuple", "type", "vars",
+    "zip", "__build_class__", "__import__",
+}
+
+# Dangerous builtin calls that must be blocked (even though they're builtins)
+_AST_BLOCKED_BUILTINS = {
+    "__import__",  # Dynamic import bypass
+    "eval",
+    "exec",
+    "compile",
+    "open",
+    "breakpoint",
+}
+
+# Dangerous attribute roots (modules/objects that shouldn't be accessed)
+_AST_BLOCKED_ATTRIBUTE_ROOTS = {
+    "os", "subprocess", "socket", "shutil", "ctypes",
+    "sys", "importlib", "builtins", "code", "codeop",
+    "ptrace", "multiprocessing", "threading", "signal",
+    "requests", "urllib", "http", "ftplib", "telnetlib",
+    "smtplib", "imaplib", "poplib",
+}
+
+
+def _check_code_safety_ast(code: str) -> str | None:
+    """AST-level security check for Python code.
+
+    Parses the code and walks the AST to validate:
+    - Imports are from the allowed whitelist
+    - No dangerous builtin calls (eval, exec, compile, open, __import__)
+    - No access to dangerous module attributes (os, subprocess, etc.)
+
+    This is the second layer of defense, after regex pattern matching.
+    AST parsing cannot be bypassed by whitespace, comments, or string
+    obfuscation tricks that would fool regex.
+
+    Returns an error message string, or None if the code passes.
+    """
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(code)
+    except SyntaxError as e:
+        return f"[Security] 代码语法错误，无法进行安全检查: {e}"
+
+    # Collect all errors before reporting
+    errors: list[str] = []
+
+    for node in _ast.walk(tree):
+        # ── Check imports ────────────────────────────────────
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] not in _AST_ALLOWED_IMPORTS:
+                    errors.append(
+                        f"不允许的导入: `import {alias.name}`。{_ALLOWED_IMPORTS_HINT}"
+                    )
+
+        elif isinstance(node, _ast.ImportFrom):
+            if node.module is None:
+                # Relative import without module: "from . import foo"
+                errors.append("不允许相对导入。")
+            elif node.module.split(".")[0] not in _AST_ALLOWED_IMPORTS:
+                errors.append(
+                    f"不允许的导入: `from {node.module} import ...`。{_ALLOWED_IMPORTS_HINT}"
+                )
+
+        # ── Check function calls ──────────────────────────────
+        elif isinstance(node, _ast.Call):
+            # Direct calls to dangerous builtins: eval(), exec(), etc.
+            if isinstance(node.func, _ast.Name):
+                if node.func.id in _AST_BLOCKED_BUILTINS:
+                    errors.append(
+                        f"禁止调用: `{node.func.id}()`。出于安全考虑，该函数已被禁用。"
+                    )
+
+            # Attribute access: os.system(), subprocess.run(), etc.
+            elif isinstance(node.func, _ast.Attribute):
+                root = _get_attr_root(node.func)
+                if root in _AST_BLOCKED_ATTRIBUTE_ROOTS:
+                    errors.append(
+                        f"禁止访问模块: `{root}`。"
+                        f"该模块不允许在沙箱中使用。"
+                    )
+
+    if errors:
+        unique = list(dict.fromkeys(errors))  # deduplicate while preserving order
+        return "[Security] AST 安全检查失败:\n- " + "\n- ".join(unique)
+
+    return None
+
+
+def _get_attr_root(node) -> str | None:
+    """Extract the root of an attribute chain.
+
+    Example: os.path.join → "os"
+             subprocess.run → "subprocess"
+             foo.bar.baz → "foo"
+    """
+    import ast as _ast
+
+    if isinstance(node, _ast.Attribute):
+        inner = node.value
+        if isinstance(inner, _ast.Name):
+            return inner.id
+        elif isinstance(inner, _ast.Attribute):
+            return _get_attr_root(inner)
+    return None
+
+
 async def execute_code(code: str, timeout: int = 30) -> str:
     """Execute Python code in an isolated workspace and return output.
 
@@ -440,10 +636,15 @@ async def execute_code(code: str, timeout: int = 30) -> str:
     if not code:
         return "[Code Error] 代码为空，请提供要执行的 Python 代码。"
 
-    # Security check
+    # Security check (layer 1: regex patterns)
     safety_error = _check_code_safety(code)
     if safety_error:
         return safety_error
+
+    # Security check (layer 2: AST whitelist)
+    ast_error = _check_code_safety_ast(code)
+    if ast_error:
+        return ast_error
 
     # Clamp timeout
     timeout = min(max(timeout, 1), MAX_RUNTIME)
@@ -699,8 +900,6 @@ _SHELL_WHITELIST = {
     "du",
     # Binary inspection
     "xxd", "hexdump", "od", "strings",
-    # Python one-liners
-    "python3",
 }
 
 # Commands with subcommand-level restrictions
@@ -818,11 +1017,7 @@ def _validate_shell_command(command: str) -> str | None:
                 return f"[Shell] 不允许命令链接符号 (在 '{tok}' 中检测到 ';' 或 '&' 后缀)"
             # Catch ; embedded mid-token: "/etc/passwd;ls"
             if ";" in tok:
-                is_python_code = (
-                    cmd_name == "python3"
-                    and any(tokens[j] == "-c" for j in range(i))
-                )
-                if not is_python_code and cmd_name not in _SEMICOLON_SAFE_COMMANDS:
+                if cmd_name not in _SEMICOLON_SAFE_COMMANDS:
                     return f"[Shell] 不允许命令链接符号 (在 '{tok}' 中检测到 ';')"
             # Catch && / || embedded anywhere (no-space chaining or inside args)
             if "&&" in tok or "||" in tok:
@@ -865,11 +1060,6 @@ def _validate_shell_command(command: str) -> str | None:
         if cmd_name == "sed":
             if any(flag in tokens for flag in _SED_BLOCKED_FLAGS):
                 return "[Shell] sed 不允许使用 -i (文件内编辑)。只能进行只读文本处理。"
-
-        # ── Block python3 without -c ──────────────────────────
-        if cmd_name == "python3":
-            if "-c" not in tokens:
-                return "[Shell] python3 仅允许 -c 单行执行模式。"
 
     return None  # Safe
 
