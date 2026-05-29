@@ -1196,6 +1196,10 @@ async def _send_response(response: str, matcher=None):
     if not response:
         return
 
+    # Append disclaimer to every agent response
+    disclaimer = "\n\nRoxy 的回答并非总是准确无误，请理性判断。"
+    response += disclaimer
+
     # Shorter chunks + longer delays to avoid QQ rate limiting
     max_len = 300
     if len(response) <= max_len:
