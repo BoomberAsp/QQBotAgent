@@ -813,6 +813,11 @@ def _build_reply_context(event: MessageEvent) -> str:
     Returns a string for injection into the augmented message, or "" if
     there is no reply segment.
     """
+    # ── Diagnostic: log all message segments ───────────────────────
+    import sys
+    seg_types = [seg.type for seg in event.message]
+    print(f"[REPLY_DIAG] msg_id={event.message_id}  seg_types={seg_types}", file=sys.stderr, flush=True)
+
     for seg in event.message:
         if seg.type != "reply":
             continue
@@ -820,7 +825,7 @@ def _build_reply_context(event: MessageEvent) -> str:
         reply_text = seg.data.get("text", "") or seg.data.get("message", "") or ""
 
         # ── Diagnostic: log reply lookup ──────────────────────────
-        print(f"[REPLY_DIAG] reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}")
+        print(f"[REPLY_DIAG] reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
 
         parts = []
         if reply_text:
@@ -840,6 +845,27 @@ def _build_reply_context(event: MessageEvent) -> str:
                 )
 
         return "\n".join(parts) if parts else ""
+
+    # ── Fallback: parse [reply:id=XXX] from plain text ────────────
+    import re as _re
+    text = event.get_plaintext()
+    m = _re.match(r'^\[reply:id=(\d+)\]', text)
+    if m:
+        reply_id = m.group(1)
+        print(f"[REPLY_DIAG] text fallback: reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
+        if reply_id in _recent_files:
+            files = _recent_files[reply_id]
+            parts = []
+            for f in files:
+                parts.append(
+                    f"[用户引用了文件 \"{f['name']}\"。"
+                    f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                    f"忽略对话历史中关于其他文件的提及。"
+                    f"文件路径: {f['path']}]"
+                )
+            return "\n".join(parts) if parts else ""
+        else:
+            return f"[用户回复了消息 {reply_id}]"
 
     return ""
 
@@ -1033,7 +1059,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
     # ── Detect reply/quote context ─────────────────────────────────
     reply_context = _build_reply_context(event)
     if reply_context:
-        print(f"[REPLY_DIAG] reply_context built ({len(reply_context)} chars): {reply_context[:300]}")
+        import sys; print(f"[REPLY_DIAG] reply_context built ({len(reply_context)} chars): {reply_context[:300]}", file=sys.stderr, flush=True)
 
     # ── Detect and download file/image attachments ─────────────────
     file_context_parts = []
