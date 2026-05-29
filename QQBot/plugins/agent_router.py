@@ -835,6 +835,11 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
 
     text_content = event.get_plaintext().strip()
 
+    # ── Handle feedback / bug report (before agent, zero token cost) ─
+    if text_content.startswith(("#反馈", "#bug", "#建议")):
+        await _handle_feedback(text_content, user_id)
+        return
+
     # ── Handle session management commands ──────────────────────────
     if text_content.startswith("/") or text_content.startswith("#"):
         cmd_handled = await _handle_session_command(text_content, user_id)
@@ -1314,6 +1319,79 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
 
     # Not a session command
     return False
+
+
+async def _handle_feedback(text: str, user_id: str):
+    """Record user feedback / bug report to JSONL with context snapshot.
+
+    Commands: #反馈 <content>, #bug <content>, #建议 <content>
+    Zero LLM token cost — intercepted before agent processing.
+    """
+    # Parse command and content
+    cmd, _, content = text.partition(" ")
+    content = content.strip()
+
+    if cmd == "#反馈" and not content:
+        await _safe_send(
+            "请按格式提交反馈：\n"
+            "#反馈 <你的建议或问题>\n"
+            "例如：#反馈 execute_code 超时后临时文件没有清理"
+        )
+        return
+    if cmd == "#bug" and not content:
+        await _safe_send(
+            "请按格式提交 Bug 报告：\n"
+            "#bug <Bug 描述>\n"
+            "例如：#bug shell_exec 对大文件处理超时"
+        )
+        return
+    if cmd == "#建议" and not content:
+        await _safe_send(
+            "请按格式提交改进建议：\n"
+            "#建议 <你的建议>\n"
+            "例如：#建议 get_user_info 增加工作区目录快照"
+        )
+        return
+
+    fb_type = {"#反馈": "feedback", "#bug": "bug", "#建议": "suggestion"}[cmd]
+
+    # ── Build context snapshot ──
+    role = _perm_manager.get_role(user_id)
+    active_special = _special_sessions.get_active(user_id)
+    ws_path = _workspace_manager.get_workspace(user_id)
+    ws_size = _workspace_manager.get_size(user_id)
+    ws_quota_mb = _perm_manager.get_workspace_quota_mb(role)
+
+    ctx = {
+        "role": role.value,
+        "workspace_path": ws_path,
+        "workspace_usage_mb": round(ws_size / (1024 * 1024), 2),
+        "workspace_quota_mb": ws_quota_mb,
+        "active_special_session": active_special.name if active_special else None,
+    }
+
+    entry = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "user_id": user_id,
+        "type": fb_type,
+        "content": content,
+        "context": ctx,
+    }
+
+    # ── Write to JSONL ──
+    feedback_dir = os.path.join(_AGENT_DIR, "data", "feedback")
+    os.makedirs(feedback_dir, exist_ok=True)
+    feedback_file = os.path.join(feedback_dir, f"feedback_{time.strftime('%Y-%m')}.jsonl")
+
+    try:
+        with open(feedback_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        await _safe_send("反馈记录失败，请稍后重试或直接联系管理员。")
+        return
+
+    type_label = {"feedback": "反馈", "bug": "Bug 报告", "suggestion": "改进建议"}[fb_type]
+    await _safe_send(f"已记录你的{type_label}，感谢！")
 
 
 async def _handle_special_command(command: str, user_id: str):
