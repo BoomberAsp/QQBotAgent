@@ -9,30 +9,50 @@ This document defines what happens when the agent starts up.
 2. Load SOUL.md           → Personality and behavior rules
 3. Load TOOLS.md          → Available tool definitions
 4. Load AGENTS.md         → Orchestration rules
-5. Load SESSION.md        → Session configuration
-6. Load MEMORY.md         → Long-term memory index
-7. Register built-in tools → ToolRegistry initialization
-8. Verify LLM connection   → Health check to DeepSeek API
-9. Verify QQ connection    → Health check to Napcat WebSocket
-10. Start HEARTBEAT.md     → Begin periodic health checks
-11. Agent READY            → Begin accepting messages
+5. Load WORKSPACE.md      → Capability boundaries and workspace constraints
+6. Load SESSION.md        → Session configuration
+7. Load MEMORY.md         → Long-term memory index
+8. Register built-in tools → ToolRegistry initialization
+9. Verify LLM connection   → Health check to DeepSeek API
+10. Verify QQ connection    → Health check to Napcat WebSocket
+11. Start HEARTBEAT.md     → Begin periodic health checks
+12. Agent READY            → Begin accepting messages
 ```
 
 ## Tool Registration
 
 On bootstrap, the following tools are registered by default:
 
-| Tool Name | Module | Status |
-|-----------|--------|--------|
-| `search_web` | `tools.builtin_tools` | Required |
-| `check_weather` | `tools.builtin_tools` | Required |
-| `execute_code` | `tools.builtin_tools` | Required |
-| `translate_text` | `tools.builtin_tools` | Required |
-| `get_time` | `tools.builtin_tools` | Required |
-| `gacha_pull` | `tools.legacy_tools` | Optional |
-| `calculate_speed` | `tools.legacy_tools` | Optional |
-| `compare_speed_probability` | `tools.legacy_tools` | Optional |
-| `explain_code` | `tools.legacy_tools` | Optional |
+**Built-in tools** (`tools.builtin_tools`) — Required:
+| Tool Name | Description |
+|-----------|-------------|
+| `search_web` | SearXNG meta-search engine |
+| `get_time` | Current date/time |
+| `execute_code` | Sandboxed Python execution |
+| `shell_exec` | Read-only shell commands (40+ whitelist) |
+| `download_repo` | Git clone HTTPS repos |
+| `summarize_pdf` | PDF text extraction |
+| `read_file` | Text/PDF/image/audio file analysis |
+| `get_system_load` | CPU/memory/disk load check |
+
+**Map tools** (`tools.map_tools`) — Required:
+| Tool Name | Description |
+|-----------|-------------|
+| `geocode` | Address → coordinates |
+| `reverse_geocode` | Coordinates → address |
+| `get_weather` | Real-time/forecast weather (Amap API) |
+| `search_poi` | Points of interest search |
+| `plan_route` | Driving/walking/transit routing |
+
+**Legacy tools** (`tools.legacy_tools`) — Optional:
+| Tool Name | Description |
+|-----------|-------------|
+| `gacha_pull` | Game gacha simulation |
+| `play_gacha_animation` | Gacha animation in QQ chat |
+| `calculate_speed` | Game speed calculation |
+| `compare_speed_probability` | Speed randomization probability |
+| `explain_code` | Code explanation |
+| `translate_text` | Text translation |
 
 ## Startup Health Checks
 

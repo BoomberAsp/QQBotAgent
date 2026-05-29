@@ -648,7 +648,7 @@ agent = Agent(
     hardware_detector=_hardware_detector,
     workspace_manager=_workspace_manager,
     special_session_manager=_special_sessions,
-    max_tool_iterations=12,
+    max_tool_iterations=20,
     thinking_timeout=180.0,
 )
 
@@ -922,7 +922,7 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
         await _send_response(response, matcher=continuous_router)
 
     except asyncio.TimeoutError:
-        await _safe_send("抱歉，思考超时了。请尝试用更简单的方式提问~", matcher=continuous_router)
+        await _safe_send("抱歉，Roxy思考时间超过您的配额时长了。请尝试用更简单的方式提问~", matcher=continuous_router)
     except Exception as e:
         await _safe_send(f"处理消息时出现错误: {str(e)}", matcher=continuous_router)
 
@@ -968,6 +968,8 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         try:
             name = args if args else None
             session = _special_sessions.create(user_id, name)
+            # Activate the session — create() only persists it, doesn't set active_session
+            _special_sessions.switch_to(user_id, session.name)
             if args:
                 await _safe_send(
                     f"已创建特殊会话「{session.name}」。\n"
@@ -1108,6 +1110,8 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         name = args if args else None
         try:
             session = _special_sessions.create(user_id, name)
+            # Activate the session so add_message() calls below actually work
+            _special_sessions.switch_to(user_id, session.name)
         except ValueError as e:
             await _safe_send(str(e))
             return True

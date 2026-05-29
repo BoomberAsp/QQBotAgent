@@ -233,7 +233,7 @@ class Agent:
                 return final_content
 
         # Max iterations reached
-        return "抱歉，Roxy 在尝试处理你的请求时似乎陷入了循环。请尝试换一种方式提问~"
+        return f"抱歉，Roxy 在尝试处理你的请求时似乎陷入了循环或工具调用次数已经超过当前配额上限（{self.max_tool_iterations}次）。请尝试换一种方式提问~"
 
     # ── Message Building ──────────────────────────────────────────
 
@@ -267,17 +267,22 @@ class Agent:
                 f"当前会话名称: {special_session.name}\n"
                 f"会话消息数: {special_session.total_messages}\n"
                 f"会话创建于: {time.strftime('%Y-%m-%d %H:%M', time.localtime(special_session.created_at))}\n"
-                f"工作区: {self.workspaces.get_workspace(user_id) if self.workspaces else '默认'}\n\n"
                 f"你处于特殊会话模式，拥有完整的对话上下文记忆。"
-                f"可以使用用户工作区存储文件。"
                 f"如果任务已完成，可以建议用户使用 /结束会话 退出特殊会话模式。"
             )
 
-            # Quota context
-            if self.workspaces:
-                quota_ctx = self.workspaces.get_quota_context(user_id)
-                if quota_ctx:
-                    system_content += f"\n{quota_ctx}"
+        # Workspace context — always injected for all session types
+        if self.workspaces:
+            workspace_path = self.workspaces.get_workspace(user_id)
+            system_content += (
+                f"\n\n## 用户工作区（独立隔离，仅该用户可访问）\n"
+                f"路径: {workspace_path}\n"
+                f"用户可以在工作区内存放持久化文件、代码和输出。"
+                f"子目录: code/（代码执行）、uploads/（上传文件）、output/（生成输出）、projects/（项目文件）。"
+            )
+            quota_ctx = self.workspaces.get_quota_context(user_id)
+            if quota_ctx:
+                system_content += f"\n{quota_ctx}"
 
         messages.append({"role": "system", "content": system_content})
 

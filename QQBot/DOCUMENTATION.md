@@ -144,7 +144,7 @@ User Message (@Bot)
 ```
 
 **关键参数**:
-- `max_tool_iterations=12` — 最多 12 轮工具调用，防止死循环
+- `max_tool_iterations=20` — 最多 20 轮工具调用，防止死循环
 - `thinking_timeout=180.0s` — LLM 思考超时
 - `max_context_messages=20` — 每会话保留最近 20 条上下文
 - `session_timeout=1800.0s` — 会话 30 分钟无活动自动过期
