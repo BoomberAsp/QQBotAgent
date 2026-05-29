@@ -761,6 +761,52 @@ _perm_manager = PermissionManager()
 # messages from that user are rejected with a brief "busy" reply.
 _user_busy: set = set()
 
+# Recent file tracking — maps message_id to downloaded file info so that
+# when a user replies to a file message we can resolve which file they mean.
+_MAX_RECENT_FILES = 200
+_recent_files: dict[str, list[dict]] = {}
+
+
+def _record_file(message_id: str, name: str, path: str):
+    """Record a downloaded file against its source message for reply resolution."""
+    if message_id not in _recent_files:
+        _recent_files[message_id] = []
+    _recent_files[message_id].append({"name": name, "path": path})
+    # Prune oldest entries if cache grows too large
+    while len(_recent_files) > _MAX_RECENT_FILES:
+        oldest = next(iter(_recent_files))
+        del _recent_files[oldest]
+
+
+def _build_reply_context(event: MessageEvent) -> str:
+    """Extract reply/quote context from a message's reply segment.
+
+    Returns a string for injection into the augmented message, or "" if
+    there is no reply segment.
+    """
+    for seg in event.message:
+        if seg.type != "reply":
+            continue
+        reply_id = seg.data.get("id", "")
+        reply_text = seg.data.get("text", "") or seg.data.get("message", "") or ""
+
+        parts = []
+        if reply_text:
+            parts.append(f"[用户引用了消息: \"{reply_text}\"]")
+        elif reply_id:
+            parts.append(f"[用户回复了消息 {reply_id}]")
+
+        # Check if the replied-to message had files
+        if reply_id and reply_id in _recent_files:
+            for f in _recent_files[reply_id]:
+                parts.append(
+                    f"[被引用消息中包含文件 {f['name']}，已保存至: {f['path']}]"
+                )
+
+        return "\n".join(parts) if parts else ""
+
+    return ""
+
 
 # ── User Info Tool ─────────────────────────────────────────────────
 
@@ -948,8 +994,12 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         if cmd_handled:
             return
 
+    # ── Detect reply/quote context ─────────────────────────────────
+    reply_context = _build_reply_context(event)
+
     # ── Detect and download file/image attachments ─────────────────
     file_context_parts = []
+    msg_id = str(event.message_id)
     for seg in event.message:
         if seg.type == "image":
             url = seg.data.get("url", "")
@@ -957,6 +1007,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             saved_path, error = await _download_and_save_file(url, f"image-{file_id}", bot=bot, file_id=file_id)
             if saved_path:
                 file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
+                _record_file(msg_id, f"image-{file_id}", saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
 
@@ -967,6 +1018,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
             if saved_path:
                 file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
+                _record_file(msg_id, name, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
 
@@ -974,19 +1026,40 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
             if saved_path:
                 file_context_parts.append(
-                    f"[用户发送了语音消息，已保存至: {saved_path}]\n"
-                    f"用户发送了语音消息，可以使用 read_file 工具分析音频内容。"
+                    f"[用户发送了语音消息，已保存至: {saved_path}]"
                 )
+                _record_file(msg_id, "语音消息", saved_path)
             elif error:
                 file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
 
-    # ── Build augmented message ────────────────────────────────────
-    if file_context_parts:
-        file_context = "\n".join(file_context_parts)
-        if text_content:
-            augmented_message = f"{file_context}\n用户说: {text_content}"
+    # ── File-only messages: acknowledge and skip agent ─────────────
+    has_files = bool(file_context_parts)
+    if has_files and not text_content and not reply_context:
+        names = []
+        for part in file_context_parts:
+            m = re.search(r"文件 (.+?)，", part) or re.search(r"上传了(\w+)，", part)
+            if m:
+                names.append(m.group(1))
+        if names:
+            ack = f"已收到 {'、'.join(names)}，需要分析的话引用这条消息告诉我~"
         else:
-            augmented_message = f"{file_context}\n用户发送了文件或语音消息，请使用 read_file 工具查看内容。"
+            ack = "已收到文件，需要分析的话引用这条消息告诉我~"
+        await _safe_send(ack)
+        return
+
+    # ── Build augmented message ────────────────────────────────────
+    context_parts = []
+    if reply_context:
+        context_parts.append(reply_context)
+    if file_context_parts:
+        context_parts.append("\n".join(file_context_parts))
+    context_prefix = "\n".join(context_parts)
+
+    if context_prefix:
+        if text_content:
+            augmented_message = f"{context_prefix}\n用户说: {text_content}"
+        else:
+            augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请使用 read_file 工具查看内容。"
     else:
         augmented_message = text_content
 
@@ -1126,15 +1199,13 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         await _safe_send("已结束连续对话模式，之后需要@我才能触发~", matcher=continuous_router)
         return
 
-    # Guard: nothing to process
-    if not text_content:
-        return
+    # ── Detect reply/quote context and file attachments ────────────
+    # These run BEFORE the text guard so files are always saved and
+    # recorded, even for file-only messages that may be replied to later.
+    reply_context = _build_reply_context(event)
 
-    # Renew the window on each message
-    _continuous_sessions.touch(group_id, user_id)
-
-    # Detect and download file/image attachments
     file_context_parts = []
+    msg_id = str(event.message_id)
     for seg in event.message:
         if seg.type == "image":
             url = seg.data.get("url", "")
@@ -1142,6 +1213,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             saved_path, error = await _download_and_save_file(url, f"image-{file_id}", bot=bot, file_id=file_id)
             if saved_path:
                 file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
+                _record_file(msg_id, f"image-{file_id}", saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
 
@@ -1152,6 +1224,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
             if saved_path:
                 file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
+                _record_file(msg_id, name, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
 
@@ -1159,26 +1232,34 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
             if saved_path:
                 file_context_parts.append(
-                    f"[用户发送了语音消息，已保存至: {saved_path}]\n"
-                    f"用户发送了语音消息，可以使用 read_file 工具分析音频内容。"
+                    f"[用户发送了语音消息，已保存至: {saved_path}]"
                 )
+                _record_file(msg_id, "语音消息", saved_path)
             elif error:
                 file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
 
+    # Renew the window on each message
+    _continuous_sessions.touch(group_id, user_id)
+
+    # Guard: nothing to process (no text, no files, no reply)
+    if not text_content and not file_context_parts and not reply_context:
+        return
+
     # Build augmented message with continuous mode context
+    context_parts = []
+    if reply_context:
+        context_parts.append(reply_context)
     if file_context_parts:
-        file_context = "\n".join(file_context_parts)
-        augmented_message = (
-            f"[连续对话模式] 用户未@你，正在继续之前的任务。"
-            f"回复保持简洁。如果任务已完成，可以建议用户发送 /取消 来退出连续模式。\n"
-            f"{file_context}\n用户说: {text_content}"
-        )
+        context_parts.append("\n".join(file_context_parts))
+
+    continuous_prefix = (
+        "[连续对话模式] 用户未@你，正在继续之前的任务。"
+        "回复保持简洁。如果任务已完成，可以建议用户发送 /取消 来退出连续模式。"
+    )
+    if context_parts:
+        augmented_message = f"{continuous_prefix}\n{'\n'.join(context_parts)}\n用户说: {text_content}"
     else:
-        augmented_message = (
-            f"[连续对话模式] 用户未@你，正在继续之前的任务。"
-            f"回复保持简洁。如果任务已完成，可以建议用户发送 /取消 来退出连续模式。\n"
-            f"用户说: {text_content}"
-        )
+        augmented_message = f"{continuous_prefix}\n用户说: {text_content}"
 
     try:
         # Triage and route

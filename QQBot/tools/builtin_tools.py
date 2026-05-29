@@ -135,17 +135,20 @@ def _validate_path(file_path: str, must_exist: bool = True) -> tuple[str | None,
     # Resolve to absolute path
     abs_path = os.path.abspath(file_path)
 
+    # Use runtime workspace root (respects per-user contextvar), not frozen import-time constant
+    workspace_root = _get_workspace_root()
+
     # If relative, assume under workspace
     if not os.path.isabs(file_path) or not file_path.startswith("/"):
-        abs_path = os.path.join(WORKSPACE_ROOT, file_path)
+        abs_path = os.path.join(workspace_root, file_path)
         abs_path = os.path.abspath(abs_path)
 
     # Check within workspace
-    workspace_real = os.path.realpath(WORKSPACE_ROOT)
+    workspace_real = os.path.realpath(workspace_root)
     path_real = os.path.realpath(abs_path)
     if not path_real.startswith(workspace_real + os.sep) and path_real != workspace_real:
         return None, (
-            f"路径超出工作区范围。所有文件操作必须限于 {WORKSPACE_ROOT}/ 目录下。\n"
+            f"路径超出工作区范围。所有文件操作必须限于 {workspace_root}/ 目录下。\n"
             f"请求路径: {file_path}\n"
             f"解析后: {abs_path}"
         )
@@ -685,7 +688,7 @@ async def execute_code(code: str, timeout: int = 30) -> str:
 
     # Create isolated temp directory
     try:
-        work_dir = tempfile.mkdtemp(dir=WORKSPACE_CODE, prefix="exec_")
+        work_dir = tempfile.mkdtemp(dir=os.path.join(_get_workspace_root(), "code"), prefix="exec_")
     except Exception as e:
         return f"[Code Error] 无法创建工作目录: {e}"
 
@@ -749,7 +752,7 @@ async def execute_code(code: str, timeout: int = 30) -> str:
                 src = os.path.join(work_dir, filename)
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 dest_name = f"chart_{timestamp}_{filename}"
-                dest = os.path.join(WORKSPACE_OUTPUT, dest_name)
+                dest = os.path.join(_get_workspace_root(), "output", dest_name)
                 shutil.copy2(src, dest)
                 saved_images.append(dest)
 
@@ -863,7 +866,7 @@ def download_repo(repo_url: str, target_dir: str = None) -> str:
 
     # Always force target to workspace
     _ensure_workspace_dirs()
-    target_dir = WORKSPACE_REPOS
+    target_dir = os.path.join(_get_workspace_root(), "repos")
 
     repo_name = safe_url.rstrip("/").split("/")[-1].replace(".git", "")
     # Sanitize repo name (prevent path tricks)
@@ -1122,15 +1125,16 @@ async def shell_exec(command: str, timeout: int = 15) -> str:
     _ensure_workspace_dirs()
 
     try:
+        workspace_root = _get_workspace_root()
         result = subprocess.run(
             ["bash", "-c", command],
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=WORKSPACE_ROOT,
+            cwd=workspace_root,
             env={
                 "PATH": "/usr/bin:/usr/local/bin:/bin",
-                "HOME": WORKSPACE_ROOT,
+                "HOME": workspace_root,
                 "LANG": "en_US.UTF-8",
                 "LC_ALL": "C",
             },
