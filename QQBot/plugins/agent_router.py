@@ -57,7 +57,6 @@ from tools.builtin_tools import (
     download_repo,
     shell_exec,
     summarize_pdf,
-    WORKSPACE_UPLOADS,
     _ensure_workspace_dirs,
 )
 from tools.file_tools import read_file
@@ -94,7 +93,21 @@ def _init_workspace():
 _init_workspace()
 
 
-# ── File Download Helper ──────────────────────────────────────────
+# ── File Download Helpers ──────────────────────────────────────────
+
+def _get_uploads_dir() -> str:
+    """Get the uploads directory at runtime, respecting user workspace contextvar.
+
+    Unlike the module-level WORKSPACE_UPLOADS constant (frozen at import time),
+    this checks _current_user_workspace on every call so files are saved to the
+    correct per-user workspace during special sessions.
+    """
+    user_ws = _current_user_workspace.get()
+    if user_ws:
+        return os.path.join(user_ws, "uploads")
+    # Fallback: shared workspace default
+    return os.path.join(_AGENT_DIR, "data", "workspace", "uploads")
+
 
 async def _download_voice(bot, seg_data: dict, message_id: str = "", max_size_mb: int = 50) -> tuple:
     """Download a QQ voice message.
@@ -114,8 +127,10 @@ async def _download_voice(bot, seg_data: dict, message_id: str = "", max_size_mb
 
     max_size_bytes = max_size_mb * 1024 * 1024
     _ensure_workspace_dirs()
+    uploads_dir = _get_uploads_dir()
+    os.makedirs(uploads_dir, exist_ok=True)
     save_path = os.path.join(
-        WORKSPACE_UPLOADS,
+        uploads_dir,
         f"{uuid.uuid4().hex[:8]}-{file_id}"
     )
 
@@ -287,24 +302,31 @@ async def _download_voice(bot, seg_data: dict, message_id: str = "", max_size_mb
     return None, f"语音下载失败。诊断: {'; '.join(diag)}"
 
 
-async def _download_and_save_file(url: str, filename: str, max_size_mb: int = 50) -> tuple:
+async def _download_and_save_file(
+    url: str, filename: str, max_size_mb: int = 50,
+    bot=None, file_id: str = "",
+) -> tuple:
     """Download a file from QQ and save to workspace uploads.
 
+    When the direct ``url`` is available it is used first (standard for
+    group-chat files).  When ``url`` is empty (common in private chats) the
+    function falls back to the OneBot ``get_file`` API if *bot* and *file_id*
+    are provided.
+
     Args:
-        url: Download URL from the message segment.
+        url: Download URL from the message segment (may be empty).
         filename: Original filename (used for extension detection).
         max_size_mb: Maximum file size in MB.
+        bot: Optional OneBot V11 Bot instance for API fallback.
+        file_id: File ID from the message segment for API fallback.
 
     Returns:
         (saved_path, error_message) — one is None, the other is not.
     """
-    if not url:
-        return None, "文件 URL 为空，无法下载。"
-
-    max_size_bytes = max_size_mb * 1024 * 1024
-
-    # Ensure the uploads directory exists
+    # ── Pick uploads dir at runtime (respects per-user workspace) ──
     _ensure_workspace_dirs()
+    uploads_dir = _get_uploads_dir()
+    os.makedirs(uploads_dir, exist_ok=True)
 
     # Generate safe filename: uuid8 prefix + sanitized original name
     ext = os.path.splitext(filename)[1] or ""
@@ -312,47 +334,108 @@ async def _download_and_save_file(url: str, filename: str, max_size_mb: int = 50
     if not safe_name:
         safe_name = "file"
     unique_name = f"{uuid.uuid4().hex[:8]}-{safe_name}{ext}"
-    save_path = os.path.join(WORKSPACE_UPLOADS, unique_name)
+    save_path = os.path.join(uploads_dir, unique_name)
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=120.0, follow_redirects=True)
-            response.raise_for_status()
+    max_size_bytes = max_size_mb * 1024 * 1024
 
-            content_length = len(response.content)
-            if content_length > max_size_bytes:
-                return None, (
-                    f"文件过大 ({content_length / 1024 / 1024:.1f} MB)，"
-                    f"超过限制 ({max_size_mb} MB)。请压缩后重试。"
-                )
+    # ── Strategy 1: direct URL download ──────────────────────────
+    if url:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=120.0, follow_redirects=True)
+                response.raise_for_status()
 
-            # Determine actual extension from Content-Type if possible
-            content_type = response.headers.get("content-type", "")
-            ct_map = {
-                "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
-                "image/webp": ".webp", "image/bmp": ".bmp",
-                "application/pdf": ".pdf",
-            }
-            for ct_prefix, ct_ext in ct_map.items():
-                if ct_prefix in content_type and not save_path.endswith(ct_ext):
-                    save_path = save_path + ct_ext
-                    break
+                content_length = len(response.content)
+                if content_length > max_size_bytes:
+                    return None, (
+                        f"文件过大 ({content_length / 1024 / 1024:.1f} MB)，"
+                        f"超过限制 ({max_size_mb} MB)。请压缩后重试。"
+                    )
 
-            with open(save_path, "wb") as f:
-                f.write(response.content)
+                # Determine actual extension from Content-Type if possible
+                content_type = response.headers.get("content-type", "")
+                ct_map = {
+                    "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+                    "image/webp": ".webp", "image/bmp": ".bmp",
+                    "application/pdf": ".pdf",
+                }
+                for ct_prefix, ct_ext in ct_map.items():
+                    if ct_prefix in content_type and not save_path.endswith(ct_ext):
+                        save_path = save_path + ct_ext
+                        break
 
-            return save_path, None
+                with open(save_path, "wb") as f:
+                    f.write(response.content)
 
-    except httpx.HTTPStatusError as e:
-        return None, f"下载失败 (HTTP {e.response.status_code}): {e.response.reason_phrase}"
-    except httpx.TimeoutException:
-        return None, "下载超时 (120秒)。文件可能过大或网络不稳定。"
-    except httpx.RequestError as e:
-        return None, f"网络请求失败: {e}"
-    except IOError as e:
-        return None, f"文件保存失败: {e}"
-    except Exception as e:
-        return None, f"下载文件时出现意外错误: {e}"
+                return save_path, None
+
+        except httpx.HTTPStatusError as e:
+            return None, f"下载失败 (HTTP {e.response.status_code}): {e.response.reason_phrase}"
+        except httpx.TimeoutException:
+            return None, "下载超时 (120秒)。文件可能过大或网络不稳定。"
+        except httpx.RequestError as e:
+            return None, f"网络请求失败: {e}"
+        except IOError as e:
+            return None, f"文件保存失败: {e}"
+        except Exception as e:
+            return None, f"下载文件时出现意外错误: {e}"
+
+    # ── Strategy 2: OneBot get_file API fallback (private chats) ──
+    if bot is not None and file_id:
+        diag = []
+        for action in ("get_file", "getFile", "download_file"):
+            for param_name in ("file", "file_id"):
+                try:
+                    result = await bot.call_api(action, **{param_name: file_id})
+                except Exception as e:
+                    diag.append(f"[API {action} {param_name}=] 异常: {e}")
+                    continue
+
+                if isinstance(result, dict):
+                    file_data = result.get("file", "") or result.get("path", "") or result.get("url", "") or ""
+                elif isinstance(result, str):
+                    file_data = result
+                else:
+                    diag.append(f"[API {action} {param_name}=] 返回类型异常: {type(result).__name__}")
+                    continue
+
+                if not file_data:
+                    diag.append(f"[API {action} {param_name}=] 无 file/path/url 字段: {json.dumps(result, ensure_ascii=False)[:200]}")
+                    continue
+
+                try:
+                    import base64
+                    if file_data.startswith("base64://"):
+                        data = base64.b64decode(file_data[len("base64://"):])
+                    elif file_data.startswith(("http://", "https://")):
+                        async with httpx.AsyncClient() as client:
+                            resp = await client.get(file_data, timeout=120.0, follow_redirects=True)
+                            resp.raise_for_status()
+                            data = resp.content
+                    elif os.path.isfile(file_data):
+                        with open(file_data, "rb") as src:
+                            data = src.read()
+                    else:
+                        diag.append(f"[API {action} {param_name}=] 无法识别返回格式: {file_data[:120]}")
+                        continue
+
+                    if len(data) > max_size_bytes:
+                        return None, f"文件过大 ({len(data) / 1024 / 1024:.1f} MB)，超过限制 ({max_size_mb} MB)。"
+
+                    with open(save_path, "wb") as f:
+                        f.write(data)
+                    return save_path, None
+
+                except Exception as e:
+                    diag.append(f"[API {action} {param_name}=] 处理返回值出错: {e}")
+                    continue
+
+        return None, f"文件下载失败 (API fallback 已尝试 {len(diag)} 次)。诊断: {'; '.join(diag)}"
+
+    if not url and not file_id:
+        return None, "文件缺少下载地址和文件 ID，可能未成功上传或 QQ 客户端限制了文件传输。"
+    if not url:
+        return None, "文件下载地址为空（私聊文件可能需通过 OneBot API 下载，但缺少 bot 连接）。"
 
 
 # ── Build Tool Registry ──────────────────────────────────────────
@@ -871,22 +954,21 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         if seg.type == "image":
             url = seg.data.get("url", "")
             file_id = seg.data.get("file", "")
-            if url:
-                saved_path, error = await _download_and_save_file(url, f"image-{file_id}")
-                if saved_path:
-                    file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
-                elif error:
-                    file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
+            saved_path, error = await _download_and_save_file(url, f"image-{file_id}", bot=bot, file_id=file_id)
+            if saved_path:
+                file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
+            elif error:
+                file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
             name = seg.data.get("name", "file")
-            if url:
-                saved_path, error = await _download_and_save_file(url, name)
-                if saved_path:
-                    file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
-                elif error:
-                    file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
+            file_id = seg.data.get("file", "")
+            saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
+            if saved_path:
+                file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
+            elif error:
+                file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
 
         elif seg.type == "record":
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
@@ -1057,22 +1139,21 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         if seg.type == "image":
             url = seg.data.get("url", "")
             file_id = seg.data.get("file", "")
-            if url:
-                saved_path, error = await _download_and_save_file(url, f"image-{file_id}")
-                if saved_path:
-                    file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
-                elif error:
-                    file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
+            saved_path, error = await _download_and_save_file(url, f"image-{file_id}", bot=bot, file_id=file_id)
+            if saved_path:
+                file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
+            elif error:
+                file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
             name = seg.data.get("name", "file")
-            if url:
-                saved_path, error = await _download_and_save_file(url, name)
-                if saved_path:
-                    file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
-                elif error:
-                    file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
+            file_id = seg.data.get("file", "")
+            saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
+            if saved_path:
+                file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
+            elif error:
+                file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
 
         elif seg.type == "record":
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))

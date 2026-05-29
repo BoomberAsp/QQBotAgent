@@ -106,9 +106,14 @@ MAX_RUNTIME = 60  # seconds
 # ── Helpers ─────────────────────────────────────────────────────────
 
 def _ensure_workspace_dirs() -> None:
-    """Create workspace directories if they don't exist."""
-    for d in [WORKSPACE_CODE, WORKSPACE_REPOS, WORKSPACE_UPLOADS, WORKSPACE_OUTPUT]:
-        os.makedirs(d, exist_ok=True)
+    """Create workspace directories if they don't exist.
+
+    Uses _get_workspace_root() at runtime so that user workspace
+    contextvar overrides are respected (not frozen at import time).
+    """
+    root = _get_workspace_root()
+    for sub in ["code", "repos", "uploads", "output"]:
+        os.makedirs(os.path.join(root, sub), exist_ok=True)
 
 
 def _validate_path(file_path: str, must_exist: bool = True) -> tuple[str | None, str | None]:
