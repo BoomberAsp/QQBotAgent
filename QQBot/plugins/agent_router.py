@@ -816,7 +816,7 @@ def _build_reply_context(event: MessageEvent) -> str:
     for seg in event.message:
         if seg.type != "reply":
             continue
-        reply_id = seg.data.get("id", "")
+        reply_id = str(seg.data.get("id", ""))
         reply_text = seg.data.get("text", "") or seg.data.get("message", "") or ""
 
         parts = []
