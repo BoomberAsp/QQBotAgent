@@ -846,19 +846,39 @@ def _build_reply_context(event: MessageEvent) -> str:
 
         return "\n".join(parts) if parts else ""
 
-    # ── Fallback: parse [reply:id=XXX] from multiple sources ─────
+    # ── Fallback: extract reply id from multiple sources ─────────
     import re as _re
-    # Try raw_message (OneBot V11 wire-level field)
+
+    # 1) Try event.reply attribute (OneBot V11 field)
+    event_reply = getattr(event, 'reply', None)
+    if event_reply is not None:
+        # event.reply can be a dict {'message_id': ..., ...} or a Reply object
+        if isinstance(event_reply, dict):
+            reply_id = str(event_reply.get('message_id', '') or event_reply.get('id', ''))
+        else:
+            reply_id = str(getattr(event_reply, 'message_id', '') or getattr(event_reply, 'id', ''))
+        if reply_id:
+            print(f"[REPLY_DIAG] event.reply: reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
+            if reply_id in _recent_files:
+                files = _recent_files[reply_id]
+                parts = []
+                for f in files:
+                    parts.append(
+                        f"[用户引用了文件 \"{f['name']}\"。"
+                        f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                        f"忽略对话历史中关于其他文件的提及。"
+                        f"文件路径: {f['path']}]"
+                    )
+                return "\n".join(parts) if parts else ""
+            else:
+                return f"[用户回复了消息 {reply_id}]"
+
+    # 2) Parse [CQ:reply,id=XXX] or [reply:id=XXX] from raw message
     raw_msg = getattr(event, 'raw_message', '') or str(event.message)
-    text = event.get_plaintext()
-    print(f"[REPLY_DIAG] fallback: raw={raw_msg!r}  plaintext={text!r}  event_attrs={[a for a in dir(event) if 'reply' in a.lower()]}", file=sys.stderr, flush=True)
-    # Search raw message for reply id
-    m = _re.search(r'\[reply:id=(\d+)\]', raw_msg)
-    if not m:
-        m = _re.match(r'^\[reply:id=(\d+)\]', text)
+    m = _re.search(r'\[(?:CQ:)?reply[,:]id=(\d+)\]', raw_msg)
     if m:
         reply_id = m.group(1)
-        print(f"[REPLY_DIAG] text fallback: reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
+        print(f"[REPLY_DIAG] regex fallback: reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
         if reply_id in _recent_files:
             files = _recent_files[reply_id]
             parts = []
