@@ -1103,8 +1103,8 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
-            name = seg.data.get("name") or seg.data.get("filename") or seg.data.get("file_name") or seg.data.get("title") or "file"
-            file_id = seg.data.get("file", "")
+            name = seg.data.get("name") or seg.data.get("filename") or seg.data.get("file_name") or seg.data.get("title") or seg.data.get("file") or "file"
+            file_id = seg.data.get("file_id", "")
             saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
             if saved_path:
                 file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
@@ -1311,8 +1311,8 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
-            name = seg.data.get("name") or seg.data.get("filename") or seg.data.get("file_name") or seg.data.get("title") or "file"
-            file_id = seg.data.get("file", "")
+            name = seg.data.get("name") or seg.data.get("filename") or seg.data.get("file_name") or seg.data.get("title") or seg.data.get("file") or "file"
+            file_id = seg.data.get("file_id", "")
             saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
             if saved_path:
                 file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
