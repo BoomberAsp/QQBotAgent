@@ -824,10 +824,11 @@ def _build_reply_context(event: MessageEvent) -> str:
         reply_id = str(seg.data.get("id", ""))
         reply_text = seg.data.get("text", "") or seg.data.get("message", "") or ""
 
+        parts = []
+
         # ── Diagnostic: log reply lookup ──────────────────────────
         print(f"[REPLY_DIAG] reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
 
-        parts = []
         if reply_text:
             parts.append(f"[用户引用了消息: \"{reply_text}\"]")
         elif reply_id:
@@ -943,7 +944,7 @@ def _get_user_info() -> str:
     lines.append(f"  目录快照:")
     ws = Path(ws_path)
     if ws.is_dir():
-        for subdir_name in ["code", "output", "projects", "uploads"]:
+        for subdir_name in ["code", "output", "projects", "repos", "uploads"]:
             subdir = ws / subdir_name
             if not subdir.is_dir():
                 continue

@@ -851,13 +851,14 @@ def summarize_pdf(file_path: str) -> str:
 # ── Repository Download ──────────────────────────────────────────
 
 def download_repo(repo_url: str, target_dir: str = None) -> str:
-    """Clone a git repository to /data/workspace/repos/.
+    """Clone a git repository to the current user's workspace repos/ directory.
 
-    Only HTTPS URLs are accepted. Target directory is always forced to workspace.
+    Only HTTPS URLs are accepted. Target directory is always forced to the
+    current user's workspace (resolved via _get_workspace_root() at runtime).
 
     Args:
         repo_url: Git repository URL (HTTPS only).
-        target_dir: Ignored — always uses /data/workspace/repos/.
+        target_dir: Ignored — always uses {user_workspace}/repos/.
     """
     # Validate URL
     safe_url, error = _validate_repo_url(repo_url)
