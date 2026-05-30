@@ -655,12 +655,14 @@ def _build_tool_registry() -> ToolRegistry:
     registry.register(
         "play_gacha_animation", play_gacha_animation,
         "播放抽卡动画。传入最高星级（3=蓝色, 4=紫色, 5=金色, 6=红色）和是否为单抽。"
-        "动画会直接发送到QQ聊天窗口。应该在给出文字抽卡结果之前调用此工具。",
+        "动画会直接发送到QQ聊天窗口。应该在给出文字抽卡结果之前调用此工具。"
+        "可以通过 interval 参数控制帧间隔（默认 0.75 秒）。",
         {
             "type": "object",
             "properties": {
                 "star_level": {"type": "integer", "description": "最高星级。3=蓝色, 4=紫色, 5=金色, 6=红色", "enum": [3, 4, 5, 6]},
                 "is_single": {"type": "boolean", "description": "是否为单抽。true=单抽, false=十连", "default": False},
+                "interval": {"type": "number", "description": "帧间隔秒数（默认 0.75）", "default": 0.75},
             },
             "required": ["star_level", "is_single"],
         },
@@ -1159,7 +1161,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         return
 
     # Handle special commands that bypass the agent
-    if augmented_message in ["/clear", "清除上下文", "新对话", "/status"]:
+    if augmented_message in ["/clear", "清除上下文", "新对话", "/status", "/帮助", "#帮助", "/help", "#help"]:
         await _handle_special_command(augmented_message, user_id)
         return
 
@@ -1549,7 +1551,7 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         return True
 
     # ── /结束会话 ──────────────────────────────────────────────
-    if cmd in ("/结束会话", "#结束会话", "/临时会话", "#临时会话"):
+    if cmd in ("/结束会话", "#结束会话", "/临时会话", "#临时会话", "/退出特殊会话", "/退出会话"):
         active = _special_sessions.get_active(user_id)
         if active:
             _special_sessions.end_active(user_id)
@@ -1603,6 +1605,31 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             f"现在处于特殊会话模式，后续对话将持续保存。\n"
             f"当前特殊会话: {len(sessions)}/{_max_special_sessions}"
         )
+        return True
+
+    # ── /帮助 — 命令列表 ───────────────────────────────────────
+    if cmd in ("/帮助", "#帮助", "/help", "#help", "/命令", "#命令"):
+        help_text = (
+            "**系统命令列表**\n\n"
+            "🟢 **特殊会话管理**\n"
+            "/新会话 [名称] — 创建特殊会话\n"
+            "/切换会话 <名称> — 切换到已有会话\n"
+            "/会话列表 或 /会话 — 查看所有会话\n"
+            "/重命名会话 <旧名> <新名> — 重命名会话\n"
+            "/删除会话 <名称> — 删除会话（需确认）\n"
+            "/结束会话 或 /临时会话 或 /退出特殊会话 — 退出特殊会话\n"
+            "/保存为会话 <名称> — 将临时上下文保存为会话\n\n"
+            "🔵 **连续对话（群聊）**\n"
+            "/取消 或 #取消 — 退出连续对话模式\n\n"
+            "🟡 **反馈**\n"
+            "#反馈 <内容> — 提交功能建议\n"
+            "#bug <内容> — 提交 Bug 报告\n"
+            "#建议 <内容> — 提交改进建议\n\n"
+            "⚪ **其他**\n"
+            "/status — 查看机器人运行状态\n"
+            "/clear 或 新对话 — 清除临时上下文"
+        )
+        await _safe_send(help_text)
         return True
 
     # Not a session command

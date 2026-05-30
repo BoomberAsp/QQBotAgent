@@ -27,13 +27,15 @@ On bootstrap, the following tools are registered by default:
 | Tool Name | Description |
 |-----------|-------------|
 | `search_web` | SearXNG meta-search engine |
+| `web_fetch` | HTTPS URL fetcher with HTML-to-text extraction |
 | `get_time` | Current date/time |
-| `execute_code` | Sandboxed Python execution |
-| `shell_exec` | Read-only shell commands (40+ whitelist) |
+| `execute_code` | Sandboxed Python execution (tiered by role) |
+| `shell_exec` | Read-only shell commands (40+ whitelist, admin only) |
 | `download_repo` | Git clone HTTPS repos |
 | `summarize_pdf` | PDF text extraction |
 | `read_file` | Text/PDF/image/audio file analysis |
 | `get_system_load` | CPU/memory/disk load check |
+| `get_user_info` | User profile, permissions, workspace snapshot |
 
 **Map tools** (`tools.map_tools`) — Required:
 | Tool Name | Description |
