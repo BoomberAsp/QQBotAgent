@@ -3,6 +3,8 @@ Map & Location Tools — Powered by Amap (高德地图) Web Services API.
 
 All tools are async and use the shared amap_client for HTTP calls.
 """
+import re
+
 from lib.amap_client import _amap_get
 
 
@@ -257,6 +259,33 @@ async def plan_route(
         "destination": dest.replace(" ", ""),
         "extensions": "base",
     }
+
+    # ── Transit mode requires "city" (起点城市) ──────────────────
+    if mode == "transit":
+        # Try to derive city from coordinates via reverse geocode
+        city = ""
+        if re.match(r'^\d+\.\d+,\d+\.\d+$', orig):
+            rev_data, _ = await _amap_get("/geocode/regeo", {
+                "location": orig.replace(" ", ""),
+                "extensions": "base",
+            })
+            if rev_data:
+                addr_comp = rev_data.get("regeocode", {}).get("addressComponent", {})
+                city = addr_comp.get("city") or addr_comp.get("province", "")
+                if not city:
+                    city = "深圳市"  # last-resort fallback
+        else:
+            # Address string — geocode first
+            geo_data, _ = await _amap_get("/geocode/geo", {
+                "address": orig,
+                "city": orig,
+            })
+            if geo_data:
+                geos = geo_data.get("geocodes", [])
+                if geos:
+                    city = geos[0].get("city") or geos[0].get("province", "") or orig
+        if city:
+            params["city"] = city
 
     data, err = await _amap_get(endpoint, params)
     if err:

@@ -8,6 +8,16 @@ This replaces the old distributed on_command architecture with a single
 intelligent entry point.
 """
 
+# ── Load .env into os.environ BEFORE any module-level reads ──────
+# NoneBot2 (nb run) loads .env into its own pydantic config only, NOT
+# into os.environ. Downstream module-level reads of os.environ (e.g.
+# USER_DATA_ROOT, quota, session limits) would silently get defaults.
+# This load_dotenv call must be the very first thing in this module.
+from pathlib import Path
+from dotenv import load_dotenv as _load_dotenv
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+_load_dotenv(_ENV_FILE)
+
 import asyncio
 import json
 import os
@@ -20,7 +30,12 @@ from nonebot import on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageEvent, Message, ActionFailed
 from agent.agent import Agent
 from agent.continuous_session import ContinuousSessionManager
-from agent.context import _send_msg, _current_user_workspace
+from agent.context import (
+    _send_msg, _current_user_workspace,
+    _current_user_role, _current_code_limits,
+    _current_user_id,
+)
+from agent.permissions import PermissionManager
 from agent.hardware import HardwareDetector
 from agent.special_session import SpecialSessionManager
 from agent.tool_registry import ToolRegistry
@@ -42,7 +57,6 @@ from tools.builtin_tools import (
     download_repo,
     shell_exec,
     summarize_pdf,
-    WORKSPACE_UPLOADS,
     _ensure_workspace_dirs,
 )
 from tools.file_tools import read_file
@@ -79,7 +93,21 @@ def _init_workspace():
 _init_workspace()
 
 
-# ── File Download Helper ──────────────────────────────────────────
+# ── File Download Helpers ──────────────────────────────────────────
+
+def _get_uploads_dir() -> str:
+    """Get the uploads directory at runtime, respecting user workspace contextvar.
+
+    Unlike the module-level WORKSPACE_UPLOADS constant (frozen at import time),
+    this checks _current_user_workspace on every call so files are saved to the
+    correct per-user workspace during special sessions.
+    """
+    user_ws = _current_user_workspace.get()
+    if user_ws:
+        return os.path.join(user_ws, "uploads")
+    # Fallback: shared workspace default
+    return os.path.join(_AGENT_DIR, "data", "workspace", "uploads")
+
 
 async def _download_voice(bot, seg_data: dict, message_id: str = "", max_size_mb: int = 50) -> tuple:
     """Download a QQ voice message.
@@ -99,8 +127,10 @@ async def _download_voice(bot, seg_data: dict, message_id: str = "", max_size_mb
 
     max_size_bytes = max_size_mb * 1024 * 1024
     _ensure_workspace_dirs()
+    uploads_dir = _get_uploads_dir()
+    os.makedirs(uploads_dir, exist_ok=True)
     save_path = os.path.join(
-        WORKSPACE_UPLOADS,
+        uploads_dir,
         f"{uuid.uuid4().hex[:8]}-{file_id}"
     )
 
@@ -272,24 +302,31 @@ async def _download_voice(bot, seg_data: dict, message_id: str = "", max_size_mb
     return None, f"语音下载失败。诊断: {'; '.join(diag)}"
 
 
-async def _download_and_save_file(url: str, filename: str, max_size_mb: int = 50) -> tuple:
+async def _download_and_save_file(
+    url: str, filename: str, max_size_mb: int = 50,
+    bot=None, file_id: str = "",
+) -> tuple:
     """Download a file from QQ and save to workspace uploads.
 
+    When the direct ``url`` is available it is used first (standard for
+    group-chat files).  When ``url`` is empty (common in private chats) the
+    function falls back to the OneBot ``get_file`` API if *bot* and *file_id*
+    are provided.
+
     Args:
-        url: Download URL from the message segment.
+        url: Download URL from the message segment (may be empty).
         filename: Original filename (used for extension detection).
         max_size_mb: Maximum file size in MB.
+        bot: Optional OneBot V11 Bot instance for API fallback.
+        file_id: File ID from the message segment for API fallback.
 
     Returns:
         (saved_path, error_message) — one is None, the other is not.
     """
-    if not url:
-        return None, "文件 URL 为空，无法下载。"
-
-    max_size_bytes = max_size_mb * 1024 * 1024
-
-    # Ensure the uploads directory exists
+    # ── Pick uploads dir at runtime (respects per-user workspace) ──
     _ensure_workspace_dirs()
+    uploads_dir = _get_uploads_dir()
+    os.makedirs(uploads_dir, exist_ok=True)
 
     # Generate safe filename: uuid8 prefix + sanitized original name
     ext = os.path.splitext(filename)[1] or ""
@@ -297,47 +334,137 @@ async def _download_and_save_file(url: str, filename: str, max_size_mb: int = 50
     if not safe_name:
         safe_name = "file"
     unique_name = f"{uuid.uuid4().hex[:8]}-{safe_name}{ext}"
-    save_path = os.path.join(WORKSPACE_UPLOADS, unique_name)
+    save_path = os.path.join(uploads_dir, unique_name)
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=120.0, follow_redirects=True)
-            response.raise_for_status()
+    max_size_bytes = max_size_mb * 1024 * 1024
 
-            content_length = len(response.content)
-            if content_length > max_size_bytes:
-                return None, (
-                    f"文件过大 ({content_length / 1024 / 1024:.1f} MB)，"
-                    f"超过限制 ({max_size_mb} MB)。请压缩后重试。"
-                )
+    # ── Helper: detect file type from magic bytes ─────────────────
+    def _magic_ext(data: bytes) -> str:
+        if data[:4] == b'%PDF':
+            return ".pdf"
+        if data[:4] == b'\x89PNG':
+            return ".png"
+        if data[:3] == b'\xff\xd8\xff':
+            return ".jpg"
+        if data[:6] in (b'GIF87a', b'GIF89a'):
+            return ".gif"
+        if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+            return ".webp"
+        if data[:2] == b'BM':
+            return ".bmp"
+        return ""
 
-            # Determine actual extension from Content-Type if possible
-            content_type = response.headers.get("content-type", "")
-            ct_map = {
-                "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
-                "image/webp": ".webp", "image/bmp": ".bmp",
-                "application/pdf": ".pdf",
-            }
-            for ct_prefix, ct_ext in ct_map.items():
-                if ct_prefix in content_type and not save_path.endswith(ct_ext):
-                    save_path = save_path + ct_ext
-                    break
+    # ── Strategy 1: direct URL download ──────────────────────────
+    if url:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=120.0, follow_redirects=True)
+                response.raise_for_status()
 
-            with open(save_path, "wb") as f:
-                f.write(response.content)
+                content_length = len(response.content)
+                if content_length > max_size_bytes:
+                    return None, (
+                        f"文件过大 ({content_length / 1024 / 1024:.1f} MB)，"
+                        f"超过限制 ({max_size_mb} MB)。请压缩后重试。"
+                    )
 
-            return save_path, None
+                # Determine actual extension: Content-Type first, then magic bytes
+                content_type = response.headers.get("content-type", "")
+                ct_map = {
+                    "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+                    "image/webp": ".webp", "image/bmp": ".bmp",
+                    "application/pdf": ".pdf",
+                }
+                for ct_prefix, ct_ext in ct_map.items():
+                    if ct_prefix in content_type and not save_path.endswith(ct_ext):
+                        save_path = save_path + ct_ext
+                        break
+                else:
+                    # Content-Type didn't match — try magic bytes
+                    magic_ext = _magic_ext(response.content)
+                    if magic_ext and not save_path.endswith(magic_ext):
+                        save_path = save_path + magic_ext
 
-    except httpx.HTTPStatusError as e:
-        return None, f"下载失败 (HTTP {e.response.status_code}): {e.response.reason_phrase}"
-    except httpx.TimeoutException:
-        return None, "下载超时 (120秒)。文件可能过大或网络不稳定。"
-    except httpx.RequestError as e:
-        return None, f"网络请求失败: {e}"
-    except IOError as e:
-        return None, f"文件保存失败: {e}"
-    except Exception as e:
-        return None, f"下载文件时出现意外错误: {e}"
+                with open(save_path, "wb") as f:
+                    f.write(response.content)
+
+                return save_path, None
+
+        except httpx.HTTPStatusError as e:
+            return None, f"下载失败 (HTTP {e.response.status_code}): {e.response.reason_phrase}"
+        except httpx.TimeoutException:
+            return None, "下载超时 (120秒)。文件可能过大或网络不稳定。"
+        except httpx.RequestError as e:
+            return None, f"网络请求失败: {e}"
+        except IOError as e:
+            return None, f"文件保存失败: {e}"
+        except Exception as e:
+            return None, f"下载文件时出现意外错误: {e}"
+
+    # ── Strategy 2: OneBot get_file API fallback (private chats) ──
+    if bot is not None and file_id:
+        diag = []
+        for action in ("get_file", "getFile", "download_file"):
+            for param_name in ("file", "file_id"):
+                try:
+                    result = await bot.call_api(action, **{param_name: file_id})
+                except Exception as e:
+                    diag.append(f"[API {action} {param_name}=] 异常: {e}")
+                    continue
+
+                if isinstance(result, dict):
+                    file_data = result.get("file", "") or result.get("path", "") or result.get("url", "") or ""
+                elif isinstance(result, str):
+                    file_data = result
+                else:
+                    diag.append(f"[API {action} {param_name}=] 返回类型异常: {type(result).__name__}")
+                    continue
+
+                if not file_data:
+                    diag.append(f"[API {action} {param_name}=] 无 file/path/url 字段: {json.dumps(result, ensure_ascii=False)[:200]}")
+                    continue
+
+                try:
+                    import base64
+                    if file_data.startswith("base64://"):
+                        data = base64.b64decode(file_data[len("base64://"):])
+                    elif file_data.startswith(("http://", "https://")):
+                        async with httpx.AsyncClient() as client:
+                            resp = await client.get(file_data, timeout=120.0, follow_redirects=True)
+                            resp.raise_for_status()
+                            data = resp.content
+                    elif os.path.isfile(file_data):
+                        with open(file_data, "rb") as src:
+                            data = src.read()
+                    else:
+                        diag.append(f"[API {action} {param_name}=] 无法识别返回格式: {file_data[:120]}")
+                        continue
+
+                    if len(data) > max_size_bytes:
+                        return None, f"文件过大 ({len(data) / 1024 / 1024:.1f} MB)，超过限制 ({max_size_mb} MB)。"
+
+                    with open(save_path, "wb") as f:
+                        f.write(data)
+
+                    # Fix extension from magic bytes if missing
+                    magic_ext = _magic_ext(data)
+                    if magic_ext and not save_path.endswith(magic_ext):
+                        new_path = save_path + magic_ext
+                        os.rename(save_path, new_path)
+                        save_path = new_path
+
+                    return save_path, None
+
+                except Exception as e:
+                    diag.append(f"[API {action} {param_name}=] 处理返回值出错: {e}")
+                    continue
+
+        return None, f"文件下载失败 (API fallback 已尝试 {len(diag)} 次)。诊断: {'; '.join(diag)}"
+
+    if not url and not file_id:
+        return None, "文件缺少下载地址和文件 ID，可能未成功上传或 QQ 客户端限制了文件传输。"
+    if not url:
+        return None, "文件下载地址为空（私聊文件可能需通过 OneBot API 下载，但缺少 bot 连接）。"
 
 
 # ── Build Tool Registry ──────────────────────────────────────────
@@ -648,13 +775,258 @@ agent = Agent(
     hardware_detector=_hardware_detector,
     workspace_manager=_workspace_manager,
     special_session_manager=_special_sessions,
-    max_tool_iterations=12,
+    max_tool_iterations=20,
     thinking_timeout=180.0,
 )
 
 _model_router = ModelRouter()
 
 _continuous_sessions = ContinuousSessionManager(timeout_minutes=5.0)
+
+_perm_manager = PermissionManager()
+
+# Per-user busy flag — prevents concurrent message processing for the
+# same user. When a user's message is being processed, subsequent
+# messages from that user are rejected with a brief "busy" reply.
+_user_busy: set = set()
+
+# Recent file tracking — maps message_id to downloaded file info so that
+# when a user replies to a file message we can resolve which file they mean.
+_MAX_RECENT_FILES = 200
+_recent_files: dict[str, list[dict]] = {}
+
+
+def _record_file(message_id: str, name: str, path: str):
+    """Record a downloaded file against its source message for reply resolution."""
+    if message_id not in _recent_files:
+        _recent_files[message_id] = []
+    _recent_files[message_id].append({"name": name, "path": path})
+    # Prune oldest entries if cache grows too large
+    while len(_recent_files) > _MAX_RECENT_FILES:
+        oldest = next(iter(_recent_files))
+        del _recent_files[oldest]
+
+
+def _build_reply_context(event: MessageEvent) -> str:
+    """Extract reply/quote context from a message's reply segment.
+
+    Returns a string for injection into the augmented message, or "" if
+    there is no reply segment.
+    """
+    # ── Diagnostic: log all message segments ───────────────────────
+    import sys
+    seg_types = [seg.type for seg in event.message]
+    print(f"[REPLY_DIAG] msg_id={event.message_id}  seg_types={seg_types}", file=sys.stderr, flush=True)
+
+    for seg in event.message:
+        if seg.type != "reply":
+            continue
+        reply_id = str(seg.data.get("id", ""))
+        reply_text = seg.data.get("text", "") or seg.data.get("message", "") or ""
+
+        parts = []
+
+        # ── Diagnostic: log reply lookup ──────────────────────────
+        print(f"[REPLY_DIAG] reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
+
+        if reply_text:
+            parts.append(f"[用户引用了消息: \"{reply_text}\"]")
+        elif reply_id:
+            parts.append(f"[用户回复了消息 {reply_id}]")
+
+        # Check if the replied-to message had files
+        if reply_id and reply_id in _recent_files:
+            files = _recent_files[reply_id]
+            for f in files:
+                parts.append(
+                    f"[用户引用了文件 \"{f['name']}\"。"
+                    f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                    f"忽略对话历史中关于其他文件的提及。"
+                    f"文件路径: {f['path']}]"
+                )
+
+        return "\n".join(parts) if parts else ""
+
+    # ── Fallback: extract reply id from multiple sources ─────────
+    import re as _re
+
+    # 1) Try event.reply attribute (OneBot V11 field)
+    event_reply = getattr(event, 'reply', None)
+    if event_reply is not None:
+        # event.reply can be a dict {'message_id': ..., ...} or a Reply object
+        if isinstance(event_reply, dict):
+            reply_id = str(event_reply.get('message_id', '') or event_reply.get('id', ''))
+        else:
+            reply_id = str(getattr(event_reply, 'message_id', '') or getattr(event_reply, 'id', ''))
+        if reply_id:
+            print(f"[REPLY_DIAG] event.reply: reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
+            if reply_id in _recent_files:
+                files = _recent_files[reply_id]
+                parts = []
+                for f in files:
+                    parts.append(
+                        f"[用户引用了文件 \"{f['name']}\"。"
+                        f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                        f"忽略对话历史中关于其他文件的提及。"
+                        f"文件路径: {f['path']}]"
+                    )
+                return "\n".join(parts) if parts else ""
+            else:
+                return f"[用户回复了消息 {reply_id}]"
+
+    # 2) Parse [CQ:reply,id=XXX] or [reply:id=XXX] from raw message
+    raw_msg = getattr(event, 'raw_message', '') or str(event.message)
+    m = _re.search(r'\[(?:CQ:)?reply[,:]id=(\d+)\]', raw_msg)
+    if m:
+        reply_id = m.group(1)
+        print(f"[REPLY_DIAG] regex fallback: reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
+        if reply_id in _recent_files:
+            files = _recent_files[reply_id]
+            parts = []
+            for f in files:
+                parts.append(
+                    f"[用户引用了文件 \"{f['name']}\"。"
+                    f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                    f"忽略对话历史中关于其他文件的提及。"
+                    f"文件路径: {f['path']}]"
+                )
+            return "\n".join(parts) if parts else ""
+        else:
+            return f"[用户回复了消息 {reply_id}]"
+
+    return ""
+
+
+# ── User Info Tool ─────────────────────────────────────────────────
+
+def _get_user_info() -> str:
+    """返回当前用户的系统信息快照（权限、会话、工作区），零推理 token 消耗。
+
+    适用场景：用户询问「我的设置」「我有什么权限」「我的工作区」「我的会话」等。
+
+    此工具直接读取系统状态，无需 LLM 推理即可返回结构化信息。
+    """
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "无法获取用户信息：当前请求未设置用户上下文。"
+
+    role = _perm_manager.get_role(user_id)
+    role_label = {"admin": "管理员", "vip": "会员", "regular": "普通用户"}[role.value]
+
+    lines = [f"用户信息快照", f"", f"用户 ID: {user_id}", f"权限级别: {role_label} ({role.value})"]
+
+    # ── 特殊会话 ──
+    sessions = _special_sessions.list_sessions(user_id)
+    active = _special_sessions.get_active(user_id)
+    max_sessions = _perm_manager.get_max_special_sessions(role)
+    lines.append(f"")
+    lines.append(f"特殊会话 ({len(sessions)}/{max_sessions}):")
+    if sessions:
+        for s in sessions:
+            marker = " ★ 当前" if active and s["name"] == active.name else ""
+            lines.append(f"  · {s['name']}{marker} — {s['total_messages']} 条消息")
+    else:
+        lines.append(f"  (无特殊会话)")
+
+    # ── 工作区 ──
+    ws_path = _workspace_manager.get_workspace(user_id)
+    ws_size = _workspace_manager.get_size(user_id)
+    ws_quota_mb = _perm_manager.get_workspace_quota_mb(role)
+    ws_usage_mb = ws_size / (1024 * 1024)
+    pct = (ws_size / (ws_quota_mb * 1024 * 1024)) * 100 if ws_quota_mb > 0 else 0
+    lines.append(f"")
+    lines.append(f"工作区:")
+    lines.append(f"  路径: {ws_path}")
+    lines.append(f"  用量: {ws_usage_mb:.1f} MB / {ws_quota_mb} MB ({pct:.1f}%)")
+
+    # ── 工作区目录快照 ──
+    lines.append(f"")
+    lines.append(f"  目录快照:")
+    ws = Path(ws_path)
+    if ws.is_dir():
+        for subdir_name in ["code", "output", "projects", "repos", "uploads"]:
+            subdir = ws / subdir_name
+            if not subdir.is_dir():
+                continue
+            try:
+                entries = sorted(subdir.iterdir(), key=lambda e: e.name.lower())
+            except PermissionError:
+                lines.append(f"    {subdir_name}/ (无权限访问)")
+                continue
+
+            if not entries:
+                lines.append(f"    {subdir_name}/ (空)")
+            else:
+                lines.append(f"    {subdir_name}/ ({len(entries)} 项)")
+                for entry in entries[:20]:  # cap at 20 entries per dir
+                    if entry.is_symlink():
+                        lines.append(f"      {entry.name} -> (符号链接)")
+                    elif entry.is_dir():
+                        item_count = sum(1 for _ in entry.rglob("*"))
+                        lines.append(f"      {entry.name}/ ({item_count} 项)")
+                    else:
+                        size = entry.stat().st_size
+                        if size < 1024:
+                            size_str = f"{size} B"
+                        elif size < 1024 * 1024:
+                            size_str = f"{size / 1024:.1f} KB"
+                        else:
+                            size_str = f"{size / (1024 * 1024):.1f} MB"
+                        lines.append(f"      {entry.name} ({size_str})")
+                if len(entries) > 20:
+                    lines.append(f"      ... 还有 {len(entries) - 20} 项未显示")
+    else:
+        lines.append(f"    (工作区目录不存在)")
+
+    # ── 权限范围 ──
+    allowed = _perm_manager.get_allowed_tools(role)
+    code_limits = _perm_manager.get_code_limits(role)
+
+    lines.append(f"")
+    lines.append(f"可用工具: {len(allowed)} 个")
+
+    # Categorize tools
+    info_tools = {"search_web", "get_time", "get_weather", "read_file", "summarize_pdf",
+                  "geocode", "reverse_geocode", "search_poi", "plan_route"}
+    dev_tools = {"execute_code", "shell_exec", "web_fetch", "download_repo", "get_system_load"}
+    fun_tools = {"gacha_pull", "play_gacha_animation", "calculate_speed",
+                 "compare_speed_probability", "explain_code", "translate_text"}
+    misc = allowed - info_tools - dev_tools - fun_tools
+
+    sections = [
+        ("信息查询", sorted(allowed & info_tools)),
+        ("开发工具", sorted(allowed & dev_tools)),
+        ("娱乐工具", sorted(allowed & fun_tools)),
+    ]
+    if misc:
+        sections.append(("其他", sorted(misc)))
+
+    for label, tools in sections:
+        if tools:
+            lines.append(f"  [{label}] {', '.join(tools)}")
+        else:
+            lines.append(f"  [{label}] (无)")
+
+    if code_limits:
+        lines.append(f"")
+        lines.append(f"代码执行限制:")
+        lines.append(f"  超时: {code_limits.max_timeout}s")
+        lines.append(f"  输出上限: {code_limits.max_output // 1024}KB")
+        lines.append(f"  内存: {code_limits.max_memory_mb}MB")
+
+    return "\n".join(lines)
+
+
+# Register user info tool (must happen after _get_user_info definition and after
+# singletons like _workspace_manager, _special_sessions are initialized)
+_tool_registry.register(
+    "get_user_info", _get_user_info,
+    "获取当前用户的系统信息，包括：权限级别、特殊会话列表、工作区用量、可用工具范围、"
+    "代码执行限制（如有）。当用户询问「我的设置」「我的权限」「我的工作区」「我的会话」"
+    "「我能用什么工具」或类似用户自身信息相关问题时，应调用此工具。此工具返回结构化"
+    "系统数据，可避免 LLM 在系统信息类问题上浪费推理 token。",
+    {"type": "object", "properties": {}, "required": []},
+)
 
 
 # ── Message Handlers ─────────────────────────────────────────────
@@ -680,11 +1052,30 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
         if not is_at_bot and not event.is_tome():
             return  # Not directed at bot, skip silently
 
+    # ── Per-user concurrency guard ──
+    if user_id in _user_busy:
+        await _safe_send("Roxy 正在处理你的上一条消息，请稍等~")
+        return
+    _user_busy.add(user_id)
+    try:
+        return await _handle_agent_message_impl(bot, event, user_id)
+    finally:
+        _user_busy.discard(user_id)
+
+
+async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str):
+    """Inner implementation — called under per-user busy guard."""
+
     # Set user workspace for tool scoping
     _workspace_manager.ensure_dirs(user_id)
     _current_user_workspace.set(_workspace_manager.get_workspace(user_id))
 
     text_content = event.get_plaintext().strip()
+
+    # ── Handle feedback / bug report (before agent, zero token cost) ─
+    if text_content.startswith(("#反馈", "#bug", "#建议")):
+        await _handle_feedback(text_content, user_id)
+        return
 
     # ── Handle session management commands ──────────────────────────
     if text_content.startswith("/") or text_content.startswith("#"):
@@ -692,46 +1083,74 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
         if cmd_handled:
             return
 
+    # ── Detect reply/quote context ─────────────────────────────────
+    reply_context = _build_reply_context(event)
+    if reply_context:
+        import sys; print(f"[REPLY_DIAG] reply_context built ({len(reply_context)} chars): {reply_context[:300]}", file=sys.stderr, flush=True)
+
     # ── Detect and download file/image attachments ─────────────────
     file_context_parts = []
+    msg_id = str(event.message_id)
     for seg in event.message:
         if seg.type == "image":
             url = seg.data.get("url", "")
             file_id = seg.data.get("file", "")
-            if url:
-                saved_path, error = await _download_and_save_file(url, f"image-{file_id}")
-                if saved_path:
-                    file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
-                elif error:
-                    file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
+            saved_path, error = await _download_and_save_file(url, f"image-{file_id}", bot=bot, file_id=file_id)
+            if saved_path:
+                file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
+                _record_file(msg_id, f"image-{file_id}", saved_path)
+            elif error:
+                file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
-            name = seg.data.get("name", "file")
-            if url:
-                saved_path, error = await _download_and_save_file(url, name)
-                if saved_path:
-                    file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
-                elif error:
-                    file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
+            name = seg.data.get("name") or seg.data.get("filename") or seg.data.get("file_name") or seg.data.get("title") or seg.data.get("file") or "file"
+            file_id = seg.data.get("file_id", "")
+            saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
+            if saved_path:
+                file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
+                _record_file(msg_id, name, saved_path)
+            elif error:
+                file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
 
         elif seg.type == "record":
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
             if saved_path:
                 file_context_parts.append(
-                    f"[用户发送了语音消息，已保存至: {saved_path}]\n"
-                    f"用户发送了语音消息，可以使用 read_file 工具分析音频内容。"
+                    f"[用户发送了语音消息，已保存至: {saved_path}]"
                 )
+                _record_file(msg_id, "语音消息", saved_path)
             elif error:
                 file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
 
-    # ── Build augmented message ────────────────────────────────────
-    if file_context_parts:
-        file_context = "\n".join(file_context_parts)
-        if text_content:
-            augmented_message = f"{file_context}\n用户说: {text_content}"
+    # ── File-only messages: acknowledge and skip agent ─────────────
+    has_files = bool(file_context_parts)
+    if has_files and not text_content and not reply_context:
+        names = []
+        for part in file_context_parts:
+            m = re.search(r"文件 (.+?)，", part) or re.search(r"上传了(\w+)，", part)
+            if m:
+                names.append(m.group(1))
+        if names:
+            ack = f"已收到 {'、'.join(names)}，需要分析的话引用这条消息告诉我~"
         else:
-            augmented_message = f"{file_context}\n用户发送了文件或语音消息，请使用 read_file 工具查看内容。"
+            ack = "已收到文件，需要分析的话引用这条消息告诉我~"
+        await _safe_send(ack)
+        return
+
+    # ── Build augmented message ────────────────────────────────────
+    context_parts = []
+    if reply_context:
+        context_parts.append(reply_context)
+    if file_context_parts:
+        context_parts.append("\n".join(file_context_parts))
+    context_prefix = "\n".join(context_parts)
+
+    if context_prefix:
+        if text_content:
+            augmented_message = f"{context_prefix}\n用户说: {text_content}"
+        else:
+            augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请使用 read_file 工具查看内容。"
     else:
         augmented_message = text_content
 
@@ -773,6 +1192,17 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
         active_special = _special_sessions.get_active(user_id)
         session_type = "special" if active_special else "temporary"
 
+        # Resolve user permissions
+        role = _perm_manager.get_role(user_id)
+        allowed_tools = _perm_manager.get_allowed_tools(role)
+        code_limits = _perm_manager.get_code_limits(role)
+
+        # Set permission contextvars for downstream tools
+        _current_user_id.set(user_id)
+        _current_user_role.set(role.value)
+        if code_limits:
+            _current_code_limits.set(code_limits.to_dict())
+
         try:
             response = await asyncio.wait_for(
                 agent.run(
@@ -780,6 +1210,8 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
                     client=client,
                     progress_callback=_progress,
                     session_type=session_type,
+                    allowed_tools=allowed_tools,
+                    user_role=role.value,
                 ),
                 timeout=300.0,
             )
@@ -836,6 +1268,20 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
     if not _continuous_sessions.is_active(group_id, user_id):
         return
 
+    # ── Per-user concurrency guard ──
+    if user_id in _user_busy:
+        await _safe_send("Roxy 正在处理你的上一条消息，请稍等~", matcher=continuous_router)
+        return
+    _user_busy.add(user_id)
+    try:
+        return await _handle_continuous_message_impl(bot, event, user_id, group_id)
+    finally:
+        _user_busy.discard(user_id)
+
+
+async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id: str, group_id: str):
+    """Inner implementation — called under per-user busy guard."""
+
     text_content = event.get_plaintext().strip()
 
     # Cancel detection: slash/hash commands
@@ -844,60 +1290,69 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
         await _safe_send("已结束连续对话模式，之后需要@我才能触发~", matcher=continuous_router)
         return
 
-    # Guard: nothing to process
-    if not text_content:
-        return
+    # ── Detect reply/quote context and file attachments ────────────
+    # These run BEFORE the text guard so files are always saved and
+    # recorded, even for file-only messages that may be replied to later.
+    reply_context = _build_reply_context(event)
+    if reply_context:
+        print(f"[REPLY_DIAG] continuous reply_context built ({len(reply_context)} chars): {reply_context[:300]}")
 
-    # Renew the window on each message
-    _continuous_sessions.touch(group_id, user_id)
-
-    # Detect and download file/image attachments
     file_context_parts = []
+    msg_id = str(event.message_id)
     for seg in event.message:
         if seg.type == "image":
             url = seg.data.get("url", "")
             file_id = seg.data.get("file", "")
-            if url:
-                saved_path, error = await _download_and_save_file(url, f"image-{file_id}")
-                if saved_path:
-                    file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
-                elif error:
-                    file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
+            saved_path, error = await _download_and_save_file(url, f"image-{file_id}", bot=bot, file_id=file_id)
+            if saved_path:
+                file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
+                _record_file(msg_id, f"image-{file_id}", saved_path)
+            elif error:
+                file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
-            name = seg.data.get("name", "file")
-            if url:
-                saved_path, error = await _download_and_save_file(url, name)
-                if saved_path:
-                    file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
-                elif error:
-                    file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
+            name = seg.data.get("name") or seg.data.get("filename") or seg.data.get("file_name") or seg.data.get("title") or seg.data.get("file") or "file"
+            file_id = seg.data.get("file_id", "")
+            saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
+            if saved_path:
+                file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
+                _record_file(msg_id, name, saved_path)
+            elif error:
+                file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
 
         elif seg.type == "record":
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
             if saved_path:
                 file_context_parts.append(
-                    f"[用户发送了语音消息，已保存至: {saved_path}]\n"
-                    f"用户发送了语音消息，可以使用 read_file 工具分析音频内容。"
+                    f"[用户发送了语音消息，已保存至: {saved_path}]"
                 )
+                _record_file(msg_id, "语音消息", saved_path)
             elif error:
                 file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
 
+    # Renew the window on each message
+    _continuous_sessions.touch(group_id, user_id)
+
+    # Guard: nothing to process (no text, no files, no reply)
+    if not text_content and not file_context_parts and not reply_context:
+        return
+
     # Build augmented message with continuous mode context
+    context_parts = []
+    if reply_context:
+        context_parts.append(reply_context)
     if file_context_parts:
-        file_context = "\n".join(file_context_parts)
-        augmented_message = (
-            f"[连续对话模式] 用户未@你，正在继续之前的任务。"
-            f"回复保持简洁。如果任务已完成，可以建议用户发送 /取消 来退出连续模式。\n"
-            f"{file_context}\n用户说: {text_content}"
-        )
+        context_parts.append("\n".join(file_context_parts))
+
+    continuous_prefix = (
+        "[连续对话模式] 用户未@你，正在继续之前的任务。"
+        "回复保持简洁。如果任务已完成，可以建议用户发送 /取消 来退出连续模式。"
+    )
+    if context_parts:
+        augmented_message = f"{continuous_prefix}\n{'\n'.join(context_parts)}\n用户说: {text_content}"
     else:
-        augmented_message = (
-            f"[连续对话模式] 用户未@你，正在继续之前的任务。"
-            f"回复保持简洁。如果任务已完成，可以建议用户发送 /取消 来退出连续模式。\n"
-            f"用户说: {text_content}"
-        )
+        augmented_message = f"{continuous_prefix}\n用户说: {text_content}"
 
     try:
         # Triage and route
@@ -911,9 +1366,20 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
             await _safe_send(seg, matcher=continuous_router)
         token = _send_msg.set(_send_image)
         try:
+            # Resolve user permissions
+            role = _perm_manager.get_role(user_id)
+            allowed_tools = _perm_manager.get_allowed_tools(role)
+            code_limits = _perm_manager.get_code_limits(role)
+            _current_user_id.set(user_id)
+            _current_user_role.set(role.value)
+            if code_limits:
+                _current_code_limits.set(code_limits.to_dict())
+
             response = await asyncio.wait_for(
                 agent.run(augmented_message, user_id, client=client,
-                           progress_callback=lambda msg: _safe_send(msg, matcher=continuous_router)),
+                           progress_callback=lambda msg: _safe_send(msg, matcher=continuous_router),
+                           allowed_tools=allowed_tools,
+                           user_role=role.value),
                 timeout=300.0,
             )
         finally:
@@ -922,7 +1388,7 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
         await _send_response(response, matcher=continuous_router)
 
     except asyncio.TimeoutError:
-        await _safe_send("抱歉，思考超时了。请尝试用更简单的方式提问~", matcher=continuous_router)
+        await _safe_send("抱歉，Roxy思考时间超过您的配额时长了。请尝试用更简单的方式提问~", matcher=continuous_router)
     except Exception as e:
         await _safe_send(f"处理消息时出现错误: {str(e)}", matcher=continuous_router)
 
@@ -968,6 +1434,8 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         try:
             name = args if args else None
             session = _special_sessions.create(user_id, name)
+            # Activate the session — create() only persists it, doesn't set active_session
+            _special_sessions.switch_to(user_id, session.name)
             if args:
                 await _safe_send(
                     f"已创建特殊会话「{session.name}」。\n"
@@ -1108,6 +1576,8 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         name = args if args else None
         try:
             session = _special_sessions.create(user_id, name)
+            # Activate the session so add_message() calls below actually work
+            _special_sessions.switch_to(user_id, session.name)
         except ValueError as e:
             await _safe_send(str(e))
             return True
@@ -1139,6 +1609,79 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
     return False
 
 
+async def _handle_feedback(text: str, user_id: str):
+    """Record user feedback / bug report to JSONL with context snapshot.
+
+    Commands: #反馈 <content>, #bug <content>, #建议 <content>
+    Zero LLM token cost — intercepted before agent processing.
+    """
+    # Parse command and content
+    cmd, _, content = text.partition(" ")
+    content = content.strip()
+
+    if cmd == "#反馈" and not content:
+        await _safe_send(
+            "请按格式提交反馈：\n"
+            "#反馈 <你的建议或问题>\n"
+            "例如：#反馈 execute_code 超时后临时文件没有清理"
+        )
+        return
+    if cmd == "#bug" and not content:
+        await _safe_send(
+            "请按格式提交 Bug 报告：\n"
+            "#bug <Bug 描述>\n"
+            "例如：#bug shell_exec 对大文件处理超时"
+        )
+        return
+    if cmd == "#建议" and not content:
+        await _safe_send(
+            "请按格式提交改进建议：\n"
+            "#建议 <你的建议>\n"
+            "例如：#建议 get_user_info 增加工作区目录快照"
+        )
+        return
+
+    fb_type = {"#反馈": "feedback", "#bug": "bug", "#建议": "suggestion"}[cmd]
+
+    # ── Build context snapshot ──
+    role = _perm_manager.get_role(user_id)
+    active_special = _special_sessions.get_active(user_id)
+    ws_path = _workspace_manager.get_workspace(user_id)
+    ws_size = _workspace_manager.get_size(user_id)
+    ws_quota_mb = _perm_manager.get_workspace_quota_mb(role)
+
+    ctx = {
+        "role": role.value,
+        "workspace_path": ws_path,
+        "workspace_usage_mb": round(ws_size / (1024 * 1024), 2),
+        "workspace_quota_mb": ws_quota_mb,
+        "active_special_session": active_special.name if active_special else None,
+    }
+
+    entry = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "user_id": user_id,
+        "type": fb_type,
+        "content": content,
+        "context": ctx,
+    }
+
+    # ── Write to JSONL ──
+    feedback_dir = os.path.join(_AGENT_DIR, "data", "feedback")
+    os.makedirs(feedback_dir, exist_ok=True)
+    feedback_file = os.path.join(feedback_dir, f"feedback_{time.strftime('%Y-%m')}.jsonl")
+
+    try:
+        with open(feedback_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        await _safe_send("反馈记录失败，请稍后重试或直接联系管理员。")
+        return
+
+    type_label = {"feedback": "反馈", "bug": "Bug 报告", "suggestion": "改进建议"}[fb_type]
+    await _safe_send(f"已记录你的{type_label}，感谢！")
+
+
 async def _handle_special_command(command: str, user_id: str):
     """Handle special meta-commands."""
     if command in ["/clear", "清除上下文", "新对话"]:
@@ -1163,6 +1706,10 @@ async def _send_response(response: str, matcher=None):
     """
     if not response:
         return
+
+    # Append disclaimer to every agent response
+    disclaimer = "\n\nRoxy 的回答并非总是准确无误，请理性判断。"
+    response += disclaimer
 
     # Shorter chunks + longer delays to avoid QQ rate limiting
     max_len = 300

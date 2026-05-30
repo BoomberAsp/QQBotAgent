@@ -7,7 +7,7 @@
 | **max_context_messages** | 20 | Maximum conversation history messages kept per user |
 | **max_context_turns** | 10 | Maximum conversation turns (user + assistant pairs) |
 | **session_timeout** | 1800 | Session inactivity timeout in seconds (30 minutes) |
-| **max_tool_calls_per_turn** | 5 | Maximum tool invocations per user message |
+| **max_tool_calls_per_turn** | 20 | Maximum tool invocations per user message |
 | **tool_timeout** | 60 | Default tool execution timeout in seconds |
 | **thinking_timeout** | 180 | Maximum time for LLM reasoning in seconds |
 | **reminder_interval** | 15 | Seconds between "still thinking" reminders |
@@ -57,7 +57,25 @@ When context exceeds `max_context_messages`:
 
 ## Session Persistence
 
-Sessions are stored at: `QQBot/data/sessions/{user_id}.json`
+系统有三套独立的存储系统，功能不同、路径不同、互不干扰：
+
+### 存储架构总览
+
+| 存储系统 | 路径 | 管理者 | 用途 |
+|---------|------|--------|------|
+| **临时会话** | `data/sessions/{uid}.json` | `SessionManager` (`agent/session.py`) | 默认会话，最近 20 条消息，30 分钟过期 |
+| **特殊会话** | `{USER_DATA_ROOT}/{uid}/sessions/{name}/` | `SpecialSessionManager` (`agent/special_session.py`) | 持久化长对话，完整上下文，快照+增量双层存储 |
+| **用户工作区** | `{USER_DATA_ROOT}/{uid}/workspace/` | `UserWorkspaceManager` (`agent/workspace.py`) | 用户独立文件空间，500MB 配额，QQ 号隔离 |
+
+**重要**: 临时会话 (`data/sessions/`) 和特殊会话 (`users_store/.../sessions/`) 是完全独立的存储系统，互不关联。不要将它们描述为同一系统的不同"层"。
+
+### 临时会话持久化
+
+临时会话存储为单个 JSON 文件：
+
+```
+QQBot/data/sessions/{user_id}.json
+```
 
 Each session file contains:
 ```json

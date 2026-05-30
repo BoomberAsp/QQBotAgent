@@ -2,11 +2,13 @@
 Memory System — Long-term persistent memory for the agent.
 
 Memory types:
-- user: Per-user facts, preferences, interaction summaries
-- knowledge: Agent-learned information
-- system: Agent self-reflection and configuration history
+- user: Per-user facts, preferences, interaction summaries (scoped to user_id)
+- knowledge: Agent-learned information (shared across users)
+- system: Agent self-reflection and configuration history (shared across users)
 
 Memory is stored as markdown files with frontmatter, with an index in MEMORY.md.
+User-type memories are isolated: stored in per-user subdirectories and only
+returned when the matching user_id is provided.
 """
 
 import json
@@ -24,13 +26,19 @@ class MemoryEntry:
     description: str
     type: str  # user, knowledge, system
     content: str
+    user_id: Optional[str] = None  # Owner user_id (required for user-type memories)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class MemorySystem:
-    """File-based long-term memory system."""
+    """File-based long-term memory system with per-user isolation.
+
+    User-type memories are stored in {base_dir}/user/{user_id}/ subdirectories
+    and are only returned when queried with the matching user_id. Knowledge
+    and system memories are stored globally and shared across users.
+    """
 
     def __init__(self, base_dir: str):
         self.base_dir = base_dir
@@ -48,21 +56,48 @@ class MemorySystem:
                     "## System Memories\n\n"
                 )
 
+    # ── Path resolution ───────────────────────────────────────────
+
+    def _get_storage_dir(self, mem_type: str, user_id: str = None) -> str:
+        """Get the storage directory for a memory type.
+
+        User memories go to {base_dir}/user/{user_id}/ for isolation.
+        Knowledge and system memories go to {base_dir}/{type}/ (flat, shared).
+        """
+        if mem_type == "user" and user_id:
+            dir_path = os.path.join(self.base_dir, "user", self._safe_id(user_id))
+        else:
+            dir_path = os.path.join(self.base_dir, mem_type)
+        os.makedirs(dir_path, exist_ok=True)
+        return dir_path
+
+    @staticmethod
+    def _safe_id(id_str: str) -> str:
+        """Sanitize an ID for use as a directory name."""
+        return "".join(c if c.isalnum() or c in "-_" else "_" for c in id_str)
+
     # ── CRUD ──────────────────────────────────────────────────────
 
     def save(self, entry: MemoryEntry) -> str:
-        """Save a memory entry. Returns the file path."""
-        type_dir = os.path.join(self.base_dir, entry.type)
-        os.makedirs(type_dir, exist_ok=True)
+        """Save a memory entry. Returns the file path.
+
+        User-type memories are stored in a per-user subdirectory.
+        """
+        user_id = entry.user_id if entry.type == "user" else None
+        type_dir = self._get_storage_dir(entry.type, user_id)
 
         filename = self._sanitize_filename(entry.name) + ".md"
         filepath = os.path.join(type_dir, filename)
+
+        # Include user_id in frontmatter for user-type memories
+        user_id_line = f"user_id: {entry.user_id}\n" if entry.user_id else ""
 
         content = (
             f"---\n"
             f"name: {entry.name}\n"
             f"description: {entry.description}\n"
             f"type: {entry.type}\n"
+            f"{user_id_line}"
             f"created_at: {entry.created_at}\n"
             f"updated_at: {entry.updated_at}\n"
             f"---\n\n"
@@ -75,63 +110,109 @@ class MemorySystem:
         self._update_index(entry, filepath)
         return filepath
 
-    def recall(self, name: str, mem_type: str = None) -> Optional[MemoryEntry]:
-        """Recall a memory by name, optionally filtered by type."""
-        search_dirs = [mem_type] if mem_type else ["user", "knowledge", "system"]
-        for t in search_dirs:
-            type_dir = os.path.join(self.base_dir, t)
-            if not os.path.exists(type_dir):
-                continue
+    def recall(self, name: str, mem_type: str = None, user_id: str = None) -> Optional[MemoryEntry]:
+        """Recall a memory by name, optionally filtered by type and user_id.
+
+        For user-type memories, user_id is required to find the memory.
+        """
+        search_dirs = self._get_search_dirs(mem_type, user_id)
+        for search_dir in search_dirs:
             filename = self._sanitize_filename(name) + ".md"
-            filepath = os.path.join(type_dir, filename)
+            filepath = os.path.join(search_dir, filename)
             if os.path.exists(filepath):
                 return self._load_file(filepath)
         return None
 
-    def forget(self, name: str, mem_type: str = None):
-        """Delete a memory by name."""
-        search_dirs = [mem_type] if mem_type else ["user", "knowledge", "system"]
-        for t in search_dirs:
-            type_dir = os.path.join(self.base_dir, t)
+    def forget(self, name: str, mem_type: str = None, user_id: str = None) -> bool:
+        """Delete a memory by name. For user memories, user_id scopes the deletion."""
+        search_dirs = self._get_search_dirs(mem_type, user_id)
+        for search_dir in search_dirs:
             filename = self._sanitize_filename(name) + ".md"
-            filepath = os.path.join(type_dir, filename)
+            filepath = os.path.join(search_dir, filename)
             if os.path.exists(filepath):
                 os.remove(filepath)
                 self._remove_from_index(name)
                 return True
         return False
 
-    def search(self, query: str, mem_type: str = None) -> List[MemoryEntry]:
-        """Search memories by content keyword. Simple, not semantic."""
+    def search(self, query: str, mem_type: str = None, user_id: str = None) -> List[MemoryEntry]:
+        """Search memories by content keyword. Simple, not semantic.
+
+        User-type memories are only returned when user_id matches.
+        Knowledge and system memories are always included (they're shared).
+        """
         results = []
-        search_dirs = [mem_type] if mem_type else ["user", "knowledge", "system"]
-        for t in search_dirs:
-            type_dir = os.path.join(self.base_dir, t)
-            if not os.path.exists(type_dir):
+        search_dirs = self._get_search_dirs(mem_type, user_id)
+        for search_dir in search_dirs:
+            if not os.path.exists(search_dir):
                 continue
-            for filename in os.listdir(type_dir):
+            for filename in os.listdir(search_dir):
                 if filename.endswith(".md") and filename != "MEMORY.md":
-                    filepath = os.path.join(type_dir, filename)
+                    filepath = os.path.join(search_dir, filename)
                     entry = self._load_file(filepath)
                     if entry and query.lower() in entry.content.lower():
                         results.append(entry)
         return results
 
-    def list_all(self, mem_type: str = None) -> List[MemoryEntry]:
-        """List all memories, optionally filtered by type."""
+    def list_all(self, mem_type: str = None, user_id: str = None) -> List[MemoryEntry]:
+        """List all memories, optionally filtered by type and user_id."""
         results = []
-        search_dirs = [mem_type] if mem_type else ["user", "knowledge", "system"]
-        for t in search_dirs:
-            type_dir = os.path.join(self.base_dir, t)
-            if not os.path.exists(type_dir):
+        search_dirs = self._get_search_dirs(mem_type, user_id)
+        for search_dir in search_dirs:
+            if not os.path.exists(search_dir):
                 continue
-            for filename in os.listdir(type_dir):
+            for filename in os.listdir(search_dir):
                 if filename.endswith(".md") and filename != "MEMORY.md":
-                    filepath = os.path.join(type_dir, filename)
+                    filepath = os.path.join(search_dir, filename)
                     entry = self._load_file(filepath)
                     if entry:
                         results.append(entry)
         return results
+
+    # ── Search directory resolution ───────────────────────────────
+
+    def _get_search_dirs(self, mem_type: str, user_id: str) -> List[str]:
+        """Get the list of directories to search based on type and user_id.
+
+        - Specific type provided: return directories for that type only.
+          For user type, scoped to the given user_id.
+        - No type: return all applicable directories:
+          - knowledge/ and system/ (shared, always included)
+          - user/{user_id}/ if user_id is given (scoped isolation)
+        """
+        if mem_type:
+            if mem_type == "user":
+                if user_id:
+                    return [self._get_storage_dir("user", user_id)]
+                else:
+                    # No user_id — search ALL user subdirectories (admin/debug use)
+                    user_base = os.path.join(self.base_dir, "user")
+                    if os.path.exists(user_base):
+                        return [
+                            os.path.join(user_base, d)
+                            for d in os.listdir(user_base)
+                            if os.path.isdir(os.path.join(user_base, d))
+                        ]
+                    return []
+            else:
+                return [self._get_storage_dir(mem_type)]
+        else:
+            # All types
+            dirs = [
+                self._get_storage_dir("knowledge"),
+                self._get_storage_dir("system"),
+            ]
+            if user_id:
+                dirs.append(self._get_storage_dir("user", user_id))
+            else:
+                # No user_id — include all user subdirectories
+                user_base = os.path.join(self.base_dir, "user")
+                if os.path.exists(user_base):
+                    for d in os.listdir(user_base):
+                        d_path = os.path.join(user_base, d)
+                        if os.path.isdir(d_path):
+                            dirs.append(d_path)
+            return dirs
 
     # ── Helpers ───────────────────────────────────────────────────
 
@@ -152,6 +233,7 @@ class MemorySystem:
                         name=meta.get("name", ""),
                         description=meta.get("description", ""),
                         type=meta.get("type", "knowledge"),
+                        user_id=meta.get("user_id"),
                         content=parts[2].strip(),
                         created_at=float(meta.get("created_at", time.time())),
                         updated_at=float(meta.get("updated_at", time.time())),
@@ -166,7 +248,8 @@ class MemorySystem:
             with open(self.index_path, "r", encoding="utf-8") as f:
                 index_content = f.read()
 
-            entry_line = f"- [{entry.name}]({os.path.relpath(filepath, self.base_dir)}) — {entry.description}\n"
+            rel_path = os.path.relpath(filepath, self.base_dir)
+            entry_line = f"- [{entry.name}]({rel_path}) — {entry.description}\n"
 
             section_marker = {
                 "user": "## User Memories",
