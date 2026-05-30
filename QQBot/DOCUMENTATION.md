@@ -45,13 +45,14 @@ QQBotAgent/
     │   ├── hardware.py      #   硬件自动检测 & 动态任务拒绝
     │   ├── workspace.py     #   用户工作区隔离 & 配额管理
     │   ├── context.py       #   执行上下文传递 (contextvars, 工具→QQ图片)
+    │   ├── permissions.py   #   三层权限系统 (PermissionManager, UserRole)
     │   ├── memory.py        #   长期记忆系统 (Markdown 文件存储)
     │   ├── profile.py       #   用户画像 (LLM 驱动背景事实提取)
     │   └── config/          #   智能体配置文件 (12 个)
     │       ├── SOUL.md      #     人格定义 & 行为规则
     │       ├── IDENTITY.md  #     身份声明 (名称/版本/能力/安全模型)
     │       ├── AGENTS.md    #     编排规则 (工具选择/错误处理/工作区约束)
-    │       ├── TOOLS.md     #     工具文档参考 (全部 20 个工具)
+    │       ├── TOOLS.md     #     工具文档参考 (全部 21 个工具)
     │       ├── WORKSPACE.md #     工作区约束 & 能力边界 (硬性规则)
     │       ├── BOOTSTRAP.md #     启动序列 & 健康检查
     │       ├── SESSION.md   #     会话参数配置
@@ -144,7 +145,7 @@ User Message (@Bot)
 ```
 
 **关键参数**:
-- `max_tool_iterations=12` — 最多 12 轮工具调用，防止死循环
+- `max_tool_iterations=20` — 最多 20 轮工具调用，防止死循环
 - `thinking_timeout=180.0s` — LLM 思考超时
 - `max_context_messages=20` — 每会话保留最近 20 条上下文
 - `session_timeout=1800.0s` — 会话 30 分钟无活动自动过期
@@ -343,7 +344,102 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 - 无新信息时返回空 `{}`
 - JSON 解析支持裸 JSON、Markdown 代码块、正则兜底
 
-### 2.6 `lib/deepseek_client.py` — DeepSeek API 客户端
+### 2.6 `agent/permissions.py` — 三层权限系统 (v2.16)
+
+权限系统实现管理员 (admin)、会员 (vip)、普通用户 (regular) 三层权限体系。通过 **请求时 schema 过滤** 作为主要防线，LLM 只能看到当前角色允许调用的工具；`_execute_tool_calls()` 中的硬拦截作为纵深防御。
+
+#### 类: `UserRole`
+
+```python
+class UserRole(Enum):
+    ADMIN = "admin"      # 管理员 — 全部工具可用
+    VIP = "vip"          # 会员 — 大部分工具 + 受限 execute_code
+    REGULAR = "regular"  # 普通用户 — 基础工具
+```
+
+#### 类: `CodeLimits`
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `max_timeout` | `int` | 最大执行超时 (秒) |
+| `max_output` | `int` | 最大输出大小 (字节) |
+| `max_memory_mb` | `int` | 最大内存限制 (MB) |
+
+#### 类: `PermissionManager`
+
+| 构造参数 | 类型 | 说明 |
+|----------|------|------|
+| (无) | — | 从环境变量 `SUPERUSERS` 和 `VIP_USERS` 读取配置 |
+
+| 方法 | 说明 |
+|------|------|
+| `get_role(user_id)` | 根据 QQ 号解析用户角色 |
+| `get_allowed_tools(role)` | 返回该角色可用的工具名称集合 |
+| `can_use(user_id, tool_name)` | 检查指定用户能否使用某工具 |
+| `get_code_limits(role)` | 返回该角色的 `CodeLimits` (execute_code 分级限制) |
+| `get_workspace_quota_mb(role)` | 返回工作区磁盘配额 (MB) |
+| `get_max_special_sessions(role)` | 返回最大特殊会话数量 |
+
+#### 工具权限矩阵
+
+| 工具 | 管理员 | 会员 | 普通用户 |
+|------|:---:|:---:|:---:|
+| `search_web`, `get_time`, `get_weather` | ✅ | ✅ | ✅ |
+| `read_file` (文本/PDF) | ✅ | ✅ | ✅ |
+| `summarize_pdf` | ✅ | ✅ | ✅ |
+| `geocode`, `reverse_geocode`, `search_poi`, `plan_route` | ✅ | ✅ | ✅ |
+| 游戏/娱乐工具 (抽卡/测速/翻译等) | ✅ | ✅ | ✅ |
+| `get_system_load` | ✅ | ✅ | ❌ |
+| `web_fetch` | ✅ | ✅ | ❌ |
+| `download_repo` | ✅ | ✅ | ❌ |
+| `read_file` (图片/音频 AI 分析) | ✅ | ✅ | ❌ |
+| `execute_code` | ✅ 完整 | ✅ 受限 | ❌ |
+| `shell_exec` | ✅ | ❌ | ❌ |
+
+#### execute_code 分级限制
+
+| 参数 | 管理员 | 会员 |
+|------|:---:|:---:|
+| 最大超时 | 60s | 15s |
+| 输出上限 | 100KB | 50KB |
+| 内存上限 | 256MB | 128MB |
+
+#### 资源配额
+
+| 资源 | 管理员 | 会员 | 普通用户 |
+|------|:---:|:---:|:---:|
+| 工作区磁盘配额 | 2 GB | 500 MB | 100 MB |
+| 最大特殊会话数 | 10 | 3 | 1 |
+
+#### 身份识别
+
+- **管理员**: `SUPERUSERS` 环境变量 (QQ 号逗号分隔列表)
+- **会员**: `VIP_USERS` 环境变量 (QQ 号逗号分隔列表)
+- **普通用户**: 不在以上两列表中的所有用户
+
+#### 权限传递机制
+
+权限信息通过 `contextvars` 在请求处理链路中传递：
+
+```
+agent_router.py
+  ├── PermissionManager.get_role(user_id) → UserRole
+  ├── _current_user_role.set(role.value)          ← contextvar
+  ├── _current_code_limits.set(limits_dict)        ← contextvar
+  └── agent.run(message, user_id, allowed_tools=..., user_role=...)
+        ├── get_schemas_for(allowed_tools)         ← LLM 只看到允许的工具
+        └── _execute_tool_calls()                  ← 硬拦截二次校验
+              └── execute_code() → _get_code_limits() ← 读取 contextvar 应用分级限制
+```
+
+#### 设计原则
+
+1. **Schema 过滤为主**: LLM 看不到越权工具就不会调用，从根源避免权限违规
+2. **硬拦截为纵深防御**: `_execute_tool_calls()` 中检查 `allowed_tools`，即使 schema 过滤出现 bug 也能兜底
+3. **环境变量认证**: 仅通过 `SUPERUSERS` / `VIP_USERS` 环境变量识别身份，无 QQ 命令提权路径，防止社会工程攻击
+4. **权限不足不暴露系统能力**: Agent 被告知权限受限时应说明"当前账户权限不支持"，而非"系统没有此功能"
+
+### 2.7 `lib/deepseek_client.py` — DeepSeek API 客户端
 
 #### 类: `DeepSeekClient`
 
@@ -361,7 +457,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 
 **全局实例**: `deepseek_client` — 模块级单例，try/except 创建，兼容测试环境。通过可选构造参数支持多模型实例化。
 
-### 2.7 `plugins/agent_router.py` — 统一消息入口
+### 2.8 `plugins/agent_router.py` — 统一消息入口
 
 **这是当前唯一活跃的 QQ 消息处理插件**。所有旧的 `on_command` / `on_message` 处理程序已禁用。
 
@@ -378,12 +474,16 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 | `/clear`, `清除上下文`, `新对话` | 清除当前用户会话上下文 (临时会话) |
 | `/status` | 显示 Agent 状态 (活跃会话数、已注册工具列表) |
 | `/新会话 [名称]` | 创建特殊会话。可选名称，留空由 LLM 自动命名 |
-| `/切换会话 <编号>` | 切换到指定特殊会话。编号从 `/我的会话` 获取 |
-| `/我的会话` | 列出所有特殊会话及状态 (名称/消息数/创建时间) |
-| `/重命名会话 <编号> <新名称>` | 重命名指定特殊会话 |
-| `/删除会话 <编号>` | 删除指定特殊会话 (输出 6 位确认码, 60s 有效期) |
-| `/激活会话` | 显示当前激活的特殊会话信息 |
-| `/退出会话` | 退出特殊会话模式，回到临时会话 |
+| `/切换会话 <名称>` | 切换到指定特殊会话 |
+| `/会话列表` | 列出所有特殊会话及状态 (名称/消息数/创建时间) |
+| `/重命名会话 <旧名> <新名>` | 重命名指定特殊会话 |
+| `/删除会话 <名称>` | 删除指定特殊会话 (输出 6 位确认码, 60s 有效期) |
+| `/保存为会话 [名称]` | 将当前临时对话保存为特殊会话 |
+| `/结束会话` | 退出特殊会话模式，回到临时会话 |
+| `/取消` | 退出群聊连续对话模式（免@窗口） |
+| `#反馈 <内容>` | 提交使用反馈，自动附带用户上下文（零 token 消耗） |
+| `#bug <描述>` | 提交 Bug 报告，自动附带用户上下文（零 token 消耗） |
+| `#建议 <内容>` | 提交改进建议，自动附带用户上下文（零 token 消耗） |
 
 #### 消息发送辅助函数
 
@@ -425,9 +525,9 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
             └── >300 字符 → _split_text() 句子边界拆分 → 逐块 _safe_send() (1s 间隔)
 ```
 
-#### 已注册工具 (20 个)
+#### 已注册工具 (21 个)
 
-**内置工具 (9 个)**:
+**内置工具 (10 个)**:
 
 | 工具名 | 来源 | 说明 |
 |--------|------|------|
@@ -439,6 +539,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 | `download_repo` | builtin_tools | Git clone 代码仓库 (HTTPS only, 命令注入防护) |
 | `summarize_pdf` | builtin_tools | 提取并总结 PDF 内容 (PyPDF2, 路径验证) |
 | `get_system_load` | builtin_tools | 获取服务器实时系统负载 (CPU/内存/磁盘, 用于任务预检) |
+| `get_user_info` | agent_router | 获取当前用户系统信息快照 (权限/会话/工作区/工具范围, 零 token 消耗) |
 | `read_file` | file_tools | 读取用户上传的文件 (文本/PDF/图片/音频, 图片和音频可 AI 分析) |
 
 **地图工具 (5 个)**:
@@ -464,7 +565,7 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 
 **注**: `check_weather` 已移除。天气查询通过 `get_weather` (Amap API) 或 `search_web` → SearXNG 搜索 + LLM 合成结果实现。`web_fetch` 用于直接抓取搜索结果中无法索引的网页。
 
-### 2.8 `lib/model_router.py` — 多模型路由器
+### 2.9 `lib/model_router.py` — 多模型路由器
 
 #### 类: `ModelRouter`
 
@@ -582,7 +683,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 | `IDENTITY.md` | 身份声明: 名称/版本/技术栈/能力列表/安全模型/联系方式 |
 | `AGENTS.md` | 编排规则: Think→Act→Observe→Respond 循环、工具选择标准、错误处理、工作区约束引用 |
 | `WORKSPACE.md` | 工作区约束: CAN/CANNOT 表、硬性拒绝规则、中文拒绝模板、资源限制、隐私策略 |
-| `TOOLS.md` | 工具文档参考: 全部 20 个工具的功能/参数/使用场景 |
+| `TOOLS.md` | 工具文档参考: 全部 21 个工具的功能/参数/使用场景 |
 | `BOOTSTRAP.md` | 启动序列: 初始化步骤、健康检查规则 |
 | `SESSION.md` | 会话配置: 最大消息数、超时时间、最大工具调用次数 |
 | `USER.md` | 用户画像模板: 新用户默认画像、隐私声明 |
@@ -601,7 +702,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 
 ## 五、工具实现
 
-### 5.1 `tools/builtin_tools.py` — 内置工具 (7 个)
+### 5.1 `tools/builtin_tools.py` — 内置工具 (8 个)
 
 | 函数 | 说明 | 实现方式 |
 |------|------|----------|
@@ -954,7 +1055,7 @@ python -m pytest test_agent.py -v
 6. **配置 `.env`**: 设置 `DRIVER=~fastapi`, `HOST=0.0.0.0`, `PORT=8081`, `ONEBOT_ACCESS_TOKEN`, `SUPERUSERS`, `SEARXNG_ENDPOINT`
 7. **启动 NoneBot**: `cd QQBot && nb run`
 8. **启动 Napcat**: `xvfb-run -a /path/to/qq --no-sandbox`
-9. **验证**: 发送 `@Roxy /status` 确认 20 个工具已注册、SearXNG 可连通
+9. **验证**: 发送 `@Roxy /status` 确认 21 个工具已注册、SearXNG 可连通
 10. **配置多模型 (可选)**: 编辑 `QQBot/config/models_settings.json` 填入各模型的 API 信息，参考 `models_settings_example.json` 格式
 
 ### Docker 部署
@@ -1128,7 +1229,7 @@ v2.3 基础上增加:
   ├── Agent.run() 模型切换: 可选 client 参数, 运行时路由
   ├── 统一配置文件: models_settings.json (含 task_routing 规则)
   └── Token 优化: 简单对话→FLASH_MODEL (轻量), 复杂任务→REASONING_MODEL (强力)
-
+```
 ### v2.5 — 群聊连续对话
 
 ```
@@ -1321,4 +1422,38 @@ v2.14 基础上增加:
       └── asyncio.wait_for timeout: 200s → 300s
 
 工具数量: 20 (不变, read_file 功能扩展)
+```
+
+### v2.16 — 三层权限系统 (2026-05-29)
+```
+v2.14 基础上增加:
+  ├── agent/permissions.py: UserRole 枚举 + CodeLimits 数据类 + PermissionManager
+  │   ├── 身份识别: SUPERUSERS 环境变量 → admin, VIP_USERS → vip, 默认 → regular
+  │   ├── 工具权限矩阵: _PUBLIC_TOOLS (15), _VIP_TOOLS (4), _ADMIN_TOOLS (shell_exec)
+  │   └── 资源配额: 工作区磁盘 (admin=2GB, vip=500MB, regular=100MB), 特殊会话数 (10/3/1)
+  │
+  ├── agent/context.py: 新增 _current_user_role + _current_code_limits contextvars
+  │   └── 权限信息在请求链路中通过 contextvars 传递，无需修改工具函数签名
+  │
+  ├── agent/tool_registry.py: 新增 get_schemas_for(allowed_names)
+  │   └── 根据用户角色过滤工具 schema，LLM 只看到允许调用的工具
+  │
+  ├── agent/agent.py 修改:
+  │   ├── run(): 新增 allowed_tools + user_role 参数
+  │   ├── LLM 调用使用 get_schemas_for() 过滤 schema (schema 过滤防线)
+  │   └── _execute_tool_calls(): 硬拦截非允许工具调用 (纵深防御)
+  │
+  ├── tools/builtin_tools.py: execute_code 读取 _current_code_limits contextvar
+  │   └── 按角色应用分级限制: admin (60s/100KB/256MB), vip (15s/50KB/128MB)
+  │
+  ├── plugins/agent_router.py: 集成 PermissionManager
+  │   ├── 请求入口解析角色 → 设置 contextvars → 传递 allowed_tools 给 agent.run()
+  │   └── 权限不足处理: 礼貌说明，建议联系管理员，不暴露系统完整能力
+  │
+  └── agent/config/AGENTS.md: 新增权限系统文档段
+      ├── 用户层级表 (角色/识别方式/权限范围)
+      ├── 权限不足处理原则 (5 条)
+      └── Permission 错误拦截说明
+
+设计原则: Schema 过滤为主, 硬拦截为纵深防御, 环境变量认证, 权限不足不暴露系统能力
 ```

@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .tool_registry import ToolRegistry
@@ -60,6 +61,12 @@ class Agent:
         self.special_sessions = special_session_manager
         self.max_tool_iterations = max_tool_iterations
         self.thinking_timeout = thinking_timeout
+
+        # Audit logging
+        self._audit_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "audit",
+        )
 
         # Load configs
         self._configs: Dict[str, str] = {}
@@ -131,6 +138,8 @@ class Agent:
         client=None,
         progress_callback: Optional[Callable[[str], Any]] = None,
         session_type: str = "temporary",
+        allowed_tools: Optional[set] = None,
+        user_role: Optional[str] = None,
     ) -> str:
         """Process a user message through the agent loop.
 
@@ -156,7 +165,7 @@ class Agent:
         session = self.sessions.get_or_create(user_id)
 
         # Build messages: system prompt + history + current message
-        messages = self._build_messages(session, user_message, special_session)
+        messages = self._build_messages(session, user_message, special_session, role_hint=user_role)
 
         # Track tool names for deduplication across iterations
         _last_reported_tools: Optional[frozenset] = None
@@ -164,9 +173,14 @@ class Agent:
         # Agent loop
         for iteration in range(self.max_tool_iterations):
             llm_client = client or self.client
+            schemas = (
+                self.tools.get_schemas_for(allowed_tools)
+                if allowed_tools
+                else self.tools.get_schemas()
+            )
             response = await llm_client.chat_completion_with_tools(
                 messages=messages,
-                tools=self.tools.get_schemas(),
+                tools=schemas,
                 timeout=self.thinking_timeout,
             )
 
@@ -190,7 +204,7 @@ class Agent:
                             pass
 
                 tool_results = await self._execute_tool_calls(
-                    response["tool_calls"], session
+                    response["tool_calls"], session, user_id, allowed_tools
                 )
 
                 assistant_msg = {
@@ -233,7 +247,7 @@ class Agent:
                 return final_content
 
         # Max iterations reached
-        return "抱歉，Roxy 在尝试处理你的请求时似乎陷入了循环。请尝试换一种方式提问~"
+        return f"抱歉，Roxy 在尝试处理你的请求时似乎陷入了循环或工具调用次数已经超过当前配额上限（{self.max_tool_iterations}次）。请尝试换一种方式提问~"
 
     # ── Message Building ──────────────────────────────────────────
 
@@ -242,6 +256,7 @@ class Agent:
         session: Session,
         user_message: str,
         special_session: Optional[SpecialSession] = None,
+        role_hint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Build the full message list for the LLM.
 
@@ -250,9 +265,10 @@ class Agent:
         2. Session type marker (special/temporary/continuous)
         3. User profile context (from ProfileManager)
         4. Workspace quota context (if in special session)
-        5. Relevant long-term memories (from MemorySystem)
-        6. Conversation history (from Session or SpecialSession)
-        7. Current user message
+        5. Permission role context (if not admin)
+        6. Relevant long-term memories (from MemorySystem)
+        7. Conversation history (from Session or SpecialSession)
+        8. Current user message
         """
         messages = []
 
@@ -267,17 +283,22 @@ class Agent:
                 f"当前会话名称: {special_session.name}\n"
                 f"会话消息数: {special_session.total_messages}\n"
                 f"会话创建于: {time.strftime('%Y-%m-%d %H:%M', time.localtime(special_session.created_at))}\n"
-                f"工作区: {self.workspaces.get_workspace(user_id) if self.workspaces else '默认'}\n\n"
                 f"你处于特殊会话模式，拥有完整的对话上下文记忆。"
-                f"可以使用用户工作区存储文件。"
                 f"如果任务已完成，可以建议用户使用 /结束会话 退出特殊会话模式。"
             )
 
-            # Quota context
-            if self.workspaces:
-                quota_ctx = self.workspaces.get_quota_context(user_id)
-                if quota_ctx:
-                    system_content += f"\n{quota_ctx}"
+        # Workspace context — always injected for all session types
+        if self.workspaces:
+            workspace_path = self.workspaces.get_workspace(user_id)
+            system_content += (
+                f"\n\n## 用户工作区（独立隔离，仅该用户可访问）\n"
+                f"路径: {workspace_path}\n"
+                f"用户可以在工作区内存放持久化文件、代码和输出。"
+                f"子目录: code/（代码执行）、uploads/（上传文件）、output/（生成输出）、projects/（项目文件）。"
+            )
+            quota_ctx = self.workspaces.get_quota_context(user_id)
+            if quota_ctx:
+                system_content += f"\n{quota_ctx}"
 
         messages.append({"role": "system", "content": system_content})
 
@@ -288,9 +309,19 @@ class Agent:
             if profile_context:
                 messages[0]["content"] += "\n\n" + profile_context
 
-        # 4. Relevant long-term memories
+        # 4. Permission role context (for non-admin users)
+        if role_hint and role_hint != "admin":
+            messages[0]["content"] += (
+                f"\n\n## 当前会话权限\n"
+                f"你的工具列表已由系统根据当前用户身份自动过滤。"
+                f"你只能看到和使用当前可用的工具。"
+                f"如果用户的请求需要使用你无法访问的工具（如 shell 命令、网页抓取等），"
+                f"请礼貌地说明当前权限不支持此操作，并建议用户联系管理员获取更高权限。"
+            )
+
+        # 5. Relevant long-term memories (scoped to user_id)
         if self.memory:
-            memories = self.memory.search(user_message)
+            memories = self.memory.search(user_message, user_id=user_id)
             if memories:
                 mem_lines = ["\n## Relevant Past Interactions"]
                 for m in memories[:3]:
@@ -353,7 +384,8 @@ class Agent:
     # ── Tool Execution ────────────────────────────────────────────
 
     async def _execute_tool_calls(
-        self, tool_calls: List[dict], session: Session
+        self, tool_calls: List[dict], session: Session, user_id: str = "",
+        allowed_tools: Optional[set] = None,
     ) -> List[Dict[str, str]]:
         """Execute tool calls from the LLM response.
 
@@ -367,8 +399,19 @@ class Agent:
             except json.JSONDecodeError:
                 arguments = {}
 
-            result_text = await self.tools.execute(tool_name, arguments)
+            # Hard-reject: defense-in-depth against disallowed tools
+            if allowed_tools is not None and tool_name not in allowed_tools:
+                result_text = (
+                    f"[Permission] 工具 '{tool_name}' 超出当前用户权限范围，"
+                    f"此调用已被系统拦截。如果你确实需要此功能，请联系管理员。"
+                )
+            else:
+                result_text = await self.tools.execute(tool_name, arguments)
+
             session.tool_call_count += 1
+
+            # Audit log: record every tool invocation (including blocked ones)
+            self._write_audit_log(user_id, tool_name, arguments, result_text)
 
             results.append({
                 "role": "tool",
@@ -377,6 +420,44 @@ class Agent:
             })
 
         return results
+
+    # ── Audit Logging ────────────────────────────────────────────
+
+    def _write_audit_log(
+        self, user_id: str, tool_name: str,
+        arguments: dict, result_text: str,
+    ):
+        """Write a JSONL audit log entry for a tool invocation.
+
+        Each entry records: timestamp, user_id, tool_name, arguments,
+        success/error status, and a result summary (first 200 chars).
+        Logs are written to daily files under data/audit/.
+        """
+        try:
+            os.makedirs(self._audit_dir, exist_ok=True)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            log_path = os.path.join(self._audit_dir, f"tool_calls_{today}.jsonl")
+
+            # Determine if the tool returned an error
+            is_error = result_text.startswith("[") and any(
+                result_text.startswith(f"[{prefix}]") or result_text.startswith(f"[{prefix} ")
+                for prefix in ["Search", "WebFetch", "Shell", "Code Error",
+                               "Security", "PDF Error", "Git Error", "SSRF"]
+            )
+
+            entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "user_id": user_id,
+                "tool": tool_name,
+                "arguments": arguments,
+                "success": not is_error,
+                "result_summary": result_text[:200].replace("\n", " "),
+            }
+
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass  # Audit logging must never break the main flow
 
     # ── Memory ────────────────────────────────────────────────────
 
@@ -396,6 +477,7 @@ class Agent:
                 name=f"interaction_{user_id}_{int(time.time())}",
                 description=f"Conversation with {user_id}: {summary}",
                 type="user",
+                user_id=user_id,
                 content=f"## User Message\n{user_message}\n\n## Agent Response\n{agent_response[:500]}",
             )
             self.memory.save(entry)

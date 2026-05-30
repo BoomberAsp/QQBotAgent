@@ -62,6 +62,7 @@ HOST=0.0.0.0
 PORT=8081
 ONEBOT_ACCESS_TOKEN=你的Token
 SUPERUSERS=["你的QQ号"]
+VIP_USERS=["会员QQ号"]
 DEEPSEEK_API_KEY=sk-xxxxxxxx
 DEEPSEEK_API_BASE=https://api.deepseek.com
 SEARXNG_ENDPOINT=http://localhost:8082
@@ -106,21 +107,32 @@ bash start.sh
 
 应返回已注册的工具列表和机器人状态。
 
-### 特殊会话命令
+### QQ 命令一览
 
-在 QQ 聊天中 @机器人 使用以下命令：
+在 QQ 聊天中 @机器人 或直接发送以下命令：
+
+**会话管理**
 
 | 命令 | 说明 |
 |------|------|
 | `/新会话 [名称]` | 创建特殊会话 (留空由 LLM 自动命名) |
-| `/切换会话 <编号>` | 切换到指定会话 |
-| `/我的会话` | 列出所有特殊会话 |
-| `/重命名会话 <编号> <名称>` | 重命名会话 |
-| `/删除会话 <编号>` | 删除会话 (确认码保护) |
-| `/激活会话` | 查看当前会话状态 |
-| `/退出会话` | 退出特殊会话，回到临时模式 |
+| `/切换会话 <名称>` | 切换到指定会话 |
+| `/会话列表` | 列出所有特殊会话 |
+| `/重命名会话 <旧名> <新名>` | 重命名会话 |
+| `/删除会话 <名称>` | 删除会话 (确认码保护) |
+| `/保存为会话 [名称]` | 将当前临时对话保存为特殊会话 |
+| `/结束会话` | 退出特殊会话，回到临时模式 |
+| `/取消` | 退出连续对话模式（群聊免@窗口） |
 | `/clear` / `清除上下文` | 清除当前会话上下文 |
 | `/status` | 查看 Agent 状态 |
+
+**反馈 & Bug 报告**（零 token 消耗，直达开发者）
+
+| 命令 | 说明 |
+|------|------|
+| `#bug <描述>` | 提交 Bug 报告，自动附用户上下文 |
+| `#反馈 <内容>` | 提交使用反馈或建议 |
+| `#建议 <内容>` | 提交改进建议 |
 
 ## 启动脚本
 
@@ -307,7 +319,7 @@ class ContinuousSessionManager:
 | `MemorySystem` | `memory.py` | 长期记忆（Markdown 文件），关键词搜索，最多返回 3 条 |
 | `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣，持久化到 `data/users/` |
 
-## 已注册工具（20 个）
+## 已注册工具（21 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -316,6 +328,8 @@ class ContinuousSessionManager:
 | `execute_code` | Python 沙盒执行（支持图表输出） |
 | `shell_exec` | Shell 命令执行（白名单+管道） |
 | `get_time` | 当前日期时间 |
+| `get_system_load` | 服务器实时负载（CPU/内存/磁盘） |
+| `get_user_info` | 用户信息快照（权限/会话/工作区/工具范围） |
 | `read_file` | 读取文件（文本 / PDF / 图片 AI 分析 / 音频 AI 分析） |
 | `summarize_pdf` | PDF 提取 + 总结 |
 | `download_repo` | Git clone 仓库（HTTPS only） |
@@ -393,12 +407,25 @@ cd QQBot && python test_agent.py
 
 | 边界 | 规则 |
 |------|------|
-| 代码执行 | `python3 -I` 隔离 + 模式匹配（15 个禁止模式）+ 60s / 100KB 限制 |
+| 权限系统 | 三层权限 (管理员/会员/普通用户)，环境变量配置 (`SUPERUSERS` / `VIP_USERS`)，schema 过滤 + 硬拦截纵深防御 |
+| 代码执行 | `python3 -I` 隔离 + 正则匹配 + AST 白名单三层过滤，分级限制 (管理员 60s/100KB，会员 15s/50KB) |
 | 文件访问 | 仅在 `/data/workspace/`，拒绝路径遍历（`..`, `~`, `/etc/`） |
-| 网络 | 仅通过预定义工具（search, download_repo HTTPS only） |
-| 隐私 | per-user 隔离，本地存储，不上传第三方（除 API 调用外） |
+| 网络 | 仅通过预定义工具（search, download_repo HTTPS only），`web_fetch` 内置 SSRF 防护 |
+| 隐私 | per-user 隔离，本地存储，不上传第三方（除 API 调用外），审计日志 (JSONL) |
 
-详见 `QQBot/agent/config/WORKSPACE.md`。
+### 权限系统
+
+通过 `SUPERUSERS` 和 `VIP_USERS` 环境变量配置用户层级：
+
+| 角色 | 配置方式 | 权限范围 |
+|------|---------|---------|
+| **管理员** | `SUPERUSERS` 环境变量 | 全部工具（含 `shell_exec`），完整 `execute_code`（60s/100KB/256MB），2GB 工作区，10 个特殊会话 |
+| **会员** | `VIP_USERS` 环境变量 | 大部分工具（含 `web_fetch`、`download_repo`、受限 `execute_code`），500MB 工作区，3 个特殊会话 |
+| **普通用户** | 默认 | 基础工具（搜索/天气/地图/文件阅读/娱乐），100MB 工作区，1 个特殊会话 |
+
+工具权限通过请求时 **schema 过滤** 控制（LLM 只看到允许调用的工具），`_execute_tool_calls()` 中的硬拦截作为纵深防御。
+
+详见 `QQBot/agent/config/WORKSPACE.md` 与 `QQBot/agent/config/AGENTS.md`。
 
 ## 安装 NapCat（详细）
 

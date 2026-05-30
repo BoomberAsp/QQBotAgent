@@ -10,7 +10,7 @@ Tools are functions that the agent can call. Each tool has:
 
 import json
 import inspect
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 
 class ToolRegistry:
@@ -57,6 +57,11 @@ class ToolRegistry:
     def get_schemas(self) -> List[dict]:
         """Return all tool schemas in OpenAI function-calling format."""
         return [t["schema"] for t in self._tools.values()]
+
+    def get_schemas_for(self, allowed_names: Set[str]) -> List[dict]:
+        """Return schemas only for the specified tool names."""
+        allowed = set(allowed_names)
+        return [t["schema"] for name, t in self._tools.items() if name in allowed]
 
     def get_schema(self, name: str) -> Optional[dict]:
         """Get a single tool's schema."""
