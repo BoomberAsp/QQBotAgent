@@ -42,15 +42,16 @@ def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -> str:
     return str(text_segment)
 
 
-async def play_gacha_animation(star_level: int, is_single: bool = False) -> str:
+async def play_gacha_animation(star_level: int, is_single: bool = False, interval: float = 0.75) -> str:
     """Play gacha pull animation frames in QQ chat.
 
-    Reads animation images and sends them sequentially (0.75s intervals).
+    Reads animation images and sends them sequentially with configurable intervals.
     Uses the _send_msg context variable set by agent_router to send images.
 
     Args:
         star_level: Highest star level (3=blue, 4=purple, 5=gold, 6=red).
         is_single: True for single pull, False for ten-pull.
+        interval: Delay between animation frames in seconds (default 0.75).
     """
     from agent.context import _send_msg
     from plugins.pullingMonitor import (
@@ -103,7 +104,7 @@ async def play_gacha_animation(star_level: int, is_single: bool = False) -> str:
         try:
             await send(frame)
             sent_count += 1
-            await asyncio.sleep(0.75)
+            await asyncio.sleep(interval)
         except Exception:
             pass  # One frame failed, continue with the rest
 

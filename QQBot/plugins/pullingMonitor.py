@@ -284,12 +284,13 @@ def format_result(result, count):
         return MessageSegment.text(result_text), 3
 
 
-async def pulling_anime(matcher: Matcher, level: int, single: bool):
+async def pulling_anime(matcher: Matcher, level: int, single: bool, interval: float = 0.75):
     """
     输入抽卡的星级
     :param single: 是否为单抽
     :param matcher: 上一级函数调用的matcher
     :param level: 抽卡结果中最高星级的等级：红色6，金色5，紫色4，蓝色3。
+    :param interval: 动画帧之间间隔秒数。
     :return: 无
     """
     if level == 3: # 蓝色
@@ -298,16 +299,16 @@ async def pulling_anime(matcher: Matcher, level: int, single: bool):
 
         else:
             await matcher.send(ten_pull_start)
-        time.sleep(0.75)
+        time.sleep(interval)
 
         await matcher.send(pull_1)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_middle)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_end)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_or_purple_spaceship_close)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_spaceship_open)
 
     if level == 4: # 紫色
@@ -316,15 +317,15 @@ async def pulling_anime(matcher: Matcher, level: int, single: bool):
 
         else:
             await matcher.send(ten_pull_start)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(pull_1)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_middle)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(purple_end)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_or_purple_spaceship_close)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(purple_spaceship_open)
 
     if level == 5: # 金色
@@ -333,15 +334,15 @@ async def pulling_anime(matcher: Matcher, level: int, single: bool):
 
         else:
             await matcher.send(ten_pull_start)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(pull_1)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(purple_middle)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(golden_end)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(gold_spaceship_close)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(gold_spaceship_open)
 
     if level == 6: # 红色
@@ -350,27 +351,27 @@ async def pulling_anime(matcher: Matcher, level: int, single: bool):
 
         else:
             await matcher.send(ten_pull_start)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(pull_1)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(purple_middle)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(red_end)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(red_spaceship_close)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(red_spaceship_open)
 
 
-async def single_pulling_anime(matcher: Matcher, level: int):
+async def single_pulling_anime(matcher: Matcher, level: int, interval: float = 0.75):
     if level == 3:
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_spaceship_open)
     elif level == 4:
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(purple_spaceship_open)
     elif level == 5:
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(gold_spaceship_open)
     elif level == 6:
         await matcher.send(red_spaceship_open)

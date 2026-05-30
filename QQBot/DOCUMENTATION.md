@@ -9,7 +9,7 @@
 - **QQ 协议适配**: NapCat (OneBot V11 反向 WebSocket)
 - **AI 后端**: DeepSeek API (OpenAI 兼容 Function Calling) + 多模型路由 (FLASH/REASONING/MULTIMODAL)
 - **搜索引擎**: SearXNG (Docker 自托管，聚合 Bing/DDG) + `web_fetch` 直接抓取网页
-- **特殊会话**: 每用户至多 3 个持久化会话，百万 token 上下文，快照+增量存储
+- **特殊会话**: 每用户持久化会话（按角色：管理员 10 / 会员 3 / 普通 1），百万 token 上下文，快照+增量存储
 - **用户工作区**: 每用户独立文件空间，配额管理，跨会话隔离
 - **部署方式**: Docker Compose（含 NVIDIA GPU 支持）或手动部署
 
@@ -40,7 +40,7 @@ QQBotAgent/
     │   ├── agent.py         #   主循环: Think→Act→Observe→Respond
     │   ├── tool_registry.py #   工具注册表 (OpenAI JSON Schema 生成)
     │   ├── session.py       #   会话管理 (per-user, timeout, trim, 持久化)
-    │   ├── special_session.py #  特殊会话管理 (百万 token, 快照+增量存储, 最多3个)
+    │   ├── special_session.py #  特殊会话管理 (百万 token, 快照+增量存储, 按角色限制数量)
     │   ├── continuous_session.py # 群聊连续对话窗口管理 (5分钟免@)
     │   ├── hardware.py      #   硬件自动检测 & 动态任务拒绝
     │   ├── workspace.py     #   用户工作区隔离 & 配额管理
@@ -253,12 +253,12 @@ Memories       → 相关长期记忆 (关键词搜索，最多 3 条)
 
 #### 类: `SpecialSessionManager` (v2.13)
 
-管理持久化的「特殊会话」——每用户至多 3 个，百万 token 上下文窗口，快照 + 增量双层存储。
+管理持久化的「特殊会话」——按角色限制数量（管理员 10 / 会员 3 / 普通 1），百万 token 上下文窗口，快照 + 增量双层存储。
 
 | 构造参数 | 类型 | 默认值 | 说明 |
 |----------|------|--------|------|
 | `user_data_root` | `str` | (必填) | 用户数据根目录 |
-| `max_per_user` | `int` | 3 | 每用户最大会话数 |
+| `max_per_user` | `int` | 3 | 每用户最大会话数（默认值，实际按角色：管理员 10 / 会员 3 / 普通 1） |
 | `llm_client` | `DeepSeekClient` | None | LLM 客户端 (用于自动命名) |
 
 | 方法 | 说明 |
@@ -479,8 +479,9 @@ agent_router.py
 | `/重命名会话 <旧名> <新名>` | 重命名指定特殊会话 |
 | `/删除会话 <名称>` | 删除指定特殊会话 (输出 6 位确认码, 60s 有效期) |
 | `/保存为会话 [名称]` | 将当前临时对话保存为特殊会话 |
-| `/结束会话` | 退出特殊会话模式，回到临时会话 |
-| `/取消` | 退出群聊连续对话模式（免@窗口） |
+| `/结束会话` 或 `/退出特殊会话` 或 `/退出会话` 或 `/临时会话` | 退出特殊会话模式，回到临时会话 |
+| `/帮助` 或 `/help` 或 `/命令` | 显示完整系统命令列表 |
+| `/取消` 或 `#取消` | 退出群聊连续对话模式 |
 | `#反馈 <内容>` | 提交使用反馈，自动附带用户上下文（零 token 消耗） |
 | `#bug <描述>` | 提交 Bug 报告，自动附带用户上下文（零 token 消耗） |
 | `#建议 <内容>` | 提交改进建议，自动附带用户上下文（零 token 消耗） |
@@ -532,7 +533,7 @@ agent_router.py
 | 工具名 | 来源 | 说明 |
 |--------|------|------|
 | `get_time` | builtin_tools | 获取当前日期和时间 (含中文星期) |
-| `search_web` | builtin_tools | SearXNG 聚合搜索 — 覆盖天气/新闻/百科/知识 |
+| `search_web` | builtin_tools | SearXNG 聚合搜索 — 新闻/百科/知识查询 |
 | `web_fetch` | builtin_tools | 直接抓取 HTTPS 网页内容并提取纯文本 |
 | `execute_code` | builtin_tools | 执行 Python 代码，自动捕获并发送生成的图表 |
 | `shell_exec` | builtin_tools | 执行只读 shell 命令（白名单+管道，40+命令） |
@@ -563,7 +564,7 @@ agent_router.py
 | `explain_code` | legacy_tools | LLM 中文解释代码功能和原理 |
 | `translate_text` | legacy_tools | LLM 多语言翻译 |
 
-**注**: `check_weather` 已移除。天气查询通过 `get_weather` (Amap API) 或 `search_web` → SearXNG 搜索 + LLM 合成结果实现。`web_fetch` 用于直接抓取搜索结果中无法索引的网页。
+**注**: `check_weather` 已移除。天气查询通过专用的 `get_weather` 工具（高德地图 API）实现。`web_fetch` 用于直接抓取搜索结果中无法索引的网页。
 
 ### 2.9 `lib/model_router.py` — 多模型路由器
 
@@ -625,7 +626,7 @@ agent_router.py
 
 **第 2 层 — 进程隔离**: `python3 -I` 隔离模式 (忽略 PYTHON* 环境变量, 不加载 site-packages)，清洁环境变量，独立 temp 工作目录
 
-**第 3 层 — 资源限制**: 60s 超时, 100KB 输出上限, 执行后自动清理临时目录
+**第 3 层 — 资源限制**: 分级超时与输出上限（管理员 60s/100KB，会员 15s/50KB），执行后自动清理临时目录
 
 ### 3.3 路径验证
 
@@ -663,7 +664,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 
 | 资源 | 限制 |
 |------|------|
-| 最大工具调用轮数 | 12 |
+| 最大工具调用轮数 | 20 |
 | 单次消息处理总超时 | 300 秒 |
 | LLM 思考超时 | 180 秒 |
 | 响应消息长度 | 2000 字符 (智能拆分为 300 字符片段, 1s 发送间隔) |
@@ -707,7 +708,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 | 函数 | 说明 | 实现方式 |
 |------|------|----------|
 | `get_time()` | 返回当前日期时间 (含中文星期) | `datetime.now().strftime` |
-| `search_web(query, num_results=5)` | SearXNG 聚合搜索 (覆盖天气/新闻/百科) | `urllib.request` → SearXNG JSON API (`/search?format=json`)，15s 超时，安全搜索开启，中文优先 |
+| `search_web(query, num_results=5)` | SearXNG 聚合搜索 (新闻/百科/知识) | `urllib.request` → SearXNG JSON API (`/search?format=json`)，15s 超时，安全搜索开启，中文优先 |
 | `web_fetch(url)` | 异步，抓取 HTTPS 网页并提取纯文本 | `httpx` → HTML→文本转换 (`html.parser`)，HTTPS only，2MB/8000字符/30s 限制 |
 | `execute_code(code, timeout=30)` | 异步，执行 Python 代码 + 自动发送图表 | `subprocess.run` (独立 tmpdir)，扫描 .png/.svg 等图片 → 拷贝到 output/ → QQ 发送 |
 | `shell_exec(command, timeout=15)` | 异步，执行只读 shell 命令 (白名单+管道) | `subprocess.run(["bash", "-c", cmd])`，40+ 白名单命令，管道解析验证，危险字符拦截 |
@@ -784,7 +785,7 @@ NoneBot2 (FastAPI, 端口 8081)
        ▼
 agent_router.py: on_message(priority=1, rule=to_me())
        │
-       ├── 特殊命令 → /clear, /status, 8 个会话命令 (直接处理，不经过 Agent)
+       ├── 特殊命令 → 会话管理 / 反馈 / 元命令 (直接处理，不经过 Agent)
        │
        ├── session_type 检测 → active_special ? "special" : "temporary"
        │
@@ -795,7 +796,7 @@ agent_router.py: on_message(priority=1, rule=to_me())
                          ├── MemorySystem.search(message) → top 3 memories
                          ├── build_system_prompt() → SOUL+IDENTITY+AGENTS+时间
                          │
-                         └── Think→Act→Observe→Respond Loop (max 12)
+                         └── Think→Act→Observe→Respond Loop (max 20)
                               │
                               ├── chat_completion_with_tools(messages, tools)
                               ├── has tool_calls?
@@ -893,7 +894,7 @@ docker logs searxng --tail 20
 
 ### 7.6 天气查询
 
-天气通过 `search_web` 统一处理 —— Agent 搜索 "城市名 天气"，SearXNG 返回天气网站结果，LLM 从结果中提取温度/湿度/风力等信息并整合为自然语言回复。无需独立的天气 API。
+天气通过专用工具 `get_weather`（高德地图 API）处理，支持实时天气和 4 天预报。无需通过搜索获取天气信息。
 
 ---
 
@@ -1180,7 +1181,7 @@ docker compose up -d
 用户消息 → on_message(to_me) → Agent 统一入口
   ├── LLM 理解意图
   ├── 自主选择工具 (OpenAI Function Calling)
-  ├── 多轮 Think→Act→Observe→Respond (最多 12 轮)
+  ├── 多轮 Think→Act→Observe→Respond (最多 20 轮)
   └── 智能回复 + 用户画像 + 长期记忆
 ```
 
@@ -1349,14 +1350,14 @@ v2.7 基础上增加:
 v2.12 基础上增加:
   ├── agent/hardware.py: 硬件自动检测 (CPU/内存/磁盘/GPU/OS)，首次启动缓存到 .hardware.json
   ├── agent/workspace.py: 用户工作区隔离 (per-user 目录, contextvars 传递), 配额管理 (3 级策略)
-  ├── agent/special_session.py: 特殊会话 (百万 token 上下文, 快照+增量双层存储, 最多 3 个)
+  ├── agent/special_session.py: 特殊会话 (百万 token 上下文, 快照+增量双层存储, 按角色限制数量)
   ├── agent/agent.py 更新:
   │   ├── build_system_prompt(): 动态注入硬件上下文 (替换硬编码规格表)
   │   ├── run(): 新增 session_type 参数 → 路由到 SpecialSessionManager
   │   └── _build_messages(): 注入 session marker + quota context
   ├── agent/profile.py 更新: 画像存储路径迁移到 {USER_DATA_ROOT}/{safe_id}/profile.json (自动迁移旧路径)
   ├── plugins/agent_router.py 更新:
-  │   ├── _handle_session_command(): 8 个特殊会话管理命令
+  │   ├── _handle_session_command(): 特殊会话管理命令（含 /帮助）
   │   ├── session_type 检测: active_special → "special", 否则 → "temporary"
   │   └── contextvars 工作区隔离: 每次请求前 set 用户工作区路径
   ├── tools/builtin_tools.py 更新:

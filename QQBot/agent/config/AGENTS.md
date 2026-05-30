@@ -48,8 +48,8 @@ All file operations MUST stay within the workspace root (default: project `data/
 
 | Tool | Constraint                                                                                                                                                                                      |
 |------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `search_web` | Uses SearXNG JSON API. Handles ALL information retrieval including weather.                                                                                                                     |
-| `execute_code` | Python only, 60s timeout, no network, no shell, no file system access outside workspace code dir                                                                                                |
+| `search_web` | SearXNG JSON API for web search. Weather is handled by the dedicated `get_weather` tool (Amap API), NOT by search_web. |
+| `execute_code` | Python only, tiered timeout (admin=60s, vip=15s), no network, no shell, no file system access outside workspace code dir. Uses per-role output limits (admin=100KB, vip=50KB). |
 | `download_repo` | HTTPS only, target always workspace repos dir                                                                                                                                                   |
 | `summarize_pdf` | File must be under workspace; reject paths with `..`, `~`, or absolute paths outside workspace                                                                                                  |
 | `read_file` | File must be under workspace (auto-validated). Supports text/PDF/image/audio. Images get AI analysis when multimodal configured. Audios get another AI analysis when audio model is configured. |
@@ -77,22 +77,50 @@ All file operations MUST stay within the workspace root (default: project `data/
 
 | 特性 | 临时会话 | 特殊会话 |
 |------|---------|---------|
-| 上下文窗口 | 最近 20 条消息 | 完整保留（百万 token 级） |
+| 上下文窗口 | 最近 20 条消息 | 完整保留（百万 token 级，含分层压缩） |
 | 持久化 | 重启/超时后丢失 | 永久保存，快照+增量双层存储 |
-| 工作区 | 共享工作区 | 独立用户工作区（500MB 配额） |
-| 数量限制 | 无 | 每用户最多 3 个 |
+| 工作区 | 用户工作区（所有会话共享） | 用户工作区（所有会话共享，按角色配额） |
+| 数量限制 | 无 | 按角色：管理员 10 / 会员 3 / 普通 1 个 |
+
+**工作区配额（按角色）：**
+| 管理员 | 会员 | 普通 |
+|--------|------|------|
+| 2 GB | 500 MB | 100 MB |
 
 **启动和管理命令（由系统接管，不经过 LLM）：**
+
+### 特殊会话管理
 
 | 命令 | 说明 |
 |------|------|
 | `/新会话 [名称]` | 创建特殊会话（名称留空由 LLM 自动命名） |
 | `/切换会话 <名称>` | 切换到已有会话 |
-| `/会话列表` 或 `/会话` | 查看所有特殊会话 |
+| `/会话列表` 或 `/会话` | 查看所有特殊会话（含消息数、创建时间） |
 | `/重命名会话 <旧名> <新名>` | 重命名会话 |
-| `/删除会话 <名称>` | 删除会话（需二次确认） |
-| `/结束会话` | 退出特殊会话，回到临时模式 |
+| `/删除会话 <名称>` | 删除会话（需二次确认，60秒内有效） |
+| `/结束会话` 或 `/退出特殊会话` 或 `/退出会话` 或 `/临时会话` | 退出特殊会话，回到临时模式 |
 | `/保存为会话 <名称>` | 将当前临时会话最近 20 条消息保存为新特殊会话 |
+| `/帮助` 或 `/help` 或 `/命令` | 显示完整系统命令列表 |
+
+### 反馈与建议
+
+| 命令 | 说明 |
+|------|------|
+| `#反馈 <内容>` | 提交功能建议（附上下文快照，写入 JSONL） |
+| `#bug <内容>` | 提交 Bug 报告（附上下文快照） |
+| `#建议 <内容>` | 提交改进建议（附上下文快照） |
+
+### 其他系统命令
+
+| 命令 | 说明 |
+|------|------|
+| `/取消` 或 `#取消` | 退出群聊连续对话模式（仅连续模式中有效） |
+| `/clear` | 清除临时会话上下文，开始新对话 |
+| `/status` | 查看机器人运行状态（活跃会话数、注册工具列表） |
+
+**当用户使用不存在的命令时：**
+- 不要猜或者脑补命令。系统命令不会被 LLM 看到，但你会收到静默忽略后用户的追问
+- 直接告诉用户准确的命令格式，或者建议用户使用 `/帮助` 查看完整列表
 
 **当用户询问特殊会话相关问题时：**
 - 如果用户问"怎么创建/启动特殊会话"，告诉他们使用 `/新会话` 命令
