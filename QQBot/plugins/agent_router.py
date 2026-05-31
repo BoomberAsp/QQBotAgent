@@ -1074,6 +1074,29 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
     text_content = event.get_plaintext().strip()
 
+    # ── Handle pending delete confirmation (bare text, no / prefix) ──
+    pending_delete = _pending_delete_confirm.get(user_id)
+    if pending_delete:
+        expected = f"确认删除 {pending_delete[0]}"
+        if text_content == expected or text_content == f"/{expected}":
+            if time.time() < pending_delete[1]:
+                try:
+                    _special_sessions.delete(user_id, pending_delete[0])
+                    _pending_delete_confirm.pop(user_id, None)
+                    role = _perm_manager.get_role(user_id)
+                    max_sess = _perm_manager.get_max_special_sessions(role)
+                    sessions = _special_sessions.list_sessions(user_id)
+                    await _safe_send(
+                        f"已删除特殊会话「{pending_delete[0]}」。\n"
+                        f"当前特殊会话: {len(sessions)}/{max_sess}"
+                    )
+                except ValueError as e:
+                    await _safe_send(str(e))
+            else:
+                _pending_delete_confirm.pop(user_id, None)
+                await _safe_send("确认已超时（60秒），请重新发起 /删除会话。")
+            return
+
     # ── Handle feedback / bug report (before agent, zero token cost) ─
     if text_content.startswith(("#反馈", "#bug", "#建议")):
         await _handle_feedback(text_content, user_id)
@@ -1292,6 +1315,33 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         await _safe_send("已结束连续对话模式，之后需要@我才能触发~", matcher=continuous_router)
         return
 
+    # ── Handle pending delete confirmation (intercept before agent) ──
+    pending_delete = _pending_delete_confirm.get(user_id)
+    if pending_delete:
+        expected = f"确认删除 {pending_delete[0]}"
+        if text_content == expected or text_content == f"/{expected}":
+            if time.time() < pending_delete[1]:
+                try:
+                    _special_sessions.delete(user_id, pending_delete[0])
+                    _pending_delete_confirm.pop(user_id, None)
+                    role = _perm_manager.get_role(user_id)
+                    max_sess = _perm_manager.get_max_special_sessions(role)
+                    sessions = _special_sessions.list_sessions(user_id)
+                    await _safe_send(
+                        f"已删除特殊会话「{pending_delete[0]}」。\n"
+                        f"当前特殊会话: {len(sessions)}/{max_sess}",
+                        matcher=continuous_router
+                    )
+                except ValueError as e:
+                    await _safe_send(str(e), matcher=continuous_router)
+            else:
+                _pending_delete_confirm.pop(user_id, None)
+                await _safe_send(
+                    "确认已超时（60秒），请重新发起 /删除会话。",
+                    matcher=continuous_router
+                )
+            return
+
     # ── Detect reply/quote context and file attachments ────────────
     # These run BEFORE the text guard so files are always saved and
     # recorded, even for file-only messages that may be replied to later.
@@ -1433,6 +1483,16 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
 
     # ── /新会话 [名称] ─────────────────────────────────────────
     if cmd in ("/新会话", "#新会话"):
+        role = _perm_manager.get_role(user_id)
+        max_sessions = _perm_manager.get_max_special_sessions(role)
+        sessions = _special_sessions.list_sessions(user_id)
+        if len(sessions) >= max_sessions:
+            names = ", ".join(s["name"] for s in sessions)
+            await _safe_send(
+                f"已达到最大特殊会话数 ({max_sessions})。"
+                f"现有会话: {names}。请先删除一个再创建。"
+            )
+            return True
         try:
             name = args if args else None
             session = _special_sessions.create(user_id, name)
@@ -1443,7 +1503,7 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
                     f"已创建特殊会话「{session.name}」。\n"
                     f"当前处于特殊会话模式，上下文将持续保存。\n"
                     f"使用 /结束会话 退出，/会话列表 查看所有会话。\n"
-                    f"当前特殊会话: {len(_special_sessions.list_sessions(user_id))}/{_max_special_sessions}"
+                    f"当前特殊会话: {len(sessions)+1}/{max_sessions}"
                 )
             else:
                 _pending_naming[user_id] = True
@@ -1451,7 +1511,7 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
                     f"已创建特殊会话「{session.name}」（名称待精炼）。\n"
                     f"首次交互后会自动生成更贴切的名称。\n"
                     f"当前处于特殊会话模式，上下文将持续保存。\n"
-                    f"当前特殊会话: {len(_special_sessions.list_sessions(user_id))}/{_max_special_sessions}"
+                    f"当前特殊会话: {len(sessions)+1}/{max_sessions}"
                 )
         except ValueError as e:
             await _safe_send(str(e))
@@ -1459,11 +1519,13 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
 
     # ── /会话列表 ──────────────────────────────────────────────
     if cmd in ("/会话列表", "#会话列表", "/会话", "#会话"):
+        role = _perm_manager.get_role(user_id)
+        max_sessions = _perm_manager.get_max_special_sessions(role)
         sessions = _special_sessions.list_sessions(user_id)
         if not sessions:
             await _safe_send(
                 "你目前没有特殊会话。\n"
-                f"使用 /新会话 [名称] 创建一个（最多 {_max_special_sessions} 个）。"
+                f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个）。"
             )
             return True
 
@@ -1476,7 +1538,7 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
                 f"  {s['name']}{marker}\n"
                 f"    创建: {created} | 消息数: {s['total_messages']}"
             )
-        lines.append(f"\n共 {len(sessions)}/{_max_special_sessions} 个会话")
+        lines.append(f"\n共 {len(sessions)}/{max_sessions} 个会话")
         await _safe_send("\n".join(lines))
         return True
 
@@ -1524,10 +1586,12 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
                     try:
                         _special_sessions.delete(user_id, args)
                         _pending_delete_confirm.pop(user_id, None)
+                        role = _perm_manager.get_role(user_id)
+                        max_sess = _perm_manager.get_max_special_sessions(role)
                         sessions = _special_sessions.list_sessions(user_id)
                         await _safe_send(
                             f"已删除特殊会话「{args}」。\n"
-                            f"当前特殊会话: {len(sessions)}/{_max_special_sessions}"
+                            f"当前特殊会话: {len(sessions)}/{max_sess}"
                         )
                     except ValueError as e:
                         await _safe_send(str(e))
@@ -1575,6 +1639,17 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             await _safe_send("临时会话中没有可保存的上下文。")
             return True
 
+        role = _perm_manager.get_role(user_id)
+        max_sessions = _perm_manager.get_max_special_sessions(role)
+        sessions = _special_sessions.list_sessions(user_id)
+        if len(sessions) >= max_sessions:
+            names = ", ".join(s["name"] for s in sessions)
+            await _safe_send(
+                f"已达到最大特殊会话数 ({max_sessions})。"
+                f"现有会话: {names}。请先删除一个再创建。"
+            )
+            return True
+
         name = args if args else None
         try:
             session = _special_sessions.create(user_id, name)
@@ -1599,11 +1674,13 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             _pending_naming[user_id] = True
 
         sessions = _special_sessions.list_sessions(user_id)
+        role = _perm_manager.get_role(user_id)
+        max_sess = _perm_manager.get_max_special_sessions(role)
         await _safe_send(
             f"已将当前临时会话（最近 {min(len(temp_session.context), 20)} 条消息）"
             f"保存为特殊会话「{session.name}」。\n"
             f"现在处于特殊会话模式，后续对话将持续保存。\n"
-            f"当前特殊会话: {len(sessions)}/{_max_special_sessions}"
+            f"当前特殊会话: {len(sessions)}/{max_sess}"
         )
         return True
 
