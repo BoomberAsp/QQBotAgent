@@ -15,11 +15,12 @@ import asyncio
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
+
+from curl_cffi import requests as cffi_requests
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -168,51 +169,35 @@ class WikiScraper:
 
     @staticmethod
     async def _fetch_json(url: str, params: dict) -> dict | None:
-        """Make a GET request via curl and return parsed JSON.
+        """Make a GET request and return parsed JSON.
 
-        Uses curl with browser-mimicking headers to avoid Cloudflare blocks.
-        Python HTTP libraries (httpx, urllib) are blocked by Cloudflare's TLS
-        fingerprinting. Runs in a thread executor to stay non-blocking.
+        Uses curl_cffi with browser TLS fingerprint impersonation (chrome116)
+        to bypass Cloudflare bot detection. Both httpx and urllib are blocked
+        by Cloudflare's TLS fingerprinting.
         """
-        query = urlencode(params)
-        full_url = f"{url}?{query}"
         loop = asyncio.get_running_loop()
 
         def _run():
             try:
-                result = subprocess.run(
-                    ["curl", "-sS", "--max-time", "30",
-                     "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-                           " AppleWebKit/537.36 (KHTML, like Gecko)"
-                           " Chrome/126.0.0.0 Safari/537.36",
-                     "-H", "Accept: application/json",
-                     "-H", "Accept-Language: en-US,en;q=0.9",
-                     full_url],
-                    capture_output=True, timeout=35,
+                resp = cffi_requests.get(
+                    url,
+                    params=params,
+                    impersonate="chrome116",
+                    timeout=30,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                                      " AppleWebKit/537.36 (KHTML, like Gecko)"
+                                      " Chrome/116.0.0.0 Safari/537.36",
+                    },
                 )
-                stdout = result.stdout.decode("utf-8", errors="replace")
-                stderr_out = result.stderr.decode("utf-8", errors="replace")
-                if result.returncode != 0:
-                    print(f"[WikiScraper] curl exit {result.returncode}: "
-                          f"{stderr_out[:200]}", file=sys.stderr)
+                if resp.status_code != 200:
+                    preview = resp.text[:200].replace("\n", " ")
+                    print(f"[WikiScraper] HTTP {resp.status_code}: {preview}",
+                          file=sys.stderr)
                     return None
-                if not stdout.strip():
-                    print(f"[WikiScraper] Empty response from curl", file=sys.stderr)
-                    return None
-                return json.loads(stdout)
-            except json.JSONDecodeError as e:
-                preview = stdout[:500] if 'stdout' in dir() else "(no body)"
-                print(f"[WikiScraper] JSON decode error: {e}. "
-                      f"Preview: {preview}", file=sys.stderr)
-                return None
-            except FileNotFoundError:
-                print("[WikiScraper] curl not found!", file=sys.stderr)
-                return None
-            except subprocess.TimeoutExpired:
-                print("[WikiScraper] curl timed out", file=sys.stderr)
-                return None
+                return resp.json()
             except Exception as e:
-                print(f"[WikiScraper] curl error: {type(e).__name__}: {e}",
+                print(f"[WikiScraper] HTTP error: {type(e).__name__}: {e}",
                       file=sys.stderr)
                 return None
 
