@@ -364,6 +364,12 @@ class Agent:
                 f"请礼貌地说明当前权限不支持此操作，并建议用户联系管理员获取更高权限。"
             )
 
+        # 4.5. Group feature restrictions
+        from agent.context import _current_group_context
+        group_ctx = _current_group_context.get()
+        if group_ctx:
+            messages[0]["content"] += group_ctx
+
         # 5. Relevant long-term memories (scoped to user_id)
         if self.memory:
             memories = self.memory.search(user_message, user_id=user_id)

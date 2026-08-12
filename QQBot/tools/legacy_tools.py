@@ -71,7 +71,7 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
         is_single: True for single pull, False for ten-pull.
         interval: Delay between animation frames in seconds (default 0.75).
     """
-    from agent.context import _send_msg
+    from agent.context import _current_group_id, _send_msg
     from plugins.pullingMonitor import (
         pull_1, blue_end, blue_middle, blue_or_purple_spaceship_close,
         blue_spaceship_open, gold_spaceship_close, gold_spaceship_open,
@@ -84,6 +84,14 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
     send = _send_msg.get()
     if send is None:
         return "[Gacha] 当前环境不支持发送图片（非QQ聊天上下文）。"
+
+    # ── Group feature toggle check ────────────────────────────────
+    group_id = _current_group_id.get()
+    if group_id:
+        from agent.group_features import get_group_features
+        gf = get_group_features()
+        if not gf.is_enabled(group_id, "image"):
+            return "[Gacha] 该群聊的图片发送功能已被管理员关闭，无法播放抽卡动画。"
 
     if star_level not in (3, 4, 5, 6):
         return f"[Gacha] 无效的星级: {star_level}。可选: 3(蓝), 4(紫), 5(金), 6(红)"
