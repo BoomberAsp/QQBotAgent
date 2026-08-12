@@ -62,10 +62,12 @@ class WikiScraper:
     # ── Public API ────────────────────────────────────────────────
 
     def get_cached_data(self) -> dict | None:
-        """Synchronously load cached gacha data if not stale.
+        """Synchronously load cached gacha data.
 
-        Returns None if cache doesn't exist, is stale, or contains empty data
-        (caller should fall back to static JSON). Does NOT make network requests.
+        Returns None only if the cache file doesn't exist or is corrupt.
+        If the cache exists (even if stale), returns it — the caller gets
+        the best available data. Staleness is handled separately by
+        is_stale() + background refresh in gacha_pull().
         """
         if not os.path.exists(self._cache_file):
             return None
@@ -76,16 +78,17 @@ class WikiScraper:
         except Exception:
             return None
 
-        scraped_at = cache.get("scraped_at", 0)
-        if self._is_stale(scraped_at):
-            return None
-
         data = cache.get("data", {})
         pools = data.get("pools", {})
         total_items = sum(len(p.get("items", [])) for p in pools.values())
         if total_items == 0:
-            print("[WikiScraper] Cached data is empty, treating as stale", file=sys.stderr)
+            print("[WikiScraper] Cached data is empty, ignoring", file=sys.stderr)
             return None
+
+        scraped_at = cache.get("scraped_at", 0)
+        if self._is_stale(scraped_at):
+            print(f"[WikiScraper] Using stale cache (will try background refresh)",
+                  file=sys.stderr)
 
         return data
 
@@ -294,11 +297,18 @@ class WikiScraper:
         except (ValueError, TypeError):
             return None
 
+        # Filter unreleased bonds: pure ID codes (A0287 etc.) indicate
+        # characters/bonds not yet released — drop them to avoid leaking
+        # unreleased content.
+        bond_value = bond.strip() if bond else ""
+        if re.match(r"^A\d{4}$", bond_value):
+            bond_value = ""
+
         return {
             "name": title,
             "stars": stars,
             "element": element.strip(),
-            "bond": bond.strip() if bond else "",
+            "bond": bond_value,
             "obtain": obtain.strip() if obtain else "",
         }
 
