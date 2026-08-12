@@ -11,6 +11,7 @@ venv/
 # NoneBot 配置
 QQBot/data
 !QQBot/data/wiki_cache/
+!QQBot/data/name_index/
 QQBot/logs
 QQBot/.env
 QQBot/.env.prod

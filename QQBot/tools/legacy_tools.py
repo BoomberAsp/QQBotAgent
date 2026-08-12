@@ -23,7 +23,7 @@ async def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -
     Args:
         pool_type: Banner type ('常规招募', '几率up招募', '神秘招募', '银河招募')
         count: Number of pulls (1 or 10).
-        up_character: Rate-up character name (optional).
+        up_character: Rate-up character name (optional, supports fuzzy matching).
     """
     from plugins.pullingMonitor import drawing_cards, format_result
 
@@ -44,9 +44,20 @@ async def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -
     if pool_type == "几率up招募" and not up_character:
         return "[Gacha Error] 几率UP招募需要指定 up_character (UP角色名)"
 
-    results = [drawing_cards(pool_type, up_character) for _ in range(count)]
+    # ── Fuzzy name resolution ──
+    resolved_note = ""
+    actual_up = up_character
+    if up_character:
+        from tools.name_resolver import get_resolver
+        resolver = get_resolver()
+        resolved = resolver.resolve_character(up_character)
+        if resolved and resolved != up_character:
+            resolved_note = f"[名称解析: 「{up_character}」→「{resolved}」]\n"
+            actual_up = resolved
+
+    results = [drawing_cards(pool_type, actual_up) for _ in range(count)]
     text_segment, _ = format_result(results, count)
-    return str(text_segment)
+    return resolved_note + str(text_segment)
 
 
 async def play_gacha_animation(star_level: int, is_single: bool = False, interval: float = 0.75) -> str:

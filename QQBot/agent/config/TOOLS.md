@@ -295,9 +295,9 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: gacha_pull
 
-**Description**: Simulate a game character gacha/recruitment pull. Supports single pulls and ten-pulls across different banner types (standard, rate-up, mystic, galaxy).
+**Description**: Execute a game character gacha/recruitment pull. Supports single pulls and ten-pulls across four banner types (标准, UP, 神秘, 银河). **This is the ONLY way to produce real gacha results — never fabricate or simulate gacha output.**
 
-**When to use**: When the user wants to simulate character pulls or gacha draws. Keywords: 单抽, 十连抽, 抽卡, 招募.
+**When to use**: Any gacha/抽卡 request. Keywords: 单抽, 十连抽, 抽卡, 招募, 抽一发, 再来一次 (after a previous pull).
 
 **Parameters**:
 ```json
@@ -317,7 +317,7 @@ This document defines all tools available to the agent. Each tool has a name, de
     },
     "up_character": {
       "type": "string",
-      "description": "Rate-up character name (only for rate-up and mystic banners)",
+      "description": "Rate-up character name (supports fuzzy matching — aliases, English names, homophones all resolve correctly)",
       "default": null
     }
   },
@@ -325,7 +325,11 @@ This document defines all tools available to the agent. Each tool has a name, de
 }
 ```
 
-**Important**: This tool only returns **text** results. Before calling this tool, you MUST first ask the user whether they want to see the pull animation. Do NOT call this tool directly without asking.
+**Workflow rules**:
+
+1. **First gacha request in conversation**: Ask "要先看抽卡动画还是直接看结果？", then call this tool after the user replies.
+2. **Follow-up "再来一次" / "再抽" / "继续抽"**: Call this tool **immediately** with the same pool_type and up_character as the previous call. Do NOT ask about animation again.
+3. **NEVER fabricate gacha results**. Every pull result MUST come from this tool. If you output star ratings, character names, or gacha results without calling this tool, you are hallucinating.
 
 ---
 
