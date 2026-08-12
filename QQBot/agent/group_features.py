@@ -59,6 +59,15 @@ class GroupFeatureManager:
                     self._config = json.load(f)
             except (json.JSONDecodeError, IOError):
                 self._config = {}
+        else:
+            self._config = {}
+
+    def refresh(self):
+        """Re-read config from disk. Call before making feature queries.
+
+        Ensures the singleton sees changes made by other processes
+        or previous requests."""
+        self._load()
 
     def _save(self):
         """Persist feature config to JSON file."""

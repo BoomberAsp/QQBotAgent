@@ -90,6 +90,7 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
     if group_id:
         from agent.group_features import get_group_features
         gf = get_group_features()
+        gf.refresh()
         if not gf.is_enabled(group_id, "image"):
             return "[Gacha] 该群聊的图片发送功能已被管理员关闭，无法播放抽卡动画。"
 

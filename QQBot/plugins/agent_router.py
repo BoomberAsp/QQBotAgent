@@ -1231,11 +1231,22 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
         if group_id:
             gf = get_group_features()
+            gf.refresh()
             disabled_tools = gf.get_disabled_tools(group_id)
             if disabled_tools:
                 allowed_tools = allowed_tools - disabled_tools
             _current_group_id.set(group_id)
             _current_group_context.set(gf.get_disabled_context(group_id))
+            # Prepend restriction notice to user message so the LLM
+            # can't miss it (system prompt alone isn't always enough)
+            disabled_features = gf.get_disabled_features(group_id)
+            if disabled_features:
+                names = "、".join(disabled_features.values())
+                augmented_message = (
+                    f"[系统提示] 当前群聊的以下功能已被管理员关闭：{names}。"
+                    f"如果用户请求这些功能，请直接告知已被限制，不要尝试调用工具或提供替代方案。\n\n"
+                    f"{augmented_message}"
+                )
         else:
             _current_group_id.set("")
             _current_group_context.set("")
@@ -1445,6 +1456,24 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             if code_limits:
                 _current_code_limits.set(code_limits.to_dict())
 
+            # Resolve group feature restrictions
+            gf = get_group_features()
+            gf.refresh()
+            disabled_tools = gf.get_disabled_tools(group_id)
+            if disabled_tools:
+                allowed_tools = allowed_tools - disabled_tools
+            _current_group_id.set(group_id)
+            _current_group_context.set(gf.get_disabled_context(group_id))
+            # Prepend restriction notice to user message
+            disabled_features = gf.get_disabled_features(group_id)
+            if disabled_features:
+                names = "、".join(disabled_features.values())
+                augmented_message = (
+                    f"[系统提示] 当前群聊的以下功能已被管理员关闭：{names}。"
+                    f"如果用户请求这些功能，请直接告知已被限制，不要尝试调用工具或提供替代方案。\n\n"
+                    f"{augmented_message}"
+                )
+
             response = await asyncio.wait_for(
                 agent.run(augmented_message, user_id, client=client,
                            progress_callback=lambda msg: _safe_send(msg, matcher=continuous_router),
@@ -1508,6 +1537,7 @@ async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -
 
     group_id = str(event.group_id)
     gf = get_group_features()
+    gf.refresh()
 
     # Check superuser
     if not gf.is_superuser(user_id):
