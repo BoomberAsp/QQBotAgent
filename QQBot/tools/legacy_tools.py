@@ -17,15 +17,22 @@ if _plugins_dir not in sys.path:
 
 # ── Gacha Pull ───────────────────────────────────────────────────
 
-def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -> str:
+async def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -> str:
     """Simulate game gacha/recruitment pulls.
 
     Args:
         pool_type: Banner type ('常规招募', '几率up招募', '神秘招募', '银河招募')
         count: Number of pulls (1 or 10).
-        up_character: Rate-up character name (optional).
+        up_character: Rate-up character name (optional, supports fuzzy matching).
     """
     from plugins.pullingMonitor import drawing_cards, format_result
+
+    # Trigger background wiki refresh if cache is stale
+    from tools.wiki_scraper import WikiScraper
+    from lib.model_router import model_router
+    scraper = WikiScraper(llm_client=model_router.flash_client)
+    if scraper.is_stale():
+        asyncio.create_task(scraper.refresh())
 
     if pool_type not in ["常规招募", "几率up招募", "神秘招募", "银河招募"]:
         return f"[Gacha Error] 无效的卡池类型: '{pool_type}'。可选: 常规招募, 几率up招募, 神秘招募, 银河招募"
@@ -37,9 +44,20 @@ def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -> str:
     if pool_type == "几率up招募" and not up_character:
         return "[Gacha Error] 几率UP招募需要指定 up_character (UP角色名)"
 
-    results = [drawing_cards(pool_type, up_character) for _ in range(count)]
+    # ── Fuzzy name resolution ──
+    resolved_note = ""
+    actual_up = up_character
+    if up_character:
+        from tools.name_resolver import get_resolver
+        resolver = get_resolver()
+        resolved = resolver.resolve_character(up_character)
+        if resolved and resolved != up_character:
+            resolved_note = f"[名称解析: 「{up_character}」→「{resolved}」]\n"
+            actual_up = resolved
+
+    results = [drawing_cards(pool_type, actual_up) for _ in range(count)]
     text_segment, _ = format_result(results, count)
-    return str(text_segment)
+    return resolved_note + str(text_segment)
 
 
 async def play_gacha_animation(star_level: int, is_single: bool = False, interval: float = 0.75) -> str:
@@ -53,7 +71,7 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
         is_single: True for single pull, False for ten-pull.
         interval: Delay between animation frames in seconds (default 0.75).
     """
-    from agent.context import _send_msg
+    from agent.context import _current_group_id, _send_msg
     from plugins.pullingMonitor import (
         pull_1, blue_end, blue_middle, blue_or_purple_spaceship_close,
         blue_spaceship_open, gold_spaceship_close, gold_spaceship_open,
@@ -66,6 +84,15 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
     send = _send_msg.get()
     if send is None:
         return "[Gacha] 当前环境不支持发送图片（非QQ聊天上下文）。"
+
+    # ── Group feature toggle check ────────────────────────────────
+    group_id = _current_group_id.get()
+    if group_id:
+        from agent.group_features import get_group_features
+        gf = get_group_features()
+        gf.refresh()
+        if not gf.is_enabled(group_id, "image"):
+            return "[Gacha] 该群聊的图片发送功能已被管理员关闭，无法播放抽卡动画。"
 
     if star_level not in (3, 4, 5, 6):
         return f"[Gacha] 无效的星级: {star_level}。可选: 3(蓝), 4(紫), 5(金), 6(红)"

@@ -170,6 +170,10 @@ class Agent:
         # Track tool names for deduplication across iterations
         _last_reported_tools: Optional[frozenset] = None
 
+        # Track repeated tool failures to break infinite retry loops.
+        # Key: (tool_name, hash(arguments_json)) -> failure_count
+        _recent_tool_failures: dict = {}
+
         # Agent loop
         for iteration in range(self.max_tool_iterations):
             llm_client = client or self.client
@@ -218,6 +222,47 @@ class Agent:
 
                 for tr in tool_results:
                     messages.append(tr)
+
+                # ── Detect repeated tool failures (anti-infinite-loop) ──
+                _error_prefixes = (
+                    "[Git Error]", "[Search", "[WebFetch", "[Code Error",
+                    "[Shell", "[Security", "[SSRF", "[PDF Error",
+                )
+                for tc in response["tool_calls"]:
+                    tn = tc["function"]["name"]
+                    args_str = tc["function"].get("arguments", "{}")
+                    try:
+                        import hashlib
+                        args_hash = hashlib.md5(args_str.encode()).hexdigest()[:12]
+                    except Exception:
+                        args_hash = str(hash(args_str))
+                    key = (tn, args_hash)
+
+                    # Find the corresponding tool result
+                    call_id = tc.get("id", f"call_{tn}")
+                    result_text = ""
+                    for tr in tool_results:
+                        if tr.get("tool_call_id") == call_id:
+                            result_text = tr.get("content", "")
+                            break
+
+                    is_error = result_text.startswith("[") and any(
+                        result_text.startswith(prefix) for prefix in _error_prefixes
+                    )
+                    if is_error:
+                        _recent_tool_failures[key] = _recent_tool_failures.get(key, 0) + 1
+                        if _recent_tool_failures[key] >= 2:
+                            messages.append({
+                                "role": "system",
+                                "content": (
+                                    f"⚠️ 工具 '{tn}' 对相同参数的调用已连续失败 "
+                                    f"{_recent_tool_failures[key]} 次。"
+                                    f"请停止重试该操作，向用户说明失败原因并建议替代方案。"
+                                ),
+                            })
+                    else:
+                        # Success resets the counter for this tool+args
+                        _recent_tool_failures.pop(key, None)
 
                 continue
 
@@ -318,6 +363,12 @@ class Agent:
                 f"如果用户的请求需要使用你无法访问的工具（如 shell 命令、网页抓取等），"
                 f"请礼貌地说明当前权限不支持此操作，并建议用户联系管理员获取更高权限。"
             )
+
+        # 4.5. Group feature restrictions
+        from agent.context import _current_group_context
+        group_ctx = _current_group_context.get()
+        if group_ctx:
+            messages[0]["content"] += group_ctx
 
         # 5. Relevant long-term memories (scoped to user_id)
         if self.memory:

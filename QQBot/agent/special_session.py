@@ -95,18 +95,15 @@ class SpecialSessionManager:
         Raises:
             ValueError: If the user already has max_per_user sessions.
         """
-        sessions = self.list_sessions(user_id)
-        if len(sessions) >= self.max_per_user:
-            names = ", ".join(s["name"] for s in sessions)
-            raise ValueError(
-                f"已达到最大特殊会话数 ({self.max_per_user})。"
-                f"现有会话: {names}。请先删除一个再创建。"
-            )
-
+        # NOTE: Per-role session limits are enforced upstream by
+        # agent_router._handle_session_command() via PermissionManager.
+        # create() intentionally does NOT check self.max_per_user so that
+        # per-role limits (admin=10, vip=3, regular=1) can take effect.
         if name is None:
             name = self._generate_temp_name()
 
         # Ensure unique name
+        sessions = self.list_sessions(user_id)
         base_name = name
         counter = 1
         while any(s["name"] == name for s in sessions):

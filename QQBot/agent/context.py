@@ -43,3 +43,17 @@ _current_user_role: contextvars.ContextVar[str] = (
 _current_code_limits: contextvars.ContextVar[dict] = (
     contextvars.ContextVar("_current_code_limits", default={})
 )
+
+# Current group chat ID (only set for group messages, empty for private).
+# Set by agent_router before each agent.run() call.
+# Used by tools (play_gacha_animation) to check group-level feature toggles.
+_current_group_id: contextvars.ContextVar[str] = (
+    contextvars.ContextVar("_current_group_id", default="")
+)
+
+# Group feature restriction context — pre-built system prompt section
+# set by agent_router before agent.run(). Read by agent._build_messages()
+# to inject into the system prompt so the LLM knows what's disabled.
+_current_group_context: contextvars.ContextVar[str] = (
+    contextvars.ContextVar("_current_group_context", default="")
+)

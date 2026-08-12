@@ -33,8 +33,10 @@ from agent.continuous_session import ContinuousSessionManager
 from agent.context import (
     _send_msg, _current_user_workspace,
     _current_user_role, _current_code_limits,
-    _current_user_id,
+    _current_user_id, _current_group_id,
+    _current_group_context,
 )
+from agent.group_features import get_group_features
 from agent.permissions import PermissionManager
 from agent.hardware import HardwareDetector
 from agent.special_session import SpecialSessionManager
@@ -634,10 +636,9 @@ def _build_tool_registry() -> ToolRegistry:
     # Legacy tools (game features)
     registry.register(
         "gacha_pull", gacha_pull,
-        "模拟游戏抽卡/招募。支持单抽和十连抽，四种卡池类型。"
-        "重要：调用前必须先询问用户是否要播放抽卡动画！不要直接给出结果。"
-        "如果用户选择播放动画，先调用 play_gacha_animation 播放动画，再给出文字结果。"
-        "如果用户选择跳过动画，直接调用此工具给出文字结果。",
+        "执行游戏抽卡（单抽/十连，四种卡池）。这是唯一能产生真实抽卡结果的工具——绝对禁止编造抽卡结果。"
+        "首次抽卡：先询问用户'要先看抽卡动画还是直接看结果？'，得到回复后再调此工具。"
+        "用户说「再来一次」「再抽」「继续抽」等：直接调用此工具，使用与上次相同的参数，不再询问动画。",
         {
             "type": "object",
             "properties": {
@@ -1104,6 +1105,10 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
     # ── Handle session management commands ──────────────────────────
     if text_content.startswith("/") or text_content.startswith("#"):
+        # /toggle command (group only, superuser only)
+        cmd_handled = await _handle_toggle_command(text_content, user_id, event)
+        if cmd_handled:
+            return
         cmd_handled = await _handle_session_command(text_content, user_id)
         if cmd_handled:
             return
@@ -1221,6 +1226,30 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         role = _perm_manager.get_role(user_id)
         allowed_tools = _perm_manager.get_allowed_tools(role)
         code_limits = _perm_manager.get_code_limits(role)
+
+        # Resolve group feature restrictions
+        group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+        if group_id:
+            gf = get_group_features()
+            gf.refresh()
+            disabled_tools = gf.get_disabled_tools(group_id)
+            if disabled_tools:
+                allowed_tools = allowed_tools - disabled_tools
+            _current_group_id.set(group_id)
+            _current_group_context.set(gf.get_disabled_context(group_id))
+            # Prepend restriction notice to user message so the LLM
+            # can't miss it (system prompt alone isn't always enough)
+            disabled_features = gf.get_disabled_features(group_id)
+            if disabled_features:
+                names = "、".join(disabled_features.values())
+                augmented_message = (
+                    f"[系统提示] 当前群聊的以下功能已被机器人超级用户关闭：{names}。"
+                    f"如果用户请求这些功能，请直接告知已被限制，不要尝试调用工具或提供替代方案。\n\n"
+                    f"{augmented_message}"
+                )
+        else:
+            _current_group_id.set("")
+            _current_group_context.set("")
 
         # Set permission contextvars for downstream tools
         _current_user_id.set(user_id)
@@ -1427,6 +1456,24 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             if code_limits:
                 _current_code_limits.set(code_limits.to_dict())
 
+            # Resolve group feature restrictions
+            gf = get_group_features()
+            gf.refresh()
+            disabled_tools = gf.get_disabled_tools(group_id)
+            if disabled_tools:
+                allowed_tools = allowed_tools - disabled_tools
+            _current_group_id.set(group_id)
+            _current_group_context.set(gf.get_disabled_context(group_id))
+            # Prepend restriction notice to user message
+            disabled_features = gf.get_disabled_features(group_id)
+            if disabled_features:
+                names = "、".join(disabled_features.values())
+                augmented_message = (
+                    f"[系统提示] 当前群聊的以下功能已被机器人超级用户关闭：{names}。"
+                    f"如果用户请求这些功能，请直接告知已被限制，不要尝试调用工具或提供替代方案。\n\n"
+                    f"{augmented_message}"
+                )
+
             response = await asyncio.wait_for(
                 agent.run(augmented_message, user_id, client=client,
                            progress_callback=lambda msg: _safe_send(msg, matcher=continuous_router),
@@ -1471,6 +1518,70 @@ async def _safe_send(message, max_retries: int = 2, matcher=None):
     if last_error:
         from nonebot import logger
         logger.warning(f"Failed to send message after {max_retries} retries: {last_error.info}")
+
+
+async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -> bool:
+    """Handle /toggle command for group feature management.
+
+    Only works in group chats, only for superusers.
+    Returns True if the command was handled.
+    """
+    cmd, _, args = text.partition(" ")
+    if cmd not in ("/toggle", "#toggle"):
+        return False
+
+    # Only in group chats
+    if not isinstance(event, GroupMessageEvent):
+        await _safe_send("此命令仅在群聊中可用。")
+        return True
+
+    group_id = str(event.group_id)
+    gf = get_group_features()
+    gf.refresh()
+
+    # Check superuser
+    if not gf.is_superuser(user_id):
+        await _safe_send("此命令仅限超级用户（代码开发者）使用。")
+        return True
+
+    from agent.group_features import FEATURE_LABELS, FEATURE_ORDER
+
+    args = args.strip().lower()
+
+    # /toggle — show current settings
+    if not args:
+        features = gf.get_all_features(group_id)
+        lines = ["当前群聊功能状态："]
+        for key in FEATURE_ORDER:
+            label = FEATURE_LABELS[key]
+            state = "开启" if features[key] else "关闭"
+            lines.append(f"  {label}: {state}")
+        lines.append(f"\n用法: /toggle <功能名> <on|off>  例如: /toggle gacha off")
+        await _safe_send("\n".join(lines))
+        return True
+
+    # /toggle <feature> <on|off>
+    parts = args.split()
+    if len(parts) != 2:
+        await _safe_send("用法: /toggle <功能名> <on|off>\n例如: /toggle gacha off\n\n可用的功能名: " + ", ".join(FEATURE_ORDER))
+        return True
+
+    feature, action = parts
+
+    if action not in ("on", "off"):
+        await _safe_send("第二个参数必须是 on 或 off。\n例如: /toggle gacha off")
+        return True
+
+    try:
+        enabled = (action == "on")
+        gf.set_feature(group_id, feature, enabled)
+        label = FEATURE_LABELS.get(feature, feature)
+        state = "开启" if enabled else "关闭"
+        await _safe_send(f"已在本群{state}「{label}」。")
+    except ValueError as e:
+        await _safe_send(str(e))
+
+    return True
 
 
 async def _handle_session_command(text: str, user_id: str) -> bool:
