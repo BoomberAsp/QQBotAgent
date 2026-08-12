@@ -126,9 +126,10 @@ setup_env() {
         echo "  HOST=0.0.0.0"
         echo "  PORT=8081"
         echo "  ONEBOT_ACCESS_TOKEN=<你的Token>"
-        echo "  SUPERUSERS=[\"你的QQ号\"]"
+        echo "  SUPERUSERS=[\"管理员的QQ号1\",\"管理员的QQ号2\"]"
+        echo "  VIP_USERS=[\"VIP用户的QQ号1\",\"VIP用户的QQ号2\"]"
         echo "  DEEPSEEK_API_KEY=<你的DeepSeek API Key>"
-        echo "  DEEPSEEK_API_BASE=https://api.deepseek.com"
+        echo "  DEEPSEEK_API_BASE=https://api.deepseek.com/v1"
         echo "  SEARXNG_ENDPOINT=http://localhost:8082"
         echo "  AMAP_API_KEY=<你的高德地图Key> (可选, 用于地图工具)"
         echo "  NAPCAT_HTTP_BASE=http://127.0.0.1:6099 (NapCat HTTP服务地址, 用于下载语音消息)"
@@ -141,16 +142,17 @@ DRIVER=~fastapi
 HOST=0.0.0.0
 PORT=8081
 ONEBOT_ACCESS_TOKEN=请修改为你的Token
-SUPERUSERS=["你的QQ号"]
+SUPERUSERS=["管理员的QQ号1","管理员的QQ号2"]
+VIP_USERS=["VIP用户的QQ号1","VIP用户的QQ号2"]
 COMMAND_START=["/", ""]
 COMMAND_SEP=[" "]
-DEEPSEEK_API_KEY=请修改为你的DeepSeek API Key （或其它厂商提供的LLM API key，记得删除括号）
-DEEPSEEK_API_BASE=https://api.deepseek.com （或其它厂商提供的LLM base url，记得删除括号）
+DEEPSEEK_API_KEY=请修改为你的DeepSeek API Key
+DEEPSEEK_API_BASE=https://api.deepseek.com/v1
 SEARXNG_ENDPOINT=http://localhost:8082
 # 高德地图 (可选, 用于地图/天气/路径规划)
 AMAP_API_KEY=
 # ── 用户数据 & 特殊会话 (v2.13) ──
-USER_DATA_ROOT=/data/qqbot/users
+USER_DATA_ROOT=/path/to/store/users'/data
 MAX_SPECIAL_SESSIONS=3
 USER_WORKSPACE_QUOTA_MB=500
 # ── NapCat HTTP 服务地址 (用于下载语音/图片/文件) ──

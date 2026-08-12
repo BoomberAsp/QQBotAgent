@@ -4,13 +4,13 @@
 
 ## 特性
 
-- **智能体架构** — Markdown 配置驱动，OpenAI 兼容 Function Calling，最多 12 轮工具调用
+- **智能体架构** — Markdown 配置驱动，OpenAI 兼容 Function Calling，最多 20 轮工具调用
 - **多模型路由** — 轻量 FLASH 模型处理简单任务，强力 REASONING 模型处理复杂推理，MULTIMODAL 模型理解图片，AUDIO 模型分析语音
-- **特殊会话** — 每用户至多 3 个持久化会话，百万 token 上下文窗口，快照+增量双层存储
+- **特殊会话** — 每用户至多 10/3/1 个（按角色），百万 token 上下文窗口，快照+增量双层存储
 - **用户工作区** — 每用户独立文件空间，配额管理（3 级策略），跨会话隔离
 - **流式交互** — 群聊连续对话模式：@一次后 5 分钟内免 @，消息自动续期
 - **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）
-- **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制）
+- **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制，分级限制：管理员 60s/100KB，会员 15s/50KB）
 - **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
 - **用户系统** — 长期记忆（Markdown 存储）+ LLM 驱动用户画像提取
 - **游戏工具** — 抽卡模拟（数据 JSON 可配置）、战斗测速、乱速概率计算
@@ -61,14 +61,16 @@ DRIVER=~fastapi
 HOST=0.0.0.0
 PORT=8081
 ONEBOT_ACCESS_TOKEN=你的Token
-SUPERUSERS=["你的QQ号"]
+SUPERUSERS=["管理员的QQ号1","管理员的QQ号2"]
+VIP_USERS=["VIP用户的QQ号1","VIP用户的QQ号2"]
 DEEPSEEK_API_KEY=sk-xxxxxxxx
-DEEPSEEK_API_BASE=https://api.deepseek.com
+DEEPSEEK_API_BASE=https://api.deepseek.com/v1
 SEARXNG_ENDPOINT=http://localhost:8082
 AMAP_API_KEY=你的高德Key  # 可选，用于地图工具
-USER_DATA_ROOT=data/users_store/  # 用户数据根目录
-MAX_SPECIAL_SESSIONS=3  # 每用户最大特殊会话数
-USER_WORKSPACE_QUOTA_MB=500  # 每用户工作区配额 (MB)
+NAPCAT_HTTP_BASE=http://127.0.0.1:6099  # NapCat HTTP 服务地址
+USER_DATA_ROOT=/path/to/store/users'/data  # 用户数据根目录
+MAX_SPECIAL_SESSIONS=3  # 每用户最大特殊会话数（默认，实际按角色）
+USER_WORKSPACE_QUOTA_MB=500  # 每用户工作区配额 MB（默认，实际按角色）
 ```
 
 **多模型配置（可选）**：编辑 `QQBot/config/models_settings.json` 配置三种模型，留空则回退到 `.env` 默认配置。参考 `QQBot/config/models_settings_example.json` 格式。
@@ -106,21 +108,43 @@ bash start.sh
 
 应返回已注册的工具列表和机器人状态。
 
-### 特殊会话命令
+### QQ 命令一览
 
-在 QQ 聊天中 @机器人 使用以下命令：
+在 QQ 聊天中 @机器人 或直接发送以下命令：
+
+**会话管理**
 
 | 命令 | 说明 |
 |------|------|
 | `/新会话 [名称]` | 创建特殊会话 (留空由 LLM 自动命名) |
-| `/切换会话 <编号>` | 切换到指定会话 |
-| `/我的会话` | 列出所有特殊会话 |
-| `/重命名会话 <编号> <名称>` | 重命名会话 |
-| `/删除会话 <编号>` | 删除会话 (确认码保护) |
-| `/激活会话` | 查看当前会话状态 |
-| `/退出会话` | 退出特殊会话，回到临时模式 |
-| `/clear` / `清除上下文` | 清除当前会话上下文 |
-| `/status` | 查看 Agent 状态 |
+| `/切换会话 <名称>` | 切换到指定会话 |
+| `/会话列表` 或 `/会话` | 列出所有特殊会话 |
+| `/重命名会话 <旧名> <新名>` | 重命名会话 |
+| `/删除会话 <名称>` | 删除会话 (二次确认，60s 有效) |
+| `/保存为会话 [名称]` | 将当前临时对话保存为特殊会话 |
+| `/结束会话` 或 `/退出特殊会话` 或 `/退出会话` 或 `/临时会话` | 退出特殊会话，回到临时模式 |
+| `/帮助` 或 `/help` 或 `/命令` | 显示完整系统命令列表 |
+
+**连续对话**
+
+| 命令 | 说明 |
+|------|------|
+| `/取消` 或 `#取消` | 退出群聊连续对话模式 |
+
+**其他**
+
+| 命令 | 说明 |
+|------|------|
+| `/clear` 或 `清除上下文` | 清除临时会话上下文 |
+| `/status` | 查看 Agent 运行状态 |
+
+**反馈 & Bug 报告**（零 token 消耗，直达开发者）
+
+| 命令 | 说明 |
+|------|------|
+| `#反馈 <内容>` | 提交使用反馈，自动附用户上下文 |
+| `#bug <描述>` | 提交 Bug 报告，自动附用户上下文 |
+| `#建议 <内容>` | 提交改进建议，自动附用户上下文 |
 
 ## 启动脚本
 
@@ -165,7 +189,7 @@ QQBotAgent/
     │   ├── context.py      #   执行上下文（contextvars, 工具→QQ图片）
     │   ├── memory.py       #   长期记忆（Markdown 文件）
     │   ├── profile.py      #   用户画像（LLM 自动提取）
-    │   └── config/         #   智能体配置（10 个 Markdown）
+    │   └── config/         #   智能体配置（Markdown 文件）
     │
     ├── plugins/            # NoneBot 插件
     │   └── agent_router.py #   ★ 统一消息入口（所有交互的唯一处理器）
@@ -189,7 +213,7 @@ QQBotAgent/
         ├── sessions/       #   会话持久化
         ├── memory/         #   长期记忆
         ├── users/          #   用户画像
-        └── workspace/      #   工作区（代码执行 / 仓库 / 上传 / 输出）
+        └── users/           #   用户数据（按 QQ 号隔离的工作区/会话/画像）
 ```
 
 ## 核心架构
@@ -203,14 +227,14 @@ User Message → agent_router
        ├── ModelRouter.classify_complexity(message)
        │     FLASH_MODEL → "simple" 或 "complex"
        ├── Build Messages (System + Profile + Memory + History)
-       └── Think→Act→Observe→Respond 循环（最多 12 轮）
+       └── Think→Act→Observe→Respond 循环（最多 20 轮）
             ├── think: LLM 分析，决定是否调用工具
             ├── act: 执行工具（搜索 / 代码 / 文件等）
             ├── observe: 工具结果注入对话
             └── respond: 无工具调用时 → 回复用户
 ```
 
-**关键参数**：`max_tool_iterations=12`, `thinking_timeout=180s`, `total_timeout=300s`, `session_timeout=30min`
+**关键参数**：`max_tool_iterations=20`, `thinking_timeout=180s`, `total_timeout=300s`, `session_timeout=30min`
 
 ### 多模型路由
 
@@ -247,10 +271,12 @@ class Agent:
     # 构造
     def __init__(self, deepseek_client, tool_registry, config_dir,
                  session_manager=None, memory_system=None, profile_manager=None,
-                 max_tool_iterations=12, thinking_timeout=180.0)
+                 max_tool_iterations=20, thinking_timeout=180.0)
 
     # 核心方法
-    async def run(self, user_message, user_id, client=None) -> str
+    async def run(self, user_message, user_id, client=None,
+                  progress_callback=None, session_type="temporary",
+                  allowed_tools=None, user_role=None) -> str
     def build_system_prompt(self) -> str                      # SOUL + IDENTITY + AGENTS
     def get_status(self) -> dict                              # 运行状态
     def clear_user_session(self, user_id)                     # 清除会话
@@ -307,15 +333,17 @@ class ContinuousSessionManager:
 | `MemorySystem` | `memory.py` | 长期记忆（Markdown 文件），关键词搜索，最多返回 3 条 |
 | `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣，持久化到 `data/users/` |
 
-## 已注册工具（20 个）
+## 已注册工具（21 个）
 
 | 工具 | 说明 |
 |------|------|
-| `search_web` | SearXNG 聚合搜索（天气 / 新闻 / 百科） |
+| `search_web` | SearXNG 聚合搜索（新闻 / 百科 / 知识） |
 | `web_fetch` | 直接抓取 HTTPS 网页内容（搜索无结果时的 fallback） |
 | `execute_code` | Python 沙盒执行（支持图表输出） |
 | `shell_exec` | Shell 命令执行（白名单+管道） |
 | `get_time` | 当前日期时间 |
+| `get_system_load` | 服务器实时负载（CPU/内存/磁盘） |
+| `get_user_info` | 用户信息快照（权限/会话/工作区/工具范围） |
 | `read_file` | 读取文件（文本 / PDF / 图片 AI 分析 / 音频 AI 分析） |
 | `summarize_pdf` | PDF 提取 + 总结 |
 | `download_repo` | Git clone 仓库（HTTPS only） |
@@ -393,12 +421,25 @@ cd QQBot && python test_agent.py
 
 | 边界 | 规则 |
 |------|------|
-| 代码执行 | `python3 -I` 隔离 + 模式匹配（15 个禁止模式）+ 60s / 100KB 限制 |
+| 权限系统 | 三层权限 (管理员/会员/普通用户)，环境变量配置 (`SUPERUSERS` / `VIP_USERS`)，schema 过滤 + 硬拦截纵深防御 |
+| 代码执行 | `python3 -I` 隔离 + 正则匹配 + AST 白名单三层过滤，分级限制 (管理员 60s/100KB，会员 15s/50KB) |
 | 文件访问 | 仅在 `/data/workspace/`，拒绝路径遍历（`..`, `~`, `/etc/`） |
-| 网络 | 仅通过预定义工具（search, download_repo HTTPS only） |
-| 隐私 | per-user 隔离，本地存储，不上传第三方（除 API 调用外） |
+| 网络 | 仅通过预定义工具（search, download_repo HTTPS only），`web_fetch` 内置 SSRF 防护 |
+| 隐私 | per-user 隔离，本地存储，不上传第三方（除 API 调用外），审计日志 (JSONL) |
 
-详见 `QQBot/agent/config/WORKSPACE.md`。
+### 权限系统
+
+通过 `SUPERUSERS` 和 `VIP_USERS` 环境变量配置用户层级：
+
+| 角色 | 配置方式 | 权限范围 |
+|------|---------|---------|
+| **管理员** | `SUPERUSERS` 环境变量 | 全部工具（含 `shell_exec`），完整 `execute_code`（60s/100KB/256MB），2GB 工作区，10 个特殊会话 |
+| **会员** | `VIP_USERS` 环境变量 | 大部分工具（含 `web_fetch`、`download_repo`、受限 `execute_code`），500MB 工作区，3 个特殊会话 |
+| **普通用户** | 默认 | 基础工具（搜索/天气/地图/文件阅读/娱乐），100MB 工作区，1 个特殊会话 |
+
+工具权限通过请求时 **schema 过滤** 控制（LLM 只看到允许调用的工具），`_execute_tool_calls()` 中的硬拦截作为纵深防御。
+
+详见 `QQBot/agent/config/WORKSPACE.md` 与 `QQBot/agent/config/AGENTS.md`。
 
 ## 安装 NapCat（详细）
 

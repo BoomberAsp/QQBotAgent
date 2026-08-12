@@ -69,7 +69,10 @@ _gacha_data = None  # Lazy-loaded cache
 
 
 def _load_gacha_data():
-    """Load gacha pools and banners from config/gacha_data.json.
+    """Load gacha pools and banners.
+
+    Tries wiki cache first (via WikiScraper), falls back to static
+    config/gacha_data.json if cache is stale or unavailable.
 
     Returns a dict with two keys:
         pools:   dict[str, dict] — pool_name → {star, type, items: [{name, bond?}]}
@@ -83,6 +86,28 @@ def _load_gacha_data():
     if _gacha_data is not None:
         return _gacha_data
 
+    from tools.wiki_scraper import WikiScraper
+
+    scraper = WikiScraper()
+    wiki_data = scraper.get_cached_data()
+
+    if wiki_data is not None:
+        pools = wiki_data["pools"]
+        banners = wiki_data.get("banners", {})
+    else:
+        pools, banners = _load_static_gacha_data()
+
+    # ── Build derived bond pools ──────────────────────────────────
+    # These are already computed by WikiScraper, but we recompute here
+    # for the static fallback path and to ensure consistency.
+    _build_derived_pools(pools)
+
+    _gacha_data = {"pools": pools, "banners": banners}
+    return _gacha_data
+
+
+def _load_static_gacha_data():
+    """Load gacha data from config/gacha_data.json (fallback path)."""
     import json
     config_path = os.path.join(CURRENT_DIR, "..", "config", "gacha_data.json")
     config_path = os.path.abspath(config_path)
@@ -90,18 +115,23 @@ def _load_gacha_data():
     with open(config_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    pools = data["pools"]
-    banners = data["banners"]
+    return data["pools"], data["banners"]
 
-    # ── Build derived bond pools from character data ────────────
-    # bonds_five_star_all: 三色 + 限定 five-star character bonds
+
+def _build_derived_pools(pools):
+    """Build bonds_five_star_all and bonds_five_star_tricolor from character data."""
+    # Only build if not already present (WikiScraper already sets them)
+    if "bonds_five_star_all" in pools and "bonds_five_star_tricolor" in pools:
+        # Validate they are non-empty; if empty, rebuild
+        if pools["bonds_five_star_all"]["items"] and pools["bonds_five_star_tricolor"]["items"]:
+            return
+
     bonds_all = []
     for pool_key in ("three_color_five_star", "special_three_color_five_star"):
         for item in pools[pool_key]["items"]:
             if "bond" in item:
                 bonds_all.append({"name": item["bond"]})
 
-    # bonds_five_star_tricolor: 三色 five-star bonds only
     bonds_tricolor = []
     for item in pools["three_color_five_star"]["items"]:
         if "bond" in item:
@@ -119,9 +149,6 @@ def _load_gacha_data():
         "type": "bond",
         "items": bonds_tricolor,
     }
-
-    _gacha_data = {"pools": pools, "banners": banners}
-    return _gacha_data
 
 
 def _find_character_bond(character_name: str, pools: dict) -> str | None:
@@ -284,12 +311,13 @@ def format_result(result, count):
         return MessageSegment.text(result_text), 3
 
 
-async def pulling_anime(matcher: Matcher, level: int, single: bool):
+async def pulling_anime(matcher: Matcher, level: int, single: bool, interval: float = 0.75):
     """
     输入抽卡的星级
     :param single: 是否为单抽
     :param matcher: 上一级函数调用的matcher
     :param level: 抽卡结果中最高星级的等级：红色6，金色5，紫色4，蓝色3。
+    :param interval: 动画帧之间间隔秒数。
     :return: 无
     """
     if level == 3: # 蓝色
@@ -298,16 +326,16 @@ async def pulling_anime(matcher: Matcher, level: int, single: bool):
 
         else:
             await matcher.send(ten_pull_start)
-        time.sleep(0.75)
+        time.sleep(interval)
 
         await matcher.send(pull_1)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_middle)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_end)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_or_purple_spaceship_close)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_spaceship_open)
 
     if level == 4: # 紫色
@@ -316,15 +344,15 @@ async def pulling_anime(matcher: Matcher, level: int, single: bool):
 
         else:
             await matcher.send(ten_pull_start)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(pull_1)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_middle)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(purple_end)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_or_purple_spaceship_close)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(purple_spaceship_open)
 
     if level == 5: # 金色
@@ -333,15 +361,15 @@ async def pulling_anime(matcher: Matcher, level: int, single: bool):
 
         else:
             await matcher.send(ten_pull_start)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(pull_1)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(purple_middle)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(golden_end)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(gold_spaceship_close)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(gold_spaceship_open)
 
     if level == 6: # 红色
@@ -350,27 +378,27 @@ async def pulling_anime(matcher: Matcher, level: int, single: bool):
 
         else:
             await matcher.send(ten_pull_start)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(pull_1)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(purple_middle)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(red_end)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(red_spaceship_close)
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(red_spaceship_open)
 
 
-async def single_pulling_anime(matcher: Matcher, level: int):
+async def single_pulling_anime(matcher: Matcher, level: int, interval: float = 0.75):
     if level == 3:
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(blue_spaceship_open)
     elif level == 4:
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(purple_spaceship_open)
     elif level == 5:
-        time.sleep(0.75)
+        time.sleep(interval)
         await matcher.send(gold_spaceship_open)
     elif level == 6:
         await matcher.send(red_spaceship_open)

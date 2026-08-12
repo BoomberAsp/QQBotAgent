@@ -5,7 +5,11 @@ These rules are enforced both by the agent's system prompt (refusal) and by tool
 
 ---
 
-## 1. Workspace Root
+## 1. Workspace — Two Layers
+
+系统有**两层工作区**，用途不同、路径不同：
+
+### 共享工作区（所有用户公用，临时暂存）
 
 ```
 默认: 项目 data/workspace/
@@ -21,6 +25,34 @@ MUST be confined within this directory.
 | `{workspace}/repos/` | Cloned repositories |
 | `{workspace}/uploads/` | User-uploaded files — auto-downloaded from QQ messages (images, PDFs, text files, etc.) |
 | `{workspace}/output/` | Generated output files |
+
+**注意**: 共享工作区是所有用户的临时文件暂存区，不具备用户隔离。用户上传的文件保存于此，工具执行也在此。
+
+### 用户独立工作区（按 QQ 号隔离，持久存储）
+
+```
+路径: {USER_DATA_ROOT}/{safe_qq_id}/workspace/
+管理者: UserWorkspaceManager (agent/workspace.py)
+配额: 每用户 500MB（通过 USER_WORKSPACE_QUOTA_MB 环境变量配置）
+```
+
+| Directory | Purpose |
+|-----------|---------|
+| `{user_workspace}/code/` | 该用户持久化的代码文件 |
+| `{user_workspace}/uploads/` | 该用户持久化的上传文件 |
+| `{user_workspace}/output/` | 该用户生成的输出文件 |
+| `{user_workspace}/projects/` | 该用户的项目文件 |
+
+**关键特性**:
+- 按 QQ 号隔离，用户 A 无法访问用户 B 的工作区
+- 持久化存储，重启后不丢失
+- 配额管理：超出 80% 时提醒，超出 100% 时发出警告
+- 用户的系统提示词中会动态注入工作区路径和配额信息
+
+**共享工作区 vs 用户工作区**:
+- 共享区是临时暂存，所有用户共用，用户上传的图片/文件下载到这里
+- 用户区是持久存储，按 QQ 号隔离，适合存放项目文件、代码、长期数据
+- 两者是不同的目录，不存在层级或包含关系
 
 ## 2. Capability Boundaries
 
@@ -56,12 +88,12 @@ MUST be confined within this directory.
 
 ### 2.4 Repository Download (RESTRICTED)
 
-| Rule | Constraint |
-|------|------------|
-| **Target directory** | Always `/data/workspace/repos/` |
-| **Max clone time** | 120 seconds |
+| Rule | Constraint                                      |
+|------|-------------------------------------------------|
+| **Target directory** | Always `/data/workspace/repos/`                 |
+| **Max clone time** | 120 seconds                                     |
 | **Protocol** | HTTPS only (reject `git@`, `ssh://`, `file://`) |
-| **Max repo size** | No explicit limit (timeout-based) |
+| **Max repo size** | No bigger than 250MB (and timeout-based limit)  |
 
 ### 2.5 Entertainment (ALLOWED)
 
@@ -131,12 +163,12 @@ The agent MUST refuse (politely) when asked to:
 
 ## 5. Resource Limits (per user request)
 
-| Resource | Limit |
-|----------|-------|
-| Max tool calls per user message | 5 |
-| Max total processing time | 200 seconds |
-| Max response length | 2000 characters (auto-split into 500-char chunks) |
-| Session lifetime | 30 minutes of inactivity |
+| Resource | Limit                                             |
+|----------|---------------------------------------------------|
+| Max tool calls per user message | 20                                                |
+| Max total processing time | 300 seconds                                       |
+| Max response length | 2500 characters (auto-split into 500-char chunks) |
+| Session lifetime | 30 minutes of inactivity                          |
 
 ## 6. Privacy
 

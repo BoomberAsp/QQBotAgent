@@ -5,7 +5,7 @@
 | Field | Value |
 |-------|-------|
 | **Name** | Roxy |
-| **Version** | 2.0.0 (Agent Architecture) |
+| **Version** | 2.13 (Agent Architecture) |
 | **Created** | 2025 |
 | **Owner** | BoomberAsp |
 | **License** | MIT |

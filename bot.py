@@ -22,6 +22,17 @@
 # if __name__ == "__main__":
 #     nonebot.run()
 import os
+import sys
+
+# ── Load .env into os.environ BEFORE any module imports ──────────
+# NoneBot2 loads .env into its own pydantic config model but does NOT
+# set os.environ. Many downstream modules (agent_router, permissions,
+# etc.) read os.environ directly at import time. This call ensures
+# all .env values are available through os.environ from the start.
+from dotenv import load_dotenv as _load_dotenv
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "QQBot", ".env")
+_load_dotenv(_ENV_PATH)
+
 import nonebot
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 from nonebot.rule import command

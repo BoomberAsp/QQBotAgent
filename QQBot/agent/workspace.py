@@ -112,12 +112,12 @@ class UserWorkspaceManager:
                 f"建议清理不需要的文件。"
             )
 
-        # Over quota — allow the operation but flag for next time
+        # Over quota — hard reject
         self._over_quota[user_id] = True
-        return True, (
-            f"⚠️ 工作区已超出配额: {usage_mb:.0f} MB / "
-            f"{self.quota_bytes // (1024 * 1024)} MB。"
-            f"请尽快清理不需要的文件以释放空间。"
+        return False, (
+            f"⛔ 工作区已超出配额: {usage_mb:.0f} MB / "
+            f"{self.quota_bytes // (1024 * 1024)} MB ({usage_pct:.0f}%)。"
+            f"请清理不需要的文件后重试。"
         )
 
     def is_over_quota(self, user_id: str) -> bool:

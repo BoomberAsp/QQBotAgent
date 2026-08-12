@@ -295,9 +295,9 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: gacha_pull
 
-**Description**: Simulate a game character gacha/recruitment pull. Supports single pulls and ten-pulls across different banner types (standard, rate-up, mystic, galaxy).
+**Description**: Execute a game character gacha/recruitment pull. Supports single pulls and ten-pulls across four banner types (标准, UP, 神秘, 银河). **This is the ONLY way to produce real gacha results — never fabricate or simulate gacha output.**
 
-**When to use**: When the user wants to simulate character pulls or gacha draws. Keywords: 单抽, 十连抽, 抽卡, 招募.
+**When to use**: Any gacha/抽卡 request. Keywords: 单抽, 十连抽, 抽卡, 招募, 抽一发, 再来一次 (after a previous pull).
 
 **Parameters**:
 ```json
@@ -317,7 +317,7 @@ This document defines all tools available to the agent. Each tool has a name, de
     },
     "up_character": {
       "type": "string",
-      "description": "Rate-up character name (only for rate-up and mystic banners)",
+      "description": "Rate-up character name (supports fuzzy matching — aliases, English names, homophones all resolve correctly)",
       "default": null
     }
   },
@@ -325,7 +325,11 @@ This document defines all tools available to the agent. Each tool has a name, de
 }
 ```
 
-**Important**: This tool only returns **text** results. Before calling this tool, you MUST first ask the user whether they want to see the pull animation. Do NOT call this tool directly without asking.
+**Workflow rules**:
+
+1. **First gacha request in conversation**: Ask "要先看抽卡动画还是直接看结果？", then call this tool after the user replies.
+2. **Follow-up "再来一次" / "再抽" / "继续抽"**: Call this tool **immediately** with the same pool_type and up_character as the previous call. Do NOT ask about animation again.
+3. **NEVER fabricate gacha results**. Every pull result MUST come from this tool. If you output star ratings, character names, or gacha results without calling this tool, you are hallucinating.
 
 ---
 
@@ -463,6 +467,30 @@ This document defines all tools available to the agent. Each tool has a name, de
   "required": []
 }
 ```
+
+---
+
+## Tool: get_user_info
+
+**Description**: 返回当前用户的系统信息快照，包括权限级别、特殊会话列表（数量/名称/消息数）、工作区磁盘用量、可用工具范围及分类、代码执行限制（如有）。此工具零推理 token 消耗，直接读取系统状态。
+
+**When to use**: 当用户询问以下任一问题时必须调用：
+- 「我的设置」「我的信息」「我的账号」
+- 「我有什么权限」「我能用什么工具」「我的功能范围」
+- 「我的工作区」「我的空间」「我的配额」
+- 「我的会话」「我有几个特殊会话」「会话列表」
+- 任何涉及用户自身系统状态的问题
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {},
+  "required": []
+}
+```
+
+**返回内容**: 用户 ID、权限级别、特殊会话列表（含当前激活标记）、工作区路径及用量百分比、**工作区目录快照**（各子目录文件列表及大小）、可用工具按分类陈列、代码执行限制（如有）。
 
 ---
 

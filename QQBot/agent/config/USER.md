@@ -31,7 +31,7 @@ Over time, the agent may infer user preferences:
 
 ## User Data Storage
 
-User profiles are stored at: `QQBot/data/users/{user_id}.json`
+User profiles are stored at: `{USER_DATA_ROOT}/{safe_qq_id}/profile.json` (managed by ProfileManager)
 
 ## Privacy Notice
 
