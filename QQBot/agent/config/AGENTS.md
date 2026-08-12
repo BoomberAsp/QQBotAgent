@@ -115,7 +115,7 @@ All file operations MUST stay within the workspace root (default: project `data/
 | 命令 | 说明 |
 |------|------|
 | `/personality` 或 `/人格切换` | 查看当前人格和可用人格列表 |
-| `/personality <名称>` 或 `/人格切换 <名称>` | 切换人格（例如 `/personality rubi`） |
+| `/personality <名称>` 或 `/人格切换 <名称>` | 切换人格（支持显示名称模糊匹配，如 `/人格切换 露比`） |
 
 ### 兑换码
 

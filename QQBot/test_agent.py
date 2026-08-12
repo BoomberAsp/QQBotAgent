@@ -438,7 +438,9 @@ class TestAgentCore:
         )
 
         prompt = agent.build_system_prompt()
-        assert "Roxy" in prompt, "System prompt should contain agent name"
+        # Agent name comes from the personality profile injected at runtime
+        # (see agent.py _build_messages). Verify prompt is well-formed.
+        assert "QQBot" in prompt, "System prompt should contain bot framework name"
         assert len(prompt) > 100, "System prompt should be substantial"
         print_pass("System prompt construction (from SOUL.md + IDENTITY.md + AGENTS.md)")
 

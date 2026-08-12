@@ -98,6 +98,61 @@ class PersonalityManager:
         available = self._discover()
         return available[0] if available else "assistant"
 
+    def resolve_name(self, name: str) -> Optional[str]:
+        """Resolve a user-provided name to a personality key.
+
+        Matching order:
+        1. Exact key match (e.g., "rubi" → "rubi")
+        2. Case-insensitive key match (e.g., "Rubi" → "rubi")
+        3. Display name substring match (e.g., "露比" matches "露比 (Rubi)")
+        4. Case-insensitive display name match
+        5. Unique partial key match (e.g., "rub" → "rubi" if unique)
+        6. Unique partial display name match
+
+        Returns the matched key, or None if no match or ambiguous.
+        """
+        available = self._discover()
+        if not available:
+            return None
+
+        name_lower = name.lower().strip()
+
+        # 1. Exact key match
+        if name in available:
+            return name
+
+        # 2. Case-insensitive key match
+        for key in available:
+            if key.lower() == name_lower:
+                return key
+
+        # 3. Display name substring match (e.g., "露比" matches "露比 (Rubi)")
+        for key in available:
+            display = self.get_display_name(key)
+            if name in display:
+                return key
+
+        # 4. Case-insensitive display name match
+        for key in available:
+            display_lower = self.get_display_name(key).lower()
+            if name_lower in display_lower:
+                return key
+
+        # 5. Unique partial key match
+        key_matches = [k for k in available if name_lower in k.lower()]
+        if len(key_matches) == 1:
+            return key_matches[0]
+
+        # 6. Unique partial display name match
+        display_matches = [
+            k for k in available
+            if name_lower in self.get_display_name(k).lower()
+        ]
+        if len(display_matches) == 1:
+            return display_matches[0]
+
+        return None
+
     # ── Settings Persistence ──────────────────────────────────────
 
     def _load_settings(self) -> dict:
@@ -126,13 +181,25 @@ class PersonalityManager:
         return name
 
     def set_user_personality(self, user_id: str, name: str):
-        """Set the active personality for a user."""
-        if name not in self._discover():
+        """Set the active personality for a user.
+
+        Supports fuzzy matching: key, display name, or partial match.
+        Raises ValueError with helpful message if no match or ambiguous.
+        """
+        resolved = self.resolve_name(name)
+        if resolved is None:
+            available = self._discover()
+            if not available:
+                raise ValueError("没有可用的人格配置。")
+            examples = []
+            for k in available:
+                d = self.get_display_name(k)
+                examples.append(f"{d} ({k})")
             raise ValueError(
-                f"未知人格: '{name}'。可用: {', '.join(self._discover())}"
+                f"未找到匹配「{name}」的人格。\n\n可用人格:\n  " + "\n  ".join(examples)
             )
         settings = self._load_settings()
-        settings[user_id] = name
+        settings[user_id] = resolved
         self._save_settings()
 
 

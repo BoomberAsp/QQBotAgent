@@ -1630,19 +1630,22 @@ async def _handle_personality_command(text: str, user_id: str) -> bool:
         for p in personalities:
             marker = " ← 当前" if p["key"] == current_key else ""
             lines.append(f"  {p['display_name']} ({p['key']}){marker}")
-        lines.append(f"\n使用 /personality <名称> 切换，例如: /personality {personalities[0]['key']}")
+        lines.append(f"\n使用 /人格切换 <名称> 切换，例如: /人格切换 {personalities[0]['display_name']}")
         await _safe_send("\n".join(lines))
         return True
 
     # /personality <name> — switch
     try:
         pm.set_user_personality(user_id, args)
-        display = pm.get_display_name(args)
+        resolved = pm.resolve_name(args)
+        display = pm.get_display_name(resolved)
         await _safe_send(f"已切换至「{display}」人格。")
     except ValueError as e:
         await _safe_send(str(e))
-
-    return True
+    except Exception as e:
+        from nonebot import logger
+        logger.error(f"Personality switch error: {e}")
+        await _safe_send(f"人格切换失败，请稍后重试。如果问题持续存在，请使用 #bug 反馈。")
 
 
 async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -> bool:
