@@ -1243,7 +1243,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             if disabled_features:
                 names = "、".join(disabled_features.values())
                 augmented_message = (
-                    f"[系统提示] 当前群聊的以下功能已被管理员关闭：{names}。"
+                    f"[系统提示] 当前群聊的以下功能已被机器人超级用户关闭：{names}。"
                     f"如果用户请求这些功能，请直接告知已被限制，不要尝试调用工具或提供替代方案。\n\n"
                     f"{augmented_message}"
                 )
@@ -1469,7 +1469,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             if disabled_features:
                 names = "、".join(disabled_features.values())
                 augmented_message = (
-                    f"[系统提示] 当前群聊的以下功能已被管理员关闭：{names}。"
+                    f"[系统提示] 当前群聊的以下功能已被机器人超级用户关闭：{names}。"
                     f"如果用户请求这些功能，请直接告知已被限制，不要尝试调用工具或提供替代方案。\n\n"
                     f"{augmented_message}"
                 )

@@ -110,14 +110,14 @@ class GroupFeatureManager:
 
         lines = [
             "\n## 当前群聊功能限制",
-            "以下功能已被管理员在本群关闭：",
+            "以下功能已被机器人超级用户在本群关闭：",
         ]
         for key in FEATURE_ORDER:
             if key in disabled:
                 lines.append(f"- {FEATURE_LABELS[key]}：已关闭")
         lines.append(
-            "如果用户请求这些功能，请礼貌告知该功能在当前群聊已被管理员限制，"
-            "建议联系群管理员开启。不要在受限功能上提供替代方案或模拟结果。"
+            "如果用户请求这些功能，请礼貌告知该功能在当前群聊已被机器人超级用户限制，"
+            "而不是群管理员。不要在受限功能上提供替代方案或模拟结果。"
         )
         return "\n".join(lines)
 
