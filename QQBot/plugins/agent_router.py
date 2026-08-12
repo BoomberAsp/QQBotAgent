@@ -360,7 +360,14 @@ async def _download_and_save_file(
     # ── Strategy 1: direct URL download ──────────────────────────
     if url:
         try:
-            async with httpx.AsyncClient() as client:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            }
+            async with httpx.AsyncClient(headers=headers) as client:
                 response = await client.get(url, timeout=120.0, follow_redirects=True)
                 response.raise_for_status()
 
@@ -394,7 +401,11 @@ async def _download_and_save_file(
                 return save_path, None
 
         except httpx.HTTPStatusError as e:
-            return None, f"下载失败 (HTTP {e.response.status_code}): {e.response.reason_phrase}"
+            # QQ CDN URLs may return 400/403 with default headers — fall back to API
+            if e.response.status_code in (400, 403) and bot is not None and file_id:
+                pass  # Fall through to Strategy 2 below
+            else:
+                return None, f"下载失败 (HTTP {e.response.status_code}): {e.response.reason_phrase}"
         except httpx.TimeoutException:
             return None, "下载超时 (120秒)。文件可能过大或网络不稳定。"
         except httpx.RequestError as e:
@@ -836,11 +847,14 @@ _MAX_RECENT_FILES = 200
 _recent_files: dict[str, list[dict]] = {}
 
 
-def _record_file(message_id: str, name: str, path: str):
-    """Record a downloaded file against its source message for reply resolution."""
+def _record_file(message_id: str, name: str, path: str = "", error: str = ""):
+    """Record a downloaded file (or failed download) against its source
+    message for reply resolution."""
     if message_id not in _recent_files:
         _recent_files[message_id] = []
-    _recent_files[message_id].append({"name": name, "path": path})
+    _recent_files[message_id].append(
+        {"name": name, "path": path, "error": error}
+    )
     # Prune oldest entries if cache grows too large
     while len(_recent_files) > _MAX_RECENT_FILES:
         oldest = next(iter(_recent_files))
@@ -878,12 +892,19 @@ def _build_reply_context(event: MessageEvent) -> str:
         if reply_id and reply_id in _recent_files:
             files = _recent_files[reply_id]
             for f in files:
-                parts.append(
-                    f"[用户引用了文件 \"{f['name']}\"。"
-                    f"你必须使用 read_file 工具读取此文件来回答用户问题，"
-                    f"忽略对话历史中关于其他文件的提及。"
-                    f"文件路径: {f['path']}]"
-                )
+                if f.get("error"):
+                    parts.append(
+                        f"[用户引用了文件 \"{f['name']}\"，"
+                        f"但该文件之前下载失败（{f['error']}）。"
+                        f"请告知用户文件无法读取，建议重新上传。]"
+                    )
+                else:
+                    parts.append(
+                        f"[用户引用了文件 \"{f['name']}\"。"
+                        f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                        f"忽略对话历史中关于其他文件的提及。"
+                        f"文件路径: {f['path']}]"
+                    )
 
         return "\n".join(parts) if parts else ""
 
@@ -1094,7 +1115,10 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
 
     # ── Per-user concurrency guard ──
     if user_id in _user_busy:
-        await _safe_send("Roxy 正在处理你的上一条消息，请稍等~")
+        _short = get_personality_manager().get_short_name(
+            get_personality_manager().get_user_personality(user_id)
+        )
+        await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~")
         return
     _user_busy.add(user_id)
     try:
@@ -1150,6 +1174,10 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         cmd_handled = await _handle_redeem_code_command(text_content, user_id)
         if cmd_handled:
             return
+        # /功能 / /features command (direct, no agent)
+        cmd_handled = await _handle_features_command(text_content, user_id)
+        if cmd_handled:
+            return
         # /personality / /人格切换 command
         cmd_handled = await _handle_personality_command(text_content, user_id)
         if cmd_handled:
@@ -1176,6 +1204,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
                 _record_file(msg_id, f"image-{file_id}", saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
+                _record_file(msg_id, f"image-{file_id}", error=error)
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
@@ -1187,6 +1216,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
                 _record_file(msg_id, name, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
+                _record_file(msg_id, name, error=error)
 
         elif seg.type == "record":
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
@@ -1197,6 +1227,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
                 _record_file(msg_id, "语音消息", saved_path)
             elif error:
                 file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
+                _record_file(msg_id, "语音消息", error=error)
 
     # ── File-only messages: acknowledge and skip agent ─────────────
     has_files = bool(file_context_parts)
@@ -1240,7 +1271,9 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
     # Send thinking indicator (non-critical, ignore send failures)
     try:
-        await _safe_send("Roxy 正在思考...")
+        _pm = get_personality_manager()
+        _short = _pm.get_short_name(_pm.get_user_personality(user_id))
+        await _safe_send(f"{_short} 正在思考...")
     except Exception:
         pass
 
@@ -1373,7 +1406,10 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
 
     # ── Per-user concurrency guard ──
     if user_id in _user_busy:
-        await _safe_send("Roxy 正在处理你的上一条消息，请稍等~", matcher=continuous_router)
+        _short = get_personality_manager().get_short_name(
+            get_personality_manager().get_user_personality(user_id)
+        )
+        await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~", matcher=continuous_router)
         return
     _user_busy.add(user_id)
     try:
@@ -1439,6 +1475,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
                 _record_file(msg_id, f"image-{file_id}", saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
+                _record_file(msg_id, f"image-{file_id}", error=error)
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
@@ -1450,6 +1487,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
                 _record_file(msg_id, name, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
+                _record_file(msg_id, name, error=error)
 
         elif seg.type == "record":
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
@@ -1460,6 +1498,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
                 _record_file(msg_id, "语音消息", saved_path)
             elif error:
                 file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
+                _record_file(msg_id, "语音消息", error=error)
 
     # Renew the window on each message
     _continuous_sessions.touch(group_id, user_id)
@@ -1540,7 +1579,9 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         await _send_response(response, matcher=continuous_router)
 
     except asyncio.TimeoutError:
-        await _safe_send("抱歉，Roxy思考时间超过您的配额时长了。请尝试用更简单的方式提问~", matcher=continuous_router)
+        _pm = get_personality_manager()
+        _short = _pm.get_short_name(_pm.get_user_personality(user_id))
+        await _safe_send(f"抱歉，{_short}思考时间超过您的配额时长了。请尝试用更简单的方式提问~", matcher=continuous_router)
     except Exception as e:
         await _safe_send(f"处理消息时出现错误: {str(e)}", matcher=continuous_router)
 
@@ -1646,6 +1687,66 @@ async def _handle_personality_command(text: str, user_id: str) -> bool:
         from nonebot import logger
         logger.error(f"Personality switch error: {e}")
         await _safe_send(f"人格切换失败，请稍后重试。如果问题持续存在，请使用 #bug 反馈。")
+
+    return True
+
+
+async def _handle_features_command(text: str, user_id: str) -> bool:
+    """Handle /功能 / /features command — direct, no agent.
+
+    Reads FEATURES.md and sends it to the user in segments.
+    Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/功能", "/features"):
+        return False
+
+    features_path = os.path.join(
+        os.path.dirname(__file__), "..", "agent", "config", "FEATURES.md"
+    )
+    try:
+        with open(features_path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except FileNotFoundError:
+        await _safe_send("功能表文件不存在，请联系管理员。")
+        return True
+    except Exception as e:
+        await _safe_send(f"读取功能表失败: {e}")
+        return True
+
+    if not content:
+        await _safe_send("功能表为空。")
+        return True
+
+    # Segment by ## section headers, keeping each section intact
+    parts = []
+    current = ""
+    for line in content.split("\n"):
+        if line.startswith("## ") and current:
+            parts.append(current.rstrip())
+            current = line + "\n"
+        else:
+            current += line + "\n"
+    if current:
+        parts.append(current.rstrip())
+
+    # Merge short parts to fit QQ message limits (~400 chars)
+    merged = []
+    buf = ""
+    for part in parts:
+        if len(buf) + len(part) < 500:
+            buf += "\n\n" + part if buf else part
+        else:
+            if buf:
+                merged.append(buf)
+            buf = part
+    if buf:
+        merged.append(buf)
+
+    for i, chunk in enumerate(merged):
+        await _safe_send(chunk)
+        if i < len(merged) - 1:
+            await asyncio.sleep(1.0)
 
     return True
 
@@ -1937,6 +2038,11 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             "/删除会话 <名称> — 删除会话（需确认）\n"
             "/结束会话 或 /临时会话 或 /退出特殊会话 — 退出特殊会话\n"
             "/保存为会话 <名称> — 将临时上下文保存为会话\n\n"
+            "🟣 **人格切换**\n"
+            "/人格切换 — 查看当前人格和可用列表\n"
+            "/人格切换 <名称> — 切换人格（支持模糊匹配）\n\n"
+            "🟠 **游戏工具**\n"
+            "/兑换码 或 /redeem-code — 查询有效兑换码\n\n"
             "🔵 **连续对话（群聊）**\n"
             "/取消 或 #取消 — 退出连续对话模式\n\n"
             "🟡 **反馈**\n"
@@ -1944,6 +2050,7 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             "#bug <内容> — 提交 Bug 报告\n"
             "#建议 <内容> — 提交改进建议\n\n"
             "⚪ **其他**\n"
+            "/功能 或 /features — 查看完整功能一览\n"
             "/status — 查看机器人运行状态\n"
             "/clear 或 新对话 — 清除临时上下文"
         )
@@ -2035,8 +2142,11 @@ async def _handle_special_command(command: str, user_id: str):
     elif command == "/status":
         status = agent.get_status()
         tool_list = "\n  ".join(status["tool_names"])
+        _short = get_personality_manager().get_short_name(
+            get_personality_manager().get_user_personality(user_id)
+        )
         await _safe_send(
-            f"Roxy 状态:\n"
+            f"{_short} 状态:\n"
             f"  活跃会话: {status['active_sessions']}\n"
             f"  已注册工具 ({status['tools_registered']}):\n  {tool_list}"
         )
@@ -2053,7 +2163,10 @@ async def _send_response(response: str, matcher=None):
         return
 
     # Append disclaimer to every agent response
-    disclaimer = "\n\nRoxy 的回答并非总是准确无误，请理性判断。"
+    _pm = get_personality_manager()
+    _persona = _current_personality.get() or _pm.get_default()
+    _short = _pm.get_short_name(_persona)
+    disclaimer = f"\n\n{_short} 的回答并非总是准确无误，请理性判断。"
     response += disclaimer
 
     # Shorter chunks + longer delays to avoid QQ rate limiting

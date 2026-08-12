@@ -11,6 +11,7 @@ swapping a simple prompt string — no complex state machines.
 
 import json
 import os
+import re
 from typing import Dict, List, Optional
 
 
@@ -80,6 +81,20 @@ class PersonalityManager:
                 if line.startswith("# ") and not line.startswith("## "):
                     return line[2:].strip()
         return name
+
+    def get_short_name(self, name: str) -> str:
+        """Extract a short name from the display name for use in messages.
+
+        "助手 Roxy" → "Roxy"
+        "露比 (Rubi)" → "露比"
+        "角色 Roxy (无职转生)" → "Roxy"
+        """
+        display = self.get_display_name(name)
+        # Remove parenthetical at end: "露比 (Rubi)" → "露比"
+        display = re.sub(r'\s*\([^)]*\)\s*$', '', display).strip()
+        # Take the last word as the short name
+        parts = display.split()
+        return parts[-1] if parts else display
 
     # ── List ──────────────────────────────────────────────────────
 

@@ -129,6 +129,7 @@ All file operations MUST stay within the workspace root (default: project `data/
 |------|------|
 | `/取消` 或 `#取消` | 退出群聊连续对话模式（仅连续模式中有效） |
 | `/clear` | 清除临时会话上下文，开始新对话 |
+| `/功能` 或 `/features` | 查看完整功能一览表（直接返回，不经智能体） |
 | `/status` | 查看机器人运行状态（活跃会话数、注册工具列表） |
 
 **当用户使用不存在的命令时：**
