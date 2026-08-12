@@ -15,6 +15,8 @@ import asyncio
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
@@ -61,8 +63,8 @@ class WikiScraper:
     def get_cached_data(self) -> dict | None:
         """Synchronously load cached gacha data if not stale.
 
-        Returns None if cache doesn't exist or is stale (caller should
-        fall back to static JSON). Does NOT make network requests.
+        Returns None if cache doesn't exist, is stale, or contains empty data
+        (caller should fall back to static JSON). Does NOT make network requests.
         """
         if not os.path.exists(self._cache_file):
             return None
@@ -77,7 +79,14 @@ class WikiScraper:
         if self._is_stale(scraped_at):
             return None
 
-        return cache.get("data")
+        data = cache.get("data", {})
+        pools = data.get("pools", {})
+        total_items = sum(len(p.get("items", [])) for p in pools.values())
+        if total_items == 0:
+            print("[WikiScraper] Cached data is empty, treating as stale", file=sys.stderr)
+            return None
+
+        return data
 
     def is_stale(self) -> bool:
         """Check whether the cache is stale (without loading full data)."""
@@ -109,9 +118,19 @@ class WikiScraper:
             if parsed:
                 bonds.append(parsed)
 
+        print(f"[WikiScraper] Parsed {len(members)} members, {len(bonds)} bonds", file=sys.stderr)
+
         # 3. Classify into pools
         pools = self._classify_members(members)
         self._classify_bonds(bonds, pools)
+
+        total_items = sum(len(p["items"]) for p in pools.values())
+        print(f"[WikiScraper] Classified into {len(pools)} pools, {total_items} total items", file=sys.stderr)
+
+        # Guard: don't cache empty results (indicates a fetch failure)
+        if total_items == 0:
+            print("[WikiScraper] WARNING: No items scraped, discarding empty result", file=sys.stderr)
+            return self._load_static_fallback()
 
         # 4. Translate English names to Chinese (hybrid: cache + LLM)
         await self._translate_names(pools)
@@ -149,26 +168,42 @@ class WikiScraper:
 
     @staticmethod
     async def _curl_json(url: str, params: dict) -> dict | None:
-        """Make a GET request via curl subprocess and return parsed JSON.
+        """Make a GET request via curl and return parsed JSON.
 
-        Uses curl because Miraheze's Cloudflare blocks httpx's TLS fingerprint.
+        Uses subprocess.run in a thread executor for reliability.
         """
         query = urlencode(params)
         full_url = f"{url}?{query}"
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "curl", "-sS", "--max-time", "30",
-                "-H", "User-Agent: QQBotAgent/1.0 (Wiki Scraper)",
-                full_url,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _stderr = await proc.communicate()
-            if proc.returncode != 0:
+        loop = asyncio.get_running_loop()
+
+        def _run():
+            try:
+                result = subprocess.run(
+                    ["curl", "-sS", "--max-time", "30",
+                     "-H", "User-Agent: QQBotAgent/1.0 (Wiki Scraper)",
+                     full_url],
+                    capture_output=True, timeout=35,
+                )
+                if result.returncode != 0:
+                    print(f"[WikiScraper] curl exit {result.returncode}: "
+                          f"{result.stderr.decode('utf-8', errors='replace')[:200]}",
+                          file=sys.stderr)
+                    return None
+                return json.loads(result.stdout.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError as e:
+                print(f"[WikiScraper] JSON decode error: {e}", file=sys.stderr)
                 return None
-            return json.loads(stdout.decode("utf-8", errors="replace"))
-        except Exception:
-            return None
+            except FileNotFoundError:
+                print("[WikiScraper] curl not found!", file=sys.stderr)
+                return None
+            except subprocess.TimeoutExpired:
+                print("[WikiScraper] curl timed out", file=sys.stderr)
+                return None
+            except Exception as e:
+                print(f"[WikiScraper] curl error: {type(e).__name__}: {e}", file=sys.stderr)
+                return None
+
+        return await loop.run_in_executor(None, _run)
 
     async def _fetch_template_pages(self, template_name: str) -> list[tuple[str, str]]:
         """Fetch wikitext for all pages embedding a given template.
@@ -177,6 +212,7 @@ class WikiScraper:
         """
         # Step 1: Get all page titles using embeddedin
         titles = await self._get_embedded_titles(template_name)
+        print(f"[WikiScraper] Found {len(titles)} pages for Template:{template_name}", file=sys.stderr)
         if not titles:
             return []
 
@@ -586,9 +622,17 @@ class WikiScraper:
 
     # ── Merge ─────────────────────────────────────────────────────
 
+    def _load_static_fallback(self) -> dict:
+        """Load complete gacha data from static config (fallback when scraping fails)."""
+        try:
+            with open(self._static_config, "r", encoding="utf-8") as f:
+                static = json.load(f)
+            return {"pools": static["pools"], "banners": static.get("banners", {})}
+        except Exception:
+            return {"pools": {}, "banners": {}}
+
     def _merge_with_static(self, pools: dict) -> dict:
         """Merge scraped pools with static banner config."""
-        # Load static banners from gacha_data.json
         banners = {}
         try:
             with open(self._static_config, "r", encoding="utf-8") as f:
