@@ -103,6 +103,7 @@ class SpecialSessionManager:
             name = self._generate_temp_name()
 
         # Ensure unique name
+        sessions = self.list_sessions(user_id)
         base_name = name
         counter = 1
         while any(s["name"] == name for s in sessions):
