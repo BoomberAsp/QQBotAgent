@@ -57,3 +57,10 @@ _current_group_id: contextvars.ContextVar[str] = (
 _current_group_context: contextvars.ContextVar[str] = (
     contextvars.ContextVar("_current_group_context", default="")
 )
+
+# Current personality name (e.g. "assistant", "roxy_character", "rubi").
+# Set by agent_router before each agent.run() call, persisted per-user.
+# Read by agent._build_messages() to inject the personality prompt.
+_current_personality: contextvars.ContextVar[str] = (
+    contextvars.ContextVar("_current_personality", default="assistant")
+)

@@ -319,6 +319,16 @@ class Agent:
 
         # 1. Global system prompt
         system_content = self.build_system_prompt()
+
+        # 1.5. Personality prompt (injected at the very top)
+        from agent.context import _current_personality
+        from agent.personality import get_personality_manager
+        persona_name = _current_personality.get()
+        if persona_name:
+            pm = get_personality_manager()
+            persona_content = pm.load(persona_name)
+            if persona_content:
+                system_content = persona_content + "\n\n---\n\n" + system_content
         user_id = special_session.user_id if special_session else session.user_id
 
         # 2. Session type marker

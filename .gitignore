@@ -12,6 +12,7 @@ venv/
 QQBot/data
 !QQBot/data/wiki_cache/
 !QQBot/data/name_index/
+!QQBot/data/redeem_code/
 QQBot/logs
 QQBot/.env
 QQBot/.env.prod

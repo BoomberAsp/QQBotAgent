@@ -62,6 +62,7 @@ _PUBLIC_TOOLS: Set[str] = {
     "compare_speed_probability",
     "explain_code",
     "translate_text",
+    "redeem_code",
 }
 
 # Additional tools for VIP users (on top of _PUBLIC_TOOLS)

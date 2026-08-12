@@ -13,8 +13,10 @@
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制，分级限制：管理员 60s/100KB，会员 15s/50KB）
 - **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
 - **用户系统** — 长期记忆（Markdown 存储）+ LLM 驱动用户画像提取
-- **游戏工具** — 抽卡模拟（数据 JSON 可配置）、战斗测速、乱速概率计算
+- **游戏工具** — 抽卡模拟（Wiki 自动爬取卡池数据）、战斗测速、乱速概率计算、兑换码查询（自动爬取+手动维护）
 - **地图服务** — 地址↔坐标转换、实时天气、POI搜索、路线规划（高德地图）
+- **群聊管理** — 按群开关功能（抽卡/图片/语音），超级用户可远程管理
+- **人格切换** — 多套人格（助手/角色扮演），简单提示词驱动，用户可自选
 - **安全设计** — 工作区隔离、路径验证防穿越、Git URL 注入防护
 
 ## 技术栈
@@ -125,6 +127,26 @@ bash start.sh
 | `/结束会话` 或 `/退出特殊会话` 或 `/退出会话` 或 `/临时会话` | 退出特殊会话，回到临时模式 |
 | `/帮助` 或 `/help` 或 `/命令` | 显示完整系统命令列表 |
 
+**人格切换**
+
+| 命令 | 说明 |
+|------|------|
+| `/personality` 或 `/人格切换` | 查看当前人格和可用人格列表 |
+| `/personality <名称>` 或 `/人格切换 <名称>` | 切换人格（例如 `/personality rubi`） |
+
+**群聊功能管理**（仅超级用户，仅群聊）
+
+| 命令 | 说明 |
+|------|------|
+| `/toggle` | 查看当前群聊功能开关状态 |
+| `/toggle <功能> <on/off>` | 开关功能（gacha / image / voice） |
+
+**游戏工具**
+
+| 命令 | 说明 |
+|------|------|
+| `/兑换码` 或 `/redeem-code` | 查询当前有效游戏兑换码（直接返回，不经智能体） |
+
 **连续对话**
 
 | 命令 | 说明 |
@@ -189,16 +211,31 @@ QQBotAgent/
     │   ├── context.py      #   执行上下文（contextvars, 工具→QQ图片）
     │   ├── memory.py       #   长期记忆（Markdown 文件）
     │   ├── profile.py      #   用户画像（LLM 自动提取）
+    │   ├── group_features.py   # 群聊功能开关（按群控制抽卡/图片/语音）
+    │   ├── personality.py      # 人格管理（多套人格切换）
+    │   ├── permissions.py  #   权限管理（三层角色 + 工具过滤）
     │   └── config/         #   智能体配置（Markdown 文件）
+    │       ├── SOUL.md     #     行为规则 & 能力边界（共享）
+    │       ├── IDENTITY.md #     身份声明 & 技术栈
+    │       ├── AGENTS.md   #     编排规则 & 系统命令
+    │       ├── TOOLS.md    #     工具文档（22 个工具）
+    │       └── personalities/  # 人格定义（每人一套提示词）
+    │           ├── assistant.md     # 助手 Roxy
+    │           ├── roxy_character.md # 角色 Roxy (无职转生)
+    │           └── rubi.md          # 露比 (OpenRubi)
     │
     ├── plugins/            # NoneBot 插件
-    │   └── agent_router.py #   ★ 统一消息入口（所有交互的唯一处理器）
+    │   ├── agent_router.py #   ★ 统一消息入口（所有交互的唯一处理器）
+    │   ├── pullingMonitor.py   # 抽卡监控 & 卡池数据加载
+    │   └── check_redeem_code.py # 兑换码爬取 & 缓存管理
     │
     ├── tools/              # Agent 工具实现
     │   ├── builtin_tools.py#   搜索 / 抓取 / 代码执行 / Shell / Git / PDF / 时间
     │   ├── file_tools.py   #   文件读取（文本 / PDF / 图片 / 音频分析）
     │   ├── map_tools.py    #   地图工具（地理编码 / 天气 / POI / 路径）
-    │   └── legacy_tools.py #   游戏工具（抽卡 / 测速 / 翻译）
+    │   ├── legacy_tools.py #   游戏工具（抽卡 / 测速 / 翻译）
+    │   ├── wiki_scraper.py #   Wiki 爬虫（角色/羁绊数据自动更新）
+    │   └── name_resolver.py#   角色别名解析（模糊匹配）
     │
     ├── lib/                # 库
     │   ├── deepseek_client.py   # DeepSeek API 客户端
@@ -333,7 +370,7 @@ class ContinuousSessionManager:
 | `MemorySystem` | `memory.py` | 长期记忆（Markdown 文件），关键词搜索，最多返回 3 条 |
 | `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣，持久化到 `data/users/` |
 
-## 已注册工具（21 个）
+## 已注册工具（22 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -348,6 +385,7 @@ class ContinuousSessionManager:
 | `summarize_pdf` | PDF 提取 + 总结 |
 | `download_repo` | Git clone 仓库（HTTPS only） |
 | `translate_text` | 多语言翻译 |
+| `redeem_code` | 游戏兑换码查询（自动爬取+缓存） |
 | `explain_code` | 代码解释 |
 | `gacha_pull` | 抽卡模拟（4 种卡池，数据 JSON 可配） |
 | `play_gacha_animation` | 抽卡动画播放（图片序列） |
@@ -370,6 +408,7 @@ class ContinuousSessionManager:
 | `AGENTS.md` | 编排规则 & 工具选择 & 连续对话模式 |
 | `WORKSPACE.md` | 工作区约束 & 安全边界 |
 | `TOOLS.md` | 全部工具的参数文档 |
+| `personalities/` | 人格定义目录（assistant / roxy_character / rubi） |
 | `BOOTSTRAP.md` | 启动健康检查 |
 | `SESSION.md` | 会话参数 |
 

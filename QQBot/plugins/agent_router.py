@@ -34,10 +34,11 @@ from agent.context import (
     _send_msg, _current_user_workspace,
     _current_user_role, _current_code_limits,
     _current_user_id, _current_group_id,
-    _current_group_context,
+    _current_group_context, _current_personality,
 )
 from agent.group_features import get_group_features
 from agent.permissions import PermissionManager
+from agent.personality import get_personality_manager
 from agent.hardware import HardwareDetector
 from agent.special_session import SpecialSessionManager
 from agent.tool_registry import ToolRegistry
@@ -711,6 +712,42 @@ def _build_tool_registry() -> ToolRegistry:
         },
     )
 
+    # ── Redeem Code ────────────────────────────────────────────
+
+    async def _redeem_code_tool() -> str:
+        """Agent-facing tool: query valid redeem codes."""
+        from plugins.check_redeem_code import get_redeem_codes, check_and_refresh
+
+        await check_and_refresh()
+        codes = get_redeem_codes()
+
+        if not codes:
+            return "当前没有有效的兑换码。"
+
+        lines = ["当前有效兑换码:"]
+        for entry in codes:
+            code = entry.get("code", "")
+            content = entry.get("content", "")
+            valid = entry.get("valid", "")
+            line = f"  {code}"
+            if content:
+                line += f" — {content}"
+            if valid:
+                line += f" (有效期至: {valid})"
+            lines.append(line)
+        return "\n".join(lines)
+
+    registry.register(
+        "redeem_code", _redeem_code_tool,
+        "查询当前有效的游戏兑换码列表。返回兑换码、奖励内容和有效期。"
+        "当用户询问兑换码相关问题时使用此工具。",
+        {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    )
+
     # ── System Load ─────────────────────────────────────────────
     registry.register(
         "get_system_load", get_system_load,
@@ -1109,6 +1146,14 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         cmd_handled = await _handle_toggle_command(text_content, user_id, event)
         if cmd_handled:
             return
+        # /兑换码 / /redeem-code command (direct, no agent)
+        cmd_handled = await _handle_redeem_code_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /personality / /人格切换 command
+        cmd_handled = await _handle_personality_command(text_content, user_id)
+        if cmd_handled:
+            return
         cmd_handled = await _handle_session_command(text_content, user_id)
         if cmd_handled:
             return
@@ -1256,6 +1301,10 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         _current_user_role.set(role.value)
         if code_limits:
             _current_code_limits.set(code_limits.to_dict())
+
+        # Set personality contextvar
+        pm = get_personality_manager()
+        _current_personality.set(pm.get_user_personality(user_id))
 
         try:
             response = await asyncio.wait_for(
@@ -1456,6 +1505,10 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             if code_limits:
                 _current_code_limits.set(code_limits.to_dict())
 
+            # Set personality contextvar
+            pm = get_personality_manager()
+            _current_personality.set(pm.get_user_personality(user_id))
+
             # Resolve group feature restrictions
             gf = get_group_features()
             gf.refresh()
@@ -1518,6 +1571,78 @@ async def _safe_send(message, max_retries: int = 2, matcher=None):
     if last_error:
         from nonebot import logger
         logger.warning(f"Failed to send message after {max_retries} retries: {last_error.info}")
+
+
+async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
+    """Handle /兑换码 / /redeem-code command — direct, no agent.
+
+    Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/兑换码", "/redeem-code", "#兑换码", "#redeem-code"):
+        return False
+
+    from plugins.check_redeem_code import get_redeem_codes, check_and_refresh
+
+    # Trigger background refresh if stale, then use cached data
+    refreshed = await check_and_refresh()
+    codes = get_redeem_codes()
+
+    if not codes:
+        status = " (已是最新)" if refreshed else ""
+        await _safe_send(f"现在还没有兑换码哦Σ( ° △ °){status}")
+        return True
+
+    lines = ["当前有效兑换码:" if not refreshed else "当前有效兑换码 (已更新):", ""]
+    for entry in codes:
+        code = entry.get("code", "")
+        content = entry.get("content", "")
+        valid = entry.get("valid", "")
+        line = f"  {code}"
+        if content:
+            line += f"\n  内容: {content}"
+        if valid:
+            line += f"\n  有效期至: {valid}"
+        lines.append(line)
+
+    await _safe_send("\n".join(lines))
+    return True
+
+
+async def _handle_personality_command(text: str, user_id: str) -> bool:
+    """Handle /personality / /人格切换 command for personality switching.
+
+    Returns True if the command was handled.
+    """
+    cmd, _, args = text.partition(" ")
+    if cmd not in ("/personality", "/人格切换"):
+        return False
+
+    pm = get_personality_manager()
+    personalities = pm.list_personalities()
+    args = args.strip()
+
+    # /personality — show current and available
+    if not args:
+        current_key = pm.get_user_personality(user_id)
+        current_display = pm.get_display_name(current_key)
+        lines = [f"当前人格: {current_display} ({current_key})", "", "可用人格:"]
+        for p in personalities:
+            marker = " ← 当前" if p["key"] == current_key else ""
+            lines.append(f"  {p['display_name']} ({p['key']}){marker}")
+        lines.append(f"\n使用 /personality <名称> 切换，例如: /personality {personalities[0]['key']}")
+        await _safe_send("\n".join(lines))
+        return True
+
+    # /personality <name> — switch
+    try:
+        pm.set_user_personality(user_id, args)
+        display = pm.get_display_name(args)
+        await _safe_send(f"已切换至「{display}」人格。")
+    except ValueError as e:
+        await _safe_send(str(e))
+
+    return True
 
 
 async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -> bool:

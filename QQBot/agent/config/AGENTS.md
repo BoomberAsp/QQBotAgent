@@ -110,6 +110,19 @@ All file operations MUST stay within the workspace root (default: project `data/
 | `#bug <内容>` | 提交 Bug 报告（附上下文快照） |
 | `#建议 <内容>` | 提交改进建议（附上下文快照） |
 
+### 人格切换
+
+| 命令 | 说明 |
+|------|------|
+| `/personality` 或 `/人格切换` | 查看当前人格和可用人格列表 |
+| `/personality <名称>` 或 `/人格切换 <名称>` | 切换人格（例如 `/personality rubi`） |
+
+### 兑换码
+
+| 命令 | 说明 |
+|------|------|
+| `/兑换码` 或 `/redeem-code` | 查询当前有效的游戏兑换码（直接返回，不经智能体） |
+
 ### 其他系统命令
 
 | 命令 | 说明 |

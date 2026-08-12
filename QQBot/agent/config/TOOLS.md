@@ -293,6 +293,25 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ---
 
+## Tool: redeem_code
+
+**Description**: Query currently valid game redeem/exchange codes. Returns code strings, reward descriptions, and expiry dates. Codes are automatically scraped and cached daily; expired codes (>7 days) are cleaned up automatically.
+
+**When to use**: When the user asks about redeem codes, exchange codes, or 兑换码. Keywords: 兑换码, redeem code, CDK, 礼包码, CDKey.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {},
+  "required": []
+}
+```
+
+**Note**: The `/兑换码` and `/redeem-code` slash commands also trigger this feature directly without going through the agent. The tool is for natural-language requests like "有什么兑换码吗".
+
+---
+
 ## Tool: gacha_pull
 
 **Description**: Execute a game character gacha/recruitment pull. Supports single pulls and ten-pulls across four banner types (标准, UP, 神秘, 银河). **This is the ONLY way to produce real gacha results — never fabricate or simulate gacha output.**
