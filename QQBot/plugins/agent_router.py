@@ -1647,6 +1647,8 @@ async def _handle_personality_command(text: str, user_id: str) -> bool:
         logger.error(f"Personality switch error: {e}")
         await _safe_send(f"人格切换失败，请稍后重试。如果问题持续存在，请使用 #bug 反馈。")
 
+    return True
+
 
 async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -> bool:
     """Handle /toggle command for group feature management.

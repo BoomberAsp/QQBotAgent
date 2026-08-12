@@ -200,7 +200,7 @@ class PersonalityManager:
             )
         settings = self._load_settings()
         settings[user_id] = resolved
-        self._save_settings()
+        self._save_settings(settings)
 
 
 # ── Module-level singleton ────────────────────────────────────────
