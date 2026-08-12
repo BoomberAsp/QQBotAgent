@@ -15,12 +15,11 @@ import asyncio
 import json
 import os
 import re
-import ssl
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -169,10 +168,11 @@ class WikiScraper:
 
     @staticmethod
     async def _fetch_json(url: str, params: dict) -> dict | None:
-        """Make a GET request and return parsed JSON.
+        """Make a GET request via curl and return parsed JSON.
 
-        Uses urllib in a thread executor to avoid event loop issues
-        and Cloudflare TLS fingerprint blocking.
+        Uses curl with browser-mimicking headers to avoid Cloudflare blocks.
+        Python HTTP libraries (httpx, urllib) are blocked by Cloudflare's TLS
+        fingerprinting. Runs in a thread executor to stay non-blocking.
         """
         query = urlencode(params)
         full_url = f"{url}?{query}"
@@ -180,27 +180,39 @@ class WikiScraper:
 
         def _run():
             try:
-                req = Request(
-                    full_url,
-                    headers={"User-Agent": "QQBotAgent/1.0 (Wiki Scraper)"},
+                result = subprocess.run(
+                    ["curl", "-sS", "--max-time", "30",
+                     "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                           " AppleWebKit/537.36 (KHTML, like Gecko)"
+                           " Chrome/126.0.0.0 Safari/537.36",
+                     "-H", "Accept: application/json",
+                     "-H", "Accept-Language: en-US,en;q=0.9",
+                     full_url],
+                    capture_output=True, timeout=35,
                 )
-                # Create an SSL context that doesn't verify (Miraheze uses
-                # standard HTTPS, but some environments have CA issues)
-                ctx = ssl.create_default_context()
-                resp = urlopen(req, timeout=30, context=ctx)
-                body = resp.read().decode("utf-8", errors="replace")
-                if not body.strip():
-                    print(f"[WikiScraper] Empty response, HTTP {resp.status}",
-                          file=sys.stderr)
+                stdout = result.stdout.decode("utf-8", errors="replace")
+                stderr_out = result.stderr.decode("utf-8", errors="replace")
+                if result.returncode != 0:
+                    print(f"[WikiScraper] curl exit {result.returncode}: "
+                          f"{stderr_out[:200]}", file=sys.stderr)
                     return None
-                return json.loads(body)
+                if not stdout.strip():
+                    print(f"[WikiScraper] Empty response from curl", file=sys.stderr)
+                    return None
+                return json.loads(stdout)
             except json.JSONDecodeError as e:
-                preview = body[:500] if 'body' in dir() else "(no body)"
+                preview = stdout[:500] if 'stdout' in dir() else "(no body)"
                 print(f"[WikiScraper] JSON decode error: {e}. "
                       f"Preview: {preview}", file=sys.stderr)
                 return None
+            except FileNotFoundError:
+                print("[WikiScraper] curl not found!", file=sys.stderr)
+                return None
+            except subprocess.TimeoutExpired:
+                print("[WikiScraper] curl timed out", file=sys.stderr)
+                return None
             except Exception as e:
-                print(f"[WikiScraper] HTTP error: {type(e).__name__}: {e}",
+                print(f"[WikiScraper] curl error: {type(e).__name__}: {e}",
                       file=sys.stderr)
                 return None
 
