@@ -17,7 +17,7 @@ if _plugins_dir not in sys.path:
 
 # ── Gacha Pull ───────────────────────────────────────────────────
 
-def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -> str:
+async def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -> str:
     """Simulate game gacha/recruitment pulls.
 
     Args:
@@ -26,6 +26,13 @@ def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -> str:
         up_character: Rate-up character name (optional).
     """
     from plugins.pullingMonitor import drawing_cards, format_result
+
+    # Trigger background wiki refresh if cache is stale
+    from tools.wiki_scraper import WikiScraper
+    from lib.model_router import model_router
+    scraper = WikiScraper(llm_client=model_router.flash_client)
+    if scraper.is_stale():
+        asyncio.create_task(scraper.refresh())
 
     if pool_type not in ["常规招募", "几率up招募", "神秘招募", "银河招募"]:
         return f"[Gacha Error] 无效的卡池类型: '{pool_type}'。可选: 常规招募, 几率up招募, 神秘招募, 银河招募"
