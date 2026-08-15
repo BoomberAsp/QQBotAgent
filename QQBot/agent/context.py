@@ -44,6 +44,14 @@ _current_code_limits: contextvars.ContextVar[dict] = (
     contextvars.ContextVar("_current_code_limits", default={})
 )
 
+# Per-user workspace disk quota in bytes, resolved from the current user's
+# role. Set by agent_router before each agent.run() call (admin 2GB /
+# vip 500MB / regular 100MB). Read by UserWorkspaceManager.check_quota()
+# and get_quota_context() so quota warnings use the correct per-role limit.
+_current_quota_bytes: contextvars.ContextVar[int] = (
+    contextvars.ContextVar("_current_quota_bytes", default=0)
+)
+
 # Current group chat ID (only set for group messages, empty for private).
 # Set by agent_router before each agent.run() call.
 # Used by tools (play_gacha_animation) to check group-level feature toggles.
@@ -63,4 +71,11 @@ _current_group_context: contextvars.ContextVar[str] = (
 # Read by agent._build_messages() to inject the personality prompt.
 _current_personality: contextvars.ContextVar[str] = (
     contextvars.ContextVar("_current_personality", default="assistant")
+)
+
+# File-creation callback: tools invoke it after writing a file into the
+# workspace, passing the absolute path. Set by agent_router before agent.run()
+# to attribute the file to the active special session.
+_on_file_created: contextvars.ContextVar[Optional[Callable[[str], None]]] = (
+    contextvars.ContextVar("_on_file_created", default=None)
 )

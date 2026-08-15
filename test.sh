@@ -28,8 +28,14 @@ echo -e "${GREEN}[INFO]${NC} 运行所有测试..."
 echo ""
 
 python test_agent.py
+AGENT_EXIT=$?
 
-EXIT_CODE=$?
+python test_workspace.py
+WS_EXIT=$?
+
+EXIT_CODE=0
+if [ $AGENT_EXIT -ne 0 ]; then EXIT_CODE=$AGENT_EXIT; fi
+if [ $WS_EXIT -ne 0 ]; then EXIT_CODE=$WS_EXIT; fi
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}=========================================${NC}"

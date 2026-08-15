@@ -35,6 +35,7 @@ from agent.context import (
     _current_user_role, _current_code_limits,
     _current_user_id, _current_group_id,
     _current_group_context, _current_personality,
+    _on_file_created, _current_quota_bytes,
 )
 from agent.group_features import get_group_features
 from agent.permissions import PermissionManager
@@ -46,6 +47,13 @@ from agent.session import SessionManager
 from agent.memory import MemorySystem
 from agent.profile import ProfileManager
 from agent.workspace import UserWorkspaceManager
+from agent.workspace_snapshot import build_tree, rel_to_root, fmt_bytes
+from agent.quota_cleanup import (
+    list_candidates,
+    execute_cleanup,
+    format_cleanup_prompt,
+    resolve_targets,
+)
 from lib.deepseek_client import deepseek_client as _global_client, DeepSeekClient as _DeepSeekClient
 from lib.model_router import ModelRouter
 
@@ -60,6 +68,7 @@ from tools.builtin_tools import (
     download_repo,
     shell_exec,
     summarize_pdf,
+    delete_workspace_file,
     _ensure_workspace_dirs,
 )
 from tools.file_tools import read_file
@@ -576,6 +585,20 @@ def _build_tool_registry() -> ToolRegistry:
             "required": ["file_path"],
         },
     )
+    registry.register(
+        "delete_workspace_file", delete_workspace_file,
+        "删除当前用户工作区内的指定文件或空目录，释放磁盘空间。"
+        "参数 path 为相对于工作区根目录的路径，如 'uploads/abc.png' 或 'repos/my-repo'。"
+        "只能删除空目录；非空目录会拒绝删除。禁止删除隐藏文件。"
+        "当用户表达删除工作区文件/仓库的意图时使用此工具，删除前先调用 get_user_info 获取快照确认目标。",
+        {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "相对于工作区根目录的路径，如 'uploads/abc.png' 或 'repos/my-repo'"},
+            },
+            "required": ["path"],
+        },
+    )
 
     # Map / location tools (Amap API)
     registry.register(
@@ -861,6 +884,178 @@ def _record_file(message_id: str, name: str, path: str = "", error: str = ""):
         del _recent_files[oldest]
 
 
+def _record_session_file(user_id: str, abs_path: str) -> None:
+    """Attribute a newly written workspace file to the active special session.
+
+    No-op when no special session is active, or when the path is outside the
+    user's workspace. ``abs_path`` is converted to a workspace-relative path.
+    """
+    active = _special_sessions.get_active(user_id)
+    if active is None:
+        return
+    ws = _workspace_manager.get_workspace(user_id)
+    try:
+        rel = os.path.relpath(abs_path, ws)
+    except ValueError:
+        return
+    if rel.startswith("..") or os.path.isabs(rel):
+        return
+    _special_sessions.add_file(user_id, active.name, rel)
+
+
+def _format_delete_summary(result: dict) -> str:
+    """Render the file-cleanup portion of a session-deletion notification."""
+    lines = []
+    if result.get("deleted"):
+        lines.append(
+            f"已清理 {len(result['deleted'])} 个文件"
+            f"（释放 {fmt_bytes(result['freed_bytes'])}）："
+        )
+        lines.extend(f"  - {rel}" for rel in result["deleted"])
+    if result.get("kept_repos"):
+        lines.append("以下仓库予以保留（工作区内仍可用）：")
+        lines.extend(f"  - {rel}" for rel in result["kept_repos"])
+    return "\n".join(lines)
+
+
+def _quota_warning(user_id: str) -> str:
+    """Return a quota warning if workspace usage >= 80% of the role quota.
+
+    Uses the same usage metric (``_workspace_manager.get_size``) and per-role
+    quota (``_perm_manager.get_workspace_quota_mb``) as ``_get_user_info`` and
+    ``_handle_cleanup_flow``. Returns "" below the 80% threshold.
+    """
+    role = _perm_manager.get_role(user_id)
+    quota_mb = _perm_manager.get_workspace_quota_mb(role)
+    quota_bytes = quota_mb * 1024 * 1024
+    used = _workspace_manager.get_size(user_id)
+    if used >= quota_bytes * 0.8:
+        pct = used / quota_bytes * 100
+        used_mb = used / (1024 * 1024)
+        return (
+            f"⚠️ 工作区容量已使用 {pct:.0f}%（{used_mb:.1f} MB / {quota_mb} MB）。"
+            f"建议发送 /管理工作区 查看详情并清理不需要的文件，"
+            f"或直接告诉我「帮我清理工作区」。"
+        )
+    return ""
+
+
+# ── Quota Cleanup Protocol (Feature 2) ───────────────────────────
+# Elastic-quota cleanup: when a user exceeds their workspace quota, the next
+# message triggers a cleanup protocol. The agent lists the earliest-mtime
+# candidates, the user may customize (but not skip), and after 10 minutes the
+# agent deletes autonomously without approval.
+
+CLEANUP_TIMEOUT = 600  # seconds (10 minutes)
+
+# user_id -> {"candidates": list[CleanupCandidate], "deadline": float}
+_cleanup_plans: dict = {}
+
+
+async def _handle_cleanup_flow(user_id: str, text_content: str) -> bool:
+    """Intercept messages during the quota-cleanup protocol.
+
+    Returns True when the message was fully consumed (caller should return
+    without running the agent).
+    """
+    plan = _cleanup_plans.get(user_id)
+    if plan is not None:
+        if time.time() >= plan["deadline"]:
+            await _execute_cleanup_plan(user_id, plan, plan["candidates"], 0.8)
+        else:
+            await _handle_cleanup_response(user_id, text_content, plan)
+        return True
+
+    # No active plan — trigger if over quota.
+    quota_mb = _perm_manager.get_workspace_quota_mb(_perm_manager.get_role(user_id))
+    quota_bytes = quota_mb * 1024 * 1024
+    if _workspace_manager.get_size(user_id) < quota_bytes:
+        return False
+
+    candidates = list_candidates(_workspace_manager.get_workspace(user_id))
+    if not candidates:
+        return False
+
+    deadline = time.time() + CLEANUP_TIMEOUT
+    _cleanup_plans[user_id] = {"candidates": candidates, "deadline": deadline}
+    await _send_cleanup_prompt(user_id, candidates)
+    asyncio.create_task(_auto_cleanup_after(user_id, deadline))
+    return True
+
+
+async def _handle_cleanup_response(user_id: str, text_content: str, plan: dict) -> None:
+    """Interpret a user message while a cleanup plan is active."""
+    decision = resolve_targets(text_content, plan["candidates"])
+
+    if decision.mode == "skip":
+        await _safe_send(
+            "⚠️ 无法跳过清理。工作区已超出配额，必须清理后才能继续使用。\n"
+            "你可以：\n"
+            "1. 回复「删吧」确认删除上列文件\n"
+            "2. 回复「保留 X」指定要保留的文件（其余删除）\n"
+            "3. 指定要删除的文件路径或编号\n"
+            "⏳ 10 分钟内未回复将自动删除上列候选文件。"
+        )
+        return
+
+    if decision.mode == "confirm":
+        await _execute_cleanup_plan(user_id, plan, plan["candidates"], 0.8)
+        return
+
+    if decision.mode in ("keep", "explicit"):
+        # Explicit user choice — delete exactly the selected targets.
+        await _execute_cleanup_plan(user_id, plan, decision.targets, 0.0)
+        return
+
+    await _safe_send(
+        "请明确你的清理指令：\n"
+        "1. 回复「删吧」删除上列所有文件\n"
+        "2. 回复「保留 X」保留指定文件\n"
+        "3. 回复要删除的文件路径或编号\n"
+        "⏳ 10 分钟内未回复将自动删除上列候选文件。"
+    )
+
+
+async def _send_cleanup_prompt(user_id: str, candidates) -> None:
+    quota_mb = _perm_manager.get_workspace_quota_mb(_perm_manager.get_role(user_id))
+    usage_mb = _workspace_manager.get_size(user_id) / (1024 * 1024)
+    await _safe_send(format_cleanup_prompt(candidates, usage_mb, quota_mb))
+
+
+async def _execute_cleanup_plan(user_id: str, plan: dict, targets, target_ratio: float) -> None:
+    """Delete the given candidates (mtime asc) and report the result."""
+    _cleanup_plans.pop(user_id, None)
+    quota_mb = _perm_manager.get_workspace_quota_mb(_perm_manager.get_role(user_id))
+    quota_bytes = quota_mb * 1024 * 1024
+    ws = _workspace_manager.get_workspace(user_id)
+    result = execute_cleanup(ws, quota_bytes, candidates=targets, target_ratio=target_ratio)
+    deleted = result["deleted"]
+
+    if deleted:
+        lines = [f"✅ 已清理工作区，删除 {len(deleted)} 项，释放 {fmt_bytes(result['freed_bytes'])}："]
+        for c in deleted:
+            lines.append(f"  - {c.rel_path}")
+        usage_mb = _workspace_manager.get_size(user_id) / (1024 * 1024)
+        if usage_mb * 1024 * 1024 < quota_bytes:
+            lines.append(f"当前占用 {usage_mb:.1f} MB / {quota_mb} MB，已回到配额内。")
+        else:
+            lines.append(f"当前占用 {usage_mb:.1f} MB / {quota_mb} MB，仍超出配额，请继续清理。")
+        await _safe_send("\n".join(lines))
+    else:
+        await _safe_send("未删除任何文件。请手动检查工作区，或发送「帮我清理工作区」重新发起。")
+
+    _workspace_manager.clear_quota_flag(user_id)
+
+
+async def _auto_cleanup_after(user_id: str, deadline: float) -> None:
+    """Autonomous deletion fallback after the 10-minute timeout."""
+    await asyncio.sleep(CLEANUP_TIMEOUT)
+    plan = _cleanup_plans.get(user_id)
+    if plan is None or plan["deadline"] != deadline:
+        return  # already resolved (or superseded)
+    await _execute_cleanup_plan(user_id, plan, plan["candidates"], 0.8)
+
+
 def _build_reply_context(event: MessageEvent) -> str:
     """Extract reply/quote context from a message's reply segment.
 
@@ -995,49 +1190,20 @@ def _get_user_info() -> str:
     ws_quota_mb = _perm_manager.get_workspace_quota_mb(role)
     ws_usage_mb = ws_size / (1024 * 1024)
     pct = (ws_size / (ws_quota_mb * 1024 * 1024)) * 100 if ws_quota_mb > 0 else 0
+    # Hide the absolute data-root prefix; show paths relative to USER_DATA_ROOT.
+    rel_ws = rel_to_root(ws_path, _workspace_manager.user_data_root)
     lines.append(f"")
     lines.append(f"工作区:")
-    lines.append(f"  路径: {ws_path}")
+    lines.append(f"  路径: {rel_ws}/")
     lines.append(f"  用量: {ws_usage_mb:.1f} MB / {ws_quota_mb} MB ({pct:.1f}%)")
+    if pct >= 80:
+        lines.append(f"  ⚠️ 容量警告：工作区已使用 {pct:.1f}%，接近上限。"
+                     f"建议清理不需要的文件（如「帮我清理工作区」）。")
 
     # ── 工作区目录快照 ──
     lines.append(f"")
     lines.append(f"  目录快照:")
-    ws = Path(ws_path)
-    if ws.is_dir():
-        for subdir_name in ["code", "output", "projects", "repos", "uploads"]:
-            subdir = ws / subdir_name
-            if not subdir.is_dir():
-                continue
-            try:
-                entries = sorted(subdir.iterdir(), key=lambda e: e.name.lower())
-            except PermissionError:
-                lines.append(f"    {subdir_name}/ (无权限访问)")
-                continue
-
-            if not entries:
-                lines.append(f"    {subdir_name}/ (空)")
-            else:
-                lines.append(f"    {subdir_name}/ ({len(entries)} 项)")
-                for entry in entries[:20]:  # cap at 20 entries per dir
-                    if entry.is_symlink():
-                        lines.append(f"      {entry.name} -> (符号链接)")
-                    elif entry.is_dir():
-                        item_count = sum(1 for _ in entry.rglob("*"))
-                        lines.append(f"      {entry.name}/ ({item_count} 项)")
-                    else:
-                        size = entry.stat().st_size
-                        if size < 1024:
-                            size_str = f"{size} B"
-                        elif size < 1024 * 1024:
-                            size_str = f"{size / 1024:.1f} KB"
-                        else:
-                            size_str = f"{size / (1024 * 1024):.1f} MB"
-                        lines.append(f"      {entry.name} ({size_str})")
-                if len(entries) > 20:
-                    lines.append(f"      ... 还有 {len(entries) - 20} 项未显示")
-    else:
-        lines.append(f"    (工作区目录不存在)")
+    lines.extend(build_tree(Path(ws_path), f"{rel_ws}/", indent="  "))
 
     # ── 权限范围 ──
     allowed = _perm_manager.get_allowed_tools(role)
@@ -1133,6 +1299,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
     # Set user workspace for tool scoping
     _workspace_manager.ensure_dirs(user_id)
     _current_user_workspace.set(_workspace_manager.get_workspace(user_id))
+    _on_file_created.set(lambda p: _record_session_file(user_id, p))
 
     text_content = event.get_plaintext().strip()
 
@@ -1143,15 +1310,17 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         if text_content == expected or text_content == f"/{expected}":
             if time.time() < pending_delete[1]:
                 try:
-                    _special_sessions.delete(user_id, pending_delete[0])
+                    result = _special_sessions.delete(user_id, pending_delete[0])
                     _pending_delete_confirm.pop(user_id, None)
                     role = _perm_manager.get_role(user_id)
                     max_sess = _perm_manager.get_max_special_sessions(role)
                     sessions = _special_sessions.list_sessions(user_id)
-                    await _safe_send(
-                        f"已删除特殊会话「{pending_delete[0]}」。\n"
-                        f"当前特殊会话: {len(sessions)}/{max_sess}"
-                    )
+                    summary = _format_delete_summary(result)
+                    msg = f"已删除特殊会话「{pending_delete[0]}」。"
+                    if summary:
+                        msg += "\n" + summary
+                    msg += f"\n当前特殊会话: {len(sessions)}/{max_sess}"
+                    await _safe_send(msg)
                 except ValueError as e:
                     await _safe_send(str(e))
             else:
@@ -1186,6 +1355,13 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         if cmd_handled:
             return
 
+    # ── Quota cleanup protocol intercept ───────────────────────────
+    # Runs before file download / agent so that, when the user is over quota,
+    # new space allocations (uploads, code output, clones) are blocked and the
+    # cleanup protocol takes over this turn.
+    if await _handle_cleanup_flow(user_id, text_content):
+        return
+
     # ── Detect reply/quote context ─────────────────────────────────
     reply_context = _build_reply_context(event)
     if reply_context:
@@ -1202,6 +1378,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             if saved_path:
                 file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
                 _record_file(msg_id, f"image-{file_id}", saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
                 _record_file(msg_id, f"image-{file_id}", error=error)
@@ -1214,6 +1391,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             if saved_path:
                 file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
                 _record_file(msg_id, name, saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
                 _record_file(msg_id, name, error=error)
@@ -1225,9 +1403,13 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
                     f"[用户发送了语音消息，已保存至: {saved_path}]"
                 )
                 _record_file(msg_id, "语音消息", saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
                 _record_file(msg_id, "语音消息", error=error)
+
+    # ── Quota warning after any upload ─────────────────────────────
+    quota_warn = _quota_warning(user_id)
 
     # ── File-only messages: acknowledge and skip agent ─────────────
     has_files = bool(file_context_parts)
@@ -1241,10 +1423,16 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             ack = f"已收到 {'、'.join(names)}，需要分析的话引用这条消息告诉我~"
         else:
             ack = "已收到文件，需要分析的话引用这条消息告诉我~"
+        if quota_warn:
+            ack += f"\n\n{quota_warn}"
         await _safe_send(ack)
         return
 
     # ── Build augmented message ────────────────────────────────────
+    if quota_warn:
+        file_context_parts.append(
+            f"[系统提醒] {quota_warn}\n请在回复末尾原样提醒用户这一容量警告。"
+        )
     context_parts = []
     if reply_context:
         context_parts.append(reply_context)
@@ -1332,6 +1520,9 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         # Set permission contextvars for downstream tools
         _current_user_id.set(user_id)
         _current_user_role.set(role.value)
+        _current_quota_bytes.set(
+            _perm_manager.get_workspace_quota_mb(role) * 1024 * 1024
+        )
         if code_limits:
             _current_code_limits.set(code_limits.to_dict())
 
@@ -1436,16 +1627,17 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         if text_content == expected or text_content == f"/{expected}":
             if time.time() < pending_delete[1]:
                 try:
-                    _special_sessions.delete(user_id, pending_delete[0])
+                    result = _special_sessions.delete(user_id, pending_delete[0])
                     _pending_delete_confirm.pop(user_id, None)
                     role = _perm_manager.get_role(user_id)
                     max_sess = _perm_manager.get_max_special_sessions(role)
                     sessions = _special_sessions.list_sessions(user_id)
-                    await _safe_send(
-                        f"已删除特殊会话「{pending_delete[0]}」。\n"
-                        f"当前特殊会话: {len(sessions)}/{max_sess}",
-                        matcher=continuous_router
-                    )
+                    summary = _format_delete_summary(result)
+                    msg = f"已删除特殊会话「{pending_delete[0]}」。"
+                    if summary:
+                        msg += "\n" + summary
+                    msg += f"\n当前特殊会话: {len(sessions)}/{max_sess}"
+                    await _safe_send(msg, matcher=continuous_router)
                 except ValueError as e:
                     await _safe_send(str(e), matcher=continuous_router)
             else:
@@ -1473,6 +1665,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             if saved_path:
                 file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
                 _record_file(msg_id, f"image-{file_id}", saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
                 _record_file(msg_id, f"image-{file_id}", error=error)
@@ -1485,6 +1678,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             if saved_path:
                 file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
                 _record_file(msg_id, name, saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
                 _record_file(msg_id, name, error=error)
@@ -1496,9 +1690,18 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
                     f"[用户发送了语音消息，已保存至: {saved_path}]"
                 )
                 _record_file(msg_id, "语音消息", saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
                 _record_file(msg_id, "语音消息", error=error)
+
+    # ── Quota warning after any upload this turn ───────────────────
+    if file_context_parts:
+        quota_warn = _quota_warning(user_id)
+        if quota_warn:
+            file_context_parts.append(
+                f"[系统提醒] {quota_warn}\n请在回复末尾原样提醒用户这一容量警告。"
+            )
 
     # Renew the window on each message
     _continuous_sessions.touch(group_id, user_id)
@@ -1541,6 +1744,10 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             code_limits = _perm_manager.get_code_limits(role)
             _current_user_id.set(user_id)
             _current_user_role.set(role.value)
+            _current_quota_bytes.set(
+                _perm_manager.get_workspace_quota_mb(role) * 1024 * 1024
+            )
+            _on_file_created.set(lambda p: _record_session_file(user_id, p))
             if code_limits:
                 _current_code_limits.set(code_limits.to_dict())
 
@@ -1840,8 +2047,9 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             session = _special_sessions.create(user_id, name)
             # Activate the session — create() only persists it, doesn't set active_session
             _special_sessions.switch_to(user_id, session.name)
+            quota_warn = _quota_warning(user_id)
             if args:
-                await _safe_send(
+                msg = (
                     f"已创建特殊会话「{session.name}」。\n"
                     f"当前处于特殊会话模式，上下文将持续保存。\n"
                     f"使用 /结束会话 退出，/会话列表 查看所有会话。\n"
@@ -1849,12 +2057,15 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
                 )
             else:
                 _pending_naming[user_id] = True
-                await _safe_send(
+                msg = (
                     f"已创建特殊会话「{session.name}」（名称待精炼）。\n"
                     f"首次交互后会自动生成更贴切的名称。\n"
                     f"当前处于特殊会话模式，上下文将持续保存。\n"
                     f"当前特殊会话: {len(sessions)+1}/{max_sessions}"
                 )
+            if quota_warn:
+                msg += f"\n\n{quota_warn}"
+            await _safe_send(msg)
         except ValueError as e:
             await _safe_send(str(e))
         return True
@@ -1926,15 +2137,17 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             if pending and pending[0] == args:
                 if time.time() < pending[1]:
                     try:
-                        _special_sessions.delete(user_id, args)
+                        result = _special_sessions.delete(user_id, args)
                         _pending_delete_confirm.pop(user_id, None)
                         role = _perm_manager.get_role(user_id)
                         max_sess = _perm_manager.get_max_special_sessions(role)
                         sessions = _special_sessions.list_sessions(user_id)
-                        await _safe_send(
-                            f"已删除特殊会话「{args}」。\n"
-                            f"当前特殊会话: {len(sessions)}/{max_sess}"
-                        )
+                        summary = _format_delete_summary(result)
+                        msg = f"已删除特殊会话「{args}」。"
+                        if summary:
+                            msg += "\n" + summary
+                        msg += f"\n当前特殊会话: {len(sessions)}/{max_sess}"
+                        await _safe_send(msg)
                     except ValueError as e:
                         await _safe_send(str(e))
                     return True
@@ -2018,12 +2231,16 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         sessions = _special_sessions.list_sessions(user_id)
         role = _perm_manager.get_role(user_id)
         max_sess = _perm_manager.get_max_special_sessions(role)
-        await _safe_send(
+        quota_warn = _quota_warning(user_id)
+        msg = (
             f"已将当前临时会话（最近 {min(len(temp_session.context), 20)} 条消息）"
             f"保存为特殊会话「{session.name}」。\n"
             f"现在处于特殊会话模式，后续对话将持续保存。\n"
             f"当前特殊会话: {len(sessions)}/{max_sess}"
         )
+        if quota_warn:
+            msg += f"\n\n{quota_warn}"
+        await _safe_send(msg)
         return True
 
     # ── /帮助 — 命令列表 ───────────────────────────────────────
@@ -2038,6 +2255,8 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             "/删除会话 <名称> — 删除会话（需确认）\n"
             "/结束会话 或 /临时会话 或 /退出特殊会话 — 退出特殊会话\n"
             "/保存为会话 <名称> — 将临时上下文保存为会话\n\n"
+            "🟦 **工作区**\n"
+            "/管理工作区 — 查看工作区占用并引导清理\n\n"
             "🟣 **人格切换**\n"
             "/人格切换 — 查看当前人格和可用列表\n"
             "/人格切换 <名称> — 切换人格（支持模糊匹配）\n\n"
@@ -2056,6 +2275,12 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         )
         await _safe_send(help_text)
         return True
+
+    # ── /管理工作区 ─────────────────────────────────────────────
+    # Not intercepted: falls through to the agent, which (per AGENTS.md)
+    # calls get_user_info to show the snapshot and guide cleanup.
+    if cmd in ("/管理工作区", "#管理工作区"):
+        return False
 
     # Not a session command
     return False

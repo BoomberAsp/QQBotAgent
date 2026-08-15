@@ -17,6 +17,17 @@
 
 ## Feature 1: `get_workspace_snapshot` Tool
 
+### 当前状态：**已实现（方案 A）**
+
+不新建独立工具，改为扩展 `get_user_info` 的目录快照（`agent_router.py`）：
+
+- ✅ 树形结构 + 每节点文件大小，目录优先、按名称字母序（`_build_workspace_tree()`）
+- ✅ 跳过 `.git`/缓存目录/`.pyc` 文件（`_ws_skip()`）
+- ✅ 80% 配额警告横幅
+- ✅ 路径脱敏：以 `USER_DATA_ROOT` 为根返回相对路径（如 `2578260985/workspace/`），不暴露绝对路径
+
+> 备注：`get_user_info`（注册于 `permissions.py:49`）原本已含「工作区目录快照」，与本 Feature 高度重合，故采用方案 A 合并实现，避免工具语义重复。
+
 ### Purpose
 
 快速返回当前用户工作区完整快照：目录树 + 每个文件的大小 + 磁盘使用量汇总。
@@ -81,6 +92,14 @@
 
 ## Feature 2: `delete_workspace_file` Tool
 
+### 当前状态：**已实现**
+
+`delete_workspace_file` 已在 `tools/builtin_tools.py` 定义并注册（`_build_tool_registry()`），加入 `_PUBLIC_TOOLS`（所有用户）。配套：
+- `agent/quota_cleanup.py`（纯函数）：候选枚举 `list_candidates`、按 mtime 删除 `execute_cleanup`、清理响应解析 `resolve_targets`。
+- `agent/workspace.py` 新增 `list_files_by_mtime()`。
+- `agent_router.py` 配额清理协议（弹性超限 → 列出最早 mtime 文件 → 用户可自定义但不可跳过 → 10 分钟超时自主删除）。
+- 测试：`test_workspace.py` 新增 4 套（删除行为、候选枚举、删除至配额内、响应解析）。
+
 ### Purpose
 
 允许用户删除工作区中的文件或空目录，释放磁盘空间。
@@ -114,6 +133,10 @@
 ---
 
 ## Feature 3: Session File Provenance Tracking
+
+### 当前状态：**已实现**
+
+实现见 `docs/feature3-session-file-provenance.md`。`SpecialSessionManager` 新增 `add_file()`；`files` 存于 `_index.json` 的 `metadata.files`（非 `_meta.json`）；`delete()` 删会话时直接删除会话级文件（`uploads`/`output`），保留 `repos/` 仓库并返回删除摘要供上层通知用户。
 
 ### Purpose
 
@@ -176,6 +199,10 @@ class SpecialSessionManager:
 
 ## Feature 4: Session Deletion with File Cleanup Prompt
 
+### 当前状态：**未实现**
+
+`/删除会话` 已有 60 秒二次确认（`agent_router.py:1915-1943`），但无文件列表展示与 `--with-files` 选项。
+
 ### Purpose
 
 用户删除特殊会话时，智能体主动提示是否同步清理该会话上传的文件。
@@ -219,6 +246,15 @@ class SpecialSessionManager:
 ---
 
 ## Feature 5: Quota Threshold Auto-Reminder
+
+### 当前状态：**已实现**
+
+实现见 `docs/feature5-6-7-workspace-management.md`。
+
+- ✅ `check_quota()` / `get_quota_context()` 改用每角色配额（`_effective_quota_bytes()` 读 `_current_quota_bytes` contextvar，回退固定默认值）
+- ✅ `agent_router.py` 新增 `_quota_warning()`；上传后（纯文件 ack + agent 回复两路径）注入 80% 容量警告
+- ✅ `/新会话` 与 `/保存为会话` 创建后追加容量警告（仅提醒，不阻止）
+- ✅ `get_user_info` 快照 ≥80% 横幅（Feature 1 已有，无需改动）
 
 ### Purpose
 
@@ -265,6 +301,10 @@ def _check_quota_warning() -> str:
 
 ## Feature 6: `/管理工作区` Router Command
 
+### 当前状态：**已实现**
+
+`/管理工作区` 经 `_handle_session_command()` 显式 `return False` 落入 agent（`agent_router.py`），AGENTS.md 引导其调用 `get_user_info` 展示快照并引导清理；`/帮助` 列表已补条目。
+
 ### Purpose
 
 用户发送 `/管理工作区` 后，智能体自动调用 `get_workspace_snapshot` 并引导用户管理文件。
@@ -290,15 +330,59 @@ if cmd in ("/管理工作区", "#管理工作区"):
 
 ---
 
+## Feature 7: 自然语言驱动的自主工作区管理
+
+### 当前状态：**已实现**
+
+底层 CRUD 已齐备（`get_user_info` 快照 + `delete_workspace_file`）。`AGENTS.md` 已扩充「工作区删除与配额清理」：`/管理工作区` 引导 + 批量删除确认 / 模糊条件询问 / 拒绝解释规则。
+
+### Purpose
+
+让智能体把用户的一句自然语言（如「帮我把 uploads 里超过 50MB 的旧文件删掉」「清理工作区」「我有哪些 PDF」）自主拆解为对底层增删改查工具的调用序列，无需用户手动记住 `/管理工作区` 等命令。
+
+### 依赖
+
+| 能力 | 对应工具 | 状态 |
+|------|---------|------|
+| 增 | QQ 文件上传 → `_download_and_save_file()` | ✅ 已有 |
+| 查 | `get_workspace_snapshot`（或 `get_user_info` 目录快照） | ⚠️ 见 Feature 1 |
+| 删 | `delete_workspace_file` | ❌ Feature 2 未实现 |
+| 改 | （不提供，与设计原则一致） | — |
+
+### Behavior
+
+智能体（Agent）在收到工作区管理意图时，自主编排工具：
+
+1. **理解意图**：解析自然语言，提取目标（哪些文件 / 哪个目录 / 什么条件）
+2. **查**：调用快照工具获取当前状态
+3. **决策**：根据条件（大小、后缀、时间、目录）筛选出候选文件
+4. **确认**：对批量删除等不可逆操作，先列出清单请用户确认（除非用户已明确「直接删」）
+5. **删**：调用 `delete_workspace_file` 逐个执行
+6. **反馈**：汇总删除结果 + 释放空间
+
+### Agent 侧交互引导（AGENTS.md 新增）
+
+- 批量删除前必须展示清单 + 请求确认（不可逆操作）
+- 用户条件模糊（如「旧文件」）时，先展示候选再询问，不擅自删除
+- 删除后主动汇报释放了多少空间、剩余配额
+- 遇到路径穿越/非空目录等被拒绝的操作，向用户解释原因
+
+### 与 Feature 6 的关系
+
+Feature 6 的 `/管理工作区` 命令是「显式入口」，本 Feature 是「隐式能力」——两者殊途同归。用户既可以直接发 `/管理工作区`，也可以用自然语言描述意图；智能体都应落到同一套 CRUD 工具上。
+
+---
+
 ## Files to Modify
 
 | 文件 | 变更 |
 |------|------|
-| `QQBot/tools/builtin_tools.py` | 新增 `get_workspace_snapshot()`, `delete_workspace_file()`, `_check_quota_warning()` |
+| `QQBot/tools/builtin_tools.py` | 新增 `delete_workspace_file()`, `_check_quota_warning()`（`get_workspace_snapshot` 已并入 `get_user_info`，见 Feature 1） |
 | `QQBot/plugins/agent_router.py` | 修改 `/删除会话` 确认流程（Feature 4）；增加文件上传后的配额检查（Feature 5）；添加 `/管理工作区` 路由（Feature 6）；在文件下载后记录会话归属（Feature 3） |
 | `QQBot/agent/special_session.py` | 新增 `add_file()`, `get_files()`, `remove_file()` 方法；`_meta.json` 新增 `files` 字段 |
 | `QQBot/agent/permissions.py` | `get_workspace_snapshot` 和 `delete_workspace_file` 加入 `_ALL_USER_TOOLS` 集合 |
 | `QQBot/agent/context.py` | 新增 `_current_quota_bytes` contextvar，供配额检查使用 |
+| `QQBot/agent/config/AGENTS.md` | 新增工作区自主管理交互引导规则（Feature 7：批量删除确认、模糊条件询问等） |
 
 ## Files to Create
 
@@ -683,9 +767,12 @@ New messages (30): {recent_30_messages}
 
 > 来源：`next_step.md` §8.3，与 PLAN.md Feature 5（80% 提醒）互补
 
-### 当前状态：**仅硬拦截 100%**
+### 当前状态：**部分实现（80% 提醒已落地，柔性超额未实现）**
 
-当前 `UserWorkspaceManager.check_quota()` 在达到 100% 配额时硬拒绝。PLAN.md Feature 5 补充了 80% 提醒，但 >100% 的柔性处理未涉及。
+- ✅ **80% 提醒**已实现：`check_quota()` (`workspace.py:93-121`) 在 80-100% 返回警告；`get_quota_context()` (`workspace.py:131-147`) 在 80%/100% 注入系统提示（`agent.py:354`）
+- ❌ **>100% 柔性超额**未实现：`check_quota()` 仍硬拒绝（返回 `False`），未采用「仍允许写入 + 标记 `_over_quota`」的柔性策略
+- ❌ `check_quota()` 目前**未被任何工具调用**（见 `docs/security-boundary-remaining.md`），实时配额检查未接入上传/代码执行等写入路径
+- ❌ 150% 绝对硬限、连续 3 次超额拒绝、`download_repo --depth=1` 浅克隆、`execute_code` 输出 100MB 软限制均未实现
 
 ### 问题
 
@@ -947,5 +1034,5 @@ OCR 文字块: (text="Boss名称", bbox=[x1, y1, x2, y2])
 | 4 | 85% 上下文压缩提示 | **未实现** | 待实现（token 估算 + `/压缩会话` 命令） |
 | 5 | 群聊文件延迟下载 | **未实现** | 待实现（元数据记录 + 按需下载 + 进度反馈） |
 | 6 | 分层上下文 Layer 3 | **未实现** | 待实现（每 30 条异步生成渐进式摘要） |
-| 7 | 配额柔性处理 | **未实现** | 待实现（三级策略：80%提醒 / 100%柔性 / 150%硬限） |
+| 7 | 配额柔性处理 | **部分实现** | 80% 提醒已实现（`check_quota`/`get_quota_context`）；>100% 柔性超额与 150% 硬限待实现 |
 | 8 | 截图测速（OCR+LLM 两层降级） | **未实现** | 待实现（OCR 颜色采样 + 多模态 LLM 降级 + parse_battle_screenshots + Agent 交互引导） |

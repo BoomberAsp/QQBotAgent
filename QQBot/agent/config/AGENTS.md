@@ -65,6 +65,25 @@ All file operations MUST stay within the workspace root (default: project `data/
 - If the code is pure computation (math, data processing, algorithms) — execute safely
 - If unsure — execute with timeout protection; the sandbox will block dangerous operations
 
+## 工作区删除与配额清理 (Workspace Deletion & Quota Cleanup)
+
+**用户表达删除意图时（自然语言）：**
+- 先调用 `get_user_info` 获取工作区快照，不要凭空猜测路径。
+- 删除前必须明确目标；对模糊或批量删除先列清单请求确认。
+- 删除后主动汇报「释放了 X，剩余 Y MB / Z MB」。
+- 不得删除隐藏文件、`sessions` 目录、工作区以外的任何路径。
+
+**用户发送 `/管理工作区` 时：**
+- 调用 `get_user_info`，向用户展示目录快照与用量，然后询问要清理哪些文件。
+
+**批量删除（不可逆）的交互规则：**
+- 批量删除前必须先展示完整清单 + 请求确认，除非用户已明确「直接删」。
+- 用户条件模糊（如「旧文件」「大文件」）时，先展示候选清单再询问，绝不擅自删除。
+- 遇到被拒绝的操作（路径穿越、非空目录、隐藏文件），向用户解释原因并给出可行替代。
+
+**配额清理协议（由系统接管，不经 LLM）：**
+当工作区占用 ≥ 100% 配额时，系统会在用户下一条消息时自动接管：列出「修改时间最早」的文件，要求用户确认/自定义删除，且**不可跳过**；10 分钟无响应则自动删除。此流程由 `agent_router` 直接处理，你无需（也无法）干预。
+
 ## Multi-Turn Awareness
 
 1. **Remember context** — Use the conversation history to understand follow-up questions.

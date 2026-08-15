@@ -513,6 +513,35 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ---
 
+## Tool: delete_workspace_file
+
+**Description**: 删除当前用户工作区内的指定文件或空目录，释放磁盘空间。路径为相对于工作区根目录的路径（如 `uploads/abc.png` 或 `repos/my-repo`）。
+
+**When to use**: 当用户表达删除工作区文件/仓库的意图时（如「删掉那个文件」「帮我清理工作区」「删除那个仓库」）。删除前应先调用 `get_user_info` 获取快照确认目标，不要凭空猜测路径。
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "相对于工作区根目录的路径，如 'uploads/abc.png' 或 'repos/my-repo'"
+    }
+  },
+  "required": ["path"]
+}
+```
+
+**行为与安全约束**:
+- 目标为**文件** → 删除并汇报释放空间
+- 目标为**空目录** → 删除
+- 目标为**非空目录** → 拒绝（防止误删整个目录），提示先删除内部文件
+- 拒绝删除隐藏文件（`.` 开头）、工作区以外的路径、路径穿越（`..`）
+- 删除后主动汇报「释放了 X，剩余 Y MB / Z MB」
+
+---
+
 ## Tool: read_file
 
 **Description**: Read and analyze files that users upload in QQ messages. Supports text files (code, logs, configs, etc. — returns full content), PDF files (returns extracted text), image files (returns metadata + AI analysis if multimodal LLM configured), and audio files (returns metadata + AI transcription/emotion/context analysis if audio model configured).

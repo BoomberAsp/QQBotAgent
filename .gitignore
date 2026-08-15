@@ -33,3 +33,6 @@ __pycache__/
 # 临时文件
 *.log
 *.tmp
+
+# 开发文档
+QQBot/docs/
