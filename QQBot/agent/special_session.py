@@ -307,6 +307,17 @@ class SpecialSessionManager:
             self._save_index(user_id, index)
             return
 
+    def get_files(self, user_id: str, name: str) -> List[str]:
+        """Return the workspace-relative file paths recorded against a session.
+
+        Returns an empty list if the session does not exist or has no files.
+        """
+        index = self._load_index(user_id)
+        for s in index.get("sessions", []):
+            if s["name"] == name:
+                return list(s.get("metadata", {}).get("files", []))
+        return []
+
     def _workspace_root(self, user_id: str) -> str:
         """Derive the workspace root (same layout as UserWorkspaceManager)."""
         return os.path.join(os.path.abspath(self.user_data_root),

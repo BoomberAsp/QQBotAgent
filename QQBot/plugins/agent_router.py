@@ -1248,10 +1248,11 @@ def _get_user_info() -> str:
 # singletons like _workspace_manager, _special_sessions are initialized)
 _tool_registry.register(
     "get_user_info", _get_user_info,
-    "获取当前用户的系统信息，包括：权限级别、特殊会话列表、工作区用量、可用工具范围、"
-    "代码执行限制（如有）。当用户询问「我的设置」「我的权限」「我的工作区」「我的会话」"
-    "「我能用什么工具」或类似用户自身信息相关问题时，应调用此工具。此工具返回结构化"
-    "系统数据，可避免 LLM 在系统信息类问题上浪费推理 token。",
+    "获取当前用户的系统信息，包括：权限级别、特殊会话列表、工作区用量与目录快照"
+    "（含 repos 仓库清单、uploads 文件清单）、可用工具范围、代码执行限制（如有）。"
+    "当用户询问「我的设置」「我的权限」「我的工作区」「查看工作区」「工作区里有什么」"
+    "「我的会话」「我能用什么工具」或类似用户自身信息相关问题时，应调用此工具。"
+    "此工具返回结构化系统数据，可避免 LLM 在系统信息类问题上浪费推理 token。",
     {"type": "object", "properties": {}, "required": []},
 )
 
@@ -2163,10 +2164,26 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             return True
 
         _pending_delete_confirm[user_id] = (args, time.time() + 60)
-        await _safe_send(
-            f"确认删除特殊会话「{args}」？此操作不可撤销。\n"
-            f"请回复「确认删除 {args}」来执行（60秒内有效）。"
-        )
+
+        files = _special_sessions.get_files(user_id, args)
+        deletable = [
+            f for f in files
+            if f != "repos" and not f.startswith("repos" + os.sep)
+        ]
+        kept_repos = [
+            f for f in files
+            if f == "repos" or f.startswith("repos" + os.sep)
+        ]
+
+        msg = f"确认删除特殊会话「{args}」？此操作不可撤销。\n"
+        if deletable:
+            msg += f"删除后将清理 {len(deletable)} 个关联文件：\n"
+            msg += "\n".join(f"  - {rel}" for rel in deletable) + "\n"
+        if kept_repos:
+            msg += "以下仓库予以保留（工作区内仍可用）：\n"
+            msg += "\n".join(f"  - {rel}" for rel in kept_repos) + "\n"
+        msg += f"请回复「确认删除 {args}」来执行（60秒内有效）。"
+        await _safe_send(msg)
         return True
 
     # ── /结束会话 ──────────────────────────────────────────────
