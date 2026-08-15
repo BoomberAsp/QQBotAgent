@@ -412,19 +412,33 @@ Feature 6 的 `/管理工作区` 命令是「显式入口」，本 Feature 是�
 
 ## Idea 1: 临时会话文件迁移到用户专属工作区
 
-### 当前状态：**已架构上消除（无需迁移）**
+### 当前状态：**已实现（方案 B）**
 
-所有文件从上传那一刻起就写入用户专属工作区 `{USER_DATA_ROOT}/{user_id}/workspace/`，无论是临时会话还是特殊会话。关键代码：
+**文件系统层面已隔离（无需迁移）**：所有文件从上传那一刻起就写入用户专属工作区 `{USER_DATA_ROOT}/{user_id}/workspace/`，无论是临时会话还是特殊会话。关键代码：
 
-- `agent_router.py:1068-1070` — 每条消息处理前设置 `_current_user_workspace` contextvar：
-  ```python
-  _workspace_manager.ensure_dirs(user_id)
-  _current_user_workspace.set(_workspace_manager.get_workspace(user_id))
-  ```
-- `agent_router.py:98-109` — `_get_uploads_dir()` 运行时读取 contextvar，始终返回用户工作区路径
-- `builtin_tools.py:37-59` — `_get_workspace_root()` 同样读取 contextvar
+- `agent_router.py:1301-1303` — 每条消息处理前设置 `_current_user_workspace` contextvar
+- `agent_router.py:887-903` — `_record_session_file()` 将新写入文件归属到活动特殊会话
 
-**结论**：不存在「共享工作区」，所有用户的文件从一开始就隔离。无需迁移。但 `/保存为会话` 只复制了对话上下文（最近 20 条消息），没有额外操作——这已经足够，因为文件已经在正确位置。
+**被掩盖的缺口**：`/保存为会话`（`agent_router.py:2202-2261`）只复制最近 20 条**消息**，不迁移临时会话期间上传的文件归属。而 `_record_session_file()` 在无活动特殊会话时直接 no-op（`active is None → return`），导致临时会话上传的文件无归属记录；`/保存为会话` 后新会话 `metadata.files` 为空，日后 `/删除会话` 时这些文件变成孤儿、无法随会话清理。
+
+### 方案（选定：方案 B）
+
+**方案 B — 显式跟踪临时会话文件（推荐）**
+
+- 新增模块级缓存 `_temp_session_files: dict[str, set[str]]`（`user_id` → workspace 相对路径集合）
+- 改造 `_record_session_file()`：无活动特殊会话时，把相对路径记入 `_temp_session_files[user_id]`（而非直接丢弃）
+- `/保存为会话` 复制消息后：`for rel in _temp_session_files.pop(user_id, set()): _special_sessions.add_file(user_id, session.name, rel)`
+- 清理点：`/clear`（`_handle_special_command`）、`/新会话`（`_handle_session_command`）时 `_temp_session_files.pop(user_id, None)`
+
+**方案 A — 从消息文本解析（备选）**：扫描 `/保存为会话` 复制的 `[用户上传了文件 X，已保存至: <abs_path>]` 文本，正则提取路径后 `add_file`。无新状态，但依赖消息格式、脆弱，故弃用。
+
+### 实现要点
+
+| 文件 | 变更 |
+|------|------|
+| `QQBot/plugins/agent_router.py` | 新增 `_temp_session_files`；`_record_session_file()` 无活动会话时记录；`/保存为会话` 迁移归属；`/clear`、`/新会话` 清理 |
+
+> 边界：`add_file` 幂等，同一文件多会话引用互不影响；临时会话 30 分钟超时未保存，文件仍保留在工作区（本就是用户持久资产），`_temp_session_files` 残留引用由下次 `/clear`/`/新会话` 或 `/保存为会话` 的 `pop` 兜底清理。
 
 ---
 
@@ -456,35 +470,39 @@ AGENTS.md 中也有文档记录 (`config/AGENTS.md:95`)：
 
 ## Idea 3: 15+ 条消息自动建议升级为特殊会话
 
-### 当前状态：**未实现**
+### 当前状态：**已实现（方案 A）**
 
 ### 问题
 
 用户在临时会话中连续讨论同一话题，发送 15 条以上消息时，智能体不会主动建议升级。用户可能不知道 `/保存为会话` 功能，导致上下文积累在临时会话中、无法持久化。
 
-### 设计
+临时会话 `Session.context` 上限为 20 条（`session.py:85` `max_context_messages=20`，`trim()` 在 `session.py:49`），每轮追加 user + assistant 两条（`agent.py:281-282`），tool 消息不落库。故「15 条」≈ 7~8 轮，为上限的 75%，阈值合理。
 
-**触发条件**：临时会话上下文中累计消息数 ≥ 15 条，且智能体即将回复时。
+### 设计（选定：方案 A）
 
-**行为**：智能体在回复末尾追加升级建议：
+**触发条件**：`session_type == "temporary"` 且 `message_count(user_id) >= 15`，在调用 `agent.run()` 前注入提示指令。
+
+**注入点**：`agent_router.py:1536`（`agent.run()` 调用前）；`session_type` 已在 `1489-1490` 判定。
+
+**注入内容**（追加到 `augmented_message` 前缀）：
 
 ```
-💡 提示：当前话题已持续 {n} 条消息。考虑发送 /保存为会话 <名称> 来保存这段对话，方便后续继续讨论。临时会话有消息数限制，超出后会丢失早期上下文。
+[系统提示] 当前临时会话已累积 {n} 条消息，接近 20 条上限，超出后早期上下文会丢失。若用户当前话题明确且可能继续，请在回复末尾用一句话自然建议其发送「/保存为会话 <名称>」持久化这段对话。
 ```
 
-**关键问题：谁来触发？**
+**限流**：`_upgrade_hint_last: dict[str, int]`（user_id → 上次提示时的消息数），仅当 `n - last >= 10` 时再次提示。
 
-- **方案 A（推荐）**：在 `agent_router.py` 的 `_handle_agent_message_impl()` 中，调用 agent 前检查 `len(temp_session.context) >= 15`，如果满足且未在近 5 条消息内提示过，在 augmented message 末尾追加提示指令（低 token 成本方式）。智能体在回复时自然提及。
-- **方案 B**：agent 回复后，`agent_router.py` 在发送前检查并追加提示文本（零 token 成本，但可能打断智能体输出）。
-
-选择方案 A：让智能体在回复中自然融入提示，更符合对话体验。
+**方案 B（备选，弃用）**：agent 回复后、发送前追加提示文本——零 token、零污染，但硬插在回复末尾，体验不如 A 自然。
 
 ### 实现要点
 
-- `SessionManager` 暴露 `message_count(user_id)` 方法
-- `agent_router.py` 在构建 augmented message 时检查
-- 限流：同一用户每 10 条消息最多提示一次（防止骚扰）
-- 提示文本加在 augmented message 中（非回复后追加），智能体可选择自然融入或忽略
+| 步骤 | 文件 | 变更 |
+|------|------|------|
+| 1. 消息计数 | `agent/session.py` | 新增 `message_count(user_id)`，返回 `len(context)` 或 0 |
+| 2. 常量与限流状态 | `plugins/agent_router.py` | 新增 `UPGRADE_HINT_THRESHOLD=15`、`UPGRADE_HINT_INTERVAL=10`、`_upgrade_hint_last` |
+| 3. 注入逻辑 | `plugins/agent_router.py` | `agent.run()` 前，`session_type=="temporary"` 且满足阈值+限流时，前缀注入提示 |
+
+> 边界：仅临时会话触发（特殊会话已持久化；群聊连续模式走独立代码路径 `1714+`，不受影响）；提示作为 user 消息落入 20 条 `context` 会被自然 trim，且限流控制频率，可接受。
 
 ---
 
@@ -547,9 +565,9 @@ AGENTS.md 中也有文档记录 (`config/AGENTS.md:95`)：
 
 | # | Idea | Status | Action |
 |:-:|------|:------:|--------|
-| 1 | 临时会话文件迁移 | 架构上已消除 | 无需改动 |
+| 1 | 临时会话文件迁移 | 已实现（方案 B） | 文件系统隔离 + `/保存为会话` 归属迁移 |
 | 2 | 两种创建方式 | 已实现 | 无需改动 |
-| 3 | 15+ 条消息升级建议 | **未实现** | 待实现（方案 A：augmented message 注入） |
+| 3 | 15+ 条消息升级建议 | 已实现（方案 A） | `message_count` + augmented message 注入 + 限流 |
 | 4 | 85% 上下文压缩提示 | **未实现** | 待实现（token 估算 + `/压缩会话` 命令） |
 | 5 | 群聊文件延迟下载 | **未实现** | 待实现（元数据记录 + 按需下载 + 进度反馈） |
 
@@ -1028,9 +1046,9 @@ OCR 文字块: (text="Boss名称", bbox=[x1, y1, x2, y2])
 
 | # | Idea | Status | Action |
 |:-:|------|:------:|--------|
-| 1 | 临时会话文件迁移 | 架构上已消除 | 无需改动 |
+| 1 | 临时会话文件迁移 | 已实现（方案 B） | 文件系统隔离 + `/保存为会话` 归属迁移 |
 | 2 | 两种创建方式 | 已实现 | 无需改动 |
-| 3 | 15+ 条消息升级建议 | **未实现** | 待实现（方案 A：augmented message 注入） |
+| 3 | 15+ 条消息升级建议 | 已实现（方案 A） | `message_count` + augmented message 注入 + 限流 |
 | 4 | 85% 上下文压缩提示 | **未实现** | 待实现（token 估算 + `/压缩会话` 命令） |
 | 5 | 群聊文件延迟下载 | **未实现** | 待实现（元数据记录 + 按需下载 + 进度反馈） |
 | 6 | 分层上下文 Layer 3 | **未实现** | 待实现（每 30 条异步生成渐进式摘要） |

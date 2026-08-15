@@ -869,6 +869,15 @@ _user_busy: set = set()
 _MAX_RECENT_FILES = 200
 _recent_files: dict[str, list[dict]] = {}
 
+# Temporary-session file provenance — tracks workspace-relative paths uploaded
+# while no special session is active, so /保存为会话 can migrate ownership.
+_temp_session_files: dict[str, set[str]] = {}
+
+# Idea 3 — suggest upgrading a long temporary session to a special session.
+UPGRADE_HINT_THRESHOLD = 15   # message count at which to start suggesting
+UPGRADE_HINT_INTERVAL = 10    # re-suggest at most every N messages
+_upgrade_hint_last: dict[str, int] = {}  # user_id -> message count at last hint
+
 
 def _record_file(message_id: str, name: str, path: str = "", error: str = ""):
     """Record a downloaded file (or failed download) against its source
@@ -887,12 +896,11 @@ def _record_file(message_id: str, name: str, path: str = "", error: str = ""):
 def _record_session_file(user_id: str, abs_path: str) -> None:
     """Attribute a newly written workspace file to the active special session.
 
-    No-op when no special session is active, or when the path is outside the
-    user's workspace. ``abs_path`` is converted to a workspace-relative path.
+    When no special session is active, the file is recorded into
+    ``_temp_session_files`` so ``/保存为会话`` can migrate the provenance
+    later. ``abs_path`` is converted to a workspace-relative path; paths
+    outside the user's workspace are ignored.
     """
-    active = _special_sessions.get_active(user_id)
-    if active is None:
-        return
     ws = _workspace_manager.get_workspace(user_id)
     try:
         rel = os.path.relpath(abs_path, ws)
@@ -900,7 +908,12 @@ def _record_session_file(user_id: str, abs_path: str) -> None:
         return
     if rel.startswith("..") or os.path.isabs(rel):
         return
-    _special_sessions.add_file(user_id, active.name, rel)
+
+    active = _special_sessions.get_active(user_id)
+    if active is not None:
+        _special_sessions.add_file(user_id, active.name, rel)
+    else:
+        _temp_session_files.setdefault(user_id, set()).add(rel)
 
 
 def _format_delete_summary(result: dict) -> str:
@@ -1531,6 +1544,19 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         pm = get_personality_manager()
         _current_personality.set(pm.get_user_personality(user_id))
 
+        # Idea 3 — suggest upgrading a long temporary session to a special session.
+        if session_type == "temporary":
+            n = _session_manager.message_count(user_id)
+            last = _upgrade_hint_last.get(user_id, -UPGRADE_HINT_INTERVAL)
+            if n >= UPGRADE_HINT_THRESHOLD and (n - last) >= UPGRADE_HINT_INTERVAL:
+                _upgrade_hint_last[user_id] = n
+                augmented_message = (
+                    f"[系统提示] 当前临时会话已累积 {n} 条消息，接近 20 条上限，"
+                    f"超出后早期上下文会丢失。若用户当前话题明确且可能继续，"
+                    f"请在回复末尾用一句话自然建议其发送「/保存为会话 <名称>」"
+                    f"持久化这段对话。\n\n{augmented_message}"
+                )
+
         try:
             response = await asyncio.wait_for(
                 agent.run(
@@ -2048,6 +2074,9 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             session = _special_sessions.create(user_id, name)
             # Activate the session — create() only persists it, doesn't set active_session
             _special_sessions.switch_to(user_id, session.name)
+            # Starting a fresh special session; drop any pending temp-session file
+            # provenance (the user did not choose /保存为会话 to carry it over).
+            _temp_session_files.pop(user_id, None)
             quota_warn = _quota_warning(user_id)
             if args:
                 msg = (
@@ -2239,6 +2268,11 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
                 msg["content"],
                 msg.get("reasoning_content"),
             )
+
+        # Migrate temporary-session file provenance to the new session
+        for rel in _temp_session_files.pop(user_id, set()):
+            _special_sessions.add_file(user_id, session.name, rel)
+
         # Force name update (user specified name)
         if name and session.name == name:
             pass  # Already named
@@ -2380,6 +2414,7 @@ async def _handle_special_command(command: str, user_id: str):
     """Handle special meta-commands."""
     if command in ["/clear", "清除上下文", "新对话"]:
         agent.clear_user_session(user_id)
+        _temp_session_files.pop(user_id, None)
         await _safe_send("已清除对话上下文，开始新对话~")
     elif command == "/status":
         status = agent.get_status()
