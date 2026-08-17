@@ -13,6 +13,8 @@ QQBot/data
 !QQBot/data/wiki_cache/
 !QQBot/data/name_index/
 !QQBot/data/redeem_code/
+!QQBot/data/personality_config.json
+!QQBot/data/group_personality.json
 QQBot/logs
 QQBot/.env
 QQBot/.env.prod

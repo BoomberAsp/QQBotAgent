@@ -1295,9 +1295,9 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
 
     # ── Per-user concurrency guard ──
     if user_id in _user_busy:
-        _short = get_personality_manager().get_short_name(
-            get_personality_manager().get_user_personality(user_id)
-        )
+        _gid = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+        _pm = get_personality_manager()
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, _gid))
         await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~")
         return
     _user_busy.add(user_id)
@@ -1362,7 +1362,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         if cmd_handled:
             return
         # /personality / /人格切换 command
-        cmd_handled = await _handle_personality_command(text_content, user_id)
+        cmd_handled = await _handle_personality_command(text_content, user_id, event)
         if cmd_handled:
             return
         cmd_handled = await _handle_session_command(text_content, user_id)
@@ -1473,8 +1473,9 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
     # Send thinking indicator (non-critical, ignore send failures)
     try:
+        _gid = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
         _pm = get_personality_manager()
-        _short = _pm.get_short_name(_pm.get_user_personality(user_id))
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, _gid))
         await _safe_send(f"{_short} 正在思考...")
     except Exception:
         pass
@@ -1542,7 +1543,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
         # Set personality contextvar
         pm = get_personality_manager()
-        _current_personality.set(pm.get_user_personality(user_id))
+        _current_personality.set(pm.resolve_effective_personality(user_id, group_id))
 
         # Idea 3 — suggest upgrading a long temporary session to a special session.
         if session_type == "temporary":
@@ -1624,9 +1625,8 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
 
     # ── Per-user concurrency guard ──
     if user_id in _user_busy:
-        _short = get_personality_manager().get_short_name(
-            get_personality_manager().get_user_personality(user_id)
-        )
+        _pm = get_personality_manager()
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, group_id))
         await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~", matcher=continuous_router)
         return
     _user_busy.add(user_id)
@@ -1780,7 +1780,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
 
             # Set personality contextvar
             pm = get_personality_manager()
-            _current_personality.set(pm.get_user_personality(user_id))
+            _current_personality.set(pm.resolve_effective_personality(user_id, group_id))
 
             # Resolve group feature restrictions
             gf = get_group_features()
@@ -1814,7 +1814,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
 
     except asyncio.TimeoutError:
         _pm = get_personality_manager()
-        _short = _pm.get_short_name(_pm.get_user_personality(user_id))
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, group_id))
         await _safe_send(f"抱歉，{_short}思考时间超过您的配额时长了。请尝试用更简单的方式提问~", matcher=continuous_router)
     except Exception as e:
         await _safe_send(f"处理消息时出现错误: {str(e)}", matcher=continuous_router)
@@ -1884,7 +1884,7 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
     return True
 
 
-async def _handle_personality_command(text: str, user_id: str) -> bool:
+async def _handle_personality_command(text: str, user_id: str, event: MessageEvent) -> bool:
     """Handle /personality / /人格切换 command for personality switching.
 
     Returns True if the command was handled.
@@ -1896,12 +1896,19 @@ async def _handle_personality_command(text: str, user_id: str) -> bool:
     pm = get_personality_manager()
     personalities = pm.list_personalities()
     args = args.strip()
+    group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
 
     # /personality — show current and available
     if not args:
-        current_key = pm.get_user_personality(user_id)
+        current_key = pm.resolve_effective_personality(user_id, group_id)
         current_display = pm.get_display_name(current_key)
-        lines = [f"当前人格: {current_display} ({current_key})", "", "可用人格:"]
+        # Annotate where the effective personality comes from
+        source = "全局默认"
+        if pm.get_personal_personality(user_id) == current_key:
+            source = "个人设置"
+        elif pm.get_group_personality(group_id) == current_key:
+            source = "群默认"
+        lines = [f"当前人格: {current_display} ({current_key}，{source})", "", "可用人格:"]
         for p in personalities:
             marker = " ← 当前" if p["key"] == current_key else ""
             lines.append(f"  {p['display_name']} ({p['key']}){marker}")
@@ -1911,8 +1918,7 @@ async def _handle_personality_command(text: str, user_id: str) -> bool:
 
     # /personality <name> — switch
     try:
-        pm.set_user_personality(user_id, args)
-        resolved = pm.resolve_name(args)
+        resolved = pm.set_user_personality(user_id, args)
         display = pm.get_display_name(resolved)
         await _safe_send(f"已切换至「{display}」人格。")
     except ValueError as e:
@@ -2021,8 +2027,47 @@ async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -
             label = FEATURE_LABELS[key]
             state = "开启" if features[key] else "关闭"
             lines.append(f"  {label}: {state}")
+        pm = get_personality_manager()
+        group_key = pm.get_group_personality(group_id)
+        if group_key:
+            lines.append(f"  默认人格: {pm.get_display_name(group_key)} ({group_key})")
+        else:
+            lines.append(f"  默认人格: 未绑定（全局默认 {pm.get_display_name(pm.get_default())}）")
         lines.append(f"\n用法: /toggle <功能名> <on|off>  例如: /toggle gacha off")
+        lines.append(f"用法: /toggle personality <名称>  设置本群默认人格；/toggle personality 默认 清除")
         await _safe_send("\n".join(lines))
+        return True
+
+    # /toggle personality [名称|默认] — group default personality
+    if args == "personality" or args.startswith("personality "):
+        pm = get_personality_manager()
+        rest = args[len("personality"):].strip()
+        if not rest:
+            group_key = pm.get_group_personality(group_id)
+            global_key = pm.get_default()
+            if group_key:
+                lines = [
+                    f"当前本群默认人格: {pm.get_display_name(group_key)} ({group_key})",
+                    f"全局默认人格: {pm.get_display_name(global_key)} ({global_key})",
+                ]
+            else:
+                lines = [
+                    "当前本群未绑定默认人格（使用全局默认）。",
+                    f"全局默认人格: {pm.get_display_name(global_key)} ({global_key})",
+                ]
+            lines.append("\n用法: /toggle personality <名称> 设置；/toggle personality 默认 清除绑定")
+            await _safe_send("\n".join(lines))
+            return True
+        if rest == "默认":
+            pm.clear_group_personality(group_id)
+            global_key = pm.get_default()
+            await _safe_send(f"已清除本群默认人格，回落到全局默认「{pm.get_display_name(global_key)}」。")
+            return True
+        try:
+            resolved = pm.set_group_personality(group_id, rest)
+            await _safe_send(f"已设置本群默认人格为「{pm.get_display_name(resolved)}」。")
+        except ValueError as e:
+            await _safe_send(str(e))
         return True
 
     # /toggle <feature> <on|off>

@@ -23,6 +23,12 @@ _PERSONALITIES_DIR = os.path.join(
 _SETTINGS_FILE = os.path.join(
     os.path.dirname(__file__), "..", "data", "personality_settings.json"
 )
+_DEFAULT_CONFIG_FILE = os.path.join(
+    os.path.dirname(__file__), "..", "data", "personality_config.json"
+)
+_GROUP_CONFIG_FILE = os.path.join(
+    os.path.dirname(__file__), "..", "data", "group_personality.json"
+)
 
 
 # ── PersonalityManager ────────────────────────────────────────────
@@ -109,9 +115,29 @@ class PersonalityManager:
         return result
 
     def get_default(self) -> str:
-        """Return the default personality key."""
+        """Return the default personality key.
+
+        Reads ``data/personality_config.json`` (``default`` field). If the
+        config is missing/invalid, or the configured key no longer exists,
+        falls back to the first available personality, then "assistant".
+        """
+        default = self._load_default_key()
         available = self._discover()
+        if default in available:
+            return default
         return available[0] if available else "assistant"
+
+    def _load_default_key(self) -> str:
+        """Read the default personality key from data/personality_config.json."""
+        try:
+            with open(_DEFAULT_CONFIG_FILE, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                key = config.get("default")
+                if isinstance(key, str) and key.strip():
+                    return key.strip()
+        except (FileNotFoundError, json.JSONDecodeError, IOError):
+            pass
+        return "assistant"
 
     def resolve_name(self, name: str) -> Optional[str]:
         """Resolve a user-provided name to a personality key.
@@ -119,10 +145,9 @@ class PersonalityManager:
         Matching order:
         1. Exact key match (e.g., "rubi" → "rubi")
         2. Case-insensitive key match (e.g., "Rubi" → "rubi")
-        3. Display name substring match (e.g., "露比" matches "露比 (Rubi)")
-        4. Case-insensitive display name match
-        5. Unique partial key match (e.g., "rub" → "rubi" if unique)
-        6. Unique partial display name match
+        3. Display name substring match, case-insensitive (e.g., "露比" matches "露比 (Rubi)")
+        4. Unique partial key match (e.g., "rub" → "rubi" if unique)
+        5. Unique partial display name match
 
         Returns the matched key, or None if no match or ambiguous.
         """
@@ -141,24 +166,17 @@ class PersonalityManager:
             if key.lower() == name_lower:
                 return key
 
-        # 3. Display name substring match (e.g., "露比" matches "露比 (Rubi)")
+        # 3. Display name substring match (case-insensitive)
         for key in available:
-            display = self.get_display_name(key)
-            if name in display:
+            if name_lower in self.get_display_name(key).lower():
                 return key
 
-        # 4. Case-insensitive display name match
-        for key in available:
-            display_lower = self.get_display_name(key).lower()
-            if name_lower in display_lower:
-                return key
-
-        # 5. Unique partial key match
+        # 4. Unique partial key match
         key_matches = [k for k in available if name_lower in k.lower()]
         if len(key_matches) == 1:
             return key_matches[0]
 
-        # 6. Unique partial display name match
+        # 5. Unique partial display name match
         display_matches = [
             k for k in available
             if name_lower in self.get_display_name(k).lower()
@@ -186,6 +204,22 @@ class PersonalityManager:
         with open(_SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(settings, f, ensure_ascii=False, indent=2)
 
+    def _load_group_settings(self) -> dict:
+        """Load per-group personality bindings from JSON."""
+        if not os.path.exists(_GROUP_CONFIG_FILE):
+            return {}
+        try:
+            with open(_GROUP_CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+
+    def _save_group_settings(self, settings: dict):
+        """Persist per-group personality bindings to JSON."""
+        os.makedirs(os.path.dirname(_GROUP_CONFIG_FILE), exist_ok=True)
+        with open(_GROUP_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+
     def get_user_personality(self, user_id: str) -> str:
         """Get the active personality for a user. Default: first available."""
         settings = self._load_settings()
@@ -195,10 +229,19 @@ class PersonalityManager:
             return self.get_default()
         return name
 
-    def set_user_personality(self, user_id: str, name: str):
+    def get_personal_personality(self, user_id: str) -> Optional[str]:
+        """Return the user's explicit personal setting, or None if unset."""
+        settings = self._load_settings()
+        name = settings.get(user_id)
+        if name and name in self._discover():
+            return name
+        return None
+
+    def set_user_personality(self, user_id: str, name: str) -> str:
         """Set the active personality for a user.
 
         Supports fuzzy matching: key, display name, or partial match.
+        Returns the resolved personality key.
         Raises ValueError with helpful message if no match or ambiguous.
         """
         resolved = self.resolve_name(name)
@@ -216,6 +259,75 @@ class PersonalityManager:
         settings = self._load_settings()
         settings[user_id] = resolved
         self._save_settings(settings)
+        return resolved
+
+    # ── Group-Bound Default Personality ────────────────────────────
+
+    def get_group_personality(self, group_id: str) -> Optional[str]:
+        """Return the personality key bound to a group, or None if unset.
+
+        Validates that the stored key still exists; invalid/removed keys
+        are treated as unset.
+        """
+        if not group_id:
+            return None
+        settings = self._load_group_settings()
+        name = settings.get(group_id)
+        if name and name in self._discover():
+            return name
+        return None
+
+    def set_group_personality(self, group_id: str, name: str) -> str:
+        """Bind a default personality to a group.
+
+        Supports fuzzy matching via resolve_name. Returns the resolved key.
+        Raises ValueError if no match or ambiguous.
+        """
+        resolved = self.resolve_name(name)
+        if resolved is None:
+            available = self._discover()
+            if not available:
+                raise ValueError("没有可用的人格配置。")
+            examples = []
+            for k in available:
+                d = self.get_display_name(k)
+                examples.append(f"{d} ({k})")
+            raise ValueError(
+                f"未找到匹配「{name}」的人格。\n\n可用人格:\n  " + "\n  ".join(examples)
+            )
+        settings = self._load_group_settings()
+        settings[group_id] = resolved
+        self._save_group_settings(settings)
+        return resolved
+
+    def clear_group_personality(self, group_id: str):
+        """Remove a group's default personality binding."""
+        settings = self._load_group_settings()
+        if group_id in settings:
+            del settings[group_id]
+            self._save_group_settings(settings)
+
+    def resolve_effective_personality(
+        self, user_id: str, group_id: str = None
+    ) -> str:
+        """Resolve the personality that should be in effect.
+
+        Priority: user override > group default > global default.
+        Falls back to the first available personality, then "assistant".
+        """
+        # 1. User override
+        settings = self._load_settings()
+        name = settings.get(user_id)
+        if name and name in self._discover():
+            return name
+
+        # 2. Group default (only when group_id provided)
+        group_name = self.get_group_personality(group_id or "")
+        if group_name:
+            return group_name
+
+        # 3. Global default
+        return self.get_default()
 
 
 # ── Module-level singleton ────────────────────────────────────────

@@ -508,24 +508,60 @@ AGENTS.md 中也有文档记录 (`config/AGENTS.md:95`)：
 
 ## Idea 4: 上下文长度达到 85% 时提示压缩
 
-### 当前状态：**未实现**
+### 当前状态：**部分实现（仅 Layer 1+2 截断）— 待严密设计，暂不实现**
+
+> ⚠️ 智能体的记忆系统（上下文压缩 / 摘要 / token 管理）需要严密设计后再动手。本 Idea 当前只做现状核查与设计预留，**不进入实现**。
 
 ### 问题
 
-特殊会话的 `context` 列表无限增长（`special_session.py:244-272` `add_message()` 无长度限制）。当消息累积到接近模型上下文窗口上限时，API 调用会失败或返回截断结果。目前没有主动的上下文长度监控或压缩提示。
+特殊会话的 `context` 列表无限增长（`special_session.py:260-288` `add_message()` 无长度限制）。当消息累积到接近模型上下文窗口上限时，API 调用会失败或返回截断结果。目前没有主动的上下文长度监控或压缩提示。
 
-### 现有相关代码
+### 现状核查（2026-08-15）
 
-| 代码 | 作用 | 局限性 |
-|------|------|--------|
-| `agent.py:348-382` `_compress_context()` | 压缩旧 tool 结果（保留前 20 条完整，截断旧输出到第一行） | 仅按消息数量截断，不感知 token 数 |
-| `config/models_settings.json` | 定义 `max_tokens`（REASONING_MODEL: 409600, FLASH_MODEL: 102400） | 这是模型输出上限，非上下文窗口上限；代码中未读取用于上下文管理 |
+**已存在：`_compress_context()`（`agent/agent.py:409-443`）** —— 一个 `@staticmethod`，仅在 `_build_messages()`（`agent.py:396`）对特殊会话 context 做请求前预处理：
 
-### 设计
+- **Layer 1**：最近 20 条消息保留完整原文
+- **Layer 2**：20 条之前的 `tool` 结果截断到首行（前 200 字符）
+- **Layer 3**：渐进式摘要 —— **未实现**（代码注释 `agent.py:415`：`"Layer 3: Progressive summary not yet implemented"`）
+
+其关键性质（对 Idea 4 的定位很重要）：
+
+1. **无 token 感知**：只数消息条数（固定 20 条），不估算 token，不知道上下文窗口多大
+2. **不可调用**：不是注册工具，也无 `/压缩会话` 命令，用户无法触发
+3. **不落盘、不写回**：只对 context 副本操作并返回新列表，持久化 context 仍无限增长
+4. **只在读时压缩**：每次请求临时压一下，存储层无任何压缩状态
+
+**不存在的部分（Idea 4 需从零实现）**：
+
+| 能力 | 状态 |
+|------|------|
+| `/压缩会话` 命令 | ❌ 无（AGENTS.md 命令表无此项） |
+| token 估算函数 | ❌ 无任何实现 |
+| 85% 阈值 / `_needs_compression` 标志 | ❌ 无 |
+| 摘要生成逻辑（除 PDF 摘要工具外） | ❌ 无 |
+| 上下文窗口上限读取 | ❌ 无 |
+
+**模型配置现状**（`config/models_settings.json`）：
+
+| 模型 | model | `max_tokens` |
+|------|-------|-------------|
+| REASONING | `deepseek-v4-pro` | 409600 |
+| FLASH | `deepseek-v4-flash` | 102400 |
+| MULTIMODAL | `qwen3.6-plus` | 20480 |
+
+⚠️ 上述 `max_tokens` 是**输出上限**，非上下文窗口（输入上限）；`model_router.py` / `deepseek_client.py` 均未读取该字段，配置中亦无 `context_window` 字段。
+
+**「无限记忆」（特殊会话）的真实状态**：
+
+- 存储：快照 + 增量双层（`special_session.py` `SNAPSHOT_INTERVAL=50`），`add_message()` 无限追加，无长度限制、无 token 计数、无压缩标志
+- 读取：仅 `_compress_context()` Layer 1+2 截断，且不写回
+- 结论：「百万 token」（DOCUMENTATION.md:256）目前只是乐观描述，无任何机制保证 context 不超窗口
+
+### 设计（初稿，待严密设计）
 
 **上下文窗口上限获取**：
-- reasoning model（如 DeepSeek V3.2）：从 `models_settings.json` 或 API `/models` 端点获取 `max_input_tokens`
-- flash model（如 DeepSeek V3.2 Flash）：同上
+- reasoning model（`deepseek-v4-pro`）：从 `models_settings.json` 新增 `context_window` 字段，或 API `/models` 端点获取 `max_input_tokens`
+- flash model（`deepseek-v4-flash`）：同上
 - 取 `min(reasoning_max_input, flash_max_input)` 作为有效上限
 
 **触发条件**：
@@ -568,7 +604,7 @@ AGENTS.md 中也有文档记录 (`config/AGENTS.md:95`)：
 | 1 | 临时会话文件迁移 | 已实现（方案 B） | 文件系统隔离 + `/保存为会话` 归属迁移 |
 | 2 | 两种创建方式 | 已实现 | 无需改动 |
 | 3 | 15+ 条消息升级建议 | 已实现（方案 A） | `message_count` + augmented message 注入 + 限流 |
-| 4 | 85% 上下文压缩提示 | **未实现** | 待实现（token 估算 + `/压缩会话` 命令） |
+| 4 | 85% 上下文压缩提示 | 部分实现（Layer 1+2 截断） | 待严密设计，暂不实现（token 估算 + `/压缩会话`） |
 | 5 | 群聊文件延迟下载 | **未实现** | 待实现（元数据记录 + 按需下载 + 进度反馈） |
 
 ---
@@ -1049,7 +1085,7 @@ OCR 文字块: (text="Boss名称", bbox=[x1, y1, x2, y2])
 | 1 | 临时会话文件迁移 | 已实现（方案 B） | 文件系统隔离 + `/保存为会话` 归属迁移 |
 | 2 | 两种创建方式 | 已实现 | 无需改动 |
 | 3 | 15+ 条消息升级建议 | 已实现（方案 A） | `message_count` + augmented message 注入 + 限流 |
-| 4 | 85% 上下文压缩提示 | **未实现** | 待实现（token 估算 + `/压缩会话` 命令） |
+| 4 | 85% 上下文压缩提示 | 部分实现（Layer 1+2 截断） | 待严密设计，暂不实现（token 估算 + `/压缩会话`） |
 | 5 | 群聊文件延迟下载 | **未实现** | 待实现（元数据记录 + 按需下载 + 进度反馈） |
 | 6 | 分层上下文 Layer 3 | **未实现** | 待实现（每 30 条异步生成渐进式摘要） |
 | 7 | 配额柔性处理 | **部分实现** | 80% 提醒已实现（`check_quota`/`get_quota_context`）；>100% 柔性超额与 150% 硬限待实现 |
