@@ -963,6 +963,7 @@ class TestPersonality:
         self.test_resolve_precedence()
         self.test_set_group_personality()
         self.test_clear_group_personality()
+        self.test_ambiguous_resolution()
 
     def _make_manager(self):
         import agent.personality as pmod
@@ -970,7 +971,11 @@ class TestPersonality:
         tmpdir = tempfile.mkdtemp(prefix="personality_test_")
         pdir = os.path.join(tmpdir, "personalities")
         os.makedirs(pdir, exist_ok=True)
-        for name, title in [("assistant", "助手 Roxy"), ("rubi", "露比 (Rubi)")]:
+        for name, title in [
+            ("assistant", "助手 Roxy"),
+            ("roxy_character", "角色 Roxy (无职转生)"),
+            ("rubi", "露比 (Rubi)"),
+        ]:
             with open(os.path.join(pdir, f"{name}.md"), "w", encoding="utf-8") as f:
                 f.write(f"# {title}\n\nTest personality.")
 
@@ -1023,6 +1028,25 @@ class TestPersonality:
             except ValueError:
                 pass
             print_pass("set_group_personality fuzzy match + validation")
+        finally:
+            patcher.stop()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_ambiguous_resolution(self):
+        pm, patcher, tmpdir = self._make_manager()
+        try:
+            # "Roxy" is a substring of both 助手 Roxy and 角色 Roxy → ambiguous
+            assert pm.resolve_name("Roxy") is None
+            # Distinct prefixes still resolve uniquely
+            assert pm.resolve_name("助手") == "assistant"
+            assert pm.resolve_name("角色") == "roxy_character"
+            # Ambiguous name raises ValueError with a hint
+            try:
+                pm.set_user_personality("u1", "Roxy")
+                assert False, "expected ValueError for ambiguous name"
+            except ValueError as e:
+                assert "多个" in str(e)
+            print_pass("ambiguous names rejected instead of silently mispicked")
         finally:
             patcher.stop()
             shutil.rmtree(tmpdir, ignore_errors=True)

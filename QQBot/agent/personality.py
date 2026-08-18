@@ -145,9 +145,10 @@ class PersonalityManager:
         Matching order:
         1. Exact key match (e.g., "rubi" → "rubi")
         2. Case-insensitive key match (e.g., "Rubi" → "rubi")
-        3. Display name substring match, case-insensitive (e.g., "露比" matches "露比 (Rubi)")
-        4. Unique partial key match (e.g., "rub" → "rubi" if unique)
-        5. Unique partial display name match
+        3. Exact display name match (e.g., "助手 Roxy" → assistant)
+        4. Display name substring match — must be unique (e.g., "露比" → rubi);
+           "Roxy" is ambiguous between 助手 Roxy / 角色 Roxy, so it resolves to None
+        5. Unique partial key match (e.g., "rub" → "rubi" if unique)
 
         Returns the matched key, or None if no match or ambiguous.
         """
@@ -166,25 +167,57 @@ class PersonalityManager:
             if key.lower() == name_lower:
                 return key
 
-        # 3. Display name substring match (case-insensitive)
-        for key in available:
-            if name_lower in self.get_display_name(key).lower():
-                return key
+        # 3. Exact display name match (full name, case-insensitive)
+        exact = [k for k in available if self.get_display_name(k).lower() == name_lower]
+        if len(exact) == 1:
+            return exact[0]
 
-        # 4. Unique partial key match
-        key_matches = [k for k in available if name_lower in k.lower()]
-        if len(key_matches) == 1:
-            return key_matches[0]
-
-        # 5. Unique partial display name match
+        # 4. Display name substring match — reject ambiguity
         display_matches = [
             k for k in available
             if name_lower in self.get_display_name(k).lower()
         ]
         if len(display_matches) == 1:
             return display_matches[0]
+        if len(display_matches) > 1:
+            return None  # ambiguous — don't silently pick one
+
+        # 5. Unique partial key match
+        key_matches = [k for k in available if name_lower in k.lower()]
+        if len(key_matches) == 1:
+            return key_matches[0]
 
         return None
+
+    def _resolve_or_raise(self, name: str) -> str:
+        """Resolve name, or raise ValueError with a helpful message.
+
+        Distinguishes "no match" from "ambiguous" so users get an
+        actionable hint (e.g., 助手 vs 角色) instead of a wrong pick.
+        """
+        available = self._discover()
+        if not available:
+            raise ValueError("没有可用的人格配置。")
+
+        resolved = self.resolve_name(name)
+        if resolved is not None:
+            return resolved
+
+        name_lower = name.lower().strip()
+        matches = [
+            k for k in available
+            if name_lower in self.get_display_name(k).lower()
+        ]
+        examples = "\n  ".join(
+            f"{self.get_display_name(k)} ({k})" for k in available
+        )
+        if len(matches) > 1:
+            raise ValueError(
+                f"「{name}」匹配到多个人格，请更具体。\n\n可用人格:\n  {examples}"
+            )
+        raise ValueError(
+            f"未找到匹配「{name}」的人格。\n\n可用人格:\n  {examples}"
+        )
 
     # ── Settings Persistence ──────────────────────────────────────
 
@@ -244,18 +277,7 @@ class PersonalityManager:
         Returns the resolved personality key.
         Raises ValueError with helpful message if no match or ambiguous.
         """
-        resolved = self.resolve_name(name)
-        if resolved is None:
-            available = self._discover()
-            if not available:
-                raise ValueError("没有可用的人格配置。")
-            examples = []
-            for k in available:
-                d = self.get_display_name(k)
-                examples.append(f"{d} ({k})")
-            raise ValueError(
-                f"未找到匹配「{name}」的人格。\n\n可用人格:\n  " + "\n  ".join(examples)
-            )
+        resolved = self._resolve_or_raise(name)
         settings = self._load_settings()
         settings[user_id] = resolved
         self._save_settings(settings)
@@ -283,18 +305,7 @@ class PersonalityManager:
         Supports fuzzy matching via resolve_name. Returns the resolved key.
         Raises ValueError if no match or ambiguous.
         """
-        resolved = self.resolve_name(name)
-        if resolved is None:
-            available = self._discover()
-            if not available:
-                raise ValueError("没有可用的人格配置。")
-            examples = []
-            for k in available:
-                d = self.get_display_name(k)
-                examples.append(f"{d} ({k})")
-            raise ValueError(
-                f"未找到匹配「{name}」的人格。\n\n可用人格:\n  " + "\n  ".join(examples)
-            )
+        resolved = self._resolve_or_raise(name)
         settings = self._load_group_settings()
         settings[group_id] = resolved
         self._save_group_settings(settings)
