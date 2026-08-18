@@ -723,6 +723,7 @@ class TestUserProfile:
         self.test_to_prompt_context_empty()
         self.test_to_prompt_context_full()
         self.test_merge_facts_dedup()
+        self.test_merge_facts_cap()
         self.test_persistence()
 
     def test_create_and_save(self):
@@ -782,6 +783,18 @@ class TestUserProfile:
         profile.merge_facts(["在深圳", "喜欢游戏"])
         assert len(profile.facts) == 3, f"Expected 3 facts, got {len(profile.facts)}: {profile.facts}"
         print_pass("Fact deduplication (fuzzy matching)")
+
+    def test_merge_facts_cap(self):
+        from agent.profile import UserProfile, MAX_FACTS
+
+        profile = UserProfile(user_id="cap_user")
+        many = [f"fact_{i}" for i in range(MAX_FACTS + 5)]
+        profile.merge_facts(many)
+        assert len(profile.facts) == MAX_FACTS, (
+            f"Expected {MAX_FACTS} facts, got {len(profile.facts)}"
+        )
+        assert profile.facts == many[-MAX_FACTS:], "Oldest facts should be pruned"
+        print_pass("Fact list capped at MAX_FACTS with oldest pruned")
 
     def test_persistence(self):
         from agent.profile import UserProfile, ProfileManager
