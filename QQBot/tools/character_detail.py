@@ -14,6 +14,7 @@ Entry points:
 import asyncio
 import json
 import os
+import sys
 
 from tools.name_resolver import get_resolver
 
@@ -216,11 +217,12 @@ async def character_detail(character_name: str) -> str:
     """
     text, card_path = await character_detail_with_card(character_name)
     if card_path:
-        await _send_card_image(card_path)
-        text += (
-            "\n\n（角色卡片图片已直接发送到聊天，回复时无需重复详情内容，"
-            "简短说明即可。）"
-        )
+        sent = await _send_card_image(card_path)
+        if sent:
+            text += (
+                "\n\n（角色卡片图片已直接发送到聊天，回复时无需重复详情内容，"
+                "简短说明即可。）"
+            )
     return text
 
 
@@ -244,24 +246,35 @@ async def character_detail_with_card(character_name: str) -> tuple[str, str | No
 
 
 def render_card(entry: dict) -> str | None:
-    """Render a character card PNG; return its path, or None on failure."""
+    """Render a character card PNG (if stale); return its path, or None."""
     try:
-        from tools.card_renderer import render_character_card
-        return render_character_card(entry)
+        from tools.card_renderer import render_character_card_if_stale
+        return render_character_card_if_stale(entry)
     except Exception:
         return None
 
 
-async def _send_card_image(card_path: str):
-    """Send a card image to QQ via the ``_send_msg`` contextvar (tool context)."""
+async def _send_card_image(card_path: str) -> bool:
+    """Send a card image to QQ via the ``_send_msg`` contextvar (tool context).
+
+    Returns True on success, False if the contextvar is missing or the send
+    fails (logged so a silent "text says sent, no image arrived" mismatch is
+    diagnosable).
+    """
     try:
         from agent.context import _send_msg
         from nonebot.adapters.onebot.v11 import MessageSegment
         send = _send_msg.get()
-        if send is not None:
-            await send(MessageSegment.image(f"file://{card_path}"))
-    except Exception:
-        pass
+        if send is None:
+            print("[character_detail] _send_msg contextvar not set; image not sent",
+                  file=sys.stderr)
+            return False
+        await send(MessageSegment.image(f"file://{card_path}"))
+        return True
+    except Exception as e:
+        print(f"[character_detail] card image send failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return False
 
 
 def _invalidate():
@@ -271,11 +284,11 @@ def _invalidate():
 
 
 async def _maybe_refresh_characters():
-    """Kick off a background refresh if the character cache is stale.
+    """Refresh the character cache if it's stale or missing.
 
-    Fire-and-forget (like gacha_pull's background refresh) so the current
-    request isn't blocked by the slow scrape+translate pipeline. Any failure
-    here is swallowed — the lookup still proceeds with cached data.
+    Stale-but-present cache → background (fire-and-forget) refresh so the
+    current request isn't blocked. Missing cache (first build) → block so the
+    current request returns real data instead of "not found".
     """
     global _refreshing
     if _refreshing:
@@ -290,9 +303,12 @@ async def _maybe_refresh_characters():
             return
 
         _refreshing = True
-        asyncio.create_task(_do_refresh(scraper))
+        if os.path.exists(_CACHE_PATH):
+            asyncio.create_task(_do_refresh(scraper))
+        else:
+            await _do_refresh(scraper)
     except Exception:
-        pass
+        _refreshing = False
 
 
 async def _do_refresh(scraper):
