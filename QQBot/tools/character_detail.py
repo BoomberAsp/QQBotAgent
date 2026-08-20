@@ -264,12 +264,13 @@ async def _send_card_image(card_path: str) -> bool:
     try:
         from agent.context import _send_msg
         from nonebot.adapters.onebot.v11 import MessageSegment
+        from pathlib import Path
         send = _send_msg.get()
         if send is None:
             print("[character_detail] _send_msg contextvar not set; image not sent",
                   file=sys.stderr)
             return False
-        await send(MessageSegment.image(f"file://{card_path}"))
+        await send(MessageSegment.image(Path(card_path)))
         return True
     except Exception as e:
         print(f"[character_detail] card image send failed: {type(e).__name__}: {e}",
