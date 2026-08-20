@@ -26,6 +26,11 @@ from curl_cffi import requests as cffi_requests
 # ── Constants ────────────────────────────────────────────────────
 
 WIKI_API = "https://arkrecodewiki.miraheze.org/w/api.php"
+# Outbound HTTP proxy used to reach the wiki. Miraheze blocks the Tencent Cloud
+# IP at the Cloudflare layer (HTTP 403 even with browser TLS impersonation), so
+# requests are routed through the sing-box HTTP inbound on the host
+# (127.0.0.1:1081). Set WIKI_PROXY="" to force a direct connection.
+WIKI_PROXY = os.environ.get("WIKI_PROXY", "http://127.0.0.1:1081")
 STATIC_CONFIG = os.path.join(
     os.path.dirname(__file__), "..", "config", "gacha_data.json"
 )
@@ -176,7 +181,9 @@ class WikiScraper:
 
         Uses curl_cffi with browser TLS fingerprint impersonation (chrome116)
         to bypass Cloudflare bot detection. Both httpx and urllib are blocked
-        by Cloudflare's TLS fingerprinting.
+        by Cloudflare's TLS fingerprinting. Requests are routed through the
+        outbound proxy (WIKI_PROXY) since Miraheze additionally blocks the
+        server's China IP regardless of TLS fingerprint.
         """
         loop = asyncio.get_running_loop()
 
@@ -187,6 +194,7 @@ class WikiScraper:
                     params=params,
                     impersonate="chrome116",
                     timeout=30,
+                    proxy=WIKI_PROXY or None,
                     headers={
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
                                       " AppleWebKit/537.36 (KHTML, like Gecko)"
