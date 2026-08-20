@@ -496,6 +496,29 @@ This document defines all tools available to the agent. Each tool has a name, de
   "required": ["bond_name"]
 }
 ```
+  
+---
+
+## Tool: parse_battle_screenshots
+
+**Description**: 解析 Ark Re:Code 战斗截图，用 OCR 提取角色名、行动值、阵营（我方/敌方）。接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON 和 calculate_speed 兼容的文本格式。优先使用 OCR + 像素颜色采样，失败时降级多模态 LLM。
+
+**When to use**: 当用户上传战斗截图并要求测速/分析行动值时，调用此工具提取数据。提取后需展示结果给用户确认，询问我方角色速度值，再调用 calculate_speed。
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "paths": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "截图文件路径列表（1-2 张，跑条前+跑条后）"
+    }
+  },
+  "required": ["paths"]
+}
+```
 
 ---
 

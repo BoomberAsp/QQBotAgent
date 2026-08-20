@@ -65,6 +65,126 @@ OPENRUBI_CHAR_DIC = os.path.join(OPENRUBI_CHAR_DIR, "character_dic.json")
 OPENRUBI_MEMBERS_INFO = os.path.join(OPENRUBI_CHAR_DIR, "members_info.json")
 OPENRUBI_BONDS_INFO = os.path.join(OPENRUBI_CHAR_DIR, "bonds_info.json")
 
+# Status-effect / game-term → Chinese (deterministic, applied before LLM translation).
+# Longer phrases first so "ATK Down" is replaced before "ATK" would match inside it.
+_STATUS_TERM_CN = [
+    ("Effect Resistance", "效果抵抗"),
+    ("Effect Hit Rate", "效果命中"),
+    ("SPD Down", "速度下降"),
+    ("ATK Down", "攻击力下降"),
+    ("DEF Down", "防御力下降"),
+    ("SPD Up", "速度提升"),
+    ("ATK Up", "攻击力提升"),
+    ("DEF Up", "防御力提升"),
+    ("Provoke", "嘲讽"),
+    ("Immunity", "免疫"),
+    ("Shield", "护盾"),
+    ("Stun", "眩晕"),
+    ("Silence", "沉默"),
+    ("Poison", "中毒"),
+    ("Burn", "灼烧"),
+    ("Bleed", "流血"),
+    ("Recovery", "持续恢复"),
+    ("Speed", "速度"),
+    ("ATK", "攻击力"),
+    ("DEF", "防御力"),
+    ("HP", "生命值"),
+    ("Additional damage", "追加伤害"),
+    ("Upon hit", "技能命中时"),
+    ("ACC", "（基础）命中率"),
+    ("Lock On", "锁定"),
+    ("Foresight", "看破"),
+    ("Ignore Effect RES", "无视效果抵抗"),
+    ("Astrogen", "星源力"),
+    ("Flanking", "追加攻击"),
+    ("Extra Turn", "额外回合"),
+    ("Stealth", "潜伏"),
+    ("Penetrate", "贯穿（一定防御力）"),
+    ("Extinction", "灭绝"),
+    ("Increase the Action Gauge", "行动值提升"),
+    ("damage distribution effects", "伤害分配（分摊）效果"),
+    ("ACC Up", "（基础）命中率提升"),
+    ("Morale", "战意"),
+    ("Injury", "创伤"),
+    ("restore HP", "回复生命值"),
+    ("Vigor", "气魄"),
+    ("Hits", "命中的攻击"),
+    ("Crit", "暴击"),
+    ("Unbuffable", "无法强化"),
+    ("Immortal", "不屈"),
+    ("Revived", "复活"),
+    ("fatal blow", "致命伤害"),
+    ("removing all buffs", "驱散所有正向状态"),
+    ("Seal/Passiveless", "被动无效"),
+    ("ACC Down", "（基础）命中率下降"),
+    ("damage taken is reduced", "伤害量下降"),
+    ("Counter", "反击"),
+    ("Evasion Up", "闪避率提升"),
+    ("reduce the Cooldown", "冷却减少"),
+    ("At the start of the battle", "进入战斗时"),
+    ("Invincible", "无敌"),
+    ("stealing (one/two/etc.) buff(s)", "窃取（一个/两个/等）正向状态"),
+    ("Blink", "瞬动"),
+    ("Bomb", "炸弹"),
+    ("lower their Action Gauge", "造成行动值降低"),
+    ("Ignite (the burn and bomb)", "激发"),
+    ("DMG RED effect", "伤害量下降效果"),
+    ("Curse", "诅咒"),
+    ("Unhealable", "禁疗"),
+    ("Resurgence", "回生"),
+    ("Unremovable", "不可解除"),
+    ("Lifesteal", "吸血"),
+    ("increase their Skill Cooldowns", "技能冷却时间延长"),
+    ("Sleep", "沉睡"),
+    ("Confusion", "迷乱"),
+    ("Focus", "集中力"),
+    ("Crit RES Up", "暴击抵抗"),
+    ("Defiant", "遇强则强"),
+    ("Hinder", "妨碍"),
+    ("Skill Nullifier", "技能免疫"),
+    ("Restrict", "拘禁"),
+    ("Frostburn", "冰灼"),
+    ("Stellar Sigil", "星链标记"),
+    ("Flanking Boost", "追击强化"),
+    ("Flanking", "追击"),
+    ("decreasing the duration of their buffs", "减少正向状态时间"),
+    ("Guard", "守护"),
+    ("fixed damage", "固定伤害"),
+    ("copy buffs", "复制正向状态"),
+    ("Random Buff", "随机正向状态"),
+    ("extending the duration of all debuffs", "负向状态延长"),
+    ("Immobilizing Debuffs", "无法行动类型负向状态"),
+    ("Pain Threshold", "受伤上限"),
+    ("Hibiscus Morning Dew", "扶桑晓露"),
+    ("Crit DMG Up", "暴击伤害提升"),
+    ("Performance Mode", "公演模式"),
+    ("Arrogant Bullying", "自视甚高的欺侮"),
+    ("Flow State", "心流状态"),
+    ("Active", "主动技"),
+    ("Passive", "被动技"),
+    ("Resuscitate", "复苏"),
+    ("ADD DMG RED", "追加伤害下降"),
+    ("Shield Conversion", "护盾转换"),
+    ("Cluster", "凝聚"),
+    ("reducing the debuffs", "负向状态时间减少"),
+    ("Jumpy Pumpkins", "鬼跳南瓜"),
+    ("FXXK YXU", "FXXK YXU"),
+    ("Targeted Taunt", "指定嘲讽"),
+    ("Transfer", "转移"),
+    ("rebound", "反弹"),
+    ("favorable attribute", "有利属性"),
+    ("attribute counter", "不利属性")
+]
+
+# Wiki stat multipliers: the wiki's {{Member}} template computes level-60 stats
+# from growth ratios with these constants (verified against all 198 openrubi
+# characters — zero mismatches across 792 stat values).
+#   ATK:   round(ATK_ratio * 608)
+#   HP:    round(HP_ratio  * 4960)
+#   DEF:   round(DEF_ratio * 617)
+#   SPD:   round(SPD_ratio * 100)
+_STAT_MULTIPLIERS = {"ATK": 608, "HP": 4960, "DEF": 617, "SPD": 100}
+
 # Deterministic element/class translation maps (user-confirmed)
 ELEMENT_CN = {"Flame": "火", "Water": "水", "Nature": "木", "Light": "光", "Dark": "暗"}
 CLASS_CN = {
@@ -671,6 +791,11 @@ class WikiScraper:
             lambda m: (m.group(2) or m.group(1) or "").strip(),
             text,
         )
+        # Deterministic game-term → Chinese (word-boundary match, longest first).
+        # Runs here so both the English fallback and the LLM input see Chinese
+        # terms, preventing mixed-language descriptions.
+        for en, cn in _STATUS_TERM_CN:
+            text = re.sub(r"\b" + re.escape(en) + r"\b", cn, text)
         # {{Example}} → 示例
         text = text.replace("{{Example}}", "示例")
         # Remaining simple templates {{X}} → X
@@ -898,7 +1023,7 @@ class WikiScraper:
 
     @staticmethod
     def _apply_deterministic_maps(entry: dict):
-        """Fill element/class/constellation via fixed maps (no LLM)."""
+        """Fill element/class/constellation/stats_max via fixed maps (no LLM)."""
         entry["element"] = ELEMENT_CN.get(entry.get("element_en", ""), entry.get("element_en", ""))
         entry["class_cn"] = CLASS_CN.get(entry.get("class_en", ""), entry.get("class_en", ""))
         const = entry.get("constellation", "").strip()
@@ -906,6 +1031,29 @@ class WikiScraper:
             entry["constellation"] = CONSTELLATION_CN.get(
                 const[:1].upper() + const[1:], const
             )
+        # Compute level-60 max stats from wiki growth ratios
+        WikiScraper._compute_stats_max(entry)
+
+    @staticmethod
+    def _compute_stats_max(entry: dict):
+        """Compute level-60 max stats from wiki growth ratios (deterministic).
+
+        The wiki's ``{{Member}}`` template uses fixed multipliers:
+        ``{{#expr:{{{ATK}}}*608 round0}}`` etc. The result is stored as
+        ``entry["stats_max"]`` — always present for every character, regardless
+        of whether an openrubi seed exists.
+        """
+        stats = entry.get("stats") or {}
+        stats_max = {}
+        for key, mult in _STAT_MULTIPLIERS.items():
+            raw = stats.get(key, "")
+            if raw:
+                try:
+                    stats_max[key] = str(round(float(raw) * mult))
+                except (ValueError, TypeError):
+                    stats_max[key] = ""
+        if stats_max:
+            entry["stats_max"] = stats_max
 
     @staticmethod
     def _default_cn_fields(entry: dict):
@@ -1002,7 +1150,8 @@ class WikiScraper:
         Skills are matched by position (S1/S2/S3 order matches openrubi's
         Skills list). openrubi has no bio/desc, so desc keeps its English
         fallback; the numeric Discipline dict is rendered into Chinese talent
-        text deterministically.
+        text deterministically. Level-60 max stats are merged from openrubi's
+        ATK/HP/DEF/Speed fields alongside the wiki's growth ratios.
         """
         if seed.get("name"):
             entry["name_cn"] = seed["name"]

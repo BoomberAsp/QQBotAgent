@@ -133,13 +133,26 @@ def _wrap(draw: ImageDraw.ImageDraw, text: str, size: int, max_width: float) -> 
 
 # ── Image helpers ────────────────────────────────────────────────
 
-def _load_scaled(path: str, w: int, h: int | None = None) -> Image.Image | None:
+def _load_scaled(path: str, w: int, h: int | None = None,
+                 keep_aspect: bool = True) -> Image.Image | None:
+    """Load an image and resize it to *w* × *h* (or auto-height if *h* is None).
+
+    When *keep_aspect* is True and both dimensions are given, the image is
+    scaled to **fit within** the box while preserving the original aspect
+    ratio (the resulting image may be smaller than *w* or *h* in one axis).
+    Set *keep_aspect* to False to force an exact stretch (used for icons
+    that are later masked to circles).
+    """
     if not os.path.exists(path):
         return None
     try:
         im = Image.open(path).convert("RGBA")
         if h is None:
             h = int(im.height * w / im.width)
+        elif keep_aspect:
+            scale = min(w / im.width, h / im.height)
+            w = int(im.width * scale)
+            h = int(im.height * scale)
         return im.resize((w, h), Image.LANCZOS)
     except Exception:
         return None
@@ -209,6 +222,11 @@ def _skill_meta(sk: dict) -> str:
 
 # ── Card path / freshness ────────────────────────────────────────
 
+# Bump this when the card layout / rendering code changes to invalidate all
+# cached PNGs. The version is appended to the content hash so that cards are
+# re-rendered even when only the renderer (not the data) has changed.
+_RENDERER_VERSION = "2"
+
 _hash_lock = threading.Lock()
 
 
@@ -260,7 +278,7 @@ def _render_if_stale(entry: dict, hash_file: str, path_fn, render_fn) -> str:
     """Render a card only if its PNG is missing or stale; return its path."""
     path = path_fn(entry)
     key = os.path.basename(path)
-    h = _entry_hash(entry)
+    h = _entry_hash(entry) + ":" + _RENDERER_VERSION
 
     with _hash_lock:
         if os.path.exists(path) and _load_hashes(hash_file).get(key) == h:
@@ -302,7 +320,7 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
     color = _element_color(entry)
 
     # --- prepare images ------------------------------------------
-    portrait = _load_scaled(_portrait_path(entry), PORTRAIT_W, PORTRAIT_H)
+    portrait = _load_scaled(_portrait_path(entry), PORTRAIT_W)
     if portrait is None:
         portrait = _placeholder(PORTRAIT_W, PORTRAIT_H, color, entry.get("name_cn", "")[:2])
 
@@ -340,10 +358,12 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
         if entry.get(key):
             personal.append(f"{label} {entry[key]}")
     personal_line = " | ".join(personal)
+    personal_lines = _wrap(probe, personal_line, 20, right_w) if personal_line else []
 
     desc_lines = _wrap(probe, entry.get("desc", ""), 22, right_w)
 
     stats = entry.get("stats") or {}
+    stats_max = entry.get("stats_max") or {}
     stat_order = [("ATK", "攻击"), ("DEF", "防御"), ("HP", "生命"), ("SPD", "速度")]
 
     # discs: keep true talent level (level 3 is universally empty on seeds)
@@ -381,15 +401,18 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
     # Top band
     header_h = ICON_SIZE
     header_h += _lh(20) + 4                       # meta line
-    if personal_line:
-        header_h += _lh(20) + 4
+    if personal_lines:
+        header_h += len(personal_lines) * _lh(20) + 4
     header_h += max(1, len(desc_lines)) * _lh(22)
-    top_h = max(PORTRAIT_H, header_h)
+    top_h = max(portrait.height, header_h)
 
     # Middle band (stats + discs + potential)
     band2_inner = 0
     band2_inner += _lh(24) + 14                   # title
-    band2_inner += _lh(18) + _lh(26) + 16         # stats label + value
+    band2_inner += _lh(18) + _lh(26) + 4          # stats label + Lv.60 value
+    if stats_max:
+        band2_inner += _lh(18) + 4               # growth-ratio row
+    band2_inner += 12
     band2_inner += ((len(discs) + 2) // 3) * (_lh(20) + 8)  # discs grid
     band2_inner += 6
     if team_pot or self_pot:
@@ -426,9 +449,11 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
     draw.text((rx, ry), meta_line, font=_font(20), fill=_TEXT_FAINT)
     ry += _lh(20) + 4
 
-    if personal_line:
-        draw.text((rx, ry), personal_line, font=_font(20), fill=_TEXT_DIM)
-        ry += _lh(20) + 4
+    for ln in personal_lines:
+        draw.text((rx, ry), ln, font=_font(20), fill=_TEXT_DIM)
+        ry += _lh(20)
+    if personal_lines:
+        ry += 4
 
     for ln in desc_lines:
         draw.text((rx, ry), ln, font=_font(22), fill=_TEXT_DIM)
@@ -440,17 +465,33 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
     draw.rounded_rectangle((PAD, y, PAD + (W - 2 * PAD), y + band2_h),
                            radius=16, fill=_PANEL + (255,))
     px, py = PAD + PAD, y + PAD
-    draw.text((px, py), "面板 · 天赋 · 潜能", font=_font(24), fill=_TEXT)
+    draw.text((px, py), "面板(Lv.60) · 天赋 · 潜能", font=_font(24), fill=_TEXT)
     py += _lh(24) + 14
 
     stat_x = px
     stat_col_w = (W - 2 * PAD) // 4
-    for key, label in stat_order:
-        draw.text((stat_x, py), label, font=_font(18), fill=_TEXT_FAINT)
-        draw.text((stat_x, py + _lh(18)), str(stats.get(key, "")),
-                  font=_font(26), fill=color)
-        stat_x += stat_col_w
-    py += _lh(18) + _lh(26) + 16
+    if stats_max:
+        # Row 1: Lv.60 max values (large, coloured)
+        for key, label in stat_order:
+            draw.text((stat_x, py), label, font=_font(18), fill=_TEXT_FAINT)
+            draw.text((stat_x, py + _lh(18)), str(stats_max.get(key, "")),
+                      font=_font(26), fill=color)
+            stat_x += stat_col_w
+        py += _lh(18) + _lh(26) + 4
+        # Row 2: growth ratios (small, dim)
+        stat_x = px
+        for key, label in stat_order:
+            draw.text((stat_x, py), f"成长 {stats.get(key, '')}",
+                      font=_font(18), fill=_TEXT_FAINT)
+            stat_x += stat_col_w
+        py += _lh(18) + 4
+    else:
+        for key, label in stat_order:
+            draw.text((stat_x, py), label, font=_font(18), fill=_TEXT_FAINT)
+            draw.text((stat_x, py + _lh(18)), str(stats.get(key, "")),
+                      font=_font(26), fill=color)
+            stat_x += stat_col_w
+        py += _lh(18) + _lh(26) + 16
 
     disc_col_w = (W - 2 * PAD) // 3
     disc_rows = (len(discs) + 2) // 3
