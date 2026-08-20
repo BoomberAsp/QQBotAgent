@@ -380,6 +380,48 @@ class WikiScraper:
 
         return await loop.run_in_executor(None, _run)
 
+    async def _background_downloads(self, tasks: list, label: str):
+        """Await a batch of image downloads, swallowing any failure.
+
+        Used by refresh_characters/refresh_bonds to run image download as a
+        fire-and-forget task after the text cache has already been written.
+        """
+        try:
+            await asyncio.gather(*tasks)
+        except Exception as e:
+            print(f"[WikiScraper] {label} download error: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+
+    async def _background_render_cards(self, entries: list, kind: str):
+        """Render character/bond cards in worker threads (fire-and-forget).
+
+        Each entry is drawn only if its card PNG is missing or stale (content
+        hash mismatch). PIL rendering is CPU-bound, so it runs via
+        ``asyncio.to_thread`` with a small semaphore to keep the event loop
+        responsive while cards are pre-rendered in the background.
+        """
+        try:
+            if kind == "character":
+                from tools.card_renderer import render_character_card_if_stale as render_fn
+            else:
+                from tools.card_renderer import render_bond_card_if_stale as render_fn
+        except Exception as e:
+            print(f"[WikiScraper] card renderer unavailable: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            return
+
+        sem = asyncio.Semaphore(2)
+
+        async def _one(entry: dict):
+            try:
+                async with sem:
+                    await asyncio.to_thread(render_fn, entry)
+            except Exception as e:
+                print(f"[WikiScraper] card render error: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+
+        await asyncio.gather(*(_one(e) for e in entries), return_exceptions=True)
+
     async def _download_character_images(self, entry: dict, semaphore: asyncio.Semaphore):
         """Download portrait / head icon / skill icons for one character.
 
@@ -786,19 +828,14 @@ class WikiScraper:
         if to_translate:
             await self._translate_character_details(to_translate)
 
-        # Download character art (portrait / icon / skill icons). Idempotent —
-        # only missing files are fetched. Bounded concurrency so the fire-and-
-        # forget background refresh doesn't hammer the wiki. Failures here are
-        # non-fatal: cards degrade to placeholder tiles.
-        try:
-            sem = asyncio.Semaphore(4)
-            await asyncio.gather(
-                *(self._download_character_images(e, sem) for e in result.values())
-            )
-        except Exception as e:
-            print(f"[WikiScraper] character art download skipped: "
-                  f"{type(e).__name__}: {e}", file=sys.stderr)
+        # Stamp each entry with its content hash so the card renderer can skip
+        # re-drawing unchanged cards.
+        for entry in result.values():
+            entry["_card_hash"] = self._entry_card_hash(entry)
 
+        # Write the text cache FIRST — lookups only need the JSON. The image
+        # download below is slow (1000+ files via proxy) and must not delay
+        # availability of character details.
         cache = {
             "scraped_at": time.time(),
             "scraped_at_iso": datetime.now(BEIJING).isoformat(),
@@ -808,6 +845,27 @@ class WikiScraper:
         os.makedirs(self._cache_dir, exist_ok=True)
         with open(self._character_detail_cache, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
+
+        # Fire-and-forget image download (portrait / icon / skill icons).
+        # Idempotent and non-fatal: cards degrade to placeholder tiles until
+        # images land.
+        try:
+            sem = asyncio.Semaphore(4)
+            tasks = [self._download_character_images(e, sem) for e in result.values()]
+            asyncio.create_task(self._background_downloads(tasks, "character art"))
+        except Exception as e:
+            print(f"[WikiScraper] character art download skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+
+        # Fire-and-forget card rendering (new/changed cards only, gated by
+        # _card_hash). Keeps the on-demand path instant for repeat lookups.
+        try:
+            asyncio.create_task(
+                self._background_render_cards(list(result.values()), "character")
+            )
+        except Exception as e:
+            print(f"[WikiScraper] character card render skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
 
         return result
 
@@ -822,6 +880,19 @@ class WikiScraper:
         entry is re-translated on the next refresh.
         """
         payload = {k: v for k, v in entry.items() if k != "_src_hash"}
+        s = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _entry_card_hash(entry: dict) -> str:
+        """Fingerprint the final (translated) entry for card-render invalidation.
+
+        Unlike ``_source_hash`` (raw English fields, drives re-translation),
+        this hashes the fully-populated entry so a re-translation or any field
+        change also invalidates the cached PNG card. The card renderer uses
+        this to skip re-drawing cards whose content is unchanged.
+        """
+        payload = {k: v for k, v in entry.items() if k != "_card_hash"}
         s = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -1303,15 +1374,11 @@ class WikiScraper:
         if to_translate:
             await self._translate_bond_details(to_translate)
 
-        try:
-            sem = asyncio.Semaphore(4)
-            await asyncio.gather(
-                *(self._download_bond_icon(e, sem) for e in result.values())
-            )
-        except Exception as e:
-            print(f"[WikiScraper] bond icon download skipped: "
-                  f"{type(e).__name__}: {e}", file=sys.stderr)
+        # Stamp each entry with its content hash for card-render dedup.
+        for entry in result.values():
+            entry["_card_hash"] = self._entry_card_hash(entry)
 
+        # Write the text cache FIRST — lookups only need the JSON.
         cache = {
             "scraped_at": time.time(),
             "scraped_at_iso": datetime.now(BEIJING).isoformat(),
@@ -1321,6 +1388,24 @@ class WikiScraper:
         os.makedirs(self._cache_dir, exist_ok=True)
         with open(self._bond_detail_cache, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
+
+        # Fire-and-forget icon download (idempotent, non-fatal).
+        try:
+            sem = asyncio.Semaphore(4)
+            tasks = [self._download_bond_icon(e, sem) for e in result.values()]
+            asyncio.create_task(self._background_downloads(tasks, "bond icon"))
+        except Exception as e:
+            print(f"[WikiScraper] bond icon download skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+
+        # Fire-and-forget card rendering (new/changed cards only).
+        try:
+            asyncio.create_task(
+                self._background_render_cards(list(result.values()), "bond")
+            )
+        except Exception as e:
+            print(f"[WikiScraper] bond card render skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
 
         return result
 

@@ -22,7 +22,10 @@ Missing images degrade to element-coloured placeholder tiles, so rendering
 never blocks on network state.
 """
 
+import hashlib
+import json
 import os
+import threading
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -39,6 +42,12 @@ _SKILL_DIR = os.path.join(_CACHE_DIR, "skill_icons")
 _CARD_DIR = os.path.join(_CACHE_DIR, "cards")
 _BOND_ICON_DIR = os.path.join(_CACHE_DIR, "bond_icons")
 _BOND_CARD_DIR = os.path.join(_CACHE_DIR, "bond_cards")
+
+# Per-directory sidecar mapping card filename → content hash of the entry it
+# was rendered from. Lets renderers skip re-drawing cards whose data is
+# unchanged (the wiki_scraper stamps each entry with a ``_card_hash``).
+_CARD_HASH_FILE = os.path.join(_CARD_DIR, "_hashes.json")
+_BOND_CARD_HASH_FILE = os.path.join(_BOND_CARD_DIR, "_hashes.json")
 
 
 # ── Palette ──────────────────────────────────────────────────────
@@ -196,6 +205,94 @@ def _skill_meta(sk: dict) -> str:
     if sk.get("cd"):
         parts.append(f"冷却 {sk['cd']}")
     return " · ".join(parts)
+
+
+# ── Card path / freshness ────────────────────────────────────────
+
+_hash_lock = threading.Lock()
+
+
+def _entry_hash(entry: dict) -> str:
+    """Return the content hash stamped on an entry (or compute one).
+
+    The wiki_scraper stamps each cache entry with ``_card_hash``; when it's
+    absent (e.g. an old cache built before this feature) we fall back to
+    hashing the whole entry, which yields a stable value for dedup.
+    """
+    h = entry.get("_card_hash")
+    if h:
+        return str(h)
+    payload = {k: v for k, v in entry.items() if k != "_card_hash"}
+    s = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _load_hashes(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_hashes(path: str, data: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def character_card_path(entry: dict) -> str:
+    name = entry.get("name_cn") or entry.get("title", "character")
+    return os.path.join(_CARD_DIR, f"{name}.png")
+
+
+def bond_card_path(entry: dict) -> str:
+    name = entry.get("name_cn") or entry.get("title", "bond")
+    return os.path.join(_BOND_CARD_DIR, f"{name}.png")
+
+
+def _render_if_stale(entry: dict, hash_file: str, path_fn, render_fn) -> str:
+    """Render a card only if its PNG is missing or stale; return its path."""
+    path = path_fn(entry)
+    key = os.path.basename(path)
+    h = _entry_hash(entry)
+
+    with _hash_lock:
+        if os.path.exists(path) and _load_hashes(hash_file).get(key) == h:
+            return path
+
+    # Render outside the lock (PIL work is slow); the hash is deterministic so
+    # a benign race only means a redundant draw + identical last-writer write.
+    path = render_fn(entry, path)
+
+    with _hash_lock:
+        hashes = _load_hashes(hash_file)
+        hashes[key] = h
+        _save_hashes(hash_file, hashes)
+    return path
+
+
+def render_character_card_if_stale(entry: dict, out_path: str | None = None) -> str:
+    """Render a character card if missing/stale, else return the cached path."""
+    if out_path is not None:
+        return _render_if_stale(entry, _CARD_HASH_FILE,
+                                lambda e: out_path, render_character_card)
+    return _render_if_stale(entry, _CARD_HASH_FILE,
+                            character_card_path, render_character_card)
+
+
+def render_bond_card_if_stale(entry: dict, out_path: str | None = None) -> str:
+    """Render a bond card if missing/stale, else return the cached path."""
+    if out_path is not None:
+        return _render_if_stale(entry, _BOND_CARD_HASH_FILE,
+                                lambda e: out_path, render_bond_card)
+    return _render_if_stale(entry, _BOND_CARD_HASH_FILE,
+                            bond_card_path, render_bond_card)
 
 
 # ── Main render ──────────────────────────────────────────────────
@@ -397,8 +494,7 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
               font=_font(16), fill=_TEXT_FAINT)
 
     if out_path is None:
-        name = entry.get("name_cn") or entry.get("title", "character")
-        out_path = os.path.join(_CARD_DIR, f"{name}.png")
+        out_path = character_card_path(entry)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     canvas.convert("RGB").save(out_path, "PNG")
     return out_path
@@ -569,8 +665,7 @@ def render_bond_card(entry: dict, out_path: str | None = None) -> str:
               font=_font(16), fill=_TEXT_FAINT)
 
     if out_path is None:
-        name = entry.get("name_cn") or entry.get("title", "bond")
-        out_path = os.path.join(_BOND_CARD_DIR, f"{name}.png")
+        out_path = bond_card_path(entry)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     canvas.convert("RGB").save(out_path, "PNG")
     return out_path
