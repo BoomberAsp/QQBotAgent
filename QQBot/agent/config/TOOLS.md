@@ -455,6 +455,50 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ---
 
+## Tool: character_detail
+
+**Description**: 查询 Ark Re:Code 角色的详细资料（面板成长系数、技能、倍率、属性、天赋、潜能）。数据来自 wiki + LLM 翻译，缓存于本地。
+
+**When to use**: 当用户只发送一个角色名/别名（如「夏妮」「狼团长」「Shani」「瞎泥」）而没有其他请求时、用户表示希望得到某角色的信息时或者你需要得到Ark Re:Code角色信息时，调用此工具返回该角色详情。
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "character_name": {
+      "type": "string",
+      "description": "角色名或别名"
+    }
+  },
+  "required": ["character_name"]
+}
+```
+
+---
+
+## Tool: bond_detail
+
+**Description**: 查询 Ark Re:Code 羁绊（Bond/神器）的详细资料（类别、星级、攻击/生命、羁绊技能、获取方式、出售价格、经验值、上线时间）。数据来自 wiki + openrubi 种子 + LLM 翻译，缓存于本地。
+
+**When to use**: 当用户只发送一个羁绊名/别名（如「驰骋的快感」「复活甲」「Pleasure of Exploration」）而没有其他请求时、用户表示希望得到某羁绊的信息时或者你需要得到Ark Re:Code羁绊信息时，调用此工具返回该羁绊详情。
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "bond_name": {
+      "type": "string",
+      "description": "羁绊名或别名"
+    }
+  },
+  "required": ["bond_name"]
+}
+```
+
+---
+
 ## Tool: get_time
 
 **Description**: Get the current date and time.

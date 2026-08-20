@@ -21,12 +21,10 @@ from pypinyin import Style, pinyin
 
 # ── Paths ────────────────────────────────────────────────────────
 
-_OPENRUBI_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "..", "..", "openrubi", "arkrecode"
-)
-_CHAR_DIC_PATH = os.path.join(_OPENRUBI_DIR, "members", "character_dic.json")
-_BOND_DIC_PATH = os.path.join(_OPENRUBI_DIR, "bonds", "bonds_search_dic.json")
-_PINYIN_CACHE_PATH = os.path.join(_OPENRUBI_DIR, "members", "pinyin_choices.json")
+_CHAR_DIR = os.path.join(os.path.dirname(__file__), "..", "config", "characters")
+_CHAR_DIC_PATH = os.path.join(_CHAR_DIR, "character_dic.json")
+_BOND_DIC_PATH = os.path.join(_CHAR_DIR, "bonds_search_dic.json")
+_PINYIN_CACHE_PATH = os.path.join(_CHAR_DIR, "pinyin_choices.json")
 # QQBotAgent's own translation mapping (supplements OpenRubi)
 _NAME_MAPPING_PATH = os.path.join(
     os.path.dirname(__file__), "..", "data", "wiki_cache", "name_mapping.json"
