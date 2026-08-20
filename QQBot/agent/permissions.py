@@ -63,6 +63,8 @@ _PUBLIC_TOOLS: Set[str] = {
     "compare_speed_probability",
     "explain_code",
     "translate_text",
+    "character_detail",
+    "bond_detail",
     "redeem_code",
 }
 

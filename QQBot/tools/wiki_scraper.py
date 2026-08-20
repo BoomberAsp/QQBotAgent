@@ -12,6 +12,7 @@ Data sources:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -26,6 +27,11 @@ from curl_cffi import requests as cffi_requests
 # ── Constants ────────────────────────────────────────────────────
 
 WIKI_API = "https://arkrecodewiki.miraheze.org/w/api.php"
+# Outbound HTTP proxy used to reach the wiki. Miraheze blocks the Tencent Cloud
+# IP at the Cloudflare layer (HTTP 403 even with browser TLS impersonation), so
+# requests are routed through the sing-box HTTP inbound on the host
+# (127.0.0.1:1081). Set WIKI_PROXY="" to force a direct connection.
+WIKI_PROXY = os.environ.get("WIKI_PROXY", "http://127.0.0.1:1081")
 STATIC_CONFIG = os.path.join(
     os.path.dirname(__file__), "..", "config", "gacha_data.json"
 )
@@ -34,6 +40,14 @@ CACHE_DIR = os.path.join(
 )
 CACHE_FILE = os.path.join(CACHE_DIR, "gacha.json")
 TRANSLATION_CACHE = os.path.join(CACHE_DIR, "name_mapping.json")
+CHARACTER_DETAIL_CACHE = os.path.join(CACHE_DIR, "character_details.json")
+BOND_DETAIL_CACHE = os.path.join(CACHE_DIR, "bond_details.json")
+
+# Character art caches (portrait / head icon / skill icons), keyed by id/title.
+PORTRAIT_DIR = os.path.join(CACHE_DIR, "portraits")
+ICON_DIR = os.path.join(CACHE_DIR, "icons")
+SKILL_ICON_DIR = os.path.join(CACHE_DIR, "skill_icons")
+BOND_ICON_DIR = os.path.join(CACHE_DIR, "bond_icons")
 
 BATCH_SIZE = 50  # MediaWiki pages per revisions query
 BEIJING = timezone(timedelta(hours=8))
@@ -41,6 +55,56 @@ BEIJING = timezone(timedelta(hours=8))
 # Element → pool prefix mapping
 LIGHT_DARK_ELEMENTS = {"Light", "Dark"}
 THREE_COLOR_ELEMENTS = {"Flame", "Water", "Nature"}
+
+# Vendored openrubi reference data — used as few-shot examples + name lookup
+# for LLM translation. These are static reference files, NOT the data source.
+OPENRUBI_CHAR_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "config", "characters"
+)
+OPENRUBI_CHAR_DIC = os.path.join(OPENRUBI_CHAR_DIR, "character_dic.json")
+OPENRUBI_MEMBERS_INFO = os.path.join(OPENRUBI_CHAR_DIR, "members_info.json")
+OPENRUBI_BONDS_INFO = os.path.join(OPENRUBI_CHAR_DIR, "bonds_info.json")
+
+# Deterministic element/class translation maps (user-confirmed)
+ELEMENT_CN = {"Flame": "火", "Water": "水", "Nature": "木", "Light": "光", "Dark": "暗"}
+CLASS_CN = {
+    "Warrior": "战士",
+    "Caster": "术士",
+    "Defender": "重装",
+    "Medic": "医疗",
+    "Sniper": "狙击",
+    "Vanguard": "先锋",
+}
+
+# Western zodiac constellation names (identity field)
+CONSTELLATION_CN = {
+    "Aries": "白羊座", "Taurus": "金牛座", "Gemini": "双子座",
+    "Cancer": "巨蟹座", "Leo": "狮子座", "Virgo": "处女座",
+    "Libra": "天秤座", "Scorpio": "天蝎座", "Scorpius": "天蝎座",
+    "Sagittarius": "射手座", "Capricorn": "摩羯座", "Capricornus": "摩羯座",
+    "Aquarius": "水瓶座", "Pisces": "双鱼座",
+}
+
+# openrubi Discipline stat keys → (Chinese label, is_percentage).
+# Used to render openrubi's numeric Discipline dict into Chinese talent text
+# for seeded entries (no LLM), closing the discs gap openrubi leaves English.
+DISCIPLINE_STAT_CN = {
+    "ATK%": ("攻击力", True),
+    "HP%": ("生命值", True),
+    "DEF%": ("防御力", True),
+    "Speed": ("速度", False),
+    "Effect_Hit_Rate": ("效果命中", True),
+    "Effect_RES": ("效果抵抗", True),
+    "Crit_Rate": ("暴击率", True),
+    "Crit_DMG": ("暴击伤害", True),
+}
+
+# Bond economy values are deterministic by star count (from Template:Bond's
+# {{#switch: {{{Stars}}}} markup). No wiki field stores them — they are
+# computed at render time, so we reproduce the mapping here.
+BOND_SELL_GOLD = {"5": "12500", "4": "4200", "3": "2100"}
+BOND_SELL_FRAGMENT = {"5": "30", "4": "8", "3": "1"}
+BOND_XP_VALUE = {"5": "1030", "4": "850", "3": "680"}
 
 
 # ── WikiScraper ──────────────────────────────────────────────────
@@ -52,6 +116,8 @@ class WikiScraper:
         self._cache_dir = os.path.abspath(CACHE_DIR)
         self._cache_file = os.path.abspath(CACHE_FILE)
         self._translation_cache = os.path.abspath(TRANSLATION_CACHE)
+        self._character_detail_cache = os.path.abspath(CHARACTER_DETAIL_CACHE)
+        self._bond_detail_cache = os.path.abspath(BOND_DETAIL_CACHE)
         self._static_config = os.path.abspath(STATIC_CONFIG)
         self.llm_client = llm_client  # For name translation (can be set later)
 
@@ -102,6 +168,56 @@ class WikiScraper:
             return self._is_stale(cache.get("scraped_at", 0))
         except Exception:
             return True
+
+    def is_characters_stale(self) -> bool:
+        """Check whether character_details.json is stale or missing.
+
+        Stale = scraped_at earlier than the most recent Wednesday 20:00
+        (Beijing), so character details refresh at most once a week, keyed to
+        the weekly Wednesday 20:00 boundary (mirrors the gacha/redeem-cache
+        pattern, just with a weekly instead of daily anchor).
+        """
+        if not os.path.exists(self._character_detail_cache):
+            return True
+        try:
+            with open(self._character_detail_cache, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            scraped_at = cache.get("scraped_at", 0)
+        except Exception:
+            return True
+        return scraped_at < self._most_recent_wed_20()
+
+    def is_bonds_stale(self) -> bool:
+        """Check whether bond_details.json is stale or missing.
+
+        Same weekly Wednesday-20:00 anchor as character details.
+        """
+        if not os.path.exists(self._bond_detail_cache):
+            return True
+        try:
+            with open(self._bond_detail_cache, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            scraped_at = cache.get("scraped_at", 0)
+        except Exception:
+            return True
+        return scraped_at < self._most_recent_wed_20()
+
+    @staticmethod
+    def _most_recent_wed_20() -> float:
+        """Unix timestamp of the most recent Wednesday 20:00 (Beijing).
+
+        ``(weekday - 2) % 7`` counts days back to Wednesday; if today is
+        Wednesday but before 20:00, fall back to the previous Wednesday.
+        """
+        now = datetime.now(BEIJING)
+        days_back = (now.weekday() - 2) % 7
+        wed = now.date() - timedelta(days=days_back)
+        wed_20 = datetime.combine(
+            wed, datetime.min.time().replace(hour=20), tzinfo=BEIJING
+        )
+        if now < wed_20:
+            wed_20 -= timedelta(days=7)
+        return wed_20.timestamp()
 
     async def refresh(self) -> dict:
         """Scrape wiki, merge with static config, write cache, return data."""
@@ -176,7 +292,9 @@ class WikiScraper:
 
         Uses curl_cffi with browser TLS fingerprint impersonation (chrome116)
         to bypass Cloudflare bot detection. Both httpx and urllib are blocked
-        by Cloudflare's TLS fingerprinting.
+        by Cloudflare's TLS fingerprinting. Requests are routed through the
+        outbound proxy (WIKI_PROXY) since Miraheze additionally blocks the
+        server's China IP regardless of TLS fingerprint.
         """
         loop = asyncio.get_running_loop()
 
@@ -187,6 +305,7 @@ class WikiScraper:
                     params=params,
                     impersonate="chrome116",
                     timeout=30,
+                    proxy=WIKI_PROXY or None,
                     headers={
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
                                       " AppleWebKit/537.36 (KHTML, like Gecko)"
@@ -205,6 +324,99 @@ class WikiScraper:
                 return None
 
         return await loop.run_in_executor(None, _run)
+
+    async def _resolve_image_url(self, filename: str, width: int | None = None) -> str | None:
+        """Resolve a ``File:`` filename to a (thumbnail) URL via imageinfo.
+
+        Using the API avoids reconstructing MediaWiki's MD5 hash directory
+        (``thumb/1/11/...``). ``width`` requests a thumbnail of that width
+        (``thumburl``), otherwise the original file URL is returned.
+        """
+        params = {
+            "action": "query",
+            "prop": "imageinfo",
+            "iiprop": "url",
+            "titles": f"File:{filename}",
+            "format": "json",
+        }
+        if width:
+            params["iiurlwidth"] = width
+        data = await self._fetch_json(WIKI_API, params)
+        if not data:
+            return None
+        pages = data.get("query", {}).get("pages", {})
+        for _pid, info in pages.items():
+            for ii in info.get("imageinfo", []):
+                return ii.get("thumburl") or ii.get("url")
+        return None
+
+    async def _download_image(self, url: str, dest: str) -> bool:
+        """Download an image binary to ``dest`` via the outbound proxy."""
+        loop = asyncio.get_running_loop()
+
+        def _run():
+            try:
+                resp = cffi_requests.get(
+                    url,
+                    impersonate="chrome116",
+                    timeout=30,
+                    proxy=WIKI_PROXY or None,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                                      " AppleWebKit/537.36 (KHTML, like Gecko)"
+                                      " Chrome/116.0.0.0 Safari/537.36",
+                    },
+                )
+                if resp.status_code != 200 or not resp.content:
+                    return False
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as f:
+                    f.write(resp.content)
+                return True
+            except Exception as e:
+                print(f"[WikiScraper] image download error: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+                return False
+
+        return await loop.run_in_executor(None, _run)
+
+    async def _download_character_images(self, entry: dict, semaphore: asyncio.Semaphore):
+        """Download portrait / head icon / skill icons for one character.
+
+        Idempotent: skips files already on disk. Filenames follow the wiki
+        convention the user confirmed:
+          - portrait : ``{ID}_90_Emo1_normal_LV1.png``
+          - icon     : ``Icon_{title}.png``
+          - skills   : ``Icon_Skill_{ID}_{001|002|003}.png``
+        """
+        cid = str(entry.get("id", "")).strip()
+        title = str(entry.get("title", "")).strip()
+        if not cid:
+            return
+
+        targets = []
+        if cid:
+            targets.append(
+                (f"{cid}_90_Emo1_normal_LV1.png",
+                 os.path.join(PORTRAIT_DIR, f"{cid}.png"), 600)
+            )
+        if title:
+            targets.append(
+                (f"Icon_{title}.png", os.path.join(ICON_DIR, f"{title}.png"), None)
+            )
+        for n in range(1, 4):
+            targets.append(
+                (f"Icon_Skill_{cid}_{n:03d}.png",
+                 os.path.join(SKILL_ICON_DIR, f"{cid}_{n}.png"), None)
+            )
+
+        for filename, dest, width in targets:
+            if os.path.exists(dest):
+                continue
+            async with semaphore:
+                url = await self._resolve_image_url(filename, width)
+                if url:
+                    await self._download_image(url, dest)
 
     async def _fetch_template_pages(self, template_name: str) -> list[tuple[str, str]]:
         """Fetch wikitext for all pages embedding a given template.
@@ -359,11 +571,12 @@ class WikiScraper:
 
         return None
 
-    def _extract_param(self, block: str, param_name: str) -> str | None:
-        """Extract a template parameter value.
+    def _extract_param_value(self, block: str, param_name: str) -> str | None:
+        """Return the raw value of a template parameter (no markup cleaning).
 
-        Matches |ParamName= value (until next | or end of block).
-        Handles multi-line values and nested templates/links.
+        Matches |ParamName= value (until next | or end of block), tracking
+        nested braces/brackets so `|` inside [[...]] / {{...}} doesn't end the
+        value prematurely.
         """
         pattern = r"\|" + re.escape(param_name) + r"\s*=\s*"
         match = re.search(pattern, block)
@@ -371,7 +584,6 @@ class WikiScraper:
             return None
 
         start = match.end()
-        # Track nested braces and brackets to find the real end of value
         i = start
         brace_depth = 0
         while i < len(block):
@@ -384,11 +596,923 @@ class WikiScraper:
                 brace_depth -= 1
             i += 1
 
-        value = block[start:i].strip()
+        return block[start:i].strip() or None
+
+    def _extract_param(self, block: str, param_name: str) -> str | None:
+        """Extract a template parameter value (legacy cleaning for gacha).
+
+        Matches |ParamName= value (until next | or end of block).
+        Handles multi-line values and nested templates/links.
+        """
+        value = self._extract_param_value(block, param_name)
+        if value is None:
+            return None
         # Remove HTML tags and wiki markup from the value
         value = re.sub(r"<[^>]+>", "", value)
         value = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]+?)\]\]", r"\1", value)
         return value or None
+
+    @staticmethod
+    def _clean_markup(text: str) -> str:
+        """Clean wikitext/HTML markup into plain text for translation/display.
+
+        Resolves {{Status Tooltip|KEY|DISPLAY}} → DISPLAY (or KEY), strips
+        bold/italic markers and image links, converts <br> to newlines, and
+        removes remaining HTML tags.
+        """
+        if not text:
+            return ""
+
+        # {{Status Tooltip|KEY}} or {{Status Tooltip|KEY|DISPLAY}}
+        text = re.sub(
+            r"\{\{\s*Status Tooltip\s*(?:\|([^}|]*))?(?:\|([^}]*))?\s*\}\}",
+            lambda m: (m.group(2) or m.group(1) or "").strip(),
+            text,
+        )
+        # {{Example}} → 示例
+        text = text.replace("{{Example}}", "示例")
+        # Remaining simple templates {{X}} → X
+        text = re.sub(r"\{\{\s*([^{}|]+)\s*\}\}", r"\1", text)
+        # Image links [[File:...]] / [[Image:...]] → removed entirely
+        text = re.sub(r"\[\[(?:File|Image):[^\]]*\]\]", "", text)
+        # Wiki links [[Page|display]] (multi-| safe) → display
+        text = re.sub(r"\[\[(?:[^|\]]*\|)*([^\]]+?)\]\]", r"\1", text)
+        # Bold/italic markers
+        text = text.replace("'''", "").replace("''", "")
+        # <br> → newline
+        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+        # Other HTML tags
+        text = re.sub(r"<[^>]+>", "", text)
+        # Collapse per-line whitespace, drop empty lines
+        lines = []
+        for ln in text.splitlines():
+            ln = re.sub(r"[ \t]+", " ", ln).strip()
+            if ln:
+                lines.append(ln)
+        return "\n".join(lines)
+
+    # ── Character Detail (full member fields) ─────────────────────
+
+    def _parse_member_full(self, title: str, wikitext: str) -> dict | None:
+        """Parse a {{Member}} template into a full character-detail entry.
+
+        Extracts identity, personal info, growth-ratio stats, discipline,
+        potential, and S1/S2/S3 skills. Returns None if the template has no
+        Stars (i.e. not a real character page). English fields are kept under
+        ``*_en`` keys and translated later by _translate_character_details.
+        """
+        block = self._extract_template_block(wikitext, "Member")
+        if not block:
+            return None
+
+        stars_raw = self._extract_param_value(block, "Stars")
+        if not stars_raw:
+            return None
+        try:
+            stars = int(stars_raw.strip())
+        except (ValueError, TypeError):
+            return None
+
+        def p(name):
+            return self._extract_param_value(block, name)
+
+        entry = {
+            "title": title,
+            "id": (p("ID") or "").strip(),
+            "stars": stars,
+            "element_en": (p("Element") or "").strip(),
+            "class_en": (p("Class") or "").strip(),
+            "constellation": (p("Constellation") or "").strip(),
+            "breast": (p("Breast") or "").strip(),
+            "birthday": (p("Birthday") or "").strip(),
+            "height": (p("Height") or "").strip(),
+            "weight": (p("Weight") or "").strip(),
+            "release": (p("Release") or "").strip(),
+            "desc_en": self._clean_markup(p("Desc") or ""),
+            "stats": {
+                "ATK": (p("ATK") or "").strip(),
+                "DEF": (p("DEF") or "").strip(),
+                "HP": (p("HP") or "").strip(),
+                "SPD": (p("SPD") or "").strip(),
+            },
+            "discs_en": [self._clean_markup(p(f"Disc{i}") or "") for i in range(1, 7)],
+            "team_pot_en": self._clean_markup(p("TeamPot") or ""),
+            "self_pot_en": self._clean_markup(p("SelfPot") or ""),
+            "skills": [],
+        }
+
+        for s in ("S1", "S2", "S3"):
+            name = p(s)
+            if not name:
+                continue
+            entry["skills"].append({
+                "name_en": self._clean_markup(name),
+                "type": (p(s + "Type") or "").strip(),
+                "soul": (p(s + "Soul") or "").strip(),
+                "cd": (p(s + "CD") or "").strip(),
+                "focus": (p(s + "Focus") or "").strip(),
+                "des_en": self._clean_markup(p(s + "Des") or ""),
+                "des2_en": self._clean_markup(p(s + "Des2") or ""),
+                "burst_en": self._clean_markup(p(s + "Burst") or ""),
+                "burst_cost": (p(s + "BurstCost") or "").strip(),
+                "multi": self._clean_markup(p(s + "Multi") or ""),
+            })
+
+        return entry
+
+    async def refresh_characters(self) -> dict:
+        """Scrape full character details, translate only changed/new entries.
+
+        Incremental + openrubi-seeded to minimise LLM token cost:
+        - A per-entry ``_src_hash`` of the raw English wiki fields detects
+          change. Entries whose hash matches the cache are reused untouched.
+        - On the first build (empty cache), entries are seeded from openrubi's
+          already-translated members_info.json; only characters openrubi
+          doesn't know are LLM-translated.
+        - On later refreshes, only changed/new entries hit the LLM.
+
+        Independent of the gacha refresh() — writes character_details.json.
+        Returns {title: entry} (empty on failure).
+        """
+        member_wikitexts = await self._fetch_template_pages("Member")
+        scraped = []
+        for title, wikitext in member_wikitexts:
+            parsed = self._parse_member_full(title, wikitext)
+            if parsed:
+                scraped.append(parsed)
+
+        print(f"[WikiScraper] Parsed {len(scraped)} full character entries", file=sys.stderr)
+        if not scraped:
+            return {}
+
+        existing = self._load_character_cache()
+        # Seed from openrubi only when building the cache for the first time;
+        # on incremental refreshes the existing translations are authoritative.
+        seed_index = self._openrubi_seed_index() if not existing else None
+
+        to_translate = []
+        result = {}
+        unchanged = seeded = changed = 0
+
+        for entry in scraped:
+            title = entry["title"]
+            h = self._source_hash(entry)
+            old = existing.get(title)
+
+            # Unchanged → reuse existing (already translated) entry as-is.
+            if old is not None and old.get("_src_hash") == h:
+                result[title] = old
+                unchanged += 1
+                continue
+
+            # Changed or new.
+            seed = self._match_seed(seed_index, entry) if seed_index else None
+            if seed is not None:
+                self._apply_deterministic_maps(entry)
+                self._default_cn_fields(entry)
+                entry = self._merge_seed(entry, seed)
+                entry["_src_hash"] = h
+                result[title] = entry
+                seeded += 1
+            else:
+                entry["_src_hash"] = h
+                to_translate.append(entry)
+                result[title] = entry
+                changed += 1
+
+        print(f"[WikiScraper] {unchanged} unchanged, {seeded} seeded from openrubi, "
+              f"{changed} to translate", file=sys.stderr)
+
+        if to_translate:
+            await self._translate_character_details(to_translate)
+
+        # Download character art (portrait / icon / skill icons). Idempotent —
+        # only missing files are fetched. Bounded concurrency so the fire-and-
+        # forget background refresh doesn't hammer the wiki. Failures here are
+        # non-fatal: cards degrade to placeholder tiles.
+        try:
+            sem = asyncio.Semaphore(4)
+            await asyncio.gather(
+                *(self._download_character_images(e, sem) for e in result.values())
+            )
+        except Exception as e:
+            print(f"[WikiScraper] character art download skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+
+        cache = {
+            "scraped_at": time.time(),
+            "scraped_at_iso": datetime.now(BEIJING).isoformat(),
+            "source_url": WIKI_API,
+            "data": result,
+        }
+        os.makedirs(self._cache_dir, exist_ok=True)
+        with open(self._character_detail_cache, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+
+        return result
+
+    # ── Character Detail Diff / Seed ───────────────────────────────
+
+    @staticmethod
+    def _source_hash(entry: dict) -> str:
+        """Fingerprint the raw English wiki fields of an entry.
+
+        Changes to any source field (skills, stats, desc, discs, personal,
+        element/class, id/stars) invalidate the stored translation, so the
+        entry is re-translated on the next refresh.
+        """
+        payload = {k: v for k, v in entry.items() if k != "_src_hash"}
+        s = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _apply_deterministic_maps(entry: dict):
+        """Fill element/class/constellation via fixed maps (no LLM)."""
+        entry["element"] = ELEMENT_CN.get(entry.get("element_en", ""), entry.get("element_en", ""))
+        entry["class_cn"] = CLASS_CN.get(entry.get("class_en", ""), entry.get("class_en", ""))
+        const = entry.get("constellation", "").strip()
+        if const:
+            entry["constellation"] = CONSTELLATION_CN.get(
+                const[:1].upper() + const[1:], const
+            )
+
+    @staticmethod
+    def _default_cn_fields(entry: dict):
+        """Fall back Chinese display fields to their English source.
+
+        Uses setdefault so a later _merge_seed can overwrite the fields
+        openrubi actually provides (name/skills/potential).
+        """
+        entry.setdefault("name_cn", entry.get("title", ""))
+        entry.setdefault("desc", entry.get("desc_en", ""))
+        entry.setdefault("discs", list(entry.get("discs_en", [])))
+        entry.setdefault("team_pot", entry.get("team_pot_en", ""))
+        entry.setdefault("self_pot", entry.get("self_pot_en", ""))
+        for s in entry.get("skills", []):
+            s.setdefault("name", s.get("name_en", ""))
+            s.setdefault("des", s.get("des_en", ""))
+            s.setdefault("des2", s.get("des2_en", ""))
+            s.setdefault("burst", s.get("burst_en", ""))
+
+    def _load_character_cache(self) -> dict:
+        """Load existing {title: entry} from character_details.json."""
+        if not os.path.exists(self._character_detail_cache):
+            return {}
+        try:
+            with open(self._character_detail_cache, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            return cache.get("data", {})
+        except Exception:
+            return {}
+
+    def _openrubi_seed_index(self) -> dict | None:
+        """Index openrubi members_info.json for seeding (by id + by alias)."""
+        if not os.path.exists(OPENRUBI_MEMBERS_INFO):
+            return None
+        try:
+            with open(OPENRUBI_MEMBERS_INFO, "r", encoding="utf-8") as f:
+                members = json.load(f)
+        except Exception:
+            return None
+        by_id: dict = {}
+        by_alias: dict = {}
+        for m in members:
+            mid = str(m.get("id", "")).strip().upper()
+            if mid:
+                by_id[mid] = m
+            for key in [m.get("name"), m.get("e7_name"), *m.get("other_names", [])]:
+                if key:
+                    by_alias.setdefault(str(key).strip().lower(), m)
+        return {"by_id": by_id, "by_alias": by_alias}
+
+    @staticmethod
+    def _match_seed(seed_index: dict | None, entry: dict) -> dict | None:
+        """Match a scraped entry to an openrubi seed by id, then by title."""
+        if not seed_index:
+            return None
+        eid = str(entry.get("id", "")).strip().upper()
+        if eid and eid in seed_index["by_id"]:
+            return seed_index["by_id"][eid]
+        title = entry.get("title", "").strip().lower()
+        if title and title in seed_index["by_alias"]:
+            return seed_index["by_alias"][title]
+        return None
+
+    @staticmethod
+    def _render_discipline_cn(discipline: dict) -> list[str]:
+        """Render openrubi's Discipline numeric dict into Chinese talent text.
+
+        openrubi stores talents as ``{"1": {"HP%": "3"}, "2": {...}, ...}``
+        where level 3 is universally absent (a non-stat node). Returns a
+        6-element list indexed by level-1, empty string for missing levels, so
+        ``format_character`` can keep the true talent level numbers.
+        """
+        discs = [""] * 6
+        if not isinstance(discipline, dict):
+            return discs
+        for lv, stats in discipline.items():
+            try:
+                idx = int(lv) - 1
+            except (ValueError, TypeError):
+                continue
+            if idx < 0 or idx >= 6 or not isinstance(stats, dict):
+                continue
+            for key, val in stats.items():
+                label, is_pct = DISCIPLINE_STAT_CN.get(key, (key, False))
+                suffix = "%" if is_pct else ""
+                discs[idx] = f"{label} +{val}{suffix}"
+                break  # single-stat nodes; keep the first if ever multiple
+        return discs
+
+    @staticmethod
+    def _merge_seed(entry: dict, seed: dict) -> dict:
+        """Overwrite the fields openrubi translated, leaving the rest as-is.
+
+        Skills are matched by position (S1/S2/S3 order matches openrubi's
+        Skills list). openrubi has no bio/desc, so desc keeps its English
+        fallback; the numeric Discipline dict is rendered into Chinese talent
+        text deterministically.
+        """
+        if seed.get("name"):
+            entry["name_cn"] = seed["name"]
+
+        seed_skills = seed.get("Skills", []) or []
+        for i, sk in enumerate(entry.get("skills", [])):
+            osk = seed_skills[i] if i < len(seed_skills) else None
+            if not osk:
+                continue
+            if osk.get("Name"):
+                sk["name"] = osk["Name"]
+            if osk.get("Describe"):
+                sk["des"] = osk["Describe"]
+            if osk.get("Burst"):
+                sk["burst"] = osk["Burst"]
+
+        if seed.get("Discipline"):
+            entry["discs"] = WikiScraper._render_discipline_cn(seed["Discipline"])
+
+        pot = seed.get("Potential") or {}
+        if pot.get("Team"):
+            entry["team_pot"] = pot["Team"]
+        if pot.get("Self"):
+            entry["self_pot"] = pot["Self"]
+
+        return entry
+
+    # ── Character Detail Translation ──────────────────────────────
+
+    async def _translate_character_details(self, chars: list[dict]):
+        """Translate English character entries to Chinese (name + free-text).
+
+        Called only on changed/new entries. Order: deterministic maps → field
+        fallback → name lookup (openrubi dict, then gacha name_mapping, then
+        LLM) → free-text LLM translation (desc/skills/discs) with openrubi
+        few-shot.
+        """
+        for c in chars:
+            self._apply_deterministic_maps(c)
+            self._default_cn_fields(c)
+
+        # Name translation
+        openrubi_map = self._openrubi_name_lookup()
+        name_map = self._load_translation_map()
+        unmapped = []
+        for c in chars:
+            cn = openrubi_map.get(c["title"].strip().lower()) or name_map.get(c["title"])
+            if cn:
+                c["name_cn"] = cn
+            else:
+                c["name_cn"] = c["title"]
+                unmapped.append(c["title"])
+
+        if unmapped and self.llm_client:
+            new_names = await self._llm_translate(unmapped)
+            if new_names:
+                for c in chars:
+                    if new_names.get(c["title"]):
+                        c["name_cn"] = new_names[c["title"]]
+                name_map.update(new_names)
+                self._save_translation_map(name_map)
+
+        # Free-text LLM translation (desc, skill names/descriptions, discs)
+        if self.llm_client:
+            await self._llm_translate_details(chars)
+
+    def _openrubi_name_lookup(self) -> dict:
+        """Build lowercase alias → canonical Chinese name map from openrubi.
+
+        character_dic.json is alias→canonical (e.g. 'Shani'→'夏妮'); also folds
+        in members_info.json e7_name/other_names. Used to avoid LLM calls for
+        names openrubi already knows.
+        """
+        lookup: dict = {}
+        if os.path.exists(OPENRUBI_CHAR_DIC):
+            try:
+                with open(OPENRUBI_CHAR_DIC, "r", encoding="utf-8") as f:
+                    dic = json.load(f)
+                for alias, name in dic.items():
+                    low = str(alias).strip().lower()
+                    if low and name:
+                        lookup.setdefault(low, name)
+            except Exception:
+                pass
+        if os.path.exists(OPENRUBI_MEMBERS_INFO):
+            try:
+                with open(OPENRUBI_MEMBERS_INFO, "r", encoding="utf-8") as f:
+                    members = json.load(f)
+                for m in members:
+                    cn = m.get("name")
+                    if not cn:
+                        continue
+                    for key in [m.get("e7_name"), *m.get("other_names", [])]:
+                        if key:
+                            lookup.setdefault(str(key).strip().lower(), cn)
+            except Exception:
+                pass
+        return lookup
+
+    def _build_fewshot(self) -> str:
+        """Build a few-shot string from openrubi members_info (2 example chars)."""
+        examples = []
+        if os.path.exists(OPENRUBI_MEMBERS_INFO):
+            try:
+                with open(OPENRUBI_MEMBERS_INFO, "r", encoding="utf-8") as f:
+                    members = json.load(f)
+                for m in members[:2]:
+                    skill_lines = [
+                        f"  - {s.get('Name', '')}：{s.get('Describe', '')}"
+                        for s in m.get("Skills", [])[:3]
+                    ]
+                    examples.append(
+                        f"角色「{m.get('name', '')}」（{m.get('Attribute', '')}/{m.get('Class', '')}）\n"
+                        + "\n".join(skill_lines)
+                    )
+            except Exception:
+                pass
+        return "\n\n".join(examples)
+
+    async def _llm_translate_details(self, chars: list[dict]):
+        """Batch-translate desc/skill names+descriptions/discs via LLM.
+
+        Sends characters in batches of 8, each with English fields; expects a
+        JSON object keyed by title with translated fields. openrubi few-shot +
+        a status-term glossary keep terminology consistent.
+        """
+        if not self.llm_client:
+            return
+
+        fewshot = self._build_fewshot()
+        glossary = (
+            "术语参考：ATK=攻击力，DEF=防御力，HP=生命值，Speed=速度，"
+            "ATK Down=攻击力下降，DEF Down=防御力下降，SPD Down=速度下降，"
+            "ATK Up=攻击力提升，DEF Up=防御力提升，SPD Up=速度提升，"
+            "Provoke=嘲讽，Immunity=免疫，Shield=护盾，Stun=眩晕，Silence=沉默，"
+            "Poison=中毒，Burn=灼烧，Bleed=流血，Barrier=屏障，Recovery=恢复，"
+            "Effect Hit Rate=效果命中，Effect Resistance=效果抵抗。"
+        )
+
+        for i in range(0, len(chars), 8):
+            batch = chars[i : i + 8]
+            payload = []
+            for c in batch:
+                payload.append({
+                    "title": c["title"],
+                    "desc": c.get("desc_en", ""),
+                    "skills": [
+                        {
+                            "name": s.get("name_en", ""),
+                            "des": s.get("des_en", ""),
+                            "des2": s.get("des2_en", ""),
+                            "burst": s.get("burst_en", ""),
+                        }
+                        for s in c.get("skills", [])
+                    ],
+                    "discs": c.get("discs_en", []),
+                })
+
+            prompt = (
+                "你是《Ark Re:Code》游戏本地化翻译，将以下角色的英文文本翻译为简体中文。\n"
+                "保持游戏术语风格，方括号内的数值区间（如 [40-50%]）原样保留。\n"
+                + glossary
+                + "\n"
+                + (("参考已翻译角色示例，保持术语与风格一致：\n" + fewshot + "\n") if fewshot else "")
+                + "\n输入 JSON（英文）：\n"
+                + json.dumps(payload, ensure_ascii=False, indent=1)
+                + "\n\n返回 ONLY JSON（无 markdown 代码块、无解释），结构相同但字段翻译为中文：\n"
+                '{"<title>": {"name_cn": "...", "desc": "...", "skills": [{"name":"...","des":"...","des2":"...","burst":"..."}], "discs": ["..."]}}'
+            )
+
+            try:
+                result = await self.llm_client.chat_completion(prompt, timeout_set=60.0)
+                translated = self._parse_translation_json(result)
+            except Exception:
+                translated = {}
+
+            for c in batch:
+                t = translated.get(c["title"])
+                if not isinstance(t, dict):
+                    continue
+                if t.get("name_cn"):
+                    c["name_cn"] = t["name_cn"]
+                if t.get("desc"):
+                    c["desc"] = t["desc"]
+                for idx, sk in enumerate(c.get("skills", [])):
+                    ts = t.get("skills", [])
+                    if isinstance(ts, list) and idx < len(ts) and isinstance(ts[idx], dict):
+                        if ts[idx].get("name"):
+                            sk["name"] = ts[idx]["name"]
+                        if ts[idx].get("des"):
+                            sk["des"] = ts[idx]["des"]
+                        if ts[idx].get("des2"):
+                            sk["des2"] = ts[idx]["des2"]
+                        if ts[idx].get("burst"):
+                            sk["burst"] = ts[idx]["burst"]
+                if isinstance(t.get("discs"), list):
+                    c["discs"] = t["discs"]
+
+    @staticmethod
+    def _parse_translation_json(text: str) -> dict:
+        """Extract a JSON object from LLM output (handles nested braces)."""
+        if not text:
+            return {}
+        text = text.strip()
+        m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if m:
+            text = m.group(1).strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except Exception:
+                pass
+        return {}
+
+    # ── Bond Detail (full bond fields) ─────────────────────────────
+
+    def _parse_bond_full(self, title: str, wikitext: str) -> dict | None:
+        """Parse a {{Bond}} template into a full bond-detail entry.
+
+        Extracts class/stars/ATK/HP, description, bond skill (effect), notes,
+        obtain, and the related character. Sell price / XP value are NOT stored
+        on the page — they are deterministic by Stars (see
+        _apply_bond_deterministic). Release date lives in Template:Bond/Release.
+        """
+        block = self._extract_template_block(wikitext, "Bond")
+        if not block:
+            return None
+
+        stars_raw = self._extract_param_value(block, "Stars")
+        if not stars_raw:
+            return None
+        try:
+            stars = int(stars_raw.strip())
+        except (ValueError, TypeError):
+            return None
+
+        def p(name):
+            return self._extract_param_value(block, name)
+
+        # Bond id is embedded in the icon filename (Icon_Head_S_A0001.png).
+        image = (p("Image") or "").strip()
+        m = re.search(r"Icon_Head_S_([A-Za-z0-9]+)\.png", image, re.IGNORECASE)
+        cid = m.group(1).upper() if m else ""
+
+        return {
+            "title": title,
+            "id": cid,
+            "stars": stars,
+            "class_en": (p("Class") or "").strip(),
+            "member_en": self._clean_markup(p("Member") or "").strip(),
+            "atk_base": (p("ATK") or "").strip(),
+            "atk_max": (p("ATK2") or "").strip(),
+            "hp_base": (p("HP") or "").strip(),
+            "hp_max": (p("HP2") or "").strip(),
+            "desc_en": self._clean_markup(p("Desc") or ""),
+            "effect_en": self._strip_list_markers(self._clean_markup(p("Effect") or "")),
+            "notes_en": self._clean_markup(p("Notes") or ""),
+            "obtain_en": self._clean_markup(p("Obtain") or ""),
+            "unsellable": bool((p("Unsellable") or "").strip()),
+        }
+
+    @staticmethod
+    def _strip_list_markers(text: str) -> str:
+        """Strip leading ``*``/``#`` list markers from each line."""
+        if not text:
+            return ""
+        lines = []
+        for ln in text.splitlines():
+            ln = re.sub(r"^\s*[*#]+\s*", "", ln)
+            if ln.strip():
+                lines.append(ln)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _normalize_release_date(s: str) -> str:
+        """Normalise ``November 01, 2023`` / ``2023-11-01`` → ``2023-11-01``."""
+        if not s:
+            return ""
+        s = s.strip()
+        try:
+            return datetime.strptime(s, "%B %d, %Y").strftime("%Y-%m-%d")
+        except ValueError:
+            return s
+
+    async def _fetch_bond_release_map(self) -> dict:
+        """Fetch Template:Bond/Release → {title: release date string}."""
+        data = await self._fetch_json(WIKI_API, {
+            "action": "query",
+            "prop": "revisions",
+            "rvprop": "content",
+            "rvslots": "main",
+            "titles": "Template:Bond/Release",
+            "format": "json",
+        })
+        if not data:
+            return {}
+        content = ""
+        for _pid, info in data.get("query", {}).get("pages", {}).items():
+            revs = info.get("revisions", [])
+            if revs:
+                content = revs[0].get("slots", {}).get("main", {}).get("*", "")
+        mapping = {}
+        for m in re.finditer(r"\|\s*([^=|\n]+?)\s*=\s*([^|\n]+)", content):
+            name = m.group(1).strip()
+            date = m.group(2).strip()
+            if name and date:
+                mapping[name] = date
+        return mapping
+
+    async def refresh_bonds(self) -> dict:
+        """Scrape full bond details, translate only changed/new entries.
+
+        Mirrors refresh_characters(): incremental + openrubi-seeded to minimise
+        LLM cost. Release dates come from Template:Bond/Release; sell price and
+        XP value are computed deterministically from Stars. Writes
+        bond_details.json. Returns {title: entry} (empty on failure).
+        """
+        bond_wikitexts = await self._fetch_template_pages("Bond")
+        scraped = []
+        for title, wikitext in bond_wikitexts:
+            parsed = self._parse_bond_full(title, wikitext)
+            if parsed:
+                scraped.append(parsed)
+
+        print(f"[WikiScraper] Parsed {len(scraped)} full bond entries", file=sys.stderr)
+        if not scraped:
+            return {}
+
+        release_map = await self._fetch_bond_release_map()
+        existing = self._load_bond_cache()
+        seed_index = self._openrubi_bond_seed_index() if not existing else None
+
+        to_translate = []
+        result = {}
+        unchanged = seeded = changed = 0
+
+        for entry in scraped:
+            title = entry["title"]
+            h = self._source_hash(entry)
+            old = existing.get(title)
+            if old is not None and old.get("_src_hash") == h:
+                result[title] = old
+                unchanged += 1
+                continue
+
+            self._apply_bond_deterministic(entry, release_map)
+            self._default_bond_cn_fields(entry)
+            seed = self._match_bond_seed(seed_index, entry) if seed_index else None
+            if seed is not None:
+                entry = self._merge_bond_seed(entry, seed)
+                entry["_src_hash"] = h
+                result[title] = entry
+                seeded += 1
+            else:
+                entry["_src_hash"] = h
+                to_translate.append(entry)
+                result[title] = entry
+                changed += 1
+
+        print(f"[WikiScraper] bonds: {unchanged} unchanged, {seeded} seeded, "
+              f"{changed} to translate", file=sys.stderr)
+
+        if to_translate:
+            await self._translate_bond_details(to_translate)
+
+        try:
+            sem = asyncio.Semaphore(4)
+            await asyncio.gather(
+                *(self._download_bond_icon(e, sem) for e in result.values())
+            )
+        except Exception as e:
+            print(f"[WikiScraper] bond icon download skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+
+        cache = {
+            "scraped_at": time.time(),
+            "scraped_at_iso": datetime.now(BEIJING).isoformat(),
+            "source_url": WIKI_API,
+            "data": result,
+        }
+        os.makedirs(self._cache_dir, exist_ok=True)
+        with open(self._bond_detail_cache, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+
+        return result
+
+    def _load_bond_cache(self) -> dict:
+        """Load existing {title: entry} from bond_details.json."""
+        if not os.path.exists(self._bond_detail_cache):
+            return {}
+        try:
+            with open(self._bond_detail_cache, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            return cache.get("data", {})
+        except Exception:
+            return {}
+
+    def _openrubi_bond_seed_index(self) -> dict | None:
+        """Index openrubi bonds_info.json for seeding (by id + by alias)."""
+        if not os.path.exists(OPENRUBI_BONDS_INFO):
+            return None
+        try:
+            with open(OPENRUBI_BONDS_INFO, "r", encoding="utf-8") as f:
+                bonds = json.load(f)
+        except Exception:
+            return None
+        by_id: dict = {}
+        by_alias: dict = {}
+        for b in bonds:
+            bid = str(b.get("id", "")).strip().upper()
+            if bid:
+                by_id[bid] = b
+            for key in [b.get("name"), b.get("e7_name"), *b.get("other_names", [])]:
+                if key:
+                    by_alias.setdefault(str(key).strip().lower(), b)
+        return {"by_id": by_id, "by_alias": by_alias}
+
+    @staticmethod
+    def _match_bond_seed(seed_index: dict | None, entry: dict) -> dict | None:
+        """Match a scraped bond to an openrubi seed by id, then by title."""
+        if not seed_index:
+            return None
+        eid = str(entry.get("id", "")).strip().upper()
+        if eid and eid in seed_index["by_id"]:
+            return seed_index["by_id"][eid]
+        title = entry.get("title", "").strip().lower()
+        if title and title in seed_index["by_alias"]:
+            return seed_index["by_alias"][title]
+        return None
+
+    @staticmethod
+    def _apply_bond_deterministic(entry: dict, release_map: dict | None = None):
+        """Fill class CN + deterministic sell/XP + release date (no LLM)."""
+        entry["class_cn"] = CLASS_CN.get(entry.get("class_en", ""), entry.get("class_en", ""))
+        stars = str(entry.get("stars", ""))
+        entry["sell_gold"] = BOND_SELL_GOLD.get(stars, "")
+        entry["sell_fragment"] = BOND_SELL_FRAGMENT.get(stars, "")
+        entry["xp_value"] = BOND_XP_VALUE.get(stars, "")
+        if release_map:
+            entry["release"] = WikiScraper._normalize_release_date(
+                release_map.get(entry.get("title", ""), "")
+            )
+
+    @staticmethod
+    def _default_bond_cn_fields(entry: dict):
+        """Fall back Chinese display fields to their English source."""
+        entry.setdefault("name_cn", entry.get("title", ""))
+        entry.setdefault("desc", entry.get("desc_en", ""))
+        entry.setdefault("effect", entry.get("effect_en", ""))
+        entry.setdefault("notes", entry.get("notes_en", ""))
+        entry.setdefault("obtain", entry.get("obtain_en", ""))
+        entry.setdefault("member", entry.get("member_en", ""))
+
+    @staticmethod
+    def _merge_bond_seed(entry: dict, seed: dict) -> dict:
+        """Overwrite the fields openrubi translated, leaving the rest as-is."""
+        if seed.get("name"):
+            entry["name_cn"] = seed["name"]
+        if seed.get("Description"):
+            entry["desc"] = seed["Description"]
+        if seed.get("Skill"):
+            entry["effect"] = seed["Skill"]
+        if seed.get("Notes"):
+            entry["notes"] = seed["Notes"]
+        if seed.get("Related"):
+            entry["member"] = seed["Related"]
+        if seed.get("Released"):
+            entry["release"] = WikiScraper._normalize_release_date(str(seed["Released"]))
+        return entry
+
+    def _openrubi_bond_name_lookup(self) -> dict:
+        """Build lowercase alias → Chinese bond name map from openrubi."""
+        lookup: dict = {}
+        bond_dic = os.path.join(OPENRUBI_CHAR_DIR, "bonds_search_dic.json")
+        if os.path.exists(bond_dic):
+            try:
+                with open(bond_dic, "r", encoding="utf-8") as f:
+                    dic = json.load(f)
+                for alias, name in dic.items():
+                    low = str(alias).strip().lower()
+                    if low and name:
+                        lookup.setdefault(low, name)
+            except Exception:
+                pass
+        if os.path.exists(OPENRUBI_BONDS_INFO):
+            try:
+                with open(OPENRUBI_BONDS_INFO, "r", encoding="utf-8") as f:
+                    bonds = json.load(f)
+                for b in bonds:
+                    cn = b.get("name")
+                    if not cn:
+                        continue
+                    for key in [b.get("e7_name"), *b.get("other_names", [])]:
+                        if key:
+                            lookup.setdefault(str(key).strip().lower(), cn)
+            except Exception:
+                pass
+        return lookup
+
+    async def _translate_bond_details(self, bonds: list[dict]):
+        """Translate English bond entries to Chinese (name + free-text)."""
+        name_lookup = self._openrubi_bond_name_lookup()
+        char_lookup = self._openrubi_name_lookup()
+        for b in bonds:
+            cn = name_lookup.get(b["title"].strip().lower())
+            if cn:
+                b["name_cn"] = cn
+            m = b.get("member_en", "").strip()
+            if m:
+                b["member"] = char_lookup.get(m.lower(), m)
+
+        if self.llm_client:
+            await self._llm_translate_bond_details(bonds)
+
+    async def _llm_translate_bond_details(self, bonds: list[dict]):
+        """Batch-translate desc/effect/notes/obtain (+ unmapped name) via LLM."""
+        if not self.llm_client:
+            return
+        glossary = (
+            "术语参考：ATK=攻击力，DEF=防御力，HP=生命值，Shield=护盾，"
+            "Immune=免疫，Provoke=嘲讽，Stun=眩晕，Bleed=流血，Burn=灼烧，"
+            "Poison=中毒，Revive=复活，Barrier=屏障，Recovery=恢复。"
+        )
+        for i in range(0, len(bonds), 8):
+            batch = bonds[i : i + 8]
+            payload = []
+            for b in batch:
+                payload.append({
+                    "title": b["title"],
+                    "desc": b.get("desc_en", ""),
+                    "effect": b.get("effect_en", ""),
+                    "notes": b.get("notes_en", ""),
+                    "obtain": b.get("obtain_en", ""),
+                })
+            prompt = (
+                "你是《Ark Re:Code》游戏本地化翻译，将以下羁绊(Bond)的英文文本翻译为简体中文。\n"
+                "保持游戏术语风格，方括号内的数值区间（如 [50-100%]）原样保留。\n"
+                + glossary
+                + "\n输入 JSON（英文）：\n"
+                + json.dumps(payload, ensure_ascii=False, indent=1)
+                + "\n\n返回 ONLY JSON（无 markdown 代码块、无解释），结构相同但字段翻译为中文：\n"
+                '{"<title>": {"name_cn": "...", "desc": "...", "effect": "...", "notes": "...", "obtain": "..."}}'
+            )
+            try:
+                result = await self.llm_client.chat_completion(prompt, timeout_set=60.0)
+                translated = self._parse_translation_json(result)
+            except Exception:
+                translated = {}
+            for b in batch:
+                t = translated.get(b["title"])
+                if not isinstance(t, dict):
+                    continue
+                if t.get("name_cn") and b.get("name_cn") == b["title"]:
+                    b["name_cn"] = t["name_cn"]
+                if t.get("desc"):
+                    b["desc"] = t["desc"]
+                if t.get("effect"):
+                    b["effect"] = t["effect"]
+                if t.get("notes"):
+                    b["notes"] = t["notes"]
+                if t.get("obtain"):
+                    b["obtain"] = t["obtain"]
+
+    async def _download_bond_icon(self, entry: dict, semaphore: asyncio.Semaphore):
+        """Download the bond head icon (Icon_Head_S_{id}.png). Idempotent."""
+        cid = str(entry.get("id", "")).strip()
+        if not cid:
+            return
+        dest = os.path.join(BOND_ICON_DIR, f"{cid}.png")
+        if os.path.exists(dest):
+            return
+        async with semaphore:
+            url = await self._resolve_image_url(f"Icon_Head_S_{cid}.png")
+            if url:
+                await self._download_image(url, dest)
 
     # ── Classify ──────────────────────────────────────────────────
 

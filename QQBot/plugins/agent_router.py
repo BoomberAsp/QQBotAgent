@@ -87,6 +87,8 @@ from tools.legacy_tools import (
     play_gacha_animation,
     translate_text,
 )
+from tools.character_detail import character_detail, character_detail_with_card
+from tools.bond_detail import bond_detail, bond_detail_with_card
 
 # ── Configuration Paths ───────────────────────────────────────────
 
@@ -745,6 +747,33 @@ def _build_tool_registry() -> ToolRegistry:
             "required": ["text"],
         },
     )
+    registry.register(
+        "character_detail", character_detail,
+        "查询 Ark Re:Code 角色的详细资料（面板成长系数、技能、倍率、属性、天赋、潜能）。"
+        "当用户只发送一个角色名/别名（如「夏妮」「狼团长」「Shani」「瞎泥」）而没有其他请求时，"
+        "调用此工具返回该角色详情。",
+        {
+            "type": "object",
+            "properties": {
+                "character_name": {"type": "string", "description": "角色名或别名"},
+            },
+            "required": ["character_name"],
+        },
+    )
+    registry.register(
+        "bond_detail", bond_detail,
+        "查询 Ark Re:Code 羁绊（Bond/神器）的详细资料（类别、星级、攻击/生命、羁绊技能、"
+        "获取方式、出售价格、经验值、上线时间）。"
+        "当用户只发送一个羁绊名/别名（如「驰骋的快感」「复活甲」「Pleasure of Exploration」）"
+        "而没有其他请求时，调用此工具返回该羁绊详情。",
+        {
+            "type": "object",
+            "properties": {
+                "bond_name": {"type": "string", "description": "羁绊名或别名"},
+            },
+            "required": ["bond_name"],
+        },
+    )
 
     # ── Redeem Code ────────────────────────────────────────────
 
@@ -1230,7 +1259,8 @@ def _get_user_info() -> str:
                   "geocode", "reverse_geocode", "search_poi", "plan_route"}
     dev_tools = {"execute_code", "shell_exec", "web_fetch", "download_repo", "get_system_load"}
     fun_tools = {"gacha_pull", "play_gacha_animation", "calculate_speed",
-                 "compare_speed_probability", "explain_code", "translate_text"}
+                 "compare_speed_probability", "explain_code", "translate_text",
+                 "character_detail", "bond_detail"}
     misc = allowed - info_tools - dev_tools - fun_tools
 
     sections = [
@@ -1355,6 +1385,14 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             return
         # /兑换码 / /redeem-code command (direct, no agent)
         cmd_handled = await _handle_redeem_code_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /角色详情 command (direct, no agent, zero token)
+        cmd_handled = await _handle_character_detail_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /羁绊详情 command (direct, no agent, zero token)
+        cmd_handled = await _handle_bond_detail_command(text_content, user_id)
         if cmd_handled:
             return
         # /功能 / /features command (direct, no agent)
@@ -1881,6 +1919,53 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
         lines.append(line)
 
     await _safe_send("\n".join(lines))
+    return True
+
+
+async def _handle_character_detail_command(text: str, user_id: str) -> bool:
+    """Handle /角色详情 command — direct, no agent (zero token).
+
+    Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/角色详情", "#角色详情"):
+        return False
+
+    # Extract the name argument (everything after the command word)
+    rest = text.strip()[len(cmd):].strip()
+    if not rest:
+        await _safe_send("用法: /角色详情 <角色名或别名>\n例如: /角色详情 夏妮")
+        return True
+
+    text_result, card_path = await character_detail_with_card(rest)
+    if card_path:
+        from nonebot.adapters.onebot.v11 import MessageSegment
+        await _safe_send(MessageSegment.image(f"file://{card_path}"))
+    else:
+        await _safe_send(text_result)
+    return True
+
+
+async def _handle_bond_detail_command(text: str, user_id: str) -> bool:
+    """Handle /羁绊详情 command — direct, no agent (zero token).
+
+    Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/羁绊详情", "#羁绊详情"):
+        return False
+
+    rest = text.strip()[len(cmd):].strip()
+    if not rest:
+        await _safe_send("用法: /羁绊详情 <羁绊名或别名>\n例如: /羁绊详情 驰骋的快感")
+        return True
+
+    text_result, card_path = await bond_detail_with_card(rest)
+    if card_path:
+        from nonebot.adapters.onebot.v11 import MessageSegment
+        await _safe_send(MessageSegment.image(f"file://{card_path}"))
+    else:
+        await _safe_send(text_result)
     return True
 
 
