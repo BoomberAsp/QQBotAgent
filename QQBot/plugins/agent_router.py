@@ -1939,8 +1939,9 @@ async def _handle_character_detail_command(text: str, user_id: str) -> bool:
 
     text_result, card_path = await character_detail_with_card(rest)
     if card_path:
+        from pathlib import Path
         from nonebot.adapters.onebot.v11 import MessageSegment
-        await _safe_send(MessageSegment.image(f"file://{card_path}"))
+        await _safe_send(MessageSegment.image(Path(card_path)))
     else:
         await _safe_send(text_result)
     return True
@@ -1962,8 +1963,9 @@ async def _handle_bond_detail_command(text: str, user_id: str) -> bool:
 
     text_result, card_path = await bond_detail_with_card(rest)
     if card_path:
+        from pathlib import Path
         from nonebot.adapters.onebot.v11 import MessageSegment
-        await _safe_send(MessageSegment.image(f"file://{card_path}"))
+        await _safe_send(MessageSegment.image(Path(card_path)))
     else:
         await _safe_send(text_result)
     return True
