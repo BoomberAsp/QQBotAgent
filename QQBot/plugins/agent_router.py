@@ -912,7 +912,7 @@ agent = Agent(
 
 _model_router = ModelRouter()
 
-_continuous_sessions = ContinuousSessionManager(timeout_minutes=5.0)
+_continuous_sessions = ContinuousSessionManager(timeout_minutes=1.5)
 
 _perm_manager = PermissionManager()
 
