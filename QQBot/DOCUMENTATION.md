@@ -41,7 +41,7 @@ QQBotAgent/
     │   ├── tool_registry.py #   工具注册表 (OpenAI JSON Schema 生成)
     │   ├── session.py       #   会话管理 (per-user, timeout, trim, 持久化)
     │   ├── special_session.py #  特殊会话管理 (百万 token, 快照+增量存储, 按角色限制数量)
-    │   ├── continuous_session.py # 群聊连续对话窗口管理 (5分钟免@)
+    │   ├── continuous_session.py # 群聊连续对话窗口管理 (90秒免@)
     │   ├── hardware.py      #   硬件自动检测 & 动态任务拒绝
     │   ├── workspace.py     #   用户工作区隔离 & 配额管理
     │   ├── context.py       #   执行上下文传递 (contextvars, 工具→QQ图片)
@@ -494,11 +494,11 @@ agent_router.py
 | `_send_response(response, matcher=None)` | 发送 Agent 回复。自动检测长度，短消息直接发送，长消息调用 `_split_text` 拆分后逐块发送（300 字符/块, 1s 间隔）。可选 `matcher` 参数。 |
 | `_split_text(text, max_len=300)` | 智能文本拆分。优先在句子边界（`。！？\n\n`）处断开，避免截断语义。 |
 | `_download_and_save_file(url, filename, max_size_mb=50)` | 从 QQ 消息下载文件到工作区 `uploads/`。UUID 防碰撞文件名，120s 超时。 |
-| `_continuous_sessions` | `ContinuousSessionManager` 实例。管理群聊连续对话窗口 (5分钟免@)。 |
+| `_continuous_sessions` | `ContinuousSessionManager` 实例。管理群聊连续对话窗口 (90秒免@)。 |
 
 #### 连续对话模式 (Continuous Mode)
 
-群聊中，用户首次 @机器人 后自动开启 5 分钟「免 @」窗口。窗口内用户的所有消息都会被 Agent 处理，无需反复 @mention。
+群聊中，用户首次 @机器人 后自动开启 90 秒「免 @」窗口。窗口内用户的所有消息都会被 Agent 处理，无需反复 @mention。
 
 | 处理器 | 优先级 | 触发条件 | 说明 |
 |--------|--------|----------|------|
@@ -507,9 +507,9 @@ agent_router.py
 
 **窗口生命周期**:
 1. **开启**: `agent_router` 处理完 @消息 后自动调用 `_continuous_sessions.start(group_id, user_id)`
-2. **续期**: `continuous_router` 每条消息调用 `touch()` → 重置为完整 5 分钟
+2. **续期**: `continuous_router` 每条消息调用 `touch()` → 重置为完整 90 秒
 3. **取消**: 用户发送 `/取消` / `#取消` / `/结束` / `#结束` → 窗口关闭
-4. **超时**: 5 分钟无消息 → `is_active()` 自动清理过期窗口
+4. **超时**: 90 秒无消息 → `is_active()` 自动清理过期窗口
 
 **Agent 感知**: 连续模式消息注入 `[连续对话模式]` 前缀，Agent 应保持简洁、不重复问候、适时建议用户 `/取消` 退出。
 
@@ -1237,11 +1237,11 @@ v2.3 基础上增加:
 v2.4 基础上增加:
   ├── ContinuousSessionManager: 群聊免@窗口管理 (per-group, per-user)
   ├── continuous_router: 第二消息处理器 (priority=2, 无 to_me 规则)
-  ├── 自动开启: @机器人 回复后自动为发起者打开 5 分钟窗口
-  ├── 消息续期: 每条消息重置计时器为完整 5 分钟
+  ├── 自动开启: @机器人 回复后自动为发起者打开 90 秒窗口
+  ├── 消息续期: 每条消息重置计时器为完整 90 秒
   ├── 取消命令: /取消, #取消, /结束, #结束 → 手动关闭窗口
   ├── Agent 感知: [连续对话模式] 前缀 → 简洁回复, 适时建议退出
-  ├── 超时清理: 5 分钟无消息自动过期, 静默清理
+  ├── 超时清理: 90 秒无消息自动过期, 静默清理
   └── 防重复: continuous_router 检查 is_tome() 避免与 agent_router 重复处理
 
 ### v2.6 — reasoning_content 全链路保留

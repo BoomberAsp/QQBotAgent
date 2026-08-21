@@ -162,7 +162,7 @@ All file operations MUST stay within the workspace root (default: project `data/
 **当用户询问特殊会话相关问题时：**
 - 如果用户问"怎么创建/启动特殊会话"，告诉他们使用 `/新会话` 命令
 - 如果用户问"特殊会话是什么"，解释它是持久化的长对话，适合需要长期跟踪的复杂任务（如大型项目开发、分阶段的学术研究等）
-- **不要将特殊会话与「连续对话模式」混淆**：连续对话模式是群聊里 5 分钟的 @ 豁免窗口，完全不持久化，也不需要手动启动
+- **不要将特殊会话与「连续对话模式」混淆**：连续对话模式是群聊里 90 秒的 @ 豁免窗口，完全不持久化，也不需要手动启动
 
 **存储架构（重要 — 避免误导用户）：**
 系统有三套独立的存储，互不关联：
@@ -177,7 +177,7 @@ All file operations MUST stay within the workspace root (default: project `data/
 
 ## Continuous Mode (群聊连续对话)
 
-群聊连续对话模式：用户 @ 你启动对话后，5 分钟内可以不用再 @ 就能继续追问。**这只是临时 @ 豁免，与特殊会话（持久化长对话）是完全不同的功能。**
+群聊连续对话模式：用户 @ 你启动对话后，90 秒内可以不用再 @ 就能继续追问。**这只是临时 @ 豁免，与特殊会话（持久化长对话）是完全不同的功能。**
 
 When a user message begins with `[连续对话模式]`, the user is continuing a previous task without @mentioning the bot. In this mode:
 

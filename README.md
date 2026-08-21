@@ -8,7 +8,7 @@
 - **多模型路由** — 轻量 FLASH 模型处理简单任务，强力 REASONING 模型处理复杂推理，MULTIMODAL 模型理解图片，AUDIO 模型分析语音
 - **特殊会话** — 每用户至多 10/3/1 个（按角色），百万 token 上下文窗口，快照+增量双层存储
 - **用户工作区** — 每用户独立文件空间，配额管理（3 级策略），跨会话隔离
-- **流式交互** — 群聊连续对话模式：@一次后 5 分钟内免 @，消息自动续期
+- **流式交互** — 群聊连续对话模式：@一次后 90 秒内免 @，消息自动续期
 - **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制，分级限制：管理员 60s/100KB，会员 15s/50KB）
 - **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
@@ -205,7 +205,7 @@ QQBotAgent/
     │   ├── tool_registry.py#   工具注册（OpenAI JSON Schema）
     │   ├── session.py      #   会话管理（临时会话, per-user, 持久化）
     │   ├── special_session.py  # 特殊会话（百万 token, 快照+增量, 最多3个）
-    │   ├── continuous_session.py  # 群聊连续对话窗口（5分钟免@）
+    │   ├── continuous_session.py  # 群聊连续对话窗口（90秒免@）
     │   ├── hardware.py     #   硬件自动检测 & 动态任务拒绝
     │   ├── workspace.py    #   用户工作区隔离 & 配额管理
     │   ├── context.py      #   执行上下文（contextvars, 工具→QQ图片）
@@ -293,10 +293,10 @@ User Message → agent_router
 ### 群聊连续对话
 
 ```
-@Roxy "帮我分析数据"   → agent_router (to_me) → 自动开启 5 分钟窗口
+@Roxy "帮我分析数据"   → agent_router (to_me) → 自动开启 90 秒窗口
 "这个字段是什么" (无@)  → continuous_router       → Agent 处理 + 续期
 "/取消" (无@)          → continuous_router       → 关闭窗口
-5 分钟无消息            → 自动过期清理
+90 秒无消息            → 自动过期清理
 ```
 
 ## 核心类
