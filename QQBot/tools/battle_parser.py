@@ -1014,16 +1014,22 @@ def _format_pair_result(
     action_gauge_skills: list[dict] | None = None,
 ) -> str:
     """Format a two-screenshot (pre+post) result as JSON."""
-    pre_chars = {c["name"]: c for c in pre.get("characters", [])}
-    post_chars = {c["name"]: c for c in post.get("characters", [])}
+    # Key by (name, side) so mirror/团战 rows — where the SAME character
+    # legitimately appears on both 我方 and 敌方 — are preserved as distinct
+    # entries instead of collapsing into one ambiguous row.
+    def _key(c):
+        return (c.get("name", ""), c.get("side", "unknown"))
+
+    pre_chars = {_key(c): c for c in pre.get("characters", [])}
+    post_chars = {_key(c): c for c in post.get("characters", [])}
 
     merged = []
-    all_names = set(pre_chars.keys()) | set(post_chars.keys())
+    all_keys = set(pre_chars.keys()) | set(post_chars.keys())
 
-    for name in all_names:
-        pre_c = pre_chars.get(name)
-        post_c = post_chars.get(name)
-        side = (pre_c or post_c).get("side", "unknown")
+    for key in all_keys:
+        pre_c = pre_chars.get(key)
+        post_c = post_chars.get(key)
+        name, side = key
         merged.append({
             "name": name,
             "side": side,
@@ -1035,15 +1041,20 @@ def _format_pair_result(
     enemies = [c for c in merged if c.get("side") == "enemy"]
     unknown = [c for c in merged if c.get("side") == "unknown"]
 
-    # Check for name mismatches between pre and post
+    # Check for name mismatches between pre and post (keyed by name+side).
     pre_only = set(pre_chars.keys()) - set(post_chars.keys())
     post_only = set(post_chars.keys()) - set(pre_chars.keys())
     if pre_only or post_only:
+        def _fmt(k):
+            name, side = k
+            side_cn = {"ally": "我方", "enemy": "敌方"}.get(side, side)
+            return f"{name}({side_cn})"
+
         mismatch = []
         if pre_only:
-            mismatch.append(f"仅跑条前出现: {', '.join(sorted(pre_only))}")
+            mismatch.append(f"仅跑条前出现: {', '.join(sorted(_fmt(k) for k in pre_only))}")
         if post_only:
-            mismatch.append(f"仅跑条后出现: {', '.join(sorted(post_only))}")
+            mismatch.append(f"仅跑条后出现: {', '.join(sorted(_fmt(k) for k in post_only))}")
         warnings.extend(mismatch)
 
     raw_lines = _build_raw_format(merged, allies, enemies)

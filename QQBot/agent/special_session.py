@@ -255,6 +255,33 @@ class SpecialSessionManager:
         index["active_session"] = None
         self._save_index(user_id, index)
 
+    def clear_context(self, user_id: str):
+        """Clear the active special session's message history, keeping it active.
+
+        Used by ``/clear`` so that a named session's accumulated context
+        (including stale tool outputs) is wiped without deleting the session.
+        Removes snapshots + delta on disk and resets in-memory counters.
+        """
+        session = self.get_active(user_id)
+        if session is None:
+            return
+
+        session_dir = self._session_dir(user_id, session.name)
+        if os.path.exists(session_dir):
+            for f in os.listdir(session_dir):
+                if f.startswith("snapshot_") or f == "delta.jsonl":
+                    try:
+                        os.remove(os.path.join(session_dir, f))
+                    except OSError:
+                        pass
+
+        session.context = []
+        session.total_messages = 0
+        session.last_active = time.time()
+        session._last_snapshot_seq = 0
+        session._delta_count = 0
+        self._update_index(user_id, session)
+
     # ── Message Operations ─────────────────────────────────────────
 
     def add_message(
