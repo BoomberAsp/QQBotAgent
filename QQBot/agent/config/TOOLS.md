@@ -387,9 +387,20 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: calculate_speed
 
-**Description**: Calculate enemy speed values in a game based on action value changes. Users provide battle data (ally names, initial/final action values, speeds; enemy names, initial/final action values).
+**Description**: Calculate enemy speed values in a game based on action value changes. Users provide battle data (ally names, initial/final action values, speeds; enemy names, initial/final action values). 输入可为「模版文本」或 parse_battle_screenshots 的返回结果。
 
-**When to use**: When the user provides battle data with action values and wants to calculate enemy speeds. Keywords: 测速, 计算速度, compute speed.
+**When to use**: When the user provides battle data with action values and wants to calculate enemy speeds. Keywords: 测速, 计算速度, compute speed. **当用户没有截图、或截图失败时，主动引导用户按模版文本格式粘贴数据**（无需图片）：
+
+```
+我方
+角色名1 初始行动值 结束行动值 速度
+角色名2 初始行动值 结束行动值 速度
+（至少一名我方角色需提供速度）
+敌方
+敌方名1 初始行动值 结束行动值
+敌方名2 初始行动值 结束行动值
+```
+> 速度填 0 表示未知。
 
 **Parameters**:
 ```json
@@ -398,7 +409,7 @@ This document defines all tools available to the agent. Each tool has a name, de
   "properties": {
     "battle_data": {
       "type": "string",
-      "description": "Raw formatted battle data with ally and enemy action values"
+      "description": "Raw formatted battle data with ally and enemy action values (模版文本或 parse_battle_screenshots 输出)"
     }
   },
   "required": ["battle_data"]
@@ -503,7 +514,7 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 **Description**: 解析 Ark Re:Code 战斗截图：每张图一次 qwen3.5-ocr 调用提取角色名与行动值，横幅颜色带扫描判定阵营（我方/敌方），字形匹配纠偏角色名。接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON（含自动判定的 `phase`：全员行动值≤5% 为 pre，否则 post；双图模式另有 `screenshot_phases` 与顺序校验 warnings、跑条前有效性 `pre_valid`）和 calculate_speed 兼容的文本格式。
 
-**When to use**: 当用户上传战斗截图并要求测速/分析行动值时，调用此工具提取数据。提取后需展示结果给用户确认，询问我方角色速度值，再调用 calculate_speed。
+**When to use**: 当用户上传**或引用**战斗截图并要求测速/分析行动值时，调用此工具提取数据。截图路径会以 `[用户引用了文件 ... 文件路径: xxx]` 或 `[用户上传了图片，已保存至: xxx]` 的形式出现在上下文中——**直接取该路径调用，不要改用 read_file**（read_file 无法做战斗 OCR，会产生无关内容污染上下文）。提取后需展示结果给用户确认，询问我方角色速度值，再调用 calculate_speed。
 
 **Parameters**:
 ```json

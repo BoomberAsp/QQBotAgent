@@ -15,6 +15,8 @@ venv/
 # 否则下方的 ! 重新收录规则不生效（git 不会进入被排除的目录）。
 QQBot/data/*
 !QQBot/data/wiki_cache/
+# 战斗状态图标（wiki 下载产物、可再生）
+QQBot/data/wiki_cache/status_icons/
 !QQBot/data/name_index/
 !QQBot/data/redeem_code/
 !QQBot/data/personality_config.json

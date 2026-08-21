@@ -708,10 +708,16 @@ def _build_tool_registry() -> ToolRegistry:
     )
     registry.register(
         "calculate_speed", calculate_speed,
-        "根据战斗行动值数据计算敌方速度。输入需包含'我方'和'敌方'两个区域的行动值数据。",
+        "根据战斗行动值数据计算敌方速度。输入可为「模版文本」或 parse_battle_screenshots 的返回结果。"
+        "当用户没有截图、或不愿上传截图时，引导用户按以下模版文本格式粘贴战斗数据：\n"
+        "我方\n角色名1 初始行动值 结束行动值 速度\n角色名2 初始行动值 结束行动值 速度\n"
+        "（至少一名我方角色需提供速度）\n"
+        "敌方\n敌方名1 初始行动值 结束行动值\n敌方名2 初始行动值 结束行动值\n"
+        "⚠️ 速度填0表示未知。示例：\n"
+        "我方\n兔子 0 100 220\n盖儿 3 56 0\n敌方\n金人司阍 0 88\n丰饶灵兽 0 77",
         {
             "type": "object",
-            "properties": {"battle_data": {"type": "string", "description": "战斗数据(含我方/敌方行动值)"}},
+            "properties": {"battle_data": {"type": "string", "description": "战斗数据(含我方/敌方行动值)，模版文本或 parse_battle_screenshots 输出"}},
             "required": ["battle_data"],
         },
     )
@@ -779,7 +785,9 @@ def _build_tool_registry() -> ToolRegistry:
         "parse_battle_screenshots", parse_battle_screenshots,
         "解析 Ark Re:Code 战斗截图，用 OCR 提取角色名、行动值、阵营（我方/敌方）。"
         "接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON 和 calculate_speed 兼容格式。"
-        "当用户上传战斗截图并要求测速/分析行动值时，调用此工具提取数据。",
+        "当用户上传/引用战斗截图并要求测速或分析行动值时，调用此工具提取数据。"
+        "截图路径会以「[用户引用了文件 ... 文件路径: xxx]」的形式出现在上下文中，"
+        "直接取该路径调用，不要改用 read_file（read_file 无法做战斗 OCR）。",
         {
             "type": "object",
             "properties": {
@@ -1156,7 +1164,9 @@ def _build_reply_context(event: MessageEvent) -> str:
                 else:
                     parts.append(
                         f"[用户引用了文件 \"{f['name']}\"。"
-                        f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                        f"请根据用户意图选择合适的工具处理此文件："
+                        f"战斗截图测速/行动值分析用 parse_battle_screenshots，"
+                        f"一般图片或文档用 read_file，"
                         f"忽略对话历史中关于其他文件的提及。"
                         f"文件路径: {f['path']}]"
                     )
@@ -1182,7 +1192,9 @@ def _build_reply_context(event: MessageEvent) -> str:
                 for f in files:
                     parts.append(
                         f"[用户引用了文件 \"{f['name']}\"。"
-                        f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                        f"请根据用户意图选择合适的工具处理此文件："
+                        f"战斗截图测速/行动值分析用 parse_battle_screenshots，"
+                        f"一般图片或文档用 read_file，"
                         f"忽略对话历史中关于其他文件的提及。"
                         f"文件路径: {f['path']}]"
                     )
@@ -1202,7 +1214,9 @@ def _build_reply_context(event: MessageEvent) -> str:
             for f in files:
                 parts.append(
                     f"[用户引用了文件 \"{f['name']}\"。"
-                    f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                    f"请根据用户意图选择合适的工具处理此文件："
+                    f"战斗截图测速/行动值分析用 parse_battle_screenshots，"
+                    f"一般图片或文档用 read_file，"
                     f"忽略对话历史中关于其他文件的提及。"
                     f"文件路径: {f['path']}]"
                 )
@@ -1514,7 +1528,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         if text_content:
             augmented_message = f"{context_prefix}\n用户说: {text_content}"
         else:
-            augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请使用 read_file 工具查看内容。"
+            augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请根据用户意图选择合适的工具查看内容。"
     else:
         augmented_message = text_content
 

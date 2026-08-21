@@ -18,6 +18,8 @@ from typing import Any
 
 from PIL import Image
 
+from lib.status_icons import STATUS_ICON_CN, STATUS_ICON_DIR
+
 
 # ── Lazy EasyOCR handle ────────────────────────────────────────────
 
@@ -455,10 +457,52 @@ class BuffDetector:
                 name = fname.replace("图标.png", "").replace(".png", "")
                 self._templates[name] = img
 
+        # Second icon source: wiki status icons (downloaded by wiki_scraper).
+        # Keyed by their Chinese label via STATUS_ICON_CN; loaded after the
+        # manual icons so a wiki icon covers the same-named manual icon.
+        if os.path.isdir(STATUS_ICON_DIR):
+            for fname in sorted(os.listdir(STATUS_ICON_DIR)):
+                if not fname.endswith(".png"):
+                    continue
+                cn = STATUS_ICON_CN.get(fname)
+                if not cn:
+                    continue
+                path = os.path.join(STATUS_ICON_DIR, fname)
+                img = BuffDetector._read_icon(path)
+                if img is not None:
+                    self._templates[cn] = img
+
         self._loaded = True
         if self._templates:
             print(f"[BuffDetector] Loaded {len(self._templates)} reference icons",
                   file=sys.stderr)
+
+    @staticmethod
+    def _read_icon(path: str):
+        """Read an icon PNG as a BGR ndarray, handling an alpha channel.
+
+        ``cv2.IMREAD_COLOR`` drops alpha and turns transparent pixels black,
+        which skews ``TM_CCOEFF_NORMED`` against the in-game rendering. A 4-
+        channel icon is therefore alpha-composited onto a neutral mid-gray
+        background first (constant offsets are subtracted out by the
+        coefficient normalisation, but the anti-aliased edges stay correct).
+        """
+        try:
+            import cv2
+        except ImportError:
+            return None
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+        if img.ndim == 3 and img.shape[2] == 4:
+            import numpy as np
+            bgr = img[:, :, :3].astype(np.float32)
+            alpha = img[:, :, 3:4].astype(np.float32) / 255.0
+            background = np.full_like(bgr, 128.0)
+            img = (bgr * alpha + background * (1.0 - alpha)).astype(np.uint8)
+        elif img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        return img
 
     @property
     def template_names(self) -> list[str]:

@@ -23,6 +23,8 @@ from urllib.parse import urlencode
 
 from curl_cffi import requests as cffi_requests
 
+from lib.status_icons import STATUS_ICON_CN, STATUS_ICON_DIR
+
 
 # ── Constants ────────────────────────────────────────────────────
 
@@ -42,6 +44,7 @@ CACHE_FILE = os.path.join(CACHE_DIR, "gacha.json")
 TRANSLATION_CACHE = os.path.join(CACHE_DIR, "name_mapping.json")
 CHARACTER_DETAIL_CACHE = os.path.join(CACHE_DIR, "character_details.json")
 BOND_DETAIL_CACHE = os.path.join(CACHE_DIR, "bond_details.json")
+BATTLE_MECHANICS_CACHE = os.path.join(CACHE_DIR, "battle_mechanics.json")
 
 # Character art caches (portrait / head icon / skill icons), keyed by id/title.
 PORTRAIT_DIR = os.path.join(CACHE_DIR, "portraits")
@@ -238,6 +241,7 @@ class WikiScraper:
         self._translation_cache = os.path.abspath(TRANSLATION_CACHE)
         self._character_detail_cache = os.path.abspath(CHARACTER_DETAIL_CACHE)
         self._bond_detail_cache = os.path.abspath(BOND_DETAIL_CACHE)
+        self._battle_mechanics_cache = os.path.abspath(BATTLE_MECHANICS_CACHE)
         self._static_config = os.path.abspath(STATIC_CONFIG)
         self.llm_client = llm_client  # For name translation (can be set later)
 
@@ -316,6 +320,21 @@ class WikiScraper:
             return True
         try:
             with open(self._bond_detail_cache, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            scraped_at = cache.get("scraped_at", 0)
+        except Exception:
+            return True
+        return scraped_at < self._most_recent_wed_20()
+
+    def is_battle_mechanics_stale(self) -> bool:
+        """Check whether battle_mechanics.json is stale or missing.
+
+        Same weekly Wednesday-20:00 anchor as character/bond details.
+        """
+        if not os.path.exists(self._battle_mechanics_cache):
+            return True
+        try:
+            with open(self._battle_mechanics_cache, "r", encoding="utf-8") as f:
                 cache = json.load(f)
             scraped_at = cache.get("scraped_at", 0)
         except Exception:
@@ -444,6 +463,28 @@ class WikiScraper:
                 return None
 
         return await loop.run_in_executor(None, _run)
+
+    async def _fetch_page_wikitext(self, title: str) -> str:
+        """Fetch the raw wikitext of a single page via the revisions API.
+
+        Returns the page's latest ``slots.main["*"]`` content, or ``""`` on
+        any failure (offline, missing page, HTTP error).
+        """
+        data = await self._fetch_json(WIKI_API, {
+            "action": "query",
+            "prop": "revisions",
+            "rvprop": "content",
+            "rvslots": "main",
+            "titles": title,
+            "format": "json",
+        })
+        if not data:
+            return ""
+        for _pid, info in data.get("query", {}).get("pages", {}).items():
+            revisions = info.get("revisions", [])
+            if revisions:
+                return revisions[0].get("slots", {}).get("main", {}).get("*", "")
+        return ""
 
     async def _resolve_image_url(self, filename: str, width: int | None = None) -> str | None:
         """Resolve a ``File:`` filename to a (thumbnail) URL via imageinfo.
@@ -1747,6 +1788,300 @@ class WikiScraper:
             url = await self._resolve_image_url(f"Icon_Head_S_{cid}.png")
             if url:
                 await self._download_image(url, dest)
+
+    # ── Battle Mechanics (buffs/debuffs/mechanics/damage/AI) ───────
+
+    async def refresh_battle_mechanics(self) -> dict:
+        """Scrape the Battle_Mechanics page, cache it, download status icons.
+
+        Mirrors refresh_characters()/refresh_bonds(): fetch wikitext → parse →
+        write the text cache first → fire-and-forget icon download. The buffs/
+        debuffs entries carry the wiki ``[[File:...]]`` icon filename; only
+        those filenames present in ``STATUS_ICON_CN`` are downloaded (the rest
+        are broken uploads on the wiki). Returns the parsed dict (empty on
+        failure).
+        """
+        wikitext = await self._fetch_page_wikitext("Battle_Mechanics")
+        if not wikitext:
+            print("[WikiScraper] Battle_Mechanics wikitext empty", file=sys.stderr)
+            return {}
+
+        data = self._parse_battle_mechanics_wikitext(wikitext)
+        buffs = data.get("buffs", [])
+        debuffs = data.get("debuffs", [])
+        print(f"[WikiScraper] Parsed {len(buffs)} buffs, {len(debuffs)} debuffs "
+              f"from Battle_Mechanics", file=sys.stderr)
+        if not buffs and not debuffs:
+            print("[WikiScraper] WARNING: no buffs/debuffs parsed, "
+                  "discarding empty result", file=sys.stderr)
+            return {}
+
+        cache = {
+            "scraped_at": time.time(),
+            "scraped_at_iso": datetime.now(BEIJING).isoformat(),
+            "source_url": WIKI_API,
+            "data": data,
+        }
+        os.makedirs(self._cache_dir, exist_ok=True)
+        with open(self._battle_mechanics_cache, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+
+        # Fire-and-forget status-icon download (idempotent, non-fatal).
+        try:
+            sem = asyncio.Semaphore(4)
+            tasks = [self._download_status_icons(buffs + debuffs, sem)]
+            asyncio.create_task(self._background_downloads(tasks, "status icon"))
+        except Exception as e:
+            print(f"[WikiScraper] status icon download skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+
+        return data
+
+    async def _download_status_icons(
+        self, entries: list[dict], semaphore: asyncio.Semaphore
+    ):
+        """Download the 64x64 wiki status icons (those in STATUS_ICON_CN).
+
+        Idempotent: skips files already on disk and skips any icon filename
+        not in ``STATUS_ICON_CN`` (broken wiki uploads are deliberately absent
+        from that map).
+        """
+        seen: set[str] = set()
+        tasks = []
+        for entry in entries:
+            icon = (entry.get("icon") or "").strip()
+            if not icon or icon not in STATUS_ICON_CN or icon in seen:
+                continue
+            seen.add(icon)
+            dest = os.path.join(STATUS_ICON_DIR, icon)
+            if os.path.exists(dest):
+                continue
+            tasks.append(self._download_status_icon_one(icon, dest, semaphore))
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _download_status_icon_one(
+        self, filename: str, dest: str, semaphore: asyncio.Semaphore
+    ):
+        """Download a single status icon (original 64x64, no thumbnail)."""
+        async with semaphore:
+            url = await self._resolve_image_url(filename)
+            if url:
+                await self._download_image(url, dest)
+
+    # ── Battle Mechanics parsing ──────────────────────────────────
+
+    @staticmethod
+    def _parse_battle_mechanics_wikitext(wikitext: str) -> dict:
+        """Parse Battle_Mechanics wikitext into a structured dict.
+
+        Walks the page in document order, tracking ``== headings ==`` so tables
+        and prose can be bucketed. Icon-bearing tables (Name/Icon/Effect) are
+        classified as buffs vs debuffs by the icon filename prefix; iconless
+        tables are bucketed by heading; prose between headings is stored in
+        ``sections`` (e.g. Mechanics / Damage Formula).
+
+        Effect text is stored in English (groundwork); the authoritative
+        Chinese labels live in ``STATUS_ICON_CN`` and are applied later.
+        """
+        result: dict = {
+            "buffs": [],
+            "debuffs": [],
+            "other_effects": [],
+            "trigger_effects": [],
+            "ai": [],
+            "useful_categories": [],
+            "misc_tables": [],
+            "sections": {},
+        }
+
+        lines = wikitext.splitlines()
+        n = len(lines)
+        current_heading = ""
+        prose_buffer: list[str] = []
+
+        def flush_prose():
+            nonlocal prose_buffer
+            if current_heading and prose_buffer:
+                text = WikiScraper._strip_wiki_markup("\n".join(prose_buffer))
+                if text:
+                    result["sections"][current_heading] = text
+            prose_buffer = []
+
+        i = 0
+        while i < n:
+            stripped = lines[i].strip()
+            # Heading
+            if re.match(r"^==+\s*.*?\s*==+\s*$", stripped):
+                flush_prose()
+                current_heading = re.sub(r"^=+\s*|\s*=+$", "", stripped).strip()
+                i += 1
+                continue
+            # Table start
+            if stripped.startswith("{|"):
+                flush_prose()
+                rows: list[list[str]] = []
+                j = i + 1
+                while j < n and not lines[j].strip().startswith("|}"):
+                    cell_line = lines[j].strip()
+                    if not cell_line or cell_line.startswith("|-") or cell_line.startswith("|+"):
+                        j += 1
+                        continue
+                    if cell_line.startswith("!"):
+                        rows.append(WikiScraper._split_table_cells(cell_line[1:]))
+                    elif cell_line.startswith("|"):
+                        rows.append(WikiScraper._split_table_cells(cell_line[1:]))
+                    elif rows:
+                        # Multi-line continuation of the previous cell.
+                        rows[-1][-1] = rows[-1][-1] + "\n" + cell_line
+                    j += 1
+                WikiScraper._classify_battle_table(result, current_heading, rows)
+                i = j + 1
+                continue
+            # Prose
+            if stripped:
+                prose_buffer.append(stripped)
+            i += 1
+
+        flush_prose()
+        return result
+
+    @staticmethod
+    def _classify_battle_table(result: dict, heading: str, rows: list[list[str]]):
+        """Classify one Battle_Mechanics table and append to *result*."""
+        if not rows:
+            return
+        header = [c.strip() for c in rows[0]]
+        data_rows = rows[1:] if len(rows) > 1 else []
+        icon_idx = next(
+            (k for k, h in enumerate(header) if h.lower() == "icon"), None
+        )
+
+        # Icon-bearing table → buffs or debuffs.
+        if icon_idx is not None:
+            buff_n = debuff_n = 0
+            for row in data_rows:
+                icon = WikiScraper._extract_icon(row[icon_idx]) if icon_idx < len(row) else ""
+                kind = WikiScraper._classify_status_icon(icon)
+                if kind == "buff":
+                    buff_n += 1
+                elif kind == "debuff":
+                    debuff_n += 1
+            key = "buffs" if buff_n >= debuff_n else "debuffs"
+            for row in data_rows:
+                name = WikiScraper._strip_wiki_markup(row[0]) if row else ""
+                icon = WikiScraper._extract_icon(row[icon_idx]) if icon_idx < len(row) else ""
+                effect = WikiScraper._strip_wiki_markup(row[2]) if len(row) > 2 else ""
+                if not (name or icon or effect):
+                    continue
+                result[key].append({"name": name, "icon": icon, "effect": effect})
+            return
+
+        # Iconless table → bucket by heading.
+        bucket = WikiScraper._bucket_battle_heading(heading)
+        for row in data_rows:
+            cells = [WikiScraper._strip_wiki_markup(c) for c in row]
+            if not any(cells):
+                continue
+            result[bucket].append({"cells": cells})
+
+    @staticmethod
+    def _split_table_cells(row: str) -> list[str]:
+        """Split a MediaWiki table row into cells.
+
+        Splits on ``||`` / ``!!`` only when outside ``[[...]]`` / ``{{...}}``
+        (so ``|`` inside a link label or template param doesn't end a cell).
+        """
+        cells: list[str] = []
+        buf: list[str] = []
+        i = 0
+        n = len(row)
+        while i < n:
+            two = row[i : i + 2]
+            if two == "[[":
+                buf.append(two)
+                i += 2
+                continue
+            if two == "]]":
+                buf.append(two)
+                i += 2
+                continue
+            if two == "{{":
+                buf.append(two)
+                i += 2
+                continue
+            if two == "}}":
+                buf.append(two)
+                i += 2
+                continue
+            if two in ("||", "!!"):
+                cells.append("".join(buf).strip())
+                buf = []
+                i += 2
+                continue
+            buf.append(row[i])
+            i += 1
+        cells.append("".join(buf).strip())
+        return cells
+
+    @staticmethod
+    def _extract_icon(cell: str) -> str:
+        """Extract a ``File:...`` filename from an icon cell, else ``""``."""
+        m = re.search(r"\[\[(?:File|Image):([^|\]]+)", cell or "")
+        return m.group(1).strip() if m else ""
+
+    @staticmethod
+    def _classify_status_icon(filename: str) -> str | None:
+        """Return ``"buff"`` / ``"debuff"`` for a status icon filename, else None."""
+        if not filename:
+            return None
+        if filename.startswith("Buff_") or filename in ("H118S2.png", "Immortal_Resident.png"):
+            return "buff"
+        if filename.startswith("Debuff_") or filename == "H168S2_1.png":
+            return "debuff"
+        return None
+
+    @staticmethod
+    def _bucket_battle_heading(heading: str) -> str:
+        """Map a section heading to a non-icon table bucket key."""
+        h = (heading or "").lower()
+        if "other" in h:
+            return "other_effects"
+        if "trigger" in h:
+            return "trigger_effects"
+        if "ai" in h or "artificial" in h:
+            return "ai"
+        if "categor" in h:
+            return "useful_categories"
+        return "misc_tables"
+
+    @staticmethod
+    def _strip_wiki_markup(text: str) -> str:
+        """Remove wiki/HTML markup → plain text, keeping English.
+
+        Like ``_clean_markup`` but without the ``_STATUS_TERM_CN`` translation,
+        so Battle_Mechanics effect text is stored in English (groundwork) and
+        translated later.
+        """
+        if not text:
+            return ""
+        text = re.sub(
+            r"\{\{\s*Status Tooltip\s*(?:\|([^}|]*))?(?:\|([^}]*))?\s*\}\}",
+            lambda m: (m.group(2) or m.group(1) or "").strip(),
+            text,
+        )
+        text = re.sub(r"\{\{\s*([^{}|]+)\s*\}\}", r"\1", text)
+        text = re.sub(r"\[\[(?:File|Image):[^\]]*\]\]", "", text)
+        text = re.sub(r"\[\[(?:[^|\]]*\|)*([^\]]+?)\]\]", r"\1", text)
+        text = text.replace("'''", "").replace("''", "")
+        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "", text)
+        lines = []
+        for ln in text.splitlines():
+            ln = re.sub(r"[ \t]+", " ", ln).strip()
+            if ln:
+                lines.append(ln)
+        return "\n".join(lines)
 
     # ── Classify ──────────────────────────────────────────────────
 
