@@ -89,6 +89,7 @@ from tools.legacy_tools import (
 )
 from tools.character_detail import character_detail, character_detail_with_card
 from tools.bond_detail import bond_detail, bond_detail_with_card
+from tools.battle_parser import parse_battle_screenshots
 
 # ── Configuration Paths ───────────────────────────────────────────
 
@@ -774,6 +775,23 @@ def _build_tool_registry() -> ToolRegistry:
             "required": ["bond_name"],
         },
     )
+    registry.register(
+        "parse_battle_screenshots", parse_battle_screenshots,
+        "解析 Ark Re:Code 战斗截图，用 OCR 提取角色名、行动值、阵营（我方/敌方）。"
+        "接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON 和 calculate_speed 兼容格式。"
+        "当用户上传战斗截图并要求测速/分析行动值时，调用此工具提取数据。",
+        {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "截图文件路径列表（1-2 张，跑条前+跑条后）",
+                },
+            },
+            "required": ["paths"],
+        },
+    )
 
     # ── Redeem Code ────────────────────────────────────────────
 
@@ -1260,7 +1278,7 @@ def _get_user_info() -> str:
     dev_tools = {"execute_code", "shell_exec", "web_fetch", "download_repo", "get_system_load"}
     fun_tools = {"gacha_pull", "play_gacha_animation", "calculate_speed",
                  "compare_speed_probability", "explain_code", "translate_text",
-                 "character_detail", "bond_detail"}
+                 "character_detail", "bond_detail", "parse_battle_screenshots"}
     misc = allowed - info_tools - dev_tools - fun_tools
 
     sections = [

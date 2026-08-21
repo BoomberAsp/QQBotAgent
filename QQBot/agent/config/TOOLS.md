@@ -496,6 +496,29 @@ This document defines all tools available to the agent. Each tool has a name, de
   "required": ["bond_name"]
 }
 ```
+  
+---
+
+## Tool: parse_battle_screenshots
+
+**Description**: 解析 Ark Re:Code 战斗截图：每张图一次 qwen3.5-ocr 调用提取角色名与行动值，横幅颜色带扫描判定阵营（我方/敌方），字形匹配纠偏角色名。接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON（含自动判定的 `phase`：全员行动值≤5% 为 pre，否则 post；双图模式另有 `screenshot_phases` 与顺序校验 warnings、跑条前有效性 `pre_valid`）和 calculate_speed 兼容的文本格式。
+
+**When to use**: 当用户上传战斗截图并要求测速/分析行动值时，调用此工具提取数据。提取后需展示结果给用户确认，询问我方角色速度值，再调用 calculate_speed。
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "paths": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "截图文件路径列表（1-2 张，跑条前+跑条后）"
+    }
+  },
+  "required": ["paths"]
+}
+```
 
 ---
 

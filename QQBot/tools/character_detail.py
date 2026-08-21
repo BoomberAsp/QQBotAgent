@@ -145,11 +145,20 @@ def format_character(entry: dict) -> str:
     if entry.get("desc"):
         lines.append(f"简介: {entry['desc']}")
 
-    # Stats (growth ratios)
+    # Stats (growth ratios + Lv.60 max)
     stats = entry.get("stats") or {}
-    stat_parts = [f"{k} {v}" for k, v in stats.items() if v]
-    if stat_parts:
-        lines.append("面板(成长系数): " + " | ".join(stat_parts))
+    stats_max = entry.get("stats_max") or {}
+    if stats_max:
+        max_parts = [f"{k} {v}" for k, v in stats_max.items() if v]
+        ratio_parts = [f"{k} {v}" for k, v in stats.items() if v]
+        if max_parts:
+            lines.append("面板(Lv.60): " + " | ".join(max_parts))
+        if ratio_parts:
+            lines.append("成长系数: " + " | ".join(ratio_parts))
+    else:
+        stat_parts = [f"{k} {v}" for k, v in stats.items() if v]
+        if stat_parts:
+            lines.append("面板(成长系数): " + " | ".join(stat_parts))
 
     # Skills
     skills = entry.get("skills") or []

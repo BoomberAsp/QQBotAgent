@@ -866,6 +866,17 @@ New messages (30): {recent_30_messages}
 
 > 来源：用户需求 2026-05-30
 
+### 当前状态：**已实现（OCR 层为 qwen3.5-ocr，2026-08-21 全量验证通过）**
+
+完整实现记录见 `docs/implements-for-idea-8.md`。落地要点：
+
+- ✅ `tools/battle_parser.py::parse_battle_screenshots(paths)` — 每张截图**一次** qwen3.5-ocr 调用（左半屏 0–50% 裁剪，名字+行动值按行交错返回），行配对（y 聚类 + 孤儿值按行序回填）、横幅颜色带扫描判定阵营（红=敌/蓝=我，横向计数窗口 13–45% 帧宽）、`(name, side)` 去重（镜像同名行保留）、每侧上限 3。阶段自动判定（`_detect_phase`）：全员行动值 ≤5% → `pre`（乱速后），否则 `post`；双图顺序异常（如疑似颠倒）写入 warnings。
+- ✅ `tools/ocr_name_matcher.py` 字形纠偏层保留（Stroke-IoU + 分长度阈值 + 长名截断救援），uncertain 名称走 MULTIMODAL_MODEL 视觉兜底；名称索引动态取自 wiki 缓存 + vendored 别名词典。
+- ✅ 跑条前截图三规则校验（进战 buff / 进战战意集中力 / 免疫套装 → `pre_valid`）+ 拉条推条技能提示（`action_gauge_skills`），技能索引来自 `character_details.json`；`BuffDetector` 28 图标模板匹配。
+- ✅ 输出单图/双图 JSON + `calculate_speed` 兼容 `raw_format`；工具注册于 `agent_router.py`，`_PUBLIC_TOOLS` 全员可用；`AGENTS.md` 截图测速交互流程（pre_valid 检查、行动值修正确认、询问我方速度 → `calculate_speed`）。
+- ✅ 验证（`test/test_region_ocr.py` → `test/swap_validation.json`，49 截图 / 285 真值行）：**名称 285/285、行动值 285/285、漏行 0、阵营 unknown 0**；`bash test.sh` 通过。报告中 6 个「额外」均为真实镜像行（GT 构建时继承旧管线去重 bug 未录入，非误报）。
+- 演进：初版 easyOCR 四区域 + 逐数字模板（名称 87.7% / 值 93.7%）→ qwen3.5-ocr 对比评测胜出（`test/qwen_ocr_comparison.md`）→ 残余错误根因探针（`test/qwen_fullimg_probe.md`：截断=裁剪、漏行=窄裁剪跳行、茱/茉=字形相似由 matcher 纠偏、2%→3%=列表同化、98% 漏值=坐标回归）→ 宽裁剪单调用替换，easyOCR 提取 / `_parse_action_value` / 逐数字模板退役。
+
 ### 问题
 
 当前测速功能 (`calculate_speed`) 要求用户手动键入完整的战斗数据文本（角色名 + 初始行动值 + 当前行动值 + 速度），格式严格、输入繁琐。用户已经能上传游戏截图，如果能让多模态模型从截图中直接提取行动值，则只需再提供一两个我方速度值即可完成测速。
@@ -1102,8 +1113,8 @@ OCR 文字块: (text="Boss名称", bbox=[x1, y1, x2, y2])
 - 跑条后截图的括号中注明了其是否受到行动值相关技能的影响。 
 
 跑条前截图的无效判断依据有以下几点： 
-- 当乱速已经正常完成（截图有效），拥有进入战斗立即获得buff的技能的角色（以下简称进战buff角色）会在截图中看到其对应的buff。若观察到对于buff，返回True，否则False。
-- 当乱速已经正常完成，拥有进入战斗立即获得战意/集中力状态的角色会在截图中看到对应的战意/集中力。若观察到战意/集中力，返回True，否则返回False。
+- 当乱速已经正常完成（截图有效），拥有进入战斗立即获得buff的技能的角色（以下简称进战buff角色）会在截图中看到其对应的buff。若观察到对应buff或角色不存在相应技能，返回True，否则False。
+- 当乱速已经正常完成，拥有进入战斗立即获得战意/集中力状态的角色会在截图中看到对应的战意/集中力。若观察到战意/集中力或角色不存在相应技能，返回True，否则返回False。
 - 当乱速已经正常完成，会在截图中看到穿戴免疫套装的角色的免疫buff的标识。判断角色是否穿戴免疫套装可以根据跑条后的截图是否显示了对应于该角色的免疫buff，如果跑条后截图显示该角色有免疫buff，且该角色不存在获取免疫buff的技能，则可以确定免疫buff来源于角色穿戴的免疫套装，此时跑条前截图该角色有免疫buff则返回True，否则返回False。
 
 当且仅当以上三条判断返回全为True，跑条前截图有效，否则无效。
@@ -1123,4 +1134,4 @@ OCR 文字块: (text="Boss名称", bbox=[x1, y1, x2, y2])
 | 5 | 群聊文件延迟下载 | **未实现** | 待实现（元数据记录 + 按需下载 + 进度反馈） |
 | 6 | 分层上下文 Layer 3 | **未实现** | 待实现（每 30 条异步生成渐进式摘要） |
 | 7 | 配额柔性处理 | **部分实现** | 80% 提醒已实现（`check_quota`/`get_quota_context`）；>100% 柔性超额与 150% 硬限待实现 |
-| 8 | 截图测速（OCR+LLM 两层降级） | **未实现** | 待实现（OCR 颜色采样 + 多模态 LLM 降级 + parse_battle_screenshots + Agent 交互引导） |
+| 8 | 截图测速（OCR+LLM 两层降级） | **已实现** | qwen3.5-ocr 单调用提取 + 字形名称纠偏 + 颜色带阵营判定 + 三规则校验；名称/值 285/285 全对（见 `docs/implements-for-idea-8.md`） |
