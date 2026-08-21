@@ -145,6 +145,7 @@ class SessionManager:
         session = self._sessions.get(user_id)
         if session:
             session.clear()
+            self._save_to_disk(user_id, session)
 
     def cleanup_expired(self) -> int:
         """Remove expired sessions. Returns count of removed sessions."""

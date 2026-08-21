@@ -787,7 +787,9 @@ def _build_tool_registry() -> ToolRegistry:
         "接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON 和 calculate_speed 兼容格式。"
         "当用户上传/引用战斗截图并要求测速或分析行动值时，调用此工具提取数据。"
         "截图路径会以「[用户引用了文件 ... 文件路径: xxx]」的形式出现在上下文中，"
-        "直接取该路径调用，不要改用 read_file（read_file 无法做战斗 OCR）。",
+        "直接取该路径调用，不要改用 read_file（read_file 无法做战斗 OCR）。"
+        "团战/镜像匹配时，同一角色可能同时出现在我方和敌方（同名不同阵营），属正常情况，勿视为错误。"
+        "本工具专用于 Ark Re:Code，不要根据「战意/爆裂/气魄」等术语误判为其他游戏。",
         {
             "type": "object",
             "properties": {
@@ -2578,6 +2580,7 @@ async def _handle_special_command(command: str, user_id: str):
     """Handle special meta-commands."""
     if command in ["/clear", "清除上下文", "新对话"]:
         agent.clear_user_session(user_id)
+        _special_sessions.clear_context(user_id)
         _temp_session_files.pop(user_id, None)
         await _safe_send("已清除对话上下文，开始新对话~")
     elif command == "/status":
