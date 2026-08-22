@@ -659,6 +659,165 @@ class BuffDetector:
         return results
 
 
+# ── Skill Cooldown (grayed icon) Detection ──────────────────────────
+
+
+class SkillCooldownDetector:
+    """Detect whether skill icons are on cooldown (grayed out).
+
+    Ark Re:Code renders an on-cooldown skill as a desaturated (gray) version
+    of its icon, optionally with an ``N回合`` overlay; an available skill keeps
+    its full colour.  The core signal is therefore **saturation**: a grayed
+    icon has the three RGB channels nearly equal, a coloured icon has a large
+    max−min channel spread.
+
+    The detector is colour- and layout-agnostic: it takes an explicit list of
+    icon *cells* (rectangles ``(x1, y1, x2, y2)``) and returns a per-cell
+    ``{saturation, grayed}`` verdict.  Cell positions are resolution / UI
+    specific and must be calibrated on a real screenshot before relying on the
+    verdicts — use :meth:`sample_cells` to tune ``GRAY_SAT_THRESHOLD``.
+
+    This is the observation half of L2 (Phase B2 of
+    ``docs/speedcheck-trigger-correction.md``).  When the cells are not yet
+    calibrated the caller falls back to the L2 *prediction* (AI rules).
+
+    Caveats (game knowledge, 2026-08-22): a darkened icon is NOT proof of a
+    cooldown — 沉默类控制 (skill-lock CC) and 战意/集中力不足 (unpayable cost)
+    dim skills the same way, and the basic skill (S1) never has a cooldown.
+    Callers must therefore discard slot-0 verdicts and, when a pre-battle
+    screenshot is available, treat only slots that *turned* dark between pre
+    and post as fresh cooldowns (cost/CC dimming is already present pre).
+    """
+
+    # Mean max−min channel spread (0–255) below which a cell is judged grayed.
+    # The cooldown overlay ("N回合") renders as a dark brown/red octagon with
+    # saturation up to ~52 (measured 15–52 on real casts); colourful icons sit
+    # at ~41+ *but* stay bright, so saturation alone is only half the signal.
+    # Tune with sample_cells() against a real post-cast screenshot.
+    GRAY_SAT_THRESHOLD = 60.0
+
+    # Mean per-pixel max-channel brightness below which a cell is judged
+    # darkened.  This is the primary discriminator: cooldown overlays measure
+    # val ≤ ~119 while colourful icons (even dark-purple art) measure ≥ ~129.
+    # Combined with GRAY_SAT_THRESHOLD a bright low-sat cell is never grayed.
+    GRAY_VAL_THRESHOLD = 120.0
+
+    # Horizontal position of the three skill slots (S1/S2/S3) as fractions of
+    # the detected frame width.  The skill strip sits between the action value
+    # and the buff icons; icons span ~0.42-0.49 / 0.51-0.585 / 0.60-0.67 of the
+    # frame.  Validated as frame-relative on 1610/2532/2688-px-wide captures.
+    SKILL_SLOT_X = [(0.415, 0.478), (0.505, 0.568), (0.595, 0.658)]
+
+    @classmethod
+    def cell_stats(
+        cls,
+        image: Any,
+        cell: tuple[int, int, int, int],
+    ) -> tuple[float, float] | None:
+        """Return ``(saturation, value)`` over *cell*, or None if empty/bounds."""
+        import numpy as np
+
+        h, w = image.shape[:2]
+        x1, y1, x2, y2 = cell
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        roi = image[y1:y2, x1:x2].astype(np.int32)
+        if roi.size == 0:
+            return None
+        mx = roi.max(axis=2)
+        mn = roi.min(axis=2)
+        return float((mx - mn).mean()), float(mx.mean())
+
+    # Backwards-compatible alias.
+    cell_saturation = cell_stats
+
+    @classmethod
+    def is_grayed(cls, saturation: float | None, value: float | None = None) -> bool:
+        """True when a cell is desaturated (and, if *value* given, darkened)."""
+        if saturation is None:
+            return False
+        if value is None:
+            return saturation < cls.GRAY_SAT_THRESHOLD
+        return (saturation < cls.GRAY_SAT_THRESHOLD
+                and value < cls.GRAY_VAL_THRESHOLD)
+
+    @classmethod
+    def detect(
+        cls,
+        image: Any,
+        cells: list[tuple[int, int, int, int]],
+    ) -> list[dict]:
+        """Return per-cell ``{saturation, value, grayed}`` (parallel to *cells*)."""
+        out: list[dict] = []
+        for cell in cells:
+            stats = cls.cell_stats(image, cell)
+            sat, val = stats if stats else (None, None)
+            out.append({"saturation": sat, "value": val,
+                        "grayed": cls.is_grayed(sat, val)})
+        return out
+
+    @classmethod
+    def detect_row_skills(
+        cls,
+        image: Any,
+        frame: tuple[int, int, int, int],
+        y0: int,
+        y1: int,
+        slots: list[tuple[float, float]] | None = None,
+    ) -> list[dict]:
+        """Detect the S1/S2/S3 cooldown state for one character row.
+
+        *frame* is the detected panel; *y0*/*y1* the row's vertical band.  The
+        three skill cells are placed at :data:`SKILL_SLOT_X` fractions of the
+        frame width.  Returns a length-3 list of ``{saturation, value,
+        grayed}`` (index 0/1/2 = S1/S2/S3).
+        """
+        left, _, right, _ = frame
+        fw = right - left
+        slots = slots or cls.SKILL_SLOT_X
+        out: list[dict] = []
+        for x0f, x1f in slots:
+            cell = (left + int(fw * x0f), y0 + 2, left + int(fw * x1f), y1 - 2)
+            stats = cls.cell_stats(image, cell)
+            sat, val = stats if stats else (None, None)
+            out.append({"saturation": sat, "value": val,
+                        "grayed": cls.is_grayed(sat, val)})
+        return out
+
+    @classmethod
+    def cooldown_slot(cls, row_skills: list[dict]) -> int | None:
+        """Return the single on-cooldown slot index (0/1/2), or None.
+
+        Only a *unique* grayed slot is trusted; zero or multiple grayed cells
+        mean the observation is ambiguous and the caller should fall back to
+        the L2 prediction.
+        """
+        grayed = [i for i, s in enumerate(row_skills) if s["grayed"]]
+        return grayed[0] if len(grayed) == 1 else None
+
+    @classmethod
+    def sample_cells(
+        cls,
+        image: Any,
+        cells: dict[str, tuple[int, int, int, int]],
+    ) -> list[dict]:
+        """Calibration helper: dump per-cell saturation/value for tuning."""
+        out: list[dict] = []
+        for name, cell in cells.items():
+            stats = cls.cell_stats(image, cell)
+            sat, val = stats if stats else (None, None)
+            out.append({
+                "name": name,
+                "cell": cell,
+                "saturation": sat,
+                "value": val,
+                "grayed": cls.is_grayed(sat, val),
+            })
+        return out
+
+
 def sample_side_colour(
     image: Image.Image,
     bbox: list,
@@ -724,3 +883,56 @@ def sample_side_colour(
     if 190 <= median <= 260:
         return "ally"
     return "unknown"
+
+
+# ── Calibration CLI (skill cooldown grayed detection) ───────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    import numpy as np
+
+    ap = argparse.ArgumentParser(
+        description="Calibrate SkillCooldownDetector (grayed skill icons)."
+    )
+    ap.add_argument("image", help="battle screenshot path")
+    ap.add_argument(
+        "--cells",
+        action="append",
+        default=[],
+        help="cell spec 'x1,y1,x2,y2' (repeatable); default = 3x3 grid over "
+             "the right half of the detected frame",
+    )
+    args = ap.parse_args()
+
+    im = Image.open(args.image).convert("RGB")
+    arr = np.array(im)
+    frame = detect_frame(im)
+    print("frame:", frame)
+
+    if args.cells:
+        cells = {}
+        for i, spec in enumerate(args.cells):
+            parts = [int(v) for v in spec.split(",")]
+            if len(parts) != 4:
+                raise SystemExit(f"bad cell spec: {spec}")
+            cells[f"cell{i}"] = tuple(parts)  # type: ignore[arg-type]
+    else:
+        if frame is None:
+            raise SystemExit("no frame detected")
+        left, top, right, bottom = frame
+        cells = {}
+        for gy in range(3):
+            for gx in range(3):
+                cx0 = left + (right - left) // 2 + gx * (right - left) // 2 // 3
+                cx1 = cx0 + (right - left) // 2 // 3 - 2
+                cy0 = top + gy * (bottom - top) // 3
+                cy1 = cy0 + (bottom - top) // 3 - 2
+                cells[f"g{gy}{gx}"] = (cx0, cy0, cx1, cy1)
+
+    for row in SkillCooldownDetector.sample_cells(arr, cells):
+        sat = row["saturation"]
+        print(
+            f"  {row['name']:10s} {row['cell']}  "
+            f"sat={sat and round(sat, 1)}  grayed={row['grayed']}"
+        )

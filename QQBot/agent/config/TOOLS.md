@@ -520,6 +520,15 @@ This document defines all tools available to the agent. Each tool has a name, de
 - **同名角色可出现在双方**：团战/镜像匹配时，同一角色可能同时站在我方和敌方（同名不同阵营），这是正常情况，不要当作「两边阵容对不上」的错误。
 - **本工具专用于 Ark Re:Code**：不要根据技能/机制术语（如「战意」「爆裂」「气魄」）误判为其他游戏，这些都是 Ark Re:Code 自身的机制。
 - **行动值修正**：当返回 `action_gauge_skills`（拉条/推条技能）时，需向用户确认技能是否触发；若触发，引导用户扣除技能的行动值加成（详见 AGENTS.md 截图测速流程第 5 步），而非直接拿原始差值计算。
+- **pre_valid_reasons**：`pre_valid=false` 时的结构化无效原因（逐条：哪条规则、哪个角色）。Agent 必须逐条转述给用户，不得只回「截图无效」（详见 AGENTS.md 流程第 4 步）。
+- **ag_trigger_hypothesis**：行动值触发假设（wiki AI 释放规则 + 截图冷却态观测 + 触发链解析）。字段语义：
+  - `first_actor` / `first_actor_skill`：首动角色与其释放的技能；`first_skill_observed=true` 表示由跑条后截图冷却态（图标变灰 + N回合）佐证，false 为 AI 规则预测。
+  - `chain`：推断已触发的拉条/推条被动列表，每项含 `char`/`skill`/`direction`（pull=拉条, push=推条）/`magnitude`/`target`/`trigger`/`note`。
+  - `uncertain`：需人工确认项（条件被动、概率触发、窗口外触发等），`note` 含 L4 窄 LLM 归类（`l4_applied=true` 时）；`observable=false` 的项一律交用户确认。
+  - `battle_start`：进战即生效的拉条被动，已打入初始行动值（对应 pre_valid 例外）。
+  - `bond_reminder=true`：必须向用户附「穿戴羁绊」提醒（固定措辞见 AGENTS.md）。
+  - `confidence`：high/medium/low，low 时首动技能需用户确认。
+  确认/纠错交互流程详见 AGENTS.md「截图测速交互流程」第 5 步与 one-shot 范例。
 
 **Parameters**:
 ```json

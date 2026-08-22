@@ -296,6 +296,10 @@ async def parse_battle_screenshots(paths: list[str]) -> str:
         )
         if ag_skills:
             result_dict["action_gauge_skills"] = ag_skills
+        hypothesis = _build_ag_trigger_hypothesis(all_results, paths)
+        await _apply_l4(hypothesis)
+        if hypothesis:
+            result_dict["ag_trigger_hypothesis"] = hypothesis
         return json.dumps(result_dict, ensure_ascii=False, indent=2)
 
     # Phase sanity check: the first screenshot should be pre (all values
@@ -307,9 +311,18 @@ async def parse_battle_screenshots(paths: list[str]) -> str:
             "第二张均≤5%（像跑条前）。请确认顺序后重新发送。"
         )
     elif phases[0] == "post":
-        warnings.append(
-            "第一张截图含行动值>5%的角色，不像跑条前截图（乱速后应全员≤5%）。"
-        )
+        # A pre-screenshot may legitimately show >5% for characters with a
+        # battle_start action-gauge passive (they pulled at battle start,
+        # after 乱速).  Only warn when some >5% character lacks that passive.
+        over5 = [
+            c for c in all_results[0].get("characters", [])
+            if (c.get("action_value") or 0) > _PRE_AV_MAX
+        ]
+        if not over5 or not all(_has_battle_start_ag(c.get("name", ""))
+                                for c in over5):
+            warnings.append(
+                "第一张截图含行动值>5%的角色，不像跑条前截图（除特殊进战拉条角色外，乱速后应全员≤5%）。"
+            )
     elif phases[1] == "pre":
         warnings.append(
             "第二张截图行动值均≤5%，不像跑条后截图（跑条后应有角色>5%）。"
@@ -325,10 +338,15 @@ async def parse_battle_screenshots(paths: list[str]) -> str:
         all_results[0].get("characters", []) + all_results[1].get("characters", [])
     )
 
+    hypothesis = _build_ag_trigger_hypothesis(all_results, paths)
+    await _apply_l4(hypothesis)
+
     return _format_pair_result(
         all_results[0], all_results[1], warnings,
         pre_valid=pre_valid,
+        pre_valid_reasons=validity_warnings,
         action_gauge_skills=ag_skills,
+        ag_trigger_hypothesis=hypothesis,
     )
 
 
@@ -362,8 +380,35 @@ async def _resolve_uncertain_names(result: dict, path: str) -> None:
 
 # ── qwen3.5-ocr panel extraction ────────────────────────────────────
 
+# Default OCR model name — used when the OCR_MODEL section omits ``model``
+# or when OCR_MODEL is absent entirely (fallback to MULTIMODAL_MODEL creds).
 _QWEN_OCR_MODEL = "qwen3.5-ocr"
 _QWEN_OCR_TIMEOUT = 90.0
+
+
+def _ocr_config() -> dict:
+    """Load the OCR endpoint config (§5.3).
+
+    Prefers the dedicated ``OCR_MODEL`` section of models_settings.json;
+    when it is missing/incomplete falls back to the legacy behaviour
+    (``MULTIMODAL_MODEL`` credentials + model forced to qwen3.5-ocr).
+    Raises RuntimeError when neither is configured.
+    """
+    from lib.multimodal_client import MultimodalClient
+
+    client = MultimodalClient()
+    ocr = client.get_section("OCR_MODEL")
+    if ocr and ocr.get("api_key") and ocr.get("api_base"):
+        cfg = dict(ocr)
+        cfg.setdefault("model", _QWEN_OCR_MODEL)
+        return cfg
+    if not client.is_available():
+        raise RuntimeError(
+            "OCR_MODEL / MULTIMODAL_MODEL 均未配置，OCR 不可用"
+        )
+    cfg = dict(client._config)
+    cfg["model"] = _QWEN_OCR_MODEL
+    return cfg
 
 # Left half of the panel: covers the longest (8-char) character names and
 # the action-value column while excluding the skill/buff icon overlays
@@ -436,9 +481,9 @@ async def _qwen_ocr_panel(crop: Image.Image, cfg: dict) -> list[dict]:
     crop.save(buf, format="PNG")
     data_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
     body = {
-        "model": _QWEN_OCR_MODEL,
-        "temperature": 0.0,
-        "max_tokens": 2048,
+        "model": cfg.get("model") or _QWEN_OCR_MODEL,
+        "temperature": cfg.get("temperature", 0.0),
+        "max_tokens": cfg.get("max_tokens", 2048),
         "messages": [{
             "role": "user",
             "content": [
@@ -468,7 +513,9 @@ async def _qwen_ocr_panel(crop: Image.Image, cfg: dict) -> list[dict]:
             )
         except Exception as e:
             if attempt >= 2:
-                raise RuntimeError(f"qwen3.5-ocr 调用失败: {e}") from e
+                raise RuntimeError(
+                    f"OCR 调用失败（model={cfg.get('model')}）: {e}"
+                ) from e
             await asyncio.sleep(2.0 * (attempt + 1))
     return []
 
@@ -564,13 +611,7 @@ async def _parse_single(path: str) -> dict:
     frame_w = right - left
     frame_h = bottom - top
 
-    from lib.multimodal_client import MultimodalClient
-
-    client = MultimodalClient()
-    if not client.is_available():
-        raise RuntimeError("MULTIMODAL_MODEL 未配置，qwen3.5-ocr 不可用")
-    cfg = dict(client._config)
-    cfg["model"] = _QWEN_OCR_MODEL
+    cfg = _ocr_config()
 
     # 1. qwen3.5-ocr over the panel crop (names + values in one call)
     crop = image.crop((left, top, left + int(frame_w * _PANEL_CROP_FRAC), bottom))
@@ -983,6 +1024,222 @@ def _summarize_action_gauge_skills(characters: list[dict]) -> list[dict]:
     return result
 
 
+# ── Action gauge trigger hypothesis (L2/L3) ─────────────────────────
+
+
+_ag_index: dict | None = None
+
+
+def _load_ag_index() -> dict:
+    """Lazily build the L1 action-gauge skill index (ag_skill_index).
+
+    Returns {} when the cache file is missing (dev machine / no crawled data)
+    so callers degrade gracefully to "no hypothesis".
+    """
+    global _ag_index
+    if _ag_index is not None:
+        return _ag_index
+    try:
+        from tools.ag_skill_index import build_index
+        _ag_index = build_index()
+    except Exception:
+        _ag_index = {}
+    return _ag_index
+
+
+def _has_battle_start_ag(name: str) -> bool:
+    """True if *name* has a battle_start action-gauge passive (拉条)."""
+    idx = _load_ag_index()
+    ch = idx.get(name)
+    if not ch:
+        return False
+    for s in ch.get("skills", []):
+        for e in s.get("ag_effects", []):
+            if e.get("trigger") == "battle_start":
+                return True
+    return False
+
+
+def _find_first_actor(results: list[dict]) -> tuple[str | None, str | None]:
+    """Return (name, side) of the first actor from the post screenshot.
+
+    The first actor is the row whose action value reset to 0 (``acting``).
+    Iterating ``reversed(results)`` prefers the post screenshot in pair mode.
+    """
+    for result in reversed(results):
+        chars = result.get("characters", [])
+        for c in chars:
+            if c.get("acting"):
+                return c.get("name"), c.get("side")
+        named = [c for c in chars
+                 if c.get("name") and c.get("action_value") is not None]
+        if named:
+            first = min(named, key=lambda c: c["action_value"])
+            return first.get("name"), first.get("side")
+    return None, None
+
+
+def _row_skill_cells(path: str, result: dict, name: str) -> list[dict] | None:
+    """Per-slot ``{saturation, value, grayed}`` for *name*'s row, or None."""
+    frame = result.get("frame")
+    c = next((c for c in result.get("characters", [])
+              if c.get("name") == name and c.get("bbox")), None)
+    if not frame or c is None:
+        return None
+    ys = [p[1] for p in c["bbox"]]
+    from lib.ocr_engine import SkillCooldownDetector
+    rgb = np.array(Image.open(path).convert("RGB"))
+    return SkillCooldownDetector.detect_row_skills(
+        rgb, frame, int(min(ys)), int(max(ys)))
+
+
+def _observe_first_skill_slot(
+    path: str, result: dict,
+    pre_path: str | None = None, pre_result: dict | None = None,
+) -> int | None:
+    """B2 observation: the on-cooldown skill slot on the first actor's row.
+
+    The post screenshot still shows the first actor on the acting row with
+    the just-cast skill grayed ("N回合").  Darkened icons are NOT always
+    cooldowns — 沉默类控制 and 战意/集中力不足 also dim skills, and S1 never
+    has a cooldown.  Disambiguation rules:
+
+    * a 沉默 icon on the acting row → observation discarded;
+    * slot 0 (S1) is never a cooldown → excluded;
+    * with a pre screenshot, a slot already darkened there is CC/cost
+      dimming (nothing was on cooldown pre-battle) → only slots that turned
+      dark between pre and post count as fresh cooldowns.
+
+    Returns the unique remaining grayed slot index, or None when
+    ambiguous/absent (caller falls back to the L2 prediction, §7).
+    """
+    chars = result.get("characters", [])
+    acting = next((c for c in chars if c.get("acting") and c.get("bbox")), None)
+    if acting is None:
+        return None
+
+    # 沉默类控制 darkens the whole row's skills → not a cooldown signal.
+    idx = chars.index(acting)
+    row_buffs = result.get("row_buffs") or []
+    if idx < len(row_buffs) and any("沉默" in bn for bn in (row_buffs[idx] or {})):
+        return None
+
+    try:
+        post_row = _row_skill_cells(path, result, acting["name"])
+        if not post_row:
+            return None
+        grayed = [i for i, s in enumerate(post_row) if s["grayed"] and i != 0]
+        if pre_path is not None and pre_result is not None:
+            pre_row = _row_skill_cells(pre_path, pre_result, acting["name"])
+            if pre_row:
+                grayed = [i for i in grayed if not pre_row[i]["grayed"]]
+        slot = grayed[0] if len(grayed) == 1 else None
+    except Exception as e:
+        print(f"[battle_parser] cooldown observation skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return None
+    if slot is not None:
+        print(f"[battle_parser] B2 observed first-actor cooldown slot "
+              f"{slot + 1} on 「{acting.get('name')}」", file=sys.stderr)
+    return slot
+
+
+def _build_ag_trigger_hypothesis(results: list[dict],
+                                 paths: list[str] | None = None) -> dict | None:
+    """Build the §5.1 ``ag_trigger_hypothesis`` for the parsed screenshots.
+
+    Returns None when the first actor or the L1 index is unavailable.  The
+    first skill slot is taken from the B2 cooldown observation on the post
+    screenshot's acting row when unambiguous, else from the L2 prediction.
+    """
+    first_actor, _ = _find_first_actor(results)
+    if not first_actor:
+        return None
+    idx = _load_ag_index()
+    if not idx:
+        return None
+
+    observed_slot = None
+    if paths:
+        post_rp = pre_rp = None
+        for result in results:
+            i = result.get("_index")
+            if i is None or i >= len(paths):
+                continue
+            if result.get("phase") == "post" and post_rp is None:
+                post_rp = (paths[i], result)
+            elif result.get("phase") == "pre" and pre_rp is None:
+                pre_rp = (paths[i], result)
+        if post_rp:
+            observed_slot = _observe_first_skill_slot(
+                post_rp[0], post_rp[1],
+                pre_rp[0] if pre_rp else None,
+                pre_rp[1] if pre_rp else None,
+            )
+
+    team: list[dict] = []
+    seen: set[tuple] = set()
+    for r in results:
+        for c in r.get("characters", []):
+            name = c.get("name")
+            if not name:
+                continue
+            key = (name, c.get("side"))
+            if key in seen:
+                continue
+            seen.add(key)
+            team.append({"name": name, "side": c.get("side", "unknown")})
+
+    try:
+        from tools.ag_trigger_engine import build_hypothesis
+    except Exception:
+        return None
+    return build_hypothesis(team, first_actor, idx,
+                            first_skill_slot=observed_slot)
+
+
+async def _apply_l4(hypothesis: dict | None) -> None:
+    """Phase D: L4 narrow-LLM fallback for the uncertain conditional items.
+
+    On-demand only (skipped when no conditional item); mutates *hypothesis*
+    in place, annotating each resolved item with ``l4_trigger`` /
+    ``window_feasible`` and a human-readable note.  Silent no-op when the
+    LLM is unavailable (items stay "需人工确认").
+    """
+    if not hypothesis:
+        return
+    targets = [e for e in hypothesis.get("uncertain", [])
+               if e.get("trigger") == "conditional"]
+    if not targets:
+        return
+    try:
+        from tools.ag_llm_resolver import resolve_uncertain
+        resolved = await resolve_uncertain(targets, _load_ag_index())
+    except Exception as e:
+        print(f"[battle_parser] L4 skipped: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return
+    if not resolved:
+        return
+
+    keyed = {(r["char"], r["skill"], r["skill_name"]): r for r in resolved}
+    for e in hypothesis["uncertain"]:
+        r = keyed.get((e.get("char"), e.get("skill"), e.get("skill_name")))
+        if not r:
+            continue
+        e["l4_trigger"] = r["l4_trigger"]
+        e["window_feasible"] = r["window_feasible"]
+        if r["window_note"]:
+            verdict = (f"L4 将 trigger 归类为 {r['l4_trigger']}："
+                       f"{r['window_note']}")
+        else:
+            verdict = (f"L4 将 trigger 归类为 {r['l4_trigger']}；"
+                       + ("窗口内可能触发" if r["window_feasible"]
+                          else "窗口内不会发生"))
+        e["note"] = verdict
+    hypothesis["l4_applied"] = True
+
+
 # ── Output formatting ───────────────────────────────────────────────
 
 
@@ -1011,7 +1268,9 @@ def _format_single_result(result: dict, warnings: list[str]) -> str:
 def _format_pair_result(
     pre: dict, post: dict, warnings: list[str],
     pre_valid: bool | None = None,
+    pre_valid_reasons: list[str] | None = None,
     action_gauge_skills: list[dict] | None = None,
+    ag_trigger_hypothesis: dict | None = None,
 ) -> str:
     """Format a two-screenshot (pre+post) result as JSON."""
     # Key by (name, side) so mirror/团战 rows — where the SAME character
@@ -1076,6 +1335,9 @@ def _format_pair_result(
     if pre_valid is not None:
         result["pre_valid"] = pre_valid
         if not pre_valid:
+            # 结构化原因（逐条：哪条规则/哪个角色）+ 泛化兜底文案并存（§5.2）。
+            if pre_valid_reasons:
+                result["pre_valid_reasons"] = list(pre_valid_reasons)
             result["pre_valid_note"] = (
                 "跑条前截图可能无效（乱速尚未完成），"
                 "初始行动值不可靠，无法用于测速计算。请等待乱速完成后重新截图。"
@@ -1087,6 +1349,14 @@ def _format_pair_result(
             "部分角色拥有拉条/推条技能（见 action_gauge_skills），"
             "行动值差值可能需要修正后才能用于测速。"
             "请根据技能描述判断是否影响了本次跑条的行动值变化。"
+        )
+
+    if ag_trigger_hypothesis:
+        result["ag_trigger_hypothesis"] = ag_trigger_hypothesis
+        result["ag_trigger_note"] = (
+            "已根据 wiki AI 释放规则 + 触发链解析，生成行动值触发假设"
+            "（见 ag_trigger_hypothesis）。请与用户确认 chain/uncertain 中"
+            "各拉条/推条是否实际触发，再据此修正行动值差。"
         )
 
     return json.dumps(result, ensure_ascii=False, indent=2)
