@@ -14,6 +14,7 @@ Usage:
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -348,6 +349,13 @@ class TestListCandidates:
             (root / "uploads" / "__pycache__").mkdir()
             (root / "uploads" / "__pycache__" / "c.pyc").write_text("p")
 
+            # 显式拉开 mtime——部分文件系统（ext2/ext3）时间戳精度为秒级，
+            # 连续创建的文件 mtime 会完全相同，排序退化为按路径，测试将不确定。
+            now = time.time()
+            os.utime(old, (now - 30, now - 30))
+            os.utime(new, (now - 20, now - 20))
+            os.utime(root / "repos" / "repoA" / "f.py", (now - 10, now - 10))
+
             cands = list_candidates(root)
             rels = [c.rel_path for c in cands]
             # 隐藏文件、.git、__pycache__ 均不在候选
@@ -379,6 +387,12 @@ class TestExecuteCleanup:
             f2.write_text("y" * 300)
             f3 = root / "uploads" / "c.txt"
             f3.write_text("z" * 200)
+
+            # 同上：显式拉开 mtime，避免秒级精度文件系统上的平局
+            now = time.time()
+            os.utime(f1, (now - 30, now - 30))
+            os.utime(f2, (now - 20, now - 20))
+            os.utime(f3, (now - 10, now - 10))
 
             cands = list_candidates(root)
             # 配额 800 字节，目标 80% = 640：应删除 a(500) 后剩 500 <= 640
