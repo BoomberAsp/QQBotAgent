@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import io
 import json
 import os
@@ -294,6 +295,93 @@ def get_character_skill_info(name: str) -> dict | None:
 # ── Public API ──────────────────────────────────────────────────────
 
 
+# ── Fuzzy screenshot-path resolution ────────────────────────────────
+# LLMs frequently drop a few characters when copying the long hex
+# filenames of uploaded screenshots from the "已保存至" note into the
+# tool call.  Instead of failing (and sending the agent into a retry
+# loop) we look for a confidently similar image in the same directory.
+
+_UPLOAD_PREFIX_RE = re.compile(r"^[0-9a-f]{8}-image-", re.IGNORECASE)
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _resolve_screenshot_path(path: str) -> tuple[str, str | None]:
+    """Return ``(resolved_path, note)``; *note* is non-None when the
+    given path did not exist but a confident, unambiguous fuzzy match
+    in the same directory was used instead.
+    """
+    if os.path.isfile(path):
+        return path, None
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    if not os.path.isdir(directory):
+        return path, None
+
+    want = _UPLOAD_PREFIX_RE.sub("", base).lower()
+    prefix_m = re.match(r"^([0-9a-f]{8})-", base.lower())
+    want_prefix = prefix_m.group(1) if prefix_m else None
+
+    entries: list[tuple[float, str]] = []
+    for name in os.listdir(directory):
+        if not name.lower().endswith(_IMG_EXTS):
+            continue
+        stripped = _UPLOAD_PREFIX_RE.sub("", name).lower()
+        ratio = difflib.SequenceMatcher(None, want, stripped).ratio()
+        entries.append((ratio, name))
+
+    pool: list[tuple[float, str]] = []
+    if want_prefix:
+        # The uuid prefix is unique per download, so a same-prefix hit is
+        # the file the agent was told about — prefer it outright.
+        pool = [e for e in entries
+                if e[1].lower().startswith(want_prefix + "-")]
+    if not pool:
+        # Basename after the uuid prefix is a content hash, so files
+        # sharing it are identical copies — collapse them (else they
+        # would trip the ambiguity guard), keeping the newest.
+        by_stripped: dict[str, tuple[float, str, float]] = {}
+        for ratio, name in entries:
+            stripped = _UPLOAD_PREFIX_RE.sub("", name).lower()
+            full = os.path.join(directory, name)
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                mtime = 0.0
+            prev = by_stripped.get(stripped)
+            if prev is None or (ratio, mtime) > (prev[0], prev[2]):
+                by_stripped[stripped] = (ratio, name, mtime)
+        pool = [(ratio, name) for ratio, name, _ in by_stripped.values()]
+    if not pool:
+        return path, None
+    pool.sort(key=lambda t: t[0], reverse=True)
+    best_ratio, best_name = pool[0][0], pool[0][1]
+    # Confident AND unambiguous (runner-up must be clearly worse).
+    if best_ratio < 0.75:
+        return path, None
+    if len(pool) > 1 and pool[1][0] > best_ratio - 0.10:
+        return path, None
+    return (
+        os.path.join(directory, best_name),
+        f"截图路径自动修正: {base} → {best_name}",
+    )
+
+
+def _missing_path_hint(path: str) -> str:
+    """List the image files living next to *path* (error-message hint)."""
+    directory = os.path.dirname(path) or "."
+    try:
+        names = sorted(
+            n for n in os.listdir(directory) if n.lower().endswith(_IMG_EXTS)
+        )
+    except OSError:
+        return ""
+    if not names:
+        return ""
+    shown = "、".join(names[:8])
+    more = f" 等共 {len(names)} 个" if len(names) > 8 else ""
+    return f"。该目录下现有图片: {shown}{more}"
+
+
 async def parse_battle_screenshots(paths: list[str]) -> str:
     """Extract structured battle data from 1-2 screenshots.
 
@@ -320,11 +408,20 @@ async def parse_battle_screenshots(paths: list[str]) -> str:
     all_results: list[dict] = []
     warnings: list[str] = []
 
-    for i, path in enumerate(paths):
-        if not os.path.exists(path):
+    resolved_paths: list[str] = []
+    for path in paths:
+        resolved, note = _resolve_screenshot_path(path)
+        if note:
+            warnings.append(note)
+        if not os.path.isfile(resolved):
             return json.dumps(
-                {"error": f"截图文件不存在: {path}"}, ensure_ascii=False
+                {"error": f"截图文件不存在: {path}{_missing_path_hint(path)}"},
+                ensure_ascii=False,
             )
+        resolved_paths.append(resolved)
+    paths = resolved_paths
+
+    for i, path in enumerate(paths):
         try:
             result = await _parse_single(path)
             await _resolve_uncertain_names(result, path)
