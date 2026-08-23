@@ -2117,8 +2117,8 @@ async def _send_markdown_doc(path: str, label: str = "文档") -> bool:
 async def _handle_features_command(text: str, user_id: str) -> bool:
     """Handle /功能 / /features command — direct, no agent.
 
-    Reads FEATURES.md, sends it as text in segments, then renders and sends a
-    feature card image. Returns True if the command was handled.
+    Renders FEATURES.md as a feature card image and sends only the image
+    (no text). Returns True if the command was handled.
     """
     cmd = text.strip().split()[0] if text.strip() else ""
     if cmd not in ("/功能", "/features"):
@@ -2126,17 +2126,15 @@ async def _handle_features_command(text: str, user_id: str) -> bool:
 
     features_path = os.path.join(_CONFIG_DIR, "FEATURES.md")
 
-    # 1. Send the FEATURES.md text (segmented)
-    await _send_markdown_doc(features_path, label="功能表")
-
-    # 2. Render and send the feature card (best-effort; text already sent)
     try:
         from nonebot.adapters.onebot.v11 import MessageSegment
         card_path = await asyncio.to_thread(render_feature_card, features_path)
         if card_path:
             await _safe_send(MessageSegment.image(Path(card_path)))
+        else:
+            await _safe_send("功能表为空或不存在，请联系管理员。")
     except Exception:
-        pass
+        await _safe_send("功能卡片渲染失败，请稍后重试。")
 
     return True
 
