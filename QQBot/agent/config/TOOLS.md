@@ -512,13 +512,14 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: parse_battle_screenshots
 
-**Description**: 解析 Ark Re:Code 战斗截图：每张图一次 qwen3.5-ocr 调用提取角色名与行动值，横幅颜色带扫描判定阵营（我方/敌方），字形匹配纠偏角色名。接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON（含自动判定的 `phase`：全员行动值≤5% 为 pre，否则 post；双图模式另有 `screenshot_phases` 与顺序校验 warnings、跑条前有效性 `pre_valid`）和 calculate_speed 兼容的文本格式。
+**Description**: 解析 Ark Re:Code 战斗截图：每张图一次 qwen3.5-ocr 调用提取角色名与行动值，横幅颜色带扫描判定阵营（我方/敌方），字形匹配纠偏角色名。接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON（含自动判定的 `phase`：全员行动值≤5% 为 pre，否则 post；双图模式另有 `screenshot_phases` 与顺序校验 warnings、跑条前有效性 `pre_valid`）和 calculate_speed 兼容的文本格式。**支持两种模式（`mode` 参数）：`light`（轻量，仅提取角色名与行动值，约10秒，跳过技能解析与行动值修正）与 `full`（全量，完整流程：技能解析+行动值修正，约90秒，默认）。**
 
-**When to use**: 当用户上传**或引用**战斗截图并要求测速/分析行动值时，调用此工具提取数据。截图路径会以 `[用户引用了文件 ... 文件路径: xxx]` 或 `[用户上传了图片，已保存至: xxx]` 的形式出现在上下文中——**直接取该路径调用，不要改用 read_file**（read_file 无法做战斗 OCR，会产生无关内容污染上下文）。提取后需展示结果给用户确认，询问我方角色速度值，再调用 calculate_speed。
+**When to use**: 当用户上传**或引用**战斗截图并要求测速/分析行动值时，调用此工具提取数据。截图路径会以 `[用户引用了文件 ... 文件路径: xxx]` 或 `[用户上传了图片，已保存至: xxx]` 的形式出现在上下文中——**直接取该路径调用，不要改用 read_file**（read_file 无法做战斗 OCR，会产生无关内容污染上下文）。**调用前先告知用户两种模式的区别（流程与预计用时：轻量约10秒、全量约90秒），按用户选择传入 `mode`。**提取后需展示结果给用户确认，询问我方角色速度值，再调用 calculate_speed。
 
 **重要说明**：
 - **同名角色可出现在双方**：团战/镜像匹配时，同一角色可能同时站在我方和敌方（同名不同阵营），这是正常情况，不要当作「两边阵容对不上」的错误。
 - **本工具专用于 Ark Re:Code**：不要根据技能/机制术语（如「战意」「爆裂」「气魄」）误判为其他游戏，这些都是 Ark Re:Code 自身的机制。
+- **两种模式（mode）**：`light`（轻量）仅返回角色名与行动值（不含 `pre_valid`/`action_gauge_skills`/`ag_trigger_hypothesis`），用于快速测速；`full`（全量）返回完整结果（含上述技能解析字段）。结果中的 `analysis_mode` 字段标明本次使用的模式。
 - **行动值修正**：当返回 `action_gauge_skills`（拉条/推条技能）时，需向用户确认技能是否触发；若触发，引导用户扣除技能的行动值加成（详见 AGENTS.md 截图测速流程第 5 步），而非直接拿原始差值计算。
 - **pre_valid_reasons**：`pre_valid=false` 时的结构化无效原因（逐条：哪条规则、哪个角色）。Agent 必须逐条转述给用户，不得只回「截图无效」（详见 AGENTS.md 流程第 4 步）。
 - **ag_trigger_hypothesis**：行动值触发判定（技能文案触发方式分类 + 截图冷却态证据 + 事件链推断）。字段语义：
@@ -542,6 +543,12 @@ This document defines all tools available to the agent. Each tool has a name, de
       "type": "array",
       "items": {"type": "string"},
       "description": "截图文件路径列表（1-2 张，跑条前+跑条后）"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["light", "full"],
+      "description": "解析模式。light=轻量（仅提取角色名与行动值，约10秒）；full=全量（完整流程：技能解析+行动值修正，约90秒）。默认 full",
+      "default": "full"
     }
   },
   "required": ["paths"]
