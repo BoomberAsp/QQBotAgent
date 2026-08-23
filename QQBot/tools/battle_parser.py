@@ -33,6 +33,8 @@ import httpx
 import numpy as np
 from PIL import Image
 
+from lib.buff_alias import extract_skill_buff_labels
+
 
 # ── Character Skill Index ───────────────────────────────────────────
 
@@ -79,8 +81,10 @@ def _load_character_skill_index() -> dict:
         immunity = False
         action_gauge = False
         ag_skills: list[dict] = []
+        buffs: set[str] = set()
 
         for s in skills:
+            buffs |= extract_skill_buff_labels(s)
             # Combine all text fields for keyword scanning.  Joined with
             # newlines (not spaces) so fragment splitting treats field
             # boundaries as sentence boundaries.
@@ -113,6 +117,7 @@ def _load_character_skill_index() -> dict:
             "has_immunity_skill": immunity,
             "has_action_gauge_skill": action_gauge,
             "action_gauge_skills": ag_skills,
+            "buffs": buffs,
         }
 
     return _skill_index
@@ -427,14 +432,26 @@ async def parse_battle_screenshots(paths: list[str], mode: str = "full") -> str:
         resolved_paths.append(resolved)
     paths = resolved_paths
 
-    for i, path in enumerate(paths):
+    async def _parse_one(i: int, path: str) -> tuple[int, dict | None, str | None]:
         try:
             result = await _parse_single(path)
             await _resolve_uncertain_names(result, path)
             result["_index"] = i
-            all_results.append(result)
+            return i, result, None
         except Exception as e:
-            warnings.append(f"截图 {i + 1} 解析失败: {type(e).__name__}: {e}")
+            return i, None, f"截图 {i + 1} 解析失败: {type(e).__name__}: {e}"
+
+    # OCR is the dominant cost (~60s+ per screenshot), so run the two
+    # screenshots concurrently instead of one after the other.  asyncio is
+    # single-threaded, so this just overlaps the two HTTP OCR calls.
+    parsed = await asyncio.gather(
+        *[_parse_one(i, path) for i, path in enumerate(paths)]
+    )
+    for _i, _r, _err in parsed:
+        if _r is not None:
+            all_results.append(_r)
+        else:
+            warnings.append(_err)
 
     if not all_results:
         # All OCR failed → try multimodal LLM fallback
@@ -444,6 +461,18 @@ async def parse_battle_screenshots(paths: list[str], mode: str = "full") -> str:
             "paths": paths,
             "warnings": warnings,
         }, ensure_ascii=False)
+
+    # Auto-sort two screenshots into pre → post order by detected phase, so
+    # the tool no longer depends on the caller passing them in the right
+    # order (users often send 跑条后 first, or the agent swaps them wrongly).
+    if len(all_results) == 2:
+        phases = [r.get("phase", "unknown") for r in all_results]
+        if phases == ["post", "pre"]:
+            all_results.reverse()
+            warnings.append(
+                "已自动调换截图顺序：传入的第一张判为跑条后、第二张判为跑条前，"
+                "已按「跑条前 → 跑条后」重新排列解析。"
+            )
 
     if mode == "light":
         return _format_light_result(all_results, warnings)
@@ -464,14 +493,11 @@ async def parse_battle_screenshots(paths: list[str], mode: str = "full") -> str:
         return json.dumps(result_dict, ensure_ascii=False, indent=2)
 
     # Phase sanity check: the first screenshot should be pre (all values
-    # ≤ 5% after 乱速), the second post (values have grown).
+    # ≤ 5% after 乱速), the second post (values have grown).  ["post","pre"]
+    # is already normalised by the auto-sort above, so only the remaining
+    # anomalies (first looks post, or second looks pre) are caught here.
     phases = [r.get("phase", "unknown") for r in all_results]
-    if phases == ["post", "pre"]:
-        warnings.append(
-            "截图顺序疑似颠倒：第一张行动值均>5%（像跑条后），"
-            "第二张均≤5%（像跑条前）。请确认顺序后重新发送。"
-        )
-    elif phases[0] == "post":
+    if phases[0] == "post":
         # A pre-screenshot may legitimately show >5% for characters with a
         # battle_start action-gauge passive (they pulled at battle start,
         # after 乱速).  Only warn when some >5% character lacks that passive.
@@ -929,7 +955,20 @@ async def _parse_single(path: str) -> dict:
         rows_for_buffs = [
             [{"bbox": c["bbox"]}] if c.get("bbox") else [] for c in characters
         ]
-        row_buffs = detector.detect_in_rows(img_bgr, rows_for_buffs, frame)
+        # Narrow the template set per row to the buffs that character's skills
+        # can apply (plus 免疫 gear, which is not in any skill text).  Unknown
+        # characters fall back to the full template set (None) for that row only.
+        buff_filters: list[set[str] | None] = []
+        for c in characters:
+            info = get_character_skill_info(c["name"])
+            if info is None:
+                buff_filters.append(None)
+            else:
+                flt = set(info.get("buffs") or [])
+                flt.add("免疫")
+                buff_filters.append(flt)
+        row_buffs = detector.detect_in_rows(
+            img_bgr, rows_for_buffs, frame, template_filters=buff_filters)
     except Exception as e:
         print(f"[battle_parser] Buff detection skipped: {type(e).__name__}: {e}",
               file=sys.stderr)
@@ -1482,12 +1521,7 @@ def _format_light_result(all_results: list[dict], warnings: list[str]) -> str:
         return _format_single_result(all_results[0], warnings, analysis_mode="light")
 
     phases = [r.get("phase", "unknown") for r in all_results]
-    if phases == ["post", "pre"]:
-        warnings.append(
-            "截图顺序疑似颠倒：第一张行动值均>5%（像跑条后），"
-            "第二张均≤5%（像跑条前）。请确认顺序后重新发送。"
-        )
-    elif phases[1] == "pre":
+    if phases[1] == "pre":
         warnings.append(
             "第二张截图行动值均≤5%，不像跑条后截图（跑条后应有角色>5%）。"
         )
