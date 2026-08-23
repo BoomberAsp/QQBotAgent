@@ -710,3 +710,261 @@ def render_bond_card(entry: dict, out_path: str | None = None) -> str:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     canvas.convert("RGB").save(out_path, "PNG")
     return out_path
+
+
+# ── Help card ─────────────────────────────────────────────────────
+
+# Accent colours cycled across HELP.md sections (mirror the emoji colours used
+# in the text help). Extra entries serve as fallback for longer docs.
+_HELP_SECTION_COLORS = [
+    (76, 175, 80),    # green
+    (58, 140, 232),   # blue
+    (122, 92, 232),   # purple
+    (232, 181, 58),   # gold
+    (58, 180, 200),   # cyan
+    (255, 158, 74),   # burst orange
+    (110, 116, 132),  # gray
+    (232, 80, 58),    # red
+]
+
+_HELP_CARD_PATH = os.path.join(_CACHE_DIR, "help_card.png")
+
+
+def _parse_help_md(md_path: str) -> list:
+    """Parse HELP.md into ``[(section_name, [(cmd, desc), ...]), ...]``.
+
+    ``## `` lines start a section; ``- `` lines are command rows, formatted as
+    ``- `cmd` — desc`` (backticks stripped, split on the first em-dash).
+    """
+    sections = []
+    current = None
+    try:
+        with open(md_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+
+    for line in lines:
+        line = line.strip()
+        if line.startswith("## "):
+            current = (line[3:].strip(), [])
+            sections.append(current)
+        elif line.startswith("- ") and current is not None:
+            body = line[2:].strip().replace("`", "")
+            if "—" in body:
+                cmd, _, desc = body.partition("—")
+                current[1].append((cmd.strip(), desc.strip()))
+            else:
+                current[1].append((body, ""))
+    return sections
+
+
+def render_help_card(md_path: str, out_path: str | None = None) -> str | None:
+    """Render HELP.md as a dark-theme help/command cheat-sheet card.
+
+    The card is derived from the markdown (``## `` sections + ``- `` command
+    rows), so it stays in sync with the doc ``/帮助`` sends as text. Returns
+    the PNG path, or ``None`` when the doc has no parseable sections.
+    """
+    sections = _parse_help_md(md_path)
+    if not sections:
+        return None
+
+    probe = ImageDraw.Draw(Image.new("RGBA", (W, 10)))
+
+    title = "帮助 · 命令速查"
+    subtitle = "以下命令直接由系统处理 · 发送 /功能 查看完整功能一览"
+
+    title_h = _lh(52)
+    sub_h = _lh(22)
+    pill_h = _lh(24) + 20
+    cmd_h = _lh(24)
+    row_gap = 8
+
+    total_h = PAD + title_h + sub_h + GAP
+    for _name, commands in sections:
+        total_h += pill_h + GAP // 2
+        total_h += len(commands) * (cmd_h + row_gap)
+        total_h += GAP
+    total_h += PAD
+
+    canvas = Image.new("RGBA", (W, total_h), _BG + (255,))
+    draw = ImageDraw.Draw(canvas)
+
+    y = PAD
+    draw.text((PAD, y), title, font=_font(52), fill=_TEXT)
+    y += title_h
+    draw.text((PAD, y), subtitle, font=_font(22), fill=_TEXT_FAINT)
+    y += sub_h + GAP
+
+    for idx, (name, commands) in enumerate(sections):
+        color = _HELP_SECTION_COLORS[idx % len(_HELP_SECTION_COLORS)]
+
+        # section pill header
+        pill_w = _tw(draw, name, 24) + 44
+        draw.rounded_rectangle((PAD, y, PAD + pill_w, y + pill_h),
+                               radius=pill_h // 2, fill=color + (255,))
+        draw.text((PAD + 22, y + (pill_h - _lh(24)) // 2),
+                  name, font=_font(24), fill=(255, 255, 255, 255))
+        y += pill_h + GAP // 2
+
+        # command rows
+        for cmd, desc in commands:
+            draw.text((PAD + 10, y), cmd, font=_font(24), fill=_TEXT)
+            cmd_w = _tw(draw, cmd, 24)
+            if desc:
+                draw.text((PAD + 10 + cmd_w + 18, y), desc,
+                          font=_font(24), fill=_TEXT_DIM)
+            y += cmd_h + row_gap
+
+        y += GAP
+
+    if out_path is None:
+        out_path = _HELP_CARD_PATH
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.convert("RGB").save(out_path, "PNG")
+    return out_path
+
+
+# ── Feature card ──────────────────────────────────────────────────
+
+_FEATURE_CARD_PATH = os.path.join(_CACHE_DIR, "feature_card.png")
+
+
+def _feature_tag_color(tag: str) -> tuple:
+    """Colour a permission/trigger badge by its access level."""
+    if "仅管理员" in tag:
+        return (232, 80, 58)    # red — admin only
+    if "管理员" in tag:
+        return (122, 92, 232)   # purple — vip/admin
+    if "所有人" in tag:
+        return (76, 175, 80)    # green — everyone
+    return (110, 116, 132)      # gray — trigger method etc.
+
+
+def _parse_features_md(md_path: str) -> list:
+    """Parse FEATURES.md feature sections into ``[(section, [(name, desc, tag)])]``.
+
+    Stops at the ``## 直接命令一览`` section (commands are covered by HELP.md's
+    card). Markdown table header/separator rows and ``### `` sub-sections are
+    skipped; backticks are stripped.
+    """
+    sections = []
+    current = None
+    try:
+        with open(md_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+
+    for line in lines:
+        s = line.strip()
+        if s.startswith("## "):
+            name = s[3:].strip()
+            if name == "直接命令一览":
+                break
+            current = (name, [])
+            sections.append(current)
+        elif s.startswith("### "):
+            current = None
+        elif s.startswith("|") and current is not None:
+            cells = [c.strip().replace("`", "") for c in s.strip("|").split("|")]
+            if not cells or all(c.replace("-", "").strip() == "" for c in cells):
+                continue  # separator row (|---|)
+            if cells[0] in ("功能", "命令", "级别", "类别"):
+                continue  # header row
+            name = cells[0]
+            desc = cells[1] if len(cells) > 1 else ""
+            tag = cells[2] if len(cells) > 2 else ""
+            if name:
+                current[1].append((name, desc, tag))
+    return sections
+
+
+def render_feature_card(md_path: str, out_path: str | None = None) -> str | None:
+    """Render FEATURES.md's feature overview as a dark-theme card.
+
+    Each ``## `` section becomes a coloured pill header; each table row becomes
+    a feature name + wrapped description + an optional right-aligned permission
+    badge. Returns the PNG path, or ``None`` if nothing parseable was found.
+    """
+    sections = _parse_features_md(md_path)
+    if not sections:
+        return None
+
+    probe = ImageDraw.Draw(Image.new("RGBA", (W, 10)))
+
+    title = "功能一览"
+    subtitle = "按大类分组 · 发送 /帮助 查看命令速查"
+
+    title_h = _lh(52)
+    sub_h = _lh(22)
+    pill_h = _lh(24) + 20
+    name_col = 200
+    row_font = 24
+    tag_font = 20
+    row_gap = 8
+    line_h = _lh(row_font)
+
+    name_x = PAD + 10
+    desc_x = name_x + name_col
+    right_edge = W - PAD
+
+    # measure + prepare wrapped rows
+    render = []
+    total_h = PAD + title_h + sub_h + GAP
+    for idx, (sname, feats) in enumerate(sections):
+        color = _HELP_SECTION_COLORS[idx % len(_HELP_SECTION_COLORS)]
+        items = []
+        total_h += pill_h + GAP // 2
+        for name, desc, tag in feats:
+            tag_w = _tw(probe, tag, tag_font) + 24 if tag else 0
+            tag_color = _feature_tag_color(tag) if tag else _DEFAULT_ELEMENT_COLOR
+            desc_max = right_edge - desc_x - (tag_w + 12 if tag_w else 0)
+            desc_lines = _wrap(probe, desc, row_font, max(desc_max, 40)) or [""]
+            items.append((name, desc_lines, tag, tag_color, tag_w))
+            total_h += len(desc_lines) * line_h + row_gap
+        render.append((color, sname, items))
+        total_h += GAP
+    total_h += PAD
+
+    canvas = Image.new("RGBA", (W, total_h), _BG + (255,))
+    draw = ImageDraw.Draw(canvas)
+
+    y = PAD
+    draw.text((PAD, y), title, font=_font(52), fill=_TEXT)
+    y += title_h
+    draw.text((PAD, y), subtitle, font=_font(22), fill=_TEXT_FAINT)
+    y += sub_h + GAP
+
+    for color, sname, items in render:
+        # section pill header
+        pill_w = _tw(draw, sname, 24) + 44
+        draw.rounded_rectangle((PAD, y, PAD + pill_w, y + pill_h),
+                               radius=pill_h // 2, fill=color + (255,))
+        draw.text((PAD + 22, y + (pill_h - _lh(24)) // 2),
+                  sname, font=_font(24), fill=(255, 255, 255, 255))
+        y += pill_h + GAP // 2
+
+        for name, desc_lines, tag, tag_color, tag_w in items:
+            draw.text((name_x, y), name, font=_font(row_font), fill=_TEXT)
+            for i, ln in enumerate(desc_lines):
+                draw.text((desc_x, y + i * line_h), ln,
+                          font=_font(row_font), fill=_TEXT_DIM)
+            if tag:
+                badge_h = _lh(tag_font) + 8
+                badge_x = right_edge - tag_w
+                badge_y = y + (line_h - badge_h) // 2
+                draw.rounded_rectangle((badge_x, badge_y, right_edge, badge_y + badge_h),
+                                       radius=badge_h // 2, fill=tag_color + (255,))
+                draw.text((badge_x + 12, badge_y + (badge_h - _lh(tag_font)) // 2),
+                          tag, font=_font(tag_font), fill=(255, 255, 255, 255))
+            y += len(desc_lines) * line_h + row_gap
+
+        y += GAP
+
+    if out_path is None:
+        out_path = _FEATURE_CARD_PATH
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.convert("RGB").save(out_path, "PNG")
+    return out_path

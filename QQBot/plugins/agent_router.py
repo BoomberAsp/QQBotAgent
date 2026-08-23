@@ -86,6 +86,7 @@ from tools.legacy_tools import (
 from tools.character_detail import character_detail, character_detail_with_card
 from tools.bond_detail import bond_detail, bond_detail_with_card
 from tools.battle_parser import parse_battle_screenshots
+from tools.card_renderer import render_help_card, render_feature_card
 
 # ── Configuration Paths ───────────────────────────────────────────
 
@@ -93,6 +94,7 @@ _AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CONFIG_DIR = os.path.join(_AGENT_DIR, "agent", "config")
 _DATA_DIR = os.path.join(_AGENT_DIR, "data")
 _USER_DATA_ROOT = os.environ.get("USER_DATA_ROOT", os.path.join(_AGENT_DIR, "data", "users_store"))
+_HELP_MD_PATH = os.path.join(_CONFIG_DIR, "HELP.md")
 
 # ── Workspace Initialization ─────────────────────────────────────
 
@@ -2060,32 +2062,25 @@ async def _handle_personality_command(text: str, user_id: str, event: MessageEve
     return True
 
 
-async def _handle_features_command(text: str, user_id: str) -> bool:
-    """Handle /功能 / /features command — direct, no agent.
+async def _send_markdown_doc(path: str, label: str = "文档") -> bool:
+    """Read a markdown doc and send it segmented by ``## `` sections.
 
-    Reads FEATURES.md and sends it to the user in segments.
-    Returns True if the command was handled.
+    Merges short sections to fit QQ message limits (~500 chars) with a 1s delay
+    between chunks. Returns True if any content was sent.
     """
-    cmd = text.strip().split()[0] if text.strip() else ""
-    if cmd not in ("/功能", "/features"):
-        return False
-
-    features_path = os.path.join(
-        os.path.dirname(__file__), "..", "agent", "config", "FEATURES.md"
-    )
     try:
-        with open(features_path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             content = f.read().strip()
     except FileNotFoundError:
-        await _safe_send("功能表文件不存在，请联系管理员。")
-        return True
+        await _safe_send(f"{label}不存在，请联系管理员。")
+        return False
     except Exception as e:
-        await _safe_send(f"读取功能表失败: {e}")
-        return True
+        await _safe_send(f"读取{label}失败: {e}")
+        return False
 
     if not content:
-        await _safe_send("功能表为空。")
-        return True
+        await _safe_send(f"{label}为空。")
+        return False
 
     # Segment by ## section headers, keeping each section intact
     parts = []
@@ -2099,7 +2094,7 @@ async def _handle_features_command(text: str, user_id: str) -> bool:
     if current:
         parts.append(current.rstrip())
 
-    # Merge short parts to fit QQ message limits (~400 chars)
+    # Merge short parts to fit QQ message limits (~500 chars)
     merged = []
     buf = ""
     for part in parts:
@@ -2116,6 +2111,32 @@ async def _handle_features_command(text: str, user_id: str) -> bool:
         await _safe_send(chunk)
         if i < len(merged) - 1:
             await asyncio.sleep(1.0)
+    return True
+
+
+async def _handle_features_command(text: str, user_id: str) -> bool:
+    """Handle /功能 / /features command — direct, no agent.
+
+    Reads FEATURES.md, sends it as text in segments, then renders and sends a
+    feature card image. Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/功能", "/features"):
+        return False
+
+    features_path = os.path.join(_CONFIG_DIR, "FEATURES.md")
+
+    # 1. Send the FEATURES.md text (segmented)
+    await _send_markdown_doc(features_path, label="功能表")
+
+    # 2. Render and send the feature card (best-effort; text already sent)
+    try:
+        from nonebot.adapters.onebot.v11 import MessageSegment
+        card_path = await asyncio.to_thread(render_feature_card, features_path)
+        if card_path:
+            await _safe_send(MessageSegment.image(Path(card_path)))
+    except Exception:
+        pass
 
     return True
 
@@ -2468,37 +2489,18 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         await _safe_send(msg)
         return True
 
-    # ── /帮助 — 命令列表 ───────────────────────────────────────
+    # ── /帮助 — 命令列表 + 帮助卡片 ─────────────────────────────
     if cmd in ("/帮助", "#帮助", "/help", "#help", "/命令", "#命令"):
-        help_text = (
-            "**系统命令列表**\n\n"
-            "🟢 **特殊会话管理**\n"
-            "/新会话 [名称] — 创建特殊会话\n"
-            "/切换会话 <名称> — 切换到已有会话\n"
-            "/会话列表 或 /会话 — 查看所有会话\n"
-            "/重命名会话 <旧名> <新名> — 重命名会话\n"
-            "/删除会话 <名称> — 删除会话（需确认）\n"
-            "/结束会话 或 /临时会话 或 /退出特殊会话 — 退出特殊会话\n"
-            "/保存为会话 <名称> — 将临时上下文保存为会话\n\n"
-            "🟦 **工作区**\n"
-            "/管理工作区 — 查看工作区占用并引导清理\n\n"
-            "🟣 **人格切换**\n"
-            "/人格切换 — 查看当前人格和可用列表\n"
-            "/人格切换 <名称> — 切换人格（支持模糊匹配）\n\n"
-            "🟠 **游戏工具**\n"
-            "/兑换码 或 /redeem-code — 查询有效兑换码\n\n"
-            "🔵 **连续对话（群聊）**\n"
-            "/取消 或 #取消 — 退出连续对话模式\n\n"
-            "🟡 **反馈**\n"
-            "#反馈 <内容> — 提交功能建议\n"
-            "#bug <内容> — 提交 Bug 报告\n"
-            "#建议 <内容> — 提交改进建议\n\n"
-            "⚪ **其他**\n"
-            "/功能 或 /features — 查看完整功能一览\n"
-            "/status — 查看机器人运行状态\n"
-            "/clear 或 新对话 — 清除临时上下文"
-        )
-        await _safe_send(help_text)
+        # 1. Send the HELP.md text (segmented)
+        await _send_markdown_doc(_HELP_MD_PATH, label="帮助文档")
+        # 2. Render and send the help card (best-effort; text already sent)
+        try:
+            from nonebot.adapters.onebot.v11 import MessageSegment
+            card_path = await asyncio.to_thread(render_help_card, _HELP_MD_PATH)
+            if card_path:
+                await _safe_send(MessageSegment.image(Path(card_path)))
+        except Exception:
+            pass
         return True
 
     # ── /管理工作区 ─────────────────────────────────────────────
