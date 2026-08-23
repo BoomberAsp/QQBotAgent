@@ -30,6 +30,23 @@ MIN_REMEMBER_LEN = 800
 MAX_MEMORIES_PER_USER = 20
 
 
+def _display_tool_name(tool_call: dict) -> str:
+    """Return a human-facing tool name for the progress message.
+
+    ``parse_battle_screenshots`` is annotated with its mode (轻量/全量) so
+    the user can tell the two runs apart.
+    """
+    name = tool_call["function"]["name"]
+    if name != "parse_battle_screenshots":
+        return name
+    try:
+        args = json.loads(tool_call["function"].get("arguments") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return name
+    label = "轻量" if args.get("mode") == "light" else "全量"
+    return f"{name}（{label}）"
+
+
 class Agent:
     """LLM Agent with tool-calling capability.
 
@@ -200,7 +217,7 @@ class Agent:
             if response.get("tool_calls"):
                 # ── Report progress (with deduplication) ────────────
                 if progress_callback:
-                    tool_names = [tc["function"]["name"] for tc in response["tool_calls"]]
+                    tool_names = [_display_tool_name(tc) for tc in response["tool_calls"]]
                     tool_set = frozenset(tool_names)
                     if tool_set != _last_reported_tools:
                         _last_reported_tools = tool_set

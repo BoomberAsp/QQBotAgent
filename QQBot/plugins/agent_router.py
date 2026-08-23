@@ -785,7 +785,10 @@ def _build_tool_registry() -> ToolRegistry:
         "parse_battle_screenshots", parse_battle_screenshots,
         "解析 Ark Re:Code 战斗截图，用 OCR 提取角色名、行动值、阵营（我方/敌方）。"
         "接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON 和 calculate_speed 兼容格式。"
-        "当用户上传/引用战斗截图并要求测速或分析行动值时，调用此工具提取数据。"
+        "支持两种模式（mode 参数）：light=轻量（仅提取角色名与行动值，约10秒，跳过技能解析与行动值修正）；"
+        "full=全量（完整流程：技能解析+行动值修正，约90秒）。默认 full。"
+        "当用户上传/引用战斗截图并要求测速或分析行动值时，先告知用户两种模式的区别（流程与预计用时），"
+        "再按用户选择传入 mode 调用，不要擅自替用户决定。"
         "截图路径会以「[用户引用了文件 ... 文件路径: xxx]」的形式出现在上下文中，"
         "直接取该路径调用，不要改用 read_file（read_file 无法做战斗 OCR）。"
         "团战/镜像匹配时，同一角色可能同时出现在我方和敌方（同名不同阵营），属正常情况，勿视为错误。"
@@ -797,6 +800,12 @@ def _build_tool_registry() -> ToolRegistry:
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "截图文件路径列表（1-2 张，跑条前+跑条后）",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["light", "full"],
+                    "description": "解析模式。light=轻量（仅提取角色名与行动值，约10秒）；full=全量（完整流程：技能解析+行动值修正，约90秒）。默认 full",
+                    "default": "full",
                 },
             },
             "required": ["paths"],

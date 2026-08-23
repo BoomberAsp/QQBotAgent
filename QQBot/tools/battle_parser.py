@@ -382,14 +382,18 @@ def _missing_path_hint(path: str) -> str:
     return f"。该目录下现有图片: {shown}{more}"
 
 
-async def parse_battle_screenshots(paths: list[str]) -> str:
+async def parse_battle_screenshots(paths: list[str], mode: str = "full") -> str:
     """Extract structured battle data from 1-2 screenshots.
 
     Args:
         paths: 1 or 2 image file paths (1=current state only, 2=pre+post).
+        mode: "light" (轻量：仅提取角色名与行动值，跳过技能解析与行动值
+            修正，约 10 秒) or "full" (全量：完整流程，含技能解析与行动值
+            修正，约 90 秒)。默认 "full"。
 
     Returns:
         A JSON string with keys:
+        - ``analysis_mode``: "light" | "full"
         - ``characters``: list of {name, side, action_value, acting}
         - ``phase``: detected from action values — "pre" when ALL values
           are ≤ 5% (乱速 just completed), else "post"; "pair" in
@@ -399,6 +403,8 @@ async def parse_battle_screenshots(paths: list[str]) -> str:
         - ``warnings``: list of human-readable caveats
         - ``raw_format``: calculate_speed-compatible text block
     """
+    mode = "light" if mode == "light" else "full"
+
     if not paths:
         return json.dumps({"error": "未提供截图路径"}, ensure_ascii=False)
 
@@ -438,6 +444,9 @@ async def parse_battle_screenshots(paths: list[str]) -> str:
             "paths": paths,
             "warnings": warnings,
         }, ensure_ascii=False)
+
+    if mode == "light":
+        return _format_light_result(all_results, warnings)
 
     if len(all_results) == 1:
         result = _format_single_result(all_results[0], warnings)
@@ -1463,7 +1472,31 @@ async def _apply_l4(hypothesis: dict | None) -> None:
 # ── Output formatting ───────────────────────────────────────────────
 
 
-def _format_single_result(result: dict, warnings: list[str]) -> str:
+def _format_light_result(all_results: list[dict], warnings: list[str]) -> str:
+    """轻量模式：仅返回角色名与行动值（含 raw_format）。
+
+    跳过技能解析、行动值修正、跑条前有效性校验与触发链假设；阶段顺序
+    仍做最基础的 sanity 提示（不查技能索引）。
+    """
+    if len(all_results) == 1:
+        return _format_single_result(all_results[0], warnings, analysis_mode="light")
+
+    phases = [r.get("phase", "unknown") for r in all_results]
+    if phases == ["post", "pre"]:
+        warnings.append(
+            "截图顺序疑似颠倒：第一张行动值均>5%（像跑条后），"
+            "第二张均≤5%（像跑条前）。请确认顺序后重新发送。"
+        )
+    elif phases[1] == "pre":
+        warnings.append(
+            "第二张截图行动值均≤5%，不像跑条后截图（跑条后应有角色>5%）。"
+        )
+    return _format_pair_result(
+        all_results[0], all_results[1], warnings, analysis_mode="light"
+    )
+
+
+def _format_single_result(result: dict, warnings: list[str], analysis_mode: str = "full") -> str:
     """Format a single-screenshot result as JSON."""
     characters = result.get("characters", [])
     allies = [c for c in characters if c.get("side") == "ally"]
@@ -1473,6 +1506,7 @@ def _format_single_result(result: dict, warnings: list[str]) -> str:
     raw_lines = _build_raw_format(characters, allies, enemies)
 
     return json.dumps({
+        "analysis_mode": analysis_mode,
         "phase": result.get("phase", "unknown"),
         "mode": "single",
         "characters": characters,
@@ -1491,6 +1525,7 @@ def _format_pair_result(
     pre_valid_reasons: list[str] | None = None,
     action_gauge_skills: list[dict] | None = None,
     ag_trigger_hypothesis: dict | None = None,
+    analysis_mode: str = "full",
 ) -> str:
     """Format a two-screenshot (pre+post) result as JSON."""
     # Key by (name, side) so mirror/团战 rows — where the SAME character
@@ -1557,6 +1592,7 @@ def _format_pair_result(
     raw_lines = _build_raw_format(merged, allies, enemies)
 
     result = {
+        "analysis_mode": analysis_mode,
         "phase": "pair",
         "mode": "pair",
         "screenshot_phases": [
