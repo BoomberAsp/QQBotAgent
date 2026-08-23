@@ -521,14 +521,17 @@ This document defines all tools available to the agent. Each tool has a name, de
 - **本工具专用于 Ark Re:Code**：不要根据技能/机制术语（如「战意」「爆裂」「气魄」）误判为其他游戏，这些都是 Ark Re:Code 自身的机制。
 - **行动值修正**：当返回 `action_gauge_skills`（拉条/推条技能）时，需向用户确认技能是否触发；若触发，引导用户扣除技能的行动值加成（详见 AGENTS.md 截图测速流程第 5 步），而非直接拿原始差值计算。
 - **pre_valid_reasons**：`pre_valid=false` 时的结构化无效原因（逐条：哪条规则、哪个角色）。Agent 必须逐条转述给用户，不得只回「截图无效」（详见 AGENTS.md 流程第 4 步）。
-- **ag_trigger_hypothesis**：行动值触发假设（wiki AI 释放规则 + 截图冷却态观测 + 触发链解析）。字段语义：
-  - `first_actor` / `first_actor_skill`：首动角色与其释放的技能；`first_skill_observed=true` 表示由跑条后截图冷却态（图标变灰 + N回合）佐证，false 为 AI 规则预测。
-  - `chain`：推断已触发的拉条/推条被动列表，每项含 `char`/`skill`/`direction`（pull=拉条, push=推条）/`magnitude`/`target`/`trigger`/`note`。
-  - `uncertain`：需人工确认项（条件被动、概率触发、窗口外触发等），`note` 含 L4 窄 LLM 归类（`l4_applied=true` 时）；`observable=false` 的项一律交用户确认。
+- **ag_trigger_hypothesis**：行动值触发判定（技能文案触发方式分类 + 截图冷却态证据 + 事件链推断）。字段语义：
+  - `first_actor` / `first_actor_skill`：首动角色与其释放的技能；`first_skill_observed=true` 表示由跑条后截图冷却态（图标变灰 + N回合）佐证，按事实陈述，false 为 AI 规则预测。
+  - `chain`：已触发/推断触发的拉条/推条列表，每项含 `char`/`side`/`skill`/`direction`（pull=拉条, push=推条）/`magnitude`/`target`/`trigger`/`note`。**`confirmed=true` 且 `evidence=observed_cooldown`**：跑条后截图出现新冷却，技能确已发动——按事实直接计入修正，不要求用户确认；无 `confirmed` 的条目是无证据时的推断。
+  - `not_triggered`：冷却态证据判定**未触发**的条目（静默项）——不要列出、不要提问、不要计入修正。
+  - `uncertain`：仅包含截图无法判定的项，需按 `note` 询问用户：`trigger=counter_gear`（反击套装：敌方攻击技能指向该角色时 30% 概率以 S1 反击，装备不可见）、概率性暴击、条件门（触发事件已发生但 HP/状态门无法确认）。`observable=false`。
+  - `trigger_modes`/`generates_extra_turn`：L1 技能分类属性（触发方式集合 / 是否产生追加回合），驱动事件链推断。
   - `battle_start`：进战即生效的拉条被动，已打入初始行动值（对应 pre_valid 例外）。
+  - `observed_evidence=true`：本次判定使用了截图冷却态证据（`confidence` 为 high）。
   - `bond_reminder=true`：必须向用户附「穿戴羁绊」提醒（固定措辞见 AGENTS.md）。
-  - `confidence`：high/medium/low，low 时首动技能需用户确认。
-  确认/纠错交互流程详见 AGENTS.md「截图测速交互流程」第 5 步与 one-shot 范例。
+  - `confidence`：high（有冷却态证据）/medium/low，low 时首动技能需用户确认。
+  交互原则：冷却态可判定的（变灰=已发动、未变灰=未发动）一律不向用户提问；只对 `uncertain` 提问。详见 AGENTS.md「截图测速交互流程」第 5 步与 one-shot 范例。
 
 **Parameters**:
 ```json

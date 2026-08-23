@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import io
 import json
 import os
@@ -294,6 +295,93 @@ def get_character_skill_info(name: str) -> dict | None:
 # ── Public API ──────────────────────────────────────────────────────
 
 
+# ── Fuzzy screenshot-path resolution ────────────────────────────────
+# LLMs frequently drop a few characters when copying the long hex
+# filenames of uploaded screenshots from the "已保存至" note into the
+# tool call.  Instead of failing (and sending the agent into a retry
+# loop) we look for a confidently similar image in the same directory.
+
+_UPLOAD_PREFIX_RE = re.compile(r"^[0-9a-f]{8}-image-", re.IGNORECASE)
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _resolve_screenshot_path(path: str) -> tuple[str, str | None]:
+    """Return ``(resolved_path, note)``; *note* is non-None when the
+    given path did not exist but a confident, unambiguous fuzzy match
+    in the same directory was used instead.
+    """
+    if os.path.isfile(path):
+        return path, None
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    if not os.path.isdir(directory):
+        return path, None
+
+    want = _UPLOAD_PREFIX_RE.sub("", base).lower()
+    prefix_m = re.match(r"^([0-9a-f]{8})-", base.lower())
+    want_prefix = prefix_m.group(1) if prefix_m else None
+
+    entries: list[tuple[float, str]] = []
+    for name in os.listdir(directory):
+        if not name.lower().endswith(_IMG_EXTS):
+            continue
+        stripped = _UPLOAD_PREFIX_RE.sub("", name).lower()
+        ratio = difflib.SequenceMatcher(None, want, stripped).ratio()
+        entries.append((ratio, name))
+
+    pool: list[tuple[float, str]] = []
+    if want_prefix:
+        # The uuid prefix is unique per download, so a same-prefix hit is
+        # the file the agent was told about — prefer it outright.
+        pool = [e for e in entries
+                if e[1].lower().startswith(want_prefix + "-")]
+    if not pool:
+        # Basename after the uuid prefix is a content hash, so files
+        # sharing it are identical copies — collapse them (else they
+        # would trip the ambiguity guard), keeping the newest.
+        by_stripped: dict[str, tuple[float, str, float]] = {}
+        for ratio, name in entries:
+            stripped = _UPLOAD_PREFIX_RE.sub("", name).lower()
+            full = os.path.join(directory, name)
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                mtime = 0.0
+            prev = by_stripped.get(stripped)
+            if prev is None or (ratio, mtime) > (prev[0], prev[2]):
+                by_stripped[stripped] = (ratio, name, mtime)
+        pool = [(ratio, name) for ratio, name, _ in by_stripped.values()]
+    if not pool:
+        return path, None
+    pool.sort(key=lambda t: t[0], reverse=True)
+    best_ratio, best_name = pool[0][0], pool[0][1]
+    # Confident AND unambiguous (runner-up must be clearly worse).
+    if best_ratio < 0.75:
+        return path, None
+    if len(pool) > 1 and pool[1][0] > best_ratio - 0.10:
+        return path, None
+    return (
+        os.path.join(directory, best_name),
+        f"截图路径自动修正: {base} → {best_name}",
+    )
+
+
+def _missing_path_hint(path: str) -> str:
+    """List the image files living next to *path* (error-message hint)."""
+    directory = os.path.dirname(path) or "."
+    try:
+        names = sorted(
+            n for n in os.listdir(directory) if n.lower().endswith(_IMG_EXTS)
+        )
+    except OSError:
+        return ""
+    if not names:
+        return ""
+    shown = "、".join(names[:8])
+    more = f" 等共 {len(names)} 个" if len(names) > 8 else ""
+    return f"。该目录下现有图片: {shown}{more}"
+
+
 async def parse_battle_screenshots(paths: list[str]) -> str:
     """Extract structured battle data from 1-2 screenshots.
 
@@ -320,11 +408,20 @@ async def parse_battle_screenshots(paths: list[str]) -> str:
     all_results: list[dict] = []
     warnings: list[str] = []
 
-    for i, path in enumerate(paths):
-        if not os.path.exists(path):
+    resolved_paths: list[str] = []
+    for path in paths:
+        resolved, note = _resolve_screenshot_path(path)
+        if note:
+            warnings.append(note)
+        if not os.path.isfile(resolved):
             return json.dumps(
-                {"error": f"截图文件不存在: {path}"}, ensure_ascii=False
+                {"error": f"截图文件不存在: {path}{_missing_path_hint(path)}"},
+                ensure_ascii=False,
             )
+        resolved_paths.append(resolved)
+    paths = resolved_paths
+
+    for i, path in enumerate(paths):
         try:
             result = await _parse_single(path)
             await _resolve_uncertain_names(result, path)
@@ -899,6 +996,13 @@ def _clean_name(raw: str) -> str:
 # one character has accumulated more.
 _PRE_AV_MAX = 5.0
 
+# Gauge threshold at which a character acts.  The acting row of the post
+# screenshot reads 0% (the gauge reset on acting), but within the pre→post
+# window that character accumulated a full (100 − init) gauge — a valid,
+# usually the LARGEST speed data point, so speed math uses 100 as their
+# effective final value.
+_ACTION_THRESHOLD = 100.0
+
 
 def _detect_phase(characters: list[dict]) -> str:
     """Detect the screenshot phase from extracted action values.
@@ -1111,7 +1215,8 @@ def _has_battle_start_ag(name: str) -> bool:
     if not ch:
         return False
     for s in ch.get("skills", []):
-        for e in s.get("ag_effects", []):
+        effs = getattr(s, "ag_effects", None) or s.get("ag_effects", [])
+        for e in effs:
             if e.get("trigger") == "battle_start":
                 return True
     return False
@@ -1136,18 +1241,89 @@ def _find_first_actor(results: list[dict]) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _row_skill_cells(path: str, result: dict, name: str) -> list[dict] | None:
-    """Per-slot ``{saturation, value, grayed}`` for *name*'s row, or None."""
-    frame = result.get("frame")
-    c = next((c for c in result.get("characters", [])
-              if c.get("name") == name and c.get("bbox")), None)
-    if not frame or c is None:
-        return None
-    ys = [p[1] for p in c["bbox"]]
+def _observe_all_cooldowns(
+    post_path: str, post_result: dict,
+    pre_path: str | None = None, pre_result: dict | None = None,
+) -> dict:
+    """B2 observation over EVERY post row: fresh cooldowns per character.
+
+    Darkened icons are NOT always cooldowns — 沉默类控制 and 战意/集中力不足
+    also dim skills, and S1 never has a cooldown.  Disambiguation rules:
+
+    * a row carrying a 沉默 icon is skipped entirely (not ``seen``);
+    * slot 0 (S1) is never a cooldown → excluded;
+    * with a pre screenshot, a slot already darkened there is CC/cost
+      dimming (nothing was on cooldown pre-battle) → only slots that turned
+      dark between pre and post count as fresh cooldowns.
+
+    Returns ``{"fresh": {(name, side): [slot, …]}, "seen": {(name, side):
+    True}}``.  Keys are (name, side) pairs — mirror rows (same character on
+    both sides) are kept apart.  A row is ``seen`` only when its skill
+    strip was readable in the post shot; for seen rows the ABSENCE of a
+    fresh cooldown is authoritative evidence the skill was not cast.
+    """
+    out: dict = {"fresh": {}, "seen": {}}
+    chars = post_result.get("characters", [])
+    frame = post_result.get("frame")
+    if not chars or not frame:
+        return out
     from lib.ocr_engine import SkillCooldownDetector
-    rgb = np.array(Image.open(path).convert("RGB"))
-    return SkillCooldownDetector.detect_row_skills(
-        rgb, frame, int(min(ys)), int(max(ys)))
+    try:
+        post_rgb = np.array(Image.open(post_path).convert("RGB"))
+    except Exception as e:
+        print(f"[battle_parser] cooldown observation skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return out
+    pre_rgb = None
+    if pre_path is not None and pre_result is not None:
+        try:
+            pre_rgb = np.array(Image.open(pre_path).convert("RGB"))
+        except Exception:
+            pre_rgb = None
+
+    row_buffs = post_result.get("row_buffs") or []
+    pre_chars = (pre_result or {}).get("characters", [])
+    pre_frame = (pre_result or {}).get("frame")
+
+    for idx, c in enumerate(chars):
+        name, side = c.get("name"), c.get("side")
+        if not name or not c.get("bbox"):
+            continue
+        key = (name, side)
+        # 沉默类控制 darkens the whole row's skills → not a cooldown signal.
+        if idx < len(row_buffs) and \
+                any("沉默" in bn for bn in (row_buffs[idx] or {})):
+            continue
+        ys = [p[1] for p in c["bbox"]]
+        try:
+            post_row = SkillCooldownDetector.detect_row_skills(
+                post_rgb, frame, int(min(ys)), int(max(ys)))
+        except Exception as e:
+            print(f"[battle_parser] cooldown observation skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            continue
+        if not post_row:
+            continue
+        out["seen"][key] = True
+        grayed = [i for i, s in enumerate(post_row) if s["grayed"] and i != 0]
+        if grayed and pre_rgb is not None and pre_frame is not None:
+            pc = next((p for p in pre_chars
+                       if p.get("name") == name and p.get("side") == side
+                       and p.get("bbox")), None)
+            pre_row = None
+            if pc is not None:
+                pys = [p[1] for p in pc["bbox"]]
+                try:
+                    pre_row = SkillCooldownDetector.detect_row_skills(
+                        pre_rgb, pre_frame, int(min(pys)), int(max(pys)))
+                except Exception:
+                    pre_row = None
+            if pre_row:
+                grayed = [i for i in grayed
+                          if i < len(pre_row) and not pre_row[i]["grayed"]]
+        if grayed:
+            out["fresh"][key] = grayed
+    return out
 
 
 def _observe_first_skill_slot(
@@ -1157,48 +1333,22 @@ def _observe_first_skill_slot(
     """B2 observation: the on-cooldown skill slot on the first actor's row.
 
     The post screenshot still shows the first actor on the acting row with
-    the just-cast skill grayed ("N回合").  Darkened icons are NOT always
-    cooldowns — 沉默类控制 and 战意/集中力不足 also dim skills, and S1 never
-    has a cooldown.  Disambiguation rules:
-
-    * a 沉默 icon on the acting row → observation discarded;
-    * slot 0 (S1) is never a cooldown → excluded;
-    * with a pre screenshot, a slot already darkened there is CC/cost
-      dimming (nothing was on cooldown pre-battle) → only slots that turned
-      dark between pre and post count as fresh cooldowns.
-
-    Returns the unique remaining grayed slot index, or None when
-    ambiguous/absent (caller falls back to the L2 prediction, §7).
+    the just-cast skill grayed ("N回合").  Thin wrapper over
+    :func:`_observe_all_cooldowns`: returns the UNIQUE fresh slot on the
+    acting row, or None when ambiguous/absent (caller falls back to the
+    L2 prediction, §7).
     """
     chars = result.get("characters", [])
     acting = next((c for c in chars if c.get("acting") and c.get("bbox")), None)
     if acting is None:
         return None
-
-    # 沉默类控制 darkens the whole row's skills → not a cooldown signal.
-    idx = chars.index(acting)
-    row_buffs = result.get("row_buffs") or []
-    if idx < len(row_buffs) and any("沉默" in bn for bn in (row_buffs[idx] or {})):
+    obs = _observe_all_cooldowns(path, result, pre_path, pre_result)
+    slots = obs["fresh"].get((acting["name"], acting.get("side")))
+    if not slots or len(slots) != 1:
         return None
-
-    try:
-        post_row = _row_skill_cells(path, result, acting["name"])
-        if not post_row:
-            return None
-        grayed = [i for i, s in enumerate(post_row) if s["grayed"] and i != 0]
-        if pre_path is not None and pre_result is not None:
-            pre_row = _row_skill_cells(pre_path, pre_result, acting["name"])
-            if pre_row:
-                grayed = [i for i in grayed if not pre_row[i]["grayed"]]
-        slot = grayed[0] if len(grayed) == 1 else None
-    except Exception as e:
-        print(f"[battle_parser] cooldown observation skipped: "
-              f"{type(e).__name__}: {e}", file=sys.stderr)
-        return None
-    if slot is not None:
-        print(f"[battle_parser] B2 observed first-actor cooldown slot "
-              f"{slot + 1} on 「{acting.get('name')}」", file=sys.stderr)
-    return slot
+    print(f"[battle_parser] B2 observed first-actor cooldown slot "
+          f"{slots[0] + 1} on 「{acting.get('name')}」", file=sys.stderr)
+    return slots[0]
 
 
 def _build_ag_trigger_hypothesis(results: list[dict],
@@ -1217,6 +1367,7 @@ def _build_ag_trigger_hypothesis(results: list[dict],
         return None
 
     observed_slot = None
+    observed = None
     if paths:
         post_rp = pre_rp = None
         for result in results:
@@ -1228,11 +1379,22 @@ def _build_ag_trigger_hypothesis(results: list[dict],
             elif result.get("phase") == "pre" and pre_rp is None:
                 pre_rp = (paths[i], result)
         if post_rp:
-            observed_slot = _observe_first_skill_slot(
+            observed = _observe_all_cooldowns(
                 post_rp[0], post_rp[1],
                 pre_rp[0] if pre_rp else None,
                 pre_rp[1] if pre_rp else None,
             )
+            # first-actor slot: the UNIQUE fresh cooldown on the acting row
+            acting = next((c for c in post_rp[1].get("characters", [])
+                           if c.get("acting") and c.get("bbox")), None)
+            if acting:
+                slots = observed["fresh"].get(
+                    (acting["name"], acting.get("side")))
+                if slots and len(slots) == 1:
+                    observed_slot = slots[0]
+                    print(f"[battle_parser] B2 observed first-actor cooldown "
+                          f"slot {slots[0] + 1} on 「{acting.get('name')}」",
+                          file=sys.stderr)
 
     team: list[dict] = []
     seen: set[tuple] = set()
@@ -1252,7 +1414,8 @@ def _build_ag_trigger_hypothesis(results: list[dict],
     except Exception:
         return None
     return build_hypothesis(team, first_actor, idx,
-                            first_skill_slot=observed_slot)
+                            first_skill_slot=observed_slot,
+                            observed=observed)
 
 
 async def _apply_l4(hypothesis: dict | None) -> None:
@@ -1342,16 +1505,34 @@ def _format_pair_result(
     merged = []
     all_keys = set(pre_chars.keys()) | set(post_chars.keys())
 
+    acting_keys = [k for k in all_keys
+                   if (post_chars.get(k) or {}).get("acting")]
+    acting_name: str | None = None
     for key in all_keys:
         pre_c = pre_chars.get(key)
         post_c = post_chars.get(key)
         name, side = key
-        merged.append({
+        entry = {
             "name": name,
             "side": side,
             "init_action_value": pre_c.get("action_value") if pre_c else None,
             "current_action_value": post_c.get("action_value") if post_c else None,
-        })
+        }
+        if post_c and post_c.get("acting"):
+            entry["acting"] = True
+            # The acting row reads 0% (gauge reset on acting); within this
+            # window the character actually ran init→100 and acted.  Expose
+            # the effective final value so speed math can include them —
+            # but only when the acting row is unambiguous.
+            if len(acting_keys) == 1:
+                entry["effective_current_action_value"] = _ACTION_THRESHOLD
+                acting_name = name
+        merged.append(entry)
+    if len(acting_keys) > 1:
+        warnings.append(
+            "跑条后截图出现多个行动值≈0%的行，无法确定谁刚行动完，"
+            "未对正在行动角色按 100% 折算，请人工核对。"
+        )
 
     allies = [c for c in merged if c.get("side") == "ally"]
     enemies = [c for c in merged if c.get("side") == "enemy"]
@@ -1389,6 +1570,13 @@ def _format_pair_result(
         "raw_format": raw_lines,
     }
 
+    if acting_name:
+        result["acting_note"] = (
+            f"「{acting_name}」为截图时正在行动的角色，显示 0% 是行动后归零；"
+            f"本窗口内其行动值实际由初始跑满 100% 并出手，是有效测速数据点。"
+            f"calculate_speed 时其结束行动值按 100 计（raw_format 已如此填写），不要剔除。"
+        )
+
     if pre_valid is not None:
         result["pre_valid"] = pre_valid
         if not pre_valid:
@@ -1411,9 +1599,12 @@ def _format_pair_result(
     if ag_trigger_hypothesis:
         result["ag_trigger_hypothesis"] = ag_trigger_hypothesis
         result["ag_trigger_note"] = (
-            "已根据 wiki AI 释放规则 + 触发链解析，生成行动值触发假设"
-            "（见 ag_trigger_hypothesis）。请与用户确认 chain/uncertain 中"
-            "各拉条/推条是否实际触发，再据此修正行动值差。"
+            "已根据技能文案触发链 + 截图冷却态证据，生成行动值触发判定"
+            "（见 ag_trigger_hypothesis）。chain 中 confirmed=true 的条目"
+            "有冷却态佐证，按事实直接采用并据此修正行动值差，不要向用户"
+            "求证；not_triggered 为冷却态判定未触发的条目，不要列出也不要"
+            "提问；仅对 uncertain 中的条目（概率性/条件门/反击套装）按其"
+            "note 向用户提问。"
         )
 
     return json.dumps(result, ensure_ascii=False, indent=2)
@@ -1438,19 +1629,25 @@ def _build_raw_format(
     """
     lines = []
 
+    def _final_av(c: dict):
+        # Acting characters: effective 100 (full gauge) instead of the 0%
+        # the post screenshot displays.
+        eff = c.get("effective_current_action_value")
+        if eff is not None:
+            return eff
+        return c.get("current_action_value", c.get("action_value", 0)) or 0
+
     if allies:
         lines.append("我方")
         for c in allies:
             init_av = c.get("init_action_value", c.get("action_value", 0)) or 0
-            cur_av = c.get("current_action_value", c.get("action_value", 0)) or 0
-            lines.append(f"{c['name']} {init_av} {cur_av} 0")
+            lines.append(f"{c['name']} {init_av} {_final_av(c)} 0")
 
     if enemies:
         lines.append("敌方")
         for c in enemies:
             init_av = c.get("init_action_value", c.get("action_value", 0)) or 0
-            cur_av = c.get("current_action_value", c.get("action_value", 0)) or 0
-            lines.append(f"{c['name']} {init_av} {cur_av}")
+            lines.append(f"{c['name']} {init_av} {_final_av(c)}")
 
     return "\n".join(lines)
 
