@@ -1137,20 +1137,6 @@ def _find_first_actor(results: list[dict]) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _row_skill_cells(path: str, result: dict, name: str) -> list[dict] | None:
-    """Per-slot ``{saturation, value, grayed}`` for *name*'s row, or None."""
-    frame = result.get("frame")
-    c = next((c for c in result.get("characters", [])
-              if c.get("name") == name and c.get("bbox")), None)
-    if not frame or c is None:
-        return None
-    ys = [p[1] for p in c["bbox"]]
-    from lib.ocr_engine import SkillCooldownDetector
-    rgb = np.array(Image.open(path).convert("RGB"))
-    return SkillCooldownDetector.detect_row_skills(
-        rgb, frame, int(min(ys)), int(max(ys)))
-
-
 def _observe_all_cooldowns(
     post_path: str, post_result: dict,
     pre_path: str | None = None, pre_result: dict | None = None,
