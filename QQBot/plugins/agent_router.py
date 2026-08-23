@@ -54,11 +54,7 @@ from agent.quota_cleanup import (
     format_cleanup_prompt,
     resolve_targets,
 )
-from lib.deepseek_client import deepseek_client as _global_client, DeepSeekClient as _DeepSeekClient
 from lib.model_router import ModelRouter
-
-# Handle case where NoneBot is not running (testing)
-deepseek_client = _global_client if _global_client is not None else _DeepSeekClient()
 from tools.builtin_tools import (
     execute_code,
     get_system_load,
@@ -878,11 +874,16 @@ _memory_system = MemorySystem(
     base_dir=os.path.join(_DATA_DIR, "memory"),
 )
 
+# Model router is built first so downstream components use the JSON-configured
+# reasoning model (models_settings.json) with a fallback to the .env DeepSeek
+# config — instead of the .env-only global client.
+_model_router = ModelRouter()
+
 _profile_manager = ProfileManager(
     base_dir=_USER_DATA_ROOT,
 )
 # The client is set after agent creation since agent owns the validated client
-_profile_manager.set_client(deepseek_client)
+_profile_manager.set_client(_model_router.reasoning_client)
 
 _hardware_detector = HardwareDetector(cache_dir=_USER_DATA_ROOT)
 
@@ -896,7 +897,7 @@ _max_special_sessions = int(os.environ.get("MAX_SPECIAL_SESSIONS", "3"))
 _special_sessions = SpecialSessionManager(
     user_data_root=_USER_DATA_ROOT,
     max_per_user=_max_special_sessions,
-    llm_client=deepseek_client,
+    llm_client=_model_router.reasoning_client,
 )
 
 # Track sessions pending LLM auto-naming: user_id -> True
@@ -906,7 +907,7 @@ _pending_naming: dict = {}
 _pending_delete_confirm: dict = {}
 
 agent = Agent(
-    deepseek_client=deepseek_client,
+    deepseek_client=_model_router.reasoning_client,
     tool_registry=_tool_registry,
     config_dir=_CONFIG_DIR,
     session_manager=_session_manager,
@@ -918,8 +919,6 @@ agent = Agent(
     max_tool_iterations=20,
     thinking_timeout=180.0,
 )
-
-_model_router = ModelRouter()
 
 _continuous_sessions = ContinuousSessionManager(timeout_minutes=1.5)
 

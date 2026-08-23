@@ -391,6 +391,21 @@ def _rgb_to_hue(r: int, g: int, b: int) -> float:
 # ── Buff / Debuff Icon Detection ────────────────────────────────────
 
 
+def _buff_detector_workers() -> int:
+    """Parallel worker count for row buff detection (from .env, min 1).
+
+    ``BUFF_DETECTOR_WORKERS`` is read from the environment (``.env`` is loaded
+    into ``os.environ`` by the bot entry points) and defaults to 2.  The value
+    is clamped to at least 1 so a bad setting can never disable detection.
+    """
+    raw = os.environ.get("BUFF_DETECTOR_WORKERS", "2")
+    try:
+        workers = int(raw)
+    except (TypeError, ValueError):
+        workers = 2
+    return max(1, workers)
+
+
 class BuffDetector:
     """Detect buff/debuff icons in battle screenshots via template matching.
 
@@ -566,12 +581,17 @@ class BuffDetector:
         self,
         image: Any,
         region: tuple[int, int, int, int],
+        template_filter: set[str] | None = None,
     ) -> dict[str, float]:
         """Detect buff icons in a rectangular *region* of *image*.
 
         Args:
             image: BGR numpy array (full screenshot).
             region: ``(x1, y1, x2, y2)`` in pixel coordinates.
+            template_filter: Optional set of icon names to match against.
+                When given, only templates whose name is in the set are
+                tested (the others are skipped), shrinking the per-row cost.
+                ``None`` matches the full template set.
 
         Returns:
             ``{icon_name: confidence}`` for icons whose best correlation
@@ -601,6 +621,8 @@ class BuffDetector:
 
         results: dict[str, float] = {}
         for name, template in self._templates.items():
+            if template_filter is not None and name not in template_filter:
+                continue
             conf = self._match_template_multiscale(roi, template)
             if conf >= self.MATCH_THRESHOLD:
                 results[name] = conf
@@ -614,6 +636,7 @@ class BuffDetector:
         image: Any,
         rows: list[list[dict]],
         frame: tuple[int, int, int, int] | None = None,
+        template_filters: list[set[str] | None] | None = None,
     ) -> list[dict[str, float]]:
         """Detect buff icons in each character row.
 
@@ -665,14 +688,38 @@ class BuffDetector:
                 bands[i][1] + bands[order[pos + 1]][0]) / 2
             cells[i] = (int(max(top_edge, y1)), int(min(bot_edge, y2)))
 
-        results: list[dict[str, float]] = []
+        # Load templates once before spawning threads — the lazy loader is not
+        # re-entrant, and cv2.matchTemplate reads templates read-only afterwards.
+        self._load_templates()
+
+        tasks: list[tuple[int, tuple[int, int, int, int], set[str] | None]] = []
         for i, row_blocks in enumerate(rows):
             if not row_blocks or i not in cells:
-                results.append({})
                 continue
             y1, y2 = cells[i]
             region = (left, y1, right, y2)
-            results.append(self.detect_in_region(image, region))
+            flt = template_filters[i] if template_filters and i < len(template_filters) else None
+            tasks.append((i, region, flt))
+
+        results: list[dict[str, float]] = [{} for _ in rows]
+        if not tasks:
+            return results
+
+        workers = _buff_detector_workers()
+        if workers <= 1 or len(tasks) == 1:
+            for i, region, flt in tasks:
+                results[i] = self.detect_in_region(image, region, flt)
+            return results
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _run(task: tuple[int, tuple[int, int, int, int], set[str] | None]):
+            i, region, flt = task
+            return i, self.detect_in_region(image, region, flt)
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for i, res in ex.map(_run, tasks):
+                results[i] = res
 
         return results
 
