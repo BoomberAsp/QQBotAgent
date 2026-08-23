@@ -40,7 +40,7 @@ _CHAR_DETAIL_CACHE = os.path.join(
     os.path.dirname(__file__), "..", "data", "wiki_cache", "character_details.json"
 )
 
-# Lazily built index: {name_cn: {has_entry_buff, has_entry_morale_focus, ...}}
+# Lazily built index: {name_cn: {has_entry_buff, has_immunity_skill, ...}}
 _skill_index: dict | None = None
 
 
@@ -75,28 +75,24 @@ def _load_character_skill_index() -> dict:
 
         skills = entry.get("skills") or []
         entry_buff = False
-        entry_morale = False
         immunity = False
         action_gauge = False
         ag_skills: list[dict] = []
 
         for s in skills:
-            # Combine all text fields for keyword scanning
-            text = " ".join(
+            # Combine all text fields for keyword scanning.  Joined with
+            # newlines (not spaces) so fragment splitting treats field
+            # boundaries as sentence boundaries.
+            text = "\n".join(
                 str(s.get(k, ""))
                 for k in ("name", "name_en", "des", "des_en", "des2", "des2_en")
             )
             text_lower = text.lower()
 
-            # ── Entry-battle buff: "at battle start" + buff keyword ──
+            # ── Entry-battle buff: "at battle start" + visible status ──
             if not entry_buff:
                 if _match_entry_buff(text, text_lower):
                     entry_buff = True
-
-            # ── Entry-battle morale/focus ──
-            if not entry_morale:
-                if _match_entry_morale(text, text_lower):
-                    entry_morale = True
 
             # ── Immunity skill ──
             if not immunity:
@@ -113,7 +109,6 @@ def _load_character_skill_index() -> dict:
 
         _skill_index[name] = {
             "has_entry_buff": entry_buff,
-            "has_entry_morale_focus": entry_morale,
             "has_immunity_skill": immunity,
             "has_action_gauge_skill": action_gauge,
             "action_gauge_skills": ag_skills,
@@ -147,28 +142,44 @@ _ENTRY_BATTLE_PHRASES = [
     "战斗开始",
 ]
 
-# Phrases that indicate a buff is being granted.
-_BUFF_GRANT_PHRASES = [
-    "grants",
-    "gains",
-    "applies",
-    "granted",
-    "获得",
-    "赋予",
-    "施加",
-    "得到",
-    "增加",
-    "提升",
-]
+# Sentence separators: Chinese sentence punctuation, newlines, and English
+# sentence boundaries (period/!/? followed by whitespace, so decimals like
+# "1.5" don't split).  Time scopes do NOT carry across sentences — effects
+# described in a later sentence belong to that sentence's own trigger.
+_SENTENCE_SPLIT_RE = re.compile(r"[。；;！!\n]|(?<=[.!?])\s+")
 
-# Morale / Focus keywords.
-_MORALE_FOCUS_KEYWORDS = [
-    "morale",
-    "focus",
-    "战意",
-    "集中力",
-    "气魄",
-]
+# Clause separators inside a sentence.  Time scopes DO carry across comma
+# clauses ("首次战斗开始时，获得60点战意，自身附加追击强化" — the 追击强化
+# still belongs to the entry trigger).
+_CLAUSE_SPLIT_RE = re.compile(r"[，,、]")
+
+# Timing phrases that open a NON-entry effect scope (turn/attack/death
+# triggers).  A clause containing one of these is no longer attributed to
+# the battle-start scope.
+_NON_ENTRY_SCOPE_PHRASES = (
+    "回合结束", "回合开始", "每回合", "攻击前", "攻击后", "使用技能后",
+    "死亡时", "生命力低于",
+    "end of turn", "end of the turn", "start of turn", "start of the turn",
+    "each turn", "before attacking", "after attacking",
+    "after using a skill", "upon death", "on death",
+)
+
+# Verbs that grant a VISIBLE status effect (renders a row icon).
+_ENTRY_APPLY_VERBS = ("附加", "施加", "赋予", "applies", "apply")
+
+# Verbs that grant *something* — the object decides whether it is visible.
+_ENTRY_GAIN_VERBS = (
+    "获得", "得到",
+    "gains", "gain", "obtains", "obtain", "grants", "grant", "granted",
+)
+
+# Resources that render NO row icon when granted at battle start
+# (verified visually: 战意/集中力 and entry action-gauge pulls show no
+# status icon; 气魄 IS visible and therefore NOT in this list).
+_ENTRY_INVISIBLE_RESOURCES = (
+    "战意", "集中力", "行动值",
+    "morale", "focus", "combat readiness", "action gauge",
+)
 
 # Immunity keywords.
 _IMMUNITY_KEYWORDS = [
@@ -192,22 +203,66 @@ _ACTION_GAUGE_KEYWORDS = [
 ]
 
 
+# Turn-duration markers on a granted status, e.g. 气魄(3回合) / [2回合].
+_DURATION_RE = re.compile(r"[(\[]\s*\d+\s*[-~]?\s*\d*\s*(回合|turns?)")
+
+# Periodic re-application triggers: a status re-granted at every turn
+# start/end is visible for the whole battle and therefore enforceable in
+# the pre-screenshot even when each grant carries a turn duration.
+_REAPPLY_PHRASES = (
+    "回合结束时", "回合开始时", "end of turn", "start of turn",
+)
+
+
 def _match_entry_buff(text: str, text_lower: str) -> bool:
-    """True if *text* describes a buff granted at the start of battle."""
-    has_entry = any(p in text_lower for p in _ENTRY_BATTLE_PHRASES)
-    if not has_entry:
-        return False
-    has_buff = any(p in text_lower for p in _BUFF_GRANT_PHRASES)
-    return has_buff
+    """True if *text* grants a VISIBLE status at the start of battle that
+    is enforceable in pre-screenshot validation.
 
+    Judged clause-by-clause with time-scope tracking: a clause containing
+    an entry phrase ("首次战斗开始时") opens the entry scope, a clause with
+    a turn/attack/death trigger resets it, and a comma clause without any
+    time phrase inherits the previous scope ("…，自身附加看破" belongs to
+    the entry clause before it).  Scopes never carry across a sentence
+    break, so later triggered effects ("…获得50战意\\n敌人产生追加回合时…
+    附加X") do not count X as an entry buff.  Entry Morale/Focus
+    ("获得50战意") and entry action-gauge pulls ("行动值提升[10-20%]")
+    render no row icon, so they are NOT entry buffs and must not be
+    enforced by the pre-screenshot validation.
 
-def _match_entry_morale(text: str, text_lower: str) -> bool:
-    """True if *text* describes Morale/Focus gained at the start of battle."""
-    has_entry = any(p in text_lower for p in _ENTRY_BATTLE_PHRASES)
-    if not has_entry:
-        return False
-    has_morale = any(kw in text_lower for kw in _MORALE_FOCUS_KEYWORDS)
-    return has_morale
+    A battle-start-only grant with a turn duration (菲莉西娅 气魄(3回合))
+    expires naturally a few turns in, so its absence in a mid-battle
+    pre-screenshot proves nothing — not enforceable.  Grants without a
+    duration, or re-applied at every turn start/end (朱音 潜伏(1回合),
+    贝儿 反击(1回合)), are visible for the whole battle and enforceable.
+    """
+    reapply = any(p in text_lower for p in _REAPPLY_PHRASES)
+    for sentence in _SENTENCE_SPLIT_RE.split(text_lower):
+        scopes: set[str] = set()  # active time scopes: "entry" / "other"
+        for clause in _CLAUSE_SPLIT_RE.split(sentence):
+            if not clause.strip():
+                continue
+            has_entry = any(p in clause for p in _ENTRY_BATTLE_PHRASES)
+            has_other = any(p in clause for p in _NON_ENTRY_SCOPE_PHRASES)
+            if has_entry or has_other:
+                scopes = set()
+                if has_entry:
+                    scopes.add("entry")
+                if has_other:
+                    scopes.add("other")
+            if "entry" not in scopes:
+                continue
+            # 附加/施加/赋予 (applies) always introduce a visible status.
+            applies = any(v in clause for v in _ENTRY_APPLY_VERBS)
+            # 获得/得到 (gains) — only when the object is not an invisible
+            # resource.  气魄 counts (it renders an icon).
+            gains = any(v in clause for v in _ENTRY_GAIN_VERBS) and not any(
+                r in clause for r in _ENTRY_INVISIBLE_RESOURCES)
+            if not (applies or gains):
+                continue
+            if _DURATION_RE.search(clause) and not reapply:
+                continue  # transient: expires mid-battle, not enforceable
+            return True
+    return False
 
 
 def _match_immunity(text: str, text_lower: str) -> bool:
@@ -578,7 +633,27 @@ def _detect_row_bands(
                 _flush()
                 side, gap = 0, 0
     _flush()
-    return bands
+
+    # Adjacent banners of the same side can merge into one tall band when
+    # the colourless seam between them is narrower than gap_tol (e.g. two
+    # stacked allies).  Split any band taller than ~1.5 card heights into
+    # equal card-sized pieces so each character row gets its own bbox.
+    unit = frame_h * 0.13
+    split: list[dict] = []
+    for bd in bands:
+        bh = bd["y1"] - bd["y0"]
+        n = max(1, int(round(bh / unit)))
+        if n == 1:
+            split.append(bd)
+            continue
+        step = bh / n
+        for k in range(n):
+            split.append({
+                "side": bd["side"],
+                "y0": int(bd["y0"] + k * step),
+                "y1": int(bd["y0"] + (k + 1) * step),
+            })
+    return sorted(split, key=lambda b: b["y0"])
 
 
 # ── Single-image parsing ────────────────────────────────────────────
@@ -688,7 +763,6 @@ async def _parse_single(path: str) -> dict:
     matcher = get_name_matcher()
 
     characters = []
-    buff_rows: list[list[dict]] = []
     for i, row in enumerate(rows):
         ne = row["name_e"]
         raw_name = _clean_name(ne["text"].strip())
@@ -732,19 +806,24 @@ async def _parse_single(path: str) -> dict:
             "acting": False,
             "bbox": bbox,
         })
-        buff_rows.append([{"bbox": bbox}])
 
     # 4. Post-process: identify acting character, sort, dedup, cap/side
     characters = _post_process(characters, image)
 
-    # 5. Buff detection per row (for validity checks)
+    # 5. Buff detection per row (for validity checks).  Rows are built from
+    # the FINAL (post-processed) character list so row_buffs[i] aligns with
+    # characters[i] — _post_process sorts/dedups, which broke the old
+    # loop-order alignment.
     row_buffs: list[dict] = []
     try:
         import cv2
         img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         from lib.ocr_engine import BuffDetector
         detector = BuffDetector()
-        row_buffs = detector.detect_in_rows(img_bgr, buff_rows, frame)
+        rows_for_buffs = [
+            [{"bbox": c["bbox"]}] if c.get("bbox") else [] for c in characters
+        ]
+        row_buffs = detector.detect_in_rows(img_bgr, rows_for_buffs, frame)
     except Exception as e:
         print(f"[battle_parser] Buff detection skipped: {type(e).__name__}: {e}",
               file=sys.stderr)
@@ -897,16 +976,19 @@ def _validate_pre_screenshot(
 ) -> tuple[bool, list[str]]:
     """Check whether the pre-battle screenshot is valid (乱速 completed).
 
-    Implements the three rules from PLAN.md Idea 8:
+    Implements the two rules from PLAN.md Idea 8:
 
-    1. **Entry-battle buffs**: Characters with skills that grant buffs at the
-       start of battle must show buff icons in the pre-screenshot.  If the
-       character has no such skill, the row is vacuously valid.
-    2. **Entry-battle Morale/Focus**: Same pattern — only characters whose
-       skills grant Morale/Focus *at battle start* are checked.
-    3. **Immunity gear**: Characters with 免疫 in the post-screenshot who do
-       NOT have an immunity skill are wearing 免疫 gear.  Those characters
-       must show 免疫 in the pre-screenshot.
+    1. **Entry-battle buffs** (blocking): Characters with skills that grant
+       a VISIBLE status at the start of battle must show buff icons in the
+       pre-screenshot.  If the character has no such skill, the row is
+       vacuously valid.
+    2. **Immunity gear** (advisory only): Characters with 免疫 in the
+       post-screenshot but not in the pre-screenshot, and no immunity skill,
+       *may* be wearing unloaded 免疫 gear — but post-only immunity is also
+       produced by skill grants / conditional triggers mid-battle, and the
+       two render identically (same icon, same duration badge), so gear
+       loadout is private knowledge.  Therefore this case is reported as a
+       warning and never blocks validity.
 
     Args:
         pre: Result dict from ``_parse_single`` for the pre-screenshot.
@@ -914,9 +996,8 @@ def _validate_pre_screenshot(
               (may be None for single-screenshot mode).
 
     Returns:
-        ``(is_valid, warnings)`` — *is_valid* is True only when all three
-        rules pass. *warnings* contains human-readable explanations for
-        each failing rule.
+        ``(is_valid, warnings)`` — *is_valid* reflects rule 1 only; rule 2
+        contributes advisory entries to *warnings*.
     """
     warnings: list[str] = []
     pre_chars = pre.get("characters", [])
@@ -952,32 +1033,9 @@ def _validate_pre_screenshot(
             )
             rule1_ok = False
 
-    # ── Rule 2: Entry-battle Morale/Focus ──
-    rule2_ok = True
-    for c in pre_chars:
-        name = c.get("name", "")
-        info = get_character_skill_info(name)
-        if info is None:
-            continue
-        if not info.get("has_entry_morale_focus"):
-            continue  # vacuously valid
-
-        # Character has entry-battle morale/focus → must see 气魄/战意 icon
-        row_buffs = _buffs_for_char(pre_chars, pre_row_buffs, name)
-        has_morale_icon = any(
-            kw in buff_name.lower()
-            for buff_name in row_buffs
-            for kw in ("气魄", "morale", "战意", "集中力", "focus")
-        )
-        if not has_morale_icon:
-            warnings.append(
-                f"规则2（进战战意/集中力）：角色「{name}」拥有进战获得战意/集中力"
-                f"的技能，但跑条前截图中未检测到对应图标（可能乱速尚未完成）"
-            )
-            rule2_ok = False
-
-    # ── Rule 3: Immunity gear ──
-    rule3_ok = True
+    # ── Rule 2 (advisory): immunity seen post but not pre ──
+    # Not blocking: post-only immunity has two indistinguishable causes
+    # (unloaded gear vs skill grant / conditional trigger mid-battle).
     if post:
         # Step A: Find characters in post-screenshot with 免疫 but no 免疫 skill
         gear_immune_names: set[str] = set()
@@ -995,13 +1053,12 @@ def _validate_pre_screenshot(
             row_buffs = _buffs_for_char(pre_chars, pre_row_buffs, name)
             if not any("免疫" in bn for bn in row_buffs):
                 warnings.append(
-                    f"规则3（免疫套装）：角色「{name}」穿戴免疫套装（跑条后检测到免疫，"
-                    f"且无免疫技能），但跑条前截图中未检测到免疫图标（可能乱速尚未完成）"
+                    f"提示（免疫套装）：角色「{name}」跑条后检测到免疫（且无免疫技能），"
+                    f"但跑条前截图中未检测到免疫图标。若其穿戴免疫套装，说明乱速尚未"
+                    f"完成；若免疫来自战斗中的技能赋予/条件触发，则截图有效。"
                 )
-                rule3_ok = False
 
-    is_valid = rule1_ok and rule2_ok and rule3_ok
-    return is_valid, warnings
+    return rule1_ok, warnings
 
 
 # ── Action gauge skill summary ──────────────────────────────────────

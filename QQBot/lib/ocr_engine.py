@@ -614,20 +614,26 @@ class BuffDetector:
         image: Any,
         rows: list[list[dict]],
         frame: tuple[int, int, int, int] | None = None,
-        row_padding_y: int = 4,
     ) -> list[dict[str, float]]:
         """Detect buff icons in each character row.
 
         Each row is a list of block dicts carrying a ``bbox`` (from the
-        battle parser's banner-band regions).  The row region is defined as
-        the vertical span of the blocks extended by *row_padding_y*, and the
-        full horizontal width of *frame* (or image).
+        battle parser's banner-band regions).  The row region spans the full
+        horizontal width of *frame* (or image) and, vertically, the row's
+        Voronoi cell: from the midpoint between this row's band and the
+        previous row's band down to the midpoint with the next row's band
+        (frame edges for the first/last row).
+
+        The cell (not band±padding) is essential: buff icons are taller than
+        the OCR text bands (a 47px icon on a 30px band, protruding ~27px
+        below it), and ``TM_CCOEFF_NORMED`` collapses (0.92→0.65) when even a
+        single icon row is clipped.  Cells tile the panel, so every icon is
+        fully inside exactly one row's region.
 
         Args:
             image: BGR numpy array (full screenshot).
             rows: Per-row block lists (each block has a ``bbox`` field).
             frame: Optional ``(l, t, r, b)`` of the central panel.
-            row_padding_y: Extra vertical pixels added above/below each row.
 
         Returns:
             A list parallel to *rows*; each element is ``{icon_name: confidence}``
@@ -635,26 +641,38 @@ class BuffDetector:
         """
         h, w = image.shape[:2]
         left, right = 0, w
+        top_edge, bot_edge = 0, h
         if frame is not None:
-            left, _, right, _ = frame
+            left, top_edge, right, bot_edge = frame
 
-        results: list[dict[str, float]] = []
+        bands: list[tuple[int, int] | None] = []
         for row_blocks in rows:
             if not row_blocks:
+                bands.append(None)
+                continue
+            ys = [p[1] for b in row_blocks for p in b["bbox"]]
+            bands.append((min(ys), max(ys)))
+
+        order = sorted(
+            (i for i, b in enumerate(bands) if b is not None),
+            key=lambda i: (bands[i][0] + bands[i][1]) / 2,
+        )
+        cells: dict[int, tuple[int, int]] = {}
+        for pos, i in enumerate(order):
+            y1 = top_edge if pos == 0 else (
+                bands[order[pos - 1]][1] + bands[i][0]) / 2
+            y2 = bot_edge if pos == len(order) - 1 else (
+                bands[i][1] + bands[order[pos + 1]][0]) / 2
+            cells[i] = (int(max(top_edge, y1)), int(min(bot_edge, y2)))
+
+        results: list[dict[str, float]] = []
+        for i, row_blocks in enumerate(rows):
+            if not row_blocks or i not in cells:
                 results.append({})
                 continue
-
-            ys = []
-            for b in row_blocks:
-                bbox = b["bbox"]
-                ys.extend(p[1] for p in bbox)
-
-            y1 = max(0, int(min(ys)) - row_padding_y)
-            y2 = min(h, int(max(ys)) + row_padding_y)
-
+            y1, y2 = cells[i]
             region = (left, y1, right, y2)
-            row_buffs = self.detect_in_region(image, region)
-            results.append(row_buffs)
+            results.append(self.detect_in_region(image, region))
 
         return results
 
@@ -816,6 +834,215 @@ class SkillCooldownDetector:
                 "grayed": cls.is_grayed(sat, val),
             })
         return out
+
+
+# ── Morale / Focus Bar Detection ────────────────────────────────────
+
+
+class MoraleFocusDetector:
+    """Read the 战意/集中力 resource bar rendered under each row's HP bar.
+
+    Verified pixel layout (see ``test/test_morale_focus.py`` fixtures;
+    labelled visually 2026-08-22):
+
+    * every row card ends with a faction stripe directly below the green
+      HP bar — blue-ish for allies, red-ish for enemies (bottom edge of
+      the side-coloured banner plate);
+    * characters with a resource mechanic render a 5-segment bar a couple
+      of pixels below that stripe (≈7–9 px tall at 1080p, slightly
+      narrower than the HP bar), filled strictly left-to-right:
+
+      - 战意 (morale): filled cells bright azure ``RGB ~(16-54,96-148,
+        240-255)`` on a dark navy empty background ``RGB ~(16,0,64-96)``;
+        5 cells = 100 morale, half-cell = 10;
+      - 集中力 (focus): filled cells pink ``RGB ~(192-255,64-96,144-224)``
+        on a near-black maroon background ``RGB ~(32,0,16-32)``;
+        5 cells = 5 focus.
+
+    The empty background colour identifies the resource kind even at zero
+    fill (navy → morale, maroon → focus).  Rows of characters without the
+    mechanic render no bar below the stripe (``kind=None``).
+
+    Note: the input image is an OpenCV **BGR** array.
+    """
+
+    # mask parameters tuned on the checked-in cal-speed-data screenshots
+    _MIN_BAR_COLS = 100     # real bars span 140–370 px (1x/2x renders)
+    _MIN_BAR_ROWS = 4       # real bars span 7–18 rows
+    _MIN_ROW_PIX = 40       # per-row bar-pixel count to qualify
+
+    @classmethod
+    def detect_in_rows(
+        cls,
+        image: Any,
+        rows: list[list[dict]],
+        frame: tuple[int, int, int, int],
+    ) -> list[dict]:
+        """Return per-row ``{"kind": "morale"|"focus"|None, "cells": float|None}``.
+
+        *rows* mirrors ``BuffDetector.detect_in_rows`` (per-row block lists
+        with ``bbox`` fields).  The HP-bar search is confined to each row's
+        Voronoi cell (midpoint-to-midpoint between neighbouring bands,
+        frame edges for first/last): OCR bands can overlap the neighbour
+        card, and an unconfined search would latch onto the neighbour's HP
+        bar and attribute its resource value to the wrong character.
+        """
+        h, w = image.shape[:2]
+        left, top_edge, right, bot_edge = frame
+
+        bands: list[tuple[int, int] | None] = []
+        for row_blocks in rows:
+            if not row_blocks:
+                bands.append(None)
+                continue
+            ys = [p[1] for b in row_blocks for p in b["bbox"]]
+            bands.append((min(ys), max(ys)))
+
+        order = sorted(
+            (i for i, b in enumerate(bands) if b is not None),
+            key=lambda i: (bands[i][0] + bands[i][1]) / 2,
+        )
+        cells: dict[int, tuple[int, int]] = {}
+        for pos, i in enumerate(order):
+            y1 = top_edge if pos == 0 else (
+                bands[order[pos - 1]][1] + bands[i][0]) / 2
+            y2 = bot_edge if pos == len(order) - 1 else (
+                bands[i][1] + bands[order[pos + 1]][0]) / 2
+            cells[i] = (int(max(top_edge, y1)), int(min(bot_edge, y2)))
+
+        x2 = left + int((right - left) * 0.45)
+        results: list[dict] = []
+        for i, row_blocks in enumerate(rows):
+            if not row_blocks or i not in cells:
+                results.append({"kind": None, "cells": None})
+                continue
+            cy1, cy2 = cells[i]
+            results.append(cls._detect_cell(image, cy1, cy2, left, x2))
+        return results
+
+    @classmethod
+    def _detect_cell(
+        cls,
+        image: Any,
+        y1: int,
+        y2: int,
+        x1: int,
+        x2: int,
+    ) -> dict:
+        """Classify the resource bar below the HP run inside one row cell.
+
+        The HP anchor is confined to the cell, but the strip below it may
+        bleed ~20 px past the cell bottom: with tight row spacing the bar
+        (which protrudes ~12 px below the OCR band) can lie below the
+        Voronoi midpoint while still belonging to this row.
+        """
+        import numpy as np
+
+        h = image.shape[0]
+        cell_h = y2 - y1
+        y2e = min(h, y2 + 20)
+        roi = image[y1:y2e, x1:x2].astype(np.int32)
+        if roi.size == 0:
+            return {"kind": None, "cells": None}
+        # cv2 loads BGR — keep semantic names
+        B, G, R = roi[:, :, 0], roi[:, :, 1], roi[:, :, 2]
+        green = (G > 150) & (R < 120) & (B < 160)
+        counts = green[:cell_h].sum(axis=1)
+        if counts.size == 0 or counts.max() < 20:
+            return {"kind": None, "cells": None}
+
+        thr = max(20, counts.max() * 0.5)
+        ok = counts >= thr
+        runs = []
+        i = 0
+        while i < len(ok):
+            if ok[i]:
+                j = i
+                while j + 1 < len(ok) and ok[j + 1]:
+                    j += 1
+                runs.append([i, j])
+                i = j + 1
+            else:
+                i += 1
+        # merge runs split by ≤4 px gaps (HP bars show 2 px seams)
+        merged = [runs[0]]
+        for s_, e_ in runs[1:]:
+            if s_ - merged[-1][1] <= 4:
+                merged[-1][1] = e_
+            else:
+                merged.append([s_, e_])
+        merged.sort(key=lambda t: -(t[1] - t[0]))
+        ms, me = merged[0]
+        if me - ms + 1 < 4:
+            return {"kind": None, "cells": None}
+
+        xs = np.where(green[ms:me + 1].any(axis=0))[0]
+        gx0, gx1 = int(xs.min()), int(xs.max())
+        gw = gx1 - gx0 + 1
+
+        fill = (B >= 190) & (G >= 55) & (R <= 90)                  # azure
+        navy = (R <= 45) & (G <= 45) & (B >= 40) & (B <= 135)      # morale bg
+        pink = (R >= 140) & (G <= 125) & (B >= 110) & (R >= B - 60)
+        marn = (R >= 12) & (R <= 85) & (G <= 35) & (B <= 50)       # focus bg
+        rimb = (R <= 80) & (G >= 55) & (G <= 115) & (B >= 95) & (B <= 195)
+        rimr = (R >= 60) & (R <= 160) & (G <= 55) & (B <= 85) & (R >= B)
+
+        reg = slice(me + 1, min(roi.shape[0], me + 19))
+        sub = {k: v[reg, gx0:gx1 + 1] for k, v in (
+            ("fill", fill), ("navy", navy), ("pink", pink),
+            ("marn", marn), ("rimb", rimb), ("rimr", rimr))}
+        bar_rows: list[int] = []
+        for rr in range(sub["fill"].shape[0]):
+            c = {k: int(sub[k][rr].sum()) for k in sub}
+            if max(c["rimb"], c["rimr"]) >= 0.5 * gw:
+                continue  # faction stripe under the HP bar, not the resource
+            bar_like = c["fill"] + c["navy"] + c["pink"] + c["marn"]
+            if bar_like >= cls._MIN_ROW_PIX:
+                bar_rows.append(rr)
+        if len(bar_rows) < cls._MIN_BAR_ROWS:
+            return {"kind": None, "cells": None}
+
+        fb = sub["fill"][bar_rows].any(axis=0)
+        pk = sub["pink"][bar_rows].any(axis=0)
+        nv = sub["navy"][bar_rows].any(axis=0)
+        mr = sub["marn"][bar_rows].any(axis=0)
+        # Dark stray pixels (card shadows, banner edges) match the bg masks
+        # far from the bar; keep only the largest contiguous column run
+        # (gap ≤4 bridges the fill/empty border seam).
+        idx = np.where(fb | pk | nv | mr)[0]
+        run_s = run_e = best_s = best_e = int(idx[0])
+        for a, b in zip(idx, idx[1:]):
+            if b - a <= 4:
+                run_e = int(b)
+            else:
+                if run_e - run_s > best_e - best_s:
+                    best_s, best_e = run_s, run_e
+                run_s = run_e = int(b)
+        if run_e - run_s > best_e - best_s:
+            best_s, best_e = run_s, run_e
+        if best_e - best_s + 1 < cls._MIN_BAR_COLS:
+            return {"kind": None, "cells": None}
+        seg = slice(best_s, best_e + 1)
+        fill_mask = fb | pk
+        empty_mask = (nv | mr) & ~fill_mask
+        n_fill, n_empty = (int(fill_mask[seg].sum()),
+                           int(empty_mask[seg].sum()))
+        if n_fill + n_empty < cls._MIN_BAR_COLS:
+            return {"kind": None, "cells": None}
+
+        if fb.any() and not pk.any():
+            kind = "morale"
+        elif pk.any() and not fb.any():
+            kind = "focus"
+        else:  # empty bar: background colour decides (vote over the middle
+            # rows — the bar's top/bottom border rows tint towards navy)
+            mid = bar_rows[1:-1] if len(bar_rows) >= 3 else bar_rows
+            c_navy = int(sub["navy"][mid].sum())
+            c_marn = int(sub["marn"][mid].sum())
+            kind = "morale" if c_navy >= c_marn else "focus"
+        frac = n_fill / (n_fill + n_empty)
+        cells = int(frac * 10 + 0.5) / 2
+        return {"kind": kind, "cells": cells}
 
 
 def sample_side_colour(
