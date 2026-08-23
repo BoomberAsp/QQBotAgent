@@ -13,7 +13,7 @@
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制，分级限制：管理员 60s/100KB，会员 15s/50KB）
 - **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
 - **用户系统** — 长期记忆（Markdown 存储）+ LLM 驱动用户画像提取
-- **游戏工具** — 抽卡模拟（Wiki 自动爬取卡池数据）、战斗测速、乱速概率计算、兑换码查询（自动爬取+手动维护）
+- **游戏工具** — 抽卡模拟（Wiki 自动爬取卡池数据）、团战截图测速（OCR 解析战斗截图，轻量/全量两种模式）、乱速概率计算、角色/羁绊查询（面板/技能/倍率）、兑换码查询（自动爬取+手动维护）
 - **地图服务** — 地址↔坐标转换、实时天气、POI搜索、路线规划（高德地图）
 - **群聊管理** — 按群开关功能（抽卡/图片/语音），超级用户可远程管理
 - **人格切换** — 多套人格（助手/角色扮演），简单提示词驱动，用户可自选
@@ -56,7 +56,13 @@ bash setup.sh
 
 ### 3. 配置密钥
 
-编辑 `QQBot/.env`，填入你的配置：
+`QQBot/.env.example` 是 `.env` 的**说明文档 + 模板**（逐行注释每个变量）。首次配置直接复制并填写：
+
+```bash
+cp QQBot/.env.example QQBot/.env
+```
+
+核心配置项：
 
 ```ini
 DRIVER=~fastapi
@@ -66,16 +72,17 @@ ONEBOT_ACCESS_TOKEN=你的Token
 SUPERUSERS=["管理员的QQ号1","管理员的QQ号2"]
 VIP_USERS=["VIP用户的QQ号1","VIP用户的QQ号2"]
 DEEPSEEK_API_KEY=sk-xxxxxxxx
-DEEPSEEK_API_BASE=https://api.deepseek.com/v1
+DEEPSEEK_API_BASE=https://api.deepseek.com
 SEARXNG_ENDPOINT=http://localhost:8082
 AMAP_API_KEY=你的高德Key  # 可选，用于地图工具
 NAPCAT_HTTP_BASE=http://127.0.0.1:6099  # NapCat HTTP 服务地址
 USER_DATA_ROOT=/path/to/store/users'/data  # 用户数据根目录
 MAX_SPECIAL_SESSIONS=3  # 每用户最大特殊会话数（默认，实际按角色）
 USER_WORKSPACE_QUOTA_MB=500  # 每用户工作区配额 MB（默认，实际按角色）
+BUFF_DETECTOR_WORKERS=2  # 团战测速 buff 图标匹配并行线程数
 ```
 
-**多模型配置（可选）**：编辑 `QQBot/config/models_settings.json` 配置三种模型，留空则回退到 `.env` 默认配置。参考 `QQBot/config/models_settings_example.json` 格式。
+**多模型配置（可选）**：编辑 `QQBot/config/models_settings.json` 配置各模型（REASONING/FLASH/MULTIMODAL/AUDIO/OCR），留空则回退到 `.env` 的 DeepSeek 默认配置。参考 `QQBot/config/models_settings_example.json` 格式。
 
 ### 4. 安装 NapCat（QQ 协议适配）
 
@@ -176,7 +183,7 @@ bash start.sh
 | `start.sh` | 启动所有服务（SearXNG + NoneBot + NapCat 检查） |
 | `stop.sh` | 停止所有服务（NoneBot + SearXNG） |
 | `start_bot.sh` | 仅启动 NoneBot（SearXNG & NapCat 已运行时使用） |
-| `test.sh` | 运行 38 项单元测试 |
+| `test.sh` | 运行测试套件（8 套件） |
 
 ## 目录结构
 
@@ -196,9 +203,10 @@ QQBotAgent/
 │
 └── QQBot/                  # NoneBot 机器人主体
     ├── .env                # 环境变量（密钥 / 服务配置）⚠ git-ignored
+    ├── .env.example        # .env 说明文档 + 模板（逐行注释）
     ├── requirements.txt    # Python 依赖
     ├── pyproject.toml      # NoneBot 项目配置
-    ├── test_agent.py       # 测试套件（38 项测试）
+    ├── test_agent.py       # 测试套件（8 套件）
     │
     ├── agent/              # 智能体核心
     │   ├── agent.py        #   主循环: Think→Act→Observe→Respond
@@ -218,7 +226,7 @@ QQBotAgent/
     │       ├── SOUL.md     #     行为规则 & 能力边界（共享）
     │       ├── IDENTITY.md #     身份声明 & 技术栈
     │       ├── AGENTS.md   #     编排规则 & 系统命令
-    │       ├── TOOLS.md    #     工具文档（22 个工具）
+    │       ├── TOOLS.md    #     工具文档
     │       └── personalities/  # 人格定义（每人一套提示词）
     │           ├── assistant.md     # 助手 Roxy
     │           ├── roxy_character.md # 角色 Roxy (无职转生)
@@ -234,23 +242,35 @@ QQBotAgent/
     │   ├── file_tools.py   #   文件读取（文本 / PDF / 图片 / 音频分析）
     │   ├── map_tools.py    #   地图工具（地理编码 / 天气 / POI / 路径）
     │   ├── legacy_tools.py #   游戏工具（抽卡 / 测速 / 翻译）
+    │   ├── character_detail.py # 角色详情查询（面板/技能/倍率）
+    │   ├── bond_detail.py  #   羁绊详情查询（类别/星级/技能）
+    │   ├── card_renderer.py#   角色/羁绊卡片图片渲染
+    │   ├── battle_parser.py#   团战截图 OCR 解析（行动值修正）
+    │   ├── ocr_name_matcher.py # OCR 角色名模糊匹配
+    │   ├── ag_skill_index.py   # 技能分类索引（触发方式分类）
+    │   ├── ag_trigger_engine.py # 行动值效果触发链推断
     │   ├── wiki_scraper.py #   Wiki 爬虫（角色/羁绊数据自动更新）
     │   └── name_resolver.py#   角色别名解析（模糊匹配）
     │
     ├── lib/                # 库
     │   ├── deepseek_client.py   # DeepSeek API 客户端
     │   ├── model_router.py      # 多模型路由器
-    │   └── multimodal_client.py # 多模态客户端（图片理解 + 音频分析）
+    │   ├── multimodal_client.py # 多模态客户端（图片理解 + 音频分析）
+    │   ├── ocr_engine.py        # OCR 引擎（BuffDetector / 技能冷却检测）
+    │   ├── buff_alias.py        # buff 名称 → 图标标签别名映射
+    │   ├── status_icons.py      # 状态图标文件名 → 中文标签
+    │   └── amap_client.py       # 高德地图 API 客户端
     │
     ├── config/             # 敏感配置 ⚠ git-ignored
     │   ├── models_settings.json         # 多模型配置
-    │   └── models_settings_example.json # 配置模板
+    │   ├── models_settings_example.json # 配置模板
+    │   └── gacha_data.json              # 抽卡数据
     │
     └── data/               # 运行时数据
         ├── sessions/       #   会话持久化
         ├── memory/         #   长期记忆
         ├── users/          #   用户画像
-        └── users/           #   用户数据（按 QQ 号隔离的工作区/会话/画像）
+        └── workspace/      #   用户工作区（按 QQ 号隔离）
 ```
 
 ## 核心架构
@@ -370,7 +390,7 @@ class ContinuousSessionManager:
 | `MemorySystem` | `memory.py` | 长期记忆（Markdown 文件），关键词搜索，最多返回 3 条 |
 | `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣，持久化到 `data/users/` |
 
-## 已注册工具（22 个）
+## 已注册工具（26 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -383,13 +403,17 @@ class ContinuousSessionManager:
 | `get_user_info` | 用户信息快照（权限/会话/工作区/工具范围） |
 | `read_file` | 读取文件（文本 / PDF / 图片 AI 分析 / 音频 AI 分析） |
 | `summarize_pdf` | PDF 提取 + 总结 |
+| `delete_workspace_file` | 删除工作区文件/空目录（释放磁盘） |
 | `download_repo` | Git clone 仓库（HTTPS only） |
 | `translate_text` | 多语言翻译 |
 | `redeem_code` | 游戏兑换码查询（自动爬取+缓存） |
 | `explain_code` | 代码解释 |
 | `gacha_pull` | 抽卡模拟（4 种卡池，数据 JSON 可配） |
 | `play_gacha_animation` | 抽卡动画播放（图片序列） |
-| `calculate_speed` | 游戏战斗测速 |
+| `character_detail` | 角色详情查询（面板/技能/倍率/属性/天赋） |
+| `bond_detail` | 羁绊详情查询（类别/星级/技能/获取方式） |
+| `calculate_speed` | 游戏战斗测速（模板文本或截图解析结果） |
+| `parse_battle_screenshots` | 团战截图 OCR 解析（轻量/全量两种模式） |
 | `compare_speed_probability` | 乱速概率计算 |
 | `geocode` | 地址 → 经纬度坐标查询 |
 | `reverse_geocode` | 经纬度 → 详细地址反查 |
@@ -447,14 +471,15 @@ bash test.sh
 cd QQBot && python test_agent.py
 ```
 
-7 个测试套件，38 项测试：
+8 个测试套件：
 1. **ToolRegistry** — 注册 / Schema / 同步异步执行 / 错误
 2. **SessionManager** — CRUD / 超时 / 裁剪 / 持久化
 3. **MemorySystem** — 保存 / 搜索 / 遗忘 / 列出
-4. **AgentCore** — 启动 / 提示词 / 工具循环 / 迭代上限 / 画像注入
-5. **UserProfile** — 创建 / 事实去重 / 持久化
+4. **UserProfile & ProfileManager** — 创建 / 事实去重 / 持久化
+5. **AgentCore** — 启动 / 提示词 / 工具循环 / 迭代上限 / 画像注入
 6. **DeepSeekClient** — 响应解析（纯文本 / 工具调用 / 混合）
 7. **BuiltinTools** — get_time / execute_code / search_web
+8. **Personality Manager** — 人格优先级 / 模糊匹配 / 歧义拒绝
 
 ## 安全模型
 
