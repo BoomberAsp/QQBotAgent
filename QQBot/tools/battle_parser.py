@@ -996,6 +996,13 @@ def _clean_name(raw: str) -> str:
 # one character has accumulated more.
 _PRE_AV_MAX = 5.0
 
+# Gauge threshold at which a character acts.  The acting row of the post
+# screenshot reads 0% (the gauge reset on acting), but within the pre→post
+# window that character accumulated a full (100 − init) gauge — a valid,
+# usually the LARGEST speed data point, so speed math uses 100 as their
+# effective final value.
+_ACTION_THRESHOLD = 100.0
+
 
 def _detect_phase(characters: list[dict]) -> str:
     """Detect the screenshot phase from extracted action values.
@@ -1498,16 +1505,34 @@ def _format_pair_result(
     merged = []
     all_keys = set(pre_chars.keys()) | set(post_chars.keys())
 
+    acting_keys = [k for k in all_keys
+                   if (post_chars.get(k) or {}).get("acting")]
+    acting_name: str | None = None
     for key in all_keys:
         pre_c = pre_chars.get(key)
         post_c = post_chars.get(key)
         name, side = key
-        merged.append({
+        entry = {
             "name": name,
             "side": side,
             "init_action_value": pre_c.get("action_value") if pre_c else None,
             "current_action_value": post_c.get("action_value") if post_c else None,
-        })
+        }
+        if post_c and post_c.get("acting"):
+            entry["acting"] = True
+            # The acting row reads 0% (gauge reset on acting); within this
+            # window the character actually ran init→100 and acted.  Expose
+            # the effective final value so speed math can include them —
+            # but only when the acting row is unambiguous.
+            if len(acting_keys) == 1:
+                entry["effective_current_action_value"] = _ACTION_THRESHOLD
+                acting_name = name
+        merged.append(entry)
+    if len(acting_keys) > 1:
+        warnings.append(
+            "跑条后截图出现多个行动值≈0%的行，无法确定谁刚行动完，"
+            "未对正在行动角色按 100% 折算，请人工核对。"
+        )
 
     allies = [c for c in merged if c.get("side") == "ally"]
     enemies = [c for c in merged if c.get("side") == "enemy"]
@@ -1544,6 +1569,13 @@ def _format_pair_result(
         "warnings": warnings,
         "raw_format": raw_lines,
     }
+
+    if acting_name:
+        result["acting_note"] = (
+            f"「{acting_name}」为截图时正在行动的角色，显示 0% 是行动后归零；"
+            f"本窗口内其行动值实际由初始跑满 100% 并出手，是有效测速数据点。"
+            f"calculate_speed 时其结束行动值按 100 计（raw_format 已如此填写），不要剔除。"
+        )
 
     if pre_valid is not None:
         result["pre_valid"] = pre_valid
@@ -1597,19 +1629,25 @@ def _build_raw_format(
     """
     lines = []
 
+    def _final_av(c: dict):
+        # Acting characters: effective 100 (full gauge) instead of the 0%
+        # the post screenshot displays.
+        eff = c.get("effective_current_action_value")
+        if eff is not None:
+            return eff
+        return c.get("current_action_value", c.get("action_value", 0)) or 0
+
     if allies:
         lines.append("我方")
         for c in allies:
             init_av = c.get("init_action_value", c.get("action_value", 0)) or 0
-            cur_av = c.get("current_action_value", c.get("action_value", 0)) or 0
-            lines.append(f"{c['name']} {init_av} {cur_av} 0")
+            lines.append(f"{c['name']} {init_av} {_final_av(c)} 0")
 
     if enemies:
         lines.append("敌方")
         for c in enemies:
             init_av = c.get("init_action_value", c.get("action_value", 0)) or 0
-            cur_av = c.get("current_action_value", c.get("action_value", 0)) or 0
-            lines.append(f"{c['name']} {init_av} {cur_av}")
+            lines.append(f"{c['name']} {init_av} {_final_av(c)}")
 
     return "\n".join(lines)
 
