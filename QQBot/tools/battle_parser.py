@@ -1111,7 +1111,8 @@ def _has_battle_start_ag(name: str) -> bool:
     if not ch:
         return False
     for s in ch.get("skills", []):
-        for e in s.get("ag_effects", []):
+        effs = getattr(s, "ag_effects", None) or s.get("ag_effects", [])
+        for e in effs:
             if e.get("trigger") == "battle_start":
                 return True
     return False
@@ -1150,6 +1151,91 @@ def _row_skill_cells(path: str, result: dict, name: str) -> list[dict] | None:
         rgb, frame, int(min(ys)), int(max(ys)))
 
 
+def _observe_all_cooldowns(
+    post_path: str, post_result: dict,
+    pre_path: str | None = None, pre_result: dict | None = None,
+) -> dict:
+    """B2 observation over EVERY post row: fresh cooldowns per character.
+
+    Darkened icons are NOT always cooldowns — 沉默类控制 and 战意/集中力不足
+    also dim skills, and S1 never has a cooldown.  Disambiguation rules:
+
+    * a row carrying a 沉默 icon is skipped entirely (not ``seen``);
+    * slot 0 (S1) is never a cooldown → excluded;
+    * with a pre screenshot, a slot already darkened there is CC/cost
+      dimming (nothing was on cooldown pre-battle) → only slots that turned
+      dark between pre and post count as fresh cooldowns.
+
+    Returns ``{"fresh": {(name, side): [slot, …]}, "seen": {(name, side):
+    True}}``.  Keys are (name, side) pairs — mirror rows (same character on
+    both sides) are kept apart.  A row is ``seen`` only when its skill
+    strip was readable in the post shot; for seen rows the ABSENCE of a
+    fresh cooldown is authoritative evidence the skill was not cast.
+    """
+    out: dict = {"fresh": {}, "seen": {}}
+    chars = post_result.get("characters", [])
+    frame = post_result.get("frame")
+    if not chars or not frame:
+        return out
+    from lib.ocr_engine import SkillCooldownDetector
+    try:
+        post_rgb = np.array(Image.open(post_path).convert("RGB"))
+    except Exception as e:
+        print(f"[battle_parser] cooldown observation skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return out
+    pre_rgb = None
+    if pre_path is not None and pre_result is not None:
+        try:
+            pre_rgb = np.array(Image.open(pre_path).convert("RGB"))
+        except Exception:
+            pre_rgb = None
+
+    row_buffs = post_result.get("row_buffs") or []
+    pre_chars = (pre_result or {}).get("characters", [])
+    pre_frame = (pre_result or {}).get("frame")
+
+    for idx, c in enumerate(chars):
+        name, side = c.get("name"), c.get("side")
+        if not name or not c.get("bbox"):
+            continue
+        key = (name, side)
+        # 沉默类控制 darkens the whole row's skills → not a cooldown signal.
+        if idx < len(row_buffs) and \
+                any("沉默" in bn for bn in (row_buffs[idx] or {})):
+            continue
+        ys = [p[1] for p in c["bbox"]]
+        try:
+            post_row = SkillCooldownDetector.detect_row_skills(
+                post_rgb, frame, int(min(ys)), int(max(ys)))
+        except Exception as e:
+            print(f"[battle_parser] cooldown observation skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            continue
+        if not post_row:
+            continue
+        out["seen"][key] = True
+        grayed = [i for i, s in enumerate(post_row) if s["grayed"] and i != 0]
+        if grayed and pre_rgb is not None and pre_frame is not None:
+            pc = next((p for p in pre_chars
+                       if p.get("name") == name and p.get("side") == side
+                       and p.get("bbox")), None)
+            pre_row = None
+            if pc is not None:
+                pys = [p[1] for p in pc["bbox"]]
+                try:
+                    pre_row = SkillCooldownDetector.detect_row_skills(
+                        pre_rgb, pre_frame, int(min(pys)), int(max(pys)))
+                except Exception:
+                    pre_row = None
+            if pre_row:
+                grayed = [i for i in grayed
+                          if i < len(pre_row) and not pre_row[i]["grayed"]]
+        if grayed:
+            out["fresh"][key] = grayed
+    return out
+
+
 def _observe_first_skill_slot(
     path: str, result: dict,
     pre_path: str | None = None, pre_result: dict | None = None,
@@ -1157,48 +1243,22 @@ def _observe_first_skill_slot(
     """B2 observation: the on-cooldown skill slot on the first actor's row.
 
     The post screenshot still shows the first actor on the acting row with
-    the just-cast skill grayed ("N回合").  Darkened icons are NOT always
-    cooldowns — 沉默类控制 and 战意/集中力不足 also dim skills, and S1 never
-    has a cooldown.  Disambiguation rules:
-
-    * a 沉默 icon on the acting row → observation discarded;
-    * slot 0 (S1) is never a cooldown → excluded;
-    * with a pre screenshot, a slot already darkened there is CC/cost
-      dimming (nothing was on cooldown pre-battle) → only slots that turned
-      dark between pre and post count as fresh cooldowns.
-
-    Returns the unique remaining grayed slot index, or None when
-    ambiguous/absent (caller falls back to the L2 prediction, §7).
+    the just-cast skill grayed ("N回合").  Thin wrapper over
+    :func:`_observe_all_cooldowns`: returns the UNIQUE fresh slot on the
+    acting row, or None when ambiguous/absent (caller falls back to the
+    L2 prediction, §7).
     """
     chars = result.get("characters", [])
     acting = next((c for c in chars if c.get("acting") and c.get("bbox")), None)
     if acting is None:
         return None
-
-    # 沉默类控制 darkens the whole row's skills → not a cooldown signal.
-    idx = chars.index(acting)
-    row_buffs = result.get("row_buffs") or []
-    if idx < len(row_buffs) and any("沉默" in bn for bn in (row_buffs[idx] or {})):
+    obs = _observe_all_cooldowns(path, result, pre_path, pre_result)
+    slots = obs["fresh"].get((acting["name"], acting.get("side")))
+    if not slots or len(slots) != 1:
         return None
-
-    try:
-        post_row = _row_skill_cells(path, result, acting["name"])
-        if not post_row:
-            return None
-        grayed = [i for i, s in enumerate(post_row) if s["grayed"] and i != 0]
-        if pre_path is not None and pre_result is not None:
-            pre_row = _row_skill_cells(pre_path, pre_result, acting["name"])
-            if pre_row:
-                grayed = [i for i in grayed if not pre_row[i]["grayed"]]
-        slot = grayed[0] if len(grayed) == 1 else None
-    except Exception as e:
-        print(f"[battle_parser] cooldown observation skipped: "
-              f"{type(e).__name__}: {e}", file=sys.stderr)
-        return None
-    if slot is not None:
-        print(f"[battle_parser] B2 observed first-actor cooldown slot "
-              f"{slot + 1} on 「{acting.get('name')}」", file=sys.stderr)
-    return slot
+    print(f"[battle_parser] B2 observed first-actor cooldown slot "
+          f"{slots[0] + 1} on 「{acting.get('name')}」", file=sys.stderr)
+    return slots[0]
 
 
 def _build_ag_trigger_hypothesis(results: list[dict],
@@ -1217,6 +1277,7 @@ def _build_ag_trigger_hypothesis(results: list[dict],
         return None
 
     observed_slot = None
+    observed = None
     if paths:
         post_rp = pre_rp = None
         for result in results:
@@ -1228,11 +1289,22 @@ def _build_ag_trigger_hypothesis(results: list[dict],
             elif result.get("phase") == "pre" and pre_rp is None:
                 pre_rp = (paths[i], result)
         if post_rp:
-            observed_slot = _observe_first_skill_slot(
+            observed = _observe_all_cooldowns(
                 post_rp[0], post_rp[1],
                 pre_rp[0] if pre_rp else None,
                 pre_rp[1] if pre_rp else None,
             )
+            # first-actor slot: the UNIQUE fresh cooldown on the acting row
+            acting = next((c for c in post_rp[1].get("characters", [])
+                           if c.get("acting") and c.get("bbox")), None)
+            if acting:
+                slots = observed["fresh"].get(
+                    (acting["name"], acting.get("side")))
+                if slots and len(slots) == 1:
+                    observed_slot = slots[0]
+                    print(f"[battle_parser] B2 observed first-actor cooldown "
+                          f"slot {slots[0] + 1} on 「{acting.get('name')}」",
+                          file=sys.stderr)
 
     team: list[dict] = []
     seen: set[tuple] = set()
@@ -1252,7 +1324,8 @@ def _build_ag_trigger_hypothesis(results: list[dict],
     except Exception:
         return None
     return build_hypothesis(team, first_actor, idx,
-                            first_skill_slot=observed_slot)
+                            first_skill_slot=observed_slot,
+                            observed=observed)
 
 
 async def _apply_l4(hypothesis: dict | None) -> None:
@@ -1411,9 +1484,12 @@ def _format_pair_result(
     if ag_trigger_hypothesis:
         result["ag_trigger_hypothesis"] = ag_trigger_hypothesis
         result["ag_trigger_note"] = (
-            "已根据 wiki AI 释放规则 + 触发链解析，生成行动值触发假设"
-            "（见 ag_trigger_hypothesis）。请与用户确认 chain/uncertain 中"
-            "各拉条/推条是否实际触发，再据此修正行动值差。"
+            "已根据技能文案触发链 + 截图冷却态证据，生成行动值触发判定"
+            "（见 ag_trigger_hypothesis）。chain 中 confirmed=true 的条目"
+            "有冷却态佐证，按事实直接采用并据此修正行动值差，不要向用户"
+            "求证；not_triggered 为冷却态判定未触发的条目，不要列出也不要"
+            "提问；仅对 uncertain 中的条目（概率性/条件门/反击套装）按其"
+            "note 向用户提问。"
         )
 
     return json.dumps(result, ensure_ascii=False, indent=2)
