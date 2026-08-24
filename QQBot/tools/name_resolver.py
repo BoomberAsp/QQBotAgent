@@ -118,6 +118,73 @@ def build_index() -> tuple[dict, dict]:
     return char_index, bond_index
 
 
+# ── Display Alias Map ─────────────────────────────────────────────
+
+_HCODE_RE = re.compile(r"^[Hh]\d+$")
+_ZWSP_RE = re.compile(r"\u200b")
+
+
+def build_display_alias_map(max_aliases: int = 10) -> dict[str, list[str]]:
+    """Build ``{canonical_name: [display_aliases]}`` for battle-parser output.
+
+    Maps each character's canonical full name (the value side of
+    ``character_dic.json``) to the aliases a user is most likely to type when
+    correcting an action value: the bare short name, English names, and
+    community nicknames.  Skin full names (兔女郎爱莉卡) inherit the aliases of
+    their bare short name (爱莉卡) via suffix matching.
+
+    Filters out H-codes (``H153``) and the canonical name itself, strips
+    zero-width spaces, and dedups case-insensitively.  Capped to
+    ``max_aliases`` per character to bound the token cost of attaching aliases
+    to every parsed screenshot.  Returns ``{}`` when the dictionary is absent
+    (e.g. dev machine with no crawled data).
+    """
+    if not os.path.exists(_CHAR_DIC_PATH):
+        return {}
+    with open(_CHAR_DIC_PATH, "r", encoding="utf-8") as f:
+        char_dic = json.load(f)
+
+    by_canon: dict[str, list[str]] = {}
+    for alias, name in char_dic.items():
+        alias = _ZWSP_RE.sub("", alias).strip()
+        if alias:
+            by_canon.setdefault(name, []).append(alias)
+
+    canons = set(by_canon)
+    shorts = {c for c in canons
+              if any(f != c and f.endswith(c) for f in canons)}
+
+    def _rank(alias: str, full: str) -> tuple:
+        # Bare short name first, then English, then shortest-first.
+        return (
+            0 if (not alias.isascii() and full.endswith(alias) and alias != full) else 1,
+            0 if alias.isascii() else 1,
+            len(alias),
+            alias,
+        )
+
+    out: dict[str, list[str]] = {}
+    for full, direct in by_canon.items():
+        seen: set[str] = set()
+        ordered: list[str] = []
+        candidates = list(direct)
+        for short in shorts:
+            if short != full and full.endswith(short):
+                candidates.extend(by_canon.get(short, []))
+        for alias in candidates:
+            alias = _ZWSP_RE.sub("", alias).strip()
+            if not alias or alias == full or _HCODE_RE.match(alias):
+                continue
+            low = alias.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            ordered.append(alias)
+        ordered.sort(key=lambda a: _rank(a, full))
+        out[full] = ordered[:max_aliases]
+    return out
+
+
 # ── Name Resolver ─────────────────────────────────────────────────
 
 class NameResolver:

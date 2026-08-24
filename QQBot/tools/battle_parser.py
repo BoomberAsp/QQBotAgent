@@ -1256,6 +1256,26 @@ def _load_ag_index() -> dict:
     return _ag_index
 
 
+_display_aliases: dict | None = None
+
+
+def _load_display_aliases() -> dict:
+    """Lazily build {canonical_name: [display_aliases]} (see name_resolver).
+
+    Returns {} when the dictionary is unavailable so callers degrade to
+    "no aliases attached".
+    """
+    global _display_aliases
+    if _display_aliases is not None:
+        return _display_aliases
+    try:
+        from tools.name_resolver import build_display_alias_map
+        _display_aliases = build_display_alias_map()
+    except Exception:
+        _display_aliases = {}
+    return _display_aliases
+
+
 def _has_battle_start_ag(name: str) -> bool:
     """True if *name* has a battle_start action-gauge passive (拉条)."""
     idx = _load_ag_index()
@@ -1587,6 +1607,9 @@ def _format_pair_result(
             "init_action_value": pre_c.get("action_value") if pre_c else None,
             "current_action_value": post_c.get("action_value") if post_c else None,
         }
+        aliases = _load_display_aliases().get(name)
+        if aliases:
+            entry["aliases"] = aliases
         if post_c and post_c.get("acting"):
             entry["acting"] = True
             # The acting row reads 0% (gauge reset on acting); within this

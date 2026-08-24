@@ -531,6 +531,7 @@ This document defines all tools available to the agent. Each tool has a name, de
   - `battle_start`：进战即生效的拉条被动，已打入初始行动值（对应 pre_valid 例外）。
   - `observed_evidence=true`：本次判定使用了截图冷却态证据（`confidence` 为 high）。
   - `bond_reminder=true`：必须向用户附「穿戴羁绊」提醒（固定措辞见 AGENTS.md）。
+  - `characters[].aliases`：每个角色名的**别名列表**（如 `兔女郎爱莉卡` → `爱莉卡/Erica/岚/水狙…`）。用户后续修正行动值时可能用别名（昵称/英文名/简称）指代角色——**先把用户给的名字映射回 `characters[].name` 的正式名**（在 aliases 里精确或包含匹配；命中后对齐到该角色行），再套用修正值。不要因别名对不上正式名就报「找不到该角色」。
   - `confidence`：high（有冷却态证据）/medium/low，low 时首动技能需用户确认。
   交互原则：冷却态可判定的（变灰=已发动、未变灰=未发动）一律不向用户提问；只对 `uncertain` 提问。详见 AGENTS.md「截图测速交互流程」第 5 步与 one-shot 范例。
 
