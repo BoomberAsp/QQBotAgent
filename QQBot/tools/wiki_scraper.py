@@ -583,6 +583,19 @@ class WikiScraper:
 
         await asyncio.gather(*(_one(e) for e in entries), return_exceptions=True)
 
+    async def _background_download_then_render(self, download_tasks: list, label: str,
+                                               entries: list, kind: str):
+        """Download images first, then render cards — serialized, non-fatal.
+
+        Rendering before the portrait/icon lands produces a placeholder tile
+        (first char of name), and the content hash never changes when the image
+        later arrives, so the placeholder would be cached permanently. Awaiting
+        the downloads before rendering removes that race. Still fire-and-forget
+        from the caller's perspective (wrapped in ``asyncio.create_task``).
+        """
+        await self._background_downloads(download_tasks, label)
+        await self._background_render_cards(entries, kind)
+
     async def _download_character_images(self, entry: dict, semaphore: asyncio.Semaphore):
         """Download portrait / head icon / skill icons for one character.
 
@@ -1012,25 +1025,19 @@ class WikiScraper:
         with open(self._character_detail_cache, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
 
-        # Fire-and-forget image download (portrait / icon / skill icons).
-        # Idempotent and non-fatal: cards degrade to placeholder tiles until
-        # images land.
+        # Fire-and-forget image download + card rendering, serialized so cards
+        # are never drawn before their portrait/icon lands (idempotent and
+        # non-fatal: cards degrade to placeholder tiles until images land).
         try:
             sem = asyncio.Semaphore(4)
             tasks = [self._download_character_images(e, sem) for e in result.values()]
-            asyncio.create_task(self._background_downloads(tasks, "character art"))
-        except Exception as e:
-            print(f"[WikiScraper] character art download skipped: "
-                  f"{type(e).__name__}: {e}", file=sys.stderr)
-
-        # Fire-and-forget card rendering (new/changed cards only, gated by
-        # _card_hash). Keeps the on-demand path instant for repeat lookups.
-        try:
             asyncio.create_task(
-                self._background_render_cards(list(result.values()), "character")
+                self._background_download_then_render(
+                    tasks, "character art", list(result.values()), "character"
+                )
             )
         except Exception as e:
-            print(f"[WikiScraper] character card render skipped: "
+            print(f"[WikiScraper] character art download skipped: "
                   f"{type(e).__name__}: {e}", file=sys.stderr)
 
         return result
@@ -1579,22 +1586,18 @@ class WikiScraper:
         with open(self._bond_detail_cache, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
 
-        # Fire-and-forget icon download (idempotent, non-fatal).
+        # Fire-and-forget icon download + card rendering, serialized so bond
+        # cards are never drawn before their icon lands (idempotent, non-fatal).
         try:
             sem = asyncio.Semaphore(4)
             tasks = [self._download_bond_icon(e, sem) for e in result.values()]
-            asyncio.create_task(self._background_downloads(tasks, "bond icon"))
-        except Exception as e:
-            print(f"[WikiScraper] bond icon download skipped: "
-                  f"{type(e).__name__}: {e}", file=sys.stderr)
-
-        # Fire-and-forget card rendering (new/changed cards only).
-        try:
             asyncio.create_task(
-                self._background_render_cards(list(result.values()), "bond")
+                self._background_download_then_render(
+                    tasks, "bond icon", list(result.values()), "bond"
+                )
             )
         except Exception as e:
-            print(f"[WikiScraper] bond card render skipped: "
+            print(f"[WikiScraper] bond icon download skipped: "
                   f"{type(e).__name__}: {e}", file=sys.stderr)
 
         return result

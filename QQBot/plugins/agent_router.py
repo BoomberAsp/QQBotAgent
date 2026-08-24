@@ -1344,6 +1344,32 @@ _tool_registry.register(
 )
 
 
+def _end_continuous_mode() -> str:
+    """结束当前群聊的连续对话窗口（仅连续对话模式下暴露给 LLM）。
+
+    当用户在连续对话中表达「谢谢」「好的」「不用了」「再见」等结束/告别意图，
+    且任务已完成时，调用此工具主动结束连续窗口，之后用户需 @机器人 才能再次触发。
+    """
+    group_id = _current_group_id.get()
+    user_id = _current_user_id.get()
+    if not group_id or not user_id:
+        return "无法结束连续对话：当前不在群聊连续对话上下文中。"
+    _continuous_sessions.end(group_id, user_id)
+    return "已结束连续对话模式，之后需要@我才能触发。"
+
+
+# end_continuous_mode is registered in the registry but NOT in any permission
+# set — it is unioned into ``allowed_tools`` only in the continuous-mode path
+# (_handle_continuous_message_impl), so it's never offered in the @-mention path.
+_tool_registry.register(
+    "end_continuous_mode", _end_continuous_mode,
+    "结束当前群聊的连续对话窗口。当用户表达「谢谢」「好的」「不用了」「再见」"
+    "等结束或告别意图，且当前任务已完成、无需继续追问时，调用此工具主动退出"
+    "连续模式。调用后用户需要 @机器人 才能再次触发对话。",
+    {"type": "object", "properties": {}, "required": []},
+)
+
+
 # ── Message Handlers ─────────────────────────────────────────────
 
 # Catch ALL messages. For group messages, we manually check for @mentions
@@ -1423,6 +1449,15 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
     # ── Handle session management commands ──────────────────────────
     if text_content.startswith("/") or text_content.startswith("#"):
+        # /取消 / #取消 / /结束 / #结束 — end continuous mode (group only).
+        # The continuous_router (priority=2) skips @mentioned messages, so this
+        # must also be handled here when the user @-mentions the bot; otherwise
+        # the command falls through to the agent loop and never ends the window.
+        if (isinstance(event, GroupMessageEvent)
+                and text_content in ("/取消", "#取消", "/结束", "#结束")):
+            _continuous_sessions.end(str(event.group_id), user_id)
+            await _safe_send("已结束连续对话模式，之后需要@我才能触发~")
+            return
         # /toggle command (group only, superuser only)
         cmd_handled = await _handle_toggle_command(text_content, user_id, event)
         if cmd_handled:
@@ -1828,7 +1863,9 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
 
     continuous_prefix = (
         "[连续对话模式] 用户未@你，正在继续之前的任务。"
-        "回复保持简洁。如果任务已完成，可以建议用户发送 /取消 来退出连续模式。"
+        "回复保持简洁。如果用户表达了「谢谢」「好的」「不用了」「再见」等结束或"
+        "告别意图，且任务已完成、无需继续追问，请调用 end_continuous_mode 工具"
+        "主动结束连续模式，而不是建议用户手动发送 /取消。"
     )
     if context_parts:
         augmented_message = f"{continuous_prefix}\n{'\n'.join(context_parts)}\n用户说: {text_content}"
@@ -1870,6 +1907,9 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             disabled_tools = gf.get_disabled_tools(group_id)
             if disabled_tools:
                 allowed_tools = allowed_tools - disabled_tools
+            # end_continuous_mode is only offered in the continuous path, so the
+            # agent can end the window on a natural-language "thanks/done" signal.
+            allowed_tools = allowed_tools | {"end_continuous_mode"}
             _current_group_id.set(group_id)
             _current_group_context.set(gf.get_disabled_context(group_id))
             # Prepend restriction notice to user message

@@ -45,6 +45,8 @@ python test/test_acting_value.py
 ACTING_EXIT=$?
 python test/test_aliases.py
 ALIAS_EXIT=$?
+python test/test_card_renderer_images.py
+CARDIMG_EXIT=$?
 cd "$SCRIPT_DIR/QQBot"
 
 EXIT_CODE=0
@@ -55,6 +57,7 @@ if [ $ENGINE_EXIT -ne 0 ]; then EXIT_CODE=$ENGINE_EXIT; fi
 if [ $PATH_EXIT -ne 0 ]; then EXIT_CODE=$PATH_EXIT; fi
 if [ $ACTING_EXIT -ne 0 ]; then EXIT_CODE=$ACTING_EXIT; fi
 if [ $ALIAS_EXIT -ne 0 ]; then EXIT_CODE=$ALIAS_EXIT; fi
+if [ $CARDIMG_EXIT -ne 0 ]; then EXIT_CODE=$CARDIMG_EXIT; fi
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}=========================================${NC}"

@@ -209,6 +209,24 @@ def _skill_icon_path(entry: dict, idx: int) -> str:
     return os.path.join(_SKILL_DIR, f"{entry.get('id', '')}_{idx + 1}.png")
 
 
+def _character_images_state(entry: dict) -> str:
+    """Encode which character images (portrait/icon/skills) exist on disk.
+
+    Folded into the card freshness hash so a placeholder card (rendered before
+    its images downloaded) is re-drawn once the images land.
+    """
+    parts = []
+    if entry.get("id"):
+        parts.append("p=" + ("1" if os.path.exists(_portrait_path(entry)) else "0"))
+        parts.append("s=" + "".join(
+            "1" if os.path.exists(_skill_icon_path(entry, i)) else "0"
+            for i in range(3)
+        ))
+    if entry.get("title"):
+        parts.append("i=" + ("1" if os.path.exists(_icon_path(entry)) else "0"))
+    return "|".join(parts)
+
+
 def _skill_meta(sk: dict) -> str:
     parts = []
     if sk.get("type"):
@@ -274,11 +292,23 @@ def bond_card_path(entry: dict) -> str:
     return os.path.join(_BOND_CARD_DIR, f"{name}.png")
 
 
-def _render_if_stale(entry: dict, hash_file: str, path_fn, render_fn) -> str:
-    """Render a card only if its PNG is missing or stale; return its path."""
+def _render_if_stale(entry: dict, hash_file: str, path_fn, render_fn,
+                     images_state_fn=None) -> str:
+    """Render a card only if its PNG is missing or stale; return its path.
+
+    ``images_state_fn`` (optional) returns a string encoding which expected
+    images exist on disk. It is folded into the freshness hash so a card drawn
+    as a placeholder (image missing) is re-drawn once the image lands, even
+    though the entry content itself is unchanged.
+    """
     path = path_fn(entry)
     key = os.path.basename(path)
     h = _entry_hash(entry) + ":" + _RENDERER_VERSION
+    if images_state_fn is not None:
+        try:
+            h += ":" + images_state_fn(entry)
+        except Exception:
+            pass
 
     with _hash_lock:
         if os.path.exists(path) and _load_hashes(hash_file).get(key) == h:
@@ -299,18 +329,22 @@ def render_character_card_if_stale(entry: dict, out_path: str | None = None) -> 
     """Render a character card if missing/stale, else return the cached path."""
     if out_path is not None:
         return _render_if_stale(entry, _CARD_HASH_FILE,
-                                lambda e: out_path, render_character_card)
+                                lambda e: out_path, render_character_card,
+                                _character_images_state)
     return _render_if_stale(entry, _CARD_HASH_FILE,
-                            character_card_path, render_character_card)
+                            character_card_path, render_character_card,
+                            _character_images_state)
 
 
 def render_bond_card_if_stale(entry: dict, out_path: str | None = None) -> str:
     """Render a bond card if missing/stale, else return the cached path."""
     if out_path is not None:
         return _render_if_stale(entry, _BOND_CARD_HASH_FILE,
-                                lambda e: out_path, render_bond_card)
+                                lambda e: out_path, render_bond_card,
+                                _bond_images_state)
     return _render_if_stale(entry, _BOND_CARD_HASH_FILE,
-                            bond_card_path, render_bond_card)
+                            bond_card_path, render_bond_card,
+                            _bond_images_state)
 
 
 # ── Main render ──────────────────────────────────────────────────
@@ -553,6 +587,14 @@ def _bond_class_color(entry: dict) -> tuple:
 
 def _bond_icon_path(entry: dict) -> str:
     return os.path.join(_BOND_ICON_DIR, f"{entry.get('id', '')}.png")
+
+
+def _bond_images_state(entry: dict) -> str:
+    """Encode whether the bond head icon exists on disk (see
+    ``_character_images_state``)."""
+    if not entry.get("id"):
+        return ""
+    return "i=" + ("1" if os.path.exists(_bond_icon_path(entry)) else "0")
 
 
 def render_bond_card(entry: dict, out_path: str | None = None) -> str:
