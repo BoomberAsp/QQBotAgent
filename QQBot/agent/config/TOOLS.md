@@ -293,6 +293,25 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ---
 
+## Tool: redeem_code
+
+**Description**: Query currently valid game redeem/exchange codes. Returns code strings, reward descriptions, and expiry dates. Codes are automatically scraped and cached daily; expired codes (>7 days) are cleaned up automatically.
+
+**When to use**: When the user asks about redeem codes, exchange codes, or 兑换码. Keywords: 兑换码, redeem code, CDK, 礼包码, CDKey.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {},
+  "required": []
+}
+```
+
+**Note**: The `/兑换码` and `/redeem-code` slash commands also trigger this feature directly without going through the agent. The tool is for natural-language requests like "有什么兑换码吗".
+
+---
+
 ## Tool: gacha_pull
 
 **Description**: Execute a game character gacha/recruitment pull. Supports single pulls and ten-pulls across four banner types (标准, UP, 神秘, 银河). **This is the ONLY way to produce real gacha results — never fabricate or simulate gacha output.**
@@ -368,9 +387,20 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: calculate_speed
 
-**Description**: Calculate enemy speed values in a game based on action value changes. Users provide battle data (ally names, initial/final action values, speeds; enemy names, initial/final action values).
+**Description**: Calculate enemy speed values in a game based on action value changes. Users provide battle data (ally names, initial/final action values, speeds; enemy names, initial/final action values). 输入可为「模版文本」或 parse_battle_screenshots 的返回结果。
 
-**When to use**: When the user provides battle data with action values and wants to calculate enemy speeds. Keywords: 测速, 计算速度, compute speed.
+**When to use**: When the user provides battle data with action values and wants to calculate enemy speeds. Keywords: 测速, 计算速度, compute speed. **当用户没有截图、或截图失败时，主动引导用户按模版文本格式粘贴数据**（无需图片）：
+
+```
+我方
+角色名1 初始行动值 结束行动值 速度
+角色名2 初始行动值 结束行动值 速度
+（至少一名我方角色需提供速度）
+敌方
+敌方名1 初始行动值 结束行动值
+敌方名2 初始行动值 结束行动值
+```
+> 速度填 0 表示未知。
 
 **Parameters**:
 ```json
@@ -379,7 +409,7 @@ This document defines all tools available to the agent. Each tool has a name, de
   "properties": {
     "battle_data": {
       "type": "string",
-      "description": "Raw formatted battle data with ally and enemy action values"
+      "description": "Raw formatted battle data with ally and enemy action values (模版文本或 parse_battle_screenshots 输出)"
     }
   },
   "required": ["battle_data"]
@@ -431,6 +461,98 @@ This document defines all tools available to the agent. Each tool has a name, de
     }
   },
   "required": ["code"]
+}
+```
+
+---
+
+## Tool: character_detail
+
+**Description**: 查询 Ark Re:Code 角色的详细资料（面板成长系数、技能、倍率、属性、天赋、潜能）。数据来自 wiki + LLM 翻译，缓存于本地。
+
+**When to use**: 当用户只发送一个角色名/别名（如「夏妮」「狼团长」「Shani」「瞎泥」）而没有其他请求时、用户表示希望得到某角色的信息时或者你需要得到Ark Re:Code角色信息时，调用此工具返回该角色详情。
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "character_name": {
+      "type": "string",
+      "description": "角色名或别名"
+    }
+  },
+  "required": ["character_name"]
+}
+```
+
+---
+
+## Tool: bond_detail
+
+**Description**: 查询 Ark Re:Code 羁绊（Bond/神器）的详细资料（类别、星级、攻击/生命、羁绊技能、获取方式、出售价格、经验值、上线时间）。数据来自 wiki + openrubi 种子 + LLM 翻译，缓存于本地。
+
+**When to use**: 当用户只发送一个羁绊名/别名（如「驰骋的快感」「复活甲」「Pleasure of Exploration」）而没有其他请求时、用户表示希望得到某羁绊的信息时或者你需要得到Ark Re:Code羁绊信息时，调用此工具返回该羁绊详情。
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "bond_name": {
+      "type": "string",
+      "description": "羁绊名或别名"
+    }
+  },
+  "required": ["bond_name"]
+}
+```
+  
+---
+
+## Tool: parse_battle_screenshots
+
+**Description**: 解析 Ark Re:Code 战斗截图：每张图一次 qwen3.5-ocr 调用提取角色名与行动值，横幅颜色带扫描判定阵营（我方/敌方），字形匹配纠偏角色名。接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON（含自动判定的 `phase`：全员行动值≤5% 为 pre，否则 post；双图模式会**自动把两张图排成跑条前→跑条后**，另有 `screenshot_phases`、跑条前有效性 `pre_valid`）和 calculate_speed 兼容的文本格式。**支持两种模式（`mode` 参数）：`light`（轻量，仅提取角色名与行动值，约10秒，跳过技能解析与行动值修正）与 `full`（全量，完整流程：技能解析+行动值修正，约90秒，默认）。**
+
+**When to use**: 当用户上传**或引用**战斗截图并要求测速/分析行动值时，调用此工具提取数据。截图路径会以 `[用户引用了文件 ... 文件路径: xxx]` 或 `[用户上传了图片，已保存至: xxx]` 的形式出现在上下文中——**直接取该路径调用，不要改用 read_file**（read_file 无法做战斗 OCR，会产生无关内容污染上下文）。**调用前先告知用户两种模式的区别（流程与预计用时：轻量约10秒、全量约90秒），按用户选择传入 `mode`。**提取后需展示结果给用户确认，询问我方角色速度值，再调用 calculate_speed。
+
+**重要说明**：
+- **同名角色可出现在双方**：团战/镜像匹配时，同一角色可能同时站在我方和敌方（同名不同阵营），这是正常情况，不要当作「两边阵容对不上」的错误。
+- **本工具专用于 Ark Re:Code**：不要根据技能/机制术语（如「战意」「爆裂」「气魄」）误判为其他游戏，这些都是 Ark Re:Code 自身的机制。
+- **两种模式（mode）**：`light`（轻量）仅返回角色名与行动值（不含 `pre_valid`/`action_gauge_skills`/`ag_trigger_hypothesis`），用于快速测速；`full`（全量）返回完整结果（含上述技能解析字段）。结果中的 `analysis_mode` 字段标明本次使用的模式。
+- **行动值修正**：当返回 `action_gauge_skills`（拉条/推条技能）时，需向用户确认技能是否触发；若触发，引导用户扣除技能的行动值加成（详见 AGENTS.md 截图测速流程第 5 步），而非直接拿原始差值计算。
+- **pre_valid_reasons**：`pre_valid=false` 时的结构化无效原因（逐条：哪条规则、哪个角色）。Agent 必须逐条转述给用户，不得只回「截图无效」（详见 AGENTS.md 流程第 4 步）。
+- **ag_trigger_hypothesis**：行动值触发判定（技能文案触发方式分类 + 截图冷却态证据 + 事件链推断）。字段语义：
+  - `first_actor` / `first_actor_skill`：首动角色与其释放的技能；`first_skill_observed=true` 表示由跑条后截图冷却态（图标变灰 + N回合）佐证，按事实陈述，false 为 AI 规则预测。
+  - `chain`：已触发/推断触发的拉条/推条列表，每项含 `char`/`side`/`skill`/`direction`（pull=拉条, push=推条）/`magnitude`/`target`/`trigger`/`note`。**`confirmed=true` 且 `evidence=observed_cooldown`**：跑条后截图出现新冷却，技能确已发动——按事实直接计入修正，不要求用户确认；无 `confirmed` 的条目是无证据时的推断。
+  - `not_triggered`：冷却态证据判定**未触发**的条目（静默项）——不要列出、不要提问、不要计入修正。
+  - `uncertain`：仅包含截图无法判定的项，需按 `note` 询问用户：`trigger=counter_gear`（反击套装：敌方攻击技能指向该角色时 30% 概率以 S1 反击，装备不可见）、概率性暴击、条件门（触发事件已发生但 HP/状态门无法确认）。`observable=false`。
+  - `trigger_modes`/`generates_extra_turn`：L1 技能分类属性（触发方式集合 / 是否产生追加回合），驱动事件链推断。
+  - `battle_start`：进战即生效的拉条被动，已打入初始行动值（对应 pre_valid 例外）。
+  - `observed_evidence=true`：本次判定使用了截图冷却态证据（`confidence` 为 high）。
+  - `bond_reminder=true`：必须向用户附「穿戴羁绊」提醒（固定措辞见 AGENTS.md）。
+  - `characters[].aliases`：每个角色名的**别名列表**（如 `兔女郎爱莉卡` → `爱莉卡/Erica/岚/水狙…`）。用户后续修正行动值时可能用别名（昵称/英文名/简称）指代角色——**先把用户给的名字映射回 `characters[].name` 的正式名**（在 aliases 里精确或包含匹配；命中后对齐到该角色行），再套用修正值。不要因别名对不上正式名就报「找不到该角色」。
+  - `confidence`：high（有冷却态证据）/medium/low，low 时首动技能需用户确认。
+  交互原则：冷却态可判定的（变灰=已发动、未变灰=未发动）一律不向用户提问；只对 `uncertain` 提问。详见 AGENTS.md「截图测速交互流程」第 5 步与 one-shot 范例。
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "paths": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "截图文件路径列表（1-2 张，跑条前+跑条后）"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["light", "full"],
+      "description": "解析模式。light=轻量（仅提取角色名与行动值，约10秒）；full=全量（完整流程：技能解析+行动值修正，约90秒）。默认 full",
+      "default": "full"
+    }
+  },
+  "required": ["paths"]
 }
 ```
 
@@ -491,6 +613,35 @@ This document defines all tools available to the agent. Each tool has a name, de
 ```
 
 **返回内容**: 用户 ID、权限级别、特殊会话列表（含当前激活标记）、工作区路径及用量百分比、**工作区目录快照**（各子目录文件列表及大小）、可用工具按分类陈列、代码执行限制（如有）。
+
+---
+
+## Tool: delete_workspace_file
+
+**Description**: 删除当前用户工作区内的指定文件或空目录，释放磁盘空间。路径为相对于工作区根目录的路径（如 `uploads/abc.png` 或 `repos/my-repo`）。
+
+**When to use**: 当用户表达删除工作区文件/仓库的意图时（如「删掉那个文件」「帮我清理工作区」「删除那个仓库」）。删除前应先调用 `get_user_info` 获取快照确认目标，不要凭空猜测路径。
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "相对于工作区根目录的路径，如 'uploads/abc.png' 或 'repos/my-repo'"
+    }
+  },
+  "required": ["path"]
+}
+```
+
+**行为与安全约束**:
+- 目标为**文件** → 删除并汇报释放空间
+- 目标为**空目录** → 删除
+- 目标为**非空目录** → 拒绝（防止误删整个目录），提示先删除内部文件
+- 拒绝删除隐藏文件（`.` 开头）、工作区以外的路径、路径穿越（`..`）
+- 删除后主动汇报「释放了 X，剩余 Y MB / Z MB」
 
 ---
 

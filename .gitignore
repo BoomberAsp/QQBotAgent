@@ -1,17 +1,26 @@
-# 数据和日志
-data
-logs
+# ── 运行时数据与日志 ─────────────────────────────
+# 必须锚定根目录（/data）：裸写 data 会匹配任意层级，
+# 把 QQBot/data 也排除掉，导致其 ! 重新收录规则失效。
+/data
+/logs
 con.env
 
-# 虚拟环境
+# ── 虚拟环境 ─────────────────────────────────────
 myenv
 QQBot/.venv
 venv/
 
-# NoneBot 配置
-QQBot/data
+# ── NoneBot / 运行时配置 ─────────────────────────
+# 注意：忽略目录内容（QQBot/data/*）而非目录本身，
+# 否则下方的 ! 重新收录规则不生效（git 不会进入被排除的目录）。
+QQBot/data/*
 !QQBot/data/wiki_cache/
+# 战斗状态图标（wiki 下载产物、可再生）
+QQBot/data/wiki_cache/status_icons/
 !QQBot/data/name_index/
+!QQBot/data/redeem_code/
+!QQBot/data/personality_config.json
+!QQBot/data/group_personality.json
 QQBot/logs
 QQBot/.env
 QQBot/.env.prod
@@ -19,16 +28,37 @@ QQBot/device.json
 QQBot/config/multimodal.json
 QQBot/config/models_settings.json
 
-# IDE
+# ── IDE 与本地工具 ───────────────────────────────
 .idea/
 .vscode/
 *.iml
+.claude/
 
-# Python 缓存
+# ── Python 缓存 ──────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 
-# 临时文件
+# ── 临时文件 ─────────────────────────────────────
 *.log
 *.tmp
+/wiki_card.html
+
+# ── 开发文档与报告（部署不需要）─────────────────
+/CLAUDE.md
+/REPORT.md
+/Assignment4_QQ_Agent_Requirements_Simplified(1).md
+/docs/
+QQBot/docs/
+
+# ── 本地验证数据与脚本（Idea 8 测速）────────────
+# test/ 下的校验脚本、GT、缓存、接触片均为开发产物
+/test/
+# cal-speed-data 里的战斗截图（49 张验证集）不入库，
+# 但 *图标.png 是 BuffDetector 的运行时模板，必须保留。
+QQBot/images/cal-speed-data/*
+!QQBot/images/cal-speed-data/*图标.png
+
+# ── 退役组件（仅本地留档）────────────────────────
+# easyOCR 时代的逐数字模板，qwen3.5-ocr 切换后已无代码引用
+QQBot/config/ocr_digit_templates/

@@ -21,6 +21,32 @@ from .workspace import UserWorkspaceManager
 from .special_session import SpecialSessionManager, SpecialSession
 
 
+# Long-term memory write policy. Only interactions whose combined
+# user+assistant length exceeds MIN_REMEMBER_LEN are persisted, and each user
+# is capped at MAX_MEMORIES_PER_USER entries (oldest pruned first). This keeps
+# the memory store bounded and prevents low-value/hallucinated replies from
+# accumulating and later re-entering the prompt via keyword search.
+MIN_REMEMBER_LEN = 800
+MAX_MEMORIES_PER_USER = 20
+
+
+def _display_tool_name(tool_call: dict) -> str:
+    """Return a human-facing tool name for the progress message.
+
+    ``parse_battle_screenshots`` is annotated with its mode (轻量/全量) so
+    the user can tell the two runs apart.
+    """
+    name = tool_call["function"]["name"]
+    if name != "parse_battle_screenshots":
+        return name
+    try:
+        args = json.loads(tool_call["function"].get("arguments") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return name
+    label = "轻量" if args.get("mode") == "light" else "全量"
+    return f"{name}（{label}）"
+
+
 class Agent:
     """LLM Agent with tool-calling capability.
 
@@ -191,7 +217,7 @@ class Agent:
             if response.get("tool_calls"):
                 # ── Report progress (with deduplication) ────────────
                 if progress_callback:
-                    tool_names = [tc["function"]["name"] for tc in response["tool_calls"]]
+                    tool_names = [_display_tool_name(tc) for tc in response["tool_calls"]]
                     tool_set = frozenset(tool_names)
                     if tool_set != _last_reported_tools:
                         _last_reported_tools = tool_set
@@ -319,6 +345,16 @@ class Agent:
 
         # 1. Global system prompt
         system_content = self.build_system_prompt()
+
+        # 1.5. Personality prompt (injected at the very top)
+        from agent.context import _current_personality
+        from agent.personality import get_personality_manager
+        persona_name = _current_personality.get()
+        if persona_name:
+            pm = get_personality_manager()
+            persona_content = pm.load(persona_name)
+            if persona_content:
+                system_content = persona_content + "\n\n---\n\n" + system_content
         user_id = special_session.user_id if special_session else session.user_id
 
         # 2. Session type marker
@@ -515,23 +551,38 @@ class Agent:
     async def _maybe_remember(
         self, user_id: str, user_message: str, agent_response: str
     ):
-        """Conditionally save important interactions to long-term memory."""
+        """Conditionally save important interactions to long-term memory.
+
+        Only substantive interactions (combined length above MIN_REMEMBER_LEN)
+        are persisted. After saving, the per-user memory list is capped at
+        MAX_MEMORIES_PER_USER, pruning the oldest entries first.
+        """
         if not self.memory:
             return
 
-        # Simple heuristic: save if the interaction seems substantive
-        # (long messages, or containing certain patterns)
         combined_len = len(user_message) + len(agent_response)
-        if combined_len > 300:
-            summary = user_message[:100] + ("..." if len(user_message) > 100 else "")
-            entry = MemoryEntry(
-                name=f"interaction_{user_id}_{int(time.time())}",
-                description=f"Conversation with {user_id}: {summary}",
-                type="user",
-                user_id=user_id,
-                content=f"## User Message\n{user_message}\n\n## Agent Response\n{agent_response[:500]}",
-            )
-            self.memory.save(entry)
+        if combined_len <= MIN_REMEMBER_LEN:
+            return
+
+        summary = user_message[:100] + ("..." if len(user_message) > 100 else "")
+        entry = MemoryEntry(
+            name=f"interaction_{user_id}_{int(time.time())}",
+            description=f"Conversation with {user_id}: {summary}",
+            type="user",
+            user_id=user_id,
+            content=f"## User Message\n{user_message}\n\n## Agent Response\n{agent_response[:500]}",
+        )
+        self.memory.save(entry)
+
+        # Retention: prune oldest entries beyond the per-user cap.
+        try:
+            all_user = self.memory.list_all("user", user_id=user_id)
+            if len(all_user) > MAX_MEMORIES_PER_USER:
+                all_user.sort(key=lambda m: m.created_at)
+                for old in all_user[: len(all_user) - MAX_MEMORIES_PER_USER]:
+                    self.memory.forget(old.name, "user", user_id=user_id)
+        except Exception:
+            pass  # Retention must never break the main flow
 
     # ── Profile Update ──────────────────────────────────────────────
 
