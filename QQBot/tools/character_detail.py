@@ -26,17 +26,32 @@ _CACHE_PATH = os.path.join(
 # Module-level lazy index (rebuilt only once per process)
 _data: dict | None = None
 _by_cn_name: dict = {}
+_by_cn_name_norm: dict = {}
 _by_title: dict = {}
 _by_id: dict = {}
+
+
+def _normalize_name(name: str) -> str:
+    """Normalize a character name for tolerant matching.
+
+    Strips whitespace and the decorative particle ``的`` (users type 新生的伊娥丝
+    for canonical 新生伊娥丝, 新婚的伊娥丝 for 新婚伊娥丝, …) and lowercases, so
+    minor spelling variants still land on the right entry.
+    """
+    return "".join(ch for ch in (name or "").lower() if ch not in "的 \u3000·")
 
 # In-flight guard so a slow background refresh isn't triggered concurrently
 # by multiple incoming requests (LLM translation of ~200 chars is expensive).
 _refreshing = False
 
+# One-shot-per-process flag for the image backfill check (existence checks are
+# cheap but there is no reason to repeat them on every request).
+_images_ensured = False
+
 
 def _load() -> dict:
     """Lazily load character_details.json and rebuild lookup indexes."""
-    global _data, _by_cn_name, _by_title, _by_id
+    global _data, _by_cn_name, _by_cn_name_norm, _by_title, _by_id
     if _data is not None:
         return _data
 
@@ -49,7 +64,17 @@ def _load() -> dict:
         except Exception:
             _data = {}
 
+    # Canonical names from the alias dictionary (character_dic.json maps
+    # H-codes / English titles / nicknames → canonical Chinese name). Cached
+    # name_cn values can drift from these (old LLM translations), which breaks
+    # alias lookup — so also index every entry under its canonical name.
+    try:
+        alias_map = get_resolver().character_alias_map()
+    except Exception:
+        alias_map = {}
+
     _by_cn_name = {}
+    _by_cn_name_norm = {}
     _by_title = {}
     _by_id = {}
     for entry in _data.values():
@@ -64,6 +89,14 @@ def _load() -> dict:
         cid = entry.get("id")
         if cid:
             _by_id[str(cid).strip().upper()] = entry
+        # Canonical cross-reference (setdefault: a true name_cn owner wins).
+        canonical = alias_map.get(str(cid).strip().lower()) or \
+            (alias_map.get(title.strip().lower()) if title else None)
+        if canonical:
+            _by_cn_name.setdefault(canonical, entry)
+            _by_cn_name_norm.setdefault(_normalize_name(canonical), entry)
+        if cn:
+            _by_cn_name_norm.setdefault(_normalize_name(cn), entry)
 
     return _data
 
@@ -88,13 +121,28 @@ def lookup_character(query: str) -> dict | None:
     if q.lower() in _by_title:
         return _by_title[q.lower()]
 
-    # 4. Fuzzy alias via pinyin resolver
-    try:
-        resolved = get_resolver().resolve_character(q)
-    except Exception:
-        resolved = None
-    if resolved and resolved in _by_cn_name:
-        return _by_cn_name[resolved]
+    # 4. Normalized match (ignores 的/whitespace: 新生的伊娥丝 → 新生伊娥丝)
+    qn = _normalize_name(q)
+    if qn and qn in _by_cn_name_norm:
+        return _by_cn_name_norm[qn]
+
+    # 5. Fuzzy alias via pinyin resolver (also retry without 的 so canonical
+    #    aliases like 新婚伊娥丝 match inputs like 新婚的伊娥丝)
+    resolver = get_resolver()
+    candidates = [q]
+    q_stripped = q.replace("的", "")
+    if q_stripped != q:
+        candidates.append(q_stripped)
+    for cand in candidates:
+        try:
+            resolved = resolver.resolve_character(cand)
+        except Exception:
+            resolved = None
+        if resolved:
+            entry = _by_cn_name.get(resolved) or _by_cn_name_norm.get(
+                _normalize_name(resolved))
+            if entry:
+                return entry
 
     return None
 
@@ -298,9 +346,11 @@ async def _maybe_refresh_characters():
 
     Stale-but-present cache → background (fire-and-forget) refresh so the
     current request isn't blocked. Missing cache (first build) → block so the
-    current request returns real data instead of "not found".
+    current request returns real data instead of "not found". Fresh cache →
+    one-shot image backfill check (downloads only run during the weekly
+    refresh otherwise, so a filename-convention fix would never reach disk).
     """
-    global _refreshing
+    global _refreshing, _images_ensured
     if _refreshing:
         return
 
@@ -310,6 +360,9 @@ async def _maybe_refresh_characters():
 
         scraper = WikiScraper(llm_client=model_router.flash_client)
         if not scraper.is_characters_stale():
+            if not _images_ensured:
+                _images_ensured = True
+                asyncio.create_task(_ensure_images(scraper))
             return
 
         _refreshing = True
@@ -319,6 +372,15 @@ async def _maybe_refresh_characters():
             await _do_refresh(scraper)
     except Exception:
         _refreshing = False
+
+
+async def _ensure_images(scraper):
+    """Fire-and-forget backfill of missing character art + card re-render."""
+    try:
+        await scraper.ensure_character_images()
+    except Exception as e:
+        print(f"[character_detail] image backfill failed: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
 
 
 async def _do_refresh(scraper):

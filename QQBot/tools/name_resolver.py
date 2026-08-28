@@ -221,6 +221,15 @@ class NameResolver:
 
     # ── Public API ────────────────────────────────────────────────
 
+    def character_alias_map(self) -> dict:
+        """Return the lowercase-alias → canonical-name character dictionary.
+
+        Used by character_detail to index cached entries under their canonical
+        openrubi names, keeping alias lookup working even when a cache entry's
+        ``name_cn`` drifted from the canonical value.
+        """
+        return dict(self._char_alias)
+
     def resolve_character(self, query: str) -> str | None:
         """Resolve a fuzzy character name to its canonical Chinese name.
 
