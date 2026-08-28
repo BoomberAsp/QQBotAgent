@@ -116,6 +116,24 @@ def _ensure_workspace_dirs() -> None:
         os.makedirs(os.path.join(root, sub), exist_ok=True)
 
 
+def _notify_file_created(abs_path: str) -> None:
+    """Notify the provenance callback (if set) that a file was written.
+
+    Used by execute_code / download_repo to attribute generated files to the
+    active special session. No-op when the callback is unset (temporary mode).
+    """
+    try:
+        from agent.context import _on_file_created
+    except ImportError:
+        try:
+            from QQBot.agent.context import _on_file_created
+        except ImportError:
+            return
+    cb = _on_file_created.get()
+    if cb:
+        cb(abs_path)
+
+
 def _validate_path(file_path: str, must_exist: bool = True) -> tuple[str | None, str | None]:
     """Validate a file path is safe and within workspace.
 
@@ -755,6 +773,7 @@ async def execute_code(code: str, timeout: int = 30) -> str:
                 dest = os.path.join(_get_workspace_root(), "output", dest_name)
                 shutil.copy2(src, dest)
                 saved_images.append(dest)
+                _notify_file_created(dest)
 
         # ── Send images to QQ chat if context variable is set ─────
         if saved_images:
@@ -848,6 +867,63 @@ def summarize_pdf(file_path: str) -> str:
         return f"[PDF Error] 处理 PDF 时出错: {e}"
 
 
+# ── Workspace File Deletion ──────────────────────────────────────
+
+def delete_workspace_file(path: str) -> str:
+    """Delete a file or empty directory in the current user's workspace.
+
+    The path is resolved relative to the user's workspace root (via the
+    ``_current_user_workspace`` contextvar) and validated against traversal,
+    hidden files, and workspace-boundary escape.
+
+    Args:
+        path: Path relative to the workspace root, e.g. "uploads/abc.png"
+            or "repos/my-repo".
+    """
+    if not path:
+        return "[Delete] 请提供要删除的文件或目录路径。"
+
+    # Reject hidden files (dot-prefixed basename)
+    base = os.path.basename(path.rstrip("/"))
+    if base.startswith("."):
+        return f"[Delete] 不允许删除隐藏文件: {path}"
+
+    safe_path, error = _validate_path(path)
+    if error:
+        return f"[Delete] {error}"
+
+    try:
+        if os.path.islink(safe_path):
+            os.remove(safe_path)
+            return f"已删除符号链接: {path}"
+        if os.path.isdir(safe_path):
+            if os.listdir(safe_path):
+                return (
+                    f"[Delete] 目录非空，拒绝删除（防止误删整个目录）: {path}。\n"
+                    f"请先删除目录内的文件，或明确指定要删除的文件。"
+                )
+            os.rmdir(safe_path)
+            return f"已删除空目录: {path}"
+        if os.path.isfile(safe_path):
+            size = os.path.getsize(safe_path)
+            os.remove(safe_path)
+            return f"已删除文件: {path}（释放 {_fmt_bytes(size)}）"
+        return f"[Delete] 路径不存在或不是常规文件: {path}"
+    except OSError as e:
+        return f"[Delete] 删除失败: {e}"
+
+
+def _fmt_bytes(size: int) -> str:
+    """Format a byte count as a human-readable string (local, no import)."""
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    return f"{size / (1024 * 1024 * 1024):.2f} GB"
+
+
 # ── Repository Download ──────────────────────────────────────────
 
 def download_repo(repo_url: str, target_dir: str = None) -> str:
@@ -895,6 +971,7 @@ def download_repo(repo_url: str, target_dir: str = None) -> str:
                 capture_output=True, text=True, timeout=120,
             )
             if result.returncode == 0:
+                _notify_file_created(clone_path)
                 files = sorted(os.listdir(clone_path))[:20]
                 file_list = "\n".join(f"  - {f}" for f in files)
                 total_files = len(os.listdir(clone_path))

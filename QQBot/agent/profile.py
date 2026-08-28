@@ -20,6 +20,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
+# Cap the number of facts retained per user. The system prompt only injects
+# the most recent facts[-10:], so a bounded list prevents unbounded growth
+# and keeps stale/transient facts from lingering forever.
+MAX_FACTS = 40
+
+
 @dataclass
 class UserProfile:
     """Per-user profile with discovered facts and preferences."""
@@ -96,10 +102,16 @@ class UserProfile:
         self.total_interactions += 1
 
     def merge_facts(self, new_facts: List[str]):
-        """Add new facts, avoiding duplicates (fuzzy)."""
+        """Add new facts, avoiding duplicates (fuzzy), capped to MAX_FACTS.
+
+        When the cap is exceeded, the oldest facts are dropped so the list
+        stays bounded and recent facts dominate the injected context.
+        """
         for fact in new_facts:
             if not any(self._similar(fact, existing) for existing in self.facts):
                 self.facts.append(fact)
+        if len(self.facts) > MAX_FACTS:
+            self.facts = self.facts[-MAX_FACTS:]
 
     def merge_interests(self, new_interests: List[str]):
         """Add new interests, avoiding duplicates."""
@@ -198,12 +210,26 @@ class ProfileManager:
             "Return JSON with these fields (all optional, omit if empty):\n"
             '{\n'
             '  "nickname": "name if user mentioned their name or how they want to be called",\n'
-            '  "new_facts": ["objective fact about the user", ...],\n'
+            '  "new_facts": ["durable fact about the user", ...],\n'
             '  "new_interests": ["topic user showed interest in", ...],\n'
             '  "new_preferences": {"pref_key": "pref_value"}\n'
             '}\n\n'
             "Guidelines:\n"
             "- Only include NEW information not already in the existing profile.\n"
+            "- Facts MUST be durable, stable attributes about the user: identity/name, "
+            "occupation/role, skills and technologies they use, location, language, "
+            "communication style, long-term interests, and ongoing projects/goals.\n"
+            "- DO NOT extract transient or stateful information as facts: tool errors, "
+            "debugging incidents, dependency/install problems, file uploads, workspace disk "
+            "usage, session state, one-off requests, or specific conversation outcomes.\n"
+            "- A single tool result is NOT enough to establish a durable fact about the user. "
+            "When a fact appears only in a tool output (e.g. a read_file image analysis identifying "
+            "a game or characters, a file's content, a screenshot), do NOT record it on that basis "
+            "alone. Only record it if the user themselves affirmed it in their message or the "
+            "surrounding conversation independently supports it.\n"
+            "- Game identity, character ownership, and similar personal attributes must come from "
+            "the user's own words, not inferred from an image or screenshot they uploaded. An "
+            "uploaded battle screenshot describes the screenshot's content, not the user.\n"
             "- Facts should be objective, not speculative. E.g., 'uses Python' not 'might be a developer'.\n"
             "- If nothing new is discovered, return {}.\n"
             "- Do NOT extract facts about the assistant (Roxy), only about the user."

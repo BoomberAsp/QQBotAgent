@@ -34,10 +34,12 @@ from agent.context import (
     _send_msg, _current_user_workspace,
     _current_user_role, _current_code_limits,
     _current_user_id, _current_group_id,
-    _current_group_context,
+    _current_group_context, _current_personality,
+    _on_file_created, _current_quota_bytes,
 )
 from agent.group_features import get_group_features
 from agent.permissions import PermissionManager
+from agent.personality import get_personality_manager
 from agent.hardware import HardwareDetector
 from agent.special_session import SpecialSessionManager
 from agent.tool_registry import ToolRegistry
@@ -45,11 +47,14 @@ from agent.session import SessionManager
 from agent.memory import MemorySystem
 from agent.profile import ProfileManager
 from agent.workspace import UserWorkspaceManager
-from lib.deepseek_client import deepseek_client as _global_client, DeepSeekClient as _DeepSeekClient
+from agent.workspace_snapshot import build_tree, rel_to_root, fmt_bytes
+from agent.quota_cleanup import (
+    list_candidates,
+    execute_cleanup,
+    format_cleanup_prompt,
+    resolve_targets,
+)
 from lib.model_router import ModelRouter
-
-# Handle case where NoneBot is not running (testing)
-deepseek_client = _global_client if _global_client is not None else _DeepSeekClient()
 from tools.builtin_tools import (
     execute_code,
     get_system_load,
@@ -59,6 +64,7 @@ from tools.builtin_tools import (
     download_repo,
     shell_exec,
     summarize_pdf,
+    delete_workspace_file,
     _ensure_workspace_dirs,
 )
 from tools.file_tools import read_file
@@ -77,6 +83,10 @@ from tools.legacy_tools import (
     play_gacha_animation,
     translate_text,
 )
+from tools.character_detail import character_detail, character_detail_with_card
+from tools.bond_detail import bond_detail, bond_detail_with_card
+from tools.battle_parser import parse_battle_screenshots
+from tools.card_renderer import render_help_card, render_feature_card
 
 # ── Configuration Paths ───────────────────────────────────────────
 
@@ -84,6 +94,7 @@ _AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CONFIG_DIR = os.path.join(_AGENT_DIR, "agent", "config")
 _DATA_DIR = os.path.join(_AGENT_DIR, "data")
 _USER_DATA_ROOT = os.environ.get("USER_DATA_ROOT", os.path.join(_AGENT_DIR, "data", "users_store"))
+_HELP_MD_PATH = os.path.join(_CONFIG_DIR, "HELP.md")
 
 # ── Workspace Initialization ─────────────────────────────────────
 
@@ -359,7 +370,14 @@ async def _download_and_save_file(
     # ── Strategy 1: direct URL download ──────────────────────────
     if url:
         try:
-            async with httpx.AsyncClient() as client:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            }
+            async with httpx.AsyncClient(headers=headers) as client:
                 response = await client.get(url, timeout=120.0, follow_redirects=True)
                 response.raise_for_status()
 
@@ -393,7 +411,11 @@ async def _download_and_save_file(
                 return save_path, None
 
         except httpx.HTTPStatusError as e:
-            return None, f"下载失败 (HTTP {e.response.status_code}): {e.response.reason_phrase}"
+            # QQ CDN URLs may return 400/403 with default headers — fall back to API
+            if e.response.status_code in (400, 403) and bot is not None and file_id:
+                pass  # Fall through to Strategy 2 below
+            else:
+                return None, f"下载失败 (HTTP {e.response.status_code}): {e.response.reason_phrase}"
         except httpx.TimeoutException:
             return None, "下载超时 (120秒)。文件可能过大或网络不稳定。"
         except httpx.RequestError as e:
@@ -564,6 +586,20 @@ def _build_tool_registry() -> ToolRegistry:
             "required": ["file_path"],
         },
     )
+    registry.register(
+        "delete_workspace_file", delete_workspace_file,
+        "删除当前用户工作区内的指定文件或空目录，释放磁盘空间。"
+        "参数 path 为相对于工作区根目录的路径，如 'uploads/abc.png' 或 'repos/my-repo'。"
+        "只能删除空目录；非空目录会拒绝删除。禁止删除隐藏文件。"
+        "当用户表达删除工作区文件/仓库的意图时使用此工具，删除前先调用 get_user_info 获取快照确认目标。",
+        {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "相对于工作区根目录的路径，如 'uploads/abc.png' 或 'repos/my-repo'"},
+            },
+            "required": ["path"],
+        },
+    )
 
     # Map / location tools (Amap API)
     registry.register(
@@ -670,10 +706,16 @@ def _build_tool_registry() -> ToolRegistry:
     )
     registry.register(
         "calculate_speed", calculate_speed,
-        "根据战斗行动值数据计算敌方速度。输入需包含'我方'和'敌方'两个区域的行动值数据。",
+        "根据战斗行动值数据计算敌方速度。输入可为「模版文本」或 parse_battle_screenshots 的返回结果。"
+        "当用户没有截图、或不愿上传截图时，引导用户按以下模版文本格式粘贴战斗数据：\n"
+        "我方\n角色名1 初始行动值 结束行动值 速度\n角色名2 初始行动值 结束行动值 速度\n"
+        "（至少一名我方角色需提供速度）\n"
+        "敌方\n敌方名1 初始行动值 结束行动值\n敌方名2 初始行动值 结束行动值\n"
+        "⚠️ 速度填0表示未知。示例：\n"
+        "我方\n兔子 0 100 220\n盖儿 3 56 0\n敌方\n金人司阍 0 88\n丰饶灵兽 0 77",
         {
             "type": "object",
-            "properties": {"battle_data": {"type": "string", "description": "战斗数据(含我方/敌方行动值)"}},
+            "properties": {"battle_data": {"type": "string", "description": "战斗数据(含我方/敌方行动值)，模版文本或 parse_battle_screenshots 输出"}},
             "required": ["battle_data"],
         },
     )
@@ -710,6 +752,99 @@ def _build_tool_registry() -> ToolRegistry:
             "required": ["text"],
         },
     )
+    registry.register(
+        "character_detail", character_detail,
+        "查询 Ark Re:Code 角色的详细资料（面板成长系数、技能、倍率、属性、天赋、潜能）。"
+        "当用户只发送一个角色名/别名（如「夏妮」「狼团长」「Shani」「瞎泥」）而没有其他请求时，"
+        "调用此工具返回该角色详情。",
+        {
+            "type": "object",
+            "properties": {
+                "character_name": {"type": "string", "description": "角色名或别名"},
+            },
+            "required": ["character_name"],
+        },
+    )
+    registry.register(
+        "bond_detail", bond_detail,
+        "查询 Ark Re:Code 羁绊（Bond/神器）的详细资料（类别、星级、攻击/生命、羁绊技能、"
+        "获取方式、出售价格、经验值、上线时间）。"
+        "当用户只发送一个羁绊名/别名（如「驰骋的快感」「复活甲」「Pleasure of Exploration」）"
+        "而没有其他请求时，调用此工具返回该羁绊详情。",
+        {
+            "type": "object",
+            "properties": {
+                "bond_name": {"type": "string", "description": "羁绊名或别名"},
+            },
+            "required": ["bond_name"],
+        },
+    )
+    registry.register(
+        "parse_battle_screenshots", parse_battle_screenshots,
+        "解析 Ark Re:Code 战斗截图，用 OCR 提取角色名、行动值、阵营（我方/敌方）。"
+        "接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON 和 calculate_speed 兼容格式。"
+        "支持两种模式（mode 参数）：light=轻量（仅提取角色名与行动值，约10秒，跳过技能解析与行动值修正）；"
+        "full=全量（完整流程：技能解析+行动值修正，约90秒）。默认 full。"
+        "当用户上传/引用战斗截图并要求测速或分析行动值时，先告知用户两种模式的区别（流程与预计用时），"
+        "再按用户选择传入 mode 调用，不要擅自替用户决定。"
+        "截图路径会以「[用户引用了文件 ... 文件路径: xxx]」的形式出现在上下文中，"
+        "直接取该路径调用，不要改用 read_file（read_file 无法做战斗 OCR）。"
+        "团战/镜像匹配时，同一角色可能同时出现在我方和敌方（同名不同阵营），属正常情况，勿视为错误。"
+        "本工具专用于 Ark Re:Code，不要根据「战意/爆裂/气魄」等术语误判为其他游戏。",
+        {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "截图文件路径列表（1-2 张，跑条前+跑条后）",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["light", "full"],
+                    "description": "解析模式。light=轻量（仅提取角色名与行动值，约10秒）；full=全量（完整流程：技能解析+行动值修正，约90秒）。默认 full",
+                    "default": "full",
+                },
+            },
+            "required": ["paths"],
+        },
+    )
+
+    # ── Redeem Code ────────────────────────────────────────────
+
+    async def _redeem_code_tool() -> str:
+        """Agent-facing tool: query valid redeem codes."""
+        from plugins.check_redeem_code import get_redeem_codes, check_and_refresh
+
+        await check_and_refresh()
+        codes = get_redeem_codes()
+
+        if not codes:
+            return "当前没有有效的兑换码。"
+
+        lines = ["当前有效兑换码:"]
+        for entry in codes:
+            code = entry.get("code", "")
+            content = entry.get("content", "")
+            valid = entry.get("valid", "")
+            line = f"  {code}"
+            if content:
+                line += f" — {content}"
+            if valid:
+                line += f" (有效期至: {valid})"
+            lines.append(line)
+        return "\n".join(lines)
+
+    registry.register(
+        "redeem_code", _redeem_code_tool,
+        "查询当前有效的游戏兑换码列表。返回兑换码、奖励内容和有效期。"
+        "当用户询问兑换码相关问题时使用此工具。",
+        {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    )
 
     # ── System Load ─────────────────────────────────────────────
     registry.register(
@@ -741,11 +876,16 @@ _memory_system = MemorySystem(
     base_dir=os.path.join(_DATA_DIR, "memory"),
 )
 
+# Model router is built first so downstream components use the JSON-configured
+# reasoning model (models_settings.json) with a fallback to the .env DeepSeek
+# config — instead of the .env-only global client.
+_model_router = ModelRouter()
+
 _profile_manager = ProfileManager(
     base_dir=_USER_DATA_ROOT,
 )
 # The client is set after agent creation since agent owns the validated client
-_profile_manager.set_client(deepseek_client)
+_profile_manager.set_client(_model_router.reasoning_client)
 
 _hardware_detector = HardwareDetector(cache_dir=_USER_DATA_ROOT)
 
@@ -759,7 +899,7 @@ _max_special_sessions = int(os.environ.get("MAX_SPECIAL_SESSIONS", "3"))
 _special_sessions = SpecialSessionManager(
     user_data_root=_USER_DATA_ROOT,
     max_per_user=_max_special_sessions,
-    llm_client=deepseek_client,
+    llm_client=_model_router.reasoning_client,
 )
 
 # Track sessions pending LLM auto-naming: user_id -> True
@@ -769,7 +909,7 @@ _pending_naming: dict = {}
 _pending_delete_confirm: dict = {}
 
 agent = Agent(
-    deepseek_client=deepseek_client,
+    deepseek_client=_model_router.reasoning_client,
     tool_registry=_tool_registry,
     config_dir=_CONFIG_DIR,
     session_manager=_session_manager,
@@ -782,9 +922,7 @@ agent = Agent(
     thinking_timeout=180.0,
 )
 
-_model_router = ModelRouter()
-
-_continuous_sessions = ContinuousSessionManager(timeout_minutes=5.0)
+_continuous_sessions = ContinuousSessionManager(timeout_minutes=1.5)
 
 _perm_manager = PermissionManager()
 
@@ -798,16 +936,204 @@ _user_busy: set = set()
 _MAX_RECENT_FILES = 200
 _recent_files: dict[str, list[dict]] = {}
 
+# Temporary-session file provenance — tracks workspace-relative paths uploaded
+# while no special session is active, so /保存为会话 can migrate ownership.
+_temp_session_files: dict[str, set[str]] = {}
 
-def _record_file(message_id: str, name: str, path: str):
-    """Record a downloaded file against its source message for reply resolution."""
+# Idea 3 — suggest upgrading a long temporary session to a special session.
+UPGRADE_HINT_THRESHOLD = 15   # message count at which to start suggesting
+UPGRADE_HINT_INTERVAL = 10    # re-suggest at most every N messages
+_upgrade_hint_last: dict[str, int] = {}  # user_id -> message count at last hint
+
+
+def _record_file(message_id: str, name: str, path: str = "", error: str = ""):
+    """Record a downloaded file (or failed download) against its source
+    message for reply resolution."""
     if message_id not in _recent_files:
         _recent_files[message_id] = []
-    _recent_files[message_id].append({"name": name, "path": path})
+    _recent_files[message_id].append(
+        {"name": name, "path": path, "error": error}
+    )
     # Prune oldest entries if cache grows too large
     while len(_recent_files) > _MAX_RECENT_FILES:
         oldest = next(iter(_recent_files))
         del _recent_files[oldest]
+
+
+def _record_session_file(user_id: str, abs_path: str) -> None:
+    """Attribute a newly written workspace file to the active special session.
+
+    When no special session is active, the file is recorded into
+    ``_temp_session_files`` so ``/保存为会话`` can migrate the provenance
+    later. ``abs_path`` is converted to a workspace-relative path; paths
+    outside the user's workspace are ignored.
+    """
+    ws = _workspace_manager.get_workspace(user_id)
+    try:
+        rel = os.path.relpath(abs_path, ws)
+    except ValueError:
+        return
+    if rel.startswith("..") or os.path.isabs(rel):
+        return
+
+    active = _special_sessions.get_active(user_id)
+    if active is not None:
+        _special_sessions.add_file(user_id, active.name, rel)
+    else:
+        _temp_session_files.setdefault(user_id, set()).add(rel)
+
+
+def _format_delete_summary(result: dict) -> str:
+    """Render the file-cleanup portion of a session-deletion notification."""
+    lines = []
+    if result.get("deleted"):
+        lines.append(
+            f"已清理 {len(result['deleted'])} 个文件"
+            f"（释放 {fmt_bytes(result['freed_bytes'])}）："
+        )
+        lines.extend(f"  - {rel}" for rel in result["deleted"])
+    if result.get("kept_repos"):
+        lines.append("以下仓库予以保留（工作区内仍可用）：")
+        lines.extend(f"  - {rel}" for rel in result["kept_repos"])
+    return "\n".join(lines)
+
+
+def _quota_warning(user_id: str) -> str:
+    """Return a quota warning if workspace usage >= 80% of the role quota.
+
+    Uses the same usage metric (``_workspace_manager.get_size``) and per-role
+    quota (``_perm_manager.get_workspace_quota_mb``) as ``_get_user_info`` and
+    ``_handle_cleanup_flow``. Returns "" below the 80% threshold.
+    """
+    role = _perm_manager.get_role(user_id)
+    quota_mb = _perm_manager.get_workspace_quota_mb(role)
+    quota_bytes = quota_mb * 1024 * 1024
+    used = _workspace_manager.get_size(user_id)
+    if used >= quota_bytes * 0.8:
+        pct = used / quota_bytes * 100
+        used_mb = used / (1024 * 1024)
+        return (
+            f"⚠️ 工作区容量已使用 {pct:.0f}%（{used_mb:.1f} MB / {quota_mb} MB）。"
+            f"建议发送 /管理工作区 查看详情并清理不需要的文件，"
+            f"或直接告诉我「帮我清理工作区」。"
+        )
+    return ""
+
+
+# ── Quota Cleanup Protocol (Feature 2) ───────────────────────────
+# Elastic-quota cleanup: when a user exceeds their workspace quota, the next
+# message triggers a cleanup protocol. The agent lists the earliest-mtime
+# candidates, the user may customize (but not skip), and after 10 minutes the
+# agent deletes autonomously without approval.
+
+CLEANUP_TIMEOUT = 600  # seconds (10 minutes)
+
+# user_id -> {"candidates": list[CleanupCandidate], "deadline": float}
+_cleanup_plans: dict = {}
+
+
+async def _handle_cleanup_flow(user_id: str, text_content: str) -> bool:
+    """Intercept messages during the quota-cleanup protocol.
+
+    Returns True when the message was fully consumed (caller should return
+    without running the agent).
+    """
+    plan = _cleanup_plans.get(user_id)
+    if plan is not None:
+        if time.time() >= plan["deadline"]:
+            await _execute_cleanup_plan(user_id, plan, plan["candidates"], 0.8)
+        else:
+            await _handle_cleanup_response(user_id, text_content, plan)
+        return True
+
+    # No active plan — trigger if over quota.
+    quota_mb = _perm_manager.get_workspace_quota_mb(_perm_manager.get_role(user_id))
+    quota_bytes = quota_mb * 1024 * 1024
+    if _workspace_manager.get_size(user_id) < quota_bytes:
+        return False
+
+    candidates = list_candidates(_workspace_manager.get_workspace(user_id))
+    if not candidates:
+        return False
+
+    deadline = time.time() + CLEANUP_TIMEOUT
+    _cleanup_plans[user_id] = {"candidates": candidates, "deadline": deadline}
+    await _send_cleanup_prompt(user_id, candidates)
+    asyncio.create_task(_auto_cleanup_after(user_id, deadline))
+    return True
+
+
+async def _handle_cleanup_response(user_id: str, text_content: str, plan: dict) -> None:
+    """Interpret a user message while a cleanup plan is active."""
+    decision = resolve_targets(text_content, plan["candidates"])
+
+    if decision.mode == "skip":
+        await _safe_send(
+            "⚠️ 无法跳过清理。工作区已超出配额，必须清理后才能继续使用。\n"
+            "你可以：\n"
+            "1. 回复「删吧」确认删除上列文件\n"
+            "2. 回复「保留 X」指定要保留的文件（其余删除）\n"
+            "3. 指定要删除的文件路径或编号\n"
+            "⏳ 10 分钟内未回复将自动删除上列候选文件。"
+        )
+        return
+
+    if decision.mode == "confirm":
+        await _execute_cleanup_plan(user_id, plan, plan["candidates"], 0.8)
+        return
+
+    if decision.mode in ("keep", "explicit"):
+        # Explicit user choice — delete exactly the selected targets.
+        await _execute_cleanup_plan(user_id, plan, decision.targets, 0.0)
+        return
+
+    await _safe_send(
+        "请明确你的清理指令：\n"
+        "1. 回复「删吧」删除上列所有文件\n"
+        "2. 回复「保留 X」保留指定文件\n"
+        "3. 回复要删除的文件路径或编号\n"
+        "⏳ 10 分钟内未回复将自动删除上列候选文件。"
+    )
+
+
+async def _send_cleanup_prompt(user_id: str, candidates) -> None:
+    quota_mb = _perm_manager.get_workspace_quota_mb(_perm_manager.get_role(user_id))
+    usage_mb = _workspace_manager.get_size(user_id) / (1024 * 1024)
+    await _safe_send(format_cleanup_prompt(candidates, usage_mb, quota_mb))
+
+
+async def _execute_cleanup_plan(user_id: str, plan: dict, targets, target_ratio: float) -> None:
+    """Delete the given candidates (mtime asc) and report the result."""
+    _cleanup_plans.pop(user_id, None)
+    quota_mb = _perm_manager.get_workspace_quota_mb(_perm_manager.get_role(user_id))
+    quota_bytes = quota_mb * 1024 * 1024
+    ws = _workspace_manager.get_workspace(user_id)
+    result = execute_cleanup(ws, quota_bytes, candidates=targets, target_ratio=target_ratio)
+    deleted = result["deleted"]
+
+    if deleted:
+        lines = [f"✅ 已清理工作区，删除 {len(deleted)} 项，释放 {fmt_bytes(result['freed_bytes'])}："]
+        for c in deleted:
+            lines.append(f"  - {c.rel_path}")
+        usage_mb = _workspace_manager.get_size(user_id) / (1024 * 1024)
+        if usage_mb * 1024 * 1024 < quota_bytes:
+            lines.append(f"当前占用 {usage_mb:.1f} MB / {quota_mb} MB，已回到配额内。")
+        else:
+            lines.append(f"当前占用 {usage_mb:.1f} MB / {quota_mb} MB，仍超出配额，请继续清理。")
+        await _safe_send("\n".join(lines))
+    else:
+        await _safe_send("未删除任何文件。请手动检查工作区，或发送「帮我清理工作区」重新发起。")
+
+    _workspace_manager.clear_quota_flag(user_id)
+
+
+async def _auto_cleanup_after(user_id: str, deadline: float) -> None:
+    """Autonomous deletion fallback after the 10-minute timeout."""
+    await asyncio.sleep(CLEANUP_TIMEOUT)
+    plan = _cleanup_plans.get(user_id)
+    if plan is None or plan["deadline"] != deadline:
+        return  # already resolved (or superseded)
+    await _execute_cleanup_plan(user_id, plan, plan["candidates"], 0.8)
 
 
 def _build_reply_context(event: MessageEvent) -> str:
@@ -841,12 +1167,21 @@ def _build_reply_context(event: MessageEvent) -> str:
         if reply_id and reply_id in _recent_files:
             files = _recent_files[reply_id]
             for f in files:
-                parts.append(
-                    f"[用户引用了文件 \"{f['name']}\"。"
-                    f"你必须使用 read_file 工具读取此文件来回答用户问题，"
-                    f"忽略对话历史中关于其他文件的提及。"
-                    f"文件路径: {f['path']}]"
-                )
+                if f.get("error"):
+                    parts.append(
+                        f"[用户引用了文件 \"{f['name']}\"，"
+                        f"但该文件之前下载失败（{f['error']}）。"
+                        f"请告知用户文件无法读取，建议重新上传。]"
+                    )
+                else:
+                    parts.append(
+                        f"[用户引用了文件 \"{f['name']}\"。"
+                        f"请根据用户意图选择合适的工具处理此文件："
+                        f"战斗截图测速/行动值分析用 parse_battle_screenshots，"
+                        f"一般图片或文档用 read_file，"
+                        f"忽略对话历史中关于其他文件的提及。"
+                        f"文件路径: {f['path']}]"
+                    )
 
         return "\n".join(parts) if parts else ""
 
@@ -869,7 +1204,9 @@ def _build_reply_context(event: MessageEvent) -> str:
                 for f in files:
                     parts.append(
                         f"[用户引用了文件 \"{f['name']}\"。"
-                        f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                        f"请根据用户意图选择合适的工具处理此文件："
+                        f"战斗截图测速/行动值分析用 parse_battle_screenshots，"
+                        f"一般图片或文档用 read_file，"
                         f"忽略对话历史中关于其他文件的提及。"
                         f"文件路径: {f['path']}]"
                     )
@@ -889,7 +1226,9 @@ def _build_reply_context(event: MessageEvent) -> str:
             for f in files:
                 parts.append(
                     f"[用户引用了文件 \"{f['name']}\"。"
-                    f"你必须使用 read_file 工具读取此文件来回答用户问题，"
+                    f"请根据用户意图选择合适的工具处理此文件："
+                    f"战斗截图测速/行动值分析用 parse_battle_screenshots，"
+                    f"一般图片或文档用 read_file，"
                     f"忽略对话历史中关于其他文件的提及。"
                     f"文件路径: {f['path']}]"
                 )
@@ -937,49 +1276,20 @@ def _get_user_info() -> str:
     ws_quota_mb = _perm_manager.get_workspace_quota_mb(role)
     ws_usage_mb = ws_size / (1024 * 1024)
     pct = (ws_size / (ws_quota_mb * 1024 * 1024)) * 100 if ws_quota_mb > 0 else 0
+    # Hide the absolute data-root prefix; show paths relative to USER_DATA_ROOT.
+    rel_ws = rel_to_root(ws_path, _workspace_manager.user_data_root)
     lines.append(f"")
     lines.append(f"工作区:")
-    lines.append(f"  路径: {ws_path}")
+    lines.append(f"  路径: {rel_ws}/")
     lines.append(f"  用量: {ws_usage_mb:.1f} MB / {ws_quota_mb} MB ({pct:.1f}%)")
+    if pct >= 80:
+        lines.append(f"  ⚠️ 容量警告：工作区已使用 {pct:.1f}%，接近上限。"
+                     f"建议清理不需要的文件（如「帮我清理工作区」）。")
 
     # ── 工作区目录快照 ──
     lines.append(f"")
     lines.append(f"  目录快照:")
-    ws = Path(ws_path)
-    if ws.is_dir():
-        for subdir_name in ["code", "output", "projects", "repos", "uploads"]:
-            subdir = ws / subdir_name
-            if not subdir.is_dir():
-                continue
-            try:
-                entries = sorted(subdir.iterdir(), key=lambda e: e.name.lower())
-            except PermissionError:
-                lines.append(f"    {subdir_name}/ (无权限访问)")
-                continue
-
-            if not entries:
-                lines.append(f"    {subdir_name}/ (空)")
-            else:
-                lines.append(f"    {subdir_name}/ ({len(entries)} 项)")
-                for entry in entries[:20]:  # cap at 20 entries per dir
-                    if entry.is_symlink():
-                        lines.append(f"      {entry.name} -> (符号链接)")
-                    elif entry.is_dir():
-                        item_count = sum(1 for _ in entry.rglob("*"))
-                        lines.append(f"      {entry.name}/ ({item_count} 项)")
-                    else:
-                        size = entry.stat().st_size
-                        if size < 1024:
-                            size_str = f"{size} B"
-                        elif size < 1024 * 1024:
-                            size_str = f"{size / 1024:.1f} KB"
-                        else:
-                            size_str = f"{size / (1024 * 1024):.1f} MB"
-                        lines.append(f"      {entry.name} ({size_str})")
-                if len(entries) > 20:
-                    lines.append(f"      ... 还有 {len(entries) - 20} 项未显示")
-    else:
-        lines.append(f"    (工作区目录不存在)")
+    lines.extend(build_tree(Path(ws_path), f"{rel_ws}/", indent="  "))
 
     # ── 权限范围 ──
     allowed = _perm_manager.get_allowed_tools(role)
@@ -993,7 +1303,8 @@ def _get_user_info() -> str:
                   "geocode", "reverse_geocode", "search_poi", "plan_route"}
     dev_tools = {"execute_code", "shell_exec", "web_fetch", "download_repo", "get_system_load"}
     fun_tools = {"gacha_pull", "play_gacha_animation", "calculate_speed",
-                 "compare_speed_probability", "explain_code", "translate_text"}
+                 "compare_speed_probability", "explain_code", "translate_text",
+                 "character_detail", "bond_detail", "parse_battle_screenshots"}
     misc = allowed - info_tools - dev_tools - fun_tools
 
     sections = [
@@ -1024,10 +1335,37 @@ def _get_user_info() -> str:
 # singletons like _workspace_manager, _special_sessions are initialized)
 _tool_registry.register(
     "get_user_info", _get_user_info,
-    "获取当前用户的系统信息，包括：权限级别、特殊会话列表、工作区用量、可用工具范围、"
-    "代码执行限制（如有）。当用户询问「我的设置」「我的权限」「我的工作区」「我的会话」"
-    "「我能用什么工具」或类似用户自身信息相关问题时，应调用此工具。此工具返回结构化"
-    "系统数据，可避免 LLM 在系统信息类问题上浪费推理 token。",
+    "获取当前用户的系统信息，包括：权限级别、特殊会话列表、工作区用量与目录快照"
+    "（含 repos 仓库清单、uploads 文件清单）、可用工具范围、代码执行限制（如有）。"
+    "当用户询问「我的设置」「我的权限」「我的工作区」「查看工作区」「工作区里有什么」"
+    "「我的会话」「我能用什么工具」或类似用户自身信息相关问题时，应调用此工具。"
+    "此工具返回结构化系统数据，可避免 LLM 在系统信息类问题上浪费推理 token。",
+    {"type": "object", "properties": {}, "required": []},
+)
+
+
+def _end_continuous_mode() -> str:
+    """结束当前群聊的连续对话窗口（仅连续对话模式下暴露给 LLM）。
+
+    当用户在连续对话中表达「谢谢」「好的」「不用了」「再见」等结束/告别意图，
+    且任务已完成时，调用此工具主动结束连续窗口，之后用户需 @机器人 才能再次触发。
+    """
+    group_id = _current_group_id.get()
+    user_id = _current_user_id.get()
+    if not group_id or not user_id:
+        return "无法结束连续对话：当前不在群聊连续对话上下文中。"
+    _continuous_sessions.end(group_id, user_id)
+    return "已结束连续对话模式，之后需要@我才能触发。"
+
+
+# end_continuous_mode is registered in the registry but NOT in any permission
+# set — it is unioned into ``allowed_tools`` only in the continuous-mode path
+# (_handle_continuous_message_impl), so it's never offered in the @-mention path.
+_tool_registry.register(
+    "end_continuous_mode", _end_continuous_mode,
+    "结束当前群聊的连续对话窗口。当用户表达「谢谢」「好的」「不用了」「再见」"
+    "等结束或告别意图，且当前任务已完成、无需继续追问时，调用此工具主动退出"
+    "连续模式。调用后用户需要 @机器人 才能再次触发对话。",
     {"type": "object", "properties": {}, "required": []},
 )
 
@@ -1057,7 +1395,10 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
 
     # ── Per-user concurrency guard ──
     if user_id in _user_busy:
-        await _safe_send("Roxy 正在处理你的上一条消息，请稍等~")
+        _gid = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+        _pm = get_personality_manager()
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, _gid))
+        await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~")
         return
     _user_busy.add(user_id)
     try:
@@ -1072,6 +1413,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
     # Set user workspace for tool scoping
     _workspace_manager.ensure_dirs(user_id)
     _current_user_workspace.set(_workspace_manager.get_workspace(user_id))
+    _on_file_created.set(lambda p: _record_session_file(user_id, p))
 
     text_content = event.get_plaintext().strip()
 
@@ -1082,15 +1424,17 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         if text_content == expected or text_content == f"/{expected}":
             if time.time() < pending_delete[1]:
                 try:
-                    _special_sessions.delete(user_id, pending_delete[0])
+                    result = _special_sessions.delete(user_id, pending_delete[0])
                     _pending_delete_confirm.pop(user_id, None)
                     role = _perm_manager.get_role(user_id)
                     max_sess = _perm_manager.get_max_special_sessions(role)
                     sessions = _special_sessions.list_sessions(user_id)
-                    await _safe_send(
-                        f"已删除特殊会话「{pending_delete[0]}」。\n"
-                        f"当前特殊会话: {len(sessions)}/{max_sess}"
-                    )
+                    summary = _format_delete_summary(result)
+                    msg = f"已删除特殊会话「{pending_delete[0]}」。"
+                    if summary:
+                        msg += "\n" + summary
+                    msg += f"\n当前特殊会话: {len(sessions)}/{max_sess}"
+                    await _safe_send(msg)
                 except ValueError as e:
                     await _safe_send(str(e))
             else:
@@ -1105,13 +1449,49 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
     # ── Handle session management commands ──────────────────────────
     if text_content.startswith("/") or text_content.startswith("#"):
+        # /取消 / #取消 / /结束 / #结束 — end continuous mode (group only).
+        # The continuous_router (priority=2) skips @mentioned messages, so this
+        # must also be handled here when the user @-mentions the bot; otherwise
+        # the command falls through to the agent loop and never ends the window.
+        if (isinstance(event, GroupMessageEvent)
+                and text_content in ("/取消", "#取消", "/结束", "#结束")):
+            _continuous_sessions.end(str(event.group_id), user_id)
+            await _safe_send("已结束连续对话模式，之后需要@我才能触发~")
+            return
         # /toggle command (group only, superuser only)
         cmd_handled = await _handle_toggle_command(text_content, user_id, event)
+        if cmd_handled:
+            return
+        # /兑换码 / /redeem-code command (direct, no agent)
+        cmd_handled = await _handle_redeem_code_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /角色详情 command (direct, no agent, zero token)
+        cmd_handled = await _handle_character_detail_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /羁绊详情 command (direct, no agent, zero token)
+        cmd_handled = await _handle_bond_detail_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /功能 / /features command (direct, no agent)
+        cmd_handled = await _handle_features_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /personality / /人格切换 command
+        cmd_handled = await _handle_personality_command(text_content, user_id, event)
         if cmd_handled:
             return
         cmd_handled = await _handle_session_command(text_content, user_id)
         if cmd_handled:
             return
+
+    # ── Quota cleanup protocol intercept ───────────────────────────
+    # Runs before file download / agent so that, when the user is over quota,
+    # new space allocations (uploads, code output, clones) are blocked and the
+    # cleanup protocol takes over this turn.
+    if await _handle_cleanup_flow(user_id, text_content):
+        return
 
     # ── Detect reply/quote context ─────────────────────────────────
     reply_context = _build_reply_context(event)
@@ -1129,8 +1509,10 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             if saved_path:
                 file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
                 _record_file(msg_id, f"image-{file_id}", saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
+                _record_file(msg_id, f"image-{file_id}", error=error)
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
@@ -1140,8 +1522,10 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             if saved_path:
                 file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
                 _record_file(msg_id, name, saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
+                _record_file(msg_id, name, error=error)
 
         elif seg.type == "record":
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
@@ -1150,8 +1534,13 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
                     f"[用户发送了语音消息，已保存至: {saved_path}]"
                 )
                 _record_file(msg_id, "语音消息", saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
+                _record_file(msg_id, "语音消息", error=error)
+
+    # ── Quota warning after any upload ─────────────────────────────
+    quota_warn = _quota_warning(user_id)
 
     # ── File-only messages: acknowledge and skip agent ─────────────
     has_files = bool(file_context_parts)
@@ -1165,10 +1554,16 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             ack = f"已收到 {'、'.join(names)}，需要分析的话引用这条消息告诉我~"
         else:
             ack = "已收到文件，需要分析的话引用这条消息告诉我~"
+        if quota_warn:
+            ack += f"\n\n{quota_warn}"
         await _safe_send(ack)
         return
 
     # ── Build augmented message ────────────────────────────────────
+    if quota_warn:
+        file_context_parts.append(
+            f"[系统提醒] {quota_warn}\n请在回复末尾原样提醒用户这一容量警告。"
+        )
     context_parts = []
     if reply_context:
         context_parts.append(reply_context)
@@ -1180,7 +1575,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         if text_content:
             augmented_message = f"{context_prefix}\n用户说: {text_content}"
         else:
-            augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请使用 read_file 工具查看内容。"
+            augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请根据用户意图选择合适的工具查看内容。"
     else:
         augmented_message = text_content
 
@@ -1195,7 +1590,10 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
     # Send thinking indicator (non-critical, ignore send failures)
     try:
-        await _safe_send("Roxy 正在思考...")
+        _gid = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+        _pm = get_personality_manager()
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, _gid))
+        await _safe_send(f"{_short} 正在思考...")
     except Exception:
         pass
 
@@ -1254,8 +1652,28 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         # Set permission contextvars for downstream tools
         _current_user_id.set(user_id)
         _current_user_role.set(role.value)
+        _current_quota_bytes.set(
+            _perm_manager.get_workspace_quota_mb(role) * 1024 * 1024
+        )
         if code_limits:
             _current_code_limits.set(code_limits.to_dict())
+
+        # Set personality contextvar
+        pm = get_personality_manager()
+        _current_personality.set(pm.resolve_effective_personality(user_id, group_id))
+
+        # Idea 3 — suggest upgrading a long temporary session to a special session.
+        if session_type == "temporary":
+            n = _session_manager.message_count(user_id)
+            last = _upgrade_hint_last.get(user_id, -UPGRADE_HINT_INTERVAL)
+            if n >= UPGRADE_HINT_THRESHOLD and (n - last) >= UPGRADE_HINT_INTERVAL:
+                _upgrade_hint_last[user_id] = n
+                augmented_message = (
+                    f"[系统提示] 当前临时会话已累积 {n} 条消息，接近 20 条上限，"
+                    f"超出后早期上下文会丢失。若用户当前话题明确且可能继续，"
+                    f"请在回复末尾用一句话自然建议其发送「/保存为会话 <名称>」"
+                    f"持久化这段对话。\n\n{augmented_message}"
+                )
 
         try:
             response = await asyncio.wait_for(
@@ -1324,7 +1742,9 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
 
     # ── Per-user concurrency guard ──
     if user_id in _user_busy:
-        await _safe_send("Roxy 正在处理你的上一条消息，请稍等~", matcher=continuous_router)
+        _pm = get_personality_manager()
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, group_id))
+        await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~", matcher=continuous_router)
         return
     _user_busy.add(user_id)
     try:
@@ -1351,16 +1771,17 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         if text_content == expected or text_content == f"/{expected}":
             if time.time() < pending_delete[1]:
                 try:
-                    _special_sessions.delete(user_id, pending_delete[0])
+                    result = _special_sessions.delete(user_id, pending_delete[0])
                     _pending_delete_confirm.pop(user_id, None)
                     role = _perm_manager.get_role(user_id)
                     max_sess = _perm_manager.get_max_special_sessions(role)
                     sessions = _special_sessions.list_sessions(user_id)
-                    await _safe_send(
-                        f"已删除特殊会话「{pending_delete[0]}」。\n"
-                        f"当前特殊会话: {len(sessions)}/{max_sess}",
-                        matcher=continuous_router
-                    )
+                    summary = _format_delete_summary(result)
+                    msg = f"已删除特殊会话「{pending_delete[0]}」。"
+                    if summary:
+                        msg += "\n" + summary
+                    msg += f"\n当前特殊会话: {len(sessions)}/{max_sess}"
+                    await _safe_send(msg, matcher=continuous_router)
                 except ValueError as e:
                     await _safe_send(str(e), matcher=continuous_router)
             else:
@@ -1388,8 +1809,10 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             if saved_path:
                 file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
                 _record_file(msg_id, f"image-{file_id}", saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
+                _record_file(msg_id, f"image-{file_id}", error=error)
 
         elif seg.type == "file":
             url = seg.data.get("url", "")
@@ -1399,8 +1822,10 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             if saved_path:
                 file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
                 _record_file(msg_id, name, saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
+                _record_file(msg_id, name, error=error)
 
         elif seg.type == "record":
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
@@ -1409,8 +1834,18 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
                     f"[用户发送了语音消息，已保存至: {saved_path}]"
                 )
                 _record_file(msg_id, "语音消息", saved_path)
+                _record_session_file(user_id, saved_path)
             elif error:
                 file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
+                _record_file(msg_id, "语音消息", error=error)
+
+    # ── Quota warning after any upload this turn ───────────────────
+    if file_context_parts:
+        quota_warn = _quota_warning(user_id)
+        if quota_warn:
+            file_context_parts.append(
+                f"[系统提醒] {quota_warn}\n请在回复末尾原样提醒用户这一容量警告。"
+            )
 
     # Renew the window on each message
     _continuous_sessions.touch(group_id, user_id)
@@ -1428,7 +1863,9 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
 
     continuous_prefix = (
         "[连续对话模式] 用户未@你，正在继续之前的任务。"
-        "回复保持简洁。如果任务已完成，可以建议用户发送 /取消 来退出连续模式。"
+        "回复保持简洁。如果用户表达了「谢谢」「好的」「不用了」「再见」等结束或"
+        "告别意图，且任务已完成、无需继续追问，请调用 end_continuous_mode 工具"
+        "主动结束连续模式，而不是建议用户手动发送 /取消。"
     )
     if context_parts:
         augmented_message = f"{continuous_prefix}\n{'\n'.join(context_parts)}\n用户说: {text_content}"
@@ -1453,8 +1890,16 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             code_limits = _perm_manager.get_code_limits(role)
             _current_user_id.set(user_id)
             _current_user_role.set(role.value)
+            _current_quota_bytes.set(
+                _perm_manager.get_workspace_quota_mb(role) * 1024 * 1024
+            )
+            _on_file_created.set(lambda p: _record_session_file(user_id, p))
             if code_limits:
                 _current_code_limits.set(code_limits.to_dict())
+
+            # Set personality contextvar
+            pm = get_personality_manager()
+            _current_personality.set(pm.resolve_effective_personality(user_id, group_id))
 
             # Resolve group feature restrictions
             gf = get_group_features()
@@ -1462,6 +1907,9 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             disabled_tools = gf.get_disabled_tools(group_id)
             if disabled_tools:
                 allowed_tools = allowed_tools - disabled_tools
+            # end_continuous_mode is only offered in the continuous path, so the
+            # agent can end the window on a natural-language "thanks/done" signal.
+            allowed_tools = allowed_tools | {"end_continuous_mode"}
             _current_group_id.set(group_id)
             _current_group_context.set(gf.get_disabled_context(group_id))
             # Prepend restriction notice to user message
@@ -1487,7 +1935,9 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         await _send_response(response, matcher=continuous_router)
 
     except asyncio.TimeoutError:
-        await _safe_send("抱歉，Roxy思考时间超过您的配额时长了。请尝试用更简单的方式提问~", matcher=continuous_router)
+        _pm = get_personality_manager()
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, group_id))
+        await _safe_send(f"抱歉，{_short}思考时间超过您的配额时长了。请尝试用更简单的方式提问~", matcher=continuous_router)
     except Exception as e:
         await _safe_send(f"处理消息时出现错误: {str(e)}", matcher=continuous_router)
 
@@ -1518,6 +1968,215 @@ async def _safe_send(message, max_retries: int = 2, matcher=None):
     if last_error:
         from nonebot import logger
         logger.warning(f"Failed to send message after {max_retries} retries: {last_error.info}")
+
+
+async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
+    """Handle /兑换码 / /redeem-code command — direct, no agent.
+
+    Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/兑换码", "/redeem-code", "#兑换码", "#redeem-code"):
+        return False
+
+    from plugins.check_redeem_code import get_redeem_codes, check_and_refresh
+
+    # Trigger background refresh if stale, then use cached data
+    refreshed = await check_and_refresh()
+    codes = get_redeem_codes()
+
+    if not codes:
+        status = " (已是最新)" if refreshed else ""
+        await _safe_send(f"现在还没有兑换码哦Σ( ° △ °){status}")
+        return True
+
+    lines = ["当前有效兑换码:" if not refreshed else "当前有效兑换码 (已更新):", ""]
+    for entry in codes:
+        code = entry.get("code", "")
+        content = entry.get("content", "")
+        valid = entry.get("valid", "")
+        line = f"  {code}"
+        if content:
+            line += f"\n  内容: {content}"
+        if valid:
+            line += f"\n  有效期至: {valid}"
+        lines.append(line)
+
+    await _safe_send("\n".join(lines))
+    return True
+
+
+async def _handle_character_detail_command(text: str, user_id: str) -> bool:
+    """Handle /角色详情 command — direct, no agent (zero token).
+
+    Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/角色详情", "#角色详情"):
+        return False
+
+    # Extract the name argument (everything after the command word)
+    rest = text.strip()[len(cmd):].strip()
+    if not rest:
+        await _safe_send("用法: /角色详情 <角色名或别名>\n例如: /角色详情 夏妮")
+        return True
+
+    text_result, card_path = await character_detail_with_card(rest)
+    if card_path:
+        from pathlib import Path
+        from nonebot.adapters.onebot.v11 import MessageSegment
+        await _safe_send(MessageSegment.image(Path(card_path)))
+    else:
+        await _safe_send(text_result)
+    return True
+
+
+async def _handle_bond_detail_command(text: str, user_id: str) -> bool:
+    """Handle /羁绊详情 command — direct, no agent (zero token).
+
+    Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/羁绊详情", "#羁绊详情"):
+        return False
+
+    rest = text.strip()[len(cmd):].strip()
+    if not rest:
+        await _safe_send("用法: /羁绊详情 <羁绊名或别名>\n例如: /羁绊详情 驰骋的快感")
+        return True
+
+    text_result, card_path = await bond_detail_with_card(rest)
+    if card_path:
+        from pathlib import Path
+        from nonebot.adapters.onebot.v11 import MessageSegment
+        await _safe_send(MessageSegment.image(Path(card_path)))
+    else:
+        await _safe_send(text_result)
+    return True
+
+
+async def _handle_personality_command(text: str, user_id: str, event: MessageEvent) -> bool:
+    """Handle /personality / /人格切换 command for personality switching.
+
+    Returns True if the command was handled.
+    """
+    cmd, _, args = text.partition(" ")
+    if cmd not in ("/personality", "/人格切换"):
+        return False
+
+    pm = get_personality_manager()
+    personalities = pm.list_personalities()
+    args = args.strip()
+    group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+
+    # /personality — show current and available
+    if not args:
+        current_key = pm.resolve_effective_personality(user_id, group_id)
+        current_display = pm.get_display_name(current_key)
+        # Annotate where the effective personality comes from
+        source = "全局默认"
+        if pm.get_personal_personality(user_id) == current_key:
+            source = "个人设置"
+        elif pm.get_group_personality(group_id) == current_key:
+            source = "群默认"
+        lines = [f"当前人格: {current_display} ({current_key}，{source})", "", "可用人格:"]
+        for p in personalities:
+            marker = " ← 当前" if p["key"] == current_key else ""
+            lines.append(f"  {p['display_name']} ({p['key']}){marker}")
+        lines.append(f"\n使用 /人格切换 <名称> 切换，例如: /人格切换 {personalities[0]['display_name']}")
+        await _safe_send("\n".join(lines))
+        return True
+
+    # /personality <name> — switch
+    try:
+        resolved = pm.set_user_personality(user_id, args)
+        display = pm.get_display_name(resolved)
+        await _safe_send(f"已切换至「{display}」人格。")
+    except ValueError as e:
+        await _safe_send(str(e))
+    except Exception as e:
+        from nonebot import logger
+        logger.error(f"Personality switch error: {e}")
+        await _safe_send(f"人格切换失败，请稍后重试。如果问题持续存在，请使用 #bug 反馈。")
+
+    return True
+
+
+async def _send_markdown_doc(path: str, label: str = "文档") -> bool:
+    """Read a markdown doc and send it segmented by ``## `` sections.
+
+    Merges short sections to fit QQ message limits (~500 chars) with a 1s delay
+    between chunks. Returns True if any content was sent.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except FileNotFoundError:
+        await _safe_send(f"{label}不存在，请联系管理员。")
+        return False
+    except Exception as e:
+        await _safe_send(f"读取{label}失败: {e}")
+        return False
+
+    if not content:
+        await _safe_send(f"{label}为空。")
+        return False
+
+    # Segment by ## section headers, keeping each section intact
+    parts = []
+    current = ""
+    for line in content.split("\n"):
+        if line.startswith("## ") and current:
+            parts.append(current.rstrip())
+            current = line + "\n"
+        else:
+            current += line + "\n"
+    if current:
+        parts.append(current.rstrip())
+
+    # Merge short parts to fit QQ message limits (~500 chars)
+    merged = []
+    buf = ""
+    for part in parts:
+        if len(buf) + len(part) < 500:
+            buf += "\n\n" + part if buf else part
+        else:
+            if buf:
+                merged.append(buf)
+            buf = part
+    if buf:
+        merged.append(buf)
+
+    for i, chunk in enumerate(merged):
+        await _safe_send(chunk)
+        if i < len(merged) - 1:
+            await asyncio.sleep(1.0)
+    return True
+
+
+async def _handle_features_command(text: str, user_id: str) -> bool:
+    """Handle /功能 / /features command — direct, no agent.
+
+    Renders FEATURES.md as a feature card image and sends only the image
+    (no text). Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/功能", "/features"):
+        return False
+
+    features_path = os.path.join(_CONFIG_DIR, "FEATURES.md")
+
+    try:
+        from nonebot.adapters.onebot.v11 import MessageSegment
+        card_path = await asyncio.to_thread(render_feature_card, features_path)
+        if card_path:
+            await _safe_send(MessageSegment.image(Path(card_path)))
+        else:
+            await _safe_send("功能表为空或不存在，请联系管理员。")
+    except Exception:
+        await _safe_send("功能卡片渲染失败，请稍后重试。")
+
+    return True
 
 
 async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -> bool:
@@ -1556,8 +2215,47 @@ async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -
             label = FEATURE_LABELS[key]
             state = "开启" if features[key] else "关闭"
             lines.append(f"  {label}: {state}")
+        pm = get_personality_manager()
+        group_key = pm.get_group_personality(group_id)
+        if group_key:
+            lines.append(f"  默认人格: {pm.get_display_name(group_key)} ({group_key})")
+        else:
+            lines.append(f"  默认人格: 未绑定（全局默认 {pm.get_display_name(pm.get_default())}）")
         lines.append(f"\n用法: /toggle <功能名> <on|off>  例如: /toggle gacha off")
+        lines.append(f"用法: /toggle personality <名称>  设置本群默认人格；/toggle personality 默认 清除")
         await _safe_send("\n".join(lines))
+        return True
+
+    # /toggle personality [名称|默认] — group default personality
+    if args == "personality" or args.startswith("personality "):
+        pm = get_personality_manager()
+        rest = args[len("personality"):].strip()
+        if not rest:
+            group_key = pm.get_group_personality(group_id)
+            global_key = pm.get_default()
+            if group_key:
+                lines = [
+                    f"当前本群默认人格: {pm.get_display_name(group_key)} ({group_key})",
+                    f"全局默认人格: {pm.get_display_name(global_key)} ({global_key})",
+                ]
+            else:
+                lines = [
+                    "当前本群未绑定默认人格（使用全局默认）。",
+                    f"全局默认人格: {pm.get_display_name(global_key)} ({global_key})",
+                ]
+            lines.append("\n用法: /toggle personality <名称> 设置；/toggle personality 默认 清除绑定")
+            await _safe_send("\n".join(lines))
+            return True
+        if rest == "默认":
+            pm.clear_group_personality(group_id)
+            global_key = pm.get_default()
+            await _safe_send(f"已清除本群默认人格，回落到全局默认「{pm.get_display_name(global_key)}」。")
+            return True
+        try:
+            resolved = pm.set_group_personality(group_id, rest)
+            await _safe_send(f"已设置本群默认人格为「{pm.get_display_name(resolved)}」。")
+        except ValueError as e:
+            await _safe_send(str(e))
         return True
 
     # /toggle <feature> <on|off>
@@ -1609,8 +2307,12 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             session = _special_sessions.create(user_id, name)
             # Activate the session — create() only persists it, doesn't set active_session
             _special_sessions.switch_to(user_id, session.name)
+            # Starting a fresh special session; drop any pending temp-session file
+            # provenance (the user did not choose /保存为会话 to carry it over).
+            _temp_session_files.pop(user_id, None)
+            quota_warn = _quota_warning(user_id)
             if args:
-                await _safe_send(
+                msg = (
                     f"已创建特殊会话「{session.name}」。\n"
                     f"当前处于特殊会话模式，上下文将持续保存。\n"
                     f"使用 /结束会话 退出，/会话列表 查看所有会话。\n"
@@ -1618,12 +2320,15 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
                 )
             else:
                 _pending_naming[user_id] = True
-                await _safe_send(
+                msg = (
                     f"已创建特殊会话「{session.name}」（名称待精炼）。\n"
                     f"首次交互后会自动生成更贴切的名称。\n"
                     f"当前处于特殊会话模式，上下文将持续保存。\n"
                     f"当前特殊会话: {len(sessions)+1}/{max_sessions}"
                 )
+            if quota_warn:
+                msg += f"\n\n{quota_warn}"
+            await _safe_send(msg)
         except ValueError as e:
             await _safe_send(str(e))
         return True
@@ -1695,15 +2400,17 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             if pending and pending[0] == args:
                 if time.time() < pending[1]:
                     try:
-                        _special_sessions.delete(user_id, args)
+                        result = _special_sessions.delete(user_id, args)
                         _pending_delete_confirm.pop(user_id, None)
                         role = _perm_manager.get_role(user_id)
                         max_sess = _perm_manager.get_max_special_sessions(role)
                         sessions = _special_sessions.list_sessions(user_id)
-                        await _safe_send(
-                            f"已删除特殊会话「{args}」。\n"
-                            f"当前特殊会话: {len(sessions)}/{max_sess}"
-                        )
+                        summary = _format_delete_summary(result)
+                        msg = f"已删除特殊会话「{args}」。"
+                        if summary:
+                            msg += "\n" + summary
+                        msg += f"\n当前特殊会话: {len(sessions)}/{max_sess}"
+                        await _safe_send(msg)
                     except ValueError as e:
                         await _safe_send(str(e))
                     return True
@@ -1719,10 +2426,26 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             return True
 
         _pending_delete_confirm[user_id] = (args, time.time() + 60)
-        await _safe_send(
-            f"确认删除特殊会话「{args}」？此操作不可撤销。\n"
-            f"请回复「确认删除 {args}」来执行（60秒内有效）。"
-        )
+
+        files = _special_sessions.get_files(user_id, args)
+        deletable = [
+            f for f in files
+            if f != "repos" and not f.startswith("repos" + os.sep)
+        ]
+        kept_repos = [
+            f for f in files
+            if f == "repos" or f.startswith("repos" + os.sep)
+        ]
+
+        msg = f"确认删除特殊会话「{args}」？此操作不可撤销。\n"
+        if deletable:
+            msg += f"删除后将清理 {len(deletable)} 个关联文件：\n"
+            msg += "\n".join(f"  - {rel}" for rel in deletable) + "\n"
+        if kept_repos:
+            msg += "以下仓库予以保留（工作区内仍可用）：\n"
+            msg += "\n".join(f"  - {rel}" for rel in kept_repos) + "\n"
+        msg += f"请回复「确认删除 {args}」来执行（60秒内有效）。"
+        await _safe_send(msg)
         return True
 
     # ── /结束会话 ──────────────────────────────────────────────
@@ -1778,6 +2501,11 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
                 msg["content"],
                 msg.get("reasoning_content"),
             )
+
+        # Migrate temporary-session file provenance to the new session
+        for rel in _temp_session_files.pop(user_id, set()):
+            _special_sessions.add_file(user_id, session.name, rel)
+
         # Force name update (user specified name)
         if name and session.name == name:
             pass  # Already named
@@ -1787,38 +2515,37 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         sessions = _special_sessions.list_sessions(user_id)
         role = _perm_manager.get_role(user_id)
         max_sess = _perm_manager.get_max_special_sessions(role)
-        await _safe_send(
+        quota_warn = _quota_warning(user_id)
+        msg = (
             f"已将当前临时会话（最近 {min(len(temp_session.context), 20)} 条消息）"
             f"保存为特殊会话「{session.name}」。\n"
             f"现在处于特殊会话模式，后续对话将持续保存。\n"
             f"当前特殊会话: {len(sessions)}/{max_sess}"
         )
+        if quota_warn:
+            msg += f"\n\n{quota_warn}"
+        await _safe_send(msg)
         return True
 
-    # ── /帮助 — 命令列表 ───────────────────────────────────────
+    # ── /帮助 — 命令列表 + 帮助卡片 ─────────────────────────────
     if cmd in ("/帮助", "#帮助", "/help", "#help", "/命令", "#命令"):
-        help_text = (
-            "**系统命令列表**\n\n"
-            "🟢 **特殊会话管理**\n"
-            "/新会话 [名称] — 创建特殊会话\n"
-            "/切换会话 <名称> — 切换到已有会话\n"
-            "/会话列表 或 /会话 — 查看所有会话\n"
-            "/重命名会话 <旧名> <新名> — 重命名会话\n"
-            "/删除会话 <名称> — 删除会话（需确认）\n"
-            "/结束会话 或 /临时会话 或 /退出特殊会话 — 退出特殊会话\n"
-            "/保存为会话 <名称> — 将临时上下文保存为会话\n\n"
-            "🔵 **连续对话（群聊）**\n"
-            "/取消 或 #取消 — 退出连续对话模式\n\n"
-            "🟡 **反馈**\n"
-            "#反馈 <内容> — 提交功能建议\n"
-            "#bug <内容> — 提交 Bug 报告\n"
-            "#建议 <内容> — 提交改进建议\n\n"
-            "⚪ **其他**\n"
-            "/status — 查看机器人运行状态\n"
-            "/clear 或 新对话 — 清除临时上下文"
-        )
-        await _safe_send(help_text)
+        # 1. Send the HELP.md text (segmented)
+        await _send_markdown_doc(_HELP_MD_PATH, label="帮助文档")
+        # 2. Render and send the help card (best-effort; text already sent)
+        try:
+            from nonebot.adapters.onebot.v11 import MessageSegment
+            card_path = await asyncio.to_thread(render_help_card, _HELP_MD_PATH)
+            if card_path:
+                await _safe_send(MessageSegment.image(Path(card_path)))
+        except Exception:
+            pass
         return True
+
+    # ── /管理工作区 ─────────────────────────────────────────────
+    # Not intercepted: falls through to the agent, which (per AGENTS.md)
+    # calls get_user_info to show the snapshot and guide cleanup.
+    if cmd in ("/管理工作区", "#管理工作区"):
+        return False
 
     # Not a session command
     return False
@@ -1901,12 +2628,17 @@ async def _handle_special_command(command: str, user_id: str):
     """Handle special meta-commands."""
     if command in ["/clear", "清除上下文", "新对话"]:
         agent.clear_user_session(user_id)
+        _special_sessions.clear_context(user_id)
+        _temp_session_files.pop(user_id, None)
         await _safe_send("已清除对话上下文，开始新对话~")
     elif command == "/status":
         status = agent.get_status()
         tool_list = "\n  ".join(status["tool_names"])
+        _short = get_personality_manager().get_short_name(
+            get_personality_manager().get_user_personality(user_id)
+        )
         await _safe_send(
-            f"Roxy 状态:\n"
+            f"{_short} 状态:\n"
             f"  活跃会话: {status['active_sessions']}\n"
             f"  已注册工具 ({status['tools_registered']}):\n  {tool_list}"
         )
@@ -1923,7 +2655,10 @@ async def _send_response(response: str, matcher=None):
         return
 
     # Append disclaimer to every agent response
-    disclaimer = "\n\nRoxy 的回答并非总是准确无误，请理性判断。"
+    _pm = get_personality_manager()
+    _persona = _current_personality.get() or _pm.get_default()
+    _short = _pm.get_short_name(_persona)
+    disclaimer = f"\n\n{_short} 的回答并非总是准确无误，请理性判断。"
     response += disclaimer
 
     # Shorter chunks + longer delays to avoid QQ rate limiting

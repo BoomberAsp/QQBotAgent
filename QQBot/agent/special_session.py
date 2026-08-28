@@ -16,6 +16,7 @@ Storage layout:
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -183,7 +184,6 @@ class SpecialSessionManager:
         # Remove old directory
         old_dir = self._session_dir(user_id, old_name)
         if os.path.exists(old_dir):
-            import shutil
             shutil.rmtree(old_dir, ignore_errors=True)
 
         # Update session
@@ -201,30 +201,49 @@ class SpecialSessionManager:
 
         return session
 
-    def delete(self, user_id: str, name: str):
-        """Delete a special session and all its data.
+    def delete(self, user_id: str, name: str) -> dict:
+        """Delete a special session and its session-scoped workspace files.
+
+        Repos (``repos/...``) are recorded but retained — they are user-level
+        persistent resources. File deletion is idempotent (missing files are
+        skipped). Returns a summary for the caller to notify the user:
+
+            {"deleted": [rel_path...], "freed_bytes": int, "kept_repos": [rel_path...]}
 
         Raises:
             ValueError: If the session doesn't exist.
         """
-        session = self._load(user_id, name)
-        if session is None:
+        index = self._load_index(user_id)
+        entry = None
+        for s in index.get("sessions", []):
+            if s["name"] == name:
+                entry = s
+                break
+        if entry is None:
             raise ValueError(f"会话「{name}」不存在。")
+
+        files = entry.get("metadata", {}).get("files", [])
+
+        # Delete session-scoped files (skip repos/), returning (deleted, freed)
+        deleted, freed = self._delete_owned_files(user_id, files)
 
         # Remove session directory
         session_dir = self._session_dir(user_id, name)
         if os.path.exists(session_dir):
-            import shutil
             shutil.rmtree(session_dir, ignore_errors=True)
 
         # Update index
-        index = self._load_index(user_id)
         index["sessions"] = [
             s for s in index["sessions"] if s["name"] != name
         ]
         if index.get("active_session") == name:
             index["active_session"] = None
         self._save_index(user_id, index)
+
+        kept_repos = [
+            f for f in files if f == "repos" or f.startswith("repos" + os.sep)
+        ]
+        return {"deleted": deleted, "freed_bytes": freed, "kept_repos": kept_repos}
 
     def end_active(self, user_id: str):
         """End the active special session (return to temporary mode)."""
@@ -235,6 +254,33 @@ class SpecialSessionManager:
         index = self._load_index(user_id)
         index["active_session"] = None
         self._save_index(user_id, index)
+
+    def clear_context(self, user_id: str):
+        """Clear the active special session's message history, keeping it active.
+
+        Used by ``/clear`` so that a named session's accumulated context
+        (including stale tool outputs) is wiped without deleting the session.
+        Removes snapshots + delta on disk and resets in-memory counters.
+        """
+        session = self.get_active(user_id)
+        if session is None:
+            return
+
+        session_dir = self._session_dir(user_id, session.name)
+        if os.path.exists(session_dir):
+            for f in os.listdir(session_dir):
+                if f.startswith("snapshot_") or f == "delta.jsonl":
+                    try:
+                        os.remove(os.path.join(session_dir, f))
+                    except OSError:
+                        pass
+
+        session.context = []
+        session.total_messages = 0
+        session.last_active = time.time()
+        session._last_snapshot_seq = 0
+        session._delta_count = 0
+        self._update_index(user_id, session)
 
     # ── Message Operations ─────────────────────────────────────────
 
@@ -267,6 +313,69 @@ class SpecialSessionManager:
 
         # Update index
         self._update_index(user_id, session)
+
+    # ── File Provenance ─────────────────────────────────────────
+
+    def add_file(self, user_id: str, name: str, file_path: str) -> None:
+        """Record a workspace-relative file path against a special session.
+
+        Idempotent: re-adding the same path is a no-op. Operates directly on
+        _index.json (metadata.files) to avoid loading the full message context.
+        Unknown session names are silently ignored.
+        """
+        index = self._load_index(user_id)
+        for s in index.get("sessions", []):
+            if s["name"] != name:
+                continue
+            files = s.setdefault("metadata", {}).setdefault("files", [])
+            if file_path in files:
+                return
+            files.append(file_path)
+            self._save_index(user_id, index)
+            return
+
+    def get_files(self, user_id: str, name: str) -> List[str]:
+        """Return the workspace-relative file paths recorded against a session.
+
+        Returns an empty list if the session does not exist or has no files.
+        """
+        index = self._load_index(user_id)
+        for s in index.get("sessions", []):
+            if s["name"] == name:
+                return list(s.get("metadata", {}).get("files", []))
+        return []
+
+    def _workspace_root(self, user_id: str) -> str:
+        """Derive the workspace root (same layout as UserWorkspaceManager)."""
+        return os.path.join(os.path.abspath(self.user_data_root),
+                            self._safe_id(user_id), "workspace")
+
+    def _delete_owned_files(self, user_id: str, rel_paths: List[str]) -> tuple:
+        """Delete session-scoped files, skipping repos/ dirs, ignoring missing.
+
+        Returns (deleted_rel_paths, freed_bytes).
+        """
+        ws = self._workspace_root(user_id)
+        ws_real = os.path.realpath(ws)
+        deleted: List[str] = []
+        freed = 0
+        for rel in rel_paths:
+            if not rel or rel.startswith("..") or os.path.isabs(rel):
+                continue
+            if rel == "repos" or rel.startswith("repos" + os.sep):
+                continue  # repos are recorded but retained
+            full = os.path.realpath(os.path.join(ws, rel))
+            if full != ws_real and not full.startswith(ws_real + os.sep):
+                continue  # outside workspace, never touch
+            if os.path.isdir(full):
+                continue  # only file entries are deletable here
+            try:
+                freed += os.path.getsize(full)
+                os.remove(full)
+                deleted.append(rel)
+            except OSError:
+                pass  # already gone or permission error — idempotent skip
+        return deleted, freed
 
     # ── Auto Naming ─────────────────────────────────────────────────
 

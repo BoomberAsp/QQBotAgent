@@ -1,0 +1,2346 @@
+[
+    {
+        "id": "A0001",
+        "name": "驰骋的快感",
+        "e7_name": "神圣牺牲",
+        "other_names": [
+            "Pleasure of Exploration",
+            "复活甲"
+        ],
+        "Related": "艾瑞儿",
+        "Class": "Defender",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "一身轻装、驰骋四方的她，期望你能够如同对待爱车那般，好好地疼爱她，让两人一同享受奔驰的快感。",
+        "Skill": "死亡时，有[50-100%]机率使自身以25%生命力复活，并附加<护盾>(1回合)，护盾效果根据自己最大生命力等比提升。发动1次后不会再次发动",
+        "Multipliers": {
+            "Normal": {
+                "Shield": {
+                    "Max HP": 0.3
+                }
+            }
+        },
+        "Notes": ""
+    },
+    {
+        "id": "A0002",
+        "name": "幸福的时刻",
+        "e7_name": "埃布利斯的宝剑",
+        "other_names": [
+            "Blissful Moment",
+            "大宝剑"
+        ],
+        "Related": "夏妮",
+        "Class": "Defender",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "在媚药的影响下，她终于实现了她长久以来想要与自己结合的心愿。而见证两人幸福时刻的你，也越来越饥渴难耐。",
+        "Skill": "自身除外的我方成员受到攻击时，自身以[10-20%]机率反击攻击者",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0003",
+        "name": "爱人的画像",
+        "e7_name": "高洁的誓言",
+        "other_names": [
+            "Lover's Portrait",
+            "高露洁"
+        ],
+        "Related": "盖妲",
+        "Class": "Defender",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "以铁娘子之姿领导军队的她，即使内心还在思念着爱人，却仍为了复仇向你提出交合的请求。了解这点的你，便故意将脱去衣衫的她，压在她爱人的画像之上。",
+        "Skill": "若生命力越低，则防御力、状态抗性提升得越多，最多提升至[50-100%]",
+        "Multipliers": {},
+        "Notes": "该效果并非线性递增，分段为：\n·0.00-0.24最大生命 = 1.00倍提升\n·0.25-0.49最大生命 = 0.66倍提升\n·0.50-0.74最大生命 = 0.33倍提升\n·0.75-1.00最大生命 = 0.00倍提升\n该防御力%与<防御力提升>buff为加算"
+    },
+    {
+        "id": "A0019",
+        "name": "催促的回眸",
+        "e7_name": "亚乌利斯",
+        "other_names": [
+            "Backward Glance",
+            "分摊"
+        ],
+        "Related": "艾乐莱思",
+        "Class": "Defender",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 7,
+            "Max": 91
+        },
+        "HP": {
+            "Base": 63,
+            "Max": 819
+        },
+        "Description": "早已觊觎你肉体许久的她，趴在了放有多样情趣调教用具的华丽卧榻上，并以期待的眼神回眸，命令着你赶快进入。",
+        "Skill": "我方全体的防御力提升10%。我方全体受到的[10-20%]伤害由自身代为承受。不会与相同名称的羁绊效果重复，伤害量分配效果只会套用最高的效果",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0020",
+        "name": "无人的店面",
+        "e7_name": "金刚石盾牌",
+        "other_names": [
+            "Unmanned Storefront",
+            "金刚石"
+        ],
+        "Related": "卡洛琳",
+        "Class": "Defender",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 7,
+            "Max": 91
+        },
+        "HP": {
+            "Base": 63,
+            "Max": 819
+        },
+        "Description": "在雅致的咖啡厅内，除了好好感谢你所赠与的珍贵宝物之外，最重要的还是将自己献给一直暗恋的你。",
+        "Skill": "我方成员受到暴击攻击时，受到的伤害量下降[8-16%]。伤害下降效果重复时，只会套用最高的效果",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0021",
+        "name": "潜藏的爱意",
+        "e7_name": "锡拉革骑士长矛",
+        "other_names": [
+            "Hidden Affection"
+        ],
+        "Related": "露比",
+        "Class": "Defender",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 10,
+            "Max": 130
+        },
+        "HP": {
+            "Base": 55,
+            "Max": 715
+        },
+        "Description": "在他沉睡的这十年间，暗恋他的她替他打理了佣兵团，并总是陪伴在他身边，无微不至地照顾着他。在他醒来之后，她再也按捺不住自己的情意。",
+        "Skill": "自身除外的我方成员受到单一攻击时，自身的行动值提升[5.0-10.0%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0131",
+        "name": "新奇的感受",
+        "e7_name": "王的诞生",
+        "other_names": [
+            "Novel Sensation"
+        ],
+        "Related": "瑟妮卡",
+        "Class": "Defender",
+        "Stars": 5,
+        "Released": "2024-05-29",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "爱用小玩具独自缓解欲望的她，如今将体验真正的交流。在新奇感受连番涌来的同时，她必须用尽意志力，不让动情的声音传到一内之隔的下属耳边。",
+        "Skill": "防御力提升10%\n自身回合结束时，使自身除外生命力比例最低的我方目标附加相当于自身最大生命力[8-16%]的<护盾>(2回合)。不会与相同名称的羁绊效果重复",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0165",
+        "name": "醉与醒之间",
+        "e7_name": "荣耀之冠",
+        "other_names": [
+            "Intoxicated Limbo"
+        ],
+        "Related": "玳莲",
+        "Class": "Defender",
+        "Stars": 5,
+        "Released": "2024-07-10",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "你自告奋勇地参与她的酒杂直播，帮忙照应不谙酒性的她，但她喝醉后的诉求和各种暖昧不明的话语，却使你陷入「她究竟是醉是醒」的困惑之中。",
+        "Skill": "我方成员受到全体攻击时，受到的伤害量下降[10-20%]，并减少敌人5点星源。伤害下降效果重复时，只套用最高效果，减少星源效果每使用1次技能只能套用1次。不会与相同名称的羁绊效果重复",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0263",
+        "name": "纯白的真心",
+        "e7_name": "Rocket Punch",
+        "other_names": [
+            "Pristine Sincerity"
+        ],
+        "Related": "璀璨誓约的露比",
+        "Class": "Defender",
+        "Stars": 5,
+        "Released": "2025-04-02",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "少女的爱意在与你时光中成长，绽放为纯白的花朵，以最美的姿态呈现给你。",
+        "Skill": "施展单一攻击后，以[50-100%]机率对目标造成自身防御力等比的追加伤害",
+        "Multipliers": {
+            "Normal": {
+                "Flat Mod": {
+                    "DEF": 1
+                },
+                "Pow!": {
+                    "Front": 1,
+                    "Rear": 1.871
+                }
+            }
+        },
+        "Notes": "贯穿70%防御力，无克制属性，无法暴击，无法闪避"
+    },
+    {
+        "id": "A0341",
+        "name": "雪夜的铃声",
+        "e7_name": "",
+        "other_names": [
+            "Winter Night's Chime"
+        ],
+        "Related": "小女将希蓓尔",
+        "Class": "Defender",
+        "Stars": 5,
+        "Released": "2025-12-24",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "受到你帮忙的小女将，渐渐无法压抑胸中满溢的情感，期望能在雪夜的温泉中，为你提供特别服务……",
+        "Skill": "暴击伤害提升[15-30%]\n受到攻击时，伤害量下降[10-20%]。伤害下降效果重复时，只套用最高效果",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0347",
+        "name": "酸苦的过往",
+        "e7_name": "明暗双翼",
+        "other_names": [
+            "Bittersweet Past"
+        ],
+        "Related": "追忆的玛夏",
+        "Class": "Defender",
+        "Stars": 5,
+        "Released": "2026-01-21",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "面对过去留下的伤痛后，她再次展现出你熟悉的风采与笑容。",
+        "Skill": "暴击率提升15%\n攻击时伤害量提升[7-14%]，发生暴击时下一次攻击的伤害量追加提升[4-8%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0004",
+        "name": "残酷的真相",
+        "e7_name": "深渊王冠",
+        "other_names": [
+            "The Cruel Truth"
+        ],
+        "Related": "璐茜娅",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2023-11-08",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "为了心爱的你，她愿意稍微放下自己应尽的责任，将真相和爱意全部倾诉于你。当然，这也包括向你所爱的人宣示主权。",
+        "Skill": "攻击后以[12-24%]机率对敌人造成<晕眩>(1回合)",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0005",
+        "name": "忘利的商人",
+        "e7_name": "艾帝嘉权杖",
+        "other_names": [
+            "Altruistic Businessman"
+        ],
+        "Related": "奥德雅",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 43,
+            "Max": 559
+        },
+        "Description": "拥有魅惑的话术和迷人酮体的她，主动勾引你到她富丽的寝榻，并为了达成最大利益，选择与你进行日以继夜的交合。",
+        "Skill": "自身回合开始时，以[25-50%]机率使自身技能冷却时间减少1回合",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0006",
+        "name": "生猛的刺激",
+        "e7_name": "时间的物质",
+        "other_names": [
+            "Ferocity"
+        ],
+        "Related": "泰里莎",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 43,
+            "Max": 559
+        },
+        "Description": "虽然她常声称对性爱没兴趣，但此刻却陶醉在自身创造的机械触手之中。正当她赤裸的肌肤承受着激烈的刺激时，她突然向你提出了一个请求。",
+        "Skill": "消灭敌人时，使自身技能冷却时间减少1回合，下一个攻击的伤害量提升[18-36%]，每施展1次技能只能套用1次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0022",
+        "name": "初次的悸动",
+        "e7_name": "塔克赫尔古书",
+        "other_names": [
+            "The First Flutter",
+            "魂书"
+        ],
+        "Related": "伊娥丝",
+        "Class": "Caster",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 12,
+            "Max": 156
+        },
+        "HP": {
+            "Base": 45,
+            "Max": 585
+        },
+        "Description": "明明是曾经毁灭世界的魔王，却在失忆之后变成献出第一次的纯情少女，感觉不论是粗鲁地对她，还是温柔地对她，对于她来说都是脸红心跳的初体验。",
+        "Skill": "首次战斗开始时，获得[10-20]点星源",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0023",
+        "name": "战前的欢愉",
+        "e7_name": "嘉拉特拉",
+        "other_names": [
+            "Pleasure of Anticipation"
+        ],
+        "Related": "安熙恩",
+        "Class": "Caster",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 27,
+            "Max": 351
+        },
+        "Description": "为了做足准备，她用增幅装置放大欲望，并提升了从你这边吸收力量的效率，吃了媚药的她与玛夏一同褪去衣衫，热切地向你索讨欢愉。",
+        "Skill": "攻击时若目标拥有负向状态，则伤害量提升[15-30%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0024",
+        "name": "爱意的共鸣",
+        "e7_name": "席拉-莲",
+        "other_names": [
+            "Love's Resonance"
+        ],
+        "Related": "异变的使徒",
+        "Class": "Caster",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 12,
+            "Max": 156
+        },
+        "HP": {
+            "Base": 45,
+            "Max": 585
+        },
+        "Description": "在亲吻与拥抱她的同时，你与她的共鸣也达到了颠峰，回想起过往的点点滴滴，你决定向她倾诉情意，并用所有的爱来与她结合。",
+        "Skill": "攻击时以[25-50%]机率对敌人造成<随机负向状态>(1回合)\n随机负向状态：<攻击力下降>、<命中率下降>、<沉默>、<沉睡>、<中毒>其中之一",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0153",
+        "name": "部长的假面",
+        "e7_name": "红色噩梦之月",
+        "other_names": [
+            "Director's Mask"
+        ],
+        "Related": "卢妮艾塔",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2024-06-05",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "冷漠的她总是扳着一张脸，即使是交合前夕也不例外。你注视着她倔强的神情与玲珑的身材曲线，期待能够透过热情的交流，卸下她冰冷的假面。",
+        "Skill": "追击率提升[7-14%]\n非自身回合时，攻击力提升20%、状态命中提升[20-40%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0168",
+        "name": "反差的甜美",
+        "e7_name": "最后的下午茶",
+        "other_names": [
+            "Sweet Contrast"
+        ],
+        "Related": "厄德莱雅",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2025-03-26",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "这位表情阴沉的所长，意外地对你颇有兴趣。而你也从她冷漠的外表下，发掘了连她自己都不知道的，深藏白袍底下的炽热情欲。",
+        "Skill": "施展全体攻击技能时，伤害量提升[9-18%]自身回合开始时，以[12-24%]机率使自身技能冷却时间减少1回合",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0171",
+        "name": "姐妹的默契",
+        "e7_name": "改良型龙指虎",
+        "other_names": [
+            "Sisterly Chemistry"
+        ],
+        "Related": "安泰西亚",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2024-06-12",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "无论明面上的互动如何，朝夕相处的她们之间，早已产生了无形的默契。当两人对于彼此的性癖与内心真实的想法，都已经瞭若指掌之后，那份爱也无须再隐藏。",
+        "Skill": "受到攻击时，以[15-30%]机率反击",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0207",
+        "name": "羞涩的实证",
+        "e7_name": "精灵气息",
+        "other_names": [
+            "Bashful Proof"
+        ],
+        "Related": "蓓蕾卡",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2024-07-14",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "总是从书上了解一切事物的她，终于迎来实证的时刻。在你耐心引导下，强化星源的同时，她也体会到了笔墨难以形容的快乐。",
+        "Skill": "施展非攻击技能后，以[50-100%]机率使自身技能冷却时间减少1回合",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0222",
+        "name": "暗巷的交锋",
+        "e7_name": "女神的黑手",
+        "other_names": [
+            "Backstreet Friction",
+            "黑手"
+        ],
+        "Related": "赫罗薇克",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2025-09-17",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "在分秒必争的战术推进时刻，她撕下裤袜，要和你来一场酣畅淋漓的战前交锋。",
+        "Skill": "战斗开始时，提升暴击率及暴击伤害[12-24%]。该效果在每次自身攻击时降低1.2%，最多减少至[6-18%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0237",
+        "name": "赛博攻防战",
+        "e7_name": "噩梦童话",
+        "other_names": [
+            "Cyber Clash"
+        ],
+        "Related": "Projekt Melody",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2024-09-18",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "为了拯救被另一个人格侵占意识的她，你决定阃■插叆■■铏■\n……呵，我没想到这画面竟然让你如此念念不忘。还想再来的话我随时可以奉陪，当然是趁Melly不注意的时候了~哈哈哈！",
+        "Skill": "追加技能、反击、追击攻击敌人后，以60%机率解除目标1个正向状态，以100%机率造成[750-1500]固定伤害",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0246",
+        "name": "失守的防线",
+        "e7_name": "Frame of Light",
+        "other_names": [
+            "Breached Defenses",
+            "光之框架"
+        ],
+        "Related": "杏仁ミル",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2024-11-13",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 43,
+            "Max": 559
+        },
+        "Description": "总是铁齿着不愿意让你接近的可人猫娘，最终仍是难逃被注定好的命运。你借机突破了她早已弱化许多的防备心，让她的排斥感在媾合之后烟消云散。",
+        "Skill": "施展单一攻击时，伤害量提升[8-16%]施展单一攻击消灭敌人时，获得10点星源。获得星源效果发动1次后不会再发动",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0410",
+        "name": "神圣的仪礼",
+        "e7_name": "恶魔&天使",
+        "other_names": [
+            "Rite of the Divine"
+        ],
+        "Related": "空",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2026-01-07",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "她在至圣之地对你展露了少女的纯洁。希望你用最原始的欲望，与她一同完成这祝福的仪礼。",
+        "Skill": "暴击伤害提升15%\n攻击全体敌人后，自身行动值提升[10-20%]。行动值提升效果在追加技能、反击、追击时不会发动",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0008",
+        "name": "贪吃的后果",
+        "e7_name": "杜兰月",
+        "other_names": [
+            "Gluttony's Price"
+        ],
+        "Related": "莎莉丝特",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 43,
+            "Max": 559
+        },
+        "Description": "她是个众所皆知的贪吃鬼，而她旺盛得惊人的食欲，此时似乎也延伸到了你的身上，而你美味的下体，也让她一尝试便欲罢不能。",
+        "Skill": "受到攻击时，使自身行动值提升[4-8%]，若自身生命力为75%以下时，行动值追加提升[4-8%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0009",
+        "name": "真正的主角",
+        "e7_name": "循环念珠",
+        "other_names": [
+            "The Real Lead"
+        ],
+        "Related": "菲莉斯",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "答应了担当体格健美的她的家教的你，除了指导她提升魅力的方法之外，还为了渴望成为主角的她，进行了一连串汗水淋漓的课程。",
+        "Skill": "受到单一攻击时，受到的伤害量下降[8-16%]。施展单一攻击时，伤害量提升10%。伤害下降效果重复时，只套用最高效果",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0025",
+        "name": "狂暴与欲望",
+        "e7_name": "艾尔之拳",
+        "other_names": [
+            "Rage and Desire"
+        ],
+        "Related": "卡丽希",
+        "Class": "Warrior",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 12,
+            "Max": 156
+        },
+        "HP": {
+            "Base": 45,
+            "Max": 585
+        },
+        "Description": "害怕自己再度因异常而失控的她，请求你以交合来进行净化，没想到在诉说着不愉快的回忆的同时，她却突然因发作而暴走，并打算把你吃干抹净。",
+        "Skill": "若生命力越低，攻击力、速度提升得越多。最多提升至[25-50%]",
+        "Multipliers": {},
+        "Notes": "该效果并非线性递增，分段为：\n·0.00-0.24最大生命 = 1.00倍提升\n·0.25-0.49最大生命 = 0.66倍提升\n·0.50-0.74最大生命 = 0.33倍提升\n·0.75-1.00最大生命 = 0.00倍提升"
+    },
+    {
+        "id": "A0026",
+        "name": "强势的反扑",
+        "e7_name": "地狱切割机",
+        "other_names": [
+            "Counterstroke"
+        ],
+        "Related": "朵琳",
+        "Class": "Warrior",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 27,
+            "Max": 351
+        },
+        "Description": "在吻了受星源污染的她后，你感知到了医疗人员的压力，所以当她要求你协助净化时，你便马上答应，却意外地在过程中被她拿走了主导权。",
+        "Skill": "任一成员回合开始时，自身攻击力、暴击率重迭提升[2-4%]。该效果在攻击后解除",
+        "Multipliers": {},
+        "Notes": "似乎会被<中毒>移除"
+    },
+    {
+        "id": "A0027",
+        "name": "狂野的呼唤",
+        "e7_name": "史特雷克拳套",
+        "other_names": [
+            "Call of the Wild"
+        ],
+        "Related": "芭索萝",
+        "Class": "Warrior",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 7,
+            "Max": 91
+        },
+        "HP": {
+            "Base": 63,
+            "Max": 819
+        },
+        "Description": "看似气焰强盛又穿着暴露的她，却在被触碰的那瞬间脸红发颤，带着期待与不安献出了自己的第一次，而在她的内心深处，竟还十分渴望下一次的到来。",
+        "Skill": "若自身生命力为50%以上时，状态抗性提升[30-60%]，若生命力未满50%，该效果下降50%",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0037",
+        "name": "市集的角落",
+        "e7_name": "洒花",
+        "other_names": [
+            "Corner of The Market"
+        ],
+        "Related": "玛夏",
+        "Class": "Warrior",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 27,
+            "Max": 351
+        },
+        "Description": "一向靠刻苦修炼来提升实力的她，在急迫的情况之下，只好依靠你的协助。但这次的协助，意外地没有她所想的那么糟。",
+        "Skill": "状态命中提升[7-14%]消灭敌人时，使自身附加<攻击力提升>(2回合)",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0156",
+        "name": "完美的渴求",
+        "e7_name": "生命摇篮",
+        "other_names": [
+            "Pursuit of Perfection"
+        ],
+        "Related": "洁莉摩尔",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2025-02-12",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "她突然出现在你眼前，并以极其稀有的物品，让你不得不答应与她性爱的交易。而那完美的胴体，也让你对这个高傲的女人留下了深刻的印象。",
+        "Skill": "状态命中提升35%\n于自身回合施展单一攻击时，以[50-100%]机率对目标造成<随机负向状态>(2回合)。随机负向状态：<攻击力下降>、<命中率下降>、<灼烧>其中之一",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0142",
+        "name": "美味的封肉",
+        "e7_name": "优胜者奖杯",
+        "other_names": [
+            "Delicious Braised Meat"
+        ],
+        "Related": "新春的莎莉丝特",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2024-02-07",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "她的贪吃破坏了你与同伴们的原定计画，你决定给她一个教训。于是没有防备心的她在除夕夜的饭桌上轻易地被你灌醉，成为由你独享的香嫩封肉。",
+        "Skill": "状态命中提升[15-30%]\n施展基本技能后，以[13-26%]机率对目标造成<晕眩>(1回合)。追加技能、反击、追击时不会发动",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0160",
+        "name": "小丑的邀约",
+        "e7_name": "孤注一掷",
+        "other_names": [
+            "The Jester's Invitation"
+        ],
+        "Related": "哈蒂",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2024-08-07",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "你接受了小丑的邀约，与她一起坐上咖啡杯。在欢乐的音乐与灯光中，你们一起进入了前所未有的情欲乐园。",
+        "Skill": "施展非攻击技能后，攻击力提升[7.5-15%]、速度提升[5-10%]。最多可重迭3次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0174",
+        "name": "疗愈的夜袭",
+        "e7_name": "金玫瑰",
+        "other_names": [
+            "Therapeutic Night Raid"
+        ],
+        "Related": "Aoi Hinamori",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2024-03-20",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "有求于你的她，决定在某一天夜晚，让你体验被夜袭的感觉。她在你耳际那轻柔的低语，以及软嫩湿滑的唇舌爱抚，都疗愈了你身心的疲惫。",
+        "Skill": "攻击时，若自身生命力为50%以上，伤害量提升[8-16%]，若自身生命力为50%以下，恢复伤害量[15-30%]的生命力",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0192",
+        "name": "强化的渴望",
+        "e7_name": "创造之福&破坏之颂",
+        "other_names": [
+            "Desire for Enhancement"
+        ],
+        "Related": "亚毕丝",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2024-10-02",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "怀抱目的接近你的犬耳少女，反倒被激烈交合的快乐所征服。她的身心热切地纠缠着你，渴望获得更多来自你的恩赐。",
+        "Skill": "施展单一攻击时，伤害量提升8%施展技能时，以[10-20%]机率使该技能不产生冷却时间",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0231",
+        "name": "不义的陷阱",
+        "e7_name": "席格勒赛斯",
+        "other_names": [
+            "Treacherous Snare",
+            "吸血斧"
+        ],
+        "Related": "蛛美",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2025-12-17",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "你就像一个无知的猎物，落入她精心编织的陷阱中。如今，她要仔细品尝这份以你的不甘和愤恨酿就的甜美。",
+        "Skill": "攻击力提升[10-20%]\n若自身生命力为50%以下时，攻击后恢复自身相当于伤害量[25-50%]的生命力",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0240",
+        "name": "专有的服务",
+        "e7_name": "抗魔面具",
+        "other_names": [
+            "Exclusive Service"
+        ],
+        "Related": "HongKongDoll",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2024-08-21",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "就像是一种报答，她在那个最浪漫的月色下，给了你最高规格的特殊服务，而且是你才有的服务项目。",
+        "Skill": "暴击率提升15%\n回合开始时，使自身以[50-100%]机率附加<随机正向状态>(2回合)\n随机正向状态：<免疫>、<攻击力提升>、<防御力提升>、<暴击伤害提升>其中之一",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0252",
+        "name": "寂寞的救赎",
+        "e7_name": "龙族板甲",
+        "other_names": [
+            "Lonely Salvation"
+        ],
+        "Related": "圣诞的蜜拉贝儿",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2024-12-25",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "夜半的办公桌前，她承认了自己是如此渴望你的抚摸。哪怕理智担心蜜娜醒来，身体却又如此诚实。也许，净化也只是一种亲近你的借口罢了。",
+        "Skill": "暴击伤害提升[15-30%]\n受到暴击攻击时，受到的伤害量下降[8-16%]。伤害下降效果重复时，只套用最高效果",
+        "Multipliers": {},
+        "Notes": "该效果可突破350%的暴击伤害上限"
+    },
+    {
+        "id": "A0302",
+        "name": "泳池畔私语",
+        "e7_name": "青光彗星",
+        "other_names": [
+            "Poolside Secrets"
+        ],
+        "Related": "泳池魅影吉妮兹",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2025-07-23",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 43,
+            "Max": 559
+        },
+        "Description": "经历过一连串的讨价还价，你终于同意她穿着你要求的服装、用她喜欢的方式和你进行交合，也发现了由她主导……似乎并不坏。",
+        "Skill": "暴击率提升[7-14%]\n若自身生命力为50%以下时，攻击后恢复自身相当于伤害量[25-50%]的生命力",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0317",
+        "name": "隐藏的炽热",
+        "e7_name": "红丸之刀",
+        "other_names": [
+            "Hidden Passion"
+        ],
+        "Related": "猫祭",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2025-09-03",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "碍于平时的行事作风，她从未将自己渴望的性癖表露出来，但却在意外之中被你得知。那是发生在她的地下仓库中的小插曲……",
+        "Skill": "首次战斗开始时，以[50-100%]机率附加<免疫>(1回合)\n回合开始时，若自身未处于负向状态，则以[50-100%]机率附加<攻击力提升>(1回合)",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0320",
+        "name": "秘密的战略",
+        "e7_name": "孤独祈祷",
+        "other_names": [
+            "Covert Strategy"
+        ],
+        "Related": "继任者弥卡伊勒",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2025-10-01",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "无人的秘密路线。上锁的隐密房间。她向你发出邀请，与她共同探讨如何攻略方舟总理的绝美胴体……",
+        "Skill": "生命力提升[5-10%]\n攻击时，伤害量提升[5-10%]，若为追加技能时，伤害量追加提升[5-10%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0332",
+        "name": "狂放的禁果",
+        "e7_name": "洁克·欧的象征",
+        "other_names": [
+            "Reckless Temptation"
+        ],
+        "Related": "南瓜鬼怪莱拉",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2025-10-29",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "在你的引导下，少女终于压抑不住心里的渴望，在阴暗的小巷中跨到你身上……",
+        "Skill": "单一攻击时，伤害量提升[8-16%]\n以单一攻击消灭敌人时，使自身除外的全体我方成员行动值提升[6-12%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0338",
+        "name": "热烈的声援",
+        "e7_name": "纯白信赖",
+        "other_names": [
+            "Fervent Cheer"
+        ],
+        "Related": "啦啦队蓓蕾卡",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2025-12-12",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "白日为伙伴加油声援的她，夜里将顺从自己的欲望，踏着羞怯与期待的脚步来到你的房内前……",
+        "Skill": "施展单一攻击时，命中率提升25%\n施展非攻击技能时，获得10点星源，且下一次攻击的暴击伤害提升[15-30%]。获得星源效果发动1次后不会再发动",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0007",
+        "name": "束缚与控制",
+        "e7_name": "雪花石膏瓶",
+        "other_names": [
+            "Bondage and Control"
+        ],
+        "Related": "赫赛迪雅",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "她总是怀疑自己存在的意义，然而在与你交融的过程中，她终于找到了自己在这个世界的价值，并因此乐于配合你的所有要求。",
+        "Skill": "状态命中提升35%\n单一攻击后，以[35-70%]机率对目标造成<随机负向状态>(2回合)。1回合只会发生1次。随机负向状态：<攻击力下降>、<防御力下降>、<速度下降>、<无法恢复>其中之一",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0010",
+        "name": "无尽的采样",
+        "e7_name": "里安娜&路西艾拉",
+        "other_names": [
+            "Endless Sampling"
+        ],
+        "Related": "萝莎莱",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2024-01-17",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "对于身为星源研究所一部的所长，以及首屈一指的研究员的她来说，取得足够的样本是最重要的，但除此之外，肉体的欢愉也同等重要。",
+        "Skill": "自身回合结束时，以[10-20%]机率产生追加回合。1回合只会发生1次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0011",
+        "name": "难忘的惩罚",
+        "e7_name": "乘风者",
+        "other_names": [
+            "Unforgettable Punishment"
+        ],
+        "Related": "吉妮兹",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "曾经袭击过你的捣蛋鬼，此刻终于被你掌握在手中，你决定给她一场难忘的「惩罚」，来讨回还没算清的帐。",
+        "Skill": "攻击力提升[10-20%]\n消灭敌人时，自身进入<潜伏>(1回合)。下一回合开始时，使攻击力提升[20-40%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0012",
+        "name": "拘束与放荡",
+        "e7_name": "雅莉莎的提篮",
+        "other_names": [
+            "Restraint and Indulgence"
+        ],
+        "Related": "埃帕蒂",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2023-12-06",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "一边是矜持、不自在的她，一边是放荡、肆意挑逗的她，但无论表现出来的举止如何，都无法掩饰两人对于你躯体的强烈渴望。",
+        "Skill": "自身回合开始时，各以[20-40%]机率附加<攻击力大幅提升>(1回合)、<暴击率提升>(1回合)",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0028",
+        "name": "必要的强化",
+        "e7_name": "皎月梦夜",
+        "other_names": [
+            "Necessary Enhancements",
+            "闪避刀"
+        ],
+        "Related": "埃帕蒂",
+        "Class": "Vanguard",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 27,
+            "Max": 351
+        },
+        "Description": "在世界逐渐走向灭亡之际，为了对抗从宇宙而来的威胁，身为前线战斗员的她不仅向你吐露了自己的不安，还希望你能增强她的能力，让她有勇气面对强大的敌人。",
+        "Skill": "闪避提升[10-20%]\n受到攻击时，若闪避成功，则使自身附加<攻击力提升>(1回合)",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0029",
+        "name": "爱怜的疼惜",
+        "e7_name": "埃里哈刀",
+        "other_names": [
+            "Loving Caress"
+        ],
+        "Related": "翠丝特",
+        "Class": "Vanguard",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 27,
+            "Max": 351
+        },
+        "Description": "在装置的作用下，两人内心的欲望逐渐释放。伴随着药物的加持，她们以发热的身体和柔软的唇舌，爱怜地疼惜你高举的分身。",
+        "Skill": "攻击时，若目标当下的生命力非最大值，则贯穿[10-20%]防御力",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0030",
+        "name": "压抑的愉悦",
+        "e7_name": "尘埃恶魔",
+        "other_names": [
+            "Pleasure of Restraint"
+        ],
+        "Related": "茱莉亚",
+        "Class": "Vanguard",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 27,
+            "Max": 351
+        },
+        "Description": "她虽是暗影之刃的厉害杀手，但内心却渴望着被人理解，在感知到她的想法之后，你将她压在榻榻米上，与她进行除了内心以外的交流。",
+        "Skill": "施展基本技能后，若目标仍生存，以[15-30%]机率再施展一次基本技能。1回合只会发动1次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0177",
+        "name": "女王的消遣",
+        "e7_name": "撕裂的右衣袖",
+        "other_names": [
+            "Queen's Pastime"
+        ],
+        "Related": "崔西里亚",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2024-06-12",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "对高高在上的北境女王而言，人气偶像也只不过是用来取悦自己的玩物罢了。她最喜欢的消遣，大概就是消遣别人了吧？",
+        "Skill": "攻击力提升[10-20%]\n单一攻击后，以[50-100%]机率对目标造成<流血>(2回合)",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0210",
+        "name": "坦率的恋慕",
+        "e7_name": "紫色护身符",
+        "other_names": [
+            "Candid Affection",
+            "大闪避刀"
+        ],
+        "Related": "妮诺凯西",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2024-09-04",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "乍看娇柔害羞的她，在你的鼓励下逐渐萌生了勇气。在只有两人共处的此刻，她毫无保留地向你袒露了自己的心意。",
+        "Skill": "闪避提升25%\n每次攻击前，攻击力提升[10-20%]，最多重叠3次，且在战斗开始时重置",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0249",
+        "name": "征服与臣服",
+        "e7_name": "Armament",
+        "other_names": [
+            "Domination and Submission"
+        ],
+        "Related": "朱音",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2024-11-27",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "星源的汙染已经大大影响了她的生存技能。医生说，最好的解方就是乾脆退休，可是她哪有这么容易罢休呢？于是只好苦苦「哀求」你治疗她了。",
+        "Skill": "暴击率提升15%\n施展非攻击技能后，自身行动值提升[10-20%]，并附加<护盾>(2回合)。护盾效果为自身等级x[30-60]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0275",
+        "name": "私密的报答",
+        "e7_name": "冬晷切刀",
+        "other_names": [
+            "Secret Compensation"
+        ],
+        "Related": "兔女郎爱莉卡",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2025-03-05",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "替爱莉卡解决难题之后，为了报答你，她悄悄在公开场合给予你私密又销魂的报答……",
+        "Skill": "暴击率提升10%\n施展非攻击技能后获得10点星源，并减少敌人10点星源，且下一次攻击的伤害量提升[12-24%]。伤害量提升效果每施展1次技能只能套用1次。获得星源效果发动1次后不会再发动",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0344",
+        "name": "特制的甜点",
+        "e7_name": "诱惑之花",
+        "other_names": [
+            "A Sweet Confection"
+        ],
+        "Related": "蜜茶多恩",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2026-02-04",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "甜点与蜂蜜的香气充盈在你们之间，当看见她羞涩却又毫无保留地展露出身体时，你决定顺从这份渴望，满足她所有的愿望……",
+        "Skill": "状态命中提升[15-30%]\n追加施展攻击技能时，使目标行动值下降[10-20%]。3回合只会发生1次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0013",
+        "name": "足尖的诱惑",
+        "e7_name": "血玉髓",
+        "other_names": [
+            "The Allure of the Toe Tip"
+        ],
+        "Related": "奈兰希尔",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "对她来说，真正合格的驱魔者，应该要脱下所有衣物，以赤裸的肌肤碰触恶魔，才能用最强大的能量进行驱魔仪式。",
+        "Skill": "攻击后，恢复生命力比例最低的我方目标的生命力，恢复量相当于伤害量的[13-26%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0014",
+        "name": "热情的力量",
+        "e7_name": "星辰之歌",
+        "other_names": [
+            "The Power of Passion"
+        ],
+        "Related": "普利蔓",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2023-12-27",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "一向认真严肃的副指挥官，突然郑重地向你提出交合的请求，并在充满东方古典风情的房内，向你释放她强烈的电磁力。",
+        "Skill": "单一攻击后，以[50-100%]机率对目标造成<锁定>(2回合)",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0015",
+        "name": "冷静的反面",
+        "e7_name": "异界的机械",
+        "other_names": [
+            "The Other Side of Calm"
+        ],
+        "Related": "爱莉卡",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "为了更快地进入状况，身为所长的她使用了特殊的机械装置，将自己吊挂在半空中以做好准备。而你也因此看到了平时冷静的她的另一面。",
+        "Skill": "暴击伤害提升6%\n全体攻击时，伤害量提升[8-16%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0031",
+        "name": "善意的委托",
+        "e7_name": "无限提篮",
+        "other_names": [
+            "A Mission of Kindness"
+        ],
+        "Related": "克拉菈",
+        "Class": "Sniper",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 27,
+            "Max": 351
+        },
+        "Description": "你肩负他人的请托，要用老方法提升这位爱睡的小迷糊的能力，伤脑筋的是，这位小迷糊的瞌睡虫，比你想象得还要严重。",
+        "Skill": "自身回合开始时，在该回合内使自身除外的我方全体成员追击率提升[7-14%]、攻击力提升20%",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0032",
+        "name": "不只是取样",
+        "e7_name": "香袋伊妲涅斯",
+        "other_names": [
+            "More Than a Sample"
+        ],
+        "Related": "翠丝特",
+        "Class": "Sniper",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 27,
+            "Max": 351
+        },
+        "Description": "起先只是为了取得你的样本的她，完全没想到这个过程会促使她开发未知的领域，甚至还因交合的快感险些失控。",
+        "Skill": "任一敌人死亡时，使我方全体的行动值提升[8-16%]。不会与相同名称的羁绊效果重复",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0033",
+        "name": "诱人的猫咪",
+        "e7_name": "罗沙哈勒戈纳",
+        "other_names": [
+            "Alluring Kitten"
+        ],
+        "Related": "玛蒂尔达",
+        "Class": "Sniper",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 27,
+            "Max": 351
+        },
+        "Description": "热衷可爱事物的她，就连床上也堆满了童趣造型的动物玩偶，并在交合之时，将自身化为无辜的猫咪，期待着你的玩弄。",
+        "Skill": "追击率提升[7-14%]\n非自身回合时，攻击力提升30%",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0122",
+        "name": "魅魔的逆袭",
+        "e7_name": "无法拒绝的提议",
+        "other_names": [
+            "Succubus Incoming"
+        ],
+        "Related": "赤鬼伯伯",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2023-11-29",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "原本居于上风的你，因意料外的发展，一不小心成为她的掌中玩物。而掌控你行为的她，似乎打算彻底将你吃干抹净。",
+        "Skill": "施展单一攻击时，贯穿目标[10-20%]防御力。\n以单一攻击消灭敌人时，使自身除外行动值最高的我方目标的行动值提升[10-20%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0125",
+        "name": "圣诞节礼物",
+        "e7_name": "引导之光",
+        "other_names": [
+            "Christmas Gift"
+        ],
+        "Related": "柯丝玛尔",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2023-12-13",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "在节日氛围的渲染下，接受你帮助的她，决定在这特别的日子里，让自己化身为可口的礼物，以回报你伸出援手的恩情。",
+        "Skill": "战斗开始时，使自身进入<潜伏>(1回合)\n回合结束时，以[35-70%]机率使自身进入<潜伏>(2回合)。回合结束时产生的潜伏效果2回合只会发生1次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0129",
+        "name": "团长的交易",
+        "e7_name": "铁扇",
+        "other_names": [
+            "The Commander's Trade"
+        ],
+        "Related": "黛琳娜",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2024-03-15",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "强势与你进行交易的佣兵团团长，虽一心只想取得最大利益，但连连来袭的情欲高潮，却融化了她内心严守的底线。",
+        "Skill": "施展基本技能以外的全体攻击后，使自身行动值提升[15-30%]。1回合只会发生1次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0204",
+        "name": "迫切的激情",
+        "e7_name": "雷茵格尔特调饮料",
+        "other_names": [
+            "Desperate Desire"
+        ],
+        "Related": "碧海的诺可琳",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2024-07-24",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "心烦意乱的她，需要你一次又一次的占有与进犯。你的体液不仅给了她平静，也给了她满满的爱。",
+        "Skill": "全体攻击后，以[50-100%]机率造成自身攻击力等比的追加伤害",
+        "Multipliers": {
+            "Normal": {
+                "Flat Mod": {
+                    "ATK": 0.45
+                },
+                "Pow!": {
+                    "Front": 1,
+                    "Rear": 1.871
+                }
+            }
+        },
+        "Notes": "贯穿70%防御力，无克制属性，无法暴击，无法闪避"
+    },
+    {
+        "id": "A0219",
+        "name": "突破的尝试",
+        "e7_name": "暗夜指挥者",
+        "other_names": [
+            "Breakthrough Attempt"
+        ],
+        "Related": "巴尔托丝",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2024-10-30",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "严谨而淡漠的女僕，如今却因你的命令做出大不敬的举措。她体内压抑已久的欲望，也在抛开束缚的此刻展现出无比的饥渴与热情。",
+        "Skill": "攻击力提升[6-12%]\n若我方成员攻击时产生暴击，会根据暴击次数等比提升自身攻击力[2-4%]。此效果最多重叠6次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0260",
+        "name": "激情的禁果",
+        "e7_name": "束缚之印",
+        "other_names": [
+            "Forbidden Passion"
+        ],
+        "Related": "新春的蜜娜",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2025-01-22",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "确定了自己的心意之后，少女大胆地向你提出邀请。你们在少女闺房独处，在她热烈的主动进攻之下，品尝起激情的禁果……",
+        "Skill": "施展单一攻击的基本技能后，若没有发生暴击，则以[50-100%]机率造成<炸弹>(2回合)。追加技能、反击、追击时不会发动",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0257",
+        "name": "灵感的来源",
+        "e7_name": "秩序护墙",
+        "other_names": [
+            "Source of Inspiration"
+        ],
+        "Related": "东云 ft.坊桥夜泊",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2025-02-05",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "为了取材，邀你一同外出的她决定透过装睡来测试你的反应，但你却做了出乎她意料之外的举动，而她只能被动地隐忍，直到终于被高潮淹没…",
+        "Skill": "回合开始时，以30%机率加上全体敌人正向状态数量x[5-10%]的机率使自身附加<攻击力大幅提升>(1回合)。首次战斗开始及回合结束时，使自身附加相当于攻击力[35-70%]的<护盾>(1回合)",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0269",
+        "name": "坦率训练课",
+        "e7_name": "Miss Confile",
+        "other_names": [
+            "Honesty Training",
+            "破甲弓"
+        ],
+        "Related": "夏日的乔依丝",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2025-06-11",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "你知道了她想让自己摆脱黑脸形象的渴望，便约她来到你熟悉的海之家，悄悄地为她进行一连串的「教程」。",
+        "Skill": "状态命中提升20%\n单一攻击后以[35-70%]机率造成<防御力下降>(1回合)。追加技能、反击、追击时不会发动",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0305",
+        "name": "办公室秘辛",
+        "e7_name": "时空折扇",
+        "other_names": [
+            "Workplace Whispers"
+        ],
+        "Related": "归还者璐茜娅",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2025-10-15",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "以小秘书身分回归的她，调皮地丰富了我的办公生活。怎料面对难缠的印表机，一向机敏的少女骇客竟败下阵来，急需我的拯救……",
+        "Skill": "状态命中提升20%\n施展非攻击技能后，以[50-100%]机率使自身除外攻击力最高的我方成员附加<潜伏>(2回合)。4回合只会发生1次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0016",
+        "name": "高效的治疗",
+        "e7_name": "孤挺花之杖",
+        "other_names": [
+            "Effective Treatment"
+        ],
+        "Related": "多恩",
+        "Class": "Medic",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "优雅的大小姐如今因你而香汗淋漓，你不但让她亲身体验了高效的治疗法，还让她惊叹云雨带来的多种高潮，使她陶醉于欢愉之中。",
+        "Skill": "施展非攻击技能时，恢复生命力比例最低的我方目标[12-24%]生命力",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0017",
+        "name": "偶像的心声",
+        "e7_name": "席玛德拉的手杖",
+        "other_names": [
+            "Idol's Heart"
+        ],
+        "Related": "诺可琳",
+        "Class": "Medic",
+        "Stars": 5,
+        "Released": "2023-12-20",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "难得与偶像有接触机会的你，因任务而与她有了更深的交流机会，面对害羞的她，你也有点紧张，便指引她摆好姿势，然后给予强而有力的净化。",
+        "Skill": "使我方全体的状态抗性提升20%、恢复量提升[20-40%]。不会与相同名称的羁绊效果重复，恢复量提升效果重复时，只会套用最高的效果",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0018",
+        "name": "深吻与后庭",
+        "e7_name": "天青石",
+        "other_names": [
+            "Deep Kiss and Posterior"
+        ],
+        "Related": "菈法瑞",
+        "Class": "Medic",
+        "Stars": 5,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "危机当前之时，最需要高效率的结合，因此她用亲吻与美乳占据你的前侧，而她则用紧窄的后侧钳住你的下身。",
+        "Skill": "施展基本技能后，恢复生命力比例最低的我方目标[8-16%]生命力",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0034",
+        "name": "非人的体验",
+        "e7_name": "波涛的祈愿",
+        "other_names": [
+            "An Inhuman Experience"
+        ],
+        "Related": "柏妮丝",
+        "Class": "Medic",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 7,
+            "Max": 91
+        },
+        "HP": {
+            "Base": 63,
+            "Max": 819
+        },
+        "Description": "她虽为人造生命体，但不论是肌肤的触感还是皮肤的弹性，却都与真人无异，甚至还能透过人为的操控，带给你毫无间断的无上快感。",
+        "Skill": "受到攻击时，若受到的伤害量超过最大生命力的20%以上时，生命力恢复8%、行动值提升[10-20%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0035",
+        "name": "毒舌的傲骄",
+        "e7_name": "灵药的试管",
+        "other_names": [
+            "Sharp-Tongued Pride"
+        ],
+        "Related": "乔依丝",
+        "Class": "Medic",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 7,
+            "Max": 91
+        },
+        "HP": {
+            "Base": 63,
+            "Max": 819
+        },
+        "Description": "面对这个毒舌的女医师，你发现只要多夸赞她，她便会提供你更多美好的「服务」，让你感到宾至如归。",
+        "Skill": "自身回合开始时，以[50-100%]机率解除我方目标的1个负向状态",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0036",
+        "name": "激情的治疗",
+        "e7_name": "玛姬拉哈的魔法古书",
+        "other_names": [
+            "Passionate Treatment"
+        ],
+        "Related": "茉伊拉",
+        "Class": "Medic",
+        "Stars": 4,
+        "Released": "2023-11-01",
+        "ATK": {
+            "Base": 7,
+            "Max": 91
+        },
+        "HP": {
+            "Base": 63,
+            "Max": 819
+        },
+        "Description": "由于体内的奈米机器人遭受污染，使得忙碌的她突然晕倒。想帮忙净化她的你，便在医护站的病床上，与她进行激情的「治疗」。",
+        "Skill": "使用非攻击技能后，自身行动值提升[15-30%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0243",
+        "name": "羞涩的请求",
+        "e7_name": "守护的冰封碎片",
+        "other_names": [
+            "Bashful Plea",
+            "冰片"
+        ],
+        "Related": "彩伽",
+        "Class": "Medic",
+        "Stars": 5,
+        "Released": "2024-10-16",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "在她身上的星源汙染，似乎不断为她召来了仇恨与忌妒。唯有你能净化她的身体、净化她的世界，为她净化出一个避风港。",
+        "Skill": "状态抗性提升15%\n我方成员受到攻击时，若生命力为50%以下，则恢复生命力[10-20%]。若受到全体或复数攻击时，优先恢复生命力比例最低的我方成员。该效果1回合只会发生1次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0272",
+        "name": "热情的沙浴",
+        "e7_name": "列科斯的救援",
+        "other_names": [
+            "Sensual Sands"
+        ],
+        "Related": "夏日的佩忒菈",
+        "Class": "Medic",
+        "Stars": 5,
+        "Released": "2025-07-09",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "为了收集到足够谈一笔交易的体液，她想到了使用沙浴的方式，希望能让你在最放松的状态下解放欲望。",
+        "Skill": "我方全体成员的状态抗性提升20%\n自身受到攻击时，恢复全体我方成员[5-10%]生命力。1回合只会发生1次。不会与相同名称的羁绊效果重复",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0284",
+        "name": "窒息的征服",
+        "e7_name": "星之竖琴",
+        "other_names": [
+            "Breathless Domination"
+        ],
+        "Related": "乌尔德",
+        "Class": "Medic",
+        "Stars": 5,
+        "Released": "2025-03-14",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "在两人身心相通的共鸣中，你来到解放界线的不可思议场所，与她进行一场禁忌的激烈性爱。",
+        "Skill": "状态抗性提升20%\n受到攻击后以[30-60%]机率解除我方成员1个负向状态",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0413",
+        "name": "盛开的扶桑",
+        "e7_name": "唯一慰借",
+        "other_names": [
+            "Flourishing Hibiscus"
+        ],
+        "Related": "咲",
+        "Class": "Medic",
+        "Stars": 5,
+        "Released": "2025-12-10",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "羞涩的淑女提起勇气，向你提出了约会请求。不过，你却没想到约会的第一幕，竟会是如此香艳的画面……",
+        "Skill": "状态抗性提升[20-40%]\n敌人施展非攻击技能后，自身行动值提升[8%-16%]。1回合只会发生1次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0201",
+        "name": "挣扎的妥协",
+        "e7_name": "勇猛证据",
+        "other_names": [
+            "Reluctant Compromise",
+            "怂证"
+        ],
+        "Related": "伊娃",
+        "Class": "Any",
+        "Stars": 5,
+        "Released": "2025-03-14",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "曾经啤睨星海的她如今被封锁了行动，并向一直视为蚁的你敞开下体。即使神情上仍表现得咬牙切齿，但躁动的身体早已把欲望展示得一览无遗。",
+        "Skill": "受到的伤害量下降[15-30%]。每次受到攻击时减少[1.5-3%]，至多减少5次。伤害下降效果重复时，只套用最高效果。不会与相同名称的羁绊效果重复",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "Carnival006",
+        "name": "嗨！老主顾！",
+        "e7_name": "救援者们的画像",
+        "other_names": [
+            "Hello, Loyal Customer!",
+            "老主顾"
+        ],
+        "Related": "圣诞的蜜拉贝儿",
+        "Class": "Any",
+        "Stars": 4,
+        "Released": "2024-12-25",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 36,
+            "Max": 468
+        },
+        "Description": "叮叮当，你收到了邀请讯息！在这特别的日子里，举办了属于老客户的欢庆活动，诚挚邀请你参加！\n——蜜拉贝儿&蜜娜",
+        "Skill": "攻击时若目标生命力为50%以上，则伤害量提升[10-20%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "Carnival012",
+        "name": "蜜、茶、巧克力",
+        "e7_name": "至尊王牌水枪",
+        "other_names": [
+            "Honey, Tea, and Chocolate",
+            "蜜茶巧克力"
+        ],
+        "Related": "蜜茶多恩",
+        "Class": "Any",
+        "Stars": 4,
+        "Released": "2026-02-04",
+        "ATK": {
+            "Base": 18,
+            "Max": 234
+        },
+        "HP": {
+            "Base": 27,
+            "Max": 351
+        },
+        "Description": "甜如蜜、深邃如茶、又如最浓醇的巧克力般醉人，却也微微苦涩。被甜点簇拥的公主，尚且不知晓那情感的滋味——",
+        "Skill": "我方全体成员的攻击力提升5%、状态命中提升[5-10%]。不会与相同名称的羁绊效果重复",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0392",
+        "name": "温煦的午后",
+        "e7_name": "血玫瑰",
+        "other_names": [
+            "Sunlit Afternoon"
+        ],
+        "Related": "露娜",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2026-02-18",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "沐浴在阳光与青草芬芳气味之下，她仿佛化为可爱且温驯的小猫，轻抬起腰肢，向你讨要更多抚摸——",
+        "Skill": "单一攻击时，状态命中提升[30-60%]\n单一攻击后，以[25-50%]机率造成<回生>(2回合)。回生效果在追加技能、反击、追击时不会发动",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0377",
+        "name": "少女的心机",
+        "e7_name": "落日之灾",
+        "other_names": [
+            "An Innocent Ploy"
+        ],
+        "Related": "莉莉娅",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2026-02-25",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "你没想到她会换上那袭诱人的薄纱，只为在这一刻试图虏获你。然而在被你抱起来的那一刻，少女忐忑的心，就已沦陷。",
+        "Skill": "我方全体成员的攻击力提升[5-10%]\n自身暴击率提升10%、状态命中提升[15-30%]。不会与相同名称的羁绊效果重复",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0350",
+        "name": "黑丝的抚慰",
+        "e7_name": "誓言之杯",
+        "other_names": [
+            "Soothing Black Silk"
+        ],
+        "Related": "喧闹之星哈蒂",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2026-03-18",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "请你帮她补习的好学生哈蒂，为了替疲于奔命的你提神，露出了的性感的黑丝袜……",
+        "Skill": "状态命中提升[15-30%]\n施展非攻击技能时，使技能冷却时间减少1回合，战斗中发动3次后不会再发动",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0356",
+        "name": "跃动的烈情",
+        "e7_name": "钢铁机械铠",
+        "other_names": [
+            "Hopping Passion"
+        ],
+        "Related": "烈酒赤兔芭索萝",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2026-04-01",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "一隻免子趁着休息的空档悄悄熘进房内，在你的注视下红透了脸庞。她试图用强硬的语气掩饰羞涩，却藏不住眼底的渴望。",
+        "Skill": "暴击率提升10%\n追加施展攻击技能时，暴击伤害提升[4-8%]、速度提升[4-8%]。此效果最多重叠4次",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0353",
+        "name": "隐秘的开发",
+        "e7_name": "开辟之矛",
+        "other_names": [
+            "Secret Development"
+        ],
+        "Related": "重装助手翠丝特",
+        "Class": "Defender",
+        "Stars": 5,
+        "Released": "2026-04-15",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "与你的初次经验后，翠丝特对自己的身体也进行了大胆的尝试与开发，诱惑着你一同极乐……",
+        "Skill": "施展基本技能后，以[50-100%]机率对目标造成自身攻击力等比的追加伤害",
+        "Multipliers": {
+            "Normal": {
+                "Flat Mod": {
+                    "ATK": 0.45
+                },
+                "Pow!": {
+                    "Front": 1,
+                    "Rear": 1.871
+                }
+            }
+        },
+        "Notes": "贯穿70%防御力，无克制属性，无法暴击，无法闪避"
+    },
+    {
+        "id": "A0335",
+        "name": "逆转的撩拨",
+        "e7_name": "白雪水晶",
+        "other_names": [
+            "Provocative Reversal",
+            "雪花"
+        ],
+        "Related": "时界巡者Aoi",
+        "Class": "Warrior",
+        "Stars": 5,
+        "Released": "2026-05-13",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "这次，你一反过去會被她夜袭的情况，在她的闺房中掌握了主导权，也理所当然地将她娇羞的模样尽收眼底。",
+        "Skill": "暴击抵抗提升20%、生命力提升10%\n受到非暴击攻击时，行动值提升[8-16%]。1回合只会发生1次",
+        "Multipliers": {
+            "Normal": {
+                "Flat Mod": {
+                    "ATK": 0.45
+                },
+                "Pow!": {
+                    "Front": 1,
+                    "Rear": 1.871
+                }
+            }
+        },
+        "Notes": ""
+    },
+    {
+        "id": "A0380",
+        "name": "晨间的呵护",
+        "e7_name": "无为的引导者",
+        "other_names": [
+            "Morning Caress",
+            "无为"
+        ],
+        "Related": "芽路",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2026-05-27",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "她告诉你：女人的私处的肌肤就如同脸蛋般娇嫩，这让你对于这次的晨间性爱有了不同于以往的联想。",
+        "Skill": "闪避提升20%\n攻击时伤害量提升[6-12%]。生命力越低，伤害量越大，最多提升至[12-24%]",
+        "Multipliers": {},
+        "Notes": "该效果并非线性递增，分段为：\n·最大值(<25% HP)\n·0.83倍最大值(<50% HP)\n·0.67倍最大值(<75% HP)\n·0.5倍最大值(≥75% HP)"
+    },
+    {
+        "id": "A0434",
+        "name": "近岸轻撩时",
+        "e7_name": "暗影之书",
+        "other_names": [
+            "Coastal Murmurs"
+        ],
+        "Related": "爱恋泡影的玳莲",
+        "Class": "Caster",
+        "Stars": 5,
+        "Released": "2026-06-10",
+        "ATK": {
+            "Base": 15,
+            "Max": 195
+        },
+        "HP": {
+            "Base": 54,
+            "Max": 702
+        },
+        "Description": "她的一个小小的失误，在你的眼中也格外可爱。你们过往的每一场亲热，都在此时逐渐鲜明。你的轻撩和她的娇语，都被海潮声巧妙地掩盖了起来。",
+        "Skill": "非自身回合攻击时，伤害量提升[8-16%]，并对目标造成<随机负向状态>(1回合)。\n随机负向状态：<防御力下降>、<速度下降>、<沉默>、<无法强化>其中之一",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0419",
+        "name": "刹那的拥有",
+        "e7_name": "宴会之主",
+        "other_names": [
+            "Moment's Possession"
+        ],
+        "Related": "绚烂夏花卡洛琳",
+        "Class": "Vanguard",
+        "Stars": 5,
+        "Released": "2026-06-24",
+        "ATK": {
+            "Base": 21,
+            "Max": 273
+        },
+        "HP": {
+            "Base": 32,
+            "Max": 416
+        },
+        "Description": "即使只是短暂的一瞬，也足以让人生染上色彩。少女借着虚幻的梦，交付了你真实的情感。",
+        "Skill": "状态抗性提升[20-40%]\n攻击时伤害量提升[5-10%]，若目标生命力为50%以上，伤害量追加提升[4-8%]",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0386",
+        "name": "炎热和沁凉",
+        "e7_name": "隐形的观察者",
+        "other_names": [
+            "Beating the Heat"
+        ],
+        "Related": "水纪",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2026-07-08",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "原以为熄灭的火苗再次燃起，这一次，你决定要将残留的汙染彻底净化跟扑灭。",
+        "Skill": "施展非攻击技能后，自身行动值提升[10-20%]、获得10点星源。获得星源效果发动1次后不会再发动",
+        "Multipliers": {},
+        "Notes": ""
+    },
+    {
+        "id": "A0422",
+        "name": "斗室的抚触",
+        "e7_name": "慰灵烛光",
+        "other_names": [
+            "Narrow Sanctuary"
+        ],
+        "Related": "雪江",
+        "Class": "Sniper",
+        "Stars": 5,
+        "Released": "2026-07-22",
+        "ATK": {
+            "Base": 9,
+            "Max": 117
+        },
+        "HP": {
+            "Base": 76,
+            "Max": 988
+        },
+        "Description": "你给予她支持的温暖感受，让她念念不忘，因此决定安排一个能让你们独处一室的机会，在学校仓库的狭窄空间里，实现让你再次近距离触碰她的愿望。",
+        "Skill": "攻击后以[25-50%]机率造成<防御力下降>(1回合)。追加技能、反击、追击时不会发动",
+        "Multipliers": {},
+        "Notes": ""
+    }
+]

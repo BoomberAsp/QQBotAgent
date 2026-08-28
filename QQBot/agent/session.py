@@ -117,6 +117,15 @@ class SessionManager:
         """Get a session without creating."""
         return self._sessions.get(user_id)
 
+    def message_count(self, user_id: str) -> int:
+        """Return the number of messages in the user's session context.
+
+        Returns 0 when the user has no session. Used to decide when to
+        suggest upgrading a long temporary session to a special session.
+        """
+        session = self.get(user_id)
+        return len(session.context) if session else 0
+
     def update(self, user_id: str, session: Session):
         """Update a session and optionally persist."""
         self._sessions[user_id] = session
@@ -136,6 +145,7 @@ class SessionManager:
         session = self._sessions.get(user_id)
         if session:
             session.clear()
+            self._save_to_disk(user_id, session)
 
     def cleanup_expired(self) -> int:
         """Remove expired sessions. Returns count of removed sessions."""

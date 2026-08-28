@@ -75,6 +75,24 @@ class UserWorkspaceManager:
 
     # ── Quota Management ─────────────────────────────────────────
 
+    def _effective_quota_bytes(self) -> int:
+        """Return the per-request quota in bytes.
+
+        Prefers the per-role quota set by agent_router via the
+        ``_current_quota_bytes`` contextvar (admin 2GB / vip 500MB /
+        regular 100MB); falls back to the fixed default configured on
+        this manager when the contextvar is unset (e.g. outside a request).
+        """
+        try:
+            from agent.context import _current_quota_bytes
+        except ImportError:
+            try:
+                from QQBot.agent.context import _current_quota_bytes
+            except ImportError:
+                return self.quota_bytes
+        qb = _current_quota_bytes.get()
+        return qb or self.quota_bytes
+
     def get_size(self, user_id: str) -> int:
         """Return the total bytes used by this user's directory."""
         user_dir = self.get_user_dir(user_id)
@@ -98,17 +116,18 @@ class UserWorkspaceManager:
         """
         current = self.get_size(user_id)
         projected = current + additional_bytes
+        quota_bytes = self._effective_quota_bytes()
 
-        if projected < self.quota_bytes * 0.8:
+        if projected < quota_bytes * 0.8:
             return True, ""
 
-        usage_pct = (projected / self.quota_bytes) * 100
+        usage_pct = (projected / quota_bytes) * 100
         usage_mb = projected / (1024 * 1024)
 
-        if projected < self.quota_bytes:
+        if projected < quota_bytes:
             return True, (
                 f"⚠️ 工作区使用量接近上限: {usage_mb:.0f} MB / "
-                f"{self.quota_bytes // (1024 * 1024)} MB ({usage_pct:.0f}%)。"
+                f"{quota_bytes // (1024 * 1024)} MB ({usage_pct:.0f}%)。"
                 f"建议清理不需要的文件。"
             )
 
@@ -116,7 +135,7 @@ class UserWorkspaceManager:
         self._over_quota[user_id] = True
         return False, (
             f"⛔ 工作区已超出配额: {usage_mb:.0f} MB / "
-            f"{self.quota_bytes // (1024 * 1024)} MB ({usage_pct:.0f}%)。"
+            f"{quota_bytes // (1024 * 1024)} MB ({usage_pct:.0f}%)。"
             f"请清理不需要的文件后重试。"
         )
 
@@ -131,9 +150,10 @@ class UserWorkspaceManager:
     def get_quota_context(self, user_id: str) -> str:
         """Generate a quota status message for the system prompt."""
         current = self.get_size(user_id)
+        quota_bytes = self._effective_quota_bytes()
         usage_mb = current / (1024 * 1024)
-        quota_mb = self.quota_bytes // (1024 * 1024)
-        pct = (current / self.quota_bytes) * 100 if self.quota_bytes > 0 else 0
+        quota_mb = quota_bytes // (1024 * 1024)
+        pct = (current / quota_bytes) * 100 if quota_bytes > 0 else 0
 
         if pct >= 100:
             return (
@@ -145,6 +165,17 @@ class UserWorkspaceManager:
                 f"用户工作区使用量: {usage_mb:.0f}/{quota_mb} MB ({pct:.0f}%) — 接近上限。"
             )
         return ""
+
+    def list_files_by_mtime(self, user_id: str) -> list:
+        """Return deletable workspace items sorted by mtime ascending.
+
+        Each item is a ``CleanupCandidate`` (rel_path/abs_path/size/mtime/kind)
+        from ``agent.quota_cleanup``. Top-level directories under ``repos/``
+        are returned as whole "repo" units; hidden files, cache dirs, and
+        symlinks are skipped. Used by the quota-cleanup protocol.
+        """
+        from agent.quota_cleanup import list_candidates
+        return list_candidates(self.get_workspace(user_id))
 
     # ── Helpers ───────────────────────────────────────────────────
 

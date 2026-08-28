@@ -17,6 +17,17 @@
 
 ## Feature 1: `get_workspace_snapshot` Tool
 
+### 当前状态：**已实现（方案 A）**
+
+不新建独立工具，改为扩展 `get_user_info` 的目录快照（`agent_router.py`）：
+
+- ✅ 树形结构 + 每节点文件大小，目录优先、按名称字母序（`_build_workspace_tree()`）
+- ✅ 跳过 `.git`/缓存目录/`.pyc` 文件（`_ws_skip()`）
+- ✅ 80% 配额警告横幅
+- ✅ 路径脱敏：以 `USER_DATA_ROOT` 为根返回相对路径（如 `2578260985/workspace/`），不暴露绝对路径
+
+> 备注：`get_user_info`（注册于 `permissions.py:49`）原本已含「工作区目录快照」，与本 Feature 高度重合，故采用方案 A 合并实现，避免工具语义重复。
+
 ### Purpose
 
 快速返回当前用户工作区完整快照：目录树 + 每个文件的大小 + 磁盘使用量汇总。
@@ -81,6 +92,14 @@
 
 ## Feature 2: `delete_workspace_file` Tool
 
+### 当前状态：**已实现**
+
+`delete_workspace_file` 已在 `tools/builtin_tools.py` 定义并注册（`_build_tool_registry()`），加入 `_PUBLIC_TOOLS`（所有用户）。配套：
+- `agent/quota_cleanup.py`（纯函数）：候选枚举 `list_candidates`、按 mtime 删除 `execute_cleanup`、清理响应解析 `resolve_targets`。
+- `agent/workspace.py` 新增 `list_files_by_mtime()`。
+- `agent_router.py` 配额清理协议（弹性超限 → 列出最早 mtime 文件 → 用户可自定义但不可跳过 → 10 分钟超时自主删除）。
+- 测试：`test_workspace.py` 新增 4 套（删除行为、候选枚举、删除至配额内、响应解析）。
+
 ### Purpose
 
 允许用户删除工作区中的文件或空目录，释放磁盘空间。
@@ -114,6 +133,10 @@
 ---
 
 ## Feature 3: Session File Provenance Tracking
+
+### 当前状态：**已实现**
+
+实现见 `docs/feature3-session-file-provenance.md`。`SpecialSessionManager` 新增 `add_file()`；`files` 存于 `_index.json` 的 `metadata.files`（非 `_meta.json`）；`delete()` 删会话时直接删除会话级文件（`uploads`/`output`），保留 `repos/` 仓库并返回删除摘要供上层通知用户。
 
 ### Purpose
 
@@ -176,6 +199,10 @@ class SpecialSessionManager:
 
 ## Feature 4: Session Deletion with File Cleanup Prompt
 
+### 当前状态：**未实现**
+
+`/删除会话` 已有 60 秒二次确认（`agent_router.py:1915-1943`），但无文件列表展示与 `--with-files` 选项。
+
 ### Purpose
 
 用户删除特殊会话时，智能体主动提示是否同步清理该会话上传的文件。
@@ -219,6 +246,15 @@ class SpecialSessionManager:
 ---
 
 ## Feature 5: Quota Threshold Auto-Reminder
+
+### 当前状态：**已实现**
+
+实现见 `docs/feature5-6-7-workspace-management.md`。
+
+- ✅ `check_quota()` / `get_quota_context()` 改用每角色配额（`_effective_quota_bytes()` 读 `_current_quota_bytes` contextvar，回退固定默认值）
+- ✅ `agent_router.py` 新增 `_quota_warning()`；上传后（纯文件 ack + agent 回复两路径）注入 80% 容量警告
+- ✅ `/新会话` 与 `/保存为会话` 创建后追加容量警告（仅提醒，不阻止）
+- ✅ `get_user_info` 快照 ≥80% 横幅（Feature 1 已有，无需改动）
 
 ### Purpose
 
@@ -265,6 +301,10 @@ def _check_quota_warning() -> str:
 
 ## Feature 6: `/管理工作区` Router Command
 
+### 当前状态：**已实现**
+
+`/管理工作区` 经 `_handle_session_command()` 显式 `return False` 落入 agent（`agent_router.py`），AGENTS.md 引导其调用 `get_user_info` 展示快照并引导清理；`/帮助` 列表已补条目。
+
 ### Purpose
 
 用户发送 `/管理工作区` 后，智能体自动调用 `get_workspace_snapshot` 并引导用户管理文件。
@@ -290,15 +330,59 @@ if cmd in ("/管理工作区", "#管理工作区"):
 
 ---
 
+## Feature 7: 自然语言驱动的自主工作区管理
+
+### 当前状态：**已实现**
+
+底层 CRUD 已齐备（`get_user_info` 快照 + `delete_workspace_file`）。`AGENTS.md` 已扩充「工作区删除与配额清理」：`/管理工作区` 引导 + 批量删除确认 / 模糊条件询问 / 拒绝解释规则。
+
+### Purpose
+
+让智能体把用户的一句自然语言（如「帮我把 uploads 里超过 50MB 的旧文件删掉」「清理工作区」「我有哪些 PDF」）自主拆解为对底层增删改查工具的调用序列，无需用户手动记住 `/管理工作区` 等命令。
+
+### 依赖
+
+| 能力 | 对应工具 | 状态 |
+|------|---------|------|
+| 增 | QQ 文件上传 → `_download_and_save_file()` | ✅ 已有 |
+| 查 | `get_workspace_snapshot`（或 `get_user_info` 目录快照） | ⚠️ 见 Feature 1 |
+| 删 | `delete_workspace_file` | ❌ Feature 2 未实现 |
+| 改 | （不提供，与设计原则一致） | — |
+
+### Behavior
+
+智能体（Agent）在收到工作区管理意图时，自主编排工具：
+
+1. **理解意图**：解析自然语言，提取目标（哪些文件 / 哪个目录 / 什么条件）
+2. **查**：调用快照工具获取当前状态
+3. **决策**：根据条件（大小、后缀、时间、目录）筛选出候选文件
+4. **确认**：对批量删除等不可逆操作，先列出清单请用户确认（除非用户已明确「直接删」）
+5. **删**：调用 `delete_workspace_file` 逐个执行
+6. **反馈**：汇总删除结果 + 释放空间
+
+### Agent 侧交互引导（AGENTS.md 新增）
+
+- 批量删除前必须展示清单 + 请求确认（不可逆操作）
+- 用户条件模糊（如「旧文件」）时，先展示候选再询问，不擅自删除
+- 删除后主动汇报释放了多少空间、剩余配额
+- 遇到路径穿越/非空目录等被拒绝的操作，向用户解释原因
+
+### 与 Feature 6 的关系
+
+Feature 6 的 `/管理工作区` 命令是「显式入口」，本 Feature 是「隐式能力」——两者殊途同归。用户既可以直接发 `/管理工作区`，也可以用自然语言描述意图；智能体都应落到同一套 CRUD 工具上。
+
+---
+
 ## Files to Modify
 
 | 文件 | 变更 |
 |------|------|
-| `QQBot/tools/builtin_tools.py` | 新增 `get_workspace_snapshot()`, `delete_workspace_file()`, `_check_quota_warning()` |
+| `QQBot/tools/builtin_tools.py` | 新增 `delete_workspace_file()`, `_check_quota_warning()`（`get_workspace_snapshot` 已并入 `get_user_info`，见 Feature 1） |
 | `QQBot/plugins/agent_router.py` | 修改 `/删除会话` 确认流程（Feature 4）；增加文件上传后的配额检查（Feature 5）；添加 `/管理工作区` 路由（Feature 6）；在文件下载后记录会话归属（Feature 3） |
 | `QQBot/agent/special_session.py` | 新增 `add_file()`, `get_files()`, `remove_file()` 方法；`_meta.json` 新增 `files` 字段 |
 | `QQBot/agent/permissions.py` | `get_workspace_snapshot` 和 `delete_workspace_file` 加入 `_ALL_USER_TOOLS` 集合 |
 | `QQBot/agent/context.py` | 新增 `_current_quota_bytes` contextvar，供配额检查使用 |
+| `QQBot/agent/config/AGENTS.md` | 新增工作区自主管理交互引导规则（Feature 7：批量删除确认、模糊条件询问等） |
 
 ## Files to Create
 
@@ -328,19 +412,33 @@ if cmd in ("/管理工作区", "#管理工作区"):
 
 ## Idea 1: 临时会话文件迁移到用户专属工作区
 
-### 当前状态：**已架构上消除（无需迁移）**
+### 当前状态：**已实现（方案 B）**
 
-所有文件从上传那一刻起就写入用户专属工作区 `{USER_DATA_ROOT}/{user_id}/workspace/`，无论是临时会话还是特殊会话。关键代码：
+**文件系统层面已隔离（无需迁移）**：所有文件从上传那一刻起就写入用户专属工作区 `{USER_DATA_ROOT}/{user_id}/workspace/`，无论是临时会话还是特殊会话。关键代码：
 
-- `agent_router.py:1068-1070` — 每条消息处理前设置 `_current_user_workspace` contextvar：
-  ```python
-  _workspace_manager.ensure_dirs(user_id)
-  _current_user_workspace.set(_workspace_manager.get_workspace(user_id))
-  ```
-- `agent_router.py:98-109` — `_get_uploads_dir()` 运行时读取 contextvar，始终返回用户工作区路径
-- `builtin_tools.py:37-59` — `_get_workspace_root()` 同样读取 contextvar
+- `agent_router.py:1301-1303` — 每条消息处理前设置 `_current_user_workspace` contextvar
+- `agent_router.py:887-903` — `_record_session_file()` 将新写入文件归属到活动特殊会话
 
-**结论**：不存在「共享工作区」，所有用户的文件从一开始就隔离。无需迁移。但 `/保存为会话` 只复制了对话上下文（最近 20 条消息），没有额外操作——这已经足够，因为文件已经在正确位置。
+**被掩盖的缺口**：`/保存为会话`（`agent_router.py:2202-2261`）只复制最近 20 条**消息**，不迁移临时会话期间上传的文件归属。而 `_record_session_file()` 在无活动特殊会话时直接 no-op（`active is None → return`），导致临时会话上传的文件无归属记录；`/保存为会话` 后新会话 `metadata.files` 为空，日后 `/删除会话` 时这些文件变成孤儿、无法随会话清理。
+
+### 方案（选定：方案 B）
+
+**方案 B — 显式跟踪临时会话文件（推荐）**
+
+- 新增模块级缓存 `_temp_session_files: dict[str, set[str]]`（`user_id` → workspace 相对路径集合）
+- 改造 `_record_session_file()`：无活动特殊会话时，把相对路径记入 `_temp_session_files[user_id]`（而非直接丢弃）
+- `/保存为会话` 复制消息后：`for rel in _temp_session_files.pop(user_id, set()): _special_sessions.add_file(user_id, session.name, rel)`
+- 清理点：`/clear`（`_handle_special_command`）、`/新会话`（`_handle_session_command`）时 `_temp_session_files.pop(user_id, None)`
+
+**方案 A — 从消息文本解析（备选）**：扫描 `/保存为会话` 复制的 `[用户上传了文件 X，已保存至: <abs_path>]` 文本，正则提取路径后 `add_file`。无新状态，但依赖消息格式、脆弱，故弃用。
+
+### 实现要点
+
+| 文件 | 变更 |
+|------|------|
+| `QQBot/plugins/agent_router.py` | 新增 `_temp_session_files`；`_record_session_file()` 无活动会话时记录；`/保存为会话` 迁移归属；`/clear`、`/新会话` 清理 |
+
+> 边界：`add_file` 幂等，同一文件多会话引用互不影响；临时会话 30 分钟超时未保存，文件仍保留在工作区（本就是用户持久资产），`_temp_session_files` 残留引用由下次 `/clear`/`/新会话` 或 `/保存为会话` 的 `pop` 兜底清理。
 
 ---
 
@@ -372,58 +470,98 @@ AGENTS.md 中也有文档记录 (`config/AGENTS.md:95`)：
 
 ## Idea 3: 15+ 条消息自动建议升级为特殊会话
 
-### 当前状态：**未实现**
+### 当前状态：**已实现（方案 A）**
 
 ### 问题
 
 用户在临时会话中连续讨论同一话题，发送 15 条以上消息时，智能体不会主动建议升级。用户可能不知道 `/保存为会话` 功能，导致上下文积累在临时会话中、无法持久化。
 
-### 设计
+临时会话 `Session.context` 上限为 20 条（`session.py:85` `max_context_messages=20`，`trim()` 在 `session.py:49`），每轮追加 user + assistant 两条（`agent.py:281-282`），tool 消息不落库。故「15 条」≈ 7~8 轮，为上限的 75%，阈值合理。
 
-**触发条件**：临时会话上下文中累计消息数 ≥ 15 条，且智能体即将回复时。
+### 设计（选定：方案 A）
 
-**行为**：智能体在回复末尾追加升级建议：
+**触发条件**：`session_type == "temporary"` 且 `message_count(user_id) >= 15`，在调用 `agent.run()` 前注入提示指令。
+
+**注入点**：`agent_router.py:1536`（`agent.run()` 调用前）；`session_type` 已在 `1489-1490` 判定。
+
+**注入内容**（追加到 `augmented_message` 前缀）：
 
 ```
-💡 提示：当前话题已持续 {n} 条消息。考虑发送 /保存为会话 <名称> 来保存这段对话，方便后续继续讨论。临时会话有消息数限制，超出后会丢失早期上下文。
+[系统提示] 当前临时会话已累积 {n} 条消息，接近 20 条上限，超出后早期上下文会丢失。若用户当前话题明确且可能继续，请在回复末尾用一句话自然建议其发送「/保存为会话 <名称>」持久化这段对话。
 ```
 
-**关键问题：谁来触发？**
+**限流**：`_upgrade_hint_last: dict[str, int]`（user_id → 上次提示时的消息数），仅当 `n - last >= 10` 时再次提示。
 
-- **方案 A（推荐）**：在 `agent_router.py` 的 `_handle_agent_message_impl()` 中，调用 agent 前检查 `len(temp_session.context) >= 15`，如果满足且未在近 5 条消息内提示过，在 augmented message 末尾追加提示指令（低 token 成本方式）。智能体在回复时自然提及。
-- **方案 B**：agent 回复后，`agent_router.py` 在发送前检查并追加提示文本（零 token 成本，但可能打断智能体输出）。
-
-选择方案 A：让智能体在回复中自然融入提示，更符合对话体验。
+**方案 B（备选，弃用）**：agent 回复后、发送前追加提示文本——零 token、零污染，但硬插在回复末尾，体验不如 A 自然。
 
 ### 实现要点
 
-- `SessionManager` 暴露 `message_count(user_id)` 方法
-- `agent_router.py` 在构建 augmented message 时检查
-- 限流：同一用户每 10 条消息最多提示一次（防止骚扰）
-- 提示文本加在 augmented message 中（非回复后追加），智能体可选择自然融入或忽略
+| 步骤 | 文件 | 变更 |
+|------|------|------|
+| 1. 消息计数 | `agent/session.py` | 新增 `message_count(user_id)`，返回 `len(context)` 或 0 |
+| 2. 常量与限流状态 | `plugins/agent_router.py` | 新增 `UPGRADE_HINT_THRESHOLD=15`、`UPGRADE_HINT_INTERVAL=10`、`_upgrade_hint_last` |
+| 3. 注入逻辑 | `plugins/agent_router.py` | `agent.run()` 前，`session_type=="temporary"` 且满足阈值+限流时，前缀注入提示 |
+
+> 边界：仅临时会话触发（特殊会话已持久化；群聊连续模式走独立代码路径 `1714+`，不受影响）；提示作为 user 消息落入 20 条 `context` 会被自然 trim，且限流控制频率，可接受。
 
 ---
 
 ## Idea 4: 上下文长度达到 85% 时提示压缩
 
-### 当前状态：**未实现**
+### 当前状态：**部分实现（仅 Layer 1+2 截断）— 待严密设计，暂不实现**
+
+> ⚠️ 智能体的记忆系统（上下文压缩 / 摘要 / token 管理）需要严密设计后再动手。本 Idea 当前只做现状核查与设计预留，**不进入实现**。
 
 ### 问题
 
-特殊会话的 `context` 列表无限增长（`special_session.py:244-272` `add_message()` 无长度限制）。当消息累积到接近模型上下文窗口上限时，API 调用会失败或返回截断结果。目前没有主动的上下文长度监控或压缩提示。
+特殊会话的 `context` 列表无限增长（`special_session.py:260-288` `add_message()` 无长度限制）。当消息累积到接近模型上下文窗口上限时，API 调用会失败或返回截断结果。目前没有主动的上下文长度监控或压缩提示。
 
-### 现有相关代码
+### 现状核查（2026-08-15）
 
-| 代码 | 作用 | 局限性 |
-|------|------|--------|
-| `agent.py:348-382` `_compress_context()` | 压缩旧 tool 结果（保留前 20 条完整，截断旧输出到第一行） | 仅按消息数量截断，不感知 token 数 |
-| `config/models_settings.json` | 定义 `max_tokens`（REASONING_MODEL: 409600, FLASH_MODEL: 102400） | 这是模型输出上限，非上下文窗口上限；代码中未读取用于上下文管理 |
+**已存在：`_compress_context()`（`agent/agent.py:409-443`）** —— 一个 `@staticmethod`，仅在 `_build_messages()`（`agent.py:396`）对特殊会话 context 做请求前预处理：
 
-### 设计
+- **Layer 1**：最近 20 条消息保留完整原文
+- **Layer 2**：20 条之前的 `tool` 结果截断到首行（前 200 字符）
+- **Layer 3**：渐进式摘要 —— **未实现**（代码注释 `agent.py:415`：`"Layer 3: Progressive summary not yet implemented"`）
+
+其关键性质（对 Idea 4 的定位很重要）：
+
+1. **无 token 感知**：只数消息条数（固定 20 条），不估算 token，不知道上下文窗口多大
+2. **不可调用**：不是注册工具，也无 `/压缩会话` 命令，用户无法触发
+3. **不落盘、不写回**：只对 context 副本操作并返回新列表，持久化 context 仍无限增长
+4. **只在读时压缩**：每次请求临时压一下，存储层无任何压缩状态
+
+**不存在的部分（Idea 4 需从零实现）**：
+
+| 能力 | 状态 |
+|------|------|
+| `/压缩会话` 命令 | ❌ 无（AGENTS.md 命令表无此项） |
+| token 估算函数 | ❌ 无任何实现 |
+| 85% 阈值 / `_needs_compression` 标志 | ❌ 无 |
+| 摘要生成逻辑（除 PDF 摘要工具外） | ❌ 无 |
+| 上下文窗口上限读取 | ❌ 无 |
+
+**模型配置现状**（`config/models_settings.json`）：
+
+| 模型 | model | `max_tokens` |
+|------|-------|-------------|
+| REASONING | `deepseek-v4-pro` | 409600 |
+| FLASH | `deepseek-v4-flash` | 102400 |
+| MULTIMODAL | `qwen3.6-plus` | 20480 |
+
+⚠️ 上述 `max_tokens` 是**输出上限**，非上下文窗口（输入上限）；`model_router.py` / `deepseek_client.py` 均未读取该字段，配置中亦无 `context_window` 字段。
+
+**「无限记忆」（特殊会话）的真实状态**：
+
+- 存储：快照 + 增量双层（`special_session.py` `SNAPSHOT_INTERVAL=50`），`add_message()` 无限追加，无长度限制、无 token 计数、无压缩标志
+- 读取：仅 `_compress_context()` Layer 1+2 截断，且不写回
+- 结论：「百万 token」（DOCUMENTATION.md:256）目前只是乐观描述，无任何机制保证 context 不超窗口
+
+### 设计（初稿，待严密设计）
 
 **上下文窗口上限获取**：
-- reasoning model（如 DeepSeek V3.2）：从 `models_settings.json` 或 API `/models` 端点获取 `max_input_tokens`
-- flash model（如 DeepSeek V3.2 Flash）：同上
+- reasoning model（`deepseek-v4-pro`）：从 `models_settings.json` 新增 `context_window` 字段，或 API `/models` 端点获取 `max_input_tokens`
+- flash model（`deepseek-v4-flash`）：同上
 - 取 `min(reasoning_max_input, flash_max_input)` 作为有效上限
 
 **触发条件**：
@@ -463,10 +601,10 @@ AGENTS.md 中也有文档记录 (`config/AGENTS.md:95`)：
 
 | # | Idea | Status | Action |
 |:-:|------|:------:|--------|
-| 1 | 临时会话文件迁移 | 架构上已消除 | 无需改动 |
+| 1 | 临时会话文件迁移 | 已实现（方案 B） | 文件系统隔离 + `/保存为会话` 归属迁移 |
 | 2 | 两种创建方式 | 已实现 | 无需改动 |
-| 3 | 15+ 条消息升级建议 | **未实现** | 待实现（方案 A：augmented message 注入） |
-| 4 | 85% 上下文压缩提示 | **未实现** | 待实现（token 估算 + `/压缩会话` 命令） |
+| 3 | 15+ 条消息升级建议 | 已实现（方案 A） | `message_count` + augmented message 注入 + 限流 |
+| 4 | 85% 上下文压缩提示 | 部分实现（Layer 1+2 截断） | 待严密设计，暂不实现（token 估算 + `/压缩会话`） |
 | 5 | 群聊文件延迟下载 | **未实现** | 待实现（元数据记录 + 按需下载 + 进度反馈） |
 
 ---
@@ -683,9 +821,12 @@ New messages (30): {recent_30_messages}
 
 > 来源：`next_step.md` §8.3，与 PLAN.md Feature 5（80% 提醒）互补
 
-### 当前状态：**仅硬拦截 100%**
+### 当前状态：**部分实现（80% 提醒已落地，柔性超额未实现）**
 
-当前 `UserWorkspaceManager.check_quota()` 在达到 100% 配额时硬拒绝。PLAN.md Feature 5 补充了 80% 提醒，但 >100% 的柔性处理未涉及。
+- ✅ **80% 提醒**已实现：`check_quota()` (`workspace.py:93-121`) 在 80-100% 返回警告；`get_quota_context()` (`workspace.py:131-147`) 在 80%/100% 注入系统提示（`agent.py:354`）
+- ❌ **>100% 柔性超额**未实现：`check_quota()` 仍硬拒绝（返回 `False`），未采用「仍允许写入 + 标记 `_over_quota`」的柔性策略
+- ❌ `check_quota()` 目前**未被任何工具调用**（见 `docs/security-boundary-remaining.md`），实时配额检查未接入上传/代码执行等写入路径
+- ❌ 150% 绝对硬限、连续 3 次超额拒绝、`download_repo --depth=1` 浅克隆、`execute_code` 输出 100MB 软限制均未实现
 
 ### 问题
 
@@ -724,6 +865,17 @@ New messages (30): {recent_30_messages}
 ## Idea 8: 基于截图多模态的测速功能
 
 > 来源：用户需求 2026-05-30
+
+### 当前状态：**已实现（OCR 层为 qwen3.5-ocr，2026-08-21 全量验证通过）**
+
+完整实现记录见 `docs/implements-for-idea-8.md`。落地要点：
+
+- ✅ `tools/battle_parser.py::parse_battle_screenshots(paths)` — 每张截图**一次** qwen3.5-ocr 调用（左半屏 0–50% 裁剪，名字+行动值按行交错返回），行配对（y 聚类 + 孤儿值按行序回填）、横幅颜色带扫描判定阵营（红=敌/蓝=我，横向计数窗口 13–45% 帧宽）、`(name, side)` 去重（镜像同名行保留）、每侧上限 3。阶段自动判定（`_detect_phase`）：全员行动值 ≤5% → `pre`（乱速后），否则 `post`；双图顺序异常（如疑似颠倒）写入 warnings。
+- ✅ `tools/ocr_name_matcher.py` 字形纠偏层保留（Stroke-IoU + 分长度阈值 + 长名截断救援），uncertain 名称走 MULTIMODAL_MODEL 视觉兜底；名称索引动态取自 wiki 缓存 + vendored 别名词典。
+- ✅ 跑条前截图三规则校验（进战 buff / 进战战意集中力 / 免疫套装 → `pre_valid`）+ 拉条推条技能提示（`action_gauge_skills`），技能索引来自 `character_details.json`；`BuffDetector` 28 图标模板匹配。
+- ✅ 输出单图/双图 JSON + `calculate_speed` 兼容 `raw_format`；工具注册于 `agent_router.py`，`_PUBLIC_TOOLS` 全员可用；`AGENTS.md` 截图测速交互流程（pre_valid 检查、行动值修正确认、询问我方速度 → `calculate_speed`）。
+- ✅ 验证（`test/test_region_ocr.py` → `test/swap_validation.json`，49 截图 / 285 真值行）：**名称 285/285、行动值 285/285、漏行 0、阵营 unknown 0**；`bash test.sh` 通过。报告中 6 个「额外」均为真实镜像行（GT 构建时继承旧管线去重 bug 未录入，非误报）。
+- 演进：初版 easyOCR 四区域 + 逐数字模板（名称 87.7% / 值 93.7%）→ qwen3.5-ocr 对比评测胜出（`test/qwen_ocr_comparison.md`）→ 残余错误根因探针（`test/qwen_fullimg_probe.md`：截断=裁剪、漏行=窄裁剪跳行、茱/茉=字形相似由 matcher 纠偏、2%→3%=列表同化、98% 漏值=坐标回归）→ 宽裁剪单调用替换，easyOCR 提取 / `_parse_action_value` / 逐数字模板退役。
 
 ### 问题
 
@@ -935,17 +1087,51 @@ OCR 文字块: (text="Boss名称", bbox=[x1, y1, x2, y2])
 | 窗口模式/局部截图 | 检测到的文字块 < 4 个 | 可能是非标准 UI → 降级多模态 LLM |
 | 缩放后与原始比例差异大 | `scale > 3.0` | 警告用户截图质量过低，建议更换截图 |
 
+**测速流程与注意事项：**
+
+测速的方法可以见测速函数"calculate_speed"。本质需要从图片中提取敌我双方角色的名字及两组行动值（跑条前与跑条后），锁定每个角色，计算跑条前后行动值的差值 $\alpha_1、 \alpha_2、 \alpha_3 $（我方）与 $\beta_1、 \beta_2、 \beta_3$（敌方）。
+随后根据角色特殊的技能，如己方拉条、对敌推条等，对该差值进行修正，得到仅由速度引起的行动值差（即角色在本次跑条中纯靠速度跑了多少行动值）。
+
+得到仅由速度属性引起的行动值差序列后，可以根据其比例关系，在给定至少一名我方角色速度 $v_1$ 时，根据花费时间相等这一条件： $\frac{\alpha_2}{v_2} = \frac{\alpha_1}{v_1} = \frac{\alpha_3}{v_3} =\frac{\beta_1}{w_1} = \frac{\beta_2}{w_2} = \frac{\beta_3}{w_3}$，推导出敌方角色的速度 $w_1、w_2、w_3$。
+
+该问题的难点在于——如何修正行动值差？对于游戏玩家而言，哪些角色触发了拉条效果或推条效果是可由观察与经验得到的，而对于机器而言，行动值截图中并不会存在这一信息。
+因此，可以想到的一个解决方案是：从官方wiki中爬取角色信息，获取角色技能描述储存于本地，从而判断提供的行动值截图中所示的角色是否触发了有关行动值的特殊效果。但该方案依赖于LLM的推理能力，且有可能出错。
+官方wiki及其网页schema可以参照抽卡功能使用到的wiki_scraper.py。
+
+另一个解决方案是：从官方wiki中爬取角色信息，获取角色技能描述储存于本地，将角色分为技能与行动值有关与无关两类，计算时只挑选技能与行动值无关的角色。但该方案的缺点很明显，无法保证计算的可行性。
+
+**关于图像信息提取：**
+
+行动值截图一般由一个中央框与背景构成，背景可能千变万化、中央框有一定的透明度（很小）。最重要的信息展示在中央框中，包括：角色头像、血条、状态、buff以及最重要的角色名与行动值。
+
+行动值截图分为3种：无效的跑条前截图、有效的跑条前截图、跑条后截图（跑条后截图几乎总是有效）。无效的跑条前截图都是截图时间过早，还未完成乱速（在进入战斗的最开始阶段，会给所有角色随机分配一个“起跑线”，不同角色会被随机分配0.0%~5.0%的初始行动值，这个过程叫做乱速）的时候截下的图。我们的目标是识别有效的截图并提取信息。
+
+跑条前截图的有效无效判断依赖于跑条后截图与角色技能信息。"QQBot/images/cal-speed-data"目录下存放了命名好的一些截图对，命名规则如下：
+- “xx-1”表示第xx对跑条前截图；
+- “xx-2”表示第xx对跑条后截图；
+- 跑条前截图的括号中注明了其是否无效；
+- 跑条后截图的括号中注明了其是否受到行动值相关技能的影响。 
+
+跑条前截图的无效判断依据有以下几点： 
+- 当乱速已经正常完成（截图有效），拥有进入战斗立即获得buff的技能的角色（以下简称进战buff角色）会在截图中看到其对应的buff。若观察到对应buff或角色不存在相应技能，返回True，否则False。
+- 当乱速已经正常完成，拥有进入战斗立即获得战意/集中力状态的角色会在截图中看到对应的战意/集中力。若观察到战意/集中力或角色不存在相应技能，返回True，否则返回False。
+- 当乱速已经正常完成，会在截图中看到穿戴免疫套装的角色的免疫buff的标识。判断角色是否穿戴免疫套装可以根据跑条后的截图是否显示了对应于该角色的免疫buff，如果跑条后截图显示该角色有免疫buff，且该角色不存在获取免疫buff的技能，则可以确定免疫buff来源于角色穿戴的免疫套装，此时跑条前截图该角色有免疫buff则返回True，否则返回False。
+
+当且仅当以上三条判断返回全为True，跑条前截图有效，否则无效。
+
+跑条后，正在行动的角色行动值会归零，且其代表的行动条位于中间框的最上方，行动值最大的角色代表的行动条将位于中间框的底部，且被Next On条与其它角色行动条上下分开。注：角色行动值大于等于100%时，将会行动，且所有角色不再因速度属性跑条（任可受到拉条），直到行动完成后。若同时有多名角色行动值大于等于100%，按行动值大小决定行动次序。
+
 ---
 
 ## Summary (Updated)
 
 | # | Idea | Status | Action |
 |:-:|------|:------:|--------|
-| 1 | 临时会话文件迁移 | 架构上已消除 | 无需改动 |
+| 1 | 临时会话文件迁移 | 已实现（方案 B） | 文件系统隔离 + `/保存为会话` 归属迁移 |
 | 2 | 两种创建方式 | 已实现 | 无需改动 |
-| 3 | 15+ 条消息升级建议 | **未实现** | 待实现（方案 A：augmented message 注入） |
-| 4 | 85% 上下文压缩提示 | **未实现** | 待实现（token 估算 + `/压缩会话` 命令） |
+| 3 | 15+ 条消息升级建议 | 已实现（方案 A） | `message_count` + augmented message 注入 + 限流 |
+| 4 | 85% 上下文压缩提示 | 部分实现（Layer 1+2 截断） | 待严密设计，暂不实现（token 估算 + `/压缩会话`） |
 | 5 | 群聊文件延迟下载 | **未实现** | 待实现（元数据记录 + 按需下载 + 进度反馈） |
 | 6 | 分层上下文 Layer 3 | **未实现** | 待实现（每 30 条异步生成渐进式摘要） |
-| 7 | 配额柔性处理 | **未实现** | 待实现（三级策略：80%提醒 / 100%柔性 / 150%硬限） |
-| 8 | 截图测速（OCR+LLM 两层降级） | **未实现** | 待实现（OCR 颜色采样 + 多模态 LLM 降级 + parse_battle_screenshots + Agent 交互引导） |
+| 7 | 配额柔性处理 | **部分实现** | 80% 提醒已实现（`check_quota`/`get_quota_context`）；>100% 柔性超额与 150% 硬限待实现 |
+| 8 | 截图测速（OCR+LLM 两层降级） | **已实现** | qwen3.5-ocr 单调用提取 + 字形名称纠偏 + 颜色带阵营判定 + 三规则校验；名称/值 285/285 全对（见 `docs/implements-for-idea-8.md`） |

@@ -438,7 +438,9 @@ class TestAgentCore:
         )
 
         prompt = agent.build_system_prompt()
-        assert "Roxy" in prompt, "System prompt should contain agent name"
+        # Agent name comes from the personality profile injected at runtime
+        # (see agent.py _build_messages). Verify prompt is well-formed.
+        assert "QQBot" in prompt, "System prompt should contain bot framework name"
         assert len(prompt) > 100, "System prompt should be substantial"
         print_pass("System prompt construction (from SOUL.md + IDENTITY.md + AGENTS.md)")
 
@@ -721,6 +723,7 @@ class TestUserProfile:
         self.test_to_prompt_context_empty()
         self.test_to_prompt_context_full()
         self.test_merge_facts_dedup()
+        self.test_merge_facts_cap()
         self.test_persistence()
 
     def test_create_and_save(self):
@@ -780,6 +783,18 @@ class TestUserProfile:
         profile.merge_facts(["在深圳", "喜欢游戏"])
         assert len(profile.facts) == 3, f"Expected 3 facts, got {len(profile.facts)}: {profile.facts}"
         print_pass("Fact deduplication (fuzzy matching)")
+
+    def test_merge_facts_cap(self):
+        from agent.profile import UserProfile, MAX_FACTS
+
+        profile = UserProfile(user_id="cap_user")
+        many = [f"fact_{i}" for i in range(MAX_FACTS + 5)]
+        profile.merge_facts(many)
+        assert len(profile.facts) == MAX_FACTS, (
+            f"Expected {MAX_FACTS} facts, got {len(profile.facts)}"
+        )
+        assert profile.facts == many[-MAX_FACTS:], "Oldest facts should be pruned"
+        print_pass("Fact list capped at MAX_FACTS with oldest pruned")
 
     def test_persistence(self):
         from agent.profile import UserProfile, ProfileManager
@@ -952,6 +967,117 @@ class TestBuiltinTools:
         print_pass("search_web returns results or graceful fallback (SearXNG)")
 
 
+class TestPersonality:
+    """Test PersonalityManager group-bound default resolution."""
+
+    def run(self):
+        print_header("7. Personality Manager Tests")
+
+        self.test_resolve_precedence()
+        self.test_set_group_personality()
+        self.test_clear_group_personality()
+        self.test_ambiguous_resolution()
+
+    def _make_manager(self):
+        import agent.personality as pmod
+
+        tmpdir = tempfile.mkdtemp(prefix="personality_test_")
+        pdir = os.path.join(tmpdir, "personalities")
+        os.makedirs(pdir, exist_ok=True)
+        for name, title in [
+            ("assistant", "助手 Roxy"),
+            ("roxy_character", "角色 Roxy (无职转生)"),
+            ("rubi", "露比 (Rubi)"),
+        ]:
+            with open(os.path.join(pdir, f"{name}.md"), "w", encoding="utf-8") as f:
+                f.write(f"# {title}\n\nTest personality.")
+
+        config = os.path.join(tmpdir, "personality_config.json")
+        with open(config, "w", encoding="utf-8") as f:
+            json.dump({"default": "assistant"}, f)
+
+        settings = os.path.join(tmpdir, "personality_settings.json")
+        group = os.path.join(tmpdir, "group_personality.json")
+
+        patcher = patch.multiple(
+            pmod,
+            _SETTINGS_FILE=settings,
+            _DEFAULT_CONFIG_FILE=config,
+            _GROUP_CONFIG_FILE=group,
+        )
+        patcher.start()
+        return pmod.PersonalityManager(personalities_dir=pdir), patcher, tmpdir
+
+    def test_resolve_precedence(self):
+        pm, patcher, tmpdir = self._make_manager()
+        try:
+            # No settings anywhere -> global default
+            assert pm.resolve_effective_personality("u1", "g1") == "assistant"
+            # Group binding -> group wins over global
+            pm.set_group_personality("g1", "露比")
+            assert pm.resolve_effective_personality("u1", "g1") == "rubi"
+            # Personal setting -> personal wins over group
+            pm.set_user_personality("u1", "assistant")
+            assert pm.resolve_effective_personality("u1", "g1") == "assistant"
+            # User without personal setting still gets group default
+            assert pm.resolve_effective_personality("u2", "g1") == "rubi"
+            # Empty group_id -> skip group layer
+            assert pm.resolve_effective_personality("u2", "") == "assistant"
+            print_pass("resolve_effective_personality precedence chain")
+        finally:
+            patcher.stop()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_set_group_personality(self):
+        pm, patcher, tmpdir = self._make_manager()
+        try:
+            resolved = pm.set_group_personality("g1", "Rubi")
+            assert resolved == "rubi"
+            assert pm.get_group_personality("g1") == "rubi"
+            # Unknown name raises ValueError
+            try:
+                pm.set_group_personality("g2", "不存在的")
+                assert False, "expected ValueError for unknown personality"
+            except ValueError:
+                pass
+            print_pass("set_group_personality fuzzy match + validation")
+        finally:
+            patcher.stop()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_ambiguous_resolution(self):
+        pm, patcher, tmpdir = self._make_manager()
+        try:
+            # "Roxy" is a substring of both 助手 Roxy and 角色 Roxy → ambiguous
+            assert pm.resolve_name("Roxy") is None
+            # Distinct prefixes still resolve uniquely
+            assert pm.resolve_name("助手") == "assistant"
+            assert pm.resolve_name("角色") == "roxy_character"
+            # Ambiguous name raises ValueError with a hint
+            try:
+                pm.set_user_personality("u1", "Roxy")
+                assert False, "expected ValueError for ambiguous name"
+            except ValueError as e:
+                assert "多个" in str(e)
+            print_pass("ambiguous names rejected instead of silently mispicked")
+        finally:
+            patcher.stop()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_clear_group_personality(self):
+        pm, patcher, tmpdir = self._make_manager()
+        try:
+            pm.set_group_personality("g1", "rubi")
+            assert pm.get_group_personality("g1") == "rubi"
+            pm.clear_group_personality("g1")
+            assert pm.get_group_personality("g1") is None
+            assert pm.resolve_effective_personality("u1", "g1") == "assistant"
+            print_pass("clear_group_personality falls back to global")
+        finally:
+            patcher.stop()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ── Main Runner ──────────────────────────────────────────────────
 
 def main():
@@ -969,6 +1095,7 @@ def main():
         ("Agent Core (Mock LLM)", TestAgentCore()),
         ("DeepSeekClient Parsing", TestDeepSeekClientParsing()),
         ("Built-in Tools", TestBuiltinTools()),
+        ("Personality Manager", TestPersonality()),
     ]
 
     passed = 0

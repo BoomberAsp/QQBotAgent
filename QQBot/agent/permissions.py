@@ -47,6 +47,7 @@ class CodeLimits:
 # Tools available to ALL users
 _PUBLIC_TOOLS: Set[str] = {
     "get_user_info",
+    "delete_workspace_file",
     "search_web",
     "get_time",
     "get_weather",
@@ -62,6 +63,10 @@ _PUBLIC_TOOLS: Set[str] = {
     "compare_speed_probability",
     "explain_code",
     "translate_text",
+    "character_detail",
+    "bond_detail",
+    "parse_battle_screenshots",
+    "redeem_code",
 }
 
 # Additional tools for VIP users (on top of _PUBLIC_TOOLS)
