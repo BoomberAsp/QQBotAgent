@@ -229,6 +229,16 @@ BOND_SELL_GOLD = {"5": "12500", "4": "4200", "3": "2100"}
 BOND_SELL_FRAGMENT = {"5": "30", "4": "8", "3": "1"}
 BOND_XP_VALUE = {"5": "1030", "4": "850", "3": "680"}
 
+# Potential growth params are deterministic (never LLM-translated), so they are
+# excluded from the re-translation source hash. Otherwise introducing them would
+# invalidate every stored ``_src_hash`` and force a full re-translation of all
+# ~208 characters. They are backfilled onto unchanged entries during refresh and
+# are still part of ``_entry_card_hash``, so cards re-render when they change.
+_POT_DETAIL_FIELDS = (
+    "team_pot_rate", "team_pot_base", "team_pot_add",
+    "self_pot_rate", "self_pot_base", "self_pot_add",
+)
+
 
 # ── WikiScraper ──────────────────────────────────────────────────
 
@@ -962,6 +972,16 @@ class WikiScraper:
             "discs_en": [self._clean_markup(p(f"Disc{i}") or "") for i in range(1, 7)],
             "team_pot_en": self._clean_markup(p("TeamPot") or ""),
             "self_pot_en": self._clean_markup(p("SelfPot") or ""),
+            # Potential growth params — deterministic (no LLM). The wiki renders
+            # 5 tiers (B/A/S/SS/SSS) per side as Base + Add×k with k=2..6
+            # (verified against Shani's rendered page: DEF +3.6% … +10.8% from
+            # Base=0/Add=1.8).
+            "team_pot_rate": (p("TeamPotRate") or "").strip(),
+            "team_pot_base": (p("TeamPotBase") or "").strip(),
+            "team_pot_add": (p("TeamPotAdd") or "").strip(),
+            "self_pot_rate": (p("SelfPotRate") or "").strip(),
+            "self_pot_base": (p("SelfPotBase") or "").strip(),
+            "self_pot_add": (p("SelfPotAdd") or "").strip(),
             "skills": [],
         }
 
@@ -1045,6 +1065,13 @@ class WikiScraper:
                 # gap-translation so mixed English/Chinese cards self-heal.
                 if self._has_untranslated_freetext(old):
                     to_translate.append(old)
+                # Deterministic potential params are excluded from _source_hash
+                # (no translation needed), so copy the fresh values onto the
+                # reused entry — keeps them current without re-translation and
+                # changes _card_hash so the card re-renders.
+                for k in _POT_DETAIL_FIELDS:
+                    if entry.get(k):
+                        old[k] = entry[k]
                 result[title] = old
                 unchanged += 1
                 continue
@@ -1120,9 +1147,12 @@ class WikiScraper:
 
         Changes to any source field (skills, stats, desc, discs, personal,
         element/class, id/stars) invalidate the stored translation, so the
-        entry is re-translated on the next refresh.
+        entry is re-translated on the next refresh. Deterministic potential
+        growth params are excluded — they need no translation and are
+        backfilled onto unchanged entries instead.
         """
-        payload = {k: v for k, v in entry.items() if k != "_src_hash"}
+        payload = {k: v for k, v in entry.items()
+                   if k != "_src_hash" and k not in _POT_DETAIL_FIELDS}
         s = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
 

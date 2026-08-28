@@ -238,12 +238,61 @@ def _skill_meta(sk: dict) -> str:
     return " · ".join(parts)
 
 
+# Potential (潜能) stat codes → Chinese. The wiki stores potential as a stat
+# keyword plus numeric growth params (never free text), so this is fully
+# deterministic — no LLM involved.
+_POT_STAT_CN = {
+    "ATK": "攻击力", "DEF": "防御力", "HP": "生命值",
+    "SPD": "速度", "Speed": "速度",
+    "Effect Hit Rate": "效果命中", "Effect Resistance": "效果抵抗",
+    "Crit": "暴击率", "Crit Rate": "暴击率", "Crit DMG": "暴击伤害",
+}
+
+# Potential-break tiers shown by the wiki (icons B / A / S / SS / SSS). Each
+# tier's bonus = Base + Add × k with k = 2..6 (verified against the wiki's
+# rendered table, e.g. Shani DEF Base 0 / Add 1.8 → +3.6% … +10.8%).
+_POT_TIER_LABELS = ("B", "A", "S", "SS", "SSS")
+
+
+def potential_tier_lines(entry: dict) -> list:
+    """Build the per-tier potential detail lines, or [] when data is absent.
+
+    Returns e.g. ``["团队 防御力 +3.6% / +5.4% / …", "自身 生命值 +6% / …"]``
+    (tier order B→A→S→SS→SSS). Old caches that predate the growth params yield
+    ``[]`` so callers fall back to the legacy single-line team/self display.
+    """
+    def fmt(stat_code, rate, base_s, add_s):
+        try:
+            base = float(str(base_s)) if str(base_s).strip() else 0.0
+            add = float(str(add_s)) if str(add_s).strip() else 0.0
+        except (TypeError, ValueError):
+            return None
+        if add == 0 and base == 0:
+            return None
+        code = (stat_code or "").strip()
+        stat = _POT_STAT_CN.get(code, code or "?")
+        vals = " / ".join(f"+{(base + add * (i + 2)):g}{rate}"
+                          for i in range(len(_POT_TIER_LABELS)))
+        return f"{stat} {vals}"
+
+    out = []
+    t = fmt(entry.get("team_pot_en"), entry.get("team_pot_rate"),
+            entry.get("team_pot_base"), entry.get("team_pot_add"))
+    s = fmt(entry.get("self_pot_en"), entry.get("self_pot_rate"),
+            entry.get("self_pot_base"), entry.get("self_pot_add"))
+    if t:
+        out.append("团队 " + t)
+    if s:
+        out.append("自身 " + s)
+    return out
+
+
 # ── Card path / freshness ────────────────────────────────────────
 
 # Bump this when the card layout / rendering code changes to invalidate all
 # cached PNGs. The version is appended to the content hash so that cards are
 # re-rendered even when only the renderer (not the data) has changed.
-_RENDERER_VERSION = "2"
+_RENDERER_VERSION = "3"
 
 _hash_lock = threading.Lock()
 
@@ -404,8 +453,34 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
     discs_raw = entry.get("discs") or []
     discs = [(i + 1, d) for i, d in enumerate(discs_raw) if d]
 
+    # Disc grid: the Lv3 talent ("强化技能: …") carries long mechanic text, so
+    # each cell is wrapped and every row grows to fit its tallest cell. The
+    # column width must stay inside the panel's inner content width (W-4*PAD);
+    # the old (W-2*PAD)//3 was wider than the panel interior and overflowed.
+    disc_col_w = (W - 4 * PAD) // 3
+    disc_cells = [_wrap(probe, f"Lv{lv} {d}", 20, disc_col_w - 12) or [""]
+                  for lv, d in discs]
+    disc_row_hs = [
+        max(len(c) for c in disc_cells[r:r + 3]) * _lh(20) + 8
+        for r in range(0, len(disc_cells), 3)
+    ]
+    discs_h = sum(disc_row_hs)
+
     team_pot = entry.get("team_pot", "")
     self_pot = entry.get("self_pot", "")
+
+    # Potential detail: per-tier (B→SSS) values computed from growth params —
+    # deterministic, no LLM. Old caches lacking the params fall back to the
+    # legacy single-line team/self display.
+    pot_wrapped = []
+    for line in potential_tier_lines(entry):
+        pot_wrapped.extend(_wrap(probe, line, 19, W - 4 * PAD - 10))
+    if pot_wrapped:
+        pot_block_h = (_lh(19) + 6) + len(pot_wrapped) * (_lh(19) + 2)
+    elif team_pot or self_pot:
+        pot_block_h = _lh(20)
+    else:
+        pot_block_h = 0
 
     # skill columns — body is a list of (size, text, color) wrapped lines
     col_gap = GAP
@@ -413,10 +488,23 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
     col_text_w = col_w - 40
     skill_cols = []
     for i, sk in enumerate(skills[:3]):
+        # Name sits beside the skill icon; wrap it and cap at two lines so a
+        # long translated name can never push past the column edge.
+        name_w = col_w - SKILL_ICON - 12 - 40
+        name_lines = _wrap(probe, f"[{i + 1}] {sk.get('name') or sk.get('name_en', '')}",
+                           22, name_w) or [""]
+        if len(name_lines) > 2:
+            cut = name_lines[1]
+            while cut and probe.textlength(cut + "…", font=_font(22)) > name_w:
+                cut = cut[:-1]
+            name_lines = [name_lines[0], cut + "…"]
         body = []
-        for key, size in (("des", 20), ("des2", 20)):
-            for ln in _wrap(probe, sk.get(key, ""), size, col_text_w):
-                body.append((size, ln, _TEXT_DIM))
+        for ln in _wrap(probe, sk.get("des", ""), 20, col_text_w):
+            body.append((20, ln, _TEXT_DIM))
+        if sk.get("des2"):
+            # des2 is the wiki's "†Before Discipline" text (pre-enhancement).
+            for ln in _wrap(probe, f"强化前: {sk['des2']}", 18, col_text_w):
+                body.append((18, ln, _TEXT_FAINT))
         if sk.get("multi"):
             for raw in str(sk["multi"]).splitlines():
                 if raw.strip():
@@ -426,7 +514,7 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
             for ln in _wrap(probe, f"Burst: {sk['burst']}", 18, col_text_w):
                 body.append((18, ln, _BURST))
         skill_cols.append({
-            "name": sk.get("name") or sk.get("name_en", ""),
+            "name_lines": name_lines,
             "meta": _skill_meta(sk),
             "body": body,
         })
@@ -447,19 +535,20 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
     if stats_max:
         band2_inner += _lh(18) + 4               # growth-ratio row
     band2_inner += 12
-    band2_inner += ((len(discs) + 2) // 3) * (_lh(20) + 8)  # discs grid
+    band2_inner += discs_h                            # discs grid (wrapped)
     band2_inner += 6
-    if team_pot or self_pot:
-        band2_inner += _lh(20)
+    band2_inner += pot_block_h                        # potential tiers / legacy
     band2_h = band2_inner + 2 * PAD
 
-    # Skill band
-    skill_name_h = _lh(24)
+    # Skill band — the name lines sit beside the icon; the meta row must clear
+    # whichever is taller (the icon, or a wrapped two-line name).
+    name_lines_max = max((len(c["name_lines"]) for c in skill_cols), default=1)
+    skill_top_h = max(SKILL_ICON + 8, name_lines_max * _lh(22) - 2 + 6)
     skill_meta_h = _lh(18) if any(c["meta"] for c in skill_cols) else 0
     skill_body_h = max(
         (sum(_lh(s) for s, _, _ in c["body"]) for c in skill_cols), default=0
     )
-    skill_inner = SKILL_ICON + 12 + skill_name_h + skill_meta_h + 8 + skill_body_h
+    skill_inner = skill_top_h + skill_meta_h + 4 + skill_body_h
     skill_h = skill_inner + 2 * 20  # 20px vertical padding inside panel
 
     total_h = PAD + top_h + GAP + band2_h + GAP + skill_h + PAD
@@ -527,16 +616,24 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
             stat_x += stat_col_w
         py += _lh(18) + _lh(26) + 16
 
-    disc_col_w = (W - 2 * PAD) // 3
-    disc_rows = (len(discs) + 2) // 3
-    for n, (lv, d) in enumerate(discs):
-        row, col = divmod(n, 3)
-        draw.text((px + col * disc_col_w, py + row * (_lh(20) + 8)),
-                  f"Lv{lv} {d}", font=_font(20), fill=_TEXT_DIM)
-    py += disc_rows * (_lh(20) + 8)
+    for row_idx, row_h in enumerate(disc_row_hs):
+        for c_i, cell in enumerate(disc_cells[row_idx * 3: row_idx * 3 + 3]):
+            cy = py
+            for ln in cell:
+                draw.text((px + c_i * disc_col_w, cy), ln,
+                          font=_font(20), fill=_TEXT_DIM)
+                cy += _lh(20)
+        py += row_h
     py += 6
 
-    if team_pot or self_pot:
+    if pot_wrapped:
+        draw.text((px, py), "潜能 (" + " / ".join(_POT_TIER_LABELS) + ")",
+                  font=_font(19), fill=_TEXT_FAINT)
+        py += _lh(19) + 6
+        for ln in pot_wrapped:
+            draw.text((px + 10, py), ln, font=_font(19), fill=_TEXT_DIM)
+            py += _lh(19) + 2
+    elif team_pot or self_pot:
         pot_parts = []
         if team_pot:
             pot_parts.append(f"团队 {team_pot}")
@@ -553,9 +650,11 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
                                radius=16, fill=_PANEL_2 + (255,))
         ix, iy = cx + 20, y + 20
         canvas.paste(skill_icons[i], (ix, iy), skill_icons[i])
-        draw.text((ix + SKILL_ICON + 12, iy - 2), f"[{i + 1}] {col['name']}",
-                  font=_font(22), fill=_TEXT)
-        iy += SKILL_ICON + 8
+        ny = iy - 2
+        for ln in col["name_lines"]:
+            draw.text((ix + SKILL_ICON + 12, ny), ln, font=_font(22), fill=_TEXT)
+            ny += _lh(22)
+        iy = max(iy + SKILL_ICON + 8, ny + 6)
         if col["meta"]:
             draw.text((ix, iy), col["meta"], font=_font(18), fill=_TEXT_FAINT)
             iy += _lh(18)

@@ -232,7 +232,8 @@ def format_character(entry: dict) -> str:
             if sk.get("des"):
                 lines.append(_indent(sk["des"]))
             if sk.get("des2"):
-                lines.append(_indent(sk["des2"]))
+                # des2 is the wiki's "†Before Discipline" (pre-enhancement) text.
+                lines.append(_indent(f"强化前: {sk['des2']}"))
             if sk.get("multi"):
                 lines.append("    倍率:")
                 lines.append(_indent(sk["multi"], "      "))
@@ -250,14 +251,23 @@ def format_character(entry: dict) -> str:
         for lv, d in shown:
             lines.append(f"  {lv}. {d}")
 
-    # Potential
-    pot_parts = []
-    if entry.get("team_pot"):
-        pot_parts.append(f"团队 {entry['team_pot']}")
-    if entry.get("self_pot"):
-        pot_parts.append(f"自身 {entry['self_pot']}")
-    if pot_parts:
-        lines.append("潜能: " + " / ".join(pot_parts))
+    # Potential — per-tier (B/A/S/SS/SSS) values when the growth params are
+    # available; old caches fall back to the single-line team/self display.
+    from tools.card_renderer import potential_tier_lines
+
+    pot_details = potential_tier_lines(entry)
+    if pot_details:
+        lines.append("潜能 (B/A/S/SS/SSS):")
+        for ln in pot_details:
+            lines.append(f"  {ln}")
+    else:
+        pot_parts = []
+        if entry.get("team_pot"):
+            pot_parts.append(f"团队 {entry['team_pot']}")
+        if entry.get("self_pot"):
+            pot_parts.append(f"自身 {entry['self_pot']}")
+        if pot_parts:
+            lines.append("潜能: " + " / ".join(pot_parts))
 
     return "\n".join(lines)
 
