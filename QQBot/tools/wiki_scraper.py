@@ -1450,8 +1450,13 @@ class WikiScraper:
             "Effect Hit Rate=效果命中，Effect Resistance=效果抵抗。"
         )
 
-        for i in range(0, len(chars), 8):
+        total = len(chars)
+        for i in range(0, total, 8):
             batch = chars[i : i + 8]
+            # Progress heartbeat: this phase runs 20+ sequential LLM calls and
+            # is otherwise completely silent, which looks like a hang in logs.
+            print(f"[WikiScraper] translating details {i + 1}-{i + len(batch)}/{total}",
+                  file=sys.stderr)
             payload = []
             for c in batch:
                 payload.append({
