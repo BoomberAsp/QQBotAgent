@@ -40,7 +40,7 @@ from agent.context import (
 )
 from agent.task_record import build_record, build_compact_line, append_task_log
 from agent.group_features import get_group_features
-from agent.permissions import PermissionManager
+from agent.permissions import PermissionManager, UserRole
 from agent.personality import get_personality_manager
 from agent.hardware import HardwareDetector
 from agent.special_session import SpecialSessionManager
@@ -1618,6 +1618,10 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         cmd_handled = await _handle_bond_detail_command(text_content, user_id)
         if cmd_handled:
             return
+        # /刷新角色数据 command (admin-only forced wiki cache refresh)
+        cmd_handled = await _handle_refresh_data_command(text_content, user_id)
+        if cmd_handled:
+            return
         # /功能 / /features command (direct, no agent)
         cmd_handled = await _handle_features_command(text_content, user_id)
         if cmd_handled:
@@ -2198,6 +2202,79 @@ async def _handle_bond_detail_command(text: str, user_id: str) -> bool:
         await _safe_send(MessageSegment.image(Path(card_path)))
     else:
         await _safe_send(text_result)
+    return True
+
+
+# Guard so repeated /刷新角色数据 presses don't stack concurrent refreshes.
+_forced_refresh_running = False
+
+
+async def _forced_refresh_wiki_data(user_id: str) -> None:
+    """Force a full character + bond cache refresh in the background.
+
+    Runs after the triggering handler has returned, so it has no active event
+    context — completion is reported by a direct private message to the admin
+    who requested it (best-effort) rather than ``_safe_send``.
+    """
+    global _forced_refresh_running
+    summary = ""
+    try:
+        from tools.wiki_scraper import WikiScraper
+        from tools import character_detail as _cd
+        from tools import bond_detail as _bd
+        from lib.model_router import model_router
+
+        scraper = WikiScraper(llm_client=model_router.flash_client)
+        chars = await scraper.refresh_characters()
+        if chars:
+            _cd._invalidate()
+        bonds = await scraper.refresh_bonds()
+        if bonds:
+            _bd._invalidate()
+        summary = f"角色/羁绊数据库刷新完成（角色 {len(chars)} 条，羁绊 {len(bonds)} 条），卡片将自动重绘。"
+        print(f"[agent_router] forced wiki refresh done: "
+              f"{len(chars)} characters, {len(bonds)} bonds", file=sys.stderr)
+    except Exception as e:
+        summary = f"刷新失败：{type(e).__name__}，请稍后重试。"
+        print(f"[agent_router] forced wiki refresh failed: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+    finally:
+        _forced_refresh_running = False
+
+    # Best-effort completion notice to the requesting admin.
+    if summary:
+        try:
+            import nonebot
+            from nonebot.adapters.onebot.v11 import Bot as _Bot
+            bots = nonebot.get_bots()
+            bot = next((b for b in bots.values() if isinstance(b, _Bot)), None)
+            if bot is not None:
+                await bot.send_private_msg(user_id=int(user_id), message=summary)
+        except Exception as e:
+            print(f"[agent_router] refresh notice send failed: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+
+
+async def _handle_refresh_data_command(text: str, user_id: str) -> bool:
+    """Handle /刷新角色数据 — admin-only forced wiki cache refresh.
+
+    The character/bond caches auto-refresh weekly (Wednesday 20:00 anchor), so
+    scraper fixes deployed between anchors would otherwise wait up to a week.
+    This command forces an immediate background refresh (scrape + translate +
+    image download + card re-render). Returns True if the command was handled.
+    """
+    global _forced_refresh_running
+    if text.strip() not in ("/刷新角色数据", "#刷新角色数据"):
+        return False
+    if _perm_manager.get_role(user_id) != UserRole.ADMIN:
+        await _safe_send("此命令仅限管理员使用。")
+        return True
+    if _forced_refresh_running:
+        await _safe_send("刷新正在进行中，请稍候~")
+        return True
+    _forced_refresh_running = True
+    asyncio.create_task(_forced_refresh_wiki_data(user_id))
+    await _safe_send("已开始后台刷新角色/羁绊数据库（抓取+翻译+图片下载），通常需要几分钟，完成后会自动通知。")
     return True
 
 

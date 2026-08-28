@@ -636,6 +636,47 @@ class WikiScraper:
                 if url:
                     await self._download_image(url, dest)
 
+    @staticmethod
+    def _character_art_missing(entry: dict) -> bool:
+        """True if any expected character image file is absent on disk."""
+        cid = str(entry.get("id", "")).strip()
+        if not cid:
+            return False
+        expected = [os.path.join(PORTRAIT_DIR, f"{cid}.png"),
+                    os.path.join(ICON_DIR, f"{cid}.png")]
+        expected.extend(
+            os.path.join(SKILL_ICON_DIR, f"{cid}_{n}.png") for n in range(1, 4)
+        )
+        return any(not os.path.exists(p) for p in expected)
+
+    async def ensure_character_images(self) -> int:
+        """Backfill missing character art without re-scraping or re-translating.
+
+        Image downloads normally only run during the weekly cache refresh, so a
+        filename-convention fix (or an interrupted download batch) leaves cards
+        stuck on placeholder tiles until the next anchor. This method is
+        idempotent and cheap (existence checks only) and downloads just the
+        missing files, then re-renders the affected cards. Returns the number
+        of characters that needed backfill.
+        """
+        existing = self._load_character_cache()
+        if not existing:
+            return 0
+        missing = [
+            e for e in existing.values()
+            if isinstance(e, dict) and self._character_art_missing(e)
+        ]
+        if not missing:
+            return 0
+        print(f"[WikiScraper] backfilling art for {len(missing)} characters",
+              file=sys.stderr)
+        sem = asyncio.Semaphore(4)
+        tasks = [self._download_character_images(e, sem) for e in missing]
+        await self._background_download_then_render(
+            tasks, "character art backfill", missing, "character"
+        )
+        return len(missing)
+
     async def _fetch_template_pages(self, template_name: str) -> list[tuple[str, str]]:
         """Fetch wikitext for all pages embedding a given template.
 
@@ -973,9 +1014,22 @@ class WikiScraper:
         # on incremental refreshes the existing translations are authoritative.
         seed_index = self._openrubi_seed_index() if not existing else None
 
+        # Canonical Chinese names (openrubi dictionaries + own translation map).
+        # Used to heal drifted name_cn values in cached entries: alias lookup
+        # (character_dic → canonical name → _by_cn_name) only works when the
+        # cached name_cn equals the canonical name the alias dictionary uses.
+        canonical_names = self._openrubi_name_lookup()
+        try:
+            canonical_names.update({
+                str(k).strip().lower(): v
+                for k, v in self._load_translation_map().items() if v
+            })
+        except Exception:
+            pass
+
         to_translate = []
         result = {}
-        unchanged = seeded = changed = 0
+        unchanged = seeded = changed = healed = 0
 
         for entry in scraped:
             title = entry["title"]
@@ -984,6 +1038,13 @@ class WikiScraper:
 
             # Unchanged → reuse existing (already translated) entry as-is.
             if old is not None and old.get("_src_hash") == h:
+                if self._heal_name_cn(old, canonical_names):
+                    healed += 1
+                # Early cache builds left seeded entries with untranslated
+                # free text (desc/des2/burst still English). Queue those for
+                # gap-translation so mixed English/Chinese cards self-heal.
+                if self._has_untranslated_freetext(old):
+                    to_translate.append(old)
                 result[title] = old
                 unchanged += 1
                 continue
@@ -994,17 +1055,24 @@ class WikiScraper:
                 self._apply_deterministic_maps(entry)
                 self._default_cn_fields(entry)
                 entry = self._merge_seed(entry, seed)
+                self._heal_name_cn(entry, canonical_names)
                 entry["_src_hash"] = h
                 result[title] = entry
                 seeded += 1
+                # openrubi has no bio/enhanced skill descriptions — gap-fill
+                # the leftover English fields via LLM translation.
+                if self._has_untranslated_freetext(entry):
+                    to_translate.append(entry)
             else:
                 entry["_src_hash"] = h
                 to_translate.append(entry)
                 result[title] = entry
                 changed += 1
 
-        print(f"[WikiScraper] {unchanged} unchanged, {seeded} seeded from openrubi, "
-              f"{changed} to translate", file=sys.stderr)
+        print(f"[WikiScraper] {unchanged} unchanged ({healed} names healed), "
+              f"{seeded} seeded from openrubi, "
+              f"{changed} changed/new, {len(to_translate)} to translate",
+              file=sys.stderr)
 
         if to_translate:
             await self._translate_character_details(to_translate)
@@ -1122,6 +1190,42 @@ class WikiScraper:
             s.setdefault("des", s.get("des_en", ""))
             s.setdefault("des2", s.get("des2_en", ""))
             s.setdefault("burst", s.get("burst_en", ""))
+
+    @staticmethod
+    def _has_untranslated_freetext(entry: dict) -> bool:
+        """True if any display free-text field still equals its English source.
+
+        Detects leftovers from early builds where seeded entries never went
+        through LLM translation (openrubi has no bio/enhanced descriptions, so
+        ``desc``/``des2``/``burst`` kept their English fallback) — the source
+        of cards mixing English and Chinese text for the same content.
+        """
+        desc_en = (entry.get("desc_en") or "").strip()
+        if desc_en and (entry.get("desc") or "") == entry.get("desc_en"):
+            return True
+        for s in entry.get("skills", []) or []:
+            for key in ("des", "des2", "burst"):
+                en = (s.get(key + "_en") or "").strip()
+                if en and s.get(key, "") == s.get(key + "_en"):
+                    return True
+        return False
+
+    @staticmethod
+    def _heal_name_cn(entry: dict, canonical_names: dict) -> bool:
+        """Align ``name_cn`` with the canonical openrubi/translation-map name.
+
+        Alias resolution depends on ``name_cn`` matching the canonical name in
+        ``character_dic.json``; caches built before that alignment drift and
+        make alias lookups fail. Returns True when the entry was changed.
+        """
+        title = str(entry.get("title", "")).strip()
+        canonical = canonical_names.get(title.strip().lower()) if title else None
+        if not canonical:
+            return False
+        if entry.get("name_cn") == canonical:
+            return False
+        entry["name_cn"] = canonical
+        return True
 
     def _load_character_cache(self) -> dict:
         """Load existing {title: entry} from character_details.json."""
@@ -1248,6 +1352,11 @@ class WikiScraper:
         name_map = self._load_translation_map()
         unmapped = []
         for c in chars:
+            # Entries gap-filled from a seeded cache may already carry the
+            # canonical openrubi name — never overwrite a real Chinese name.
+            existing_cn = (c.get("name_cn") or "").strip()
+            if existing_cn and existing_cn != c.get("title"):
+                continue
             cn = openrubi_map.get(c["title"].strip().lower()) or name_map.get(c["title"])
             if cn:
                 c["name_cn"] = cn
@@ -1382,22 +1491,22 @@ class WikiScraper:
                 t = translated.get(c["title"])
                 if not isinstance(t, dict):
                     continue
-                if t.get("name_cn"):
+                # Merge guard: only fill fields that still equal their English
+                # source (i.e. untranslated). Authoritative Chinese values
+                # (openrubi-seeded names/descriptions) are never overwritten —
+                # this is what lets seeded entries be gap-filled safely.
+                if t.get("name_cn") and c.get("name_cn") == c.get("title"):
                     c["name_cn"] = t["name_cn"]
-                if t.get("desc"):
+                if t.get("desc") and (c.get("desc") or "") == c.get("desc_en"):
                     c["desc"] = t["desc"]
                 for idx, sk in enumerate(c.get("skills", [])):
                     ts = t.get("skills", [])
                     if isinstance(ts, list) and idx < len(ts) and isinstance(ts[idx], dict):
-                        if ts[idx].get("name"):
-                            sk["name"] = ts[idx]["name"]
-                        if ts[idx].get("des"):
-                            sk["des"] = ts[idx]["des"]
-                        if ts[idx].get("des2"):
-                            sk["des2"] = ts[idx]["des2"]
-                        if ts[idx].get("burst"):
-                            sk["burst"] = ts[idx]["burst"]
-                if isinstance(t.get("discs"), list):
+                        for key in ("name", "des", "des2", "burst"):
+                            val = ts[idx].get(key)
+                            if val and (sk.get(key) or "") == sk.get(key + "_en"):
+                                sk[key] = val
+                if isinstance(t.get("discs"), list) and c.get("discs") == c.get("discs_en"):
                     c["discs"] = t["discs"]
 
     @staticmethod
