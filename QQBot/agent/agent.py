@@ -19,6 +19,47 @@ from .profile import ProfileManager
 from .hardware import HardwareDetector, HardwareProfile
 from .workspace import UserWorkspaceManager
 from .special_session import SpecialSessionManager, SpecialSession
+from .task_record import build_auto_record, build_compact_line, append_task_log
+
+
+# Long-term memory write policy. Only interactions whose combined
+# user+assistant length exceeds MIN_REMEMBER_LEN are persisted, and each user
+# is capped at MAX_MEMORIES_PER_USER entries (oldest pruned first). This keeps
+# the memory store bounded and prevents low-value/hallucinated replies from
+# accumulating and later re-entering the prompt via keyword search.
+MIN_REMEMBER_LEN = 800
+MAX_MEMORIES_PER_USER = 20
+
+# TaskRecord auto-compression: a turn that used one of the known multi-turn task
+# tools and whose final response exceeds AUTO_COMPRESS_MIN_LEN is folded into a
+# degraded TaskRecord (unless finalize_subtask already produced an explicit
+# record). Scoped to these tools so ordinary long answers (search, character
+# lookup, …) are left intact. Full detail stays in the task log.
+AUTO_COMPRESS_MIN_LEN = 600
+_AUTO_COMPRESS_TOOLS = {"gacha_pull", "parse_battle_screenshots", "calculate_speed"}
+
+# A task fold may remove at most this many trailing messages (the setup/result
+# turns of one short flow). If the recorded boundary would remove more, it is
+# treated as stale/abandoned and the fold is skipped — a guard against an old
+# begin_task window wiping unrelated history on a later finalize_subtask.
+MAX_FOLD_MESSAGES = 8
+
+
+def _display_tool_name(tool_call: dict) -> str:
+    """Return a human-facing tool name for the progress message.
+
+    ``parse_battle_screenshots`` is annotated with its mode (轻量/全量) so
+    the user can tell the two runs apart.
+    """
+    name = tool_call["function"]["name"]
+    if name != "parse_battle_screenshots":
+        return name
+    try:
+        args = json.loads(tool_call["function"].get("arguments") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return name
+    label = "轻量" if args.get("mode") == "light" else "全量"
+    return f"{name}（{label}）"
 
 
 class Agent:
@@ -174,6 +215,15 @@ class Agent:
         # Key: (tool_name, hash(arguments_json)) -> failure_count
         _recent_tool_failures: dict = {}
 
+        # Collect this turn's tool calls (name/args/success/snippet). Used by the
+        # TaskRecord auto-compression fallback to build a degraded record when the
+        # agent did not call finalize_subtask explicitly.
+        _turn_tool_calls: list = []
+
+        # Reset the task-fold directive; finalize_subtask may set it during this run.
+        from agent.context import _pending_task_fold
+        _pending_task_fold.set(None)
+
         # Agent loop
         for iteration in range(self.max_tool_iterations):
             llm_client = client or self.client
@@ -191,7 +241,7 @@ class Agent:
             if response.get("tool_calls"):
                 # ── Report progress (with deduplication) ────────────
                 if progress_callback:
-                    tool_names = [tc["function"]["name"] for tc in response["tool_calls"]]
+                    tool_names = [_display_tool_name(tc) for tc in response["tool_calls"]]
                     tool_set = frozenset(tool_names)
                     if tool_set != _last_reported_tools:
                         _last_reported_tools = tool_set
@@ -210,6 +260,30 @@ class Agent:
                 tool_results = await self._execute_tool_calls(
                     response["tool_calls"], session, user_id, allowed_tools
                 )
+
+                # ── Collect this turn's tool calls (TaskRecord auto-fallback) ──
+                _res_by_id = {
+                    tr.get("tool_call_id"): tr.get("content", "") for tr in tool_results
+                }
+                for tc in response["tool_calls"]:
+                    _tn = tc["function"]["name"]
+                    try:
+                        _args = json.loads(tc["function"].get("arguments", "{}") or "{}")
+                    except Exception:
+                        _args = {}
+                    _res = _res_by_id.get(tc.get("id", f"call_{_tn}"), "")
+                    _is_err = _res.startswith("[") and any(
+                        _res.startswith(p) for p in (
+                            "[Git Error]", "[Search", "[WebFetch", "[Code Error",
+                            "[Shell", "[Security", "[SSRF", "[PDF Error]",
+                        )
+                    )
+                    _turn_tool_calls.append({
+                        "name": _tn,
+                        "args": _args,
+                        "success": not _is_err,
+                        "snippet": _res[:200].replace("\n", " "),
+                    })
 
                 assistant_msg = {
                     "role": "assistant",
@@ -271,17 +345,62 @@ class Agent:
                 final_content = response.get("content", "")
                 reasoning = response.get("reasoning_content")
 
-                # ── Persist to session ───────────────────────────
-                if special_session:
-                    self.special_sessions.add_message(user_id, "user", user_message)
-                    self.special_sessions.add_message(
-                        user_id, "assistant", final_content, reasoning,
-                    )
+                # ── Persist to session (TaskRecord-aware) ────────
+                # Three modes:
+                #  1. Explicit finalize_subtask → fold the task's setup turns and
+                #     persist the compact structured record instead of raw content.
+                #  2. Auto-compression fallback → tool-heavy + long response with no
+                #     explicit record; build a degraded record and persist its line.
+                #  3. Normal → persist user message + full final response.
+                fold = _pending_task_fold.get()
+                if fold is not None:
+                    line = fold.get("line", "")
+                    boundary = fold.get("boundary")
+                    if special_session:
+                        # Snapshot storage: skip setup-turn removal, fold this turn only.
+                        self.special_sessions.add_message(user_id, "user", user_message)
+                        self.special_sessions.add_message(user_id, "assistant", line)
+                    else:
+                        if boundary is not None:
+                            b = max(0, min(int(boundary), len(session.context)))
+                            # Stale-window guard: a fold may only remove up to
+                            # MAX_FOLD_MESSAGES trailing messages. If the recorded
+                            # boundary would wipe more (e.g. an abandoned begin_task
+                            # finalized much later), skip setup-turn removal and just
+                            # append the record — better to keep redundant setup turns
+                            # than to destroy unrelated history.
+                            if (len(session.context) - b) <= MAX_FOLD_MESSAGES:
+                                session.context = session.context[:b]
+                        session.add_message("user", user_message)
+                        session.add_message("assistant", line)
+                        session.trim(self.sessions.max_context_messages)
+                        self.sessions.update(user_id, session)
+                elif (
+                    any(tc.get("name") in _AUTO_COMPRESS_TOOLS for tc in _turn_tool_calls)
+                    and len(final_content) > AUTO_COMPRESS_MIN_LEN
+                ):
+                    record = build_auto_record(user_message, final_content, _turn_tool_calls)
+                    append_task_log(user_id, record)
+                    line = build_compact_line(record)
+                    if special_session:
+                        self.special_sessions.add_message(user_id, "user", user_message)
+                        self.special_sessions.add_message(user_id, "assistant", line)
+                    else:
+                        session.add_message("user", user_message)
+                        session.add_message("assistant", line)
+                        session.trim(self.sessions.max_context_messages)
+                        self.sessions.update(user_id, session)
                 else:
-                    session.add_message("user", user_message)
-                    session.add_message("assistant", final_content, reasoning_content=reasoning)
-                    session.trim(self.sessions.max_context_messages)
-                    self.sessions.update(user_id, session)
+                    if special_session:
+                        self.special_sessions.add_message(user_id, "user", user_message)
+                        self.special_sessions.add_message(
+                            user_id, "assistant", final_content, reasoning,
+                        )
+                    else:
+                        session.add_message("user", user_message)
+                        session.add_message("assistant", final_content, reasoning_content=reasoning)
+                        session.trim(self.sessions.max_context_messages)
+                        self.sessions.update(user_id, session)
 
                 # Save substantive interactions to long-term memory
                 await self._maybe_remember(user_id, user_message, final_content)
@@ -319,6 +438,20 @@ class Agent:
 
         # 1. Global system prompt
         system_content = self.build_system_prompt()
+
+        # 1.5. Personality prompt (injected at the very top)
+        from agent.context import _current_personality, _personality_transition
+        from agent.personality import get_personality_manager
+        persona_name = _current_personality.get()
+        if persona_name:
+            pm = get_personality_manager()
+            persona_content = pm.load(persona_name)
+            if persona_content:
+                system_content = persona_content + "\n\n---\n\n" + system_content
+        # 1.6. Personality transition notice (switch without clearing history)
+        transition_note = _personality_transition.get()
+        if transition_note:
+            system_content += f"\n\n{transition_note}"
         user_id = special_session.user_id if special_session else session.user_id
 
         # 2. Session type marker
@@ -363,6 +496,12 @@ class Agent:
                 f"如果用户的请求需要使用你无法访问的工具（如 shell 命令、网页抓取等），"
                 f"请礼貌地说明当前权限不支持此操作，并建议用户联系管理员获取更高权限。"
             )
+
+        # 4.5. Group feature restrictions
+        from agent.context import _current_group_context
+        group_ctx = _current_group_context.get()
+        if group_ctx:
+            messages[0]["content"] += group_ctx
 
         # 5. Relevant long-term memories (scoped to user_id)
         if self.memory:
@@ -509,23 +648,38 @@ class Agent:
     async def _maybe_remember(
         self, user_id: str, user_message: str, agent_response: str
     ):
-        """Conditionally save important interactions to long-term memory."""
+        """Conditionally save important interactions to long-term memory.
+
+        Only substantive interactions (combined length above MIN_REMEMBER_LEN)
+        are persisted. After saving, the per-user memory list is capped at
+        MAX_MEMORIES_PER_USER, pruning the oldest entries first.
+        """
         if not self.memory:
             return
 
-        # Simple heuristic: save if the interaction seems substantive
-        # (long messages, or containing certain patterns)
         combined_len = len(user_message) + len(agent_response)
-        if combined_len > 300:
-            summary = user_message[:100] + ("..." if len(user_message) > 100 else "")
-            entry = MemoryEntry(
-                name=f"interaction_{user_id}_{int(time.time())}",
-                description=f"Conversation with {user_id}: {summary}",
-                type="user",
-                user_id=user_id,
-                content=f"## User Message\n{user_message}\n\n## Agent Response\n{agent_response[:500]}",
-            )
-            self.memory.save(entry)
+        if combined_len <= MIN_REMEMBER_LEN:
+            return
+
+        summary = user_message[:100] + ("..." if len(user_message) > 100 else "")
+        entry = MemoryEntry(
+            name=f"interaction_{user_id}_{int(time.time())}",
+            description=f"Conversation with {user_id}: {summary}",
+            type="user",
+            user_id=user_id,
+            content=f"## User Message\n{user_message}\n\n## Agent Response\n{agent_response[:500]}",
+        )
+        self.memory.save(entry)
+
+        # Retention: prune oldest entries beyond the per-user cap.
+        try:
+            all_user = self.memory.list_all("user", user_id=user_id)
+            if len(all_user) > MAX_MEMORIES_PER_USER:
+                all_user.sort(key=lambda m: m.created_at)
+                for old in all_user[: len(all_user) - MAX_MEMORIES_PER_USER]:
+                    self.memory.forget(old.name, "user", user_id=user_id)
+        except Exception:
+            pass  # Retention must never break the main flow
 
     # ── Profile Update ──────────────────────────────────────────────
 

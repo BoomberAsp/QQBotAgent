@@ -62,3 +62,8 @@ outgoing:
   max_request_timeout: 15.0
   # Retry once on upstream failure (catches intermittent Bing timeouts)
   retries: 1
+  # Route all outgoing requests through the sing-box HTTP proxy (host gateway)
+  # to bypass GFW blocking of google / duckduckgo / wikipedia.
+  proxies:
+    http: http://172.18.0.1:1081
+    https: http://172.18.0.1:1081

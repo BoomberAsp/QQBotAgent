@@ -38,6 +38,7 @@ class MultimodalClient:
         self._config_path = config_path
         self._config = None
         self._audio_config = None
+        self._raw_config = None
         self._load_config()
 
     def _load_config(self):
@@ -51,9 +52,12 @@ class MultimodalClient:
             if not os.path.exists(self._config_path):
                 self._config = None
                 self._audio_config = None
+                self._raw_config = None
                 return
             with open(self._config_path, "r", encoding="utf-8") as f:
                 raw_config = json.load(f)
+
+            self._raw_config = raw_config
 
             if "MULTIMODAL_MODEL" in raw_config:
                 self._config = raw_config["MULTIMODAL_MODEL"]
@@ -67,6 +71,18 @@ class MultimodalClient:
         except (json.JSONDecodeError, IOError, OSError):
             self._config = None
             self._audio_config = None
+            self._raw_config = None
+
+    def get_section(self, name: str) -> dict | None:
+        """Return a raw config section (e.g. ``OCR_MODEL``) or None.
+
+        Generic entry point so specialised consumers (OCR, future model
+        roles) can read their own section without hardcoding keys here.
+        """
+        if not isinstance(self._raw_config, dict):
+            return None
+        section = self._raw_config.get(name)
+        return section if isinstance(section, dict) else None
 
     # ── Availability Check ──────────────────────────────────────────
 

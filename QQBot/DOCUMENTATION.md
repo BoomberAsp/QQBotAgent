@@ -31,17 +31,18 @@ QQBotAgent/
 │   └── settings.yml         #   搜索引擎配置 (Bing, 国内优化)
 │
 └── QQBot/                   # NoneBot 机器人主体
-    ├── .env                 # NoneBot 环境配置 (含 DeepSeek/OneBot 密钥)
+    ├── .env                 # NoneBot 环境配置 (含 DeepSeek/OneBot 密钥) ⚠ git-ignored
+    ├── .env.example         #   .env 说明文档 + 模板 (逐行注释每个变量)
     ├── requirements.txt     # Python 依赖
     ├── pyproject.toml       # NoneBot 项目配置
-    ├── test_agent.py        # Agent 系统测试套件 (7 套件, 38 测试)
+    ├── test_agent.py        # Agent 系统测试套件 (8 套件)
     │
     ├── agent/               # 智能体核心
     │   ├── agent.py         #   主循环: Think→Act→Observe→Respond
     │   ├── tool_registry.py #   工具注册表 (OpenAI JSON Schema 生成)
     │   ├── session.py       #   会话管理 (per-user, timeout, trim, 持久化)
     │   ├── special_session.py #  特殊会话管理 (百万 token, 快照+增量存储, 按角色限制数量)
-    │   ├── continuous_session.py # 群聊连续对话窗口管理 (5分钟免@)
+    │   ├── continuous_session.py # 群聊连续对话窗口管理 (90秒免@)
     │   ├── hardware.py      #   硬件自动检测 & 动态任务拒绝
     │   ├── workspace.py     #   用户工作区隔离 & 配额管理
     │   ├── context.py       #   执行上下文传递 (contextvars, 工具→QQ图片)
@@ -52,7 +53,7 @@ QQBotAgent/
     │       ├── SOUL.md      #     人格定义 & 行为规则
     │       ├── IDENTITY.md  #     身份声明 (名称/版本/能力/安全模型)
     │       ├── AGENTS.md    #     编排规则 (工具选择/错误处理/工作区约束)
-    │       ├── TOOLS.md     #     工具文档参考 (全部 21 个工具)
+    │       ├── TOOLS.md     #     工具文档参考 (全部 26 个工具)
     │       ├── WORKSPACE.md #     工作区约束 & 能力边界 (硬性规则)
     │       ├── BOOTSTRAP.md #     启动序列 & 健康检查
     │       ├── SESSION.md   #     会话参数配置
@@ -75,14 +76,23 @@ QQBotAgent/
     │   └── utils.py         #   工具函数 (全部注释)
     │
     ├── tools/               # Agent 工具实现
-    │   ├── builtin_tools.py #   7 个内置工具 (搜索/抓取/代码/Shell/PDF/Git/时间)
+    │   ├── builtin_tools.py #   8 个内置工具 (搜索/抓取/代码/Shell/PDF/Git/时间/系统负载/删除文件)
     │   ├── file_tools.py    #   文件读取工具 (文本/PDF/图片/音频分析)
     │   ├── map_tools.py     #   地图工具 (地理编码/逆编码/天气/POI/路径)
-    │   └── legacy_tools.py  #   6 个游戏/娱乐工具 (抽卡/动画/测速/乱速/解释/翻译)
+    │   ├── legacy_tools.py  #   6 个游戏/娱乐工具 (抽卡/动画/测速/乱速/解释/翻译)
+    │   ├── character_detail.py # 角色详情查询 (面板/技能/倍率/属性/天赋/潜能)
+    │   ├── bond_detail.py   #   羁绊详情查询 (类别/星级/攻击/生命/技能/获取/售价)
+    │   ├── card_renderer.py #   角色/羁绊卡片图片渲染
+    │   ├── battle_parser.py #   团战截图 OCR 解析 (行动值修正模块)
+    │   ├── ocr_name_matcher.py # OCR 角色名模糊匹配
+    │   ├── ag_skill_index.py   # 技能分类索引 (Skill 类 + 阵营触发方式分类)
+    │   ├── ag_trigger_engine.py # 行动值效果触发链推断
+    │   ├── wiki_scraper.py  #   Wiki 爬虫 (角色/羁绊数据 + buff 图标)
+    │   └── name_resolver.py #   角色别名解析 (模糊匹配)
     │
     ├── config/              # 配置文件
     │   ├── multimodal.json  #   多模态 LLM 配置 (已被 models_settings.json 取代)
-    │   ├── models_settings.json  #   多模型配置 (REASONING/FLASH/MULTIMODAL)
+    │   ├── models_settings.json  #   多模型配置 (REASONING/FLASH/MULTIMODAL/AUDIO/OCR)
     │   ├── models_settings_example.json  #   多模型配置示例模板
     │   └── gacha_data.json  #   抽卡数据 (角色/羁绊/概率, 由 pullingMonitor 加载)
     │
@@ -90,7 +100,10 @@ QQBotAgent/
     │   ├── deepseek_client.py  # DeepSeek API 客户端 (OpenAI 兼容 Function Calling)
     │   ├── multimodal_client.py # 多模态 LLM 客户端 (图片+音频理解)
     │   ├── model_router.py  #   多模型路由器 (复杂度分类 + 模型调度)
-    │   └── amap_client.py   #   高德地图 API 客户端
+    │   ├── amap_client.py   #   高德地图 API 客户端
+    │   ├── ocr_engine.py    #   OCR 引擎 (BuffDetector 模板匹配 + 技能冷却检测)
+    │   ├── buff_alias.py    #   buff 名称 → 图标标签别名映射 (提取/归一化)
+    │   └── status_icons.py  #   状态图标文件名 → 中文标签 (STATUS_ICON_CN)
     │
     ├── data/                # Agent 运行时数据
     │   ├── sessions/        #   会话持久化 (JSON)
@@ -494,11 +507,11 @@ agent_router.py
 | `_send_response(response, matcher=None)` | 发送 Agent 回复。自动检测长度，短消息直接发送，长消息调用 `_split_text` 拆分后逐块发送（300 字符/块, 1s 间隔）。可选 `matcher` 参数。 |
 | `_split_text(text, max_len=300)` | 智能文本拆分。优先在句子边界（`。！？\n\n`）处断开，避免截断语义。 |
 | `_download_and_save_file(url, filename, max_size_mb=50)` | 从 QQ 消息下载文件到工作区 `uploads/`。UUID 防碰撞文件名，120s 超时。 |
-| `_continuous_sessions` | `ContinuousSessionManager` 实例。管理群聊连续对话窗口 (5分钟免@)。 |
+| `_continuous_sessions` | `ContinuousSessionManager` 实例。管理群聊连续对话窗口 (90秒免@)。 |
 
 #### 连续对话模式 (Continuous Mode)
 
-群聊中，用户首次 @机器人 后自动开启 5 分钟「免 @」窗口。窗口内用户的所有消息都会被 Agent 处理，无需反复 @mention。
+群聊中，用户首次 @机器人 后自动开启 90 秒「免 @」窗口。窗口内用户的所有消息都会被 Agent 处理，无需反复 @mention。
 
 | 处理器 | 优先级 | 触发条件 | 说明 |
 |--------|--------|----------|------|
@@ -507,9 +520,9 @@ agent_router.py
 
 **窗口生命周期**:
 1. **开启**: `agent_router` 处理完 @消息 后自动调用 `_continuous_sessions.start(group_id, user_id)`
-2. **续期**: `continuous_router` 每条消息调用 `touch()` → 重置为完整 5 分钟
+2. **续期**: `continuous_router` 每条消息调用 `touch()` → 重置为完整 90 秒
 3. **取消**: 用户发送 `/取消` / `#取消` / `/结束` / `#结束` → 窗口关闭
-4. **超时**: 5 分钟无消息 → `is_active()` 自动清理过期窗口
+4. **超时**: 90 秒无消息 → `is_active()` 自动清理过期窗口
 
 **Agent 感知**: 连续模式消息注入 `[连续对话模式]` 前缀，Agent 应保持简洁、不重复问候、适时建议用户 `/取消` 退出。
 
@@ -674,9 +687,9 @@ Agent 必须在以下情况拒绝 (礼貌):
 
 ## 四、配置文件详解
 
-所有配置文件位于 `agent/config/`，共 10 个 markdown 配置文件。另外 `config/` 目录下有 2 个 JSON 配置文件。
+所有 Markdown 配置文件位于 `agent/config/`，共 11 个。另外 `config/` 目录下有 JSON 配置文件，运行时敏感配置（密钥 / 服务地址）在 `.env`。
 
-### Markdown 配置文件 (10 个)
+### Markdown 配置文件 (11 个)
 
 | 文件 | 用途 |
 |------|------|
@@ -684,26 +697,34 @@ Agent 必须在以下情况拒绝 (礼貌):
 | `IDENTITY.md` | 身份声明: 名称/版本/技术栈/能力列表/安全模型/联系方式 |
 | `AGENTS.md` | 编排规则: Think→Act→Observe→Respond 循环、工具选择标准、错误处理、工作区约束引用 |
 | `WORKSPACE.md` | 工作区约束: CAN/CANNOT 表、硬性拒绝规则、中文拒绝模板、资源限制、隐私策略 |
-| `TOOLS.md` | 工具文档参考: 全部 21 个工具的功能/参数/使用场景 |
+| `TOOLS.md` | 工具文档参考: 全部 26 个工具的功能/参数/使用场景 |
 | `BOOTSTRAP.md` | 启动序列: 初始化步骤、健康检查规则 |
 | `SESSION.md` | 会话配置: 最大消息数、超时时间、最大工具调用次数 |
 | `USER.md` | 用户画像模板: 新用户默认画像、隐私声明 |
 | `HEARTBEAT.md` | 心跳监控: 各组件健康检查时间表 |
 | `MEMORY.md` | 记忆索引: 记忆类型定义和操作说明 |
+| `FEATURES.md` | 功能一览: 按大类分组的全部功能（`/功能` 命令直接展示） |
 
-### JSON 配置文件 (2 个，在 `config/` 目录)
+### JSON 配置文件（在 `config/` 目录）
 
 | 文件 | Git | 用途 |
 |------|-----|------|
-| `models_settings.json` | 忽略 | 多模型配置 (REASONING/FLASH/MULTIMODAL)，含 API 密钥 |
+| `models_settings.json` | 忽略 | 多模型配置 (REASONING/FLASH/MULTIMODAL/AUDIO/OCR)，含 API 密钥 |
 | `models_settings_example.json` | 跟踪 | 多模型配置示例模板，供新用户参考填写 |
 | `multimodal.json` | 忽略 | [已废弃] 旧版多模态配置，已被 models_settings.json 取代 |
+| `gacha_data.json` | 跟踪 | 抽卡数据（角色/羁绊/概率，由 pullingMonitor 加载） |
+
+### 环境变量（`.env`）
+
+`.env` 是运行时敏感配置（密钥 / 服务地址），逐行说明见 **`QQBot/.env.example`**（可直接 `cp .env.example .env`）。模型凭据遵循「`models_settings.json` 优先、`.env` 回退」：某模型段在 JSON 中填了 `api_key`/`api_base` 即覆盖 `.env` 的 `DEEPSEEK_API_KEY`/`DEEPSEEK_API_BASE`；仅 JSON 段留空时才回退到 `.env` 的 DeepSeek 配置。
+
+非模型关键变量包括 `ONEBOT_ACCESS_TOKEN`、`SUPERUSERS`/`VIP_USERS`、`AMAP_API_KEY`、`USER_DATA_ROOT`、`MAX_SPECIAL_SESSIONS`、`USER_WORKSPACE_QUOTA_MB`、`BUFF_DETECTOR_WORKERS`（团战测速 buff 图标匹配并行线程数，默认 2）。
 
 ---
 
 ## 五、工具实现
 
-### 5.1 `tools/builtin_tools.py` — 内置工具 (8 个)
+### 5.1 `tools/builtin_tools.py` — 内置工具 (9 个)
 
 | 函数 | 说明 | 实现方式 |
 |------|------|----------|
@@ -715,6 +736,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 | `download_repo(repo_url)` | Git clone 仓库 (HTTPS only) | `subprocess.run(["git", "clone", url, path])`，已存在则 pull，120s 超时 |
 | `summarize_pdf(file_path)` | 提取 PDF 文本 (前 8000 字符) | PyPDF2 → 逐页提取 → 截断，路径验证 |
 | `get_system_load()` | 获取服务器实时负载 (CPU/内存/磁盘) | 读取 `/proc/loadavg`, `free`, `df` → 返回格式化评估 (低/中/高负载) |
+| `delete_workspace_file(path)` | 删除工作区文件/空目录 (释放磁盘) | 相对工作区根目录解析，拒绝非空目录与隐藏文件 |
 
 ### 5.2 `tools/file_tools.py` — 文件读取工具 (1 个，支持 4 种文件类型)
 
@@ -762,6 +784,30 @@ Agent 必须在以下情况拒绝 (礼貌):
 |------|------|
 | `_get_api_key()` | 从环境变量 `AMAP_API_KEY` 读取 Key，支持 NoneBot config 回退 |
 | `_amap_get(endpoint, params, timeout=10.0)` | 通用 GET 请求封装。自动注入 key，统一错误格式 `[地图] ...` |
+
+### 5.6 `tools/character_detail.py` / `tools/bond_detail.py` — 角色 / 羁绊查询
+
+数据来源于 Wiki 爬虫 (`tools/wiki_scraper.py`) 缓存的 `data/wiki_cache/character_details.json`，通过 `tools/name_resolver.py` 做角色别名模糊匹配，`tools/card_renderer.py` 渲染卡片图片。
+
+| 函数 | 说明 |
+|------|------|
+| `character_detail(character_name)` | 查询角色详情：面板成长系数、技能、倍率、属性、天赋、潜能 |
+| `bond_detail(bond_name)` | 查询羁绊详情：类别、星级、攻击/生命、羁绊技能、获取方式、出售价格、经验值、上线时间 |
+
+同时提供直接命令 `/角色详情 <名称>`、`/羁绊详情 <名称>`（不经智能体，零 token 消耗）。
+
+### 5.7 `tools/battle_parser.py` — 团战截图测速 (OCR + 行动值修正)
+
+`parse_battle_screenshots(paths, mode)` 是团战截图测速的入口：对 1-2 张战斗截图（跑条前 + 跑条后）执行 OCR，提取角色名、行动值、阵营，并对行动值做修正后返回 `calculate_speed` 兼容格式。
+
+- **两种模式** (`mode` 参数)：
+  - `light` — 轻量：仅提取角色名与行动值（约 10s），跳过技能解析与行动值修正
+  - `full` — 全量：完整流程（技能解析 + 行动值修正，约 90s），默认
+- **OCR 管线** (`lib/ocr_engine.py`)：EasyOCR 提取文本 + `BuffDetector` 用 `cv2.matchTemplate`（多尺度 TM_CCOEFF_NORMED）匹配 buff/debuff 图标，`BUFF_DETECTOR_WORKERS` 控制按行并行匹配的线程数。
+- **buff 图标来源**：手工图标 `images/cal-speed-data/` + Wiki 爬取的状态图标（`lib/status_icons.STATUS_ICON_CN` 维护文件名 → 中文标签）。
+- **buff 模板集裁剪**：`lib/buff_alias.py` 从角色技能文案（`(x回合)` / `(x turns)` 时长标记）提取 buff 名并归一化到图标标签，使每个角色只在其「可能出现的 buff」子集内匹配；未知角色仅该行回退全量。
+- **技能分类与触发推断**：`tools/ag_skill_index.py`（Skill 类 + 阵营触发方式分类）、`tools/ag_trigger_engine.py`（行动值效果触发链推断）、`tools/ag_llm_resolver.py`（嵌套子技能条件的 L4 窄 LLM 回退）。
+- 团战/镜像匹配时同一角色可能同时出现在我方和敌方（同名不同阵营），属正常情况。
 
 ---
 
@@ -1013,7 +1059,7 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 
 ## 九、测试系统
 
-`test_agent.py` 包含 7 个测试套件, 38 个测试用例，覆盖所有核心组件:
+`test_agent.py` 包含 8 个测试套件, 43 个测试用例，覆盖所有核心组件:
 
 | # | 测试套件 | 测试数 | 覆盖内容 |
 |---|----------|--------|----------|
@@ -1021,9 +1067,10 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 | 2 | `TestSessionManager` | 6 | 创建/超时/裁剪/清空/删除/持久化 |
 | 3 | `TestMemorySystem` | 4 | 保存/读取/遗忘/搜索/列出 |
 | 4 | `TestAgentCore` | 9 | 启动/提示词构建/纯文本/工具循环/会话持久化/清空/最大迭代/画像注入/记忆注入 |
-| 5 | `TestUserProfile` | 5 | 创建/保存/空上下文/完整上下文/去重/持久化 |
+| 5 | `TestUserProfile` | 6 | 创建/保存/空上下文/完整上下文/去重/持久化 |
 | 6 | `TestDeepSeekClientParsing` | 3 | 解析纯文本/工具调用/混合响应 |
 | 7 | `TestBuiltinTools` | 4 | get_time/execute_code(成功/错误)/search_web |
+| 8 | `TestPersonality` | 4 | 人格优先级链/群人格模糊匹配/清除回退/歧义拒绝 |
 
 **运行方式**:
 ```bash
@@ -1056,7 +1103,7 @@ python -m pytest test_agent.py -v
 6. **配置 `.env`**: 设置 `DRIVER=~fastapi`, `HOST=0.0.0.0`, `PORT=8081`, `ONEBOT_ACCESS_TOKEN`, `SUPERUSERS`, `SEARXNG_ENDPOINT`
 7. **启动 NoneBot**: `cd QQBot && nb run`
 8. **启动 Napcat**: `xvfb-run -a /path/to/qq --no-sandbox`
-9. **验证**: 发送 `@Roxy /status` 确认 21 个工具已注册、SearXNG 可连通
+9. **验证**: 发送 `@Roxy /status` 确认 26 个工具已注册、SearXNG 可连通
 10. **配置多模型 (可选)**: 编辑 `QQBot/config/models_settings.json` 填入各模型的 API 信息，参考 `models_settings_example.json` 格式
 
 ### Docker 部署
@@ -1073,13 +1120,15 @@ docker compose up -d
 
 ### 11.1 设计理念
 
-参考 Claude Code 的模型分层策略，QQBot 使用三种不同能力的模型分工合作，以合理节约 token 消耗：
+参考 Claude Code 的模型分层策略，QQBot 使用多个不同能力的模型分工合作，以合理节约 token 消耗：
 
 | 模型层级 | 用途 | 特点 |
 |----------|------|------|
 | **FLASH_MODEL** | 复杂度分类 + 简单对话 | 轻量、快速、低成本。处理问候/闲聊/常识问答 |
 | **REASONING_MODEL** | 复杂推理 + 工具调用 | 强大、高能力。处理搜索/代码/多步推理/专业知识 |
 | **MULTIMODAL_MODEL** | 图片理解 | 视觉能力。处理用户发送的图片 AI 分析 |
+| **AUDIO_MODEL** | 音频/语音理解 | 语音转文字 + 情绪/声线分析 (qwen3-omni-flash) |
+| **OCR_MODEL** | 战斗截图 OCR | 团战测速的文本提取 (qwen3.5-ocr) |
 
 ### 11.2 任务路由流程
 
@@ -1237,11 +1286,11 @@ v2.3 基础上增加:
 v2.4 基础上增加:
   ├── ContinuousSessionManager: 群聊免@窗口管理 (per-group, per-user)
   ├── continuous_router: 第二消息处理器 (priority=2, 无 to_me 规则)
-  ├── 自动开启: @机器人 回复后自动为发起者打开 5 分钟窗口
-  ├── 消息续期: 每条消息重置计时器为完整 5 分钟
+  ├── 自动开启: @机器人 回复后自动为发起者打开 90 秒窗口
+  ├── 消息续期: 每条消息重置计时器为完整 90 秒
   ├── 取消命令: /取消, #取消, /结束, #结束 → 手动关闭窗口
   ├── Agent 感知: [连续对话模式] 前缀 → 简洁回复, 适时建议退出
-  ├── 超时清理: 5 分钟无消息自动过期, 静默清理
+  ├── 超时清理: 90 秒无消息自动过期, 静默清理
   └── 防重复: continuous_router 检查 is_tome() 避免与 agent_router 重复处理
 
 ### v2.6 — reasoning_content 全链路保留
@@ -1457,4 +1506,60 @@ v2.14 基础上增加:
       └── Permission 错误拦截说明
 
 设计原则: Schema 过滤为主, 硬拦截为纵深防御, 环境变量认证, 权限不足不暴露系统能力
+```
+
+### v2.17 — 角色 / 羁绊查询 + 卡片渲染 (2026-08-20)
+```
+新增: character_detail / bond_detail
+  - tools/character_detail.py + tools/bond_detail.py: 查询角色/羁绊详情
+  - 数据源: Wiki 爬虫缓存 data/wiki_cache/character_details.json
+  - tools/name_resolver.py: 角色别名模糊匹配
+  - tools/card_renderer.py: 角色/羁绊卡片图片渲染
+  - 直接命令: /角色详情 <名称>、/羁绊详情 <名称> (不经智能体, 零 token)
+  - 修复: 中文命名图片文件路径解析、卡片图片排版/中英文混杂
+```
+
+### v2.18 — 团战截图测速工具 (OCR) (2026-08-21)
+```
+新增: parse_battle_screenshots
+  - tools/battle_parser.py: 战斗截图 OCR 解析 (角色名/行动值/阵营)
+  - lib/ocr_engine.py: EasyOCR 文本提取 + BuffDetector (cv2 多尺度模板匹配)
+  - lib/status_icons.py: 状态图标文件名 → 中文标签 (STATUS_ICON_CN)
+  - 修复: 测速工具智能体循环冲突、测速意图匹配两项方法工具候选
+```
+
+### v2.19 — 行动值修正模块 + buff 图标爬取 (2026-08-22)
+```
+v2.18 基础上增加:
+  - 行动值修正模块: 技能/羁绊/免疫套带来的行动值修正
+  - Wiki buff 图标爬取 + 测速时匹配 (status_icons.STATUS_ICON_CN)
+  - lib/buff_alias.py: buff 名 → 图标标签别名归一化 + 按角色裁剪模板集
+  - 修复: 敌我双方可存在相同角色、特殊会话/清空命令适配、buffDetector 未生效
+  - 连续会话有效窗口期 300s → 90s
+```
+
+### v2.20 — 技能分类层重建 + 触发链推断 (2026-08-23)
+```
+v2.19 基础上增加:
+  - tools/ag_skill_index.py: Skill 对象类 + 阵营触发方式分类
+  - tools/ag_trigger_engine.py: 行动值效果触发链推断 (以截图冷却态为证据)
+  - tools/ag_llm_resolver.py: 嵌套子技能条件的 L4 窄 LLM 回退 (15 类 trigger 分类)
+  - 删除: 战斗解析器中被全行冷却观测取代的死代码 _row_skill_cells
+```
+
+### v2.21 — 轻量/全量模式 + 正在行动角色修正 (2026-08-23)
+```
+v2.20 基础上增加:
+  - parse_battle_screenshots 新增 mode 参数: light (仅角色名+行动值, 约10s) / full (完整流程, 约90s)
+  - 正在行动角色不再被剔除: 其结束行动值按满条 100% 折算 (raw_format 已内置)
+  - 截图十六进制文件名丢字自校正 + 工具循环熔断话术
+```
+
+### v2.22 — 配置迁移 (.env.example + 并行线程数) (2026-08-23)
+```
+v2.21 基础上增加:
+  - .env.example: .env 说明文档 + 模板 (单一事实来源, setup.sh 直接 cp)
+  - BUFF_DETECTOR_WORKERS: BuffDetector 按行并行匹配线程数, 由 config/performance.json 迁至 .env (默认 2)
+  - model router 回退统一: ProfileManager/SpecialSessionManager/Agent 默认客户端改用
+    _model_router.reasoning_client (models_settings.json 优先, .env 回退), 修复仅读 .env 而跳过 JSON 的问题
 ```

@@ -38,6 +38,15 @@
     "temperature": 0.7
   },
 
+  "OCR_MODEL": {
+    "_comment": "Dedicated OCR model for the battle-screenshot pipeline (action-order panel text). Defaults to qwen3.5-ocr when model is left blank. Leave the whole section empty to fall back to MULTIMODAL_MODEL credentials + qwen3.5-ocr.",
+    "api_key": "",
+    "api_base": "",
+    "model": "qwen3.5-ocr",
+    "max_tokens": 2048,
+    "temperature": 0.0
+  },
+
   "task_routing": {
     "_comment": "Task routing rules — which model handles which task type. triage = model used for complexity classification. simple_task = model for simple conversations. complex_task = model for complex reasoning. image_analysis = model for multimodal image understanding. audio_analysis = model for audio/voice understanding.",
     "triage": "FLASH_MODEL",

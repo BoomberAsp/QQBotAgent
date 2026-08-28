@@ -121,7 +121,7 @@ setup_env() {
     ENV_FILE="QQBot/.env"
     if [ -f "$ENV_FILE" ]; then
         echo -e "${GREEN}[INFO]${NC} .env 文件已存在，跳过创建"
-        echo -e "${YELLOW}[WARN]${NC} 请确保 $ENV_FILE 包含以下必要配置:"
+        echo -e "${YELLOW}[WARN]${NC} 请对照 QQBot/.env.example 确保 $ENV_FILE 包含以下必要配置:"
         echo "  DRIVER=~fastapi"
         echo "  HOST=0.0.0.0"
         echo "  PORT=8081"
@@ -129,36 +129,23 @@ setup_env() {
         echo "  SUPERUSERS=[\"管理员的QQ号1\",\"管理员的QQ号2\"]"
         echo "  VIP_USERS=[\"VIP用户的QQ号1\",\"VIP用户的QQ号2\"]"
         echo "  DEEPSEEK_API_KEY=<你的DeepSeek API Key>"
-        echo "  DEEPSEEK_API_BASE=https://api.deepseek.com/v1"
+        echo "  DEEPSEEK_API_BASE=https://api.deepseek.com"
         echo "  SEARXNG_ENDPOINT=http://localhost:8082"
         echo "  AMAP_API_KEY=<你的高德地图Key> (可选, 用于地图工具)"
         echo "  NAPCAT_HTTP_BASE=http://127.0.0.1:6099 (NapCat HTTP服务地址, 用于下载语音消息)"
         echo "  USER_DATA_ROOT=/data/qqbot/users (用户数据根目录)"
         echo "  MAX_SPECIAL_SESSIONS=3 (每用户最大特殊会话数)"
         echo "  USER_WORKSPACE_QUOTA_MB=500 (每用户工作区配额)"
+        echo "  BUFF_DETECTOR_WORKERS=2 (团战测速 buff 匹配并行线程数)"
     else
-        cat > "$ENV_FILE" << 'EOF'
-DRIVER=~fastapi
-HOST=0.0.0.0
-PORT=8081
-ONEBOT_ACCESS_TOKEN=请修改为你的Token
-SUPERUSERS=["管理员的QQ号1","管理员的QQ号2"]
-VIP_USERS=["VIP用户的QQ号1","VIP用户的QQ号2"]
-COMMAND_START=["/", ""]
-COMMAND_SEP=[" "]
-DEEPSEEK_API_KEY=请修改为你的DeepSeek API Key
-DEEPSEEK_API_BASE=https://api.deepseek.com/v1
-SEARXNG_ENDPOINT=http://localhost:8082
-# 高德地图 (可选, 用于地图/天气/路径规划)
-AMAP_API_KEY=
-# ── 用户数据 & 特殊会话 (v2.13) ──
-USER_DATA_ROOT=/path/to/store/users'/data
-MAX_SPECIAL_SESSIONS=3
-USER_WORKSPACE_QUOTA_MB=500
-# ── NapCat HTTP 服务地址 (用于下载语音/图片/文件) ──
-NAPCAT_HTTP_BASE=http://127.0.0.1:6099
-EOF
-        echo -e "${GREEN}[OK]${NC} .env 模板已创建"
+        # .env.example 是 .env 的单一事实来源 (含逐行注释说明)
+        if [ -f "QQBot/.env.example" ]; then
+            cp "QQBot/.env.example" "$ENV_FILE"
+            echo -e "${GREEN}[OK]${NC} 已从 .env.example 创建 .env 模板"
+        else
+            echo -e "${RED}[ERROR]${NC} 未找到 QQBot/.env.example，请手动创建 QQBot/.env"
+            return
+        fi
         echo -e "${RED}[!!!]${NC} 请编辑 QQBot/.env 填入你的配置:"
         echo -e "  - ONEBOT_ACCESS_TOKEN (与 NapCat WebUI 中一致)"
         echo -e "  - SUPERUSERS (你的 QQ 号)"

@@ -406,6 +406,8 @@ class TestAgentCore:
         asyncio.run(self.test_session_persistence())
         asyncio.run(self.test_clear_context())
         asyncio.run(self.test_max_iterations())
+        asyncio.run(self.test_auto_compress_fallback())
+        asyncio.run(self.test_task_fold_persistence())
 
     async def test_bootstrap(self):
         from agent.tool_registry import ToolRegistry
@@ -438,7 +440,9 @@ class TestAgentCore:
         )
 
         prompt = agent.build_system_prompt()
-        assert "Roxy" in prompt, "System prompt should contain agent name"
+        # Agent name comes from the personality profile injected at runtime
+        # (see agent.py _build_messages). Verify prompt is well-formed.
+        assert "QQBot" in prompt, "System prompt should contain bot framework name"
         assert len(prompt) > 100, "System prompt should be substantial"
         print_pass("System prompt construction (from SOUL.md + IDENTITY.md + AGENTS.md)")
 
@@ -618,6 +622,181 @@ class TestAgentCore:
         assert "循环" in response or "方式" in response, f"Should give up after max iterations: {response}"
         print_pass("Max tool iterations guard (prevents infinite loops)")
 
+    async def test_auto_compress_fallback(self):
+        """A tool-heavy turn whose final answer is long gets auto-compressed:
+        session context keeps a compact TaskRecord line (not the raw verbose
+        output), while the full result stays retrievable in the task log."""
+        from agent.tool_registry import ToolRegistry
+        from agent.session import SessionManager
+        from agent.agent import Agent
+        import agent.task_record as task_record
+
+        tmp_sessions = tempfile.mkdtemp()
+        tmp_tasklog = tempfile.mkdtemp()
+        original_dir = task_record._TASK_LOG_DIR
+        try:
+            task_record._TASK_LOG_DIR = tmp_tasklog
+
+            long_result = "抽卡结果详述：" + "获得了珍贵的角色与道具。" * 60  # > 600 chars
+            mock_client = MockDeepSeekClient()
+            call_count = [0]
+
+            async def staged(messages, tools, timeout=180.0):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    return {
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_gacha_1",
+                            "type": "function",
+                            "function": {"name": "gacha_pull", "arguments": '{"count": 10}'},
+                        }],
+                        "role": "assistant",
+                        "finish_reason": "tool_calls",
+                    }
+                return {
+                    "content": long_result,
+                    "tool_calls": None,
+                    "role": "assistant",
+                    "finish_reason": "stop",
+                }
+
+            mock_client.chat_completion_with_tools = staged
+
+            registry = ToolRegistry()
+            registry.register("gacha_pull", lambda count=1: f"gacha ok x{count}",
+                              "Gacha", {"type": "object", "properties": {}})
+
+            agent = Agent(
+                deepseek_client=mock_client,
+                tool_registry=registry,
+                config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+                session_manager=SessionManager(persistence_dir=tmp_sessions),
+            )
+
+            response = await agent.run("帮我十连抽", "compress_user")
+            # The user still sees the full answer in chat…
+            assert response == long_result, "chat reply must remain the full text"
+
+            # …but only the compact record line enters the session context.
+            session = agent.sessions.get("compress_user")
+            assistant_msgs = [m for m in session.context if m["role"] == "assistant"]
+            assert len(assistant_msgs) == 1
+            line = assistant_msgs[0]["content"]
+            assert line.startswith("[子任务记录]"), f"compact line expected, got: {line[:60]}"
+            assert "目标: 帮我十连抽" in line and "工具: gacha_pull" in line
+            assert "追溯:" in line
+            for m in session.context:
+                assert long_result not in m.get("content", ""), \
+                    "raw verbose output must not be persisted into context"
+
+            # Full result remains retrievable via the per-user task log.
+            log_path = os.path.join(tmp_tasklog, "compress_user.jsonl")
+            assert os.path.isfile(log_path), "task log should be written"
+            rec = json.loads(open(log_path, encoding="utf-8").readline())
+            assert rec["tool"] == "gacha_pull" and rec["status"] == "success"
+            assert rec["result"] == long_result, "task log keeps the full result"
+            assert rec["params"] == {"count": "10"}, "tool args folded into params"
+            print_pass("Auto-compression fallback: long tool-heavy turn → TaskRecord line")
+        finally:
+            task_record._TASK_LOG_DIR = original_dir
+            shutil.rmtree(tmp_sessions, ignore_errors=True)
+            shutil.rmtree(tmp_tasklog, ignore_errors=True)
+
+    async def test_task_fold_persistence(self):
+        """finalize_subtask sets _pending_task_fold: the task's setup turns are
+        removed (folded) and the compact record replaces them; a stale boundary
+        that would wipe too many messages is skipped (history preserved)."""
+        from agent.tool_registry import ToolRegistry
+        from agent.session import SessionManager
+        from agent.agent import Agent
+        from agent.context import _pending_task_fold
+
+        compact_line = "[子任务记录] 目标: 测速 | 结果: 完成 | 追溯: ref#id"
+
+        def make_agent(tmpdir, boundary):
+            def finalize_stub(**kwargs):
+                _pending_task_fold.set({"line": compact_line, "boundary": boundary})
+                return "recorded"
+
+            registry = ToolRegistry()
+            registry.register("finalize_subtask", finalize_stub, "Finalize",
+                              {"type": "object", "properties": {}})
+
+            mock_client = MockDeepSeekClient()
+            call_count = [0]
+
+            async def staged(messages, tools, timeout=180.0):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    return {
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_fin_1",
+                            "type": "function",
+                            "function": {"name": "finalize_subtask", "arguments": "{}"},
+                        }],
+                        "role": "assistant",
+                        "finish_reason": "tool_calls",
+                    }
+                return {
+                    "content": "任务已完成。",
+                    "tool_calls": None,
+                    "role": "assistant",
+                    "finish_reason": "stop",
+                }
+
+            mock_client.chat_completion_with_tools = staged
+            return Agent(
+                deepseek_client=mock_client,
+                tool_registry=registry,
+                config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+                session_manager=SessionManager(persistence_dir=tmpdir),
+            )
+
+        # Case 1: fresh fold — boundary removes exactly the setup turns.
+        tmpdir1 = tempfile.mkdtemp()
+        try:
+            agent = make_agent(tmpdir1, boundary=2)
+            session = agent.sessions.get_or_create("fold_user")
+            # Two pre-task setup turns (4 messages), then the task runs.
+            for i in range(2):
+                session.add_message("user", f"setup q{i}")
+                session.add_message("assistant", f"setup a{i}")
+            assert len(session.context) == 4
+
+            await agent.run("开始测速", "fold_user")
+
+            session = agent.sessions.get("fold_user")
+            contents = [m["content"] for m in session.context]
+            assert contents == ["setup q0", "setup a0", "开始测速", compact_line], \
+                f"setup turn 2 should be folded, got: {contents}"
+            print_pass("Task fold: setup turns removed, compact record persisted")
+        finally:
+            shutil.rmtree(tmpdir1, ignore_errors=True)
+
+        # Case 2: stale boundary — folding would remove > MAX_FOLD_MESSAGES
+        # messages, so the fold is skipped and history is preserved.
+        tmpdir2 = tempfile.mkdtemp()
+        try:
+            agent = make_agent(tmpdir2, boundary=0)
+            session = agent.sessions.get_or_create("stale_user")
+            for i in range(6):  # 12 messages — an abandoned task window
+                session.add_message("user", f"chat q{i}")
+                session.add_message("assistant", f"chat a{i}")
+
+            await agent.run("迟来的收尾", "stale_user")
+
+            session = agent.sessions.get("stale_user")
+            contents = [m["content"] for m in session.context]
+            assert contents[:12] == [
+                f"chat {'q' if i % 2 == 0 else 'a'}{i // 2}" for i in range(12)
+            ], f"history must survive a stale fold boundary, got: {contents[:4]}..."
+            assert contents[-2:] == ["迟来的收尾", compact_line]
+            print_pass("Stale fold guard: oversized boundary skipped, history kept")
+        finally:
+            shutil.rmtree(tmpdir2, ignore_errors=True)
+
     async def test_profile_injection(self):
         from agent.tool_registry import ToolRegistry
         from agent.profile import UserProfile, ProfileManager
@@ -721,6 +900,7 @@ class TestUserProfile:
         self.test_to_prompt_context_empty()
         self.test_to_prompt_context_full()
         self.test_merge_facts_dedup()
+        self.test_merge_facts_cap()
         self.test_persistence()
 
     def test_create_and_save(self):
@@ -780,6 +960,18 @@ class TestUserProfile:
         profile.merge_facts(["在深圳", "喜欢游戏"])
         assert len(profile.facts) == 3, f"Expected 3 facts, got {len(profile.facts)}: {profile.facts}"
         print_pass("Fact deduplication (fuzzy matching)")
+
+    def test_merge_facts_cap(self):
+        from agent.profile import UserProfile, MAX_FACTS
+
+        profile = UserProfile(user_id="cap_user")
+        many = [f"fact_{i}" for i in range(MAX_FACTS + 5)]
+        profile.merge_facts(many)
+        assert len(profile.facts) == MAX_FACTS, (
+            f"Expected {MAX_FACTS} facts, got {len(profile.facts)}"
+        )
+        assert profile.facts == many[-MAX_FACTS:], "Oldest facts should be pruned"
+        print_pass("Fact list capped at MAX_FACTS with oldest pruned")
 
     def test_persistence(self):
         from agent.profile import UserProfile, ProfileManager
@@ -952,6 +1144,117 @@ class TestBuiltinTools:
         print_pass("search_web returns results or graceful fallback (SearXNG)")
 
 
+class TestPersonality:
+    """Test PersonalityManager group-bound default resolution."""
+
+    def run(self):
+        print_header("7. Personality Manager Tests")
+
+        self.test_resolve_precedence()
+        self.test_set_group_personality()
+        self.test_clear_group_personality()
+        self.test_ambiguous_resolution()
+
+    def _make_manager(self):
+        import agent.personality as pmod
+
+        tmpdir = tempfile.mkdtemp(prefix="personality_test_")
+        pdir = os.path.join(tmpdir, "personalities")
+        os.makedirs(pdir, exist_ok=True)
+        for name, title in [
+            ("assistant", "助手 Roxy"),
+            ("roxy_character", "角色 Roxy (无职转生)"),
+            ("rubi", "露比 (Rubi)"),
+        ]:
+            with open(os.path.join(pdir, f"{name}.md"), "w", encoding="utf-8") as f:
+                f.write(f"# {title}\n\nTest personality.")
+
+        config = os.path.join(tmpdir, "personality_config.json")
+        with open(config, "w", encoding="utf-8") as f:
+            json.dump({"default": "assistant"}, f)
+
+        settings = os.path.join(tmpdir, "personality_settings.json")
+        group = os.path.join(tmpdir, "group_personality.json")
+
+        patcher = patch.multiple(
+            pmod,
+            _SETTINGS_FILE=settings,
+            _DEFAULT_CONFIG_FILE=config,
+            _GROUP_CONFIG_FILE=group,
+        )
+        patcher.start()
+        return pmod.PersonalityManager(personalities_dir=pdir), patcher, tmpdir
+
+    def test_resolve_precedence(self):
+        pm, patcher, tmpdir = self._make_manager()
+        try:
+            # No settings anywhere -> global default
+            assert pm.resolve_effective_personality("u1", "g1") == "assistant"
+            # Group binding -> group wins over global
+            pm.set_group_personality("g1", "露比")
+            assert pm.resolve_effective_personality("u1", "g1") == "rubi"
+            # Personal setting -> personal wins over group
+            pm.set_user_personality("u1", "assistant")
+            assert pm.resolve_effective_personality("u1", "g1") == "assistant"
+            # User without personal setting still gets group default
+            assert pm.resolve_effective_personality("u2", "g1") == "rubi"
+            # Empty group_id -> skip group layer
+            assert pm.resolve_effective_personality("u2", "") == "assistant"
+            print_pass("resolve_effective_personality precedence chain")
+        finally:
+            patcher.stop()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_set_group_personality(self):
+        pm, patcher, tmpdir = self._make_manager()
+        try:
+            resolved = pm.set_group_personality("g1", "Rubi")
+            assert resolved == "rubi"
+            assert pm.get_group_personality("g1") == "rubi"
+            # Unknown name raises ValueError
+            try:
+                pm.set_group_personality("g2", "不存在的")
+                assert False, "expected ValueError for unknown personality"
+            except ValueError:
+                pass
+            print_pass("set_group_personality fuzzy match + validation")
+        finally:
+            patcher.stop()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_ambiguous_resolution(self):
+        pm, patcher, tmpdir = self._make_manager()
+        try:
+            # "Roxy" is a substring of both 助手 Roxy and 角色 Roxy → ambiguous
+            assert pm.resolve_name("Roxy") is None
+            # Distinct prefixes still resolve uniquely
+            assert pm.resolve_name("助手") == "assistant"
+            assert pm.resolve_name("角色") == "roxy_character"
+            # Ambiguous name raises ValueError with a hint
+            try:
+                pm.set_user_personality("u1", "Roxy")
+                assert False, "expected ValueError for ambiguous name"
+            except ValueError as e:
+                assert "多个" in str(e)
+            print_pass("ambiguous names rejected instead of silently mispicked")
+        finally:
+            patcher.stop()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_clear_group_personality(self):
+        pm, patcher, tmpdir = self._make_manager()
+        try:
+            pm.set_group_personality("g1", "rubi")
+            assert pm.get_group_personality("g1") == "rubi"
+            pm.clear_group_personality("g1")
+            assert pm.get_group_personality("g1") is None
+            assert pm.resolve_effective_personality("u1", "g1") == "assistant"
+            print_pass("clear_group_personality falls back to global")
+        finally:
+            patcher.stop()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ── Main Runner ──────────────────────────────────────────────────
 
 def main():
@@ -969,6 +1272,7 @@ def main():
         ("Agent Core (Mock LLM)", TestAgentCore()),
         ("DeepSeekClient Parsing", TestDeepSeekClientParsing()),
         ("Built-in Tools", TestBuiltinTools()),
+        ("Personality Manager", TestPersonality()),
     ]
 
     passed = 0

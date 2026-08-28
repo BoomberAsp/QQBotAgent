@@ -1,7 +1,7 @@
 """
 Continuous Session Manager — Per-user group chat interaction windows.
 
-When a user @mentions the bot in a group, a 5-minute window opens during
+When a user @mentions the bot in a group, a 90-second window opens during
 which the user can continue the conversation without @mentioning the bot.
 Each message resets the timer. The window closes on cancel command or timeout.
 
@@ -21,12 +21,12 @@ class ContinuousSession:
     group_id: str
     user_id: str
     started_at: float = field(default_factory=time.time)
-    expires_at: float = field(default_factory=lambda: time.time() + 300.0)
+    expires_at: float = field(default_factory=lambda: time.time() + 90.0)
 
     def is_expired(self) -> bool:
         return time.time() > self.expires_at
 
-    def touch(self, timeout_minutes: float = 5.0):
+    def touch(self, timeout_minutes: float = 1.5):
         self.expires_at = time.time() + (timeout_minutes * 60.0)
 
 
@@ -37,7 +37,7 @@ class ContinuousSessionManager:
     independent windows in different groups.
     """
 
-    def __init__(self, timeout_minutes: float = 5.0):
+    def __init__(self, timeout_minutes: float = 1.5):
         self.timeout_minutes = timeout_minutes
         self._sessions: Dict[Tuple[str, str], ContinuousSession] = {}
 
@@ -56,10 +56,9 @@ class ContinuousSessionManager:
         if key in self._sessions:
             self._sessions[key].touch(self.timeout_minutes)
         else:
-            self._sessions[key] = ContinuousSession(
-                group_id=group_id,
-                user_id=user_id,
-            )
+            session = ContinuousSession(group_id=group_id, user_id=user_id)
+            session.touch(self.timeout_minutes)
+            self._sessions[key] = session
 
     def is_active(self, group_id: str, user_id: str) -> bool:
         """Check if a user has an active continuous window in this group.

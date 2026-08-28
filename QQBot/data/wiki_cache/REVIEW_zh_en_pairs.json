@@ -1,0 +1,2978 @@
+[
+  {
+    "en_name": "A0287",
+    "cn_name": "A0287",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0287",
+    "cn_name": "A0287",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0290",
+    "cn_name": "A0290",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0290",
+    "cn_name": "A0290",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0293",
+    "cn_name": "A0293",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0293",
+    "cn_name": "A0293",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0308",
+    "cn_name": "A0308",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0308",
+    "cn_name": "A0308",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0389",
+    "cn_name": "A0389",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0395",
+    "cn_name": "A0395",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0398",
+    "cn_name": "A0398",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0404",
+    "cn_name": "A0404",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "A0425",
+    "cn_name": "A0425",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "不止样本",
+    "cn_name": "[未翻译] 不止样本",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "专属服务",
+    "cn_name": "[未翻译] 专属服务",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "主与宠",
+    "cn_name": "[未翻译] 主与宠",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "乌尔德",
+    "cn_name": "[未翻译] 乌尔德",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "乔伊斯",
+    "cn_name": "[未翻译] 乔伊斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "乔兰塔",
+    "cn_name": "[未翻译] 乔兰塔",
+    "en_bond": "A0293",
+    "cn_bond": "A0293",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "乔基",
+    "cn_name": "[未翻译] 乔基",
+    "en_bond": "A0395",
+    "cn_bond": "A0395",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "乔斯琳",
+    "cn_name": "[未翻译] 乔斯琳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "云目",
+    "cn_name": "[未翻译] 云目",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "仲夏之花卡罗琳",
+    "cn_name": "[未翻译] 仲夏之花卡罗琳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "伊丝",
+    "cn_name": "[未翻译] 伊丝",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "伊娃",
+    "cn_name": "[未翻译] 伊娃",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "伊比",
+    "cn_name": "[未翻译] 伊比",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "伊达利亚",
+    "cn_name": "[未翻译] 伊达利亚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "伯妮斯",
+    "cn_name": "[未翻译] 伯妮斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "佐久",
+    "cn_name": "[未翻译] 佐久",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "你好，忠诚的顾客！",
+    "cn_name": "[未翻译] 你好，忠诚的顾客！",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "佩特拉",
+    "cn_name": "[未翻译] 佩特拉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "佩蒂特",
+    "cn_name": "[未翻译] 佩蒂特",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "使徒",
+    "cn_name": "[未翻译] 使徒",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "偶像之心",
+    "cn_name": "[未翻译] 偶像之心",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "偶像之心",
+    "cn_name": "[未翻译] 偶像之心",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "光辉誓约·伊丝",
+    "cn_name": "[未翻译] 光辉誓约·伊丝",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "光辉誓约·泰迪·伊丝",
+    "cn_name": "[未翻译] 光辉誓约·泰迪·伊丝",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "光辉誓约·露比",
+    "cn_name": "[未翻译] 光辉誓约·露比",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "光辉达琳",
+    "cn_name": "[未翻译] 光辉达琳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克制与放纵",
+    "cn_name": "[未翻译] 克制与放纵",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克制与放纵",
+    "cn_name": "[未翻译] 克制与放纵",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克拉拉",
+    "cn_name": "[未翻译] 克拉拉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克洛伊",
+    "cn_name": "[未翻译] 克洛伊",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克莱尔",
+    "cn_name": "[未翻译] 克莱尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克隆乔伊斯",
+    "cn_name": "[未翻译] 克隆乔伊斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克隆克拉拉",
+    "cn_name": "[未翻译] 克隆克拉拉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克隆卡罗琳",
+    "cn_name": "[未翻译] 克隆卡罗琳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克隆卡莉西",
+    "cn_name": "[未翻译] 克隆卡莉西",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克隆吉赛尔",
+    "cn_name": "[未翻译] 克隆吉赛尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克隆巴托洛",
+    "cn_name": "[未翻译] 克隆巴托洛",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克隆玛蒂尔达",
+    "cn_name": "[未翻译] 克隆玛蒂尔达",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克隆贾尼斯",
+    "cn_name": "[未翻译] 克隆贾尼斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "克隆迪尔德丽",
+    "cn_name": "[未翻译] 克隆迪尔德丽",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "兔女郎艾丽卡",
+    "cn_name": "[未翻译] 兔女郎艾丽卡",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "公主的渴望",
+    "cn_name": "[未翻译] 公主的渴望",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "冬夜钟声",
+    "cn_name": "[未翻译] 冬夜钟声",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "冷漠",
+    "cn_name": "[未翻译] 冷漠",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "减压器",
+    "cn_name": "[未翻译] 减压器",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "凶猛",
+    "cn_name": "[未翻译] 凶猛",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "凶猛",
+    "cn_name": "[未翻译] 凶猛",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "分歧的使徒",
+    "cn_name": "[未翻译] 分歧的使徒",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "分歧的冷漠",
+    "cn_name": "[未翻译] 分歧的冷漠",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "分歧的奥帕尼",
+    "cn_name": "[未翻译] 分歧的奥帕尼",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "初次心动",
+    "cn_name": "[未翻译] 初次心动",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "利他商人",
+    "cn_name": "[未翻译] 利他商人",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "利他商人",
+    "cn_name": "[未翻译] 利他商人",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "加加林",
+    "cn_name": "[未翻译] 加加林",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "加洛尼亚",
+    "cn_name": "[未翻译] 加洛尼亚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "加百列",
+    "cn_name": "[未翻译] 加百列",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "午后之味",
+    "cn_name": "[未翻译] 午后之味",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "南瓜精灵莱拉",
+    "cn_name": "[未翻译] 南瓜精灵莱拉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "卡罗琳",
+    "cn_name": "[未翻译] 卡罗琳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "卡莉西",
+    "cn_name": "[未翻译] 卡莉西",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "卡蒂尔达",
+    "cn_name": "[未翻译] 卡蒂尔达",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "反击",
+    "cn_name": "[未翻译] 反击",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "只有我们俩",
+    "cn_name": "[未翻译] 只有我们俩",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "吉赛尔",
+    "cn_name": "[未翻译] 吉赛尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "后巷摩擦",
+    "cn_name": "[未翻译] 后巷摩擦",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "后巷摩擦",
+    "cn_name": "[未翻译] 后巷摩擦",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "呆滞眼神",
+    "cn_name": "[未翻译] 呆滞眼神",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "哈莱斯",
+    "cn_name": "[未翻译] 哈莱斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "哈鲁蒂",
+    "cn_name": "[未翻译] 哈鲁蒂",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "啦啦队长贝丽卡",
+    "cn_name": "[未翻译] 啦啦队长贝丽卡",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "善意任务",
+    "cn_name": "[未翻译] 善意任务",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "回眸",
+    "cn_name": "[未翻译] 回眸",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "圣女之秘",
+    "cn_name": "[未翻译] 圣女之秘",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "圣诞礼物",
+    "cn_name": "[未翻译] 圣诞礼物",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "圣诞米拉贝尔",
+    "cn_name": "[未翻译] 圣诞米拉贝尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "在酒中",
+    "cn_name": "[未翻译] 在酒中",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "坚定·拉娜",
+    "cn_name": "[未翻译] 坚定·拉娜",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "坦率的爱意",
+    "cn_name": "[未翻译] 坦率的爱意",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "坦率的爱意",
+    "cn_name": "[未翻译] 坦率的爱意",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "埃尔梅斯",
+    "cn_name": "[未翻译] 埃尔梅斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "塔什梅图姆",
+    "cn_name": "[未翻译] 塔什梅图姆",
+    "en_bond": "A0308",
+    "cn_bond": "A0308",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "塔娅",
+    "cn_name": "[未翻译] 塔娅",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "塔琳",
+    "cn_name": "[未翻译] 塔琳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "塞尼卡",
+    "cn_name": "[未翻译] 塞尼卡",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "塞莱斯特",
+    "cn_name": "[未翻译] 塞莱斯特",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "复仇的科希尔",
+    "cn_name": "[未翻译] 复仇的科希尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "复仇的路易斯",
+    "cn_name": "[未翻译] 复仇的路易斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "夏日乔伊斯",
+    "cn_name": "[未翻译] 夏日乔伊斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "夏日佩特拉",
+    "cn_name": "[未翻译] 夏日佩特拉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "夏日微风吉赛尔",
+    "cn_name": "[未翻译] 夏日微风吉赛尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "多琳",
+    "cn_name": "[未翻译] 多琳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "天宫咲夜",
+    "cn_name": "[未翻译] 天宫咲夜",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "天真计谋",
+    "cn_name": "[未翻译] 天真计谋",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "天真计谋",
+    "cn_name": "[未翻译] 天真计谋",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "奎妮",
+    "cn_name": "[未翻译] 奎妮",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "奥利芙",
+    "cn_name": "[未翻译] 奥利芙",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "奥尔加",
+    "cn_name": "[未翻译] 奥尔加",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "奥布琳",
+    "cn_name": "[未翻译] 奥布琳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "奥帕尼",
+    "cn_name": "[未翻译] 奥帕尼",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "奥德娅",
+    "cn_name": "[未翻译] 奥德娅",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "女王的消遣",
+    "cn_name": "[未翻译] 女王的消遣",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "姐妹的化学反应",
+    "cn_name": "[未翻译] 姐妹的化学反应",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "孤独救赎",
+    "cn_name": "[未翻译] 孤独救赎",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "守护者艾瑞尔",
+    "cn_name": "[未翻译] 守护者艾瑞尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "安希恩",
+    "cn_name": "[未翻译] 安希恩",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "安提娅",
+    "cn_name": "[未翻译] 安提娅",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "完美追求",
+    "cn_name": "[未翻译] 完美追求",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "完美追求",
+    "cn_name": "[未翻译] 完美追求",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "导演的面具",
+    "cn_name": "[未翻译] 导演的面具",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "导演的面具",
+    "cn_name": "[未翻译] 导演的面具",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "小丑的邀请",
+    "cn_name": "[未翻译] 小丑的邀请",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "小丑的邀请",
+    "cn_name": "[未翻译] 小丑的邀请",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "小小乐趣",
+    "cn_name": "[未翻译] 小小乐趣",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "小恶魔洛蒂",
+    "cn_name": "[未翻译] 小恶魔洛蒂",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "尤菲米娅",
+    "cn_name": "[未翻译] 尤菲米娅",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "尤里",
+    "cn_name": "[未翻译] 尤里",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "尼努卡西",
+    "cn_name": "[未翻译] 尼努卡西",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "巴托兹",
+    "cn_name": "[未翻译] 巴托兹",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "巴托洛",
+    "cn_name": "[未翻译] 巴托洛",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "市场一角",
+    "cn_name": "[未翻译] 市场一角",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "希恩",
+    "cn_name": "[未翻译] 希恩",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "希诺莉",
+    "cn_name": "[未翻译] 希诺莉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "帕梅拉",
+    "cn_name": "[未翻译] 帕梅拉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "帕特娅",
+    "cn_name": "[未翻译] 帕特娅",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "平静的另一面",
+    "cn_name": "[未翻译] 平静的另一面",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "平静的另一面",
+    "cn_name": "[未翻译] 平静的另一面",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "幸福时刻",
+    "cn_name": "[未翻译] 幸福时刻",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "幸福时刻",
+    "cn_name": "[未翻译] 幸福时刻",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "强化渴望",
+    "cn_name": "[未翻译] 强化渴望",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "强化渴望",
+    "cn_name": "[未翻译] 强化渴望",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "彩花",
+    "cn_name": "[未翻译] 彩花",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "彭内库斯",
+    "cn_name": "[未翻译] 彭内库斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "德丽娜",
+    "cn_name": "[未翻译] 德丽娜",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "德丽泽拉",
+    "cn_name": "[未翻译] 德丽泽拉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "必要强化",
+    "cn_name": "[未翻译] 必要强化",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "性感沙滩",
+    "cn_name": "[未翻译] 性感沙滩",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "性爱录像带",
+    "cn_name": "[未翻译] 性爱录像带",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "恋人肖像",
+    "cn_name": "[未翻译] 恋人肖像",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "恋人肖像",
+    "cn_name": "[未翻译] 恋人肖像",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "恶意象征",
+    "cn_name": "[未翻译] 恶意象征",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "情欲的浪潮",
+    "cn_name": "[未翻译] 情欲的浪潮",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "意外的羞涩",
+    "cn_name": "[未翻译] 意外的羞涩",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "感官记忆",
+    "cn_name": "[未翻译] 感官记忆",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "愤怒与欲望",
+    "cn_name": "[未翻译] 愤怒与欲望",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "战斗机械师特丽斯特",
+    "cn_name": "[未翻译] 战斗机械师特丽斯特",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "扎菲尔",
+    "cn_name": "[未翻译] 扎菲尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "执法者维里特",
+    "cn_name": "[未翻译] 执法者维里特",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "拉娜",
+    "cn_name": "[未翻译] 拉娜",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "拉斐尔",
+    "cn_name": "[未翻译] 拉斐尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "拉米埃尔",
+    "cn_name": "[未翻译] 拉米埃尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "指挥官的交易",
+    "cn_name": "[未翻译] 指挥官的交易",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "指挥官的交易",
+    "cn_name": "[未翻译] 指挥官的交易",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "挑衅逆转",
+    "cn_name": "[未翻译] 挑衅逆转",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "探索之悦",
+    "cn_name": "[未翻译] 探索之悦",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "探索之悦",
+    "cn_name": "[未翻译] 探索之悦",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "支配与服从",
+    "cn_name": "[未翻译] 支配与服从",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "救赎者·露西亚",
+    "cn_name": "[未翻译] 救赎者·露西亚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "斯卡蕾特",
+    "cn_name": "[未翻译] 斯卡蕾特",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "新奇感受",
+    "cn_name": "[未翻译] 新奇感受",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "新奇感受",
+    "cn_name": "[未翻译] 新奇感受",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "旋律计划",
+    "cn_name": "[未翻译] 旋律计划",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "无人店铺",
+    "cn_name": "[未翻译] 无人店铺",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "无尽采样",
+    "cn_name": "[未翻译] 无尽采样",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "无尽采样",
+    "cn_name": "[未翻译] 无尽采样",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "时空特工葵",
+    "cn_name": "[未翻译] 时空特工葵",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "春日塞莱斯特",
+    "cn_name": "[未翻译] 春日塞莱斯特",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "春日米娜",
+    "cn_name": "[未翻译] 春日米娜",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "晨间爱抚",
+    "cn_name": "[未翻译] 晨间爱抚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "普里玛",
+    "cn_name": "[未翻译] 普里玛",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "暗示性触手",
+    "cn_name": "[未翻译] 暗示性触手",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "暴食的代价",
+    "cn_name": "[未翻译] 暴食的代价",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "暴食的代价",
+    "cn_name": "[未翻译] 暴食的代价",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "曼德拉草",
+    "cn_name": "[未翻译] 曼德拉草",
+    "en_bond": "A0287",
+    "cn_bond": "A0287",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "有效治疗",
+    "cn_name": "[未翻译] 有效治疗",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "有效治疗",
+    "cn_name": "[未翻译] 有效治疗",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "期待之悦",
+    "cn_name": "[未翻译] 期待之悦",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "朱莉娅",
+    "cn_name": "[未翻译] 朱莉娅",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "杏仁见",
+    "cn_name": "[未翻译] 杏仁见",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "束缚与控制",
+    "cn_name": "[未翻译] 束缚与控制",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "束缚与控制",
+    "cn_name": "[未翻译] 束缚与控制",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "束缚之悦",
+    "cn_name": "[未翻译] 束缚之悦",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "格蕾丝",
+    "cn_name": "[未翻译] 格蕾丝",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "格里莫尔",
+    "cn_name": "[未翻译] 格里莫尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "梅罗",
+    "cn_name": "[未翻译] 梅罗",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "梅芙",
+    "cn_name": "[未翻译] 梅芙",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "森林冲突",
+    "cn_name": "[未翻译] 森林冲突",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "残酷的真相",
+    "cn_name": "[未翻译] 残酷的真相",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "残酷的真相",
+    "cn_name": "[未翻译] 残酷的真相",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "毒舌的骄傲",
+    "cn_name": "[未翻译] 毒舌的骄傲",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "水月",
+    "cn_name": "[未翻译] 水月",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "池畔秘语",
+    "cn_name": "[未翻译] 池畔秘语",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "泰迪·伊思",
+    "cn_name": "[未翻译] 泰迪·伊思",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "泰迪·露西亚",
+    "cn_name": "[未翻译] 泰迪·露西亚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "泳装幽灵贾尼斯",
+    "cn_name": "[未翻译] 泳装幽灵贾尼斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "洛蒂",
+    "cn_name": "[未翻译] 洛蒂",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "海岸低语",
+    "cn_name": "[未翻译] 海岸低语",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "海滨·诺克林",
+    "cn_name": "[未翻译] 海滨·诺克林",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "海蒂",
+    "cn_name": "[未翻译] 海蒂",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "涅瓦",
+    "cn_name": "[未翻译] 涅瓦",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "消暑",
+    "cn_name": "[未翻译] 消暑",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "深吻与后部",
+    "cn_name": "[未翻译] 深吻与后部",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "深吻与后部",
+    "cn_name": "[未翻译] 深吻与后部",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "深渊",
+    "cn_name": "[未翻译] 深渊",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "混沌之星海蒂",
+    "cn_name": "[未翻译] 混沌之星海蒂",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "温柔审讯",
+    "cn_name": "[未翻译] 温柔审讯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "潘塔西亚",
+    "cn_name": "[未翻译] 潘塔西亚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "激情的力量",
+    "cn_name": "[未翻译] 激情的力量",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "激情的力量",
+    "cn_name": "[未翻译] 激情的力量",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "灵感之源",
+    "cn_name": "[未翻译] 灵感之源",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "炽热之心鲁比",
+    "cn_name": "[未翻译] 炽热之心鲁比",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "热情款待",
+    "cn_name": "[未翻译] 热情款待",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "热情款待",
+    "cn_name": "[未翻译] 热情款待",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "热情的欢呼",
+    "cn_name": "[未翻译] 热情的欢呼",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "爱丽儿",
+    "cn_name": "[未翻译] 爱丽儿",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "爱之印记",
+    "cn_name": "[未翻译] 爱之印记",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "爱抚",
+    "cn_name": "[未翻译] 爱抚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "爱的共鸣",
+    "cn_name": "[未翻译] 爱的共鸣",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "特蕾莎",
+    "cn_name": "[未翻译] 特蕾莎",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "特蕾西",
+    "cn_name": "[未翻译] 特蕾西",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "特里斯特",
+    "cn_name": "[未翻译] 特里斯特",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "狂暴加洛尼亚",
+    "cn_name": "[未翻译] 狂暴加洛尼亚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "狭窄圣所",
+    "cn_name": "[未翻译] 狭窄圣所",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "猫祭",
+    "cn_name": "[未翻译] 猫祭",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "玛莎",
+    "cn_name": "[未翻译] 玛莎",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "玛蒂尔达",
+    "cn_name": "[未翻译] 玛蒂尔达",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "珍",
+    "cn_name": "[未翻译] 珍",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "珍妮丝",
+    "cn_name": "[未翻译] 珍妮丝",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "珍妮斯",
+    "cn_name": "[未翻译] 珍妮斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "瓦内萨",
+    "cn_name": "[未翻译] 瓦内萨",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "甜心黎明",
+    "cn_name": "[未翻译] 甜心黎明",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "甜蜜对比",
+    "cn_name": "[未翻译] 甜蜜对比",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "甜蜜对比",
+    "cn_name": "[未翻译] 甜蜜对比",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "甜蜜梦乡安希恩",
+    "cn_name": "[未翻译] 甜蜜梦乡安希恩",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "甜蜜糖果",
+    "cn_name": "[未翻译] 甜蜜糖果",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "疗愈夜袭",
+    "cn_name": "[未翻译] 疗愈夜袭",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "盖塔",
+    "cn_name": "[未翻译] 盖塔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "盖尔",
+    "cn_name": "[未翻译] 盖尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "真正的主角",
+    "cn_name": "[未翻译] 真正的主角",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "真正的主角",
+    "cn_name": "[未翻译] 真正的主角",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "瞬间占有",
+    "cn_name": "[未翻译] 瞬间占有",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "短暂的爱达琳",
+    "cn_name": "[未翻译] 短暂的爱达琳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "神乐",
+    "cn_name": "[未翻译] 神乐",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "神圣仪式",
+    "cn_name": "[未翻译] 神圣仪式",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "神圣的狂热",
+    "cn_name": "[未翻译] 神圣的狂热",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "禁忌的热情",
+    "cn_name": "[未翻译] 禁忌的热情",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "科希尔",
+    "cn_name": "[未翻译] 科希尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "科斯玛",
+    "cn_name": "[未翻译] 科斯玛",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "秘密开发",
+    "cn_name": "[未翻译] 秘密开发",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "秘密癖好",
+    "cn_name": "[未翻译] 秘密癖好",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "秘密补偿",
+    "cn_name": "[未翻译] 秘密补偿",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "穆利尔",
+    "cn_name": "[未翻译] 穆利尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "空",
+    "cn_name": "[未翻译] 空",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "突破尝试",
+    "cn_name": "[未翻译] 突破尝试",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "突破尝试",
+    "cn_name": "[未翻译] 突破尝试",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "突破防线",
+    "cn_name": "[未翻译] 突破防线",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "窒息支配",
+    "cn_name": "[未翻译] 窒息支配",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "窒息支配",
+    "cn_name": "[未翻译] 窒息支配",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "筱之目 feat. 芳",
+    "cn_name": "[未翻译] 筱之目 feat. 芳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "米凯尔",
+    "cn_name": "[未翻译] 米凯尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "米利安",
+    "cn_name": "[未翻译] 米利安",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "米拉赫",
+    "cn_name": "[未翻译] 米拉赫",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "繁茂的木槿",
+    "cn_name": "[未翻译] 繁茂的木槿",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "纯真诚意",
+    "cn_name": "[未翻译] 纯真诚意",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "纳克莎",
+    "cn_name": "[未翻译] 纳克莎",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "纳兰希尔",
+    "cn_name": "[未翻译] 纳兰希尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "绝望的渴望",
+    "cn_name": "[未翻译] 绝望的渴望",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "绝望的莎妮",
+    "cn_name": "[未翻译] 绝望的莎妮",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "继承者米凯尔",
+    "cn_name": "[未翻译] 继承者米凯尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "绯红之兔巴托洛",
+    "cn_name": "[未翻译] 绯红之兔巴托洛",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "维里特",
+    "cn_name": "[未翻译] 维里特",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "绽放",
+    "cn_name": "[未翻译] 绽放",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "网络红人",
+    "cn_name": "[未翻译] 网络红人",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "罗莎莉",
+    "cn_name": "[未翻译] 罗莎莉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "美味炖肉",
+    "cn_name": "[未翻译] 美味炖肉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "美月",
+    "cn_name": "[未翻译] 美月",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "羞涩恳求",
+    "cn_name": "[未翻译] 羞涩恳求",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "羞涩证明",
+    "cn_name": "[未翻译] 羞涩证明",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "羞涩证明",
+    "cn_name": "[未翻译] 羞涩证明",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "耶莉卡",
+    "cn_name": "[未翻译] 耶莉卡",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "职场低语",
+    "cn_name": "[未翻译] 职场低语",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "背叛的陷阱",
+    "cn_name": "[未翻译] 背叛的陷阱",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "背叛的陷阱",
+    "cn_name": "[未翻译] 背叛的陷阱",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "脆弱威胁",
+    "cn_name": "[未翻译] 脆弱威胁",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "脚尖的诱惑",
+    "cn_name": "[未翻译] 脚尖的诱惑",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "脚尖的诱惑",
+    "cn_name": "[未翻译] 脚尖的诱惑",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "舒缓的黑丝",
+    "cn_name": "[未翻译] 舒缓的黑丝",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "艾丽卡",
+    "cn_name": "[未翻译] 艾丽卡",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "艾希",
+    "cn_name": "[未翻译] 艾希",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "艾米",
+    "cn_name": "[未翻译] 艾米",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "苦乐参半的过去",
+    "cn_name": "[未翻译] 苦乐参半的过去",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "英勇",
+    "cn_name": "[未翻译] 英勇",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "英格洛尔",
+    "cn_name": "[未翻译] 英格洛尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "茜",
+    "cn_name": "[未翻译] 茜",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "莉娜",
+    "cn_name": "[未翻译] 莉娜",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "莉莉娅",
+    "cn_name": "[未翻译] 莉莉娅",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "莎妮",
+    "cn_name": "[未翻译] 莎妮",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "莫伊拉",
+    "cn_name": "[未翻译] 莫伊拉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "莱拉",
+    "cn_name": "[未翻译] 莱拉",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "莱斯玛",
+    "cn_name": "[未翻译] 莱斯玛",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "葵日向",
+    "cn_name": "[未翻译] 葵日向",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "蒂娜",
+    "cn_name": "[未翻译] 蒂娜",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "蒂芙尼",
+    "cn_name": "[未翻译] 蒂芙尼",
+    "en_bond": "A0404",
+    "cn_bond": "A0404",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "蜂蜜、茶与巧克力",
+    "cn_name": "[未翻译] 蜂蜜、茶与巧克力",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "蜘蛛百合朱莉娅",
+    "cn_name": "[未翻译] 蜘蛛百合朱莉娅",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "蜜酒",
+    "cn_name": "[未翻译] 蜜酒",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "蝶子",
+    "cn_name": "[未翻译] 蝶子",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "西尔巴尔",
+    "cn_name": "[未翻译] 西尔巴尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "西尔维娜",
+    "cn_name": "[未翻译] 西尔维娜",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "见习旅店老板西尔巴",
+    "cn_name": "[未翻译] 见习旅店老板西尔巴",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "记忆玛莎",
+    "cn_name": "[未翻译] 记忆玛莎",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "诚实训练",
+    "cn_name": "[未翻译] 诚实训练",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "诺亚",
+    "cn_name": "[未翻译] 诺亚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "诺克林",
+    "cn_name": "[未翻译] 诺克林",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "贝丽卡",
+    "cn_name": "[未翻译] 贝丽卡",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "贝儿",
+    "cn_name": "[未翻译] 贝儿",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "贝琳",
+    "cn_name": "[未翻译] 贝琳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "费利兹",
+    "cn_name": "[未翻译] 费利兹",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "费利西亚",
+    "cn_name": "[未翻译] 费利西亚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "赛博冲突",
+    "cn_name": "[未翻译] 赛博冲突",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "赤鬼",
+    "cn_name": "[未翻译] 赤鬼",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "赫斯提亚",
+    "cn_name": "[未翻译] 赫斯提亚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "超音速西尔维娜",
+    "cn_name": "[未翻译] 超音速西尔维娜",
+    "en_bond": "A0425",
+    "cn_bond": "A0425",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "路易斯",
+    "cn_name": "[未翻译] 路易斯",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "跳跃的热情",
+    "cn_name": "[未翻译] 跳跃的热情",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "辛迪",
+    "cn_name": "[未翻译] 辛迪",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "达琳",
+    "cn_name": "[未翻译] 达琳",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "迪尔德丽",
+    "cn_name": "[未翻译] 迪尔德丽",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "迷人小猫",
+    "cn_name": "[未翻译] 迷人小猫",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "邦妮",
+    "cn_name": "[未翻译] 邦妮",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "醉生梦死",
+    "cn_name": "[未翻译] 醉生梦死",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "醉生梦死",
+    "cn_name": "[未翻译] 醉生梦死",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "里法",
+    "cn_name": "[未翻译] 里法",
+    "en_bond": "A0398",
+    "cn_bond": "A0398",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "重生·伊丝",
+    "cn_name": "[未翻译] 重生·伊丝",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "野性的呼唤",
+    "cn_name": "[未翻译] 野性的呼唤",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "金融家",
+    "cn_name": "[未翻译] 金融家",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "阳光明媚的午后",
+    "cn_name": "[未翻译] 阳光明媚的午后",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "阿尔忒弥亚",
+    "cn_name": "[未翻译] 阿尔忒弥亚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "阿纳斯塔西娅",
+    "cn_name": "[未翻译] 阿纳斯塔西娅",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "陨落的奇迹",
+    "cn_name": "[未翻译] 陨落的奇迹",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "隐秘策略",
+    "cn_name": "[未翻译] 隐秘策略",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "隐藏的热情",
+    "cn_name": "[未翻译] 隐藏的热情",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "隐藏的爱意",
+    "cn_name": "[未翻译] 隐藏的爱意",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "难忘的惩罚",
+    "cn_name": "[未翻译] 难忘的惩罚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "难忘的惩罚",
+    "cn_name": "[未翻译] 难忘的惩罚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "雪惠",
+    "cn_name": "[未翻译] 雪惠",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "露娜",
+    "cn_name": "[未翻译] 露娜",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "露比",
+    "cn_name": "[未翻译] 露比",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "露西亚",
+    "cn_name": "[未翻译] 露西亚",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "露西法尔",
+    "cn_name": "[未翻译] 露西法尔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "露西玛",
+    "cn_name": "[未翻译] 露西玛",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "静奈",
+    "cn_name": "[未翻译] 静奈",
+    "en_bond": "A0389",
+    "cn_bond": "A0389",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "非人体验",
+    "cn_name": "[未翻译] 非人体验",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "香港娃娃",
+    "cn_name": "[未翻译] 香港娃娃",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "魅魔来袭",
+    "cn_name": "[未翻译] 魅魔来袭",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "鲁尼亚塔",
+    "cn_name": "[未翻译] 鲁尼亚塔",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "鲁莽诱惑",
+    "cn_name": "[未翻译] 鲁莽诱惑",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "鲁菲娜",
+    "cn_name": "[未翻译] 鲁菲娜",
+    "en_bond": "A0290",
+    "cn_bond": "A0290",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "黎明",
+    "cn_name": "[未翻译] 黎明",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  },
+  {
+    "en_name": "黑曜石",
+    "cn_name": "[未翻译] 黑曜石",
+    "en_bond": "",
+    "cn_bond": "",
+    "match_type": "llm_only",
+    "status": "✗ 仅LLM翻译(需审核)"
+  }
+]
