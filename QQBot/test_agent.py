@@ -406,6 +406,8 @@ class TestAgentCore:
         asyncio.run(self.test_session_persistence())
         asyncio.run(self.test_clear_context())
         asyncio.run(self.test_max_iterations())
+        asyncio.run(self.test_auto_compress_fallback())
+        asyncio.run(self.test_task_fold_persistence())
 
     async def test_bootstrap(self):
         from agent.tool_registry import ToolRegistry
@@ -619,6 +621,181 @@ class TestAgentCore:
         response = await agent.run("test", "loop_user")
         assert "循环" in response or "方式" in response, f"Should give up after max iterations: {response}"
         print_pass("Max tool iterations guard (prevents infinite loops)")
+
+    async def test_auto_compress_fallback(self):
+        """A tool-heavy turn whose final answer is long gets auto-compressed:
+        session context keeps a compact TaskRecord line (not the raw verbose
+        output), while the full result stays retrievable in the task log."""
+        from agent.tool_registry import ToolRegistry
+        from agent.session import SessionManager
+        from agent.agent import Agent
+        import agent.task_record as task_record
+
+        tmp_sessions = tempfile.mkdtemp()
+        tmp_tasklog = tempfile.mkdtemp()
+        original_dir = task_record._TASK_LOG_DIR
+        try:
+            task_record._TASK_LOG_DIR = tmp_tasklog
+
+            long_result = "抽卡结果详述：" + "获得了珍贵的角色与道具。" * 60  # > 600 chars
+            mock_client = MockDeepSeekClient()
+            call_count = [0]
+
+            async def staged(messages, tools, timeout=180.0):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    return {
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_gacha_1",
+                            "type": "function",
+                            "function": {"name": "gacha_pull", "arguments": '{"count": 10}'},
+                        }],
+                        "role": "assistant",
+                        "finish_reason": "tool_calls",
+                    }
+                return {
+                    "content": long_result,
+                    "tool_calls": None,
+                    "role": "assistant",
+                    "finish_reason": "stop",
+                }
+
+            mock_client.chat_completion_with_tools = staged
+
+            registry = ToolRegistry()
+            registry.register("gacha_pull", lambda count=1: f"gacha ok x{count}",
+                              "Gacha", {"type": "object", "properties": {}})
+
+            agent = Agent(
+                deepseek_client=mock_client,
+                tool_registry=registry,
+                config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+                session_manager=SessionManager(persistence_dir=tmp_sessions),
+            )
+
+            response = await agent.run("帮我十连抽", "compress_user")
+            # The user still sees the full answer in chat…
+            assert response == long_result, "chat reply must remain the full text"
+
+            # …but only the compact record line enters the session context.
+            session = agent.sessions.get("compress_user")
+            assistant_msgs = [m for m in session.context if m["role"] == "assistant"]
+            assert len(assistant_msgs) == 1
+            line = assistant_msgs[0]["content"]
+            assert line.startswith("[子任务记录]"), f"compact line expected, got: {line[:60]}"
+            assert "目标: 帮我十连抽" in line and "工具: gacha_pull" in line
+            assert "追溯:" in line
+            for m in session.context:
+                assert long_result not in m.get("content", ""), \
+                    "raw verbose output must not be persisted into context"
+
+            # Full result remains retrievable via the per-user task log.
+            log_path = os.path.join(tmp_tasklog, "compress_user.jsonl")
+            assert os.path.isfile(log_path), "task log should be written"
+            rec = json.loads(open(log_path, encoding="utf-8").readline())
+            assert rec["tool"] == "gacha_pull" and rec["status"] == "success"
+            assert rec["result"] == long_result, "task log keeps the full result"
+            assert rec["params"] == {"count": "10"}, "tool args folded into params"
+            print_pass("Auto-compression fallback: long tool-heavy turn → TaskRecord line")
+        finally:
+            task_record._TASK_LOG_DIR = original_dir
+            shutil.rmtree(tmp_sessions, ignore_errors=True)
+            shutil.rmtree(tmp_tasklog, ignore_errors=True)
+
+    async def test_task_fold_persistence(self):
+        """finalize_subtask sets _pending_task_fold: the task's setup turns are
+        removed (folded) and the compact record replaces them; a stale boundary
+        that would wipe too many messages is skipped (history preserved)."""
+        from agent.tool_registry import ToolRegistry
+        from agent.session import SessionManager
+        from agent.agent import Agent
+        from agent.context import _pending_task_fold
+
+        compact_line = "[子任务记录] 目标: 测速 | 结果: 完成 | 追溯: ref#id"
+
+        def make_agent(tmpdir, boundary):
+            def finalize_stub(**kwargs):
+                _pending_task_fold.set({"line": compact_line, "boundary": boundary})
+                return "recorded"
+
+            registry = ToolRegistry()
+            registry.register("finalize_subtask", finalize_stub, "Finalize",
+                              {"type": "object", "properties": {}})
+
+            mock_client = MockDeepSeekClient()
+            call_count = [0]
+
+            async def staged(messages, tools, timeout=180.0):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    return {
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_fin_1",
+                            "type": "function",
+                            "function": {"name": "finalize_subtask", "arguments": "{}"},
+                        }],
+                        "role": "assistant",
+                        "finish_reason": "tool_calls",
+                    }
+                return {
+                    "content": "任务已完成。",
+                    "tool_calls": None,
+                    "role": "assistant",
+                    "finish_reason": "stop",
+                }
+
+            mock_client.chat_completion_with_tools = staged
+            return Agent(
+                deepseek_client=mock_client,
+                tool_registry=registry,
+                config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+                session_manager=SessionManager(persistence_dir=tmpdir),
+            )
+
+        # Case 1: fresh fold — boundary removes exactly the setup turns.
+        tmpdir1 = tempfile.mkdtemp()
+        try:
+            agent = make_agent(tmpdir1, boundary=2)
+            session = agent.sessions.get_or_create("fold_user")
+            # Two pre-task setup turns (4 messages), then the task runs.
+            for i in range(2):
+                session.add_message("user", f"setup q{i}")
+                session.add_message("assistant", f"setup a{i}")
+            assert len(session.context) == 4
+
+            await agent.run("开始测速", "fold_user")
+
+            session = agent.sessions.get("fold_user")
+            contents = [m["content"] for m in session.context]
+            assert contents == ["setup q0", "setup a0", "开始测速", compact_line], \
+                f"setup turn 2 should be folded, got: {contents}"
+            print_pass("Task fold: setup turns removed, compact record persisted")
+        finally:
+            shutil.rmtree(tmpdir1, ignore_errors=True)
+
+        # Case 2: stale boundary — folding would remove > MAX_FOLD_MESSAGES
+        # messages, so the fold is skipped and history is preserved.
+        tmpdir2 = tempfile.mkdtemp()
+        try:
+            agent = make_agent(tmpdir2, boundary=0)
+            session = agent.sessions.get_or_create("stale_user")
+            for i in range(6):  # 12 messages — an abandoned task window
+                session.add_message("user", f"chat q{i}")
+                session.add_message("assistant", f"chat a{i}")
+
+            await agent.run("迟来的收尾", "stale_user")
+
+            session = agent.sessions.get("stale_user")
+            contents = [m["content"] for m in session.context]
+            assert contents[:12] == [
+                f"chat {'q' if i % 2 == 0 else 'a'}{i // 2}" for i in range(12)
+            ], f"history must survive a stale fold boundary, got: {contents[:4]}..."
+            assert contents[-2:] == ["迟来的收尾", compact_line]
+            print_pass("Stale fold guard: oversized boundary skipped, history kept")
+        finally:
+            shutil.rmtree(tmpdir2, ignore_errors=True)
 
     async def test_profile_injection(self):
         from agent.tool_registry import ToolRegistry

@@ -600,9 +600,10 @@ class WikiScraper:
         """Download portrait / head icon / skill icons for one character.
 
         Idempotent: skips files already on disk. Filenames follow the wiki
-        convention the user confirmed:
+        convention (``Template:Member`` renders the head icon as
+        ``Icon_Head_S_{{{ID}}}.png``):
           - portrait : ``{ID}_90_Emo1_normal_LV1.png``
-          - icon     : ``Icon_{title}.png``
+          - icon     : ``Icon_Head_S_{ID}.png``
           - skills   : ``Icon_Skill_{ID}_{001|002|003}.png``
         """
         cid = str(entry.get("id", "")).strip()
@@ -616,9 +617,10 @@ class WikiScraper:
                 (f"{cid}_90_Emo1_normal_LV1.png",
                  os.path.join(PORTRAIT_DIR, f"{cid}.png"), 600)
             )
-        if title:
+        if cid:
             targets.append(
-                (f"Icon_{title}.png", os.path.join(ICON_DIR, f"{title}.png"), None)
+                (f"Icon_Head_S_{cid}.png",
+                 os.path.join(ICON_DIR, f"{cid}.png"), None)
             )
         for n in range(1, 4):
             targets.append(

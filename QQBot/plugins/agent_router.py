@@ -35,8 +35,10 @@ from agent.context import (
     _current_user_role, _current_code_limits,
     _current_user_id, _current_group_id,
     _current_group_context, _current_personality,
-    _on_file_created, _current_quota_bytes,
+    _personality_transition, _on_file_created, _current_quota_bytes,
+    _pending_task_fold,
 )
+from agent.task_record import build_record, build_compact_line, append_task_log
 from agent.group_features import get_group_features
 from agent.permissions import PermissionManager
 from agent.personality import get_personality_manager
@@ -673,8 +675,10 @@ def _build_tool_registry() -> ToolRegistry:
     registry.register(
         "gacha_pull", gacha_pull,
         "执行游戏抽卡（单抽/十连，四种卡池）。这是唯一能产生真实抽卡结果的工具——绝对禁止编造抽卡结果。"
-        "首次抽卡：先询问用户'要先看抽卡动画还是直接看结果？'，得到回复后再调此工具。"
-        "用户说「再来一次」「再抽」「继续抽」等：直接调用此工具，使用与上次相同的参数，不再询问动画。",
+        "首次抽卡：先调用 begin_task 记录任务，再询问用户'要先看抽卡动画还是直接看结果？'，"
+        "得到回复后调此工具，给出结果后务必调用 finalize_subtask 收尾。"
+        "用户说「再来一次」「再抽」「继续抽」等：直接调用此工具（用与上次相同的参数，不再询问动画），"
+        "给出结果后同样调用 finalize_subtask 收尾。",
         {
             "type": "object",
             "properties": {
@@ -785,8 +789,9 @@ def _build_tool_registry() -> ToolRegistry:
         "接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON 和 calculate_speed 兼容格式。"
         "支持两种模式（mode 参数）：light=轻量（仅提取角色名与行动值，约10秒，跳过技能解析与行动值修正）；"
         "full=全量（完整流程：技能解析+行动值修正，约90秒）。默认 full。"
-        "当用户上传/引用战斗截图并要求测速或分析行动值时，先告知用户两种模式的区别（流程与预计用时），"
-        "再按用户选择传入 mode 调用，不要擅自替用户决定。"
+        "当用户上传/引用战斗截图并要求测速或分析行动值时，先调用 begin_task 记录任务，"
+        "再告知用户两种模式的区别（流程与预计用时），按用户选择传入 mode 调用，不要擅自替用户决定。"
+        "得出速度结果（通常经 calculate_speed）后，务必调用 finalize_subtask 收尾。"
         "截图路径会以「[用户引用了文件 ... 文件路径: xxx]」的形式出现在上下文中，"
         "直接取该路径调用，不要改用 read_file（read_file 无法做战斗 OCR）。"
         "团战/镜像匹配时，同一角色可能同时出现在我方和敌方（同名不同阵营），属正常情况，勿视为错误。"
@@ -907,6 +912,24 @@ _pending_naming: dict = {}
 
 # Track pending deletion confirmations: user_id -> (session_name, expiry_timestamp)
 _pending_delete_confirm: dict = {}
+
+# Track pending personality-switch choice: user_id -> (old_display, new_display)
+# Set by /人格切换, resolved on the user's next message: "清空" clears context,
+# anything else keeps history and injects a one-line transition notice.
+_pending_personality_switch: dict = {}
+
+# Persistent transition notice per user (injected until context is cleared or
+# personality changes again): user_id -> notice string.
+_personality_switch_marker: dict = {}
+
+# Active subtask window for multi-turn tool flows (gacha / speed-check):
+#   user_id -> {task_id, goal, boundary, opened_at}
+# Opened by the ``begin_task`` tool before the agent asks a setup/clarifying
+# question; ``boundary`` is the session message count at that moment so the
+# setup turns can be folded away when ``finalize_subtask`` closes the window.
+_active_task: dict = {}
+# Task windows older than this are treated as abandoned and ignored on finalize.
+_TASK_WINDOW_TTL = 15 * 60
 
 agent = Agent(
     deepseek_client=_model_router.reasoning_client,
@@ -1370,6 +1393,107 @@ _tool_registry.register(
 )
 
 
+# ── Subtask encapsulation tools (begin_task / finalize_subtask) ──
+#
+# Multi-turn tool flows (gacha, battle speed-check) pollute context: each setup
+# question and each verbose result gets persisted verbatim. These two tools let
+# the agent demarcate such a flow so it is folded into one compact structured
+# record (goal / result / params / refs / status / follow-ups / traceability)
+# instead of a pile of raw turns. Full detail is kept in data/task_log/.
+
+def _begin_task(goal: str) -> str:
+    """Mark the start of a multi-turn subtask and open a fold window."""
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "[begin_task] 无法开始子任务：当前请求未设置用户上下文。"
+    _active_task[user_id] = {
+        "task_id": uuid.uuid4().hex[:12],
+        "goal": (goal or "").strip(),
+        "boundary": _session_manager.message_count(user_id),
+        "opened_at": time.time(),
+    }
+    return (
+        "[begin_task] 已记录子任务「" + (goal or "").strip() + "」的起点。"
+        "现在请向用户提出必要的设置/澄清问题（如抽卡动画、测速模式），"
+        "得到回答后继续执行相应工具，任务完成时务必调用 finalize_subtask 收尾。"
+    )
+
+
+def _finalize_subtask(
+    goal: str,
+    result: str,
+    tool: str = "",
+    params: dict = None,
+    refs: list = None,
+    status: str = "success",
+    failure: str = "",
+    follow_ups: list = None,
+) -> str:
+    """Finalize a subtask: persist a structured record and fold this flow."""
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "[finalize_subtask] 无法收尾：当前请求未设置用户上下文。"
+
+    task = _active_task.pop(user_id, None)
+    boundary = None
+    if task and (time.time() - task.get("opened_at", 0)) <= _TASK_WINDOW_TTL:
+        boundary = task.get("boundary")
+
+    record = build_record(
+        goal=goal or (task or {}).get("goal", ""),
+        result=result or "",
+        tool=tool or "",
+        params=params,
+        refs=refs,
+        status=status,
+        failure=failure,
+        follow_ups=follow_ups,
+    )
+    append_task_log(user_id, record)
+    line = build_compact_line(record)
+    _pending_task_fold.set({"line": line, "boundary": boundary})
+    return "[finalize_subtask] 子任务结果已结构化记录，本轮交互将被折叠为一条摘要。"
+
+
+_tool_registry.register(
+    "begin_task", _begin_task,
+    "开始一个需要多轮交互的工具型子任务（如抽卡、战斗测速）。当你接下来必须先向"
+    "用户询问设置/澄清问题（例如抽卡是否看动画、测速用轻量还是全量模式）时，"
+    "先调用此工具记录任务起点，再提出该问题。它让后续的问答与结果被折叠成一条"
+    "结构化记录，避免污染上下文。仅在确有澄清环节的工具任务开始时调用一次。",
+    {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "description": "子任务目标的简短描述，如「十连抽卡」「战斗截图测速」"},
+        },
+        "required": ["goal"],
+    },
+)
+
+
+_tool_registry.register(
+    "finalize_subtask", _finalize_subtask,
+    "结束一个工具型子任务并提交结构化结果。在抽卡、战斗测速等多轮工具任务给出"
+    "最终结果后必须调用：它把整个任务折叠成一条精炼记录存入上下文，完整细节归档"
+    "到任务日志以便追溯。result 用 1-3 句话概括最终结果；params 填关键参数（如"
+    "卡池/次数/测速模式）；有未完成事项或建议时写入 follow_ups。",
+    {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "description": "子任务目标"},
+            "result": {"type": "string", "description": "最终结果的精炼概括（1-3 句）"},
+            "tool": {"type": "string", "description": "主要使用的工具名，如 gacha_pull / parse_battle_screenshots"},
+            "params": {"type": "object", "description": "关键参数/约束，如 {pool_type, count, mode}"},
+            "refs": {"type": "array", "items": {"type": "string"}, "description": "引用的角色名/文件路径/会话名等"},
+            "status": {"type": "string", "enum": ["success", "partial", "failed"], "default": "success"},
+            "failure": {"type": "string", "description": "失败类型（仅 status=failed 时填写）"},
+            "follow_ups": {"type": "array", "items": {"type": "string"}, "description": "未完成事项或后续建议"},
+        },
+        "required": ["goal", "result"],
+    },
+)
+
+
 # ── Message Handlers ─────────────────────────────────────────────
 
 # Catch ALL messages. For group messages, we manually check for @mentions
@@ -1441,6 +1565,26 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
                 _pending_delete_confirm.pop(user_id, None)
                 await _safe_send("确认已超时（60秒），请重新发起 /删除会话。")
             return
+
+    # ── Handle pending personality-switch choice (keep vs clear) ────
+    pending_switch = _pending_personality_switch.pop(user_id, None)
+    if pending_switch:
+        _old_display, new_display = pending_switch
+        _reply = text_content.strip()
+        _clear_kw = ("清空", "清除", "清空上下文", "清除上下文", "不保留", "清")
+        _keep_kw = ("保留", "保留历史", "保留记录", "是", "好的", "嗯", "行", "可以", "yes", "keep")
+        if _reply in _clear_kw:
+            agent.clear_user_session(user_id)
+            _special_sessions.clear_context(user_id)
+            _temp_session_files.pop(user_id, None)
+            _personality_switch_marker.pop(user_id, None)
+            await _safe_send(f"已清空对话上下文，开始以「{new_display}」人格的新对话~")
+            return
+        if _reply.lower() in _keep_kw:
+            await _safe_send(f"已保留历史对话，后续回复将遵循「{new_display}」人格。")
+            return
+        # Otherwise: user asked a new question — keep history (marker persists)
+        # and fall through so the agent answers with the transition notice.
 
     # ── Handle feedback / bug report (before agent, zero token cost) ─
     if text_content.startswith(("#反馈", "#bug", "#建议")):
@@ -1661,6 +1805,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         # Set personality contextvar
         pm = get_personality_manager()
         _current_personality.set(pm.resolve_effective_personality(user_id, group_id))
+        _personality_transition.set(_personality_switch_marker.get(user_id, ""))
 
         # Idea 3 — suggest upgrading a long temporary session to a special session.
         if session_type == "temporary":
@@ -1900,6 +2045,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             # Set personality contextvar
             pm = get_personality_manager()
             _current_personality.set(pm.resolve_effective_personality(user_id, group_id))
+            _personality_transition.set(_personality_switch_marker.get(user_id, ""))
 
             # Resolve group feature restrictions
             gf = get_group_features()
@@ -2089,9 +2235,25 @@ async def _handle_personality_command(text: str, user_id: str, event: MessageEve
 
     # /personality <name> — switch
     try:
+        old_key = pm.resolve_effective_personality(user_id, group_id)
+        old_display = pm.get_display_name(old_key)
         resolved = pm.set_user_personality(user_id, args)
-        display = pm.get_display_name(resolved)
-        await _safe_send(f"已切换至「{display}」人格。")
+        new_display = pm.get_display_name(resolved)
+        if resolved == old_key:
+            # Already this personality — no transition prompt/marker needed.
+            await _safe_send(f"当前已是「{new_display}」人格，无需切换~")
+            return True
+        _pending_personality_switch[user_id] = (old_display, new_display)
+        _personality_switch_marker[user_id] = (
+            f"人格已从「{old_display}」切换为「{new_display}」，"
+            f"历史回复风格不代表当前人格。"
+        )
+        await _safe_send(
+            f"已切换至「{new_display}」人格。\n"
+            f"是否保留历史对话记录？\n"
+            f"回复「保留」保留历史并注入切换提示词；\n"
+            f"回复「清空」清除当前上下文。"
+        )
     except ValueError as e:
         await _safe_send(str(e))
     except Exception as e:
@@ -2630,6 +2792,7 @@ async def _handle_special_command(command: str, user_id: str):
         agent.clear_user_session(user_id)
         _special_sessions.clear_context(user_id)
         _temp_session_files.pop(user_id, None)
+        _personality_switch_marker.pop(user_id, None)
         await _safe_send("已清除对话上下文，开始新对话~")
     elif command == "/status":
         status = agent.get_status()

@@ -73,9 +73,29 @@ _current_personality: contextvars.ContextVar[str] = (
     contextvars.ContextVar("_current_personality", default="assistant")
 )
 
+# One-line transition notice injected right after the personality prompt when
+# the user has switched personalities without clearing history, e.g.
+# "人格已从 X 切换为 Y，历史回复风格不代表当前人格。". Set by agent_router before
+# agent.run(); read by agent._build_messages(). Empty = no transition notice.
+_personality_transition: contextvars.ContextVar[str] = (
+    contextvars.ContextVar("_personality_transition", default="")
+)
+
 # File-creation callback: tools invoke it after writing a file into the
 # workspace, passing the absolute path. Set by agent_router before agent.run()
 # to attribute the file to the active special session.
 _on_file_created: contextvars.ContextVar[Optional[Callable[[str], None]]] = (
     contextvars.ContextVar("_on_file_created", default=None)
+)
+
+# Task-fold directive, set by the ``finalize_subtask`` tool mid-run and read by
+# agent persistence at end of run. A dict {"line": str, "boundary": int|None}:
+#   - "line"     the compact structured record to persist instead of the raw
+#                final response;
+#   - "boundary" session message index before the task's setup turns — messages
+#                from this index onward are removed (folded) before the record
+#                is appended. None = no setup turns to fold (compress only).
+# None (default) = persist normally (subject to auto-compression fallback).
+_pending_task_fold: contextvars.ContextVar[Optional[dict]] = (
+    contextvars.ContextVar("_pending_task_fold", default=None)
 )

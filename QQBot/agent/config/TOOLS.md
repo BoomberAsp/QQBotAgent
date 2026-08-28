@@ -346,7 +346,7 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 **Workflow rules**:
 
-1. **First gacha request in conversation**: Ask "要先看抽卡动画还是直接看结果？", then call this tool after the user replies.
+1. **First gacha request in conversation**: Call `begin_task` (goal: 抽卡), then ask "要先看抽卡动画还是直接看结果？", call this tool after the user replies, and call `finalize_subtask` after presenting the result.
 2. **Follow-up "再来一次" / "再抽" / "继续抽"**: Call this tool **immediately** with the same pool_type and up_character as the previous call. Do NOT ask about animation again.
 3. **NEVER fabricate gacha results**. Every pull result MUST come from this tool. If you output star ratings, character names, or gacha results without calling this tool, you are hallucinating.
 
@@ -672,3 +672,56 @@ This document defines all tools available to the agent. Each tool has a name, de
 - Audio: `.amr`, `.silk`, `.wav`, `.mp3`, `.ogg`, `.m4a`, `.aac`, `.flac`, `.opus` — returns duration/codec/sample-rate metadata, plus AI transcription + emotion + background analysis (if audio model configured in `QQBot/config/models_settings.json` AUDIO_MODEL section; falls back to MULTIMODAL_MODEL if that model supports audio)
 
 **Note**: If the multimodal LLM is not configured, image/audio analysis falls back to metadata-only mode with setup instructions. Text and PDF files work without any additional configuration.
+
+---
+
+## Tool: begin_task
+
+**Description**: Mark the start of a multi-turn tool-based subtask (gacha, battle speed-check) and open a fold window. The setup/clarification turns that follow will be folded into one compact structured record when the task is finalized, instead of piling up verbatim in the conversation context.
+
+**When to use**: Exactly once, at the beginning of a tool task that REQUIRES a setup/clarifying question before execution (e.g. first gacha request → ask 动画 or 直接看结果; speed-check → ask 轻量 or 全量模式). Do NOT call it for tasks that need no clarification, and do NOT call it on follow-up repetitions ("再来一次" — the window is already closed).
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "goal": {
+      "type": "string",
+      "description": "子任务目标的简短描述，如「十连抽卡」「战斗截图测速」"
+    }
+  },
+  "required": ["goal"]
+}
+```
+
+**Workflow**:
+1. Call `begin_task` → 2. Ask the setup question → 3. On the user's reply, run the real tools → 4. Present the result → 5. Call `finalize_subtask`.
+
+---
+
+## Tool: finalize_subtask
+
+**Description**: Close a subtask opened by `begin_task` and submit its structured result. The whole flow is folded into one compact record line in the conversation context; the full detail (goal, result, params, refs, status, follow-ups, tool calls) is archived to the per-user task log for later traceability.
+
+**When to use**: MANDATORY after completing a multi-turn tool task — once the final result has been presented to the user (gacha results shown, speed value computed via `calculate_speed`, ...). Fill `result` with a 1-3 sentence summary of the final outcome (the user already saw the full detail in chat), `params` with the key parameters actually used (卡池/次数/测速模式…), and `follow_ups` with any unfinished items or suggestions.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "goal": {"type": "string", "description": "子任务目标"},
+    "result": {"type": "string", "description": "最终结果的精炼概括（1-3 句）"},
+    "tool": {"type": "string", "description": "主要使用的工具名，如 gacha_pull / parse_battle_screenshots"},
+    "params": {"type": "object", "description": "关键参数/约束，如 {pool_type, count, mode}"},
+    "refs": {"type": "array", "items": {"type": "string"}, "description": "引用的角色名/文件路径/会话名等"},
+    "status": {"type": "string", "enum": ["success", "partial", "failed"], "default": "success"},
+    "failure": {"type": "string", "description": "失败类型（仅 status=failed 时填写）"},
+    "follow_ups": {"type": "array", "items": {"type": "string"}, "description": "未完成事项或后续建议"}
+  },
+  "required": ["goal", "result"]
+}
+```
+
+**Note**: Even without a prior `begin_task` (or if its 15-minute window expired), calling this tool still archives the record and folds the current turn — only the setup-turn removal is skipped. For tool-heavy turns where you forgot to call it, the system auto-compresses long results into a degraded record anyway, but explicit finalization always produces the better record.

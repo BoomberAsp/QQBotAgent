@@ -19,6 +19,7 @@ from .profile import ProfileManager
 from .hardware import HardwareDetector, HardwareProfile
 from .workspace import UserWorkspaceManager
 from .special_session import SpecialSessionManager, SpecialSession
+from .task_record import build_auto_record, build_compact_line, append_task_log
 
 
 # Long-term memory write policy. Only interactions whose combined
@@ -28,6 +29,20 @@ from .special_session import SpecialSessionManager, SpecialSession
 # accumulating and later re-entering the prompt via keyword search.
 MIN_REMEMBER_LEN = 800
 MAX_MEMORIES_PER_USER = 20
+
+# TaskRecord auto-compression: a turn that used one of the known multi-turn task
+# tools and whose final response exceeds AUTO_COMPRESS_MIN_LEN is folded into a
+# degraded TaskRecord (unless finalize_subtask already produced an explicit
+# record). Scoped to these tools so ordinary long answers (search, character
+# lookup, …) are left intact. Full detail stays in the task log.
+AUTO_COMPRESS_MIN_LEN = 600
+_AUTO_COMPRESS_TOOLS = {"gacha_pull", "parse_battle_screenshots", "calculate_speed"}
+
+# A task fold may remove at most this many trailing messages (the setup/result
+# turns of one short flow). If the recorded boundary would remove more, it is
+# treated as stale/abandoned and the fold is skipped — a guard against an old
+# begin_task window wiping unrelated history on a later finalize_subtask.
+MAX_FOLD_MESSAGES = 8
 
 
 def _display_tool_name(tool_call: dict) -> str:
@@ -200,6 +215,15 @@ class Agent:
         # Key: (tool_name, hash(arguments_json)) -> failure_count
         _recent_tool_failures: dict = {}
 
+        # Collect this turn's tool calls (name/args/success/snippet). Used by the
+        # TaskRecord auto-compression fallback to build a degraded record when the
+        # agent did not call finalize_subtask explicitly.
+        _turn_tool_calls: list = []
+
+        # Reset the task-fold directive; finalize_subtask may set it during this run.
+        from agent.context import _pending_task_fold
+        _pending_task_fold.set(None)
+
         # Agent loop
         for iteration in range(self.max_tool_iterations):
             llm_client = client or self.client
@@ -236,6 +260,30 @@ class Agent:
                 tool_results = await self._execute_tool_calls(
                     response["tool_calls"], session, user_id, allowed_tools
                 )
+
+                # ── Collect this turn's tool calls (TaskRecord auto-fallback) ──
+                _res_by_id = {
+                    tr.get("tool_call_id"): tr.get("content", "") for tr in tool_results
+                }
+                for tc in response["tool_calls"]:
+                    _tn = tc["function"]["name"]
+                    try:
+                        _args = json.loads(tc["function"].get("arguments", "{}") or "{}")
+                    except Exception:
+                        _args = {}
+                    _res = _res_by_id.get(tc.get("id", f"call_{_tn}"), "")
+                    _is_err = _res.startswith("[") and any(
+                        _res.startswith(p) for p in (
+                            "[Git Error]", "[Search", "[WebFetch", "[Code Error",
+                            "[Shell", "[Security", "[SSRF", "[PDF Error]",
+                        )
+                    )
+                    _turn_tool_calls.append({
+                        "name": _tn,
+                        "args": _args,
+                        "success": not _is_err,
+                        "snippet": _res[:200].replace("\n", " "),
+                    })
 
                 assistant_msg = {
                     "role": "assistant",
@@ -297,17 +345,62 @@ class Agent:
                 final_content = response.get("content", "")
                 reasoning = response.get("reasoning_content")
 
-                # ── Persist to session ───────────────────────────
-                if special_session:
-                    self.special_sessions.add_message(user_id, "user", user_message)
-                    self.special_sessions.add_message(
-                        user_id, "assistant", final_content, reasoning,
-                    )
+                # ── Persist to session (TaskRecord-aware) ────────
+                # Three modes:
+                #  1. Explicit finalize_subtask → fold the task's setup turns and
+                #     persist the compact structured record instead of raw content.
+                #  2. Auto-compression fallback → tool-heavy + long response with no
+                #     explicit record; build a degraded record and persist its line.
+                #  3. Normal → persist user message + full final response.
+                fold = _pending_task_fold.get()
+                if fold is not None:
+                    line = fold.get("line", "")
+                    boundary = fold.get("boundary")
+                    if special_session:
+                        # Snapshot storage: skip setup-turn removal, fold this turn only.
+                        self.special_sessions.add_message(user_id, "user", user_message)
+                        self.special_sessions.add_message(user_id, "assistant", line)
+                    else:
+                        if boundary is not None:
+                            b = max(0, min(int(boundary), len(session.context)))
+                            # Stale-window guard: a fold may only remove up to
+                            # MAX_FOLD_MESSAGES trailing messages. If the recorded
+                            # boundary would wipe more (e.g. an abandoned begin_task
+                            # finalized much later), skip setup-turn removal and just
+                            # append the record — better to keep redundant setup turns
+                            # than to destroy unrelated history.
+                            if (len(session.context) - b) <= MAX_FOLD_MESSAGES:
+                                session.context = session.context[:b]
+                        session.add_message("user", user_message)
+                        session.add_message("assistant", line)
+                        session.trim(self.sessions.max_context_messages)
+                        self.sessions.update(user_id, session)
+                elif (
+                    any(tc.get("name") in _AUTO_COMPRESS_TOOLS for tc in _turn_tool_calls)
+                    and len(final_content) > AUTO_COMPRESS_MIN_LEN
+                ):
+                    record = build_auto_record(user_message, final_content, _turn_tool_calls)
+                    append_task_log(user_id, record)
+                    line = build_compact_line(record)
+                    if special_session:
+                        self.special_sessions.add_message(user_id, "user", user_message)
+                        self.special_sessions.add_message(user_id, "assistant", line)
+                    else:
+                        session.add_message("user", user_message)
+                        session.add_message("assistant", line)
+                        session.trim(self.sessions.max_context_messages)
+                        self.sessions.update(user_id, session)
                 else:
-                    session.add_message("user", user_message)
-                    session.add_message("assistant", final_content, reasoning_content=reasoning)
-                    session.trim(self.sessions.max_context_messages)
-                    self.sessions.update(user_id, session)
+                    if special_session:
+                        self.special_sessions.add_message(user_id, "user", user_message)
+                        self.special_sessions.add_message(
+                            user_id, "assistant", final_content, reasoning,
+                        )
+                    else:
+                        session.add_message("user", user_message)
+                        session.add_message("assistant", final_content, reasoning_content=reasoning)
+                        session.trim(self.sessions.max_context_messages)
+                        self.sessions.update(user_id, session)
 
                 # Save substantive interactions to long-term memory
                 await self._maybe_remember(user_id, user_message, final_content)
@@ -347,7 +440,7 @@ class Agent:
         system_content = self.build_system_prompt()
 
         # 1.5. Personality prompt (injected at the very top)
-        from agent.context import _current_personality
+        from agent.context import _current_personality, _personality_transition
         from agent.personality import get_personality_manager
         persona_name = _current_personality.get()
         if persona_name:
@@ -355,6 +448,10 @@ class Agent:
             persona_content = pm.load(persona_name)
             if persona_content:
                 system_content = persona_content + "\n\n---\n\n" + system_content
+        # 1.6. Personality transition notice (switch without clearing history)
+        transition_note = _personality_transition.get()
+        if transition_note:
+            system_content += f"\n\n{transition_note}"
         user_id = special_session.user_id if special_session else session.user_id
 
         # 2. Session type marker

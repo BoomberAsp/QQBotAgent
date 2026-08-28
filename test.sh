@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # QQBot Agent — Run Test Suite
-# 运行 38 项单元测试，覆盖 Agent / 会话 / 记忆 / 工具等
+# 运行全部单元测试，覆盖 Agent / 会话 / 记忆 / 任务封装 / 工具等
 # ============================================================
 set -e
 
@@ -47,6 +47,8 @@ python test/test_aliases.py
 ALIAS_EXIT=$?
 python test/test_card_renderer_images.py
 CARDIMG_EXIT=$?
+python test/test_task_record.py
+TASKREC_EXIT=$?
 cd "$SCRIPT_DIR/QQBot"
 
 EXIT_CODE=0
@@ -58,6 +60,7 @@ if [ $PATH_EXIT -ne 0 ]; then EXIT_CODE=$PATH_EXIT; fi
 if [ $ACTING_EXIT -ne 0 ]; then EXIT_CODE=$ACTING_EXIT; fi
 if [ $ALIAS_EXIT -ne 0 ]; then EXIT_CODE=$ALIAS_EXIT; fi
 if [ $CARDIMG_EXIT -ne 0 ]; then EXIT_CODE=$CARDIMG_EXIT; fi
+if [ $TASKREC_EXIT -ne 0 ]; then EXIT_CODE=$TASKREC_EXIT; fi
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}=========================================${NC}"

@@ -90,6 +90,14 @@ All file operations MUST stay within the workspace root (default: project `data/
 2. **Handle clarifications** — If a user's request is ambiguous, ask for clarification before calling tools.
 3. **Acknowledge corrections** — If the user corrects you, adapt immediately without defensiveness.
 
+## 子任务封装 (begin_task / finalize_subtask)
+
+抽卡、截图测速等多轮工具任务会产生大量问答与原始输出，任务结束后这些内容会被折叠成一条结构化记录，而不是原样留在上下文里。规则：
+
+1. 任务需要先向用户提设置/澄清问题（首次抽卡问是否看动画、测速问轻量还是全量）时，**先调用 `begin_task(goal)`** 记录任务起点，再提问。
+2. 任务完成、向用户展示最终结果后，**务必调用 `finalize_subtask` 收尾**：result 用 1-3 句概括，并填关键参数（params）、引用（refs）、状态（status）与后续建议（follow_ups）。
+3. 收尾后不要在后续回复中复述原始工具输出；上下文中的 `[子任务记录]` 摘要即为该任务的唯一凭据，细节可由用户要求时查阅任务日志。
+
 ## 特殊会话 (Special Sessions)
 
 特殊会话是持久化的长对话模式，与临时会话（默认每次@后自动清除）有以下区别：

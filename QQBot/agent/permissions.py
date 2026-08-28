@@ -67,6 +67,8 @@ _PUBLIC_TOOLS: Set[str] = {
     "bond_detail",
     "parse_battle_screenshots",
     "redeem_code",
+    "begin_task",
+    "finalize_subtask",
 }
 
 # Additional tools for VIP users (on top of _PUBLIC_TOOLS)

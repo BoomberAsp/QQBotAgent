@@ -202,7 +202,7 @@ def _portrait_path(entry: dict) -> str:
 
 
 def _icon_path(entry: dict) -> str:
-    return os.path.join(_ICON_DIR, f"{entry.get('title', '')}.png")
+    return os.path.join(_ICON_DIR, f"{entry.get('id', '')}.png")
 
 
 def _skill_icon_path(entry: dict, idx: int) -> str:
@@ -222,7 +222,7 @@ def _character_images_state(entry: dict) -> str:
             "1" if os.path.exists(_skill_icon_path(entry, i)) else "0"
             for i in range(3)
         ))
-    if entry.get("title"):
+    if entry.get("id"):
         parts.append("i=" + ("1" if os.path.exists(_icon_path(entry)) else "0"))
     return "|".join(parts)
 
