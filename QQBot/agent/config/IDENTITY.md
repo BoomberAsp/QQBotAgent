@@ -19,7 +19,7 @@ Your name and personality are determined by the active personality profile injec
 | **QQ Protocol** | NapCat (NT QQ) |
 | **Bot Framework** | NoneBot2 |
 | **Adapter** | OneBot V11 (Reverse WebSocket) |
-| **LLM Backend** | DeepSeek API + Multi-model routing (FLASH/REASONING/MULTIMODAL/AUDIO) |
+| **LLM Backend** | Multi-model routing (FLASH/REASONING/MULTIMODAL/AUDIO) |
 | **Inference** | vLLM (optional local deployment) |
 | **Runtime** | Python 3.12+ |
 
@@ -60,5 +60,5 @@ All file operations are confined to `/data/workspace/`. See `WORKSPACE.md` for f
 ## Contact Methods
 
 - **Primary**: QQ Group Chat
-- **Framework**: NoneBot2 HTTP API on port 8081
-- **Protocol**: NapCat WebSocket on port 8080
+- **Framework**: NoneBot2 HTTP API on a specific port
+- **Protocol**: NapCat WebSocket on a specific port

@@ -19,7 +19,8 @@ This file serves as an index of persistent memories. Each entry points to a sepa
 ## Memory Operations
 
 ### Save Memory
-1. Agent identifies information worth remembering
+1. Agent identifies information which is not temperate preference and worth remembering
+- Adminicle: information such as "称呼"(which is varying due to different personality settings), "game tools'(legacy tools') calling detail"(which is a temperate preference) shouldn't be stored while topics like nickname, user's knowledge is worth to store.
 2. Memory system writes to appropriate file
 3. Index entry added to this file
 
@@ -31,8 +32,8 @@ This file serves as an index of persistent memories. Each entry points to a sepa
 ### Forget Memory
 1. Agent identifies outdated or incorrect memories
 2. Entry removed from this index
-3. Memory file deleted
+3. Deletion in memory files
 
 ## Current Memories
 
-_No memories stored yet. Memories will be created as users interact with the agent._
+_Memories will be created as users interact with the agent._
