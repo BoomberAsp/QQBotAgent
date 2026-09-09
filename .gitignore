@@ -4,6 +4,8 @@
 /data
 /logs
 con.env
+# WebUI 面板运行时数据（密码哈希、session、审计、PID、日志、备份）
+webui/data/
 
 # ── 虚拟环境 ─────────────────────────────────────
 myenv

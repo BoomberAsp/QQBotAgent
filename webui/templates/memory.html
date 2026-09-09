@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+  <h2 class="card-title" style="margin:0">记忆与画像</h2>
+  <span class="spacer"></span>
+  <select id="mem-type" style="width:auto">
+    <option value="">全部类型</option>
+    <option value="user">user</option>
+    <option value="knowledge">knowledge</option>
+    <option value="system">system</option>
+  </select>
+  <input id="mem-user" type="text" placeholder="user_id 过滤" style="width:130px">
+  <input id="mem-q" type="text" placeholder="搜索内容…" style="width:180px">
+  <button class="btn btn-sm" id="mem-refresh">刷新</button>
+  <button class="btn btn-sm btn-primary" id="mem-new">新建记忆</button>
+</div>
+
+<!-- 编辑/新建表单 -->
+<div class="card" id="mem-form" style="display:none">
+  <h2 class="card-title" id="mem-form-title">新建记忆</h2>
+  <div class="row" style="gap:10px;flex-wrap:wrap">
+    <label class="field" style="flex:1;min-width:180px"><span>名称（唯一标识）</span>
+      <input id="mf-name" type="text" placeholder="例如 user_preference_food"></label>
+    <label class="field" style="width:150px"><span>类型</span>
+      <select id="mf-type">
+        <option value="user">user</option>
+        <option value="knowledge">knowledge</option>
+        <option value="system">system</option>
+      </select></label>
+    <label class="field" style="width:170px"><span>user_id（user 类型必填）</span>
+      <input id="mf-user" type="text"></label>
+  </div>
+  <label class="field"><span>描述</span>
+    <input id="mf-desc" type="text"></label>
+  <label class="field"><span>内容</span>
+    <textarea id="mf-content" class="code-editor" rows="8"></textarea></label>
+  <div class="row">
+    <button class="btn btn-primary" id="mf-save">保存</button>
+    <button class="btn" id="mf-cancel">取消</button>
+  </div>
+</div>
+
+<div id="mem-list" class="muted">加载中…</div>
+<p class="muted" style="margin:8px 0 16px" id="mem-count"></p>
+
+<!-- 用户画像 -->
+<div class="card">
+  <h2 class="card-title">用户画像</h2>
+  <div class="row" style="margin-bottom:8px">
+    <input id="pf-uid" type="text" placeholder="QQ 号" style="width:180px">
+    <button class="btn btn-sm" id="pf-load">加载</button>
+    <span class="spacer"></span>
+    <button class="btn btn-sm btn-primary" id="pf-save" disabled>保存画像</button>
+  </div>
+  <textarea id="pf-editor" class="code-editor" rows="14" style="width:100%" disabled
+            placeholder="输入 QQ 号后点击加载"></textarea>
+  <p class="muted" style="margin:8px 0 0" id="pf-note">画像存于 USER_DATA_ROOT/users/{uid}/profile.json，面板以 JSON 形式编辑。</p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/memory.js"></script>
+{% endblock %}

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+  <div class="row">
+    <h2 class="card-title" style="margin:0">看门狗</h2>
+    <span id="wd-state" class="pill">—</span>
+    <span class="spacer"></span>
+    <span class="muted" id="wd-limit"></span>
+    <button class="btn btn-sm" id="wd-toggle">切换</button>
+  </div>
+  <p class="muted" style="margin:8px 0 0">
+    开启后每 <span id="wd-poll">30</span> 秒巡检一次，自动拉起应处于运行状态却退出的进程；
+    限速 <span id="wd-rate"></span>，防止崩溃风暴。通过面板「停止」的进程不会被自动拉起。
+  </p>
+</div>
+
+<div class="card">
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>进程</th><th>状态</th><th>PID</th><th>运行时长</th>
+        <th>崩溃计数</th><th style="text-align:right">操作</th>
+      </tr>
+    </thead>
+    <tbody id="proc-body">
+      <tr><td colspan="6" class="muted">加载中…</td></tr>
+    </tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/processes.js"></script>
+{% endblock %}

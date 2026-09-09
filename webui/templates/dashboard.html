@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card-grid" id="stat-cards">
+  <div class="card stat-card">
+    <div class="stat-label">NoneBot</div>
+    <div class="stat-value" id="st-nonebot">—</div>
+    <div class="stat-sub" id="st-nonebot-sub">进程管理模块待接入</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-label">NapCat</div>
+    <div class="stat-value" id="st-napcat">—</div>
+    <div class="stat-sub" id="st-napcat-sub">进程管理模块待接入</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-label">SearXNG</div>
+    <div class="stat-value" id="st-searxng">—</div>
+    <div class="stat-sub" id="st-searxng-sub">进程管理模块待接入</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-label">今日 Token</div>
+    <div class="stat-value" id="st-tokens">—</div>
+    <div class="stat-sub" id="st-tokens-sub">Token 模块待接入</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-label">未读反馈</div>
+    <div class="stat-value" id="st-feedback">—</div>
+    <div class="stat-sub" id="st-feedback-sub">反馈模块待接入</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2 class="card-title">系统资源</h2>
+  <div id="resource-panel" class="resource-panel">
+    <div class="resource-row"><span>CPU</span><div class="bar"><div id="bar-cpu"></div></div><span id="pct-cpu">—</span></div>
+    <div class="resource-row"><span>内存</span><div class="bar"><div id="bar-mem"></div></div><span id="pct-mem">—</span></div>
+    <div class="resource-row"><span>磁盘</span><div class="bar"><div id="bar-disk"></div></div><span id="pct-disk">—</span></div>
+  </div>
+  <table class="kv-table" style="margin-top:12px">
+    <tr><td>内存用量</td><td id="res-mem">—</td></tr>
+    <tr><td>磁盘用量</td><td id="res-disk">—</td></tr>
+    <tr><td>负载</td><td id="res-load">—</td></tr>
+    <tr><td>系统运行</td><td id="res-uptime">—</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h2 class="card-title">面板信息</h2>
+  <table class="kv-table" id="panel-info">
+    <tr><td>面板地址</td><td id="pi-addr">—</td></tr>
+    <tr><td>服务器时间</td><td id="pi-time">—</td></tr>
+    <tr><td>看门狗</td><td id="pi-watchdog">—</td></tr>
+    <tr><td>版本阶段</td><td>Phase 5 完成 · 进程/日志/终端/资源/数据看板/配置热管理/记忆画像/Playground</td></tr>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/dashboard.js"></script>
+{% endblock %}

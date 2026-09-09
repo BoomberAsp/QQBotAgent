@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+  <h2 class="card-title" style="margin:0">Token 消耗</h2>
+  <span class="spacer"></span>
+  <select id="tok-days">
+    <option value="7" selected>近 7 天</option>
+    <option value="14">近 14 天</option>
+    <option value="30">近 30 天</option>
+  </select>
+</div>
+
+<div class="card-grid">
+  <div class="card stat-card">
+    <div class="stat-label">总请求数</div>
+    <div class="stat-value" id="tk-requests">—</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-label">输入 Token</div>
+    <div class="stat-value" id="tk-input">—</div>
+    <div class="stat-sub" id="tk-input-sub">命中 — / 未命中 —</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-label">输出 Token</div>
+    <div class="stat-value" id="tk-output">—</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-label">缓存命中率</div>
+    <div class="stat-value" id="tk-hitrate">—</div>
+    <div class="stat-sub">按输入 token 计</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2 class="card-title">每日趋势</h2>
+  <div id="chart-daily" style="height:300px"></div>
+</div>
+
+<div class="row" style="align-items:stretch">
+  <div class="card" style="flex:1;min-width:300px">
+    <h2 class="card-title">按模型</h2>
+    <div id="chart-model" style="height:220px"></div>
+  </div>
+  <div class="card" style="flex:1;min-width:300px">
+    <h2 class="card-title">按用途</h2>
+    <table class="data-table" id="tbl-purpose"></table>
+  </div>
+</div>
+
+<div class="card">
+  <h2 class="card-title">用户排行（按总 Token）</h2>
+  <table class="data-table" id="tbl-users"></table>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/tokens.js"></script>
+{% endblock %}

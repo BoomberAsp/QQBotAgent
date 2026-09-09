@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional
 import httpx
 from nonebot import get_driver
 
+from .token_ledger import extract_usage, token_ledger
+
 
 class DeepSeekClient:
     """Async HTTP client for DeepSeek Chat Completion API.
@@ -23,6 +25,14 @@ class DeepSeekClient:
     """
 
     def __init__(self, api_key=None, api_base=None, model=None):
+        # When both api_key and api_base are passed explicitly (WebUI Playground,
+        # ModelRouter._create_client), skip the NoneBot driver lookup entirely —
+        # the panel process never initializes NoneBot, so get_driver() would raise.
+        if api_key and api_base:
+            self.api_key = api_key
+            self.api_base = api_base
+            self.model = model or "deepseek-chat"
+            return
         config = get_driver().config
         # Three-tier fallback: constructor arg → NoneBot config → env variable
         self.api_key = (
@@ -44,6 +54,7 @@ class DeepSeekClient:
         message: str,
         history: list = None,
         timeout_set: float = 180.0,
+        purpose: str = "chat",
     ) -> str:
         """Simple chat completion — single message, no tools.
 
@@ -51,6 +62,7 @@ class DeepSeekClient:
             message: User message text.
             history: Optional conversation history.
             timeout_set: Request timeout in seconds.
+            purpose: Usage-ledger purpose tag (triage / profile / chat).
 
         Returns:
             Response content string, or error message.
@@ -76,6 +88,7 @@ class DeepSeekClient:
                 )
                 response.raise_for_status()
                 result = response.json()
+                self._record_usage(result, purpose)
                 return result["choices"][0]["message"]["content"] or ""
             except httpx.ConnectTimeout:
                 return f"思考超时，最大时长{timeout_set}秒。"
@@ -91,6 +104,7 @@ class DeepSeekClient:
         messages: List[Dict[str, Any]],
         tools: List[dict],
         timeout: float = 180.0,
+        purpose: str = "agent_loop",
     ) -> Dict[str, Any]:
         """Chat completion with function/tool calling support.
 
@@ -98,6 +112,7 @@ class DeepSeekClient:
             messages: Full message list including system prompt and history.
             tools: List of tool schemas in OpenAI format.
             timeout: Request timeout in seconds.
+            purpose: Usage-ledger purpose tag (default: agent_loop).
 
         Returns:
             Dict with keys:
@@ -124,6 +139,7 @@ class DeepSeekClient:
                 )
                 response.raise_for_status()
                 result = response.json()
+                self._record_usage(result, purpose)
                 return self._parse_response(result)
             except httpx.ConnectTimeout:
                 return {
@@ -153,6 +169,22 @@ class DeepSeekClient:
                     "role": "assistant",
                     "finish_reason": "error",
                 }
+
+    # ── Usage Metering ────────────────────────────────────────────
+
+    def _record_usage(self, result: dict, purpose: str):
+        """Record token usage (input/output/cached-hit/miss) to the ledger.
+
+        Never raises — metering must not affect the request path.
+        """
+        if token_ledger is None:
+            return
+        try:
+            token_ledger.record(
+                model=self.model, purpose=purpose, usage=extract_usage(result),
+            )
+        except Exception:
+            pass
 
     # ── Response Parsing ──────────────────────────────────────────
 

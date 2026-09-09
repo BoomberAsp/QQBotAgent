@@ -18,6 +18,8 @@ from typing import Dict, Optional
 
 import httpx
 
+from .token_ledger import extract_usage, token_ledger
+
 
 class MultimodalClient:
     """Async HTTP client for multimodal LLM (image + audio understanding).
@@ -200,6 +202,7 @@ class MultimodalClient:
                 )
                 response.raise_for_status()
                 result = response.json()
+                self._record_usage(result, model, "multimodal_image")
                 message = result["choices"][0]["message"]
                 content = message.get("content", "") or "[多模态] API 返回了空内容。"
 
@@ -498,6 +501,7 @@ class MultimodalClient:
                     )
                     response.raise_for_status()
                     result = response.json()
+                    self._record_usage(result, model, "multimodal_audio")
                     output = result.get("output", {})
                     choices = output.get("choices", [])
                     if not choices:
@@ -567,6 +571,7 @@ class MultimodalClient:
                     )
                     response.raise_for_status()
                     result = response.json()
+                    self._record_usage(result, model, "multimodal_audio")
                     message = result["choices"][0]["message"]
                     content = message.get("content", "") or "[音频分析] API 返回了空内容。"
 
@@ -586,6 +591,18 @@ class MultimodalClient:
                     return f"{debug_info}\n[音频分析] 无效 API 地址: {api_base}"
                 except Exception as e:
                     return f"{debug_info}\n[音频分析] 调用异常: {str(e)}"
+
+    @staticmethod
+    def _record_usage(result: dict, model: str, purpose: str):
+        """Record token usage to the ledger. Never raises."""
+        if token_ledger is None:
+            return
+        try:
+            token_ledger.record(
+                model=model, purpose=purpose, usage=extract_usage(result),
+            )
+        except Exception:
+            pass
 
     def _build_audio_not_configured(self) -> str:
         """Return setup instructions for audio analysis."""

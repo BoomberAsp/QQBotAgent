@@ -18,20 +18,51 @@ echo -e "${RED}   QQBot Agent — 停止所有服务${NC}"
 echo -e "${RED}=========================================${NC}"
 
 # ── 1. 停止 NoneBot ─────────────────────────────────────────
+# 真实入口（已在部署服务器核实）：`cd QQBot && nb run`。`nb run` 是启动器，
+# 它会派生一个 `python3 -c "...nonebot.load_from_toml..."` 子进程真正监听 8081，
+# 所以两者都要匹配，否则杀掉 nb 父进程会留下占着端口的孤儿 worker。
+# 明确不匹配 8090 面板进程（webui.main:app），面板需单独用
+# `bash start_webui.sh stop` 停止。
 echo -e "${YELLOW}[1/3]${NC} 停止 NoneBot..."
-# Find and kill NoneBot process
-NONEBOT_PIDS=$(pgrep -f "nb run" 2>/dev/null || true)
+_nb_pids() { { pgrep -f "bin/nb run"; pgrep -f "nb run"; pgrep -f "nonebot\.load_from_toml"; pgrep -f "python.*bot\.py$"; } 2>/dev/null | sort -u || true; }
+NONEBOT_PIDS=$(_nb_pids)
 if [ -n "$NONEBOT_PIDS" ]; then
     echo "$NONEBOT_PIDS" | xargs kill 2>/dev/null
+    sleep 1
+    # 仍未退出则强制结束
+    LEFT=$(_nb_pids)
+    if [ -n "$LEFT" ]; then
+        echo "$LEFT" | xargs kill -9 2>/dev/null
+    fi
     echo -e "${GREEN}[OK]${NC} NoneBot 已停止"
+    rm -f "$SCRIPT_DIR/webui/data/nonebot.pid"
 else
     echo -e "${YELLOW}[INFO]${NC} 未找到运行中的 NoneBot 进程"
+    rm -f "$SCRIPT_DIR/webui/data/nonebot.pid"
 fi
 
-# Also check for uvicorn (NoneBot's underlying server)
+# Also check for uvicorn (NoneBot's underlying server) — 仅 8081 端口，
+# 面板的 8090 绝不在匹配范围内
 UVICORN_PIDS=$(pgrep -f "uvicorn.*8081" 2>/dev/null || true)
 if [ -n "$UVICORN_PIDS" ]; then
     echo "$UVICORN_PIDS" | xargs kill 2>/dev/null
+fi
+
+# 同步面板看门狗状态：显式停止不应在 30 秒后被看门狗拉起
+WD_STATE="$SCRIPT_DIR/webui/data/watchdog_state.json"
+if [ -f "$WD_STATE" ]; then
+    WD_PY="$HOME/.virtualenvs/QQBotAgent/bin/python"
+    [ -x "$WD_PY" ] || WD_PY="$(command -v python3)"
+    "$WD_PY" - "$WD_STATE" <<'PYEOF' 2>/dev/null || true
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+try:
+    s = json.loads(p.read_text())
+    s.setdefault("processes", {}).setdefault("nonebot", {})["should_run"] = False
+    p.write_text(json.dumps(s, indent=2))
+except Exception:
+    pass
+PYEOF
 fi
 
 # ── 2. 停止 SearXNG ─────────────────────────────────────────

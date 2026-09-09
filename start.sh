@@ -109,6 +109,11 @@ if [ "$SEARXNG_STARTED" = true ]; then
 fi
 
 # ── 5. 启动 NoneBot ─────────────────────────────────────────
+# 真实入口（已在部署服务器核实）：`cd QQBot && nb run`。
+# nb run 读取 QQBot/pyproject.toml（plugin_dirs=["plugins"]），cwd=QQBot
+# 才能让 `from agent.agent import Agent` / lib.* / tools.* 作为顶层包导入；
+# 端口 8081 来自 QQBot/.env（HOST/PORT）。切勿改成 `python bot.py`（仓库根），
+# 那会因 QQBot/ 不在 sys.path 而 ModuleNotFoundError: No module named 'agent'。
 log "启动 NoneBot Agent..."
 cd "$SCRIPT_DIR/QQBot"
 
@@ -132,12 +137,21 @@ log "NoneBot 启动中 (PID: $NONEBOT_PID)"
 # 等待启动完成
 sleep 3
 
+# ── 5.5 启动 WebUI 管理面板（独立进程，失败不影响机器人）──
+log "启动 WebUI 管理面板..."
+if bash "$SCRIPT_DIR/start_webui.sh" start; then
+    :
+else
+    warn "WebUI 面板启动失败（不影响机器人）"
+fi
+
 # ── 6. 状态展示 ─────────────────────────────────────────────
 echo ""
 echo -e "${BLUE}=========================================${NC}"
 echo -e "${GREEN}   QQBot Agent 运行中${NC}"
 echo -e "${BLUE}=========================================${NC}"
 echo -e "  NoneBot API:  ${GREEN}http://0.0.0.0:8081${NC}"
+echo -e "  WebUI 面板:   ${GREEN}http://127.0.0.1:8090${NC} (ssh -L 8090:127.0.0.1:8090 user@server)"
 echo -e "  SearXNG:      ${GREEN}http://localhost:8082${NC} $([ "$SEARXNG_STARTED" = true ] && echo '(运行中)' || echo '(未启动)')"
 echo -e "  NapCat:       $([ "$NAPCAT_RUNNING" = true ] && echo -e "${GREEN}(运行中)${NC}" || echo -e "${RED}(未运行)${NC}")"
 echo -e ""

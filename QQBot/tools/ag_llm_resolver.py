@@ -160,7 +160,17 @@ async def resolve_uncertain(items: list[dict], index: dict) -> list[dict] | None
                 headers=headers, json=body, timeout=_L4_TIMEOUT,
             )
             resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"] or ""
+            result = resp.json()
+            content = result["choices"][0]["message"]["content"] or ""
+            try:
+                from lib.token_ledger import extract_usage, token_ledger
+                if token_ledger is not None:
+                    token_ledger.record(
+                        model=cfg["model"], purpose="ag_resolver",
+                        usage=extract_usage(result),
+                    )
+            except Exception:
+                pass  # Metering must never break the resolver
     except Exception:
         return None
 

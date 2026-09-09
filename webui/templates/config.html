@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="tab-bar" id="cfg-tabs">
+  <div class="tab active" data-tab="prompts">提示词 / 人格文件</div>
+  <div class="tab" data-tab="permissions">权限名单</div>
+  <div class="tab" data-tab="models">模型配置</div>
+  <div class="tab" data-tab="group">群功能开关</div>
+  <div class="tab" data-tab="personality">人格切换配置</div>
+</div>
+
+<!-- 提示词 -->
+<div class="cfg-pane" id="pane-prompts">
+  <div class="row" style="align-items:flex-start;gap:14px">
+    <div class="card" style="width:230px;flex-shrink:0">
+      <h2 class="card-title">配置文件</h2>
+      <div id="prompt-list" class="muted">加载中…</div>
+    </div>
+    <div class="card" style="flex:1;min-width:0">
+      <div class="row" style="margin-bottom:8px">
+        <h2 class="card-title" style="margin:0" id="prompt-name">未选择文件</h2>
+        <span class="spacer"></span>
+        <span class="muted" id="prompt-meta"></span>
+        <button class="btn btn-sm btn-primary" id="prompt-save" disabled>保存</button>
+      </div>
+      <textarea id="prompt-editor" class="code-editor" rows="26" style="width:100%"
+                placeholder="← 选择左侧文件进行编辑" disabled></textarea>
+      <p class="muted" style="margin:8px 0 0">
+        保存前自动备份到面板备份目录；bot 侧 watcher 会在 5 秒内热重载，无需重启。
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- 权限 -->
+<div class="cfg-pane" id="pane-permissions" style="display:none">
+  <div class="card" style="max-width:640px">
+    <h2 class="card-title">权限名单（.env）</h2>
+    <label class="field"><span>SUPERUSERS（管理员，逗号分隔 QQ 号）</span>
+      <input id="perm-super" type="text" placeholder="123456,789012"></label>
+    <label class="field"><span>VIP_USERS（VIP 用户）</span>
+      <input id="perm-vip" type="text" placeholder="123456,789012"></label>
+    <button class="btn btn-primary" id="perm-save">保存</button>
+    <p class="muted" style="margin:10px 0 0" id="perm-note"></p>
+  </div>
+</div>
+
+<!-- 模型 -->
+<div class="cfg-pane" id="pane-models" style="display:none">
+  <div class="card" style="max-width:760px">
+    <div class="row" style="margin-bottom:8px">
+      <h2 class="card-title" style="margin:0">模型配置（models_settings.json）</h2>
+      <span class="spacer"></span>
+      <button class="btn btn-sm btn-primary" id="models-save">保存</button>
+    </div>
+    <textarea id="models-editor" class="code-editor" rows="24" style="width:100%"></textarea>
+    <p class="warn" style="margin:8px 0 0" id="models-note"></p>
+  </div>
+</div>
+
+<!-- 群功能 -->
+<div class="cfg-pane" id="pane-group" style="display:none">
+  <div class="card" style="max-width:760px">
+    <div class="row" style="margin-bottom:8px">
+      <h2 class="card-title" style="margin:0">群功能开关（group_features.json）</h2>
+      <span class="spacer"></span>
+      <button class="btn btn-sm btn-primary" id="group-save">保存</button>
+    </div>
+    <textarea id="group-editor" class="code-editor" rows="20" style="width:100%"></textarea>
+    <p class="muted" style="margin:8px 0 0" id="group-note"></p>
+  </div>
+</div>
+
+<!-- 人格 -->
+<div class="cfg-pane" id="pane-personality" style="display:none">
+  <div class="card" style="max-width:760px">
+    <h2 class="card-title">人格切换配置</h2>
+    <p class="muted">可用人格文件：<span id="pers-available" class="mono">—</span></p>
+    <label class="field"><span>personality_config.json（全局默认人格）</span>
+      <textarea id="pers-editor" class="code-editor" rows="6"></textarea></label>
+    <label class="field"><span>group_personality.json（按群覆盖）</span>
+      <textarea id="pers-group-editor" class="code-editor" rows="10"></textarea></label>
+    <button class="btn btn-primary" id="pers-save">保存</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/config.js"></script>
+{% endblock %}
