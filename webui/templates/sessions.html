@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+  <h2 class="card-title">临时会话（自动上下文）</h2>
+  <table class="data-table" id="tbl-sessions">
+    <thead><tr><th>用户</th><th>消息数</th><th>工具调用</th><th>最后活跃</th><th>大小</th><th style="text-align:right">操作</th></tr></thead>
+    <tbody><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2 class="card-title">会话详情 / 特殊会话查询</h2>
+  <div class="row" style="margin-bottom:10px">
+    <input id="ss-uid" type="text" placeholder="输入用户 QQ 号" style="width:180px">
+    <button class="btn btn-sm" id="ss-temp">查看临时上下文</button>
+    <button class="btn btn-sm" id="ss-special">查看特殊会话</button>
+    <button class="btn btn-sm btn-danger" id="ss-clear">清除临时会话</button>
+  </div>
+  <div id="ss-detail" class="log-box" style="max-height:44vh">选择用户后查看…</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/sessions.js"></script>
+{% endblock %}

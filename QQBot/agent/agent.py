@@ -236,6 +236,7 @@ class Agent:
                 messages=messages,
                 tools=schemas,
                 timeout=self.thinking_timeout,
+                purpose="agent_loop",
             )
 
             if response.get("tool_calls"):

@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+  <h2 class="card-title" style="margin:0">Agent Playground</h2>
+  <span class="spacer"></span>
+  <span class="pill badge-warn">v1 · 无工具 · 不污染线上数据</span>
+</div>
+
+<div class="card">
+  <div class="row" style="gap:12px;flex-wrap:wrap">
+    <label class="field" style="width:auto"><span>人格</span>
+      <select id="pg-personality" style="min-width:150px"></select></label>
+    <label class="field" style="width:auto"><span>模型档位</span>
+      <select id="pg-tier" style="min-width:200px"></select></label>
+    <label class="field" style="width:auto"><span>模拟角色</span>
+      <select id="pg-role" style="min-width:120px">
+        <option value="admin">admin</option>
+        <option value="vip">vip</option>
+        <option value="regular">regular</option>
+      </select></label>
+    <span class="spacer"></span>
+    <button class="btn btn-sm" id="pg-preview">预览系统提示词</button>
+    <button class="btn btn-sm" id="pg-clear">清空对话</button>
+  </div>
+  <p class="muted" style="margin:8px 0 0">
+    Playground 用 models_settings.json 里的真实模型直接对话（经 DeepSeekClient 显式参数构造，
+    不依赖 NoneBot driver）。会话仅在内存中、user_id 固定为 <span class="mono">playground</span>，
+    无工具、无记忆/画像/工作区 —— 用于验证提示词与人格效果，不会写入线上会话数据。
+    Token 用量会以 <span class="mono">playground</span> 归属记入计量表。
+  </p>
+</div>
+
+<div class="card">
+  <div id="pg-log" class="log-box" style="height:46vh;overflow-y:auto"></div>
+  <div class="row" style="margin-top:10px;align-items:flex-end">
+    <textarea id="pg-input" class="code-editor" rows="3" style="flex:1"
+              placeholder="输入消息，Ctrl+Enter 发送…"></textarea>
+    <button class="btn btn-primary" id="pg-send" style="height:42px">发送</button>
+  </div>
+  <p class="muted" style="margin:8px 0 0" id="pg-status"></p>
+</div>
+
+<div class="card" id="pg-preview-card" style="display:none">
+  <div class="row" style="margin-bottom:6px">
+    <h2 class="card-title" style="margin:0">系统提示词预览 — <span id="pg-preview-meta" class="mono"></span></h2>
+    <span class="spacer"></span>
+    <button class="btn btn-sm" id="pg-preview-close">收起</button>
+  </div>
+  <pre id="pg-preview-body" class="log-box" style="max-height:50vh;white-space:pre-wrap"></pre>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/playground.js"></script>
+{% endblock %}

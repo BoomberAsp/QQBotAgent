@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+  <h2 class="card-title" style="margin:0">Wiki 缓存状态</h2>
+  <span class="spacer"></span>
+  <span class="muted mono" id="wk-root">—</span>
+  <button class="btn btn-sm" id="wk-refresh">刷新</button>
+</div>
+
+<div class="row" style="align-items:flex-start">
+  <div class="card" id="wk-wiki" style="flex:1;min-width:280px">
+    <h2 class="card-title">wiki_cache（角色/羁绊资料）</h2>
+    <div class="muted">加载中…</div>
+  </div>
+  <div class="card" id="wk-redeem" style="flex:1;min-width:280px">
+    <h2 class="card-title">redeem_code（兑换码缓存）</h2>
+    <div class="muted">加载中…</div>
+  </div>
+</div>
+
+<p class="muted">缓存文件由 bot 侧工具维护，此处仅只读展示；如数据过期可在 Web 终端手动删除对应 JSON 触发重建。</p>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/wiki.js"></script>
+{% endblock %}

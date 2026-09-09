@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+  <h2 class="card-title" style="margin:0">任务日志</h2>
+  <span class="spacer"></span>
+  <select id="tk-user"><option value="">全部用户</option></select>
+</div>
+
+<div class="card">
+  <table class="data-table" id="tbl-tasks">
+    <thead><tr><th>时间</th><th>用户</th><th>工具</th><th>状态</th><th>目标</th><th></th></tr></thead>
+    <tbody><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+  </table>
+  <div class="row" style="margin-top:10px">
+    <button class="btn btn-sm" id="tk-prev">上一页</button>
+    <span class="muted" id="tk-pageinfo">—</span>
+    <button class="btn btn-sm" id="tk-next">下一页</button>
+  </div>
+</div>
+
+<div class="card" id="tk-detail-card" style="display:none">
+  <h2 class="card-title">任务详情</h2>
+  <div id="tk-detail" class="log-box" style="max-height:40vh"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/tasks.js"></script>
+{% endblock %}

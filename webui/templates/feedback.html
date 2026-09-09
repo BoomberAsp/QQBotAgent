@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+  <h2 class="card-title" style="margin:0">用户反馈</h2>
+  <span class="pill" id="fb-unread"></span>
+  <span class="spacer"></span>
+  <select id="fb-month"><option value="">全部月份</option></select>
+  <select id="fb-type">
+    <option value="">全部类型</option>
+    <option value="feedback">反馈</option>
+    <option value="bug">Bug</option>
+    <option value="suggestion">建议</option>
+  </select>
+  <button class="btn btn-sm" id="fb-markread">全部标为已读</button>
+</div>
+
+<div class="card">
+  <div id="fb-list" class="muted">加载中…</div>
+  <div class="row" style="margin-top:12px">
+    <button class="btn btn-sm" id="fb-prev">上一页</button>
+    <span class="muted" id="fb-pageinfo">—</span>
+    <button class="btn btn-sm" id="fb-next">下一页</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/feedback.js"></script>
+{% endblock %}

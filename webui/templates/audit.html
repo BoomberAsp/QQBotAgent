@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+  <h2 class="card-title" style="margin:0">工具审计</h2>
+  <span class="spacer"></span>
+  <select id="au-days">
+    <option value="1">近 1 天</option>
+    <option value="7" selected>近 7 天</option>
+    <option value="30">近 30 天</option>
+  </select>
+</div>
+
+<div class="card">
+  <h2 class="card-title">工具调用统计（<span id="au-total" class="mono">0</span> 次）</h2>
+  <table class="data-table" id="tbl-tools"></table>
+</div>
+
+<div class="card">
+  <div class="row" style="margin-bottom:10px">
+    <h2 class="card-title" style="margin:0">调用明细</h2>
+    <input type="date" id="au-date">
+    <input type="text" id="au-tool" placeholder="工具名" style="width:130px">
+    <input type="text" id="au-user" placeholder="用户 ID" style="width:130px">
+    <button class="btn btn-sm" id="au-search">查询</button>
+  </div>
+  <table class="data-table" id="tbl-calls"></table>
+  <div class="row" style="margin-top:10px">
+    <button class="btn btn-sm" id="au-prev">上一页</button>
+    <span class="muted" id="au-pageinfo">—</span>
+    <button class="btn btn-sm" id="au-next">下一页</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/audit.js"></script>
+{% endblock %}

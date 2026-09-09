@@ -153,6 +153,7 @@ class ModelRouter:
             result = await client.chat_completion(
                 message=prompt,
                 timeout_set=30.0,
+                purpose="triage",
             )
             # Extract the classification word
             result = result.strip().lower()

@@ -26,7 +26,8 @@ import time
 import uuid
 
 import httpx
-from nonebot import on_message
+from nonebot import on_message, get_driver
+from nonebot import logger as nonebot_logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageEvent, Message, ActionFailed
 from agent.agent import Agent
 from agent.continuous_session import ContinuousSessionManager
@@ -57,6 +58,7 @@ from agent.quota_cleanup import (
     resolve_targets,
 )
 from lib.model_router import ModelRouter
+from lib.token_ledger import set_usage_context
 from tools.builtin_tools import (
     execute_code,
     get_system_load,
@@ -97,6 +99,34 @@ _CONFIG_DIR = os.path.join(_AGENT_DIR, "agent", "config")
 _DATA_DIR = os.path.join(_AGENT_DIR, "data")
 _USER_DATA_ROOT = os.environ.get("USER_DATA_ROOT", os.path.join(_AGENT_DIR, "data", "users_store"))
 _HELP_MD_PATH = os.path.join(_CONFIG_DIR, "HELP.md")
+
+
+# ── File logging (launcher-independent) ──────────────────────────
+# Production runs the bot via `cd QQBot && nb run`, which never executes
+# bot.py, so the loguru file sink must be installed here (this plugin is
+# always imported under nb run). Mirrors all loguru output — including
+# NoneBot's own logger — to QQBot/logs/bot_YYYY-MM-DD.log so the WebUI
+# panel's log viewer has a stable file to read regardless of how the bot
+# was launched. Idempotent: added once per process, never raises.
+def _setup_file_logging():
+    try:
+        from loguru import logger as _logger
+        log_dir = os.path.join(_AGENT_DIR, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        _logger.add(
+            os.path.join(log_dir, "bot_{time:YYYY-MM-DD}.log"),
+            rotation="10 MB",
+            retention="7 days",
+            encoding="utf-8",
+            enqueue=True,
+            level="INFO",
+        )
+    except Exception:
+        pass  # 日志文件化失败绝不影响机器人运行
+
+
+_setup_file_logging()
+
 
 # ── Workspace Initialization ─────────────────────────────────────
 
@@ -949,6 +979,41 @@ _continuous_sessions = ContinuousSessionManager(timeout_minutes=1.5)
 
 _perm_manager = PermissionManager()
 
+
+# ── Config hot-reload watcher ──────────────────────────────────────
+# 每 5 秒检查 agent/config/ 下所有 *.md（含 personalities/）的 mtime，
+# 有变化则调用 agent.reload_configs()。配合 WebUI 面板的配置热编辑：
+# 面板保存提示词后 5 秒内生效，无需重启机器人。
+# 带 5 秒冷却，防止连续写入触发抖动重载。
+@get_driver().on_startup
+async def _start_config_watcher():
+    async def _watch():
+        last_mtimes: dict = {}
+        last_reload = 0.0
+        while True:
+            await asyncio.sleep(5)
+            try:
+                mtimes = {}
+                for root, _dirs, files in os.walk(_CONFIG_DIR):
+                    for fn in files:
+                        if fn.endswith(".md"):
+                            p = os.path.join(root, fn)
+                            try:
+                                mtimes[p] = os.path.getmtime(p)
+                            except OSError:
+                                pass
+                if last_mtimes and mtimes != last_mtimes \
+                        and time.time() - last_reload > 5:
+                    agent.reload_configs()
+                    last_reload = time.time()
+                    nonebot_logger.info("检测到配置文件变化，已热重载系统提示词")
+                last_mtimes = mtimes
+            except Exception:
+                pass
+
+    asyncio.create_task(_watch())
+
+
 # Per-user busy flag — prevents concurrent message processing for the
 # same user. When a user's message is being processed, subsequent
 # messages from that user are rejected with a brief "busy" reply.
@@ -1534,6 +1599,11 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
 async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str):
     """Inner implementation — called under per-user busy guard."""
 
+    # Token-usage attribution: set before triage so every LLM call of this
+    # turn (triage / agent_loop / profile extraction) is tied to this user.
+    _gid = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+    set_usage_context(user_id, _gid, "group" if _gid else "private")
+
     # Set user workspace for tool scoping
     _workspace_manager.ensure_dirs(user_id)
     _current_user_workspace.set(_workspace_manager.get_workspace(user_id))
@@ -1904,6 +1974,9 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
 
 async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id: str, group_id: str):
     """Inner implementation — called under per-user busy guard."""
+
+    # Token-usage attribution (see _handle_agent_message_impl).
+    set_usage_context(user_id, group_id, "group")
 
     text_content = event.get_plaintext().strip()
 

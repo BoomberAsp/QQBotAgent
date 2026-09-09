@@ -236,7 +236,9 @@ class ProfileManager:
         )
 
         try:
-            result = await self.client.chat_completion(prompt, timeout_set=30.0)
+            result = await self.client.chat_completion(
+                prompt, timeout_set=30.0, purpose="profile",
+            )
             extracted = self._parse_json(result)
 
             if not extracted:

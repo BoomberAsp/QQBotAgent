@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 · Roxy 管理面板</title>
+<link rel="icon" href="/static/img/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body class="login-body">
+<div class="login-card">
+  <div class="brand login-brand">
+    <span class="brand-dot"></span>
+    <div>
+      <div class="brand-name">Roxy 管理面板</div>
+      <div class="brand-sub">QQBotAgent WebUI</div>
+    </div>
+  </div>
+
+  <form id="login-form" autocomplete="off">
+    {% if setup_mode %}
+    <p class="login-hint">首次使用，请设置管理员密码（至少 8 位）。</p>
+    {% endif %}
+    <label class="field">
+      <span>管理员密码</span>
+      <input type="password" id="password" name="password" autofocus minlength="8">
+    </label>
+    <div id="login-error" class="form-error" hidden></div>
+    <button type="submit" class="btn btn-primary btn-block" id="login-btn">
+      {{ '设置密码并进入' if setup_mode else '登录' }}
+    </button>
+  </form>
+
+  <p class="login-tip">面板仅监听 127.0.0.1，请通过 SSH 隧道访问：<br>
+    <code>ssh -L 8090:127.0.0.1:8090 user@server</code></p>
+</div>
+
+<script>
+(function () {
+  const form = document.getElementById('login-form');
+  const errBox = document.getElementById('login-error');
+  const btn = document.getElementById('login-btn');
+  const SETUP_MODE = {{ 'true' if setup_mode else 'false' }};
+
+  function showErr(msg) {
+    errBox.textContent = msg;
+    errBox.hidden = false;
+  }
+
+  async function checkLock() {
+    try {
+      const r = await fetch('/api/auth/status');
+      const s = await r.json();
+      if (s.locked) {
+        btn.disabled = true;
+        showErr('面板已锁定，请 ' + s.lock_seconds + ' 秒后刷新重试');
+      }
+    } catch (e) { /* panel unreachable */ }
+  }
+
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    errBox.hidden = true;
+    const password = document.getElementById('password').value;
+    const endpoint = SETUP_MODE ? '/api/auth/setup' : '/api/auth/login';
+    btn.disabled = true;
+    try {
+      const r = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      const data = await r.json();
+      if (r.ok && (data.ok)) {
+        window.location.href = '/';
+        return;
+      }
+      showErr(data.error || '操作失败');
+      btn.disabled = false;
+      if (r.status === 429) checkLock();
+    } catch (e) {
+      showErr('无法连接面板服务');
+      btn.disabled = false;
+    }
+  });
+
+  checkLock();
+})();
+</script>
+</body>
+</html>

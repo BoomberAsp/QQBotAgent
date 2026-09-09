@@ -69,13 +69,15 @@ class MockDeepSeekClient:
         self.tool_call_response = None  # Set per test
         self.should_fail = False
 
-    async def chat_completion(self, message: str, history=None, timeout_set=180.0):
+    async def chat_completion(self, message: str, history=None, timeout_set=180.0,
+                              purpose="chat"):
         self.chat_calls.append(("chat", message, history))
         if self.should_fail:
             return "模拟API错误"
         return self.plain_response
 
-    async def chat_completion_with_tools(self, messages, tools, timeout=180.0):
+    async def chat_completion_with_tools(self, messages, tools, timeout=180.0,
+                                         purpose="agent_loop"):
         self.chat_calls.append(("chat_with_tools", messages, tools))
         if self.should_fail:
             return {
@@ -481,7 +483,7 @@ class TestAgentCore:
 
         original_method = mock_client.chat_completion_with_tools
 
-        async def staged_response(messages, tools, timeout=180.0):
+        async def staged_response(messages, tools, timeout=180.0, **_kwargs):
             call_count[0] += 1
             if call_count[0] == 1:
                 # Stage 1: LLM decides to call get_time tool
@@ -594,7 +596,7 @@ class TestAgentCore:
         mock_client = MockDeepSeekClient()
 
         # Always return tool calls (infinite loop simulation)
-        async def always_tool_calls(messages, tools, timeout=180.0):
+        async def always_tool_calls(messages, tools, timeout=180.0, **_kwargs):
             return {
                 "content": None,
                 "tool_calls": [{
@@ -641,7 +643,7 @@ class TestAgentCore:
             mock_client = MockDeepSeekClient()
             call_count = [0]
 
-            async def staged(messages, tools, timeout=180.0):
+            async def staged(messages, tools, timeout=180.0, **_kwargs):
                 call_count[0] += 1
                 if call_count[0] == 1:
                     return {
@@ -726,7 +728,7 @@ class TestAgentCore:
             mock_client = MockDeepSeekClient()
             call_count = [0]
 
-            async def staged(messages, tools, timeout=180.0):
+            async def staged(messages, tools, timeout=180.0, **_kwargs):
                 call_count[0] += 1
                 if call_count[0] == 1:
                     return {
@@ -1255,6 +1257,161 @@ class TestPersonality:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class TestTokenLedger:
+    """Test the token usage ledger (metering master table)."""
+
+    def run(self):
+        print_header("8. TokenLedger Tests")
+
+        self.test_extract_usage_deepseek_format()
+        self.test_extract_usage_missing()
+        self.test_extract_usage_dashscope_native()
+        self.test_extract_usage_clamps_cache()
+        self.test_record_and_summary()
+        self.test_aggregate_day()
+        self.test_format_summary()
+
+    def test_extract_usage_deepseek_format(self):
+        from lib.token_ledger import extract_usage
+        result = {
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+                "total_tokens": 1200,
+                "prompt_tokens_details": {"cached_tokens": 800},
+            }
+        }
+        u = extract_usage(result)
+        assert u["input_tokens"] == 1000, u
+        assert u["output_tokens"] == 200, u
+        assert u["cached_input_tokens"] == 800, u
+        assert u["uncached_input_tokens"] == 200, u
+        print_pass("extract_usage: DeepSeek format splits hit/miss input")
+
+    def test_extract_usage_missing(self):
+        from lib.token_ledger import extract_usage
+        assert extract_usage({}) == {
+            "input_tokens": 0, "output_tokens": 0,
+            "cached_input_tokens": 0, "uncached_input_tokens": 0,
+        }
+        # usage present but no cache details → all input counts as miss
+        u = extract_usage({"usage": {"prompt_tokens": 50, "completion_tokens": 5}})
+        assert u["cached_input_tokens"] == 0 and u["uncached_input_tokens"] == 50, u
+        print_pass("extract_usage: missing/partial usage yields safe zeros")
+
+    def test_extract_usage_dashscope_native(self):
+        from lib.token_ledger import extract_usage
+        # dashscope native multimodal-generation response shape
+        result = {"usage": {"input_tokens": 300, "output_tokens": 40}}
+        u = extract_usage(result)
+        assert u["input_tokens"] == 300 and u["output_tokens"] == 40, u
+        # alternate cache-hit key used by some providers
+        result2 = {"usage": {"prompt_tokens": 100, "completion_tokens": 10,
+                             "prompt_cache_hit_tokens": 60}}
+        u2 = extract_usage(result2)
+        assert u2["cached_input_tokens"] == 60, u2
+        assert u2["uncached_input_tokens"] == 40, u2
+        print_pass("extract_usage: dashscope native + prompt_cache_hit_tokens")
+
+    def test_extract_usage_clamps_cache(self):
+        from lib.token_ledger import extract_usage
+        result = {
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1,
+                      "prompt_tokens_details": {"cached_tokens": 9999}}
+        }
+        u = extract_usage(result)
+        assert u["cached_input_tokens"] == 10, u
+        assert u["uncached_input_tokens"] == 0, u
+        print_pass("extract_usage: cached_tokens clamped to input_tokens")
+
+    def test_record_and_summary(self):
+        import tempfile, shutil
+        from lib import token_ledger as tl
+        tmpdir = tempfile.mkdtemp(prefix="token_ledger_test_")
+        try:
+            ledger = tl.TokenLedger(data_dir=tmpdir)
+            # Attribution context (set by agent_router per message)
+            token = tl.usage_context.set(
+                {"user_id": "u1", "group_id": "g1", "chat_type": "group"}
+            )
+            ledger.record("deepseek-v4-pro", "agent_loop", {
+                "input_tokens": 1000, "output_tokens": 200,
+                "cached_input_tokens": 800, "uncached_input_tokens": 200,
+            })
+            ledger.record("deepseek-v4-flash", "triage", {
+                "input_tokens": 100, "output_tokens": 5,
+                "cached_input_tokens": 0, "uncached_input_tokens": 100,
+            })
+            tl.usage_context.reset(token)
+
+            # JSONL detail: one file, two entries, fields intact
+            import glob, json
+            files = glob.glob(f"{tmpdir}/usage_*.jsonl")
+            assert len(files) == 1, files
+            with open(files[0], encoding="utf-8") as f:
+                entries = [json.loads(line) for line in f if line.strip()]
+            assert len(entries) == 2, entries
+            e0 = entries[0]
+            assert e0["user_id"] == "u1" and e0["chat_type"] == "group", e0
+            assert e0["cached_input_tokens"] == 800, e0
+            assert e0["uncached_input_tokens"] == 200, e0
+
+            # Summary table: totals + per-model + per-purpose breakdowns
+            s = ledger.read_summary()
+            t = s["totals"]
+            assert t["requests"] == 2, t
+            assert t["input_tokens"] == 1100, t
+            assert t["output_tokens"] == 205, t
+            assert t["cached_input_tokens"] == 800, t
+            assert t["uncached_input_tokens"] == 300, t
+            assert s["by_model"]["deepseek-v4-pro"]["input_tokens"] == 1000
+            assert s["by_model"]["deepseek-v4-flash"]["cached_input_tokens"] == 0
+            assert s["by_purpose"]["triage"]["requests"] == 1
+            assert s["by_purpose"]["agent_loop"]["output_tokens"] == 200
+            assert len(s["daily"]) == 1
+            print_pass("record: JSONL detail + totals/by_model/by_purpose correct")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_aggregate_day(self):
+        import tempfile, shutil
+        from datetime import datetime
+        from lib.token_ledger import TokenLedger
+        tmpdir = tempfile.mkdtemp(prefix="token_ledger_test_")
+        try:
+            ledger = TokenLedger(data_dir=tmpdir)
+            ledger.record("m1", "chat", {
+                "input_tokens": 10, "output_tokens": 2,
+                "cached_input_tokens": 4, "uncached_input_tokens": 6,
+            })
+            today = datetime.now().strftime("%Y-%m-%d")
+            agg = ledger.aggregate_day(today)
+            assert agg["requests"] == 1 and agg["input_tokens"] == 10, agg
+            assert agg["cached_input_tokens"] == 4, agg
+            assert ledger.aggregate_day("1999-01-01")["requests"] == 0
+            print_pass("aggregate_day: recomputes day totals from JSONL")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_format_summary(self):
+        import tempfile, shutil
+        from lib.token_ledger import TokenLedger
+        tmpdir = tempfile.mkdtemp(prefix="token_ledger_test_")
+        try:
+            ledger = TokenLedger(data_dir=tmpdir)
+            ledger.record("m1", "agent_loop", {
+                "input_tokens": 100, "output_tokens": 10,
+                "cached_input_tokens": 25, "uncached_input_tokens": 75,
+            })
+            text = ledger.format_summary()
+            assert "命中25" in text, text
+            assert "未命中75" in text, text
+            assert "25.0%" in text, text  # hit rate = 25/100
+            print_pass("format_summary: renders hit-rate table")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ── Main Runner ──────────────────────────────────────────────────
 
 def main():
@@ -1273,6 +1430,7 @@ def main():
         ("DeepSeekClient Parsing", TestDeepSeekClientParsing()),
         ("Built-in Tools", TestBuiltinTools()),
         ("Personality Manager", TestPersonality()),
+        ("TokenLedger", TestTokenLedger()),
     ]
 
     passed = 0

@@ -40,6 +40,9 @@ from nonebot.rule import command
 
 def init():
     # 初始化 NoneBot
+    # 注意：文件日志（QQBot/logs/bot_*.log）由 agent_router.py 的
+    # _setup_file_logging() 在插件导入时安装 —— 生产用 `cd QQBot && nb run`
+    # 启动，不会执行本文件，所以 sink 必须放在被 nb run 加载的插件里。
     # DeepSeek API key from environment variable (set in QQBot/.env)
     nonebot.init(command_start={"/", ""}, command_sep={" ",},
                  DEEPSEEK_API_KEY=os.getenv("DEEPSEEK_API_KEY"),
