@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .tool_registry import ToolRegistry
 from .session import Session, SessionManager
-from .memory import MemorySystem, MemoryEntry
+from .memory import MemorySystem, TieredMemory
 from .profile import ProfileManager
 from .hardware import HardwareDetector, HardwareProfile
 from .workspace import UserWorkspaceManager
@@ -22,13 +22,9 @@ from .special_session import SpecialSessionManager, SpecialSession
 from .task_record import build_auto_record, build_compact_line, append_task_log
 
 
-# Long-term memory write policy. Only interactions whose combined
-# user+assistant length exceeds MIN_REMEMBER_LEN are persisted, and each user
-# is capped at MAX_MEMORIES_PER_USER entries (oldest pruned first). This keeps
-# the memory store bounded and prevents low-value/hallucinated replies from
-# accumulating and later re-entering the prompt via keyword search.
-MIN_REMEMBER_LEN = 800
-MAX_MEMORIES_PER_USER = 20
+# P1: long-term memory is now the three-tier engine (TieredMemory), driven
+# entirely through ProfileManager extraction. The old _maybe_remember raw-dump
+# path (MIN_REMEMBER_LEN / MAX_MEMORIES_PER_USER) is removed.
 
 # TaskRecord auto-compression: a turn that used one of the known multi-turn task
 # tools and whose final response exceeds AUTO_COMPRESS_MIN_LEN is folded into a
@@ -83,6 +79,7 @@ class Agent:
         config_dir: str,
         session_manager: Optional[SessionManager] = None,
         memory_system: Optional[MemorySystem] = None,
+        tiered_memory: Optional[TieredMemory] = None,
         profile_manager: Optional[ProfileManager] = None,
         hardware_detector: Optional[HardwareDetector] = None,
         workspace_manager: Optional[UserWorkspaceManager] = None,
@@ -95,6 +92,7 @@ class Agent:
         self.config_dir = config_dir
         self.sessions = session_manager or SessionManager()
         self.memory = memory_system
+        self.tiered_memory = tiered_memory  # P1 three-tier engine (MEDIUM injection)
         self.profiles = profile_manager
         self.hardware_detector = hardware_detector
         self.hardware: Optional[HardwareProfile] = None
@@ -403,10 +401,10 @@ class Agent:
                         session.trim(self.sessions.max_context_messages)
                         self.sessions.update(user_id, session)
 
-                # Save substantive interactions to long-term memory
-                await self._maybe_remember(user_id, user_message, final_content)
-
-                # Fire background task: extract user facts → update profile
+                # Fire background task: extract user facts + judge memory → profile.
+                # P1: the three-tier memory engine is driven entirely through
+                # ProfileManager.observe_turn (merged extract+judge). The old
+                # _maybe_remember raw-dump path is removed.
                 self._schedule_profile_update(user_id, user_message, final_content)
 
                 return final_content
@@ -431,7 +429,7 @@ class Agent:
         3. User profile context (from ProfileManager)
         4. Workspace quota context (if in special session)
         5. Permission role context (if not admin)
-        6. Relevant long-term memories (from MemorySystem)
+        6. MEDIUM-tier memory injection (from TieredMemory, P1)
         7. Conversation history (from Session or SpecialSession)
         8. Current user message
         """
@@ -504,15 +502,15 @@ class Agent:
         if group_ctx:
             messages[0]["content"] += group_ctx
 
-        # 5. Relevant long-term memories (scoped to user_id)
-        if self.memory:
-            memories = self.memory.search(user_message, user_id=user_id)
-            if memories:
-                mem_lines = ["\n## Relevant Past Interactions"]
-                for m in memories[:3]:
-                    snippet = m.content[:200].replace("\n", " ")
-                    mem_lines.append(f"- {m.description}: {snippet}")
-                messages[0]["content"] += "\n".join(mem_lines)
+        # 5. MEDIUM-tier memory injection (P1 three-tier engine).
+        # Replaces the old MemorySystem.search substring injection. NOTE: legacy
+        # shared knowledge/system memories are no longer injected here (out of P1
+        # scope, Decision 8 — audit prod knowledge/ + system/ before deploy).
+        # LONG-index injection is P2.
+        if self.tiered_memory:
+            medium_block = self.tiered_memory.build_medium_injection(user_id)
+            if medium_block:
+                messages[0]["content"] += "\n\n" + medium_block
 
         # 5. Conversation history
         if special_session:
@@ -644,44 +642,6 @@ class Agent:
         except Exception:
             pass  # Audit logging must never break the main flow
 
-    # ── Memory ────────────────────────────────────────────────────
-
-    async def _maybe_remember(
-        self, user_id: str, user_message: str, agent_response: str
-    ):
-        """Conditionally save important interactions to long-term memory.
-
-        Only substantive interactions (combined length above MIN_REMEMBER_LEN)
-        are persisted. After saving, the per-user memory list is capped at
-        MAX_MEMORIES_PER_USER, pruning the oldest entries first.
-        """
-        if not self.memory:
-            return
-
-        combined_len = len(user_message) + len(agent_response)
-        if combined_len <= MIN_REMEMBER_LEN:
-            return
-
-        summary = user_message[:100] + ("..." if len(user_message) > 100 else "")
-        entry = MemoryEntry(
-            name=f"interaction_{user_id}_{int(time.time())}",
-            description=f"Conversation with {user_id}: {summary}",
-            type="user",
-            user_id=user_id,
-            content=f"## User Message\n{user_message}\n\n## Agent Response\n{agent_response[:500]}",
-        )
-        self.memory.save(entry)
-
-        # Retention: prune oldest entries beyond the per-user cap.
-        try:
-            all_user = self.memory.list_all("user", user_id=user_id)
-            if len(all_user) > MAX_MEMORIES_PER_USER:
-                all_user.sort(key=lambda m: m.created_at)
-                for old in all_user[: len(all_user) - MAX_MEMORIES_PER_USER]:
-                    self.memory.forget(old.name, "user", user_id=user_id)
-        except Exception:
-            pass  # Retention must never break the main flow
-
     # ── Profile Update ──────────────────────────────────────────────
 
     def _schedule_profile_update(
@@ -764,6 +724,7 @@ class Agent:
             "tool_names": self.tools.list_tools(),
             "config_dir": self.config_dir,
             "has_memory": self.memory is not None,
+            "has_tiered_memory": self.tiered_memory is not None,
             "has_profile_manager": self.profiles is not None,
         }
 

@@ -94,8 +94,18 @@ _L2B_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
     )),
     # error / failure markers (transient incidents, not durable facts)
     ("error_marker", re.compile(r"报错|失败|超时|异常|崩溃|卡住")),
-    # transient state markers
-    ("transient_state", re.compile(r"正在|当前正|刚刚|刚才|这次|本次")),
+    # NOTE (P1, 2026-09): the former `transient_state` category
+    # (正在|当前正|刚刚|刚才|这次|本次) was REMOVED ENTIRELY.
+    # Why: bare 正在 false-dropped legitimate REAL-LIFE ongoing activities
+    # ("用户正在通过饮食调整降血脂" / "用户正在做力量训练…" — these PASS the
+    # litmus test and must be KEPT). Two such facts were wrongly dropped from
+    # user 1114144652 in the 2026-09-14 prod cleanup (dormant `facts` field,
+    # backed up; restored via scripts/migrate_memory_p1.py --restore-false-drops).
+    # The other markers were redundant: bot-session cases (当前正在使用连续对话 /
+    # 本次会话) are already caught by L2-A bot_state + L2-C unresolved_ref, and
+    # gacha cases (刚刚十连) by L2-A gacha + L2-B gacha_result. Pure bot-transient
+    # events (刚刚上传 / 这次搜索) are now Layer 1's job — litmus test + few-shot
+    # 例5 in profile.py. See Profile-Fact-Extraction-Plan §12.2.
 ]
 
 

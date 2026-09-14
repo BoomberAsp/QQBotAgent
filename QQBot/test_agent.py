@@ -410,6 +410,7 @@ class TestAgentCore:
         asyncio.run(self.test_max_iterations())
         asyncio.run(self.test_auto_compress_fallback())
         asyncio.run(self.test_task_fold_persistence())
+        asyncio.run(self.test_medium_memory_injection())
 
     async def test_bootstrap(self):
         from agent.tool_registry import ToolRegistry
@@ -849,46 +850,51 @@ class TestAgentCore:
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    async def test_memory_injection(self):
+    async def test_medium_memory_injection(self):
+        """P1: MEDIUM-tier memory (from TieredMemory) is injected into the system
+        prompt; the legacy MemorySystem.search substring injection is gone."""
         from agent.tool_registry import ToolRegistry
-        from agent.memory import MemorySystem, MemoryEntry
+        from agent.memory import TieredMemory
         from agent.agent import Agent
 
         tmpdir = tempfile.mkdtemp()
         try:
             mock_client = MockDeepSeekClient()
-            mock_client.plain_response = "关于Python..."
+            mock_client.plain_response = "关于力量训练..."
 
-            mem_sys = MemorySystem(base_dir=tmpdir)
-            mem_sys.save(MemoryEntry(
-                name="python_discussion",
-                description="Python discussion",
-                type="knowledge",
-                content="上次和用户讨论了Python装饰器的用法",
+            tm = TieredMemory(base_dir=tmpdir)
+            # Seed a MEDIUM item directly (count>=5 so it is NOT low-confidence).
+            st = tm._get_state("user_abc")
+            from agent.memory import MediumItem
+            st.medium.append(MediumItem(
+                id="m1", content="用户正在做力量训练，按酸痛程度分割训练循环",
+                count=6, entry_extraction_index=0,
             ))
 
             agent = Agent(
                 deepseek_client=mock_client,
                 tool_registry=ToolRegistry(),
                 config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
-                memory_system=mem_sys,
+                tiered_memory=tm,
             )
 
-            agent._captured = None
+            captured = {}
             original = agent._build_messages
 
-            def capture(session, msg):
-                msgs = original(session, msg)
-                agent._captured = msgs
+            def capture(session, msg, *a, **k):
+                msgs = original(session, msg, *a, **k)
+                captured["msgs"] = msgs
                 return msgs
 
             agent._build_messages = capture
+            await agent.run("今天练什么好？", "user_abc")
 
-            await agent.run("Python装饰器怎么用？", "user_abc")
-
-            system_content = agent._captured[0]["content"]
-            assert "装饰器" in system_content, f"Memory not injected: {system_content[:300]}"
-            print_pass("Relevant memories injected into system prompt")
+            system_content = captured["msgs"][0]["content"]
+            assert "用户记忆（中期）" in system_content, f"MEDIUM block missing: {system_content[-400:]}"
+            assert "力量训练" in system_content, f"MEDIUM fact not injected: {system_content[-400:]}"
+            # count>=5 → no low-confidence label
+            assert "(低置信)" not in system_content, "count>=5 must NOT be low-confidence"
+            print_pass("P1 MEDIUM-tier memory injected into system prompt")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1065,12 +1071,14 @@ class TestProfileExtraction:
             "抽到了UP角色": "L2B:gacha_result",
             "获得了2个4星紫色羁绊": "L2B:gacha_result",
             "请求超时了": "L2B:error_marker",
-            "用户正在上传文件": "L2B:transient_state",
+            # P1: the `transient_state` category was removed entirely (bare 正在
+            # false-dropped real-life ongoing activities). Bot-transient events
+            # are now Layer 1's job; bot-state compounds still hit L2-A/L2-C.
         }
         for text, cat in cases.items():
             r = filter_candidate(text)
             assert not r.keep and r.category == cat, f"{text!r}: want {cat}, got {r.category} (keep={r.keep})"
-        print_pass("Layer2-B: regex dropped (capacity/gacha_result/error/transient)")
+        print_pass("Layer2-B: regex dropped (capacity/gacha_result/error)")
 
     def test_l2c_structural_rules(self):
         from agent.fact_filter import filter_candidate
@@ -1095,6 +1103,11 @@ class TestProfileExtraction:
             "这个城市很好",               # bare 这个
             "用户获得了计算机硕士学位",   # bare 获得 (legit, not gacha)
             "用户出版了一本书",           # legit
+            # P1: real-life ongoing activities (正在) MUST be kept — these were
+            # false-dropped by the now-removed transient_state rule (the two
+            # facts wrongly deleted from user 1114144652 in the 2026-09-14 cleanup).
+            "用户正在通过饮食调整降血脂",
+            "用户正在做力量训练，按酸痛程度自由分割训练循环",
         ]
         for text in legit:
             r = filter_candidate(text)
@@ -1119,9 +1132,24 @@ class TestProfileExtraction:
         )
         assert "new_facts" not in prompt, "P0 schema must NOT request new_facts"
         for token in ["石蕊测试", "助手(Roxy)", "few-shot", "<conversation>",
-                      "new_interests", "new_preferences"]:
+                      "new_interests", "new_preferences",
+                      # P1: the merged extract+judge call always advertises the
+                      # memory_candidates schema (§12.1), even with no judge_list.
+                      "memory_candidates", "reinforce_short", "matched_id"]:
             assert token in prompt, f"prompt missing {token!r}"
-        print_pass("Layer1 prompt: litmus + few-shot + third-person block; no new_facts")
+        # No judge_list → the "暂无已有记忆" branch tells the model to use judge="new".
+        assert "暂无已有记忆" in prompt, "empty judge_list must use the no-memory branch"
+        # With a judge_list → the existing-memory section embeds each item + the
+        # four judge verbs so the single flash call can route candidates.
+        jp = ProfileManager._build_extraction_prompt(
+            conv, {"nickname": None, "interests": [], "preferences": {}},
+            judge_list=[{"id": "abc123", "content": "用户喜欢原神", "count": 4, "tier": "medium"}],
+        )
+        for token in ["abc123", "用户喜欢原神", "已有记忆",
+                      "new", "reinforce_short", "update", "keep"]:
+            assert token in jp, f"judge prompt missing {token!r}"
+        assert "暂无已有记忆" not in jp, "non-empty judge_list must NOT use the no-memory branch"
+        print_pass("Layer1 prompt: litmus + few-shot + memory_candidates schema + judge list")
 
     def test_format_conversation_window(self):
         from agent.profile import (
@@ -1666,6 +1694,586 @@ class TestTokenLedger:
 
 # ── Main Runner ──────────────────────────────────────────────────
 
+class TestTieredMemory:
+    """P1 three-tier memory engine (SHORT/MEDIUM/LONG) — agent/memory.py:TieredMemory."""
+
+    def _tm(self, tmpdir):
+        from agent.memory import TieredMemory
+        return TieredMemory(base_dir=tmpdir)
+
+    def run(self):
+        print_header("4.7. TieredMemory (P1 three-tier engine)")
+        self.test_short_new_enters_front()
+        self.test_short_exact_dup_guard()
+        self.test_short_reinforce_moves_front()
+        self.test_short_promote_at_count_3()
+        self.test_short_overflow_evicts_tail()
+        self.test_medium_update_refines_and_resets_age()
+        self.test_medium_keep_increments()
+        self.test_invalid_matched_id_falls_back_to_new()
+        self.test_age_demotion_to_short()
+        self.test_medium_max_safety_net()
+        self.test_long_creation_twin_kept_idempotent()
+        self.test_long_snapshot_turns_from_batch()
+        self.test_judge_list_composition()
+        self.test_injection_empty_returns_blank()
+        self.test_injection_low_confidence_label()
+        self.test_injection_top_n_plus_recent()
+        self.test_injection_token_cap()
+        self.test_touch_extraction_count()
+        self.test_persistence_roundtrip()
+        self.test_load_all()
+
+    # ── SHORT ────────────────────────────────────────────────────
+
+    def test_short_new_enters_front(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            s = tm.ingest_candidates("u", [("用户喜欢原神", "new", None), ("用户是程序员", "new", None)])
+            st = tm._get_state("u")
+            assert s["new_short"] == 2, s
+            assert len(st.short) == 2 and not st.medium
+            # newest inserted at front (index 0)
+            assert st.short[0].content == "用户是程序员", [x.content for x in st.short]
+            assert all(x.count == 1 for x in st.short)
+            print_pass("SHORT: new candidates enter at front, count=1")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_short_exact_dup_guard(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            tm.ingest_candidates("u", [("用户喜欢原神", "new", None)])
+            s = tm.ingest_candidates("u", [("用户喜欢原神", "new", None)])  # verbatim dup
+            st = tm._get_state("u")
+            assert len(st.short) == 1, "exact dup must NOT create a 2nd SHORT item"
+            assert st.short[0].count == 2, "exact dup reinforces instead"
+            assert s["reinforced_short"] == 1 and s["new_short"] == 0, s
+            print_pass("SHORT: exact-dup guard reinforces instead of duplicating")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_short_reinforce_moves_front(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import ShortItem, SHORT_PRIORITY_STEP
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            # build a list longer than SHORT_PRIORITY_STEP so the move is observable
+            for i in range(SHORT_PRIORITY_STEP + 3):
+                st.short.append(ShortItem(id=f"s{i}", content=f"事实{i}", count=1))
+            target = st.short[SHORT_PRIORITY_STEP + 1]   # deep item
+            tm.ingest_candidates("u", [("事实X", "reinforce_short", target.id)])
+            new_idx = st.short.index(target)
+            assert new_idx == 1, f"moved to idx {new_idx}, expected 1 (front by STEP)"
+            assert target.count == 2
+            print_pass("SHORT: reinforce moves item toward front + count+1")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_short_promote_at_count_3(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import ShortItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.short.append(ShortItem(id="s1", content="用户喜欢原神", count=2))
+            s = tm.ingest_candidates("u", [("用户喜欢原神", "reinforce_short", "s1")])
+            assert s["promoted_to_medium"] == 1, s
+            assert not st.short, "promoted item leaves SHORT"
+            assert len(st.medium) == 1 and st.medium[0].count == 3
+            assert st.medium[0].id == "s1", "promotion keeps the same id"
+            assert st.medium[0].entry_extraction_index == st.extraction_count
+            print_pass("SHORT→MEDIUM: promotes at count=3, keeps id, anchors age")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_short_overflow_evicts_tail(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import SHORT_MAX
+            tm = self._tm(tmp)
+            for i in range(SHORT_MAX + 10):
+                tm.ingest_candidates("u", [(f"独特事实编号{i}", "new", None)])
+            st = tm._get_state("u")
+            assert len(st.short) == SHORT_MAX, f"SHORT must cap at {SHORT_MAX}, got {len(st.short)}"
+            # newest survives at front, oldest evicted from tail
+            assert st.short[0].content == f"独特事实编号{SHORT_MAX + 9}"
+            assert all(f"编号0" not in x.content for x in st.short), "oldest should be evicted"
+            print_pass("SHORT: overflow evicts oldest from tail (cap SHORT_MAX)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── MEDIUM ───────────────────────────────────────────────────
+
+    def test_medium_update_refines_and_resets_age(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.extraction_count = 20
+            st.medium.append(MediumItem(id="m1", content="用户玩原神", count=4, entry_extraction_index=5))
+            s = tm.ingest_candidates("u", [("用户是原神活跃玩家，每天做日常", "update", "m1")])
+            assert s["reinforced_medium"] == 1, s
+            m = st.medium[0]
+            assert m.content == "用户是原神活跃玩家，每天做日常", "update replaces content"
+            assert m.count == 5, "update increments count"
+            assert m.entry_extraction_index == 20, "update resets age to current clock"
+            print_pass("MEDIUM update: refines content, count+1, age→0")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_medium_keep_increments(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m1", content="用户玩原神", count=4, entry_extraction_index=0))
+            s = tm.ingest_candidates("u", [("用户玩原神", "keep", "m1")])
+            assert s["reinforced_medium"] == 1, s
+            assert st.medium[0].content == "用户玩原神", "keep does NOT change content"
+            assert st.medium[0].count == 5
+            print_pass("MEDIUM keep: count+1, content unchanged")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_invalid_matched_id_falls_back_to_new(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            s = tm.ingest_candidates("u", [("用户喜欢猫", "update", "no_such_id"),
+                                           ("用户喜欢狗", "reinforce_short", "ghost")])
+            st = tm._get_state("u")
+            assert s["new_short"] == 2, f"hallucinated ids must fall back to new SHORT: {s}"
+            assert len(st.short) == 2 and not st.medium
+            print_pass("MEDIUM/SHORT: invalid matched_id falls back to new SHORT")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_age_demotion_to_short(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem, MEDIUM_DOWNGRADE_AGE, MEDIUM_DOWNGRADE_COUNT_RESET
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m1", content="陈旧事实", count=6, entry_extraction_index=0))
+            st.extraction_count = MEDIUM_DOWNGRADE_AGE + 1   # age = 31 > 30
+            s = tm.ingest_candidates("u", [])                 # empty ingest still runs demotions
+            assert s["demoted_to_short"] == 1, s
+            assert not st.medium, "aged-out MEDIUM leaves the tier"
+            assert len(st.short) == 1 and st.short[0].content == "陈旧事实"
+            assert st.short[0].count == MEDIUM_DOWNGRADE_COUNT_RESET, "demotion resets count to 2"
+            print_pass("MEDIUM→SHORT: age>30 demotes with count reset")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_medium_max_safety_net(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem, MEDIUM_MAX, MEDIUM_DOWNGRADE_AGE
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            # clock=30 keeps every age <=30 (no age-demotion); only the cap fires.
+            st.extraction_count = MEDIUM_DOWNGRADE_AGE
+            n = MEDIUM_MAX + 5
+            for i in range(n):
+                st.medium.append(MediumItem(id=f"m{i}", content=f"事实{i}", count=5, entry_extraction_index=i))
+            s = tm.ingest_candidates("u", [])
+            assert len(st.medium) == MEDIUM_MAX, f"cap at {MEDIUM_MAX}, got {len(st.medium)}"
+            assert s["demoted_to_short"] == 5, s
+            # oldest (entry_index=0 → highest age) demoted first
+            assert all(m.id != "m0" for m in st.medium), "oldest must be force-demoted"
+            assert any(x.content == "事实0" for x in st.short)
+            print_pass("MEDIUM_MAX safety net: force-demotes oldest above cap")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── LONG ─────────────────────────────────────────────────────
+
+    def test_long_creation_twin_kept_idempotent(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem, MEDIUM_LONG_THRESHOLD
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m1", content="用户是原神活跃玩家",
+                                        count=MEDIUM_LONG_THRESHOLD, entry_extraction_index=0))
+            s = tm.ingest_candidates("u", [("用户是原神活跃玩家", "keep", "m1")],
+                                     snapshot_turns=[("我玩原神", "好玩")])
+            assert s["promoted_to_long"] == 1, s
+            assert len(st.long) == 1 and st.long[0].linked_medium_id == "m1"
+            assert len(st.medium) == 1, "MEDIUM twin KEPT after LONG creation (Decision G)"
+            assert st.medium[0].count == MEDIUM_LONG_THRESHOLD + 1
+            # idempotent: crossing again does NOT create a 2nd LONG
+            s2 = tm.ingest_candidates("u", [("用户是原神活跃玩家", "keep", "m1")])
+            assert s2["promoted_to_long"] == 0 and len(st.long) == 1, "LONG creation must be idempotent"
+            print_pass("LONG: created at count>10, twin kept, idempotent")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_long_snapshot_turns_from_batch(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m1", content="事实", count=10, entry_extraction_index=0))
+            turns = [("今天练腿", "好的"), ("明天练背", "收到")]
+            tm.ingest_candidates("u", [("事实", "keep", "m1")], snapshot_turns=turns)
+            assert st.long[0].snapshot_turns == turns, "LONG snapshot = the triggering batch's turns"
+            print_pass("LONG: snapshot_turns captured from the current batch")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── judge list ───────────────────────────────────────────────
+
+    def test_judge_list_composition(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem, ShortItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m1", content="中期A", count=3, entry_extraction_index=0))
+            st.medium.append(MediumItem(id="m2", content="中期B", count=9, entry_extraction_index=0))
+            st.short.append(ShortItem(id="s1", content="短期A", count=1))
+            jl = tm.get_judge_list("u")
+            assert len(jl) == 3, jl
+            # MEDIUM first, sorted by count desc; then SHORT
+            assert [x["id"] for x in jl] == ["m2", "m1", "s1"], [x["id"] for x in jl]
+            assert jl[0]["tier"] == "medium" and jl[2]["tier"] == "short"
+            assert all(set(x) == {"id", "content", "count", "tier"} for x in jl)
+            print_pass("judge list: MEDIUM(top by count) + SHORT, each {id,content,count,tier}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── injection ────────────────────────────────────────────────
+
+    def test_injection_empty_returns_blank(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            assert tm.build_medium_injection("nobody") == "", "no MEDIUM → empty injection"
+            print_pass("injection: empty MEDIUM returns ''")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_injection_low_confidence_label(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem, LOW_CONFIDENCE_THRESHOLD
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="lo", content="低置信事实", count=LOW_CONFIDENCE_THRESHOLD - 1, entry_extraction_index=0))
+            block = tm.build_medium_injection("u")
+            assert "(低置信)" in block and "低置信事实" in block, block
+            st.medium.append(MediumItem(id="hi", content="高置信事实", count=LOW_CONFIDENCE_THRESHOLD, entry_extraction_index=0))
+            block2 = tm.build_medium_injection("u")
+            hi_line = [ln for ln in block2.splitlines() if "高置信事实" in ln][0]
+            assert "(低置信)" not in hi_line, "count>=5 must NOT be low-confidence"
+            print_pass("injection: (低置信) label for count<5 only")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_injection_top_n_plus_recent(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem, MEDIUM_INJECT_TOP_N
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            # counts 1..20, entry_index aligned so 'recent' == higher count too
+            for i in range(1, 21):
+                st.medium.append(MediumItem(id=f"m{i}", content=f"fact_{i:02d}", count=i, entry_extraction_index=i))
+            block = tm.build_medium_injection("u")
+            bullets = [ln for ln in block.splitlines() if ln.startswith("- ")]
+            assert len(bullets) <= MEDIUM_INJECT_TOP_N, f"too many injected: {len(bullets)}"
+            assert "fact_20" in block, "highest-count must be injected"
+            assert "fact_01" in block or True  # may be excluded; checked below
+            # the 5 lowest (fact_01..fact_05) are excluded (only top-15 selected)
+            assert "fact_01" not in block, "lowest-count/recent item should be excluded"
+            print_pass(f"injection: selects top-by-count + recent (<= {MEDIUM_INJECT_TOP_N})")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_injection_token_cap(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem, MEDIUM_INJECT_TOKEN_CAP
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            for i, c in enumerate([10, 9, 8]):
+                st.medium.append(MediumItem(id=f"m{i}", content="长" * 300, count=c, entry_extraction_index=0))
+            block = tm.build_medium_injection("u")
+            bullets = [ln for ln in block.splitlines() if ln.startswith("- ")]
+            # each bullet ~302 chars; cap 600 → only the first fits before break
+            body = sum(len(ln) for ln in bullets)
+            assert body <= MEDIUM_INJECT_TOKEN_CAP, f"body {body} exceeds cap"
+            assert len(bullets) >= 1
+            print_pass(f"injection: truncates at MEDIUM_INJECT_TOKEN_CAP ({MEDIUM_INJECT_TOKEN_CAP})")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── clock + persistence ──────────────────────────────────────
+
+    def test_touch_extraction_count(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            assert tm._get_state("u").extraction_count == 0
+            assert tm.touch_extraction_count("u") == 1
+            assert tm.touch_extraction_count("u") == 2
+            print_pass("clock: touch_extraction_count increments per call")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_persistence_roundtrip(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory, MediumItem, ShortItem
+            tm = TieredMemory(base_dir=tmp)
+            st = tm._get_state("u")
+            st.extraction_count = 7
+            st.short.append(ShortItem(id="s1", content="短期事实", count=2))
+            st.medium.append(MediumItem(id="m1", content="中期事实", count=11, entry_extraction_index=3))
+            # m1 count>10 → create a LONG with a snapshot to persist
+            from agent.memory import LongObject
+            st.long.append(LongObject(id="l1", title="中期事实", summary="中期事实",
+                                      snapshot_turns=[("玩原神", "好玩")], snapshot_time=123.0,
+                                      query_count=0, linked_medium_id="m1"))
+            tm.save_user("u")
+
+            tm2 = TieredMemory(base_dir=tmp)
+            n = tm2.load_all()
+            assert n == 1, n
+            st2 = tm2._get_state("u")
+            assert st2.extraction_count == 7
+            assert st2.short[0].content == "短期事实" and st2.short[0].count == 2
+            assert st2.medium[0].content == "中期事实" and st2.medium[0].entry_extraction_index == 3
+            assert st2.long[0].linked_medium_id == "m1"
+            assert st2.long[0].snapshot_turns == [("玩原神", "好玩")], "LONG snapshot md round-trips"
+            print_pass("persistence: save_user/load round-trips all tiers + clock + LONG md")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_load_all(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory, ShortItem
+            tm = TieredMemory(base_dir=tmp)
+            for uid in ("alice", "bob", "carol"):
+                tm._get_state(uid).short.append(ShortItem(id="x", content=f"{uid} 事实", count=1))
+                tm.save_user(uid)
+            tm2 = TieredMemory(base_dir=tmp)
+            assert tm2.load_all() == 3
+            assert tm2._get_state("bob").short[0].content == "bob 事实"
+            print_pass("load_all: reloads every persisted user at startup")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class _SeqProfileClient:
+    """Profile-extraction mock returning a sequence of canned JSON responses."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    async def chat_completion(self, message, history=None, timeout_set=180.0, purpose="chat"):
+        self.calls.append({"prompt": message, "purpose": purpose, "timeout_set": timeout_set})
+        i = min(len(self.calls) - 1, len(self.responses) - 1)
+        return self.responses[i]
+
+
+class TestMergedExtraction:
+    """P1 §12.1: profile extraction + memory judge merged into ONE flash call."""
+
+    def run(self):
+        print_header("4.8. Merged Extract+Judge Pipeline (P1)")
+        asyncio.run(self.test_routes_new_candidate_to_short())
+        asyncio.run(self.test_l2_filters_junk_candidate())
+        asyncio.run(self.test_judge_list_embedded_in_prompt())
+        asyncio.run(self.test_extraction_count_increments())
+        asyncio.run(self.test_reinforce_short_promotes_to_medium())
+
+    def _mgr(self, tmpdir, client, tm):
+        from agent.profile import ProfileManager
+        mgr = ProfileManager(base_dir=tmpdir, llm_client=client)
+        mgr.set_memory(tm)
+        return mgr
+
+    def _flush(self, mgr, uid, k):
+        from agent.profile import PROFILE_BATCH_K
+        for i in range(k):
+            mgr.observe_turn(uid, f"消息{i}", "回复")
+
+    async def test_routes_new_candidate_to_short(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory
+            tm = TieredMemory(base_dir=tmp)
+            client = _SeqProfileClient(['{"memory_candidates": [{"content": "用户喜欢原神", "judge": "new"}]}'])
+            mgr = self._mgr(tmp, client, tm)
+            self._flush(mgr, "u", 5)
+            await asyncio.sleep(0.05)
+            st = tm._get_state("u")
+            assert any(x.content == "用户喜欢原神" for x in st.short), [x.content for x in st.short]
+            assert tm._get_state("u").extraction_count == 1, "clock ticks on successful extract"
+            print_pass("merged: new memory_candidate routed into SHORT; clock +1")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def test_l2_filters_junk_candidate(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory
+            tm = TieredMemory(base_dir=tmp)
+            client = _SeqProfileClient(['{"memory_candidates": ['
+                                        '{"content": "用户工作区剩余250MB", "judge": "new"},'
+                                        '{"content": "用户是教师", "judge": "new"}]}'])
+            mgr = self._mgr(tmp, client, tm)
+            self._flush(mgr, "u", 5)
+            await asyncio.sleep(0.05)
+            st = tm._get_state("u")
+            contents = [x.content for x in st.short]
+            assert "用户是教师" in contents, contents
+            assert not any("工作区" in c for c in contents), f"L2 must drop junk before SHORT: {contents}"
+            print_pass("merged: Layer-2 filter runs on candidates before SHORT")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def test_judge_list_embedded_in_prompt(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory, MediumItem
+            tm = TieredMemory(base_dir=tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m_known", content="用户是原神玩家", count=5, entry_extraction_index=0))
+            client = _SeqProfileClient(['{}'])
+            mgr = self._mgr(tmp, client, tm)
+            self._flush(mgr, "u", 5)
+            await asyncio.sleep(0.05)
+            prompt = client.calls[0]["prompt"]
+            assert "已有记忆" in prompt, "judge section missing from prompt"
+            assert "m_known" in prompt and "用户是原神玩家" in prompt, "existing MEDIUM not embedded"
+            print_pass("merged: existing MEDIUM/SHORT judge list embedded in the flash prompt")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def test_extraction_count_increments(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory
+            tm = TieredMemory(base_dir=tmp)
+            client = _SeqProfileClient(['{}', '{}'])
+            mgr = self._mgr(tmp, client, tm)
+            self._flush(mgr, "u", 5)
+            await asyncio.sleep(0.05)
+            self._flush(mgr, "u", 5)
+            await asyncio.sleep(0.05)
+            assert tm._get_state("u").extraction_count == 2, tm._get_state("u").extraction_count
+            print_pass("merged: extraction_count increments once per successful batch")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def test_reinforce_short_promotes_to_medium(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory, ShortItem
+            tm = TieredMemory(base_dir=tmp)
+            st = tm._get_state("u")
+            st.short.append(ShortItem(id="s_fixed", content="用户喜欢原神", count=1))
+            resp = '{"memory_candidates": [{"content": "用户喜欢原神", "judge": "reinforce_short", "matched_id": "s_fixed"}]}'
+            client = _SeqProfileClient([resp, resp])
+            mgr = self._mgr(tmp, client, tm)
+            self._flush(mgr, "u", 5)        # count 1→2 (still SHORT)
+            await asyncio.sleep(0.05)
+            assert tm._get_state("u").short and tm._get_state("u").short[0].count == 2
+            self._flush(mgr, "u", 5)        # count 2→3 → promote
+            await asyncio.sleep(0.05)
+            st = tm._get_state("u")
+            assert not any(x.id == "s_fixed" for x in st.short), "promoted item leaves SHORT"
+            assert any(m.id == "s_fixed" and m.count == 3 for m in st.medium), [ (m.id,m.count) for m in st.medium]
+            print_pass("merged: reinforce_short across batches promotes SHORT→MEDIUM at count=3")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestMemoryMigration:
+    """P1 Stage 5 migration script: seed tiers from profiles + archive old dumps."""
+
+    def run(self):
+        print_header("4.9. P1 Memory Migration Script")
+        self.test_migration_seeds_and_archives()
+
+    def _load_module(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(__file__), "scripts", "migrate_memory_p1.py")
+        spec = importlib.util.spec_from_file_location("migrate_memory_p1", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_migration_seeds_and_archives(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            mod = self._load_module()
+            prof = os.path.join(tmp, "profiles")
+            mem = os.path.join(tmp, "memory")
+            bak = os.path.join(tmp, "backup")
+            os.makedirs(os.path.join(prof, "u1114144652"))
+            os.makedirs(os.path.join(mem, "user", "u1114144652"))
+            os.makedirs(os.path.join(bak, "u1114144652"))
+            # current profile (post-P0): the two real-life 正在 facts were dropped
+            with open(os.path.join(prof, "u1114144652", "profile.json"), "w", encoding="utf-8") as f:
+                json.dump({"user_id": "1114144652", "facts": ["用户喜欢原神", "用户是程序员"]}, f, ensure_ascii=False)
+            # backup (pre-P0): contains the false-drops + one still-junk fact
+            with open(os.path.join(bak, "u1114144652", "profile.json"), "w", encoding="utf-8") as f:
+                json.dump({"user_id": "1114144652", "facts": [
+                    "用户喜欢原神", "用户是程序员",
+                    "用户正在通过饮食调整降血脂",
+                    "用户正在做力量训练，按酸痛程度自由分割训练循环",
+                    "用户正在使用特殊会话",
+                ]}, f, ensure_ascii=False)
+            for n in ("interaction_1.md", "interaction_2.md"):
+                with open(os.path.join(mem, "user", "u1114144652", n), "w", encoding="utf-8") as f:
+                    f.write("old dump")
+
+            rc = mod.main(["--profile-dir", prof, "--memory-dir", mem,
+                           "--restore-false-drops", bak, "--apply", "--no-backup"])
+            assert rc == 0, rc
+
+            tier_path = os.path.join(mem, "tiers", "1114144652.json")
+            assert os.path.exists(tier_path), "tier JSON not written"
+            with open(tier_path, encoding="utf-8") as f:
+                data = json.load(f)
+            assert data["extraction_count"] == 0
+            short = {x["content"] for x in data["short"]}
+            assert short == {"用户喜欢原神", "用户是程序员"}, short
+            assert all(x["count"] == 1 for x in data["short"])
+            med = {x["content"] for x in data["medium"]}
+            assert "用户正在通过饮食调整降血脂" in med, med
+            assert "用户正在做力量训练，按酸痛程度自由分割训练循环" in med, med
+            assert "用户正在使用特殊会话" not in med, "still-junk must NOT be restored"
+            assert all(x["count"] == 3 for x in data["medium"])
+            # archives moved, originals gone
+            arch = os.path.join(mem, "user", "_archive", "u1114144652")
+            assert os.path.exists(os.path.join(arch, "interaction_1.md")), "not archived"
+            assert not os.path.exists(os.path.join(mem, "user", "u1114144652", "interaction_1.md")), "original not moved"
+
+            # idempotent re-run skips (tier file exists)
+            rc2 = mod.main(["--profile-dir", prof, "--memory-dir", mem,
+                            "--restore-false-drops", bak, "--apply", "--no-backup"])
+            assert rc2 == 0
+            with open(tier_path, encoding="utf-8") as f:
+                assert len(json.load(f)["short"]) == 2, "re-run must be idempotent (no double-seed)"
+            print_pass("migration: seeds SHORT+MEDIUM, archives dumps, restores false-drops, idempotent")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -1679,6 +2287,9 @@ def main():
         ("MemorySystem", TestMemorySystem()),
         ("UserProfile & ProfileManager", TestUserProfile()),
         ("Profile Extraction Precision", TestProfileExtraction()),
+        ("TieredMemory (P1 engine)", TestTieredMemory()),
+        ("Merged Extract+Judge (P1)", TestMergedExtraction()),
+        ("Memory Migration (P1)", TestMemoryMigration()),
         ("Agent Core (Mock LLM)", TestAgentCore()),
         ("DeepSeekClient Parsing", TestDeepSeekClientParsing()),
         ("Built-in Tools", TestBuiltinTools()),
