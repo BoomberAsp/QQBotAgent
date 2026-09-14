@@ -205,8 +205,19 @@ _PROFILE_FEW_SHOT = """例1（截图/助手解读 ≠ 用户事实 → {}）
 用户: 我最近迷上原神了，天天肝
 助手(Roxy): 原神挺耐玩的，注意别太肝……
 </conversation>
-输出: {"new_interests": ["原神"]}
-（用户本人陈述的持久兴趣，石蕊测试通过。）"""
+输出: {"new_interests": ["原神"], "memory_candidates": [{"content": "用户最近迷上原神，每天都玩", "judge": "new"}]}
+（用户本人陈述的持久兴趣，石蕊测试通过。话题词「原神」进 new_interests；完整事实句进 memory_candidates。）
+
+例5（瞬时决策态 / 犹豫中 → {}）
+输入:
+<conversation>
+用户: 我在想要不要给无线网络功能加个开关
+助手(Roxy): 这个看你的使用场景，需要的话我可以帮你查……
+</conversation>
+输出: {}
+（"在想要不要……"是瞬时决策态，石蕊测试不通过：用户不碰 bot 这条就不成立。
+反之，【现实生活】的持续活动（如"用户正在做力量训练""正在通过饮食调整降血脂"）
+通过石蕊测试，应作为持久信息抽取。）"""
 
 
 class ProfileManager:
@@ -226,6 +237,7 @@ class ProfileManager:
         """
         self.base_dir = base_dir
         self.client = llm_client
+        self._memory = None  # P1: TieredMemory engine, wired via set_memory()
         os.makedirs(base_dir, exist_ok=True)
         self._cache: Dict[str, UserProfile] = {}
 
@@ -246,6 +258,16 @@ class ProfileManager:
     def set_client(self, client):
         """Set or update the LLM client (for lazy initialization)."""
         self.client = client
+
+    def set_memory(self, memory):
+        """Wire the P1 three-tier memory engine (TieredMemory).
+
+        When set, extract_batch merges semantic-overlap judging into the single
+        flash call (§12.1) and routes accepted memory_candidates into the
+        SHORT/MEDIUM/LONG state machine. When None, behavior is P0 (profile slots
+        only) — keeps the single-turn extract_and_update path backward-compatible.
+        """
+        self._memory = memory
 
     # ── CRUD ──────────────────────────────────────────────────────
 
@@ -372,22 +394,37 @@ class ProfileManager:
             "interests": profile.interests,
             "preferences": profile.preferences,
         }
+        # P1: read the judge list BEFORE the await (synchronous read). Per-user
+        # single-flight guarantees no concurrent extraction mutates state mid-call.
+        judge_list = self._memory.get_judge_list(user_id) if self._memory else []
         conversation_block = self._format_conversation(turns)
-        prompt = self._build_extraction_prompt(conversation_block, existing)
+        prompt = self._build_extraction_prompt(conversation_block, existing, judge_list)
 
         result = await self.client.chat_completion(
             prompt, timeout_set=30.0, purpose="profile",
         )
         extracted = self._parse_json(result)
-        if not extracted:
+        # Distinguish a parse FAILURE (None — LLM error / unparseable) from a
+        # SUCCESSFUL empty extraction ({} — nothing new to remember). Only a
+        # failure skips the clock; an empty {} still advances extraction_count so
+        # existing MEDIUM facts age normally (Decision 4: tick on every success).
+        if extracted is None:
             return
 
         # ── synchronous atomic apply (no await between read and write) ──
-        if self._apply_extraction(profile, user_id, extracted):
+        snapshot_turns = list(turns)
+        if self._apply_extraction(profile, user_id, extracted, snapshot_turns):
             self.save(profile)
             logger.debug(
                 "[profile] batch-updated user_id={} turns={}", user_id, len(turns)
             )
+
+        # P1: advance the logical clock + persist tier state. Done AFTER a
+        # successful parse (Decision 4: count increments only on success) and
+        # after ingest (which ran inside _apply_extraction against the old clock).
+        if self._memory:
+            self._memory.touch_extraction_count(user_id)
+            self._memory.save_user(user_id)
 
     async def extract_and_update(self, user_id: str, user_message: str, agent_response: str):
         """Single-turn convenience wrapper over extract_batch (backward-compat).
@@ -402,13 +439,19 @@ class ProfileManager:
         profile.touch()
         await self.extract_batch(user_id, [(user_message or "", agent_response or "")])
 
-    def _apply_extraction(self, profile: UserProfile, user_id: str, extracted: dict) -> bool:
-        """Merge a parsed extraction dict into the profile. Returns changed?
+    def _apply_extraction(self, profile: UserProfile, user_id: str, extracted: dict,
+                          snapshot_turns: Optional[list] = None) -> bool:
+        """Merge a parsed extraction dict into the profile. Returns profile-changed?
 
         Synchronous, no await — runs as an atomic block after all LLM calls have
-        completed (§12.1). Interests pass the Layer-2 deterministic filter
-        (fact_filter) before they are merged; every drop is logged for
-        observability-driven blacklist tuning (§10/§12.2).
+        completed (§12.1). Interests AND memory_candidates pass the Layer-2
+        deterministic filter (fact_filter) before they are persisted; every drop
+        is logged for observability-driven blacklist tuning (§10/§12.2).
+
+        P1: memory_candidates are routed into the three-tier engine AFTER the
+        Layer-2 filter (§4 principle I: litmus + L2 before entering SHORT). The
+        return value reflects only profile.json changes; tier state is persisted
+        separately by extract_batch via save_user.
         """
         changed = False
 
@@ -446,7 +489,52 @@ class ProfileManager:
             )
             changed = True
 
+        # P1: route memory_candidates into the three-tier engine. The Layer-2
+        # filter runs on candidate content BEFORE ingestion (§4 principle I).
+        if self._memory:
+            self._route_memory_candidates(user_id, extracted, snapshot_turns)
+
         return changed
+
+    def _route_memory_candidates(self, user_id: str, extracted: dict,
+                                 snapshot_turns: Optional[list]):
+        """Layer-2 filter + route memory_candidates into TieredMemory. Sync, no await."""
+        raw = extracted.get("memory_candidates", []) or []
+        norm = []
+        if isinstance(raw, list):
+            for c in raw:
+                if not isinstance(c, dict):
+                    continue
+                content = str(c.get("content", ""))[:300]
+                if not content.strip():
+                    continue
+                norm.append({
+                    "content": content,
+                    "judge": c.get("judge", "new"),
+                    "matched_id": c.get("matched_id"),
+                })
+        dropped = []
+        ingest_list = norm
+        if norm:
+            # Layer 2 deterministic filter on candidate content (same filter as interests)
+            texts = [c["content"] for c in norm]
+            kept_texts, dropped = filter_many(texts)
+            for text, matched, category in dropped:
+                logger.debug(
+                    "[memory] L2-drop candidate user={} cat={} match={!r} text={!r}",
+                    user_id, category, matched, text,
+                )
+            kept_set = set(kept_texts)
+            ingest_list = [c for c in norm if c["content"] in kept_set]
+        # ALWAYS ingest — even an empty list runs the demotion/aging sweep against
+        # the current logical clock, so MEDIUM ages on every successful batch
+        # (including empty {} extractions, which still tick extraction_count).
+        summary = self._memory.ingest_candidates(user_id, ingest_list, snapshot_turns or [])
+        if norm or summary.get("demoted_to_short"):
+            logger.debug(
+                "[memory] ingest user={} kept={} dropped={} summary={}",
+                user_id, len(ingest_list), len(dropped), summary,
+            )
 
     # ── Layer 1 prompt construction (shared by single-turn + batch) ──
 
@@ -481,12 +569,34 @@ class ProfileManager:
         return open_tag + "\n".join(pieces) + close_tag
 
     @staticmethod
-    def _build_extraction_prompt(conversation_block: str, existing: dict) -> str:
+    def _build_extraction_prompt(conversation_block: str, existing: dict,
+                                 judge_list: Optional[list] = None) -> str:
         """Build the Layer 1 profile-extraction prompt (§10).
 
-        石蕊测试为首要判据 + few-shot 反例 + 自包含 + agent_response 禁当证据。
-        只产出 nickname / new_interests / new_preferences（无 new_facts）。
+        P1 merges the semantic-overlap judge into the SAME flash call (§12.1):
+        alongside nickname/new_interests/new_preferences, the model emits
+        memory_candidates, each tagged judge ∈ {new, reinforce_short, update,
+        keep} against the 已有记忆 list (MEDIUM top-40 + SHORT, from
+        TieredMemory.get_judge_list). 石蕊测试为首要判据 + few-shot 反例 +
+        自包含 + agent_response 禁当证据。No new_facts (P0 schema).
         """
+        if judge_list:
+            mem_section = (
+                "## 已有记忆（供 memory_candidates 语义重合判定）\n"
+                "下面是该用户已有的记忆条目（tier=medium 中期 / tier=short 短期）。\n"
+                "对每条候选事实，判断它与哪条已有记忆语义重合，并据此选择 judge：\n"
+                '  - 与任何已有记忆都无重合 → judge="new"\n'
+                '  - 与某条 tier=short 重合 → judge="reinforce_short"，matched_id=该条 id\n'
+                '  - 与某条 tier=medium 重合，且你有更详细/更新的表述 → judge="update"，'
+                'matched_id=该条 id，content 给精炼合并后的完整句\n'
+                '  - 与某条 tier=medium 重合，但无新细节 → judge="keep"，matched_id=该条 id\n'
+                f"{json.dumps(judge_list, ensure_ascii=False)}\n\n"
+            )
+        else:
+            mem_section = (
+                "## 已有记忆（供 memory_candidates 语义重合判定）\n"
+                '（该用户暂无已有记忆；所有 memory_candidates 一律用 judge="new"。）\n\n'
+            )
         return (
             "你是用户画像抽取器。从下面这轮对话中，抽取关于【用户本人】的、持久的画像信息。\n"
             "只返回合法 JSON，不要解释，不要 markdown 代码围栏。\n\n"
@@ -503,7 +613,8 @@ class ProfileManager:
             "不能由用户上传的截图/图片/文件内容反推。一张战斗截图描述的是截图内容，不是用户。\n"
             "3. 每条候选必须【自包含】：把指代（该项目/这个/上面说的）解析成明确的命名实体；"
             "无法解析成一句独立成立的话，就丢弃。\n"
-            "4. 只抽取【新的】、existing 画像里没有的信息。\n"
+            "4. nickname/new_interests/new_preferences 只抽取 existing 画像里没有的【新】信息；"
+            "memory_candidates 则须对照「已有记忆」判定 judge（见下）。\n"
             "5. 客观、不臆测：记「玩原神」，不记「可能是开发者」。\n"
             "6. 只抽取关于用户的，不抽取关于助手(Roxy)的。\n"
             "7. 没有新信息就返回 {}。\n\n"
@@ -511,11 +622,23 @@ class ProfileManager:
             "{\n"
             '  "nickname": "用户提到的名字或希望被怎样称呼",\n'
             '  "new_interests": ["用户表现出的持久兴趣/话题", ...],\n'
-            '  "new_preferences": {"语言/回复风格等偏好键": "偏好值"}\n'
+            '  "new_preferences": {"语言/回复风格等偏好键": "偏好值"},\n'
+            '  "memory_candidates": [\n'
+            '    {"content": "关于用户的精炼、自包含事实句（通过石蕊测试）",\n'
+            '     "judge": "new | reinforce_short | update | keep",\n'
+            '     "matched_id": "仅 reinforce_short/update/keep 时填，对应已有记忆的 id"}\n'
+            "  ]\n"
             "}\n\n"
+            "## memory_candidates 规则\n"
+            "1. content 必须是关于【用户本人】、通过石蕊测试、自包含的精炼事实句。\n"
+            "2. 判定 judge 只能依据【用户】说的话；助手(Roxy) 的话仅用于消歧。\n"
+            "3. 与 new_interests 的区别：兴趣是话题词（如「原神」），memory_candidates 是完整\n"
+            "   事实句（如「用户是崩坏：星穹铁道的活跃玩家，每天做日常」）；两者可并存。\n"
+            "4. 没有值得长期记住的事实就省略 memory_candidates。\n\n"
             "## few-shot\n"
             + _PROFILE_FEW_SHOT + "\n\n"
             f"## existing 画像\n{json.dumps(existing, ensure_ascii=False)}\n\n"
+            + mem_section +
             f"## 本轮对话\n{conversation_block}\n\n"
             "## 输出（仅 JSON）\n"
         )

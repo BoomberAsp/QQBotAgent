@@ -47,7 +47,7 @@ from agent.hardware import HardwareDetector
 from agent.special_session import SpecialSessionManager
 from agent.tool_registry import ToolRegistry
 from agent.session import SessionManager
-from agent.memory import MemorySystem
+from agent.memory import MemorySystem, TieredMemory
 from agent.profile import ProfileManager
 from agent.workspace import UserWorkspaceManager
 from agent.workspace_snapshot import build_tree, rel_to_root, fmt_bytes
@@ -923,6 +923,15 @@ _profile_manager = ProfileManager(
 # classification task → use the FLASH model, not the reasoning model.
 _profile_manager.set_client(_model_router.flash_client)
 
+# P1 three-tier memory engine (Profile-Fact-Extraction-Plan §7). Shares the
+# {data}/memory base dir with the legacy MemorySystem but owns a separate tiers/
+# subdir → no collision, trivial rollback (delete tiers/). load_all() pre-warms
+# the per-user cache at startup; set_memory wires it into the merged extract+judge
+# call so ProfileManager routes memory_candidates into SHORT/MEDIUM/LONG.
+_tiered_memory = TieredMemory(base_dir=os.path.join(_DATA_DIR, "memory"))
+_tiered_memory.load_all()
+_profile_manager.set_memory(_tiered_memory)
+
 _hardware_detector = HardwareDetector(cache_dir=_USER_DATA_ROOT)
 
 _user_workspace_quota_mb = int(os.environ.get("USER_WORKSPACE_QUOTA_MB", "500"))
@@ -968,6 +977,7 @@ agent = Agent(
     config_dir=_CONFIG_DIR,
     session_manager=_session_manager,
     memory_system=_memory_system,
+    tiered_memory=_tiered_memory,
     profile_manager=_profile_manager,
     hardware_detector=_hardware_detector,
     workspace_manager=_workspace_manager,
