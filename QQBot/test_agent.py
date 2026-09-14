@@ -841,10 +841,11 @@ class TestAgentCore:
             assert agent._captured_messages is not None
             system_content = agent._captured_messages[0]["content"]
             assert "小明" in system_content, f"Profile nickname not injected: {system_content[:200]}"
-            assert "深圳" in system_content, f"Profile facts not injected: {system_content[:200]}"
             assert "机器学习" in system_content, f"Profile interests not injected: {system_content[:200]}"
             assert "concise" in system_content, f"Profile preferences not injected: {system_content[:200]}"
-            print_pass("User profile injected into system prompt")
+            # P0 画像瘦身: facts dormant — must NOT be injected (§6).
+            assert "深圳" not in system_content, f"facts must not be injected: {system_content[:200]}"
+            print_pass("User profile injected (typed slots only; facts dormant)")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -947,10 +948,12 @@ class TestUserProfile:
         )
         ctx = profile.to_prompt_context()
         assert "小红" in ctx
-        assert "深圳" in ctx
         assert "机器学习" in ctx
         assert "detailed" in ctx
-        print_pass("Full profile generates complete prompt context")
+        # P0 画像瘦身: free-text `facts` are DORMANT — never injected (§6).
+        assert "深圳" not in ctx, "facts must NOT be injected after P0 slimming"
+        assert "已知信息" not in ctx, "facts block must be gone from prompt context"
+        print_pass("Full profile injects typed slots only (facts dormant)")
 
     def test_merge_facts_dedup(self):
         from agent.profile import UserProfile
@@ -996,6 +999,255 @@ class TestUserProfile:
             assert "兴趣1" in loaded.interests
             assert loaded.preferences["lang"] == "zh"
             print_pass("Profile persistence to disk")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class _GatedProfileClient:
+    """Mock profile-extraction client returning canned JSON.
+
+    If `gate` (an asyncio.Event) is set, chat_completion awaits it — lets tests
+    hold an extraction in-flight to exercise single-flight behaviour. Mirrors the
+    DeepSeekClient.chat_completion(message, history, timeout_set, purpose) shape.
+    """
+
+    def __init__(self, response: str = "{}"):
+        self.response = response
+        self.calls = []
+        self.gate = None
+
+    async def chat_completion(self, message, history=None, timeout_set=180.0, purpose="chat"):
+        self.calls.append({"prompt": message, "purpose": purpose, "timeout_set": timeout_set})
+        if self.gate is not None:
+            await self.gate.wait()
+        return self.response
+
+
+class TestProfileExtraction:
+    """P0 extraction precision: Layer 2 filter + Layer 1 prompt + Layer 3 batching."""
+
+    def run(self):
+        print_header("4.6. Profile Extraction Precision (Layer 1/2/3)")
+
+        # Layer 2 — deterministic post-filter (fact_filter)
+        self.test_l2a_compound_terms()
+        self.test_l2b_regex_patterns()
+        self.test_l2c_structural_rules()
+        self.test_l2x_deliberately_kept()
+        self.test_filter_many_partition()
+        # Layer 1 — extraction prompt + atomic apply
+        self.test_prompt_no_new_facts()
+        self.test_format_conversation_window()
+        self.test_apply_extraction_filters_interests()
+        # Layer 3 — batching / single-flight / delete-flush
+        asyncio.run(self.test_observe_turn_flush_at_k())
+        asyncio.run(self.test_single_flight())
+        asyncio.run(self.test_delete_flush())
+
+    # ── Layer 2 ──────────────────────────────────────────────────
+
+    def test_l2a_compound_terms(self):
+        from agent.fact_filter import filter_candidate
+        junk = [
+            "用户的工作区剩余空间", "这是特殊会话", "十连抽卡结果",
+            "兑换码已过期", "Roxy是机器人", "行动值跑条为3", "测速完成",
+        ]
+        for text in junk:
+            r = filter_candidate(text)
+            assert not r.keep and r.category.startswith("L2A"), f"{text!r} → {r}"
+        print_pass("Layer2-A: unambiguous compounds dropped (bot_state/tool/gacha/bot_self)")
+
+    def test_l2b_regex_patterns(self):
+        from agent.fact_filter import filter_candidate
+        cases = {
+            "剩余250 MB空间": "L2B:capacity_unit",
+            "存档占用1.5GB": "L2B:capacity_unit",
+            "抽到了UP角色": "L2B:gacha_result",
+            "获得了2个4星紫色羁绊": "L2B:gacha_result",
+            "请求超时了": "L2B:error_marker",
+            "用户正在上传文件": "L2B:transient_state",
+        }
+        for text, cat in cases.items():
+            r = filter_candidate(text)
+            assert not r.keep and r.category == cat, f"{text!r}: want {cat}, got {r.category} (keep={r.keep})"
+        print_pass("Layer2-B: regex dropped (capacity/gacha_result/error/transient)")
+
+    def test_l2c_structural_rules(self):
+        from agent.fact_filter import filter_candidate
+        r = filter_candidate("该项目使用了缓存机制")
+        assert not r.keep and r.category == "L2C:unresolved_ref", r
+        r = filter_candidate("250")
+        assert not r.keep and r.category in ("L2C:pure_numeric", "L2B:capacity_unit"), r
+        # entity markers RESOLVE an otherwise-unresolved reference → kept
+        r = filter_candidate("该项目叫「星穹铁道」很好玩")
+        assert r.keep, f"quoted entity should resolve reference: {r}"
+        print_pass("Layer2-C: unresolved-ref + pure-numeric dropped; entity markers resolve")
+
+    def test_l2x_deliberately_kept(self):
+        from agent.fact_filter import filter_candidate
+        # §10 L2-X: ambiguous bare words + legit facts must NOT be dropped.
+        legit = [
+            "用户喜欢「原神」这款游戏",  # quoted game entity
+            "用户是短跑运动员速度很快",   # bare 速度 ambiguous
+            "用户从事招募工作",           # bare 招募 ambiguous
+            "用户是会话分析研究者",       # bare 会话 ambiguous
+            "该职业很稳定",               # bare 该 (not a bot-context compound)
+            "这个城市很好",               # bare 这个
+            "用户获得了计算机硕士学位",   # bare 获得 (legit, not gacha)
+            "用户出版了一本书",           # legit
+        ]
+        for text in legit:
+            r = filter_candidate(text)
+            assert r.keep, f"L2-X FALSE POSITIVE: {text!r} dropped by {r.category}/{r.matched}"
+        print_pass("Layer2-X: ambiguous bare words + legit facts kept (no false positives)")
+
+    def test_filter_many_partition(self):
+        from agent.fact_filter import filter_many
+        kept, dropped = filter_many(["用户喜欢猫", "工作区剩余250MB", "用户是教师"])
+        assert kept == ["用户喜欢猫", "用户是教师"], kept
+        assert len(dropped) == 1 and dropped[0][2] == "L2A:bot_state", dropped
+        assert dropped[0][0] == "工作区剩余250MB" and dropped[0][1] == "工作区", dropped
+        print_pass("filter_many: partitions kept/dropped with (text, match, category)")
+
+    # ── Layer 1 ──────────────────────────────────────────────────
+
+    def test_prompt_no_new_facts(self):
+        from agent.profile import ProfileManager
+        conv = ProfileManager._format_conversation([("我最近迷上原神", "原神耐玩")])
+        prompt = ProfileManager._build_extraction_prompt(
+            conv, {"nickname": None, "interests": [], "preferences": {}}
+        )
+        assert "new_facts" not in prompt, "P0 schema must NOT request new_facts"
+        for token in ["石蕊测试", "助手(Roxy)", "few-shot", "<conversation>",
+                      "new_interests", "new_preferences"]:
+            assert token in prompt, f"prompt missing {token!r}"
+        print_pass("Layer1 prompt: litmus + few-shot + third-person block; no new_facts")
+
+    def test_format_conversation_window(self):
+        from agent.profile import (
+            ProfileManager, EXTRACT_USER_MSG_CAP, EXTRACT_AGENT_RESP_CAP,
+            EXTRACT_TOTAL_CHAR_CAP,
+        )
+        # multi-turn, oldest→newest order preserved, third-person labels
+        block = ProfileManager._format_conversation([(f"问{i}", f"答{i}") for i in range(8)])
+        assert block.startswith("<conversation>") and block.endswith("</conversation>")
+        assert "问7" in block and "助手(Roxy): 答0" in block
+        assert block.index("问0") < block.index("问7"), "turns must stay oldest→newest"
+        # per-message truncation
+        one = ProfileManager._format_conversation([("x" * 900, "y" * 900)])
+        assert ("x" * (EXTRACT_USER_MSG_CAP + 1)) not in one
+        assert ("y" * (EXTRACT_AGENT_RESP_CAP + 1)) not in one
+        # total-char cap drops OLDEST turns, newest always survives
+        big = [("a" * 480 + f"#{i}#", "b" * 190) for i in range(20)]
+        capped = ProfileManager._format_conversation(big)
+        assert len(capped) <= EXTRACT_TOTAL_CHAR_CAP, f"{len(capped)} > cap"
+        assert "#19#" in capped, "newest turn must survive the cap"
+        assert "#0#" not in capped, "oldest turn should be dropped by the cap"
+        print_pass("Layer1 _format_conversation: window order, truncation, total-char cap")
+
+    def test_apply_extraction_filters_interests(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            from agent.profile import ProfileManager
+            mgr = ProfileManager(base_dir=tmpdir)
+            prof = mgr.get("u_apply")
+            extracted = {
+                "nickname": "阿明",
+                "new_interests": ["原神", "用户工作区剩余250MB", "篮球"],
+                "new_preferences": {"语言": "中文"},
+            }
+            changed = mgr._apply_extraction(prof, "u_apply", extracted)
+            assert changed is True
+            assert prof.nickname == "阿明"
+            assert "原神" in prof.interests and "篮球" in prof.interests, prof.interests
+            assert not any("工作区" in x for x in prof.interests), "junk interest must be L2-dropped"
+            assert prof.preferences.get("语言") == "中文"
+            # empty extraction → changed False (no writes)
+            assert mgr._apply_extraction(mgr.get("u_noop"), "u_noop", {}) is False
+            print_pass("Layer1 _apply_extraction: L2-filters interests, sets nickname/prefs, changed flag")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # ── Layer 3 ──────────────────────────────────────────────────
+
+    async def test_observe_turn_flush_at_k(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            from agent.profile import ProfileManager, PROFILE_BATCH_K, EXTRACT_WINDOW_N
+            client = _GatedProfileClient('{"new_interests": ["原神"]}')
+            mgr = ProfileManager(base_dir=tmpdir, llm_client=client)
+            for i in range(PROFILE_BATCH_K - 1):
+                mgr.observe_turn("u", f"m{i}", "r")
+            await asyncio.sleep(0)
+            assert len(client.calls) == 0, "must NOT flush before K turns"
+            assert mgr._pending_n["u"] == PROFILE_BATCH_K - 1
+            mgr.observe_turn("u", "mK", "r")  # Kth turn → flush
+            await asyncio.sleep(0)
+            assert len(client.calls) == 1, "flush exactly at K turns"
+            assert client.calls[0]["purpose"] == "profile"
+            assert "mK" in client.calls[0]["prompt"] and "m0" in client.calls[0]["prompt"]
+            # rolling window bounded at EXTRACT_WINDOW_N
+            for i in range(EXTRACT_WINDOW_N + 5):
+                mgr.observe_turn("u", f"x{i}", "r")
+            assert len(mgr._recent["u"]) == EXTRACT_WINDOW_N, len(mgr._recent["u"])
+            await asyncio.sleep(0.05)
+            assert "原神" in mgr.get("u").interests
+            print_pass("Layer3 observe_turn: buffers, flushes at K, window bounded, applies")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_single_flight(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            from agent.profile import ProfileManager, PROFILE_BATCH_K
+            client = _GatedProfileClient('{"new_interests": ["原神"]}')
+            client.gate = asyncio.Event()  # hold every extraction in-flight
+            mgr = ProfileManager(base_dir=tmpdir, llm_client=client)
+            for i in range(PROFILE_BATCH_K):
+                mgr.observe_turn("u", f"m{i}", "r")
+            await asyncio.sleep(0)
+            assert len(client.calls) == 1 and "u" in mgr._inflight
+            # turns arriving while in-flight: NO 2nd extraction, pending accumulates
+            for i in range(3):
+                mgr.observe_turn("u", f"after{i}", "r")
+            await asyncio.sleep(0)
+            assert len(client.calls) == 1, "single-flight: no concurrent 2nd extraction"
+            assert mgr._pending_n["u"] == 3, mgr._pending_n["u"]
+            client.gate.set()  # release
+            await asyncio.sleep(0.05)
+            assert "u" not in mgr._inflight, "in-flight cleared after completion"
+            assert len(client.calls) == 1, "pending(3)<K must NOT auto re-flush"
+            assert "原神" in mgr.get("u").interests
+            print_pass("Layer3 single-flight: one extraction at a time; pending accumulates")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_delete_flush(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            from agent.profile import ProfileManager, PROFILE_BATCH_K
+            # substantive session (>K turns): force-flush the tail even if pending<K
+            c = _GatedProfileClient("{}")
+            m = ProfileManager(base_dir=tmpdir, llm_client=c)
+            for i in range(3):
+                m.observe_turn("u2", f"m{i}", "r")  # pending=3 < K
+            await asyncio.sleep(0)
+            assert len(c.calls) == 0
+            m.flush_on_session_end("u2", session_turn_count=PROFILE_BATCH_K + 3)
+            await asyncio.sleep(0)
+            assert len(c.calls) == 1, "substantive delete must flush the tail"
+
+            # transient session (≤K turns): drop the tail, no extraction
+            c2 = _GatedProfileClient("{}")
+            m2 = ProfileManager(base_dir=tmpdir, llm_client=c2)
+            for i in range(3):
+                m2.observe_turn("u3", f"m{i}", "r")
+            await asyncio.sleep(0)
+            m2.flush_on_session_end("u3", session_turn_count=2)
+            await asyncio.sleep(0.02)
+            assert len(c2.calls) == 0, "transient delete must NOT extract"
+            assert m2._pending_n["u3"] == 0, "tail must be dropped"
+            print_pass("Layer3 delete-flush: >K forces tail, ≤K drops (Decision J)")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1426,6 +1678,7 @@ def main():
         ("SessionManager", TestSessionManager()),
         ("MemorySystem", TestMemorySystem()),
         ("UserProfile & ProfileManager", TestUserProfile()),
+        ("Profile Extraction Precision", TestProfileExtraction()),
         ("Agent Core (Mock LLM)", TestAgentCore()),
         ("DeepSeekClient Parsing", TestDeepSeekClientParsing()),
         ("Built-in Tools", TestBuiltinTools()),

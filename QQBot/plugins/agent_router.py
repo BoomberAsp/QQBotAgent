@@ -919,8 +919,9 @@ _model_router = ModelRouter()
 _profile_manager = ProfileManager(
     base_dir=_USER_DATA_ROOT,
 )
-# The client is set after agent creation since agent owns the validated client
-_profile_manager.set_client(_model_router.reasoning_client)
+# Layer 3 (Plan §7.1/§7.9): profile extraction is a batched, low-stakes
+# classification task → use the FLASH model, not the reasoning model.
+_profile_manager.set_client(_model_router.flash_client)
 
 _hardware_detector = HardwareDetector(cache_dir=_USER_DATA_ROOT)
 
@@ -1618,8 +1619,21 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         if text_content == expected or text_content == f"/{expected}":
             if time.time() < pending_delete[1]:
                 try:
+                    # Capture the session's turn count BEFORE delete, for the
+                    # profile delete-flush (Decision J): a substantive session
+                    # (>K turns) submits its un-extracted profile tail; a
+                    # transient one (≤K turns) drops it.
+                    _del_turns = 0
+                    for _s in _special_sessions.list_sessions(user_id):
+                        if _s.get("name") == pending_delete[0]:
+                            _del_turns = _s.get("total_messages", 0) // 2
+                            break
                     result = _special_sessions.delete(user_id, pending_delete[0])
                     _pending_delete_confirm.pop(user_id, None)
+                    try:
+                        _profile_manager.flush_on_session_end(user_id, _del_turns)
+                    except Exception:
+                        pass  # profile flush must never break session deletion
                     role = _perm_manager.get_role(user_id)
                     max_sess = _perm_manager.get_max_special_sessions(role)
                     sessions = _special_sessions.list_sessions(user_id)
@@ -1993,8 +2007,21 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         if text_content == expected or text_content == f"/{expected}":
             if time.time() < pending_delete[1]:
                 try:
+                    # Capture the session's turn count BEFORE delete, for the
+                    # profile delete-flush (Decision J): a substantive session
+                    # (>K turns) submits its un-extracted profile tail; a
+                    # transient one (≤K turns) drops it.
+                    _del_turns = 0
+                    for _s in _special_sessions.list_sessions(user_id):
+                        if _s.get("name") == pending_delete[0]:
+                            _del_turns = _s.get("total_messages", 0) // 2
+                            break
                     result = _special_sessions.delete(user_id, pending_delete[0])
                     _pending_delete_confirm.pop(user_id, None)
+                    try:
+                        _profile_manager.flush_on_session_end(user_id, _del_turns)
+                    except Exception:
+                        pass  # profile flush must never break session deletion
                     role = _perm_manager.get_role(user_id)
                     max_sess = _perm_manager.get_max_special_sessions(role)
                     sessions = _special_sessions.list_sessions(user_id)

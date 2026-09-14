@@ -687,15 +687,20 @@ class Agent:
     def _schedule_profile_update(
         self, user_id: str, user_message: str, agent_response: str
     ):
-        """Schedule a background task to extract user facts and update profile."""
+        """Observe one turn for profile extraction (Layer 3 batching, §7.1).
+
+        observe_turn is SYNCHRONOUS: it buffers the turn in memory and, once the
+        per-user buffer reaches PROFILE_BATCH_K, schedules a single-flight
+        background extract_batch (flash model). There is no per-turn LLM call
+        any more (that was the old extract_and_update path). Never raises into
+        the response path.
+        """
         if not self.profiles:
             return
         try:
-            asyncio.create_task(
-                self.profiles.extract_and_update(user_id, user_message, agent_response)
-            )
-        except RuntimeError:
-            pass  # No running event loop (e.g., in tests)
+            self.profiles.observe_turn(user_id, user_message, agent_response)
+        except Exception:
+            pass  # Profile extraction must never break the response path
 
     # ── Bootstrap ─────────────────────────────────────────────────
 
