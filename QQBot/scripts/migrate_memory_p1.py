@@ -118,13 +118,40 @@ def _read_json(path: Path) -> Optional[dict]:
 
 # ── discovery ─────────────────────────────────────────────────────
 
+def _uid_from_interaction(name: str) -> Optional[str]:
+    """Parse the uid out of a legacy dump filename `interaction_<uid>_<ts>.md`.
+
+    The old MemorySystem wrote some raw dumps FLAT under user/ (pre per-user
+    isolation) instead of user/{uid}/; the uid is embedded in the filename. We
+    rsplit on the last '_' so a uid containing '_' still parses (ts is last).
+    """
+    if not name.startswith("interaction_") or not name.endswith(".md"):
+        return None
+    core = name[len("interaction_"):-len(".md")]
+    return core.rsplit("_", 1)[0] if "_" in core else (core or None)
+
+
+def loose_interaction_files(memory_dir: Path) -> Dict[str, List[Path]]:
+    """Legacy raw dumps written FLAT under user/ → {uid: [paths]}."""
+    out: Dict[str, List[Path]] = {}
+    ud = memory_dir / "user"
+    if not ud.is_dir():
+        return out
+    for p in sorted(ud.glob("interaction_*.md")):   # maxdepth 1 (not recursive)
+        uid = _uid_from_interaction(p.name)
+        if uid:
+            out.setdefault(uid, []).append(p)
+    return out
+
+
 def discover_users(profile_dir: Path, memory_dir: Path) -> Dict[str, str]:
     """Return {safe_uid: real_uid} for every user with a profile or old memories.
 
     real_uid is taken from profile.json's user_id when available (so the tier
     file is keyed by the true id); otherwise it falls back to the safe_uid stem.
     _safe_id is idempotent over already-safe stems, so tiers/{safe_uid}.json
-    resolves identically either way.
+    resolves identically either way. Sources: profiles, per-user memory subdirs,
+    AND legacy loose interaction_*.md under user/ (uid parsed from filename).
     """
     users: Dict[str, str] = {}
 
@@ -151,6 +178,10 @@ def discover_users(profile_dir: Path, memory_dir: Path) -> Dict[str, str]:
                 continue
             users.setdefault(d.name, d.name)
 
+    # legacy loose dumps flat under user/ (uid only recoverable from filename)
+    for uid in loose_interaction_files(memory_dir):
+        users.setdefault(_safe_id(uid), uid)
+
     return users
 
 
@@ -163,11 +194,17 @@ def profile_facts(profile_dir: Path, safe: str) -> List[str]:
     return []
 
 
-def interaction_files(memory_dir: Path, safe: str) -> List[Path]:
+def interaction_files(memory_dir: Path, safe: str, uid: str) -> List[Path]:
+    """All raw dumps for a user: those in user/{safe}/ PLUS legacy loose ones
+    flat under user/ whose filename embeds this uid."""
+    out: List[Path] = []
     d = memory_dir / "user" / safe
-    if not d.is_dir():
-        return []
-    return sorted(d.glob("interaction_*.md"))
+    if d.is_dir():
+        out.extend(sorted(d.glob("interaction_*.md")))
+    for p in loose_interaction_files(memory_dir).get(uid, []):
+        if p not in out:
+            out.append(p)
+    return sorted(out, key=lambda p: p.name)
 
 
 # ── seeding ───────────────────────────────────────────────────────
@@ -287,41 +324,50 @@ def main(argv: List[str] = None) -> int:
     for safe, uid in sorted(users.items()):
         try:
             tier_path = Path(tm._tier_path(uid))
-            if tier_path.exists() and not args.force:
+            # Seed only when there is no tier yet (or --force). NEVER clobber a
+            # tier the now-live bot may have created since restart. Archiving is
+            # decoupled: it runs even when seeding is skipped, so legacy dumps
+            # still get tidied regardless of live-bot timing.
+            seed = (not tier_path.exists()) or args.force
+
+            short: List[ShortItem] = []
+            medium: List[MediumItem] = []
+            if seed:
+                facts = profile_facts(profile_dir, safe)
+                short = seed_short_from_facts(facts)
+                if backup_dir is not None:
+                    for c in false_drops(backup_dir, profile_dir, safe):
+                        medium.append(MediumItem(
+                            id=os.urandom(6).hex(), content=c,
+                            count=RESTORE_MEDIUM_COUNT, entry_extraction_index=RESTORE_ENTRY_INDEX,
+                        ))
+
+            ifs = interaction_files(memory_dir, safe, uid)
+            do_archive = bool(ifs) and not args.no_archive
+
+            if not seed and not do_archive:
                 n_skipped += 1
                 if args.verbose:
-                    print(f"[skip] {uid}: tiers/{safe}.json already exists")
+                    print(f"[skip] {uid}: tier exists, nothing to archive")
                 continue
-
-            facts = profile_facts(profile_dir, safe)
-            short = seed_short_from_facts(facts)
-
-            medium: List[MediumItem] = []
-            restored: List[str] = []
-            if backup_dir is not None:
-                restored = false_drops(backup_dir, profile_dir, safe)
-                medium = [
-                    MediumItem(id=os.urandom(6).hex(), content=c,
-                               count=RESTORE_MEDIUM_COUNT, entry_extraction_index=RESTORE_ENTRY_INDEX)
-                    for c in restored
-                ]
-
-            ifs = interaction_files(memory_dir, safe)
-
-            if not short and not medium and not ifs:
+            if seed and not short and not medium and not do_archive:
                 continue  # nothing for this user
 
-            n_seeded += 1 if short else 0
-            n_restored += 1 if medium else 0
+            if short:
+                n_seeded += 1
+            if medium:
+                n_restored += 1
             total_short += len(short)
             total_medium += len(medium)
             total_files += len(ifs)
 
-            print(f"\n[user] {uid}  (safe={safe})")
-            print(f"  SHORT  <- {len(short)} dormant fact(s) (count=1)")
-            if medium:
-                print(f"  MEDIUM <- {len(medium)} restored false-drop(s) (count={RESTORE_MEDIUM_COUNT})")
-            if ifs and not args.no_archive:
+            head = f"\n[user] {uid}  (safe={safe})" + ("" if seed else "  [tier exists → seed skipped]")
+            print(head)
+            if seed:
+                print(f"  SHORT  <- {len(short)} dormant fact(s) (count=1)")
+                if medium:
+                    print(f"  MEDIUM <- {len(medium)} restored false-drop(s) (count={RESTORE_MEDIUM_COUNT})")
+            if do_archive:
                 print(f"  archive: {len(ifs)} interaction_*.md -> user/_archive/{safe}/")
             if args.verbose:
                 for s in short:
@@ -332,17 +378,21 @@ def main(argv: List[str] = None) -> int:
                     print(f"    > arch   {p.name}")
 
             if args.apply:
-                # 1. seed tier state (atomic JSON via save_user)
-                tm._states[uid] = build_state(uid, short, medium)
-                tm.save_user(uid)
-                # 2. archive old raw dumps (move, never delete)
-                if ifs and not args.no_archive:
+                acted = []
+                # 1. seed tier state (atomic JSON) — only when seeding, never clobber
+                if seed and (short or medium):
+                    tm._states[uid] = build_state(uid, short, medium)
+                    tm.save_user(uid)
+                    acted.append("seeded")
+                # 2. archive old raw dumps (move, never delete) — independent of seeding
+                if do_archive:
                     dest_dir = memory_dir / "user" / "_archive" / safe
                     dest_dir.mkdir(parents=True, exist_ok=True)
                     for p in ifs:
                         shutil.move(str(p), str(dest_dir / p.name))
                         n_archived += 1
-                print("  ✓ seeded" + (" + archived" if (ifs and not args.no_archive) else ""))
+                    acted.append("archived")
+                print(f"  ✓ {' + '.join(acted) if acted else 'no-op'}")
         except Exception as e:
             errors += 1
             print(f"  [ERROR] {uid}: {e}")
@@ -352,7 +402,7 @@ def main(argv: List[str] = None) -> int:
     print(f"  users discovered : {len(users)}")
     print(f"  users seeded     : {n_seeded}  ({total_short} SHORT items)")
     print(f"  users restored   : {n_restored}  ({total_medium} MEDIUM items)")
-    print(f"  users skipped    : {n_skipped}  (tier file already exists)")
+    print(f"  users skipped    : {n_skipped}  (tier exists & nothing to archive)")
     if not args.no_archive:
         print(f"  files archived   : {total_files if not args.apply else n_archived}"
               + ("" if args.apply else "  (would-move; use --apply to write)"))
