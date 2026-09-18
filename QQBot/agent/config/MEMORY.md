@@ -1,39 +1,33 @@
-# Memory — Long-Term Memory Index
+# Memory — Three-Tier Long-Term Memory
 
-This file serves as an index of persistent memories. Each entry points to a separate memory file.
+You have an **automatic**, per-user long-term memory. You never manually save,
+recall, or delete memories — a background pipeline extracts durable facts from
+your conversations and maintains them across three tiers. This replaces the old
+"raw interaction dump" mechanism: there are no memory files for you to manage,
+and no memory tool to call.
 
-## Memory Types
+## The three tiers
 
-| Type | Description | Storage |
-|------|-------------|---------|
-| **user** | User-specific information, preferences, facts | `memory/users/{user_id}/` |
-| **conversation** | Important conversation summaries | `memory/conversations/{date}/` |
-| **knowledge** | Agent-learned facts and information | `memory/knowledge/` |
-| **system** | Agent self-reflection and improvements | `memory/system/` |
+| Tier | Holds | Surfaced to you? |
+|------|-------|------------------|
+| **SHORT** | freshly noticed facts, seen only 1–2 times, not yet confirmed | No — never injected |
+| **MEDIUM** | confirmed facts (repeated ≥3 times); age out if long unused | **Yes** — injected into your context |
+| **LONG** | deeply reinforced facts (count > 10), archived with a conversation snapshot | Not yet — a queryable LONG index is planned, not active in this version |
 
-## Memory Entries
+Facts climb SHORT → MEDIUM → LONG as the user keeps confirming them, and are
+demoted or aged out when they stop coming up. Promotion, reinforcement, decay
+and persistence are **entirely automatic** — you cannot edit them, and need not.
 
-<!-- Memory entries are added here automatically by the memory system -->
-<!-- Format: - [Title](file.md) — Brief description -->
+## Using the memories you are given
 
-## Memory Operations
-
-### Save Memory
-1. Agent identifies information which is not temperate preference and worth remembering
-- Adminicle: information such as "称呼"(which is varying due to different personality settings), "game tools'(legacy tools') calling detail"(which is a temperate preference) shouldn't be stored while topics like nickname, user's knowledge is worth to store.
-2. Memory system writes to appropriate file
-3. Index entry added to this file
-
-### Recall Memory
-1. Agent checks this index for relevant memories
-2. Loads specific memory files as needed
-3. Inject relevant memories into conversation context
-
-### Forget Memory
-1. Agent identifies outdated or incorrect memories
-2. Entry removed from this index
-3. Deletion in memory files
-
-## Current Memories
-
-_Memories will be created as users interact with the agent._
+- A user's confirmed memories are injected into your context under the header
+  **`## 用户记忆（中期）`**, one `- ` bullet each.
+- Use them naturally to personalize your reply (the user's games, projects,
+  preferences, ongoing goals). **Do not** robotically announce "I remember…" or
+  read the list back to the user.
+- A bullet prefixed **`(低置信)`** is only weakly confirmed — treat it as a hint,
+  not a fact. Do not act on it confidently, and accept correction gracefully.
+- These memories describe the **user**, derived only from what the user said —
+  never from your own replies, role-play names, or one-off transient context.
+- If a memory conflicts with what the user says now, **trust the user**; the
+  system re-learns from the conversation on its own.

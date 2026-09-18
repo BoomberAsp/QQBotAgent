@@ -892,8 +892,13 @@ class TestAgentCore:
             system_content = captured["msgs"][0]["content"]
             assert "用户记忆（中期）" in system_content, f"MEDIUM block missing: {system_content[-400:]}"
             assert "力量训练" in system_content, f"MEDIUM fact not injected: {system_content[-400:]}"
-            # count>=5 → no low-confidence label
-            assert "(低置信)" not in system_content, "count>=5 must NOT be low-confidence"
+            # count>=5 → no low-confidence label. Scope the check to the injected
+            # MEDIUM block (appended last): MEMORY.md guidance is now part of the
+            # system prompt too and legitimately mentions both the header and the
+            # "(低置信)" label as documentation — so split on the LAST occurrence of
+            # the header (the runtime-appended block), not the first (inside MEMORY.md).
+            medium_block = system_content.rsplit("## 用户记忆（中期）", 1)[1]
+            assert "(低置信)" not in medium_block, "count>=5 must NOT be low-confidence"
             print_pass("P1 MEDIUM-tier memory injected into system prompt")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)

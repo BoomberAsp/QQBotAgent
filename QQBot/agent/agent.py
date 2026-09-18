@@ -68,6 +68,7 @@ class Agent:
     - AGENTS.md: Orchestration and reasoning rules
     - BOOTSTRAP.md: Startup sequence
     - SESSION.md: Session configuration
+    - MEMORY.md: Three-tier long-term memory rules (injected into the prompt)
     """
 
     # ── Construction ──────────────────────────────────────────────
@@ -123,6 +124,7 @@ class Agent:
             "AGENTS.md",
             "BOOTSTRAP.md",
             "SESSION.md",
+            "MEMORY.md",
         ]
         for filename in config_files:
             filepath = os.path.join(self.config_dir, filename)
@@ -150,6 +152,10 @@ class Agent:
         # AGENTS: orchestration rules
         if "agents" in self._configs:
             parts.append("# Orchestration Rules\n\n" + self._configs["agents"])
+
+        # MEMORY: three-tier long-term memory rules (P1, Decision K — wired in)
+        if "memory" in self._configs:
+            parts.append(self._configs["memory"])
 
         # Current time context
         parts.append(f"\n## Current Context\n\nCurrent time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
