@@ -1460,12 +1460,38 @@ class WikiScraper:
                 pass
         return "\n\n".join(examples)
 
+    async def _translate_batch_once(self, prompt: str, batch: list[dict],
+                                    attempt: int, attempts: int) -> dict:
+        """Run one translation batch; return parsed JSON ({} on failure).
+
+        ``chat_completion`` converts timeouts/API errors into Chinese error
+        *strings* instead of raising, so an unparseable reply is the failure
+        signal. Log it (with the reply head) rather than dropping the batch
+        silently — silent drops are how English text survived earlier cache
+        builds (a real 8-char batch measures ~47s, right at the old 60s cap).
+        """
+        try:
+            result = await self.llm_client.chat_completion(prompt,
+                                                           timeout_set=180.0)
+        except Exception as e:
+            print(f"[WikiScraper] translation batch raised "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            return {}
+        translated = self._parse_translation_json(result)
+        if not translated:
+            head = (result or "").strip().replace("\n", " ")[:120]
+            print(f"[WikiScraper] translation batch {attempt}/{attempts} got no "
+                  f"JSON ({len(batch)} chars, first={batch[0]['title']}); "
+                  f"reply head: {head!r}", file=sys.stderr)
+        return translated
+
     async def _llm_translate_details(self, chars: list[dict]):
         """Batch-translate desc/skill names+descriptions/discs via LLM.
 
-        Sends characters in batches of 8, each with English fields; expects a
+        Sends characters in batches of 4, each with English fields; expects a
         JSON object keyed by title with translated fields. openrubi few-shot +
-        a status-term glossary keep terminology consistent.
+        a status-term glossary keep terminology consistent. A batch whose
+        reply carries no JSON (timeout / API error string) is retried once.
         """
         if not self.llm_client:
             return
@@ -1481,8 +1507,8 @@ class WikiScraper:
         )
 
         total = len(chars)
-        for i in range(0, total, 8):
-            batch = chars[i : i + 8]
+        for i in range(0, total, 4):
+            batch = chars[i : i + 4]
             # Progress heartbeat: this phase runs 20+ sequential LLM calls and
             # is otherwise completely silent, which looks like a hang in logs.
             print(f"[WikiScraper] translating details {i + 1}-{i + len(batch)}/{total}",
@@ -1516,11 +1542,12 @@ class WikiScraper:
                 '{"<title>": {"name_cn": "...", "desc": "...", "skills": [{"name":"...","des":"...","des2":"...","burst":"..."}], "discs": ["..."]}}'
             )
 
-            try:
-                result = await self.llm_client.chat_completion(prompt, timeout_set=60.0)
-                translated = self._parse_translation_json(result)
-            except Exception:
-                translated = {}
+            translated = {}
+            for attempt in (1, 2):
+                translated = await self._translate_batch_once(prompt, batch,
+                                                              attempt, 2)
+                if translated:
+                    break
 
             for c in batch:
                 t = translated.get(c["title"])
@@ -1885,8 +1912,11 @@ class WikiScraper:
             "Immune=免疫，Provoke=嘲讽，Stun=眩晕，Bleed=流血，Burn=灼烧，"
             "Poison=中毒，Revive=复活，Barrier=屏障，Recovery=恢复。"
         )
-        for i in range(0, len(bonds), 8):
-            batch = bonds[i : i + 8]
+        total = len(bonds)
+        for i in range(0, total, 4):
+            batch = bonds[i : i + 4]
+            print(f"[WikiScraper] translating bonds {i + 1}-{i + len(batch)}/{total}",
+                  file=sys.stderr)
             payload = []
             for b in batch:
                 payload.append({
@@ -1905,11 +1935,12 @@ class WikiScraper:
                 + "\n\n返回 ONLY JSON（无 markdown 代码块、无解释），结构相同但字段翻译为中文：\n"
                 '{"<title>": {"name_cn": "...", "desc": "...", "effect": "...", "notes": "...", "obtain": "..."}}'
             )
-            try:
-                result = await self.llm_client.chat_completion(prompt, timeout_set=60.0)
-                translated = self._parse_translation_json(result)
-            except Exception:
-                translated = {}
+            translated = {}
+            for attempt in (1, 2):
+                translated = await self._translate_batch_once(prompt, batch,
+                                                              attempt, 2)
+                if translated:
+                    break
             for b in batch:
                 t = translated.get(b["title"])
                 if not isinstance(t, dict):
