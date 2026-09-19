@@ -380,7 +380,9 @@ async def _maybe_refresh_characters():
             asyncio.create_task(_do_refresh(scraper))
         else:
             await _do_refresh(scraper)
-    except Exception:
+    except Exception as e:
+        print(f"[character_detail] refresh scheduling failed: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
         _refreshing = False
 
 
@@ -400,7 +402,10 @@ async def _do_refresh(scraper):
         result = await scraper.refresh_characters()
         if result:
             _invalidate()
-    except Exception:
-        pass
+    except Exception as e:
+        # Never silent: a dead background refresh is why stale English text
+        # can survive in the cache for weeks with nothing in the logs.
+        print(f"[character_detail] background refresh failed: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
     finally:
         _refreshing = False

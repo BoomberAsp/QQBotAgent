@@ -11,7 +11,7 @@ This document defines what happens when the agent starts up.
 4. Load AGENTS.md         → Orchestration rules
 5. Load WORKSPACE.md      → Capability boundaries and workspace constraints
 6. Load SESSION.md        → Session configuration
-7. Load MEMORY.md         → Long-term memory index
+7. Load MEMORY.md         → Three-tier long-term memory rules (injected into the system prompt)
 8. Register built-in tools → ToolRegistry initialization
 9. Verify LLM connection   → Health check to DeepSeek API
 10. Verify QQ connection    → Health check to Napcat WebSocket

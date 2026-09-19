@@ -892,8 +892,13 @@ class TestAgentCore:
             system_content = captured["msgs"][0]["content"]
             assert "用户记忆（中期）" in system_content, f"MEDIUM block missing: {system_content[-400:]}"
             assert "力量训练" in system_content, f"MEDIUM fact not injected: {system_content[-400:]}"
-            # count>=5 → no low-confidence label
-            assert "(低置信)" not in system_content, "count>=5 must NOT be low-confidence"
+            # count>=5 → no low-confidence label. Scope the check to the injected
+            # MEDIUM block (appended last): MEMORY.md guidance is now part of the
+            # system prompt too and legitimately mentions both the header and the
+            # "(低置信)" label as documentation — so split on the LAST occurrence of
+            # the header (the runtime-appended block), not the first (inside MEMORY.md).
+            medium_block = system_content.rsplit("## 用户记忆（中期）", 1)[1]
+            assert "(低置信)" not in medium_block, "count>=5 must NOT be low-confidence"
             print_pass("P1 MEDIUM-tier memory injected into system prompt")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -2207,6 +2212,7 @@ class TestMemoryMigration:
     def run(self):
         print_header("4.9. P1 Memory Migration Script")
         self.test_migration_seeds_and_archives()
+        self.test_migration_archives_loose_legacy_dumps()
 
     def _load_module(self):
         import importlib.util
@@ -2270,6 +2276,47 @@ class TestMemoryMigration:
             with open(tier_path, encoding="utf-8") as f:
                 assert len(json.load(f)["short"]) == 2, "re-run must be idempotent (no double-seed)"
             print_pass("migration: seeds SHORT+MEDIUM, archives dumps, restores false-drops, idempotent")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_migration_archives_loose_legacy_dumps(self):
+        """Legacy raw dumps written FLAT under user/ (uid only in the filename)
+        must be discovered, attributed to the right user, and archived too —
+        not just the ones inside user/{uid}/ subdirs."""
+        tmp = tempfile.mkdtemp()
+        try:
+            mod = self._load_module()
+            prof = os.path.join(tmp, "profiles")
+            mem = os.path.join(tmp, "memory")
+            # user WITH a subdir + profile, plus loose dumps for the SAME uid
+            os.makedirs(os.path.join(prof, "2578260985"))
+            os.makedirs(os.path.join(mem, "user", "2578260985"))
+            with open(os.path.join(prof, "2578260985", "profile.json"), "w", encoding="utf-8") as f:
+                json.dump({"user_id": "2578260985", "facts": ["用户喜欢咖啡"]}, f, ensure_ascii=False)
+            for n in ("interaction_2578260985_1.md", "interaction_2578260985_2.md"):
+                open(os.path.join(mem, "user", "2578260985", n), "w").close()
+            # legacy LOOSE files flat under user/ for the same uid
+            for n in ("interaction_2578260985_900.md", "interaction_2578260985_901.md"):
+                open(os.path.join(mem, "user", n), "w").close()
+            # a loose-only user (no profile, no subdir) → archive, but NO empty tier
+            open(os.path.join(mem, "user", "interaction_777_500.md"), "w").close()
+
+            rc = mod.main(["--profile-dir", prof, "--memory-dir", mem, "--apply", "--no-backup"])
+            assert rc == 0, rc
+
+            arch = os.path.join(mem, "user", "_archive", "2578260985")
+            got = set(os.listdir(arch))
+            assert got == {"interaction_2578260985_1.md", "interaction_2578260985_2.md",
+                           "interaction_2578260985_900.md", "interaction_2578260985_901.md"}, got
+            # no loose files remain flat under user/
+            remaining = [x for x in os.listdir(os.path.join(mem, "user"))
+                         if x.startswith("interaction_")]
+            assert remaining == [], f"loose dumps not archived: {remaining}"
+            # loose-only user 777 archived under its own uid, no tier written
+            assert os.path.exists(os.path.join(mem, "user", "_archive", "777", "interaction_777_500.md"))
+            assert not os.path.exists(os.path.join(mem, "tiers", "777.json")), "no facts → no empty tier"
+            assert os.path.exists(os.path.join(mem, "tiers", "2578260985.json")), "profile user gets a tier"
+            print_pass("migration: archives legacy loose dumps by filename uid; no empty tiers")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
