@@ -255,12 +255,12 @@ class TestSessionManager:
         print_pass("Session timeout and clear")
 
     def test_trimming(self):
-        from agent.session import SessionManager
+        from agent.session import SessionManager, TRIM_HYSTERESIS
 
         mgr = SessionManager(max_context_messages=5)
         session = mgr.get_or_create("user_123")
 
-        # Add 10 messages
+        # Add 10 messages — well past max + hysteresis, so trim engages
         for i in range(10):
             session.add_message("user" if i % 2 == 0 else "assistant", f"message_{i}")
 
@@ -269,7 +269,22 @@ class TestSessionManager:
         assert len(session.context) == 5, f"Expected 5 after trim, got {len(session.context)}"
         # Should keep the LAST 5 messages
         assert session.context[0]["content"] == "message_5"
-        print_pass("Context trimming")
+
+        # Hysteresis (Phase 4, B3): within max + TRIM_HYSTERESIS the head must
+        # NOT move, so the provider-side prefix cache survives turn to turn.
+        session.clear()
+        for i in range(5 + TRIM_HYSTERESIS):
+            session.add_message("user" if i % 2 == 0 else "assistant", f"m_{i}")
+        session.trim(5)
+        assert len(session.context) == 5 + TRIM_HYSTERESIS, (
+            f"trim must be lazy inside the hysteresis band, got {len(session.context)}")
+        assert session.context[0]["content"] == "m_0", "head must not move"
+        session.add_message("user", "m_overflow")
+        session.trim(5)
+        assert len(session.context) == 5, (
+            f"past the band trim snaps back to max, got {len(session.context)}")
+        assert session.context[-1]["content"] == "m_overflow"
+        print_pass("Context trimming (with Phase 4 hysteresis band)")
 
     def test_clear_context(self):
         from agent.session import SessionManager
@@ -410,6 +425,7 @@ class TestAgentCore:
         asyncio.run(self.test_max_iterations())
         asyncio.run(self.test_auto_compress_fallback())
         asyncio.run(self.test_task_fold_persistence())
+        asyncio.run(self.test_profile_injection())
         asyncio.run(self.test_medium_memory_injection())
 
     async def test_bootstrap(self):
@@ -829,8 +845,12 @@ class TestAgentCore:
             agent._captured_messages = None
             original_build = agent._build_messages
 
-            def capture_build(session, msg):
-                msgs = original_build(session, msg)
+            # NOTE: this test was defined but never wired into run() — the
+            # 2-arg wrapper below did not match agent.run()'s call signature,
+            # so it would have raised TypeError had it been called. Fixed and
+            # registered alongside the Phase 3 assertion update.
+            def capture_build(session, msg, *a, **k):
+                msgs = original_build(session, msg, *a, **k)
                 agent._captured_messages = msgs
                 return msgs
 
@@ -838,15 +858,25 @@ class TestAgentCore:
 
             await agent.run("你好", "user_999")
 
-            # Verify profile was injected into system prompt
+            # Verify profile was injected. Phase 3 (Cache-Hit-Rate-Plan.md):
+            # the profile block moved from messages[0] to the L4 volatile tail
+            # — the LAST system message, placed after the history so that
+            # profile churn cannot invalidate the cached prefix.
             assert agent._captured_messages is not None
-            system_content = agent._captured_messages[0]["content"]
-            assert "小明" in system_content, f"Profile nickname not injected: {system_content[:200]}"
-            assert "机器学习" in system_content, f"Profile interests not injected: {system_content[:200]}"
-            assert "concise" in system_content, f"Profile preferences not injected: {system_content[:200]}"
-            # P0 画像瘦身: facts dormant — must NOT be injected (§6).
-            assert "深圳" not in system_content, f"facts must not be injected: {system_content[:200]}"
-            print_pass("User profile injected (typed slots only; facts dormant)")
+            system_msgs = [
+                m for m in agent._captured_messages if m.get("role") == "system"
+            ]
+            assert len(system_msgs) >= 2, "expected L1-L3 head + L4 tail system messages"
+            tail = system_msgs[-1]["content"]
+            head = system_msgs[0]["content"]
+            assert "小明" in tail, f"Profile nickname not injected: {tail[:200]}"
+            assert "机器学习" in tail, f"Profile interests not injected: {tail[:200]}"
+            assert "concise" in tail, f"Profile preferences not injected: {tail[:200]}"
+            assert "小明" not in head, "profile must NOT be in the cached head (Phase 3)"
+            # P0 画像瘦身: facts dormant — must NOT be injected (§6). Scope the
+            # check to the tail's 当前轮次上下文 block (the L4 injection site).
+            assert "深圳" not in tail, f"facts must not be injected: {tail[:200]}"
+            print_pass("User profile injected into L4 tail (typed slots only; facts dormant)")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -889,17 +919,23 @@ class TestAgentCore:
             agent._build_messages = capture
             await agent.run("今天练什么好？", "user_abc")
 
-            system_content = captured["msgs"][0]["content"]
-            assert "用户记忆（中期）" in system_content, f"MEDIUM block missing: {system_content[-400:]}"
-            assert "力量训练" in system_content, f"MEDIUM fact not injected: {system_content[-400:]}"
-            # count>=5 → no low-confidence label. Scope the check to the injected
-            # MEDIUM block (appended last): MEMORY.md guidance is now part of the
-            # system prompt too and legitimately mentions both the header and the
-            # "(低置信)" label as documentation — so split on the LAST occurrence of
-            # the header (the runtime-appended block), not the first (inside MEMORY.md).
-            medium_block = system_content.rsplit("## 用户记忆（中期）", 1)[1]
+            # Phase 3 (Cache-Hit-Rate-Plan.md): the MEDIUM block moved from
+            # messages[0] to the L4 volatile tail (last system message).
+            system_msgs = [m for m in captured["msgs"] if m.get("role") == "system"]
+            tail = system_msgs[-1]["content"]
+            assert "用户记忆（中期）" in tail, f"MEDIUM block missing: {tail[-400:]}"
+            assert "力量训练" in tail, f"MEDIUM fact not injected: {tail[-400:]}"
+            # MEMORY.md documentation (in the L1 head) legitimately *mentions*
+            # the header string, so check the user fact instead — documentation
+            # never contains it.
+            assert "力量训练" not in system_msgs[0]["content"], (
+                "MEDIUM facts must NOT be in the cached head (Phase 3)")
+            # count>=5 → no low-confidence label. The tail holds only runtime
+            # injections (MEMORY.md documentation lives in the L1 head), so the
+            # rsplit guard is kept merely as belt-and-braces.
+            medium_block = tail.rsplit("## 用户记忆（中期）", 1)[1]
             assert "(低置信)" not in medium_block, "count>=5 must NOT be low-confidence"
-            print_pass("P1 MEDIUM-tier memory injected into system prompt")
+            print_pass("P1 MEDIUM-tier memory injected into L4 tail")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1697,6 +1733,207 @@ class TestTokenLedger:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class TestCacheStability:
+    """Phase 3/4 (Cache-Hit-Rate-Plan.md): provider prefix-cache invariants.
+
+    Prefix caching only pays off when the bytes ahead of the new content are
+    identical to a recent request. These tests pin the structural guarantees
+    rather than the hit rate itself (which is observable only against a real
+    provider via the token ledger + webui).
+    """
+
+    def run(self):
+        print_header("14. Cache Stability Tests (Phase 3/4)")
+
+        asyncio.run(self.test_head_is_user_invariant())
+        asyncio.run(self.test_volatile_lives_in_tail())
+        asyncio.run(self.test_head_stable_across_profile_change())
+        asyncio.run(self.test_history_head_moves_rarely())
+        asyncio.run(self.test_compress_boundary_steps())
+        asyncio.run(self.test_system_prompt_has_no_timestamp())
+
+    def _make_agent(self, tmpdir=None, **kw):
+        from agent.tool_registry import ToolRegistry
+        from agent.agent import Agent
+
+        kwargs = dict(
+            deepseek_client=MockDeepSeekClient(),
+            tool_registry=ToolRegistry(),
+            config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+        )
+        if tmpdir:
+            from agent.profile import ProfileManager
+            kwargs["profile_manager"] = ProfileManager(base_dir=tmpdir)
+        kwargs.update(kw)
+        return Agent(**kwargs)
+
+    @staticmethod
+    def _systems(msgs):
+        """(head, tail) — first and last system messages of a built list."""
+        sys_msgs = [m for m in msgs if m.get("role") == "system"]
+        assert len(sys_msgs) >= 2, f"expected head+tail system messages, got {len(sys_msgs)}"
+        return sys_msgs[0]["content"], sys_msgs[-1]["content"]
+
+    async def test_head_is_user_invariant(self):
+        """B5: the cached head must not depend on who is asking.
+
+        Two users, no personality/group context → byte-identical messages[0].
+        """
+        from agent.context import _current_personality, _current_group_context
+        p_tok, g_tok = _current_personality.set(""), _current_group_context.set("")
+        try:
+            agent = self._make_agent()
+            head_a, _ = self._systems(
+                agent._build_messages(agent.sessions.get_or_create("user_A"), "hi"))
+            head_b, _ = self._systems(
+                agent._build_messages(agent.sessions.get_or_create("user_B"), "hello"))
+            assert head_a == head_b, "head must be identical across users (shared hot prefix)"
+            assert len(head_a) > 1000, "head should carry the config block"
+            print_pass("L1 head is user-invariant (shared prefix across users)")
+        finally:
+            _current_personality.reset(p_tok)
+            _current_group_context.reset(g_tok)
+
+    async def test_volatile_lives_in_tail(self):
+        """B1/B6: per-turn content must sit AFTER the history, never in the head."""
+        from agent.context import _current_personality, _current_group_context
+        p_tok, g_tok = _current_personality.set(""), _current_group_context.set("")
+        try:
+            agent = self._make_agent()
+            session = agent.sessions.get_or_create("user_A")
+            session.add_message("user", "old question")
+            session.add_message("assistant", "old answer")
+
+            head, tail = self._systems(agent._build_messages(session, "new question"))
+
+            # Tail is positioned after the history
+            msgs = agent._build_messages(session, "new question")
+            roles = [m["role"] for m in msgs]
+            assert roles[0] == "system"
+            assert roles.index("system", 1) > roles.index("assistant"), (
+                f"volatile system message must follow the history: {roles}")
+            assert roles[-1] == "user"
+            # Time lives in the tail only
+            assert "Current time:" in tail, "real per-turn time belongs in the tail"
+            assert "Current time:" not in head, "head must stay timestamp-free"
+            print_pass("Volatile context (time) is in the L4 tail, after history")
+        finally:
+            _current_personality.reset(p_tok)
+            _current_group_context.reset(g_tok)
+
+    async def test_head_stable_across_profile_change(self):
+        """B2: a profile update must not invalidate the cached head+history."""
+        from agent.context import _current_personality, _current_group_context
+        from agent.profile import ProfileManager
+        p_tok, g_tok = _current_personality.set(""), _current_group_context.set("")
+        tmpdir = tempfile.mkdtemp()
+        try:
+            profile = ProfileManager(base_dir=tmpdir).get("user_A")
+            profile.nickname = "旧昵称"
+            ProfileManager(base_dir=tmpdir).save(profile)
+
+            agent = self._make_agent(tmpdir=tmpdir)
+            session = agent.sessions.get_or_create("user_A")
+            head1, tail1 = self._systems(agent._build_messages(session, "turn one"))
+
+            # Simulate an extraction batch landing between two turns
+            p2 = agent.profiles.get("user_A")
+            p2.nickname = "新昵称"
+            agent.profiles.save(p2)
+
+            head2, tail2 = self._systems(agent._build_messages(session, "turn two"))
+            assert head1 == head2, "head must be byte-stable across a profile change"
+            assert tail1 != tail2, "tail is expected to change"
+            assert "新昵称" in tail2 and "新昵称" not in head2
+            print_pass("Head byte-stable across profile change; delta absorbed by tail")
+        finally:
+            _current_personality.reset(p_tok)
+            _current_group_context.reset(g_tok)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_history_head_moves_rarely(self):
+        """B3: with hysteresis the history head changes ~once per 5 turns, not 5×."""
+        from agent.session import Session, TRIM_HYSTERESIS
+
+        session = Session(user_id="user_A")
+        for i in range(20):  # start exactly at the documented window
+            session.add_message("user" if i % 2 == 0 else "assistant", f"m{i}")
+
+        heads = [session.context[0]["content"]]
+        for turn in range(5):
+            session.add_message("user", f"q{turn}")
+            session.add_message("assistant", f"a{turn}")
+            session.trim(20)
+            if session.context[0]["content"] != heads[-1]:
+                heads.append(session.context[0]["content"])
+            assert len(session.context) <= 20 + TRIM_HYSTERESIS
+
+        changes = len(heads) - 1
+        assert changes <= 2, f"history head moved {changes}× in 5 turns (expected ≤2)"
+        print_pass(f"Hysteresis trim: history head moved {changes}× over 5 turns (was 5×)")
+
+    async def test_compress_boundary_steps(self):
+        """B4: the compression boundary advances in steps of COMPRESS_STEP."""
+        from agent.agent import Agent
+
+        step = Agent.COMPRESS_STEP
+        # 40 messages, every 3rd is a verbose tool result
+        ctx = []
+        for i in range(40):
+            if i % 3 == 0:
+                ctx.append({"role": "tool", "tool_call_id": f"c{i}",
+                            "content": "line1\n" + "x" * 500})
+            else:
+                ctx.append({"role": "user" if i % 2 else "assistant", "content": f"c{i}"})
+
+        def compressed_count(out):
+            # Only tool messages are rewritten; non-tool messages keep identity.
+            return sum(1 for o, c in zip(out, ctx) if o is not c)
+
+        def tools_in(rng):
+            return sum(1 for i in rng if i % 3 == 0)
+
+        # Nothing compressed while inside the full-detail window
+        assert Agent._compress_context(ctx[:20]) == ctx[:20]
+        assert compressed_count(Agent._compress_context(ctx[:20 + step - 1])) == 0, (
+            "boundary must not advance before a full step accumulates")
+
+        # First step: exactly the head `step` messages are eligible
+        base_len = 20 + step
+        base = Agent._compress_context(ctx[:base_len])
+        assert compressed_count(base) == tools_in(range(step)), (
+            f"expected {tools_in(range(step))} rewritten tool messages, "
+            f"got {compressed_count(base)}")
+        assert base[step:] == ctx[step:base_len], "tail window must stay untouched"
+
+        # Byte-stability inside the step: growing the context by 1..step-1
+        # must leave the already-emitted prefix identical.
+        for extra in range(1, step):
+            grown = Agent._compress_context(ctx[:base_len + extra])
+            assert grown[:base_len] == base, (
+                f"prefix drifted at +{extra} messages — cache would miss")
+            assert compressed_count(grown) == tools_in(range(step)), (
+                f"boundary advanced early at +{extra}")
+
+        # Crossing the step advances the boundary by exactly COMPRESS_STEP
+        nxt = Agent._compress_context(ctx[:base_len + step])
+        assert compressed_count(nxt) == tools_in(range(2 * step)), (
+            f"expected {tools_in(range(2 * step))} compressed, got {compressed_count(nxt)}")
+        assert nxt[:20 + step - 1] != base[:20 + step - 1] or nxt[20:base_len] != base[20:], (
+            "boundary advance must rewrite the newly-aged messages")
+        print_pass(f"Compression boundary steps by {step} (byte-stable between steps)")
+
+    async def test_system_prompt_has_no_timestamp(self):
+        """B6: build_system_prompt() must be time-free so the cache never expires."""
+        agent = self._make_agent()
+        first = agent.build_system_prompt()
+        assert first == agent.build_system_prompt(), "prompt must be cached/stable"
+        now = time.strftime("%Y-%m-%d %H")
+        assert f"Current time: {now}" not in first, (
+            "frozen timestamp must not be baked into the cached system prompt")
+        print_pass("Cached system prompt carries no timestamp")
+
+
 # ── Main Runner ──────────────────────────────────────────────────
 
 class TestTieredMemory:
@@ -2342,6 +2579,7 @@ def main():
         ("Built-in Tools", TestBuiltinTools()),
         ("Personality Manager", TestPersonality()),
         ("TokenLedger", TestTokenLedger()),
+        ("Cache Stability (Phase 3/4)", TestCacheStability()),
     ]
 
     passed = 0

@@ -157,8 +157,12 @@ class Agent:
         if "memory" in self._configs:
             parts.append(self._configs["memory"])
 
-        # Current time context
-        parts.append(f"\n## Current Context\n\nCurrent time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        # NOTE (Cache-Hit-Rate-Plan.md Phase 3, B6): the "Current time" block
+        # used to live here — but this prompt is cached in _system_prompt, so
+        # the timestamp froze at first build (startup time) and went stale.
+        # The real per-turn time now lives in the L4 volatile tail message
+        # built by _build_messages(), AFTER the conversation history, where it
+        # cannot invalidate the provider-side prefix cache.
 
         # Hardware context (dynamically detected, replaces hardcoded WORKSPACE.md §4)
         if self.hardware:
@@ -429,48 +433,46 @@ class Agent:
     ) -> List[Dict[str, Any]]:
         """Build the full message list for the LLM.
 
-        Structure:
-        1. Global system prompt (SOUL + IDENTITY + AGENTS)
-        2. Session type marker (special/temporary/continuous)
-        3. User profile context (from ProfileManager)
-        4. Workspace quota context (if in special session)
-        5. Permission role context (if not admin)
-        6. MEDIUM-tier memory injection (from TieredMemory, P1)
-        7. Conversation history (from Session or SpecialSession)
-        8. Current user message
-        """
-        messages = []
+        Cache-friendly four-layer layout (Cache-Hit-Rate-Plan.md Phase 3) —
+        ordered by volatility so the provider-side prefix cache survives
+        across turns; everything that can change per-turn sits AFTER the
+        history in an L4 tail system message:
 
-        # 1. Global system prompt
+        messages[0] (system):
+          L1 全局静态   SOUL + IDENTITY + AGENTS + MEMORY + 硬件（所有用户共享）
+          L2 人格/群    personality 块 + 群功能限制（同人格/同群共享）
+          L3 用户级稳定 工作区路径 + 权限说明（同用户跨轮稳定）
+        然后:  会话历史（append-only，Phase 4 迟滞修剪/阶梯压缩）
+        然后:  L4 易变尾部（system）— 真实当前时间、特殊会话标记、quota 用量、
+               profile 注入、MEDIUM 记忆注入、人格过渡提示
+        最后:  当前用户消息
+        """
+        from agent.context import (
+            _current_personality, _personality_transition, _current_group_context,
+        )
+        from agent.personality import get_personality_manager
+
+        user_id = special_session.user_id if special_session else session.user_id
+
+        # ── L1: global static system prompt (identical for every user) ──
         system_content = self.build_system_prompt()
 
-        # 1.5. Personality prompt (injected at the very top)
-        from agent.context import _current_personality, _personality_transition
-        from agent.personality import get_personality_manager
+        # ── L2: personality (stable per user/group). Appended AFTER L1 —
+        # used to be prepended before it, which split the ~10k-token config
+        # block into per-personality prefixes (B5). ──
         persona_name = _current_personality.get()
         if persona_name:
             pm = get_personality_manager()
             persona_content = pm.load(persona_name)
             if persona_content:
-                system_content = persona_content + "\n\n---\n\n" + system_content
-        # 1.6. Personality transition notice (switch without clearing history)
-        transition_note = _personality_transition.get()
-        if transition_note:
-            system_content += f"\n\n{transition_note}"
-        user_id = special_session.user_id if special_session else session.user_id
+                system_content += "\n\n---\n\n" + persona_content
 
-        # 2. Session type marker
-        if special_session:
-            system_content += (
-                f"\n\n## 特殊会话模式\n"
-                f"当前会话名称: {special_session.name}\n"
-                f"会话消息数: {special_session.total_messages}\n"
-                f"会话创建于: {time.strftime('%Y-%m-%d %H:%M', time.localtime(special_session.created_at))}\n"
-                f"你处于特殊会话模式，拥有完整的对话上下文记忆。"
-                f"如果任务已完成，可以建议用户使用 /结束会话 退出特殊会话模式。"
-            )
+        # ── L2: group feature restrictions (stable per group) ──
+        group_ctx = _current_group_context.get()
+        if group_ctx:
+            system_content += group_ctx
 
-        # Workspace context — always injected for all session types
+        # ── L3: workspace path (stable per user) ──
         if self.workspaces:
             workspace_path = self.workspaces.get_workspace(user_id)
             system_content += (
@@ -479,22 +481,10 @@ class Agent:
                 f"用户可以在工作区内存放持久化文件、代码和输出。"
                 f"子目录: code/（代码执行）、uploads/（上传文件）、output/（生成输出）、projects/（项目文件）。"
             )
-            quota_ctx = self.workspaces.get_quota_context(user_id)
-            if quota_ctx:
-                system_content += f"\n{quota_ctx}"
 
-        messages.append({"role": "system", "content": system_content})
-
-        # 3. User profile context
-        if self.profiles:
-            profile = self.profiles.get(user_id)
-            profile_context = profile.to_prompt_context()
-            if profile_context:
-                messages[0]["content"] += "\n\n" + profile_context
-
-        # 4. Permission role context (for non-admin users)
+        # ── L3: permission role context (stable per user; non-admin only) ──
         if role_hint and role_hint != "admin":
-            messages[0]["content"] += (
+            system_content += (
                 f"\n\n## 当前会话权限\n"
                 f"你的工具列表已由系统根据当前用户身份自动过滤。"
                 f"你只能看到和使用当前可用的工具。"
@@ -502,71 +492,118 @@ class Agent:
                 f"请礼貌地说明当前权限不支持此操作，并建议用户联系管理员获取更高权限。"
             )
 
-        # 4.5. Group feature restrictions
-        from agent.context import _current_group_context
-        group_ctx = _current_group_context.get()
-        if group_ctx:
-            messages[0]["content"] += group_ctx
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_content},
+        ]
 
-        # 5. MEDIUM-tier memory injection (P1 three-tier engine).
-        # Replaces the old MemorySystem.search substring injection. NOTE: legacy
-        # shared knowledge/system memories are no longer injected here (out of P1
-        # scope, Decision 8 — audit prod knowledge/ + system/ before deploy).
-        # LONG-index injection is P2.
-        if self.tiered_memory:
-            medium_block = self.tiered_memory.build_medium_injection(user_id)
-            if medium_block:
-                messages[0]["content"] += "\n\n" + medium_block
-
-        # 5. Conversation history
+        # ── Conversation history (append-only cached prefix) ──
         if special_session:
             # Special session: full untrimmed context with layered compression
-            context = self._compress_context(special_session.context)
-            messages.extend(context)
+            messages.extend(self._compress_context(special_session.context))
         else:
             # Temporary session: trimmed context
             messages.extend(session.context)
 
-        # 6. Current user message
+        # ── L4: volatile tail, rebuilt every turn. Lives AFTER the history
+        # so changes here (time / session marker / quota / profile / memory)
+        # never invalidate the cached system+history prefix (B1/B2/B6). ──
+        volatile: List[str] = [
+            f"## 当前轮次上下文\n\nCurrent time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        ]
+
+        # Personality transition notice (switch without clearing history)
+        transition_note = _personality_transition.get()
+        if transition_note:
+            volatile.append(transition_note)
+
+        # Special session marker (message count changes every turn)
+        if special_session:
+            volatile.append(
+                f"## 特殊会话模式\n"
+                f"当前会话名称: {special_session.name}\n"
+                f"会话消息数: {special_session.total_messages}\n"
+                f"会话创建于: {time.strftime('%Y-%m-%d %H:%M', time.localtime(special_session.created_at))}\n"
+                f"你处于特殊会话模式，拥有完整的对话上下文记忆。"
+                f"如果任务已完成，可以建议用户使用 /结束会话 退出特殊会话模式。"
+            )
+
+        # Workspace quota usage (changes whenever the user writes files)
+        if self.workspaces:
+            quota_ctx = self.workspaces.get_quota_context(user_id)
+            if quota_ctx:
+                volatile.append(quota_ctx)
+
+        # User profile context (changes after each extraction batch)
+        if self.profiles:
+            profile = self.profiles.get(user_id)
+            profile_context = profile.to_prompt_context()
+            if profile_context:
+                volatile.append(profile_context)
+
+        # MEDIUM-tier memory injection (P1 three-tier engine; changes as
+        # memories are reinforced/updated). NOTE: legacy shared knowledge/
+        # system memories are no longer injected here (out of P1 scope,
+        # Decision 8 — audit prod knowledge/ + system/ before deploy).
+        # LONG-index injection is P2.
+        if self.tiered_memory:
+            medium_block = self.tiered_memory.build_medium_injection(user_id)
+            if medium_block:
+                volatile.append(medium_block)
+
+        messages.append({"role": "system", "content": "\n\n".join(volatile)})
+
+        # ── Current user message ──
         messages.append({"role": "user", "content": user_message})
 
         return messages
 
     # ── Context Compression ────────────────────────────────────────
 
-    @staticmethod
-    def _compress_context(context: List[Dict], recent_full: int = 20) -> List[Dict]:
+    # Compression boundary advances in steps of this many messages
+    # (Cache-Hit-Rate-Plan.md Phase 4, B4): re-deciding the boundary every
+    # turn moves the divergence point through the history each time and
+    # kills the provider prefix cache. Stepping keeps the compressed head
+    # byte-identical for COMPRESS_STEP consecutive turns.
+    COMPRESS_STEP = 4
+
+    @classmethod
+    def _compress_context(cls, context: List[Dict], recent_full: int = 20) -> List[Dict]:
         """Compress older tool results in context to save tokens.
 
-        Layer 1 (last `recent_full` messages): keep full original.
-        Layer 2 (before that): compress tool results to first line only.
+        Layer 1 (tail window): keep full original.
+        Layer 2 (head): compress tool results to first line only.
         Layer 3: Progressive summary not yet implemented — all messages
                 before Layer 1 are kept but with compressed tool results.
 
-        This preserves the full conversation flow while reducing token
-        consumption from verbose tool outputs.
+        Cache-friendly stepping: the number of compressed head messages is
+        ``floor((len - recent_full) / COMPRESS_STEP) * COMPRESS_STEP`` — the
+        boundary only advances once every COMPRESS_STEP new messages, so the
+        compressed prefix stays byte-stable between steps (the tail window
+        temporarily holds up to recent_full + COMPRESS_STEP - 1 full messages,
+        which are billed at cache-hit price).
         """
-        if len(context) <= recent_full:
+        n_compress = (
+            (len(context) - recent_full) // cls.COMPRESS_STEP * cls.COMPRESS_STEP
+        )
+        if n_compress <= 0:
             return list(context)
 
         compressed = []
         for i, msg in enumerate(context):
-            idx_from_end = len(context) - i
-            if idx_from_end <= recent_full:
+            if i >= n_compress:
                 # Layer 1: keep as-is
                 compressed.append(msg)
-            else:
+            elif msg.get("role") == "tool":
                 # Layer 2: compress tool results
-                if msg.get("role") == "tool":
-                    content = msg.get("content", "")
-                    first_line = content.split("\n")[0][:200]
-                    compressed.append({
-                        "role": "tool",
-                        "tool_call_id": msg.get("tool_call_id", ""),
-                        "content": first_line + ("..." if len(content) > 200 else ""),
-                    })
-                else:
-                    compressed.append(msg)
+                content = msg.get("content", "")
+                first_line = content.split("\n")[0][:200]
+                compressed.append({
+                    "role": "tool",
+                    "tool_call_id": msg.get("tool_call_id", ""),
+                    "content": first_line + ("..." if len(content) > 200 else ""),
+                })
+            else:
+                compressed.append(msg)
 
         return compressed
 

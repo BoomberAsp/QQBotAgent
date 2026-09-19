@@ -1,6 +1,6 @@
 # Agent Personality & Behavior
 
-Your personality (character identity, traits, and communication style) is injected at the very top of this system prompt from the active personality profile. The sections below define shared behavioral rules, capability boundaries, and decision-making framework that apply regardless of which personality is active.
+Your personality (character identity, traits, and communication style) is injected from the active personality profile right after these shared rules, marked by a `---` separator. The sections below define shared behavioral rules, capability boundaries, and decision-making framework that apply regardless of which personality is active.
 
 ## Behavioral Rules
 

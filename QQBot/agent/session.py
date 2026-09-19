@@ -15,6 +15,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
+# Trim hysteresis (Cache-Hit-Rate-Plan.md Phase 4, B3): trimming the history
+# head EVERY turn once the session is full invalidates the provider-side
+# prefix cache for the whole history. Let the context grow this many messages
+# past max before snapping back to max in one cut — the head then changes
+# once every few turns instead of every turn. The extra messages are billed
+# at cache-hit price (~1/10), so this is a net win.
+TRIM_HYSTERESIS = 4
+
+
 @dataclass
 class Session:
     """A single user's conversation session."""
@@ -47,8 +56,13 @@ class Session:
         return (time.time() - self.last_active) > timeout
 
     def trim(self, max_messages: int):
-        """Trim context to the most recent max_messages entries."""
-        if len(self.context) > max_messages:
+        """Trim context to the most recent max_messages entries (lazy).
+
+        Hysteresis: the cut only happens once the context exceeds
+        ``max_messages + TRIM_HYSTERESIS`` — see the constant's comment for
+        the prefix-cache rationale.
+        """
+        if len(self.context) > max_messages + TRIM_HYSTERESIS:
             self.context = self.context[-max_messages:]
 
     def clear(self):
