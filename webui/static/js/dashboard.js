@@ -55,11 +55,21 @@
       if (r.uptime) set('res-uptime', fmtUptime(r.uptime));
     }
 
-    // Tokens (Phase 3)
+    // Tokens (Phase 3)。命中率口径见 Cache-Hit-Rate-Plan.md Phase 1.2：
+    // 优先展示今日 agent_loop 命中率（全局口径会被 triage/多模态稀释），
+    // 全局值降级为悬浮提示。
     if (data.tokens) {
       set('st-tokens', fmtNum(data.tokens.today_tokens));
-      if (data.tokens.hit_rate !== undefined && data.tokens.hit_rate !== null) {
-        set('st-tokens-sub', `缓存命中率 ${(data.tokens.hit_rate * 100).toFixed(1)}%`);
+      const al = data.tokens.hit_rate_agent_loop;
+      const gl = data.tokens.hit_rate;
+      const sub = document.getElementById('st-tokens-sub');
+      if (al !== undefined && al !== null) {
+        set('st-tokens-sub', `agent_loop 命中率(今日) ${(al * 100).toFixed(1)}%`);
+        if (sub && gl !== undefined && gl !== null) {
+          sub.title = `全局命中率(今日) ${(gl * 100).toFixed(1)}%`;
+        }
+      } else if (gl !== undefined && gl !== null) {
+        set('st-tokens-sub', `缓存命中率 ${(gl * 100).toFixed(1)}%`);
       }
     }
 
