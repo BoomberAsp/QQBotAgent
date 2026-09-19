@@ -12,7 +12,8 @@
 - **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制，分级限制：管理员 60s/100KB，会员 15s/50KB）
 - **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
-- **用户系统** — 长期记忆（Markdown 存储）+ LLM 驱动用户画像提取
+- **用户系统** — 三层记忆引擎（SHORT / MEDIUM / LONG，`TieredMemory`）+ LLM 驱动用户画像提取（含确定性事实过滤 `fact_filter`）
+- **Web 管理面板** — FastAPI 后台（`webui/`）：进程管理、配置热编辑、记忆/画像查看、Token 用量看板、反馈处理、Playground
 - **游戏工具** — 抽卡模拟（Wiki 自动爬取卡池数据）、团战截图测速（OCR 解析战斗截图，轻量/全量两种模式）、乱速概率计算、角色/羁绊查询（面板/技能/倍率）、兑换码查询（自动爬取+手动维护）
 - **地图服务** — 地址↔坐标转换、实时天气、POI搜索、路线规划（高德地图）
 - **群聊管理** — 按群开关功能（抽卡/图片/语音），超级用户可远程管理
@@ -148,24 +149,29 @@ bash start.sh
 | `/toggle` | 查看当前群聊功能开关状态 |
 | `/toggle <功能> <on/off>` | 开关功能（gacha / image / voice） |
 
-**游戏工具**
+**游戏工具**（直接返回，零 token，不经智能体）
 
 | 命令 | 说明 |
 |------|------|
-| `/兑换码` 或 `/redeem-code` | 查询当前有效游戏兑换码（直接返回，不经智能体） |
+| `/兑换码` 或 `/redeem-code` | 查询当前有效游戏兑换码 |
+| `/角色详情 <名称>` | 查询角色详情，渲染卡片图片返回（如 `/角色详情 夏妮`） |
+| `/羁绊详情 <名称>` | 查询羁绊详情，渲染卡片图片返回（如 `/羁绊详情 驰骋的快感`） |
+| `/刷新角色数据` | **仅管理员**：强制后台刷新角色/羁绊数据库（抓取+翻译+图片下载+卡片重渲染） |
 
 **连续对话**
 
 | 命令 | 说明 |
 |------|------|
-| `/取消` 或 `#取消` | 退出群聊连续对话模式 |
+| `/取消` 或 `#取消` 或 `/结束` 或 `#结束` | 退出群聊连续对话模式（四个写法等价） |
 
 **其他**
 
 | 命令 | 说明 |
 |------|------|
-| `/clear` 或 `清除上下文` | 清除临时会话上下文 |
+| `/clear` 或 `清除上下文` 或 `新对话` | 清除临时会话上下文（三个写法等价） |
 | `/status` | 查看 Agent 运行状态 |
+| `/功能` 或 `/features` | 渲染 `FEATURES.md` 为功能卡片图片返回（零 token） |
+| `/管理工作区` | 触发智能体调用 `get_user_info` 展示工作区快照并引导清理（落入 Agent 处理，非拦截命令） |
 
 **反馈 & Bug 报告**（零 token 消耗，直达开发者）
 
@@ -181,18 +187,24 @@ bash start.sh
 |------|------|
 | `setup.sh` | 一键安装所有依赖（系统库 + Python 环境 + SearXNG） |
 | `start.sh` | 启动所有服务（SearXNG + NoneBot + NapCat 检查） |
-| `stop.sh` | 停止所有服务（NoneBot + SearXNG） |
+| `stop.sh` | 停止所有服务（NoneBot + SearXNG），并同步 WebUI 看门狗状态 |
 | `start_bot.sh` | 仅启动 NoneBot（SearXNG & NapCat 已运行时使用） |
-| `test.sh` | 运行测试套件（8 套件） |
+| `start_webui.sh` | Web 管理面板 启动/停止/重启/状态（`start\|stop\|restart\|status`，默认绑定 `127.0.0.1:8090`，经 SSH 隧道访问） |
+| `test.sh` | 运行测试套件（共 10 个脚本：`test_agent.py` + `test_workspace.py` + `test/` 下 8 个离线测试） |
+
+> ⚠️ **测试脚本说明**：`test.sh` 调用的 8 个 `test/*.py` 离线测试位于仓库根 `test/` 目录，该目录被 `.gitignore` 忽略（`.gitignore:58` `/test/`），仅存在于开发机、不随仓库分发。clone 后直接 `bash test.sh` 会因缺少这些文件而报错；CI/新环境请先确认 `test/` 是否存在，或仅运行 `cd QQBot && python test_agent.py`。
 
 ## 目录结构
 
 ```
 QQBotAgent/
 ├── setup.sh                # 一键安装脚本
-├── start.sh / stop.sh      # 启动 / 停止脚本
-├── test.sh                 # 测试脚本
-├── bot.py                  # NoneBot 入口（备用）
+├── start.sh / stop.sh      # 启动 / 停止脚本（stop.sh 同步 WebUI 看门狗状态）
+├── start_bot.sh            # 仅启动 NoneBot
+├── start_webui.sh          # Web 管理面板 启动/停止/重启/状态
+├── test.sh                 # 测试脚本（10 个脚本，其中 8 个在被 gitignore 的 test/ 下）
+├── bot.py                  # NoneBot 入口（备用；生产用 `cd QQBot && nb run`）
+├── main.py                 # PyCharm 占位入口（非实际入口）
 ├── docker-compose.yml      # Docker 编排 (SearXNG + QQBot + vLLM)
 ├── Dockerfile              # Docker 镜像构建
 ├── docker-entrypoint.sh    # Docker 容器入口
@@ -200,13 +212,30 @@ QQBotAgent/
 ├── vllm-start.sh           # vLLM 推理服务启动
 ├── searxng/                # SearXNG 搜索配置
 │   └── settings.yml        #   搜索引擎配置 (Bing / 国内优化)
+├── webui/                  # ★ Web 管理面板（FastAPI，独立服务，绑定 127.0.0.1:8090）
+│   ├── main.py             #   面板入口（48 个 /api/ 端点 + 15 个页面路由 + 2 个 WebSocket；页面路由经 PAGES 循环注册）
+│   ├── auth.py             #   登录鉴权（scrypt 口令哈希 + 内存会话）
+│   ├── process_manager.py  #   进程管理（启动/停止 bot，看门狗状态持久化）
+│   ├── config_editor.py    #   配置热编辑（含密钥脱敏）
+│   ├── data_reader.py      #   记忆/画像/日志只读访问
+│   ├── log_viewer.py / audit.py / hardware_monitor.py / playground.py
+│   ├── requirements.txt    #   面板依赖（含 psutil；与 QQBot/requirements.txt 独立）
+│   ├── templates/ static/  #   前端页面（17 个模板）与静态资源
+│   └── data/               #   面板运行时数据（webui.pid / logs / watchdog_state.json）
+├── docs/                   # 开发文档（设计/审计/实现记录，含 implements-for-idea-8.md 等）
+├── test/                   # 离线测试脚本（8 个）⚠ 被 .gitignore 忽略，仅存于开发机
+├── evidence/               # 验证证据/截图
+├── *.md                    # 各类计划文档（PLAN/REPORT/next_step/P1-Deployment 等）
 │
 └── QQBot/                  # NoneBot 机器人主体
     ├── .env                # 环境变量（密钥 / 服务配置）⚠ git-ignored
     ├── .env.example        # .env 说明文档 + 模板（逐行注释）
     ├── requirements.txt    # Python 依赖
     ├── pyproject.toml      # NoneBot 项目配置
-    ├── test_agent.py       # 测试套件（8 套件）
+    ├── config.yml          # NoneBot 配置
+    ├── test_agent.py       # 测试套件（13 套件）
+    ├── test_workspace.py   # 工作区/会话文件测试（11 类）
+    ├── DOCUMENTATION.md / PLAN.md / README.md   # 项目文档
     │
     ├── agent/              # 智能体核心
     │   ├── agent.py        #   主循环: Think→Act→Observe→Respond
@@ -216,21 +245,22 @@ QQBotAgent/
     │   ├── continuous_session.py  # 群聊连续对话窗口（90秒免@）
     │   ├── hardware.py     #   硬件自动检测 & 动态任务拒绝
     │   ├── workspace.py    #   用户工作区隔离 & 配额管理
+    │   ├── workspace_snapshot.py # 工作区目录树快照（get_user_info 用）
+    │   ├── quota_cleanup.py#   配额清理协议（Feature 2 配套）
     │   ├── context.py      #   执行上下文（contextvars, 工具→QQ图片）
-    │   ├── memory.py       #   长期记忆（Markdown 文件）
+    │   ├── memory.py       #   长期记忆：MemorySystem（旧 Markdown）+ TieredMemory（三层引擎）
+    │   ├── fact_filter.py  #   确定性事实过滤（画像/记忆抽取前置）
     │   ├── profile.py      #   用户画像（LLM 自动提取）
+    │   ├── task_record.py  #   子任务结构化记录（begin_task/finalize_subtask 配套）
     │   ├── group_features.py   # 群聊功能开关（按群控制抽卡/图片/语音）
     │   ├── personality.py      # 人格管理（多套人格切换）
     │   ├── permissions.py  #   权限管理（三层角色 + 工具过滤）
     │   └── config/         #   智能体配置（Markdown 文件）
-    │       ├── SOUL.md     #     行为规则 & 能力边界（共享）
-    │       ├── IDENTITY.md #     身份声明 & 技术栈
-    │       ├── AGENTS.md   #     编排规则 & 系统命令
-    │       ├── TOOLS.md    #     工具文档
-    │       └── personalities/  # 人格定义（每人一套提示词）
-    │           ├── assistant.md     # 助手 Roxy
-    │           ├── roxy_character.md # 角色 Roxy (无职转生)
-    │           └── rubi.md          # 露比 (OpenRubi)
+    │       ├── SOUL.md / IDENTITY.md / AGENTS.md / MEMORY.md  # 注入系统提示词（4 个）
+    │       ├── TOOLS.md / BOOTSTRAP.md / SESSION.md           # 加载但不注入（3 个）
+    │       ├── HELP.md / FEATURES.md       # /帮助、/功能 命令读取
+    │       ├── WORKSPACE.md / USER.md / HEARTBEAT.md          # 未加载（文档遗留/失效）
+    │       └── personalities/  # 人格定义（assistant / roxy_character / rubi）
     │
     ├── plugins/            # NoneBot 插件
     │   ├── agent_router.py #   ★ 统一消息入口（所有交互的唯一处理器）
@@ -249,6 +279,8 @@ QQBotAgent/
     │   ├── ocr_name_matcher.py # OCR 角色名模糊匹配
     │   ├── ag_skill_index.py   # 技能分类索引（触发方式分类）
     │   ├── ag_trigger_engine.py # 行动值效果触发链推断
+    │   ├── ag_llm_resolver.py  # 拉/推条技能 LLM 解析
+    │   ├── buff_vocab_dump.py  # buff 词表导出（模板采集辅助）
     │   ├── wiki_scraper.py #   Wiki 爬虫（角色/羁绊数据自动更新）
     │   └── name_resolver.py#   角色别名解析（模糊匹配）
     │
@@ -256,21 +288,42 @@ QQBotAgent/
     │   ├── deepseek_client.py   # DeepSeek API 客户端
     │   ├── model_router.py      # 多模型路由器
     │   ├── multimodal_client.py # 多模态客户端（图片理解 + 音频分析）
+    │   ├── token_ledger.py      # Token 用量记账（WebUI 看板数据源）
     │   ├── ocr_engine.py        # OCR 引擎（BuffDetector / 技能冷却检测）
     │   ├── buff_alias.py        # buff 名称 → 图标标签别名映射
     │   ├── status_icons.py      # 状态图标文件名 → 中文标签
     │   └── amap_client.py       # 高德地图 API 客户端
     │
-    ├── config/             # 敏感配置 ⚠ git-ignored
-    │   ├── models_settings.json         # 多模型配置
-    │   ├── models_settings_example.json # 配置模板
-    │   └── gacha_data.json              # 抽卡数据
+    ├── scripts/            # 运维脚本
+    │   ├── migrate_memory_p1.py  # 旧记忆 → 三层结构迁移
+    │   └── cleanup_profile_facts.py # 画像事实存量清理
     │
-    └── data/               # 运行时数据
+    ├── images/             # 图像资源（测速样本数据 cal-speed-data/ 等）
+    ├── logs/               # 运行日志（loguru sink，agent_router.py:111-128）
+    ├── docs/               # 机器人侧开发文档
+    │
+    ├── config/             # 配置（部分 git-ignored）
+    │   ├── models_settings.json         # 多模型配置 ⚠ 含密钥，git-ignored
+    │   ├── models_settings_example.json # 配置模板（已入库）
+    │   ├── multimodal.json              # 多模态配置
+    │   ├── gacha_data.json              # 抽卡数据
+    │   ├── font/                        # 卡片渲染字体
+    │   ├── characters/                  # 角色配置
+    │   └── ocr_digit_templates/         # OCR 数字模板
+    │
+    └── data/               # 运行时数据（生产环境位于 USER_DATA_ROOT）
         ├── sessions/       #   会话持久化
-        ├── memory/         #   长期记忆
+        ├── memory/         #   长期记忆（tiers/{uid}.json 三层结构 + long/ 快照）
         ├── users/          #   用户画像
-        └── workspace/      #   用户工作区（按 QQ 号隔离）
+        ├── workspace/      #   用户工作区（按 QQ 号隔离）
+        ├── token_usage/    #   Token 用量记录
+        ├── task_log/       #   子任务结构化日志（{uid}.jsonl，按需创建）
+        ├── audit/          #   审计日志（JSONL）
+        ├── feedback/       #   用户反馈/Bug 报告
+        ├── name_index/     #   角色名索引缓存
+        ├── wiki_cache/     #   Wiki 爬取缓存（角色/羁绊/兑换码）
+        ├── redeem_code/    #   兑换码缓存
+        └── personality_config.json # 人格选择持久化
 ```
 
 ## 核心架构
@@ -334,7 +387,7 @@ class Agent:
     async def run(self, user_message, user_id, client=None,
                   progress_callback=None, session_type="temporary",
                   allowed_tools=None, user_role=None) -> str
-    def build_system_prompt(self) -> str                      # SOUL + IDENTITY + AGENTS
+    def build_system_prompt(self) -> str                      # SOUL + IDENTITY + AGENTS + MEMORY (+ 时间/硬件上下文)
     def get_status(self) -> dict                              # 运行状态
     def clear_user_session(self, user_id)                     # 清除会话
 ```
@@ -375,7 +428,7 @@ class ToolRegistry:
 
 ```python
 class ContinuousSessionManager:
-    def __init__(self, timeout_minutes=5.0)
+    def __init__(self, timeout_minutes=1.5)   # 默认 90 秒；agent_router.py:989 以 1.5 实例化
     def start(self, group_id, user_id)                         # 开启窗口
     def is_active(self, group_id, user_id) -> bool             # 检查 + 自动清理
     def touch(self, group_id, user_id)                         # 续期
@@ -387,10 +440,11 @@ class ContinuousSessionManager:
 | 类 | 文件 | 功能 |
 |---|---|---|
 | `Session` | `session.py` | per-user 对话上下文（最多 20 条），持久化到 `data/sessions/` |
-| `MemorySystem` | `memory.py` | 长期记忆（Markdown 文件），关键词搜索，最多返回 3 条 |
-| `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣，持久化到 `data/users/` |
+| `MemorySystem` | `memory.py` | 旧版长期记忆（Markdown 文件 + frontmatter），`search()` 按关键词子串匹配返回**全部**命中（无条数上限）；P1 起已被 `TieredMemory` 取代，仅保留用于迁移与兼容 |
+| `TieredMemory` | `memory.py:385` | 三层记忆引擎（P1）：SHORT（近期原文）/ MEDIUM（按频次排序的要点）/ LONG（仅创建+持久化，查询留待 P2）；存储为 `data/memory/tiers/{uid}.json`，LONG 快照另存 `tiers/long/{uid}/{id}.md` |
+| `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣（含 `fact_filter` 确定性过滤），持久化到 `data/users/` |
 
-## 已注册工具（26 个）
+## 已注册工具（29 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -420,23 +474,49 @@ class ContinuousSessionManager:
 | `get_weather` | 实时天气 / 4天预报（高德） |
 | `search_poi` | 周边POI搜索（餐厅、地铁等） |
 | `plan_route` | 驾车/步行/公交路线规划 |
+| `begin_task` | 标记多轮工具型子任务起点（抽卡/测速），折叠问答避免污染上下文 |
+| `finalize_subtask` | 结束子任务并提交结构化结果（详情归档到任务日志） |
+| `end_continuous_mode` | 智能体主动结束群聊连续对话窗口（用户表达告别意图时） |
+
+> 📝 **权限分布**：29 个工具中 22 个为公共工具（`_PUBLIC_TOOLS`，全员可用），4 个为会员工具（`_VIP_TOOLS`：`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`_ADMIN_TOOLS`：`shell_exec`）。`end_continuous_mode` 不固定归属任一层级，由连续对话上下文动态并入可用集合（`agent_router.py:1460-1462`）。注册分布：25 个在 `_build_tool_registry()`（`agent_router.py:528-897`），其余 4 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask`）在模块级单独注册。
 
 ## 智能体配置
 
-所有配置文件在 `QQBot/agent/config/`：
+所有配置文件在 `QQBot/agent/config/`。按代码实际用途分为四类：
+
+**① 注入系统提示词（`build_system_prompt()` 拼接，共 4 个）**
 
 | 文件 | 用途 |
 |------|------|
 | `SOUL.md` | 人格定义（Roxy）& 行为规则 |
 | `IDENTITY.md` | 身份声明 & 技术栈 & 能力 |
 | `AGENTS.md` | 编排规则 & 工具选择 & 连续对话模式 |
-| `WORKSPACE.md` | 工作区约束 & 安全边界 |
-| `TOOLS.md` | 全部工具的参数文档 |
-| `personalities/` | 人格定义目录（assistant / roxy_character / rubi） |
-| `BOOTSTRAP.md` | 启动健康检查 |
-| `SESSION.md` | 会话参数 |
+| `MEMORY.md` | 三层记忆引擎规则（P1 起接入提示词，`agent.py:156-158`） |
 
-修改这些文件会**即时影响 Agent 行为**，无需重启即可生效（`reload_configs()`）。
+**② 加载但不注入提示词（`_load_configs()` 读入 `_configs`，仅作引用/文档，共 3 个）**
+
+| 文件 | 用途 |
+|------|------|
+| `TOOLS.md` | 全部工具的参数文档（供查阅，不进提示词） |
+| `BOOTSTRAP.md` | 启动序列说明 |
+| `SESSION.md` | 会话参数说明 |
+
+**③ 由 `agent_router` 在命令处理时读取（共 2 个）**
+
+| 文件 | 用途 |
+|------|------|
+| `HELP.md` | `/帮助` 命令输出内容 |
+| `FEATURES.md` | `/功能` 命令输出内容 |
+
+**④ 未被代码加载（文档遗留 / 已失效）**
+
+| 文件 | 说明 |
+|------|------|
+| `WORKSPACE.md` | 仅在 `agent.py:163` 注释中被提及——其 §4 硬件约束已由 `HardwareDetector` 动态检测取代，文件本身不再加载 |
+| `USER.md` / `HEARTBEAT.md` | 代码中无任何引用，为历史遗留文件 |
+| `personalities/` | 人格定义目录（assistant / roxy_character / rubi），由 `personality.py` 按需加载，非系统提示词的一部分 |
+
+> 📝 **热重载实况**：`agent_router.py:999-1025` 有一个配置看门狗，每 5 秒遍历 `agent/config/` 下**所有** `*.md`（含 `personalities/`）的 mtime，变化即调用 `reload_configs()`（带 5 秒冷却）。但 `reload_configs()` 只重新读取上面 ① ② 类共 7 个文件并重建提示词，因此**只有修改 ① 类（SOUL/IDENTITY/AGENTS/MEMORY）才会即时改变 Agent 行为**；修改 ③ 类（HELP/FEATURES）在下次触发对应命令时生效；修改 ④ 类无效。配合 WebUI 面板的配置热编辑，保存后约 5 秒内生效，无需重启。
 
 ## 添加新工具
 
@@ -471,15 +551,20 @@ bash test.sh
 cd QQBot && python test_agent.py
 ```
 
-8 个测试套件：
-1. **ToolRegistry** — 注册 / Schema / 同步异步执行 / 错误
-2. **SessionManager** — CRUD / 超时 / 裁剪 / 持久化
-3. **MemorySystem** — 保存 / 搜索 / 遗忘 / 列出
-4. **UserProfile & ProfileManager** — 创建 / 事实去重 / 持久化
-5. **AgentCore** — 启动 / 提示词 / 工具循环 / 迭代上限 / 画像注入
-6. **DeepSeekClient** — 响应解析（纯文本 / 工具调用 / 混合）
-7. **BuiltinTools** — get_time / execute_code / search_web
-8. **Personality Manager** — 人格优先级 / 模糊匹配 / 歧义拒绝
+`test_agent.py` 共 **13 个测试套件**（`test_workspace.py` 另有 11 个工作区/会话文件测试类）：
+1. **TestToolRegistry** — 注册 / Schema / 同步异步执行 / 错误
+2. **TestSessionManager** — CRUD / 超时 / 裁剪 / 持久化
+3. **TestMemorySystem** — 保存 / 搜索 / 遗忘 / 列出（旧版 Markdown 记忆）
+4. **TestAgentCore** — 启动 / 提示词 / 工具循环 / 迭代上限 / 画像注入
+5. **TestUserProfile** — 用户画像创建 / 事实去重 / 持久化
+6. **TestProfileExtraction** — LLM 事实提取 + 确定性过滤（`fact_filter`）
+7. **TestDeepSeekClientParsing** — 响应解析（纯文本 / 工具调用 / 混合）
+8. **TestBuiltinTools** — get_time / execute_code / search_web
+9. **TestPersonality** — 人格优先级 / 模糊匹配 / 歧义拒绝
+10. **TestTokenLedger** — Token 用量记账（`lib/token_ledger.py`）
+11. **TestTieredMemory** — 三层记忆引擎（SHORT / MEDIUM / LONG）
+12. **TestMergedExtraction** — 合并的 extract+judge 单次 flash 调用
+13. **TestMemoryMigration** — 旧记忆 → 三层结构迁移（`scripts/migrate_memory_p1.py`）
 
 ## 安全模型
 

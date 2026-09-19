@@ -1,9 +1,20 @@
 # 画像瘦身与三级记忆引擎方案（Profile Slimming & Three-Tier Memory Engine）
 
-> 状态：**方案已收敛，待动手**（文件名沿用 `Profile-Fact-Extraction-Plan.md`）
+> 状态（2026-09-19 按代码实况更新）：**P0 与 P1 均已实现并合入 dev**（文件名沿用 `Profile-Fact-Extraction-Plan.md`）
+> - **P0 止血** ✅：commit `361ea54`（fact_filter.py / cleanup_profile_facts.py / profile.py 瘦身等），
+>   已于 2026-09-14 部署生产并完成存量清理（见 `.claude/deploy-server.md` §P0 部署记录）。
+> - **P1 三级引擎** ✅：commit `9d93dd2`（TieredMemory）+ `43df292`（迁移脚本修复）+ `9da0f12`
+>   （config/MEMORY.md 重写并接入 system prompt——原属 P3 的 Decision K 提前落地）。
+>   迁移脚本 `QQBot/scripts/migrate_memory_p1.py` 已实现，生产部署验收见 `P1-Deployment-Acceptance-Plan.md`。
+> - **P2（agentic RAG）** ❌ 未动手：LONG 目前仅 create+persist，无 query 工具/索引注入/上限降级。
+> - **P3（死文件）** 部分完成：MEMORY.md 已重写接入（9da0f12）；TOOLS.md 裁剪接入、弃置文件标记未做。
+>
 > 范围：机制①画像瘦身（`profile.py`）+ 机制②三级记忆引擎（`memory.py` / `agent.py`）+ 抽取精度三层 + 死文件处理
 > 落地顺序：本地改 → `bash test.sh` 验零回归 → 审 diff → 部署（commit → 服务器 pull → 重启 bot）
 > ⚠️ 生产环境有真实用户在用，所有改动走既定部署流程，不在服务器上直接验证。
+>
+> 📝 阅读提示：§1–§4 是**动手前的问题分析**（描述的是 P0 之前的旧代码状态，行号已过时，保留作根因档案）；
+> §5–§13 中已实现部分的**实际落地形态**以各节的 ✅ 实况注记为准。
 
 ---
 
@@ -20,7 +31,10 @@
 - `用户正在参与一个名为「hadoop 期末项目」的特殊会话` —— **泄漏 bot 内部架构**（"特殊会话"是系统概念）
 - `用户要求总结该项目的匹配方法` —— **模糊指代**（"该项目"脱离上下文无法解析）
 
-这些垃圾 fact 通过 `to_prompt_context()`（`profile.py:80`，注入 `facts[-10:]`）回流进 system prompt，造成提示词污染、误导后续回复。
+这些垃圾 fact 通过 `to_prompt_context()`（旧 `profile.py:80`，注入 `facts[-10:]`）回流进 system prompt，造成提示词污染、误导后续回复。
+
+> ✅ **实况（P0 后）**：`to_prompt_context()`（现 `profile.py:100-124`）只注入 nickname/interests/preferences
+> 类型化槽，**不再注入 facts**；`facts` 字段保留在 schema 中但已 **dormant**（不抽取、不注入，见 §6 实况注记）。
 
 ---
 
@@ -34,6 +48,15 @@
 | ② 长期记忆 | `agent.py` `_maybe_remember()`（`:649`） | **纯长度阈值** `MIN_REMEMBER_LEN=800`，超阈值就把对话**原样 dump**，无 LLM 判断 | ❌ 不读任何 md |
 
 调用链：`agent.py:410` `_schedule_profile_update(user_id, user_message, final_content)` → `:694` `create_task(extract_and_update(...))`，**每轮都触发**。`final_content` = `response.get("content","")`（`agent.py:346`）= Roxy 回给用户的最终文本。
+
+> ✅ **实况（P1 后，行号已变）**：
+> - 机制①：`extract_and_update` 单轮抽取已被 **`observe_turn` 缓冲（`profile.py:299-328`）+ 满 `PROFILE_BATCH_K=5`
+>   触发 `extract_batch`（`profile.py:379-427`）** 取代；抽取 prompt 从硬编码单轮改为 `_build_extraction_prompt`
+>   （`profile.py:572` 起）的 8 轮窗口 + judge 清单合并版；客户端为 flash（`agent_router.py:924` `set_client(_model_router.flash_client)`）。
+> - 机制②：`_maybe_remember` **函数体已删除**（`grep "def _maybe_remember"` = 0；agent.py 仅存 2 处注释提及），
+>   由 `TieredMemory`（`memory.py:385`）三级引擎取代。
+> - 现调用链：`agent.py:414` `_schedule_profile_update(...)` → `:667` `profiles.observe_turn(...)`；
+>   会话删除时 `agent_router.py:1644/:2032` 调 `flush_on_session_end`（`profile.py:330`，Decision J 尾批 flush）。
 
 ### 2.2 `config/MEMORY.md` 是死文件；TOOLS/SESSION/BOOTSTRAP 同样死（已坐实）
 
@@ -49,6 +72,14 @@
 - 启动序列 → `bootstrap()`（:702）跑硬编码健康检查，**不解析 BOOTSTRAP.md**（:703 仅 docstring）。
 
 → 含义：若期望智能体遵守 TOOLS/SESSION/BOOTSTRAP/MEMORY 的规则，**它现在并没有**。详见 §9。
+
+> ✅ **实况（`9da0f12` 后）——MEMORY.md 已复活，其余不变**：
+> - `config/MEMORY.md` **已重写为三层引擎说明**（SHORT/MEDIUM/LONG 表格、`## 用户记忆（中期）` 注入格式、
+>   `(低置信)` 用法，全文 33 行），并加入 `_load_configs` 加载列表（`agent.py:127`）、
+>   注入 `build_system_prompt`（`agent.py:156-158`）。§2.2 首段"连加载列表都不在"对 MEMORY.md **已不成立**。
+> - TOOLS / BOOTSTRAP / SESSION 仍是"加载但不注入"；HEARTBEAT / USER / WORKSPACE 仍全死。
+> - 另有第二层记忆提示：MEDIUM 层内容经 `build_medium_injection`（`memory.py:626`）在 `_build_messages`
+>   （`agent.py:516-519`）追加为 `## 用户记忆（中期）` 块。
 
 ### 2.3 抽取 prompt 早已禁止这些垃圾，但模型无视
 
@@ -110,6 +141,16 @@
 | **J** | `PROFILE_BATCH_K = 5`；**不加空闲超时 flush**；改为**删除会话时**判断该会话轮数 >5 则把未抽取的尾批递交抽取，≤5 视为临时会话不抽取。**接受临时会话尾批丢失。** |
 | **K** | `config/MEMORY.md` **接入 `build_system_prompt`**，作为机制②保存记忆时的规则注入；**前提是先把内容改成与三级引擎真实行为一致**（§9）。 |
 
+> ✅ **落地对照（2026-09-19）**：
+> - **A** ✅ P0 落地，但采取**保守形态**：`facts` 字段**保留在 schema**（向后兼容旧 profile.json）而非物理删除，
+>   实际 dormant——不抽取（`_apply_extraction` 不处理 `new_facts`）、不注入（`to_prompt_context` 只用类型化槽）、
+>   `merge_facts`/`_similar`/`MAX_FACTS` 保留但无调用方（`profile.py:43/:133/:162`，注释标 DORMANT）。
+> - **B/D/E/H/I/J** ✅ P1 落地。E 的实现结构是**普通 list**（`insert(0,…)`/`pop()` 模拟双端队列），非 collections.deque。
+> - **C/G** ⏸ 部分：LONG 仅 create+persist（`memory.py:309-311` 注释 "those are P2"）；`query(name)` 工具、
+>   索引注入、`LONG_MAX` 上限降级、`query_count/query_log` 均属 **P2，未实现**。
+> - **F** ✅ 但结构为普通 list + 按需排序（§12.1 YAGNI 决策落地，`memory.py:381` 注释），非真正 heapq 堆。
+> - **K** ✅ **提前在 P1 完成**（commit `9da0f12`，原计划属 P3）。
+
 ---
 
 ## 6. 机制① 画像瘦身（`profile.py`）
@@ -122,6 +163,13 @@
 - 原本进 `facts` 的持久知识（职业、地点、技能、长期项目）**改流入机制②三级记忆**（§7），在那里享受去重 / 巩固 / RAG。
 - `extract_*` 的 JSON schema 去掉 `new_facts`，只留 `nickname` / `new_interests` / `new_preferences`；持久知识候选改走记忆管线（§7.1）。
 - `MAX_FACTS` / `merge_facts` / `_similar`（中文去重 bug）随 facts 字段一并移除；去重逻辑迁到三级引擎的语义重合判定（§7.3）。
+
+> ✅ **实况（P0/P1 后）**：瘦身按"dormant 而非物理删除"落地——`facts: List[str]` 仍在 `UserProfile`
+> （`profile.py:65`）与 `to_dict`/`from_dict`（向后兼容），但 `_apply_extraction`（`:442`）不写它、
+> `to_prompt_context`（`:100-124`）不读它；`merge_facts`（`:133-147`，注释 DORMANT）与 `_similar`（`:162-169`）
+> 保留但零调用方；`MAX_FACTS=40`（`:43`）仅被 dormant 的 `merge_facts` 引用。
+> 抽取 JSON schema 现为 `nickname`/`new_interests`/`new_preferences` + `memory_candidates[]`（后者进三级引擎）。
+> 旧 facts 的持久知识经 `migrate_memory_p1.py` 播种进 SHORT、P0 误删项经 `--restore-false-drops` 恢复到 MEDIUM。
 
 ---
 
@@ -138,6 +186,13 @@
   - 记忆候选 `memory_candidates[]` → **先过石蕊 + Layer 2 过滤（I）** → 逐条路由进三级（§7.2-7.4）。
 - 客户端：`agent_router.py:923` 改 `set_client(_model_router.flash_client)`（`model_router.py:84`）。
 
+> ✅ **实况**：管线已按此落地——`observe_turn`（`profile.py:299-328`，deque(maxlen=EXTRACT_WINDOW_N=8) 缓冲 +
+> `_pending_n` 计数 + `_inflight` 单飞）、`extract_batch`（`:379-427`）、尾批 flush `flush_on_session_end`
+> （`:330`，挂钩 `agent_router.py:1644/:2032`）、`set_client(flash_client)`（`agent_router.py:924`）。
+> **抽取与 judge 已合并为一次 flash 调用**（§7.9/§12.1 决策落地）：`get_judge_list()`（`memory.py:447`）取
+> MEDIUM top-`JUDGE_MEDIUM_LIST_CAP`(40) + SHORT 全量嵌入同一 prompt，返回 JSON 同时含画像槽与
+> `memory_candidates[]`（每条带 `judge` + `matched_id`），purpose=`"profile"` 计入 TokenLedger。
+
 ### 7.2 短期记忆 SHORT
 
 - **内容**：count ≤ 2 的候选。
@@ -147,6 +202,8 @@
 - **升级**：count 达到 3（跨过 2）→ **立即**升级为中期（与位置无关），移出短期、入中期堆。
 - **淘汰**：入队致长度 > `SHORT_MAX` → 移除最靠近出口（后）的元素（必为 count≤2，直接丢弃）。
 - **注入**：**不注入**（H）。
+- ✅ **实况**：语义一致；实现结构为**普通 `List[ShortItem]`**（`memory.py:380`），`insert(0,…)` 入队首、
+  `pop()` 尾部淘汰（`:542/:545`），非 `collections.deque`（需支持按位前移，deque 反而不便）。
 
 ### 7.3 中期记忆 MEDIUM
 
@@ -158,8 +215,20 @@
 - **降级 中→短**：`age > MEDIUM_DOWNGRADE_AGE` → 降为短期，count 设为 2。age 最大堆可从堆顶高效 poll 候选。
 - **升级 中→长**：`count > MEDIUM_LONG_THRESHOLD(10)` → **新建长期对象**（携带触发升级那次抽取的 K 轮对话快照 + 物理时间）；**保留中期孪生**（count 继续涨，无上限）。[模型 Y]
 - **实现注记**：强化改 age → 堆 key 变动 → 需 re-heapify 或带索引堆（indexed heap / 懒删除）。
+- ✅ **实况**：按 §12.1 YAGNI 决策，**未用堆**——普通 `List[MediumItem]`（`memory.py:381` 注释
+  "plain list, sorted on demand (§12.1: heap is YAGNI)"），注入/降级时按需排序（`:614`）。
+  注入实现 = `build_medium_injection`（`:626`）：top-12 by count + 3 最近晋升（`MEDIUM_INJECT_RECENT_SLOTS=3`），
+  正文截断至 `MEDIUM_INJECT_TOKEN_CAP=600` **字符**（非 token），count<`LOW_CONFIDENCE_THRESHOLD=5` 的项
+  输出为 `- (低置信) <content>`。age 降级（>30 降回 SHORT、count 置 2）与 `MEDIUM_MAX=60` 安全网均已实现。
 
 ### 7.4 长期记忆 LONG
+
+> ⏸ **实况（P1 边界）**：本节大部分属 **P2，尚未实现**。P1 只做了 **create + persist**：
+> `_maybe_create_long`（`memory.py:582-600`）在 MEDIUM count 越过 `MEDIUM_LONG_THRESHOLD=10` 时创建 LONG
+> 对象并把 K 轮快照写入 `data/memory/tiers/long/{uid}/{id}.md`（frontmatter + 正文）。
+> **索引注入、`query(name)` 工具、`query_count`/`query_log`、`LONG_MAX` 上限降级均不存在**
+> （`LONG_MAX`/`LONG_DOWNGRADE_COUNT_RESET` 两个常量在代码中 grep 为 0；`memory.py:309-311` 注释明示
+> "no index injection, no query tool, no cap demotion — those are P2, §11"）。以下为 P2 设计原文。
 
 - **不主动注入其对话快照上下文**；但注入一份**索引**（标题/摘要清单），来源 = 中期 `count>10` 的项 → 供 **agentic RAG**。
 - **每个长期对象存**：触发升级那次抽取的 K 轮对话快照（含物理时间）、`query_count`（被查询次数）、`query_log`（查询日志）。
@@ -225,17 +294,45 @@
 | `EXTRACT_TOTAL_CHAR_CAP` | 6000 † | 抽取输入总字符上限；超则从最旧轮截起 |
 | `(低置信)` 阈值 | count<5 † | 中期注入时给 count∈{3,4} 打 `(低置信)` 标签 |
 
+> ✅ **代码核对（2026-09-19）**：除以下两项外，表中常量均已按同值落地——
+> - **未实现（P2）**：`LONG_MAX`、`LONG_DOWNGRADE_COUNT_RESET` 在代码中**不存在**（LONG 无上限降级）。
+> - **命名/单位差异**：`MEDIUM_INJECT_TOKEN_CAP=600` 实际按**字符**截断（`memory.py:633` 注释 "chars"）；
+>   `(低置信)` 阈值的常量名为 `LOW_CONFIDENCE_THRESHOLD=5`（`memory.py:334`）。
+> - **代码位置**：`memory.py:324-337`（SHORT_MAX/SHORT_PROMOTE_AT_COUNT/SHORT_PRIORITY_STEP/
+>   MEDIUM_LONG_THRESHOLD/MEDIUM_DOWNGRADE_AGE/MEDIUM_DOWNGRADE_COUNT_RESET/MEDIUM_MAX/
+>   MEDIUM_INJECT_TOP_N/MEDIUM_INJECT_RECENT_SLOTS/MEDIUM_INJECT_TOKEN_CAP/LOW_CONFIDENCE_THRESHOLD/
+>   JUDGE_MEDIUM_LIST_CAP/TIER_SCHEMA_VERSION）；`profile.py:50-51`（PROFILE_BATCH_K/EXTRACT_WINDOW_N）。
+> - **规划未列、代码新增**的常量：`MEDIUM_INJECT_RECENT_SLOTS=3`（"最近晋升"名额，§12.1 防 rich-get-richer）、
+>   `TIER_SCHEMA_VERSION=1`（tiers JSON 版本戳）。
+> - `EXTRACT_USER_MSG_CAP=500` / `EXTRACT_AGENT_RESP_CAP=200` / `EXTRACT_TOTAL_CHAR_CAP=6000` 在
+>   `profile.py:47-49` 一带，值与规划一致。
+
 ### 7.8 持久化 schema
 
 - 机制②现为 `data/memory/*.md`（frontmatter）。三级属性（`tier`/`count`/`entry_extraction_index`/`query_count`）入 frontmatter 或 `metadata`；快照与查询日志入 md 正文；每用户 `extraction_count` 入小状态文件（如 `data/memory/user/{uid}/_state.json`）。
 - 运行期的双端队列 / 最大堆是**派生结构**，启动时按持久化属性重建。
 - **迁移**：现有 `data/memory` 内容 + `profile.json` 的旧 `facts` 如何并入新结构 = TODO（§12）。
 
+> ✅ **实况（实际落地的 schema 与上述草案不同）**：
+> - 每用户一个 **JSON 文件** `data/memory/tiers/{uid}.json`（`memory.py:395-396` 目录常量、`:673-684` 序列化、
+>   `:685` `_atomic_write_json` temp+replace 原子写），内含 `short`/`medium`/`long` 三层条目与
+>   `extraction_count` 逻辑时钟、`TIER_SCHEMA_VERSION`。**没有** `_state.json`，三级属性**不入 frontmatter**。
+> - LONG 快照单独存 `tiers/long/{uid}/{id}.md`（frontmatter + K 轮正文，`memory.py:754-776`）。
+> - 旧 `MemorySystem`（`data/memory/MEMORY.md` 索引 + `user|knowledge|system/` md）原样保留、未触碰。
+> - **迁移已实现**：`QQBot/scripts/migrate_memory_p1.py`（`43df292` 修订版含平铺文件处理
+>   `_uid_from_interaction`/`loose_interaction_files`、播种与归档解耦），旧 `user/**/interaction_*.md`
+>   归档至 `user/_archive/{uid}/`，画像 dormant facts 播种 SHORT，P0 误删项可 `--restore-false-drops`
+>   恢复到 MEDIUM。回归测试 `test_migration_archives_loose_legacy_dumps`（`test_agent.py:2282`）。
+
 ### 7.9 LLM 调用点与成本
 
 - 每 K 轮：1 次 **flash 抽取**调用。
 - 每批：1 次 **flash judge** 调用（候选 vs 中期清单 → 重合判定 + update/keep）。**可考虑与抽取合并为一次调用**（让抽取直接产出"是否命中已有中期 + 更新建议"）以省调用——TBD（§12）。
 - `query(name)`：**不额外调 LLM**（仅展开已存快照进智能体上下文）。
+
+> ✅ **实况**：已按 §12.1 决策**合并为一次调用**——`extract_batch`（`profile.py:379-427`）单次
+> `chat_completion(purpose="profile")` 同时产出画像槽更新与带 `judge`+`matched_id` 的 `memory_candidates`；
+> 无独立 judge 调用。`query(name)` 属 P2 未实现。
 
 ---
 
@@ -259,14 +356,17 @@
 |---|---|
 | SOUL / IDENTITY / AGENTS | 现状即注入 prompt，不动 |
 | **TOOLS.md** | ✅ **接入**，但**裁成纯编排策略**（删所有 JSON schema 复述），补 `download_repo`/`summarize_pdf` 策略 |
-| **config/MEMORY.md** | ✅ **接入（Decision K）**，但**先按三级引擎真实行为重写**（现内容类型/路径/流程全错） |
+| **config/MEMORY.md** | ✅ **接入（Decision K）**，但**先按三级引擎真实行为重写**（现内容类型/路径/流程全错）——**已完成**（`9da0f12`：重写为三层引擎说明 + `_load_configs`/`build_system_prompt` 接入） |
 | **SESSION.md** | ❌ **弃置**（不接入；**标记但不删除**）。参数大半过时/虚构，模型也改不了 |
 | **BOOTSTRAP.md** | ❌ **弃置**（不接入；**标记但不删除**）。纯启动描述且严重失真，属开发文档 |
 | HELP.md / FEATURES.md | 🚫 **勿动**（被 plugin 实时读取：/help、feature 卡片） |
 | HEARTBEAT.md / USER.md / WORKSPACE.md | ❌ **弃置**（全死、无 .py 引用；**标记但不删除**） |
 
 - **"标记但不删除"** = 在文件顶部加一行弃置注释（如 `<!-- DEPRECATED: 不再加载/注入，保留作历史参考，详见 Profile-Fact-Extraction-Plan.md §13 -->`），文件留在原处。
-- 当前仅 **SOUL / IDENTITY / AGENTS** 真正进 system prompt；**P3 完成态** = SOUL/IDENTITY/AGENTS + 重写后的 MEMORY.md + 裁剪后的 TOOLS.md（详见 §13.6）。
+- ~~当前仅 **SOUL / IDENTITY / AGENTS** 真正进 system prompt~~ → **实况（`9da0f12` 后）**：进 system prompt 的是
+  **SOUL / IDENTITY / AGENTS / MEMORY（重写版）** 四个；**P3 完成态** = 上述四个 + 裁剪后的 TOOLS.md（详见 §13.6）。
+- **处置进度**：MEMORY.md ✅ 已重写接入（9da0f12）；TOOLS.md 裁剪接入 ❌ 未做；SESSION/BOOTSTRAP/HEARTBEAT/
+  USER/WORKSPACE 的弃置标记 ❌ 未做（文件仍原样躺在 `agent/config/`）。
 
 ---
 
@@ -278,40 +378,48 @@
 - **Layer 2 — 确定性后置过滤**（进短期前用代码拦；**只拦无歧义项，歧义交 Layer 1**）。三原则：① 只黑**无歧义复合词 + 正则模式**，歧义裸词不黑（误杀静默不可见，比漏拦更危险）；② **不按具体名字拉黑**（团长/露比/蝶子 是"agent_response 当证据 / tool-output 派生"的症状，根因在 Layer 1，名字拉黑=打地鼠）；③ **每拦一条记 (候选, 命中项, 类目)** 供 instrument 迭代。初版词表：
 
   **L2-A 硬丢词表（子串匹配，无歧义复合词）**
-  - bot 架构/状态：`工作区` `特殊会话` `临时会话` `连续对话` `连续模式` `对话窗口` `系统提示词` `权限级别` `工具范围` `可用工具` `代码执行限制` `磁盘用量` `剩余空间` `存储配额`
-  - 工具操作产物：`文件路径` `截图路径` `行动值` `跑条` `拉条` `推条` `测速` `兑换码` `礼包码` `CDK` `CDKey`
-  - gacha（无歧义复合）：`十连` `单抽` `卡池` `抽卡` `常规招募` `几率up招募` `神秘招募` `银河招募`
-  - bot 自身：`Roxy` `机器人` `智能体`（关于 bot 的 fact 永不属用户）
+  - bot 架构/状态（类目 `bot_state`，`fact_filter.py:50-55`）：`工作区` `特殊会话` `临时会话` `连续对话` `连续模式` `对话窗口` `系统提示词` `权限级别` `工具范围` `可用工具` `代码执行限制` `磁盘用量` `剩余空间` `存储配额`
+  - 工具操作产物（类目 `tool_artifact`，`:57-61`）：`文件路径` `截图路径` `行动值` `跑条` `拉条` `推条` `测速` `兑换码` `礼包码` `CDK` `CDKey`
+  - gacha（类目 `gacha`，`:63-68`，无歧义复合）：`十连` `单抽` `卡池` `抽卡` `常规招募` `几率up招募` `神秘招募` `银河招募`
+    ——✅ 落地版**另加 4 词**：`连抽` `抽取结果` `抽卡结果` `招募结果`
+  - bot 自身（类目 `bot_self`，`:70-73`）：`Roxy` `机器人` `智能体`（关于 bot 的 fact 永不属用户）
 
   **L2-B 硬丢正则**
-  - 容量单位：`\d+\s*(?:MB|GB|KB)`（含 `250/2048 MB` 形态）
-  - gacha 结果：`(?:获得|抽到|未抽到|没抽到|出了|歪了)`
-  - 错误标记：`(?:报错|失败|超时|异常|崩溃|卡住)`
-  - 瞬时态：`(?:正在|当前正|刚刚|刚才|这次|本次)`（⚠️ 裸词 `正在` 会**误伤现实生活持续活动**，2026-09-14 生产清理实证；P1 收紧，见 §12.2 已知边缘项）
+  - 容量单位（类目 `capacity_unit`，`:88`）：`\d+(?:\.\d+)?\s*(?:MB|GB|KB)`（含 `250/2048 MB` 形态）
+  - gacha 结果（类目 `gacha_result`，`:92-94`）：`抽到|未抽到|没抽到|歪了|出了金|\d\s*星` 等（落地版比初稿更精细）
+  - 错误标记（类目 `error_marker`，`:96`）：`(?:报错|失败|超时|异常|崩溃|卡住)`
+  - ~~瞬时态：`(?:正在|当前正|刚刚|刚才|这次|本次)`~~ → ✅ **P1 已整类删除**（选择了 §12.2 的方向②）：
+    `fact_filter.py:97-108` 注释明示 "the former `transient_state` category … was REMOVED ENTIRELY"。
+    bot 瞬态改由 L2-A 复合词兜住（`连续对话`/`特殊会话` 等）、`本次会话` 由 L2-C 兜住，
+    现实生活持续活动（"正在…降血脂"）不再误伤。
 
   **L2-C 结构规则（非词表）**
-  - 未解析指代：含 `(?:该|此|上述|这个|那个|本项目|该项目)` 且无命名实体（`「」`/`《》`/专名）→ 丢
-  - 纯数字+单位、无主语语义 → 丢
+  - 未解析指代（类目 `unresolved_ref`，`fact_filter.py:117`）：含 `(?:该|此|上述|这个|那个|本项目|该项目)` 且无命名实体（`「」`/`《》`/专名）→ 丢
+  - 纯数字+单位、无主语语义（类目 `pure_numeric`，`:124`）→ 丢
 
   **L2-X 刻意不拦（交 Layer 1 语义判断 + few-shot）**
   - 具体角色/称谓名（团长/露比/蝶子…）：根因在 Layer 1 的"agent_response 禁当证据"+"石蕊测试"，非名字问题。
   - 歧义裸词（`会话`/`工具`/`速度`/`角色`/`羁绊`/`截图`/`上传`/`搜索`/`招募` 等）：误杀风险高（"会话分析"研究者、"短跑速度"、"从事招募工作"），不硬丢，靠 Layer 1 石蕊+few-shot 判。
-- **Layer 3 — 批量 + flash**：见 §7.1（`observe_turn` 缓冲、K=5、flash 客户端）。
+- **Layer 3 — 批量 + flash**：见 §7.1（`observe_turn` 缓冲、K=5、flash 客户端）。✅ 已落地。
 - **可观测**：记录"抽取了什么 / 保留 / 丢弃 / 升降级"，面板"记忆画像"页可视化 → 拿真实数据调黑名单与阈值。
-- **存量清理**：一次性脚本批量删旧 `profile.json` 中命中黑名单的 fact（已污染数据不会自己消失）。
+  （部分落地：Web 面板已有记忆与画像页可读写 tier/画像数据；逐条 filter 命中日志的 instrument 未做。）
+- **存量清理** ✅ 已完成：`QQBot/scripts/cleanup_profile_facts.py`（`--apply --field both --base-dir …`）
+  已于 2026-09-14 对生产画像库执行——9 个画像中 6 个受影响、共删 51 条（facts=36/interests=15），
+  备份在 `QQBot/data/profile_cleanup_backups/20260914_212159/`，复跑 dry-run=0（幂等）。
+  详见 `.claude/deploy-server.md` §P0 部署记录；被误删的 2 条真实事实经 P1 迁移 `--restore-false-drops` 恢复。
 
 ---
 
 ## 11. 实施范围与分期
 
-| 期 | 内容 | 主要文件 |
-|---|---|---|
-| **P0 止血（前提）** | Layer 1/2/3 抽取精度 + 画像瘦身（删 `facts`，留 nickname/interests/prefs）+ 存量清理脚本 + 可观测 | `profile.py`, `agent.py`, `agent_router.py`, 新清理脚本 |
-| **P1 三级引擎** | 短/中/长数据结构 + 统一抽取管线（替换 `_maybe_remember`）+ LLM judge 强化 + 状态机 + 持久化 schema + 迁移 + 测试 | `memory.py`, `agent.py`, `profile.py` |
-| **P2 agentic RAG** | 长期索引注入 + `query(name)` 工具 + `query_count`/`query_log` + 长期上限降级 | `memory.py`, `agent_router.py`(注册工具), `TOOLS.md`(若接入) |
-| **P3 死文件** | `MEMORY.md` 重写 + 接入 `build_system_prompt`；`TOOLS.md` 裁成纯策略 + 接入；`SESSION.md`/`BOOTSTRAP.md`/`HEARTBEAT.md`/`USER.md`/`WORKSPACE.md` 弃置（标记不删除）；HELP/FEATURES 勿动 | `config/MEMORY.md`, `config/TOOLS.md`, `agent.py`(`_load_configs`/`build_system_prompt`) |
+| 期 | 状态 | 内容 | 主要文件 |
+|---|---|---|---|
+| **P0 止血（前提）** | ✅ `361ea54`，2026-09-14 已部署生产 | Layer 1/2/3 抽取精度 + 画像瘦身（`facts` dormant，留 nickname/interests/prefs）+ 存量清理脚本 + 可观测 | `profile.py`, `agent.py`, `agent_router.py`, `fact_filter.py`, `scripts/cleanup_profile_facts.py` |
+| **P1 三级引擎** | ✅ `9d93dd2`+`43df292`+`9da0f12`，生产验收见 `P1-Deployment-Acceptance-Plan.md` | 短/中/长数据结构（LONG 仅 create+persist）+ 统一抽取管线（替换 `_maybe_remember`）+ 合并 extract+judge + 状态机 + `tiers/{uid}.json` 持久化 + 迁移脚本 + 测试（4.7/4.8/4.9 套件） | `memory.py`, `agent.py`, `profile.py`, `scripts/migrate_memory_p1.py` |
+| **P2 agentic RAG** | ❌ 未动手 | 长期索引注入 + `query(name)` 工具 + `query_count`/`query_log` + 长期上限降级（`LONG_MAX`） | `memory.py`, `agent_router.py`(注册工具), `TOOLS.md`(若接入) |
+| **P3 死文件** | 🔶 部分（MEMORY.md 项已由 `9da0f12` 提前完成） | ~~`MEMORY.md` 重写 + 接入 `build_system_prompt`~~ ✅；`TOOLS.md` 裁成纯策略 + 接入 ❌；`SESSION.md`/`BOOTSTRAP.md`/`HEARTBEAT.md`/`USER.md`/`WORKSPACE.md` 弃置标记 ❌（均未做）；HELP/FEATURES 勿动 ✅（本就未动） | `config/MEMORY.md`, `config/TOOLS.md`, `agent.py`(`_load_configs`/`build_system_prompt`) |
 
-**不碰**：主消息流路径。**机制②的 `_maybe_remember` 在 P1 被三级管线替换**（不再是傻 dump）。
+**不碰**：主消息流路径。**机制②的 `_maybe_remember` 在 P1 被三级管线替换** ✅（函数体已删，agent.py 仅存 2 处注释提及）。
 
 ---
 
@@ -340,10 +448,17 @@
 
 ### 12.2 仍待数据/实验（instrument-first，跑真实流量再收敛）
 
-- [x] **阈值取值（初版已敲定，见 §7.7 † 标记）**：`EXTRACT_WINDOW_N=8`、`MEDIUM_DOWNGRADE_AGE=30`（最敏感，区间 20–50）、`LONG_MAX=30`、`MEDIUM_MAX=60`、`MEDIUM_INJECT_TOP_N=15`、`(低置信)` 阈值 `count<5`、截断 user 500 / agent 200 / 总 6000。**仍需 instrument**：全量记录升降级，跑约一周真实流量后微调（尤其 `MEDIUM_DOWNGRADE_AGE`）。
+- [x] **阈值取值（初版已敲定，见 §7.7 † 标记）**：`EXTRACT_WINDOW_N=8`、`MEDIUM_DOWNGRADE_AGE=30`（最敏感，区间 20–50）、`LONG_MAX=30`（⚠️ 属 P2，代码中尚不存在）、`MEDIUM_MAX=60`、`MEDIUM_INJECT_TOP_N=15`、`(低置信)` 阈值 `count<5`（代码常量 `LOW_CONFIDENCE_THRESHOLD`）、截断 user 500 / agent 200 / 总 6000。以上除 LONG_MAX 外均已按同值落地（§7.7 代码核对）。**仍需 instrument**：全量记录升降级，跑约一周真实流量后微调（尤其 `MEDIUM_DOWNGRADE_AGE`）。
 - [x] **Layer 2 黑名单初版词条（已敲定，见 §10 L2-A/B/C/X）**：只拦无歧义复合词 + 正则；歧义裸词与具体名字**刻意不拦**（交 Layer 1）。**仍需 instrument**：每拦一条记 (候选, 命中项, 类目)，靠可观测迭代收紧/纠错。
   - **已知边缘项 — `正在` 误伤现实生活持续活动（2026-09-14 生产清理实证）**：L2B `transient_state` 的裸词 `正在` 不只会拦 bot 瞬态（"正在使用连续对话模式"），也会**误删通过石蕊测试的真实用户事实**——如"用户正在通过饮食调整降血脂"、"用户正在做力量训练，训练思路是按酸痛程度自由分割训练循环…"（用户 1114144652；落在 **dormant 的 `facts` 字段**、已备份、无线上影响，但 P1 迁移前须正视）。根因：`正在` 既表 bot 瞬态又表现实生活持续态，裸词无法区分。**P1 收紧方向（二选一）**：① `正在` 改为须与 bot-state 词（会话/模式/工作区/对话/连续）**共现**才拦；② 干脆从 L2B 删 `正在`，把"现实持续 vs bot 瞬态"的判断交给 Layer 1 石蕊+few-shot。其余瞬时词（当前正/刚刚/刚才/这次/本次）均为 bot-session 作用域，未见此误伤。
-- [ ] **持久化 schema 细节**（§7.8 已草拟方向：tier/count/entry_index/query_count 入 frontmatter，快照+query_log 入正文，每用户 `extraction_count` 入 `_state.json`）+ P1 迁移脚本实现。
+    - ✅ **已解决（P1，选了方向②并更进一步）**：`transient_state` **整类删除**（不只删 `正在`；
+      `fact_filter.py:97-108` 注释记录了删除原因与替代兜底）。误删的 2 条真实事实经
+      `migrate_memory_p1.py --restore-false-drops` 恢复到该用户 MEDIUM（count=3，带 `(低置信)` 注入）。
+      回归验证：`test_agent.py` 4.6 套件含 "降血脂 keep=True / 连续对话 keep=False" 单测点。
+- [x] ~~**持久化 schema 细节** + P1 迁移脚本实现~~ → **已实现**（与 §7.8 草案不同）：每用户单 JSON
+  `data/memory/tiers/{uid}.json`（short/medium/long + `extraction_count` + `TIER_SCHEMA_VERSION`，
+  temp+`os.replace` 原子写），LONG 快照存 `tiers/long/{uid}/{id}.md`；迁移脚本
+  `QQBot/scripts/migrate_memory_p1.py`（含 `43df292` 平铺文件修复），详见 §7.8 实况注记。
 
 ---
 
@@ -351,21 +466,25 @@
 
 ### 13.1 加载/注入现状总账（12 个 md，只 3 个进 prompt）
 
+> ⚠️ 本表为 **2026-09-11 对账快照**；`9da0f12` 后 MEMORY.md 状态已变，表内已按实况修订。
+
 | 状态 | 文件 | 证据 |
 |---|---|---|
-| 注入 prompt（活） | SOUL / IDENTITY / AGENTS | `build_system_prompt` agent.py:144-154 |
-| 加载但不注入（半死） | TOOLS / BOOTSTRAP / SESSION | `_load_configs` agent.py:121-128 读进 `_configs`，build_system_prompt 从不用；agent.py:71 注释自承 TOOLS.md 为 "documentation reference" |
-| plugin 实时读取（活，勿动） | HELP.md / FEATURES.md | agent_router.py:101/2844（/help 发 HELP.md）、:2472/2479（FEATURES.md 渲染卡片）、card_renderer.py 解析 |
-| 完全无引用（全死） | HEARTBEAT.md / USER.md / config/MEMORY.md / WORKSPACE.md | grep 全仓 .py 无读取；WORKSPACE.md 仅 builtin_tools.py:16 一句注释指向，agent.py:159 注明硬件探测已 replace WORKSPACE.md §4 |
+| 注入 prompt（活） | SOUL / IDENTITY / AGENTS | `build_system_prompt` agent.py:145-154 |
+| 注入 prompt（活）**← `9da0f12` 新接入** | **config/MEMORY.md**（重写版） | `_load_configs` agent.py:127 加载；`build_system_prompt` agent.py:156-158 注入；内容为三层引擎说明（33 行） |
+| 加载但不注入（半死） | TOOLS / BOOTSTRAP / SESSION | `_load_configs` agent.py:121-133 读进 `_configs`，build_system_prompt 从不用；agent.py 注释自承 TOOLS.md 为 "documentation reference" |
+| plugin 实时读取（活，勿动） | HELP.md / FEATURES.md | agent_router.py:101（`_HELP_MD_PATH`）/:2880-2891（/帮助 发 HELP.md + 渲染卡片）、:2506-2513（/功能 渲染 FEATURES.md 卡片）、card_renderer.py 解析 |
+| 完全无引用（全死） | HEARTBEAT.md / USER.md / WORKSPACE.md | grep 全仓 .py 无读取；WORKSPACE.md 仅 builtin_tools.py 一句注释指向，硬件探测已 replace WORKSPACE.md §4 |
 
-注：`config/MEMORY.md`（死文件，本次对象）≠ `data/memory/MEMORY.md`（memory.py:45 实时维护的索引，活）。
+注：`config/MEMORY.md`（本次已重写接入）≠ `data/memory/MEMORY.md`（memory.py:45 实时维护的 MemorySystem 索引，活）。
 
-### 13.2 TOOLS.md 漂移
-真实来源 = `_build_tool_registry`(agent_router.py:528-897) + 后注册(1424/1452/1523/1539) = **29 工具**；权限集(permissions.py) = **28**（`end_continuous_mode` 不在权限集，仅连续对话路径注入）。
+### 13.2 TOOLS.md 漂移（行号已按当前 dev `c68ca8e` 修订）
+真实来源 = `_build_tool_registry`(agent_router.py:528-897，25 个) + 函数体外后注册(`get_user_info`:1435 / `end_continuous_mode`:1463 / `begin_task`:1534 / `finalize_subtask`:1550) = **29 工具**；权限集(permissions.py:48-85) = **28**（`end_continuous_mode` 不在任何权限集，仅连续对话路径动态 union 注入，agent_router.py:1460-1462 注释）。
 - **缺 2 个已注册且有权限的工具**：`download_repo`(:588, VIP)、`summarize_pdf`(:597, PUBLIC)。
-- **schema 实证漂移**：`play_gacha_animation` 注册 schema 有 `interval`(:736)，TOOLS.md 的 JSON 漏了它。
-- `end_continuous_mode`(:1452) 未文档化（特殊工具）。
-- 其余 26 个工具名 + 权限归属对得上。
+- **schema 实证漂移**：`play_gacha_animation` 注册 schema 有 `interval`，TOOLS.md 的 JSON 漏了它。
+- `end_continuous_mode`(:1463) 未文档化（特殊工具）。
+- 其余 26 个工具名 + 权限归属对得上（`begin_task`/`finalize_subtask` 在 `_PUBLIC_TOOLS`，permissions.py:70-71）。
+- 权限分层实况：`_PUBLIC_TOOLS` 22 个 + `_VIP_TOOLS` 4 个（web_fetch/download_repo/get_system_load/execute_code）+ `_ADMIN_TOOLS` 1 个（shell_exec）。
 
 ### 13.3 SESSION.md 漂移
 真实参数：`max_context_messages=20`(session.py:85)、`session_timeout=1800`、`thinking_timeout=180`(agent.py:91)、`max_tool_iterations=20`(agent_router.py:974 / 循环 agent.py:228)。
@@ -386,6 +505,9 @@
 - 工具表缺 7 个新工具（delete_workspace_file/character_detail/bond_detail/parse_battle_screenshots/redeem_code/begin_task/finalize_subtask）+ end_continuous_mode；Required/Optional 分类与代码不符（注册无条件，无 try/except 分级）。
 
 ### 13.5 config/MEMORY.md 漂移
+> ✅ **已失效（历史档案）**：`9da0f12` 把 config/MEMORY.md 整体重写为三层引擎说明（旧版 Memory Index
+> 风格内容已不存在），下列漂移项随之全部消解。保留原文供考古。
+
 真实 = memory.py。
 - 类型表列 **4 类**(user/conversation/knowledge/system) → memory.py 只实现 **3 类**(user/knowledge/system，见 `_get_storage_dir`/`_get_search_dirs`/section markers)；**conversation 类不存在**。
 - 路径错：写 `memory/users/{uid}/`(复数) → 实际 `{base_dir}/user/{uid}/`(单数, memory.py:68)；`memory/conversations/{date}/` 不存在。
@@ -393,14 +515,31 @@
 - 措辞硬伤：`temperate`→temporary、`Adminicle`→Note、`Deletion in memory files`。
 
 ### 13.6 接入后 system prompt 组成（P3 完成态）
-`SOUL + IDENTITY + AGENTS`（现状）+ **重写后的 MEMORY.md**（机制②记忆规则）+ **裁剪后的 TOOLS.md**（纯编排策略）。SESSION/BOOTSTRAP/HEARTBEAT/USER/WORKSPACE 不进 prompt（弃置标记保留）；HELP/FEATURES 仍由 plugin 各自读取，与 system prompt 无关。
+`SOUL + IDENTITY + AGENTS` + **重写后的 MEMORY.md**（机制②记忆规则）+ **裁剪后的 TOOLS.md**（纯编排策略）。SESSION/BOOTSTRAP/HEARTBEAT/USER/WORKSPACE 不进 prompt（弃置标记保留）；HELP/FEATURES 仍由 plugin 各自读取，与 system prompt 无关。
+
+> ✅ **当前实况**：`SOUL + IDENTITY + AGENTS + MEMORY`（四个，`9da0f12` 后）；TOOLS.md 裁剪接入未做。
+> 另有两个规划时未列的动态注入块：MEDIUM 记忆注入（`agent.py:516-519`，`## 用户记忆（中期）`）
+> 与人格切换过渡标记（`_personality_switch_marker`，`agent.py:457-459`）。
+> 完整注入顺序见 `agent.py` `build_system_prompt`（:137-169）+ `_build_messages`（:423-533）：
+> system prompt 正文 → 人格 override → 会话类型标记 → 工作区上下文 → 画像类型化槽 → 权限上下文 →
+> 群聊上下文 → MEDIUM 注入 → 历史 → 当前消息。
 
 ---
 
-## 附：关键代码位置速查
+## 附：关键代码位置速查（✅ 已按 P1 后代码更新；~~删除线~~ = 旧行号仅作历史参考）
 
-- `profile.py:204-236` 抽取 prompt（硬编码） · `:104-114` `merge_facts`（MAX_FACTS，将移除） · `:128-136` `_similar`（中文去重 bug，将移除） · `:71-95` `to_prompt_context`（注入 `facts[-10:]`，将改）
-- `agent.py:346` `final_content`（=agent_response 来源） · `:410 / 687-698` `_schedule_profile_update`（改调 `observe_turn`） · `:649-683` `_maybe_remember`（机制②，将被三级管线替换） · `:121-133 / 137-165` `_load_configs` / `build_system_prompt`（只用 soul+identity+agents；MEMORY.md 待接入） · `:712` `configs_loaded`（仅列名）
-- `agent_router.py:905-907` 会话参数（硬编码） · `:911` MemorySystem base_dir · `:923` ProfileManager set_client（改 flash） · `:1621` 特殊会话删除（挂尾批 flush） · `_build_tool_registry`（工具说明真实来源）
-- `memory.py:138-155` `search()`（子串匹配，非语义） · `:81-111` `save()`（frontmatter） · `:21-32` `MemoryEntry`
-- `deepseek_client.py:52-92` `chat_completion`（单条 user 消息） · `model_router.py:84` `flash_client`
+**新管线（P0/P1 落地后）**：
+- `profile.py:50-51` `PROFILE_BATCH_K=5` / `EXTRACT_WINDOW_N=8` · `:100-124` `to_prompt_context`（只注入类型化槽） · `:299-328` `observe_turn`（缓冲+单飞+满 K 触发） · `:330` `flush_on_session_end`（尾批 flush） · `:379-427` `extract_batch`（合并 extract+judge 单次 flash 调用） · `:442` `_apply_extraction` · `:572` 起 `_build_extraction_prompt`（8 轮窗口+judge 清单）
+- dormant 遗留：`profile.py:43` `MAX_FACTS=40` · `:65` `facts` 字段 · `:133-147` `merge_facts` · `:162-169` `_similar`（均保留、零调用方）
+- `memory.py:324-337` 三级常量区 · `:385` `class TieredMemory` · `:395-397` `tiers/`、`tiers/long/` 目录 · `:447` `get_judge_list` · `:542-545` SHORT 入队/淘汰 · `:582-600` `_maybe_create_long`（P1 仅 create+persist） · `:614` MEDIUM 按需排序 · `:626-661` `build_medium_injection`（`(低置信)` 标签） · `:673-685` JSON 序列化+原子写
+- `agent.py:414/:667` `_schedule_profile_update` → `observe_turn` · `:516-519` MEDIUM 注入（`_build_messages`） · `:127/:156-158` MEMORY.md 加载与注入 · `:733` `has_tiered_memory` 状态汇报
+- `agent_router.py:924` `set_client(flash_client)` · `:931` `TieredMemory(base_dir=data/memory)` · `:1644/:2032` 会话删除挂钩 flush
+- `fact_filter.py:50-124` L2-A/B/C 词表与正则（`:97-108` transient_state 删除记录） · `scripts/cleanup_profile_facts.py`（P0 存量清理） · `scripts/migrate_memory_p1.py:121/:134/:147/:197`（`_uid_from_interaction`/`loose_interaction_files`/`discover_users`/`interaction_files`）
+- 测试：`test_agent.py` 4.6 `TestProfileExtraction`(:1037) · 4.7 `TestTieredMemory`(:1702) · 4.8 `TestMergedExtraction`(:2095) · 4.9 `TestMemoryMigration`(:2209，含 `test_migration_archives_loose_legacy_dumps`:2282)
+
+**旧机制（历史参考，行号为 P0 前）**：
+- ~~`profile.py:204-236` 硬编码抽取 prompt · `:71-95` 注入 `facts[-10:]`~~（已被上述新管线取代）
+- ~~`agent.py:649-683` `_maybe_remember`~~（函数体已删；仅 `:26`、`:413` 两处注释提及）
+- `agent_router.py` 会话参数（硬编码） · `_build_tool_registry`（工具说明真实来源，:528-897 + 后注册 :1435/:1463/:1534/:1550）
+- `memory.py` 旧 MemorySystem 仍在：`search()`（子串匹配）/ `save()`（frontmatter md）/ `MEMORY.md` 索引维护（`data/memory/MEMORY.md`）
+- `deepseek_client.py:27-35` 显式 api_key+api_base early-return（WebUI Playground 用） · `model_router.py` `flash_client`
