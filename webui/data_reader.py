@@ -86,6 +86,20 @@ def _hit_rate(bucket: dict) -> float | None:
     return bucket.get("cached_input_tokens", 0) / inp if inp else None
 
 
+def _provider_of(model: str) -> str:
+    """Infer the LLM provider from the model name.
+
+    提供商缓存互相隔离（见 Cache-Hit-Rate-Plan.md Phase 1）：DeepSeek 与
+    dashscope 的前缀缓存互不可见，命中率必须分模型呈现，不能混算。
+    """
+    m = (model or "").lower()
+    if m.startswith("deepseek"):
+        return "DeepSeek"
+    if m.startswith("qwen") or "dashscope" in m:
+        return "阿里云 dashscope"
+    return "—"
+
+
 # ── Tokens ────────────────────────────────────────────────────────
 
 def tokens_summary(days: int = 7) -> dict:
@@ -93,11 +107,24 @@ def tokens_summary(days: int = 7) -> dict:
     cutoff = (datetime.now() - timedelta(days=max(1, days) - 1)).strftime("%Y-%m-%d")
     daily = {d: b for d, b in s.get("daily", {}).items() if d >= cutoff}
     totals = s.get("totals", {})
+    # 按模型注解视图：提供商 + 命中率，按总 token 降序（Phase 1.2）
+    models = []
+    for name, b in s.get("by_model", {}).items():
+        models.append({
+            "model": name,
+            "provider": _provider_of(name),
+            "hit_rate": _hit_rate(b),
+            **{k: b.get(k, 0) for k in (
+                "requests", "input_tokens", "output_tokens",
+                "cached_input_tokens", "uncached_input_tokens")},
+        })
+    models.sort(key=lambda x: x["input_tokens"] + x["output_tokens"], reverse=True)
     return {
         "totals": totals,
         "hit_rate": _hit_rate(totals),
         "daily": dict(sorted(daily.items())),
         "by_model": s.get("by_model", {}),
+        "models": models,
         "by_purpose": s.get("by_purpose", {}),
         "updated_at": s.get("updated_at"),
     }
@@ -108,6 +135,30 @@ def tokens_daily(date_str: str) -> dict:
     return {"date": date_str, "bucket": bucket, "hit_rate": _hit_rate(bucket)}
 
 
+def tokens_daily_by_purpose(date_str: str) -> dict:
+    """Aggregate one day's detail JSONL into per-purpose buckets.
+
+    仪表盘卡片需要「今日 agent_loop 命中率」（全局命中率会被短小的 triage
+    与低收益的多模态请求稀释，见 Cache-Hit-Rate-Plan.md Phase 1.2）。
+    ledger 的 totals.json 只有累计 by_purpose，按日按用途要从明细文件聚合。
+    """
+    buckets: dict[str, dict] = {}
+    path = TOKEN_DIR / f"usage_{date_str}.jsonl"
+    for entry in _read_jsonl(path):
+        purpose = entry.get("purpose") or "chat"
+        b = buckets.setdefault(purpose, {
+            "requests": 0, "input_tokens": 0, "output_tokens": 0,
+            "cached_input_tokens": 0, "uncached_input_tokens": 0})
+        b["requests"] += 1
+        for k in ("input_tokens", "output_tokens",
+                  "cached_input_tokens", "uncached_input_tokens"):
+            try:
+                b[k] += int(entry.get(k, 0) or 0)
+            except (TypeError, ValueError):
+                pass
+    return buckets
+
+
 def tokens_users(days: int = 7, limit: int = 20) -> list:
     """Aggregate per-user tokens from the last `days` daily detail files."""
     cutoff = datetime.now() - timedelta(days=max(1, days) - 1)
@@ -115,12 +166,14 @@ def tokens_users(days: int = 7, limit: int = 20) -> list:
         "requests": 0, "input_tokens": 0, "output_tokens": 0,
         "cached_input_tokens": 0})
     try:
-        files = sorted(TOKEN_DIR.glob("token_usage_*.jsonl"))
+        # ledger 的明细文件名是 usage_YYYY-MM-DD.jsonl（token_ledger.py
+        # _daily_path）——旧 glob "token_usage_*" 永远匹配不到，用户排行恒为空
+        files = sorted(TOKEN_DIR.glob("usage_*.jsonl"))
     except OSError:
         files = []
     for fp in files:
         try:
-            d = datetime.strptime(fp.stem.replace("token_usage_", ""), "%Y-%m-%d")
+            d = datetime.strptime(fp.stem.replace("usage_", ""), "%Y-%m-%d")
         except ValueError:
             continue
         if d < cutoff.replace(hour=0, minute=0, second=0, microsecond=0):

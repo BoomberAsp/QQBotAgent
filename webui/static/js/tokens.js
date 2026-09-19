@@ -21,34 +21,58 @@
     document.getElementById('tk-output').textContent = fmtNum(s.totals.output_tokens);
     document.getElementById('tk-hitrate').textContent = pct(s.hit_rate);
 
-    // purpose table
+    // purpose table（Phase 1.1：补未命中列；agent_loop 命中率是优化核心视图）
     const rows = Object.entries(s.by_purpose).map(([name, b]) => [
       name, fmtNum(b.requests), fmtNum(b.input_tokens),
-      fmtNum(b.cached_input_tokens), fmtNum(b.output_tokens), pct(b.input_tokens ? b.cached_input_tokens / b.input_tokens : null),
+      fmtNum(b.cached_input_tokens),
+      fmtNum(b.uncached_input_tokens !== undefined ? b.uncached_input_tokens
+        : (b.input_tokens || 0) - (b.cached_input_tokens || 0)),
+      fmtNum(b.output_tokens),
+      pct(b.input_tokens ? b.cached_input_tokens / b.input_tokens : null),
     ]).sort((a, b) => b[2].length - a[2].length);
     table(document.getElementById('tbl-purpose'),
-      ['用途', '请求', '输入', '命中', '输出', '命中率'], rows);
+      ['用途', '请求', '输入', '命中', '未命中', '输出', '命中率'], rows);
 
     if (!hasCharts || !Object.keys(s.daily).length) return;
     const dates = Object.keys(s.daily);
     const get = (k) => dates.map(d => s.daily[d][k] || 0);
+    // Phase 1.3：每日命中率折线（右轴 %）
+    const hitRate = dates.map(d => {
+      const b = s.daily[d] || {};
+      return b.input_tokens ? +(100 * (b.cached_input_tokens || 0) / b.input_tokens).toFixed(1) : null;
+    });
     dailyChart = dailyChart || echarts.init(document.getElementById('chart-daily'));
     dailyChart.setOption({
       backgroundColor: 'transparent',
       tooltip: { trigger: 'axis' },
       legend: { textStyle: { color: '#8b98b8' } },
-      grid: { left: 60, right: 20, top: 40, bottom: 30 },
+      grid: { left: 60, right: 55, top: 40, bottom: 30 },
       xAxis: { type: 'category', data: dates, axisLabel: { color: '#8b98b8' } },
-      yAxis: { type: 'value', axisLabel: { color: '#8b98b8' } },
+      yAxis: [
+        { type: 'value', axisLabel: { color: '#8b98b8' } },
+        { type: 'value', min: 0, max: 100, axisLabel: { color: '#8b98b8', formatter: '{value}%' }, splitLine: { show: false } },
+      ],
       series: [
         { name: '命中输入', type: 'bar', stack: 'in', data: get('cached_input_tokens'), itemStyle: { color: '#3ecf8e' } },
         { name: '未命中输入', type: 'bar', stack: 'in', data: get('uncached_input_tokens'), itemStyle: { color: '#5b8cff' } },
         { name: '输出', type: 'line', data: get('output_tokens'), itemStyle: { color: '#f0b429' } },
+        { name: '命中率', type: 'line', yAxisIndex: 1, data: hitRate, symbol: 'circle', symbolSize: 5,
+          itemStyle: { color: '#e86bd0' }, lineStyle: { type: 'dashed' },
+          tooltip: { valueFormatter: v => v === null ? '—' : v + '%' } },
       ],
     }, true);
   }
 
   function renderModel(s) {
+    // Phase 1.2：按模型命中率表（含提供商标注，缓存按提供商隔离不可混算）
+    const models = s.models || [];
+    table(document.getElementById('tbl-model'),
+      ['模型', '提供商', '请求', '输入', '命中', '未命中', '输出', '命中率'],
+      models.map(m => [
+        m.model, m.provider, fmtNum(m.requests), fmtNum(m.input_tokens),
+        fmtNum(m.cached_input_tokens), fmtNum(m.uncached_input_tokens),
+        fmtNum(m.output_tokens), pct(m.hit_rate),
+      ]));
     if (!hasCharts) return;
     const entries = Object.entries(s.by_model);
     if (!entries.length) return;

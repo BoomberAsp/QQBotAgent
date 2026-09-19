@@ -266,6 +266,10 @@ async def api_dashboard():
     today = time.strftime("%Y-%m-%d")
     tok = await asyncio.to_thread(data_reader.tokens_daily, today)
     bucket = tok.get("bucket", {})
+    # 今日 agent_loop 命中率（全局口径会被 triage/多模态稀释，Phase 1.2）
+    _al = (await asyncio.to_thread(data_reader.tokens_daily_by_purpose, today)).get("agent_loop") or {}
+    _al_inp = _al.get("input_tokens", 0)
+    hit_rate_agent_loop = (_al.get("cached_input_tokens", 0) / _al_inp) if _al_inp else None
     unread = await asyncio.to_thread(data_reader.feedback_unread_count)
     for name, info in procs.items():
         if info.get("state") == "running":
@@ -304,6 +308,7 @@ async def api_dashboard():
             "today_input": bucket.get("input_tokens", 0),
             "today_output": bucket.get("output_tokens", 0),
             "hit_rate": tok.get("hit_rate"),
+            "hit_rate_agent_loop": hit_rate_agent_loop,
         },
         "feedback": {
             "unread": unread,

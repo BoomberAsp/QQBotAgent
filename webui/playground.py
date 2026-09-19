@@ -123,7 +123,11 @@ def preview_system_prompt(personality: str = "", role: str = "admin") -> dict:
     try:
         session = agent.sessions.get_or_create("playground")
         messages = agent._build_messages(session, "", None, role_hint=role)
-        system = messages[0]["content"] if messages else ""
+        # 四层分级后 system 内容分布在两条消息里（L1–L3 头部 + L4 易变尾部，
+        # 见 Cache-Hit-Rate-Plan.md Phase 3）——预览时拼回完整视图
+        system = "\n\n".join(
+            m.get("content", "") for m in messages if m.get("role") == "system"
+        )
     except Exception as e:
         return {"error": f"构建系统提示词失败: {e}"}
     return {

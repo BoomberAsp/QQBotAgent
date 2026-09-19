@@ -1,5 +1,12 @@
 # Workspace File Management — Design Plan
 
+> 📝 **文档性质说明（2026-09-19 修订）**：本文是工作区管理（Feature 1–7）与会话生命周期（Idea 1–8）的
+> **设计/审计档案**，各节的「当前状态」注记已按代码实况更新；但正文中引用的 **file:line 行号是各节写作
+> 时的快照**，历经 P0/P1/WebUI 等多次提交后已普遍漂移（如 `_compress_context` 现位于 agent.py:538-571、
+> `_record_session_file` 现位于 agent_router.py:1062-1082），阅读时以符号名 grep 为准，勿直接按行号跳转。
+> 本次修订已更正的实质性错误：Idea 8 跑条前校验实为**两规则**（战意/集中力规则已删除）、Feature 7 依赖表
+> 中 `delete_workspace_file` 状态、Feature 3 的 `_meta.json` 伪代码与实际 `_index.json` 存储的差异。
+
 ## Problem
 
 用户工作区文件只能通过上传增加，无法删除。磁盘配额有限（普通用户 100MB / 会员 500MB / 管理员 2GB），用完后就无法上传新文件。用户需要手段查看和管理自己的工作区文件。
@@ -195,13 +202,20 @@ class SpecialSessionManager:
 - 文件被单独删除时（通过 `delete_workspace_file`），同步从会话的 `files` 列表中移除
 - 同一文件可能被多个会话引用（例如通过 `/创建会话` 复制而来）——删除一个会话不影响其他会话对该文件的引用
 
+> 📝 **落地实况（2026-09-19）**：Feature 3 的文件归属记录**已实现**，但与上述设计有以下差异：
+> - **存储位置**：`files` 列表实际存于会话索引 `sessions/_index.json` 的 `metadata.files` 字段（`special_session.py:225/:330/:345`），**并非**每会话目录下的 `_meta.json`。上方 JSON 示例中的 `_meta.json` 为写作期设想，未落地。
+> - **API**：仅实现 `add_file`（`special_session.py:319`）与 `get_files`（`:337`）；**`remove_file` 未实现**。因此「文件被单独删除时同步从 `files` 列表移除」这条**未落地**——`delete_workspace_file` 删除文件后，`files` 列表中的记录不会被同步清理（残留为陈旧引用，删除会话时按「文件不存在则跳过」处理）。
+> - **记录入口**：`add_file` 在 `agent_router.py:1080`（`_record_session_file`，文件下载后）与 `:2856`（`/保存为会话` 归属迁移）被调用；`get_files` 在 `:2779`（`/删除会话` 文件清单）被调用。
+
 ---
 
 ## Feature 4: Session Deletion with File Cleanup Prompt
 
-### 当前状态：**未实现**
+### 当前状态：**部分实现（与下方设计有差异）**
 
-`/删除会话` 已有 60 秒二次确认（`agent_router.py:1915-1943`），但无文件列表展示与 `--with-files` 选项。
+`/删除会话` 已有 60 秒二次确认，并**已展示关联文件清单**（`agent_router.py:2779-2797`）：调用 `get_files()` 取得归属文件，按 `repos` 与否拆为「将清理」与「予以保留」两组列出，确认后随会话一并清理（`repos` 仓库始终保留）。
+
+> ⚠️ **落地差异**：实际未采用设计中的 `--with-files` 可选项——确认删除即清理全部非 `repos` 关联文件（仓库保留），用户无法「仅删会话、保留文件」。下方 Behavior/Implementation/Edge Cases 中的 `--with-files` 流程为写作期设想，未落地。
 
 ### Purpose
 
@@ -345,8 +359,8 @@ if cmd in ("/管理工作区", "#管理工作区"):
 | 能力 | 对应工具 | 状态 |
 |------|---------|------|
 | 增 | QQ 文件上传 → `_download_and_save_file()` | ✅ 已有 |
-| 查 | `get_workspace_snapshot`（或 `get_user_info` 目录快照） | ⚠️ 见 Feature 1 |
-| 删 | `delete_workspace_file` | ❌ Feature 2 未实现 |
+| 查 | `get_workspace_snapshot`（或 `get_user_info` 目录快照） | ✅ 已落地（采用**方案 A**：`get_user_info` 内嵌目录快照，未单独实现 `get_workspace_snapshot` 工具——见 Feature 1） |
+| 删 | `delete_workspace_file` | ✅ 已实现（Feature 2 已落地，`builtin_tools.py:872`，注册于 `agent_router.py:622`，列入 `_PUBLIC_TOOLS`） |
 | 改 | （不提供，与设计原则一致） | — |
 
 ### Behavior
@@ -518,11 +532,11 @@ AGENTS.md 中也有文档记录 (`config/AGENTS.md:95`)：
 
 ### 现状核查（2026-08-15）
 
-**已存在：`_compress_context()`（`agent/agent.py:409-443`）** —— 一个 `@staticmethod`，仅在 `_build_messages()`（`agent.py:396`）对特殊会话 context 做请求前预处理：
+**已存在：`_compress_context()`（`agent/agent.py:538-571`）** —— 一个 `@staticmethod`，仅在 `_build_messages()`（`agent.py:423`）对特殊会话 context 做请求前预处理：
 
 - **Layer 1**：最近 20 条消息保留完整原文
 - **Layer 2**：20 条之前的 `tool` 结果截断到首行（前 200 字符）
-- **Layer 3**：渐进式摘要 —— **未实现**（代码注释 `agent.py:415`：`"Layer 3: Progressive summary not yet implemented"`）
+- **Layer 3**：渐进式摘要 —— **未实现**（代码注释 `agent.py:543-544`：`"Layer 3: Progressive summary not yet implemented"`）
 
 其关键性质（对 Idea 4 的定位很重要）：
 
@@ -744,10 +758,10 @@ async def read_file(path: str) -> str:
 
 ### 当前状态：**Layer 1+2 已实现，Layer 3 未实现**
 
-当前 `agent.py:348-382` `_compress_context()` 已实现：
+当前 `agent.py:538-571` `_compress_context()` 已实现：
 - **Layer 1**：最近 20 条消息保留完整原文
 - **Layer 2**：20 条之前的消息压缩 tool result 到首行
-- **Layer 3**：**未实现**。代码注释 (`agent.py:354`): `"Layer 3: Progressive summary not yet implemented"`
+- **Layer 3**：**未实现**。代码注释 (`agent.py:543-544`): `"Layer 3: Progressive summary not yet implemented"`
 
 ### 问题
 
@@ -823,10 +837,17 @@ New messages (30): {recent_30_messages}
 
 ### 当前状态：**部分实现（80% 提醒已落地，柔性超额未实现）**
 
-- ✅ **80% 提醒**已实现：`check_quota()` (`workspace.py:93-121`) 在 80-100% 返回警告；`get_quota_context()` (`workspace.py:131-147`) 在 80%/100% 注入系统提示（`agent.py:354`）
+- ✅ **80% 提醒**已实现：`check_quota()` (`workspace.py:111`) 在 80-100% 返回警告；`get_quota_context()` (`workspace.py:150`) 在 80%/100% 注入系统提示（`agent.py:482`）。两者均经 `_effective_quota_bytes()`（`workspace.py:78-94`，读 `_current_quota_bytes` contextvar）取每角色配额。
 - ❌ **>100% 柔性超额**未实现：`check_quota()` 仍硬拒绝（返回 `False`），未采用「仍允许写入 + 标记 `_over_quota`」的柔性策略
-- ❌ `check_quota()` 目前**未被任何工具调用**（见 `docs/security-boundary-remaining.md`），实时配额检查未接入上传/代码执行等写入路径
+- ❌ `check_quota()` 目前**未被任何工具调用**（见 `docs/security-boundary-remaining.md`），实时配额检查未接入上传/代码执行等写入路径（注：`get_quota_context()` 仅用于系统提示注入，非写入路径门控）
 - ❌ 150% 绝对硬限、连续 3 次超额拒绝、`download_repo --depth=1` 浅克隆、`execute_code` 输出 100MB 软限制均未实现
+
+> 📝 **落地实况（2026-09-19）**：>100% 超额场景**并未采用本节的「柔性超额」设计**（仍允许写入 + 标记 `_over_quota`），而是改由 **Feature 2 的「弹性配额清理协议」**处理（`agent_router.py:1122-1235`，触发点 `:1735`，在文件下载/Agent 调用之前拦截）：
+> - 当 `get_size(uid) ≥ 配额` 时，本轮**阻断新的空间分配**（上传/代码输出/克隆），并列出最早 mtime 的候选文件；
+> - 用户可自定义删除目标但**不可跳过**（`_handle_cleanup_response` 拒绝 `skip`）；
+> - `CLEANUP_TIMEOUT = 600`（10 分钟）内未回复 → `_auto_cleanup_after` **自主删除**候选（目标回落到 80%）。
+>
+> 因此本节「柔性超额（允许写入）」与「150% 硬限 / 连续 3 次拒绝」等设计**均未落地**；实际采取的是一种更严格的「超额即阻断 + 强制清理」策略。该协议直接使用 `get_size()` 而非 `check_quota()`，故上方「`check_quota()` 未被任何工具调用」仍然成立。
 
 ### 问题
 
@@ -872,7 +893,7 @@ New messages (30): {recent_30_messages}
 
 - ✅ `tools/battle_parser.py::parse_battle_screenshots(paths)` — 每张截图**一次** qwen3.5-ocr 调用（左半屏 0–50% 裁剪，名字+行动值按行交错返回），行配对（y 聚类 + 孤儿值按行序回填）、横幅颜色带扫描判定阵营（红=敌/蓝=我，横向计数窗口 13–45% 帧宽）、`(name, side)` 去重（镜像同名行保留）、每侧上限 3。阶段自动判定（`_detect_phase`）：全员行动值 ≤5% → `pre`（乱速后），否则 `post`；双图顺序异常（如疑似颠倒）写入 warnings。
 - ✅ `tools/ocr_name_matcher.py` 字形纠偏层保留（Stroke-IoU + 分长度阈值 + 长名截断救援），uncertain 名称走 MULTIMODAL_MODEL 视觉兜底；名称索引动态取自 wiki 缓存 + vendored 别名词典。
-- ✅ 跑条前截图三规则校验（进战 buff / 进战战意集中力 / 免疫套装 → `pre_valid`）+ 拉条推条技能提示（`action_gauge_skills`），技能索引来自 `character_details.json`；`BuffDetector` 28 图标模板匹配。
+- ✅ 跑条前截图**两规则**校验（`_validate_pre_screenshot`）：规则 1「进战 buff」为阻断项、决定 `pre_valid`；规则 2「免疫套装」仅为 advisory 警告、**永不阻断**。原「进战战意/集中力」规则已删除（开战不渲染行图标，规则不可满足、只会误报；气魄归入规则 1）——见 `docs/implements-for-idea-8.md` §4 与 `battle_parser.py::_validate_pre_screenshot` docstring。+ 拉条推条技能提示（`action_gauge_skills`），技能索引来自 `character_details.json`；`BuffDetector` 28 图标模板匹配。
 - ✅ 输出单图/双图 JSON + `calculate_speed` 兼容 `raw_format`；工具注册于 `agent_router.py`，`_PUBLIC_TOOLS` 全员可用；`AGENTS.md` 截图测速交互流程（pre_valid 检查、行动值修正确认、询问我方速度 → `calculate_speed`）。
 - ✅ 验证（`test/test_region_ocr.py` → `test/swap_validation.json`，49 截图 / 285 真值行）：**名称 285/285、行动值 285/285、漏行 0、阵营 unknown 0**；`bash test.sh` 通过。报告中 6 个「额外」均为真实镜像行（GT 构建时继承旧管线去重 bug 未录入，非误报）。
 - 演进：初版 easyOCR 四区域 + 逐数字模板（名称 87.7% / 值 93.7%）→ qwen3.5-ocr 对比评测胜出（`test/qwen_ocr_comparison.md`）→ 残余错误根因探针（`test/qwen_fullimg_probe.md`：截断=裁剪、漏行=窄裁剪跳行、茱/茉=字形相似由 matcher 纠偏、2%→3%=列表同化、98% 漏值=坐标回归）→ 宽裁剪单调用替换，easyOCR 提取 / `_parse_action_value` / 逐数字模板退役。
@@ -1119,6 +1140,12 @@ OCR 文字块: (text="Boss名称", bbox=[x1, y1, x2, y2])
 
 当且仅当以上三条判断返回全为True，跑条前截图有效，否则无效。
 
+> 📝 **落地修正（2026-09-19）**：以上为原始需求文本，实际实现（`battle_parser.py::_validate_pre_screenshot`）已收敛为**两条规则**：
+> - **规则 1「进战 buff」** —— 阻断项，决定 `pre_valid`（进战立即获得 buff 的角色须在截图中可见对应 buff；气魄状态归入本规则）。
+> - **规则 2「免疫套装」** —— 已降级为 **advisory-only 警告，永不阻断**：跑条后截图显示的免疫 buff 无法区分「来源于套装」与「来源于技能授予」，故不能作为无效判据。
+> - **原「进战战意/集中力」规则已删除**：战意/集中力在开战阶段不渲染行图标，规则不可满足、只会误报。
+> 因此 `pre_valid` 实际只反映规则 1；详见 `docs/implements-for-idea-8.md` §4。
+
 跑条后，正在行动的角色行动值会归零，且其代表的行动条位于中间框的最上方，行动值最大的角色代表的行动条将位于中间框的底部，且被Next On条与其它角色行动条上下分开。注：角色行动值大于等于100%时，将会行动，且所有角色不再因速度属性跑条（任可受到拉条），直到行动完成后。若同时有多名角色行动值大于等于100%，按行动值大小决定行动次序。
 
 ---
@@ -1134,4 +1161,4 @@ OCR 文字块: (text="Boss名称", bbox=[x1, y1, x2, y2])
 | 5 | 群聊文件延迟下载 | **未实现** | 待实现（元数据记录 + 按需下载 + 进度反馈） |
 | 6 | 分层上下文 Layer 3 | **未实现** | 待实现（每 30 条异步生成渐进式摘要） |
 | 7 | 配额柔性处理 | **部分实现** | 80% 提醒已实现（`check_quota`/`get_quota_context`）；>100% 柔性超额与 150% 硬限待实现 |
-| 8 | 截图测速（OCR+LLM 两层降级） | **已实现** | qwen3.5-ocr 单调用提取 + 字形名称纠偏 + 颜色带阵营判定 + 三规则校验；名称/值 285/285 全对（见 `docs/implements-for-idea-8.md`） |
+| 8 | 截图测速（OCR+LLM 两层降级） | **已实现** | qwen3.5-ocr 单调用提取 + 字形名称纠偏 + 颜色带阵营判定 + 两规则校验（进战 buff 阻断 + 免疫套装提示）；名称/值 285/285 全对（见 `docs/implements-for-idea-8.md`） |

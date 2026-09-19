@@ -3,7 +3,9 @@ Personality Manager — Load and manage agent personality profiles.
 
 Each personality is a markdown file in config/personalities/.
 The first # heading in the file is used as the display name.
-Content is injected at the top of the system prompt.
+Content is injected into the system prompt after the shared config block
+(L2 layer — Cache-Hit-Rate-Plan.md Phase 3; it used to be prepended before
+the block, which split the shared prefix per personality).
 
 Follows OpenRubi's philosophy: personality switching is just
 swapping a simple prompt string — no complex state machines.

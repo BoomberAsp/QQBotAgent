@@ -28,7 +28,7 @@
   <div class="card stat-card">
     <div class="stat-label">缓存命中率</div>
     <div class="stat-value" id="tk-hitrate">—</div>
-    <div class="stat-sub">按输入 token 计</div>
+    <div class="stat-sub">全局口径（含多模态，会被稀释）· agent_loop 见按用途表</div>
   </div>
 </div>
 
@@ -46,6 +46,14 @@
     <h2 class="card-title">按用途</h2>
     <table class="data-table" id="tbl-purpose"></table>
   </div>
+</div>
+
+<div class="card">
+  <h2 class="card-title">按模型命中率（提供商分离口径）</h2>
+  <table class="data-table" id="tbl-model"></table>
+  <p class="muted">前缀缓存是提供商侧、按模型隔离的：DeepSeek 与阿里云 dashscope 的缓存互不可见，命中率不可混算。
+  qwen 系多模态/音频/OCR 请求以图片音频为主，命中率天然偏低属正常，不作为优化目标；
+  缓存优化的核心视图是 <b>agent_loop 用途 × DeepSeek 文本模型</b> 的命中率（见上方按用途表与本表）。</p>
 </div>
 
 <div class="card">
