@@ -387,6 +387,47 @@ def _check_ssrf(url: str) -> str | None:
         return f"[SSRF] 安全检查失败: {type(e).__name__}: {e}"
 
 
+# Common Chinese charset aliases — gb18030 is a superset of gbk/gb2312
+_CHARSET_ALIASES = {"gb2312": "gb18030", "gbk": "gb18030", "gb-2312": "gb18030", "gb_2312": "gb18030"}
+
+
+def _sniff_charset(content: bytes, content_type: str) -> str | None:
+    """Detect charset from the HTTP Content-Type header, then HTML meta tags."""
+    # 1) HTTP header: content-type: text/html; charset=gb2312
+    m = re.search(r"charset=[\"']?([a-zA-Z0-9_\-]+)", content_type)
+    if m:
+        return m.group(1).lower()
+    # 2) HTML meta tags in the first 4KB (decoded leniently as ASCII)
+    head = content[:4096].decode("ascii", errors="ignore")
+    m = re.search(r"<meta[^>]+charset=[\"']?([a-zA-Z0-9_\-]+)", head, re.I)
+    if m:
+        return m.group(1).lower()
+    m = re.search(r"<meta[^>]+content=[\"'][^\"']*charset=([a-zA-Z0-9_\-]+)", head, re.I)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def _decode_content(content: bytes, content_type: str) -> str:
+    """Decode response bytes using declared/sniffed charset with fallbacks.
+
+    Order: declared charset (header or meta) -> utf-8 strict -> gb18030.
+    Fixes mojibake on GBK/GB2312 pages (e.g. pvp.qq.com) that were
+    previously force-decoded as UTF-8.
+    """
+    candidates: list[str] = []
+    charset = _sniff_charset(content, content_type)
+    if charset:
+        candidates.append(_CHARSET_ALIASES.get(charset, charset))
+    candidates.extend(["utf-8", "gb18030"])
+    for enc in candidates:
+        try:
+            return content.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
 def _html_to_text(html: str) -> str:
     """Strip HTML tags and extract readable text."""
     from html.parser import HTMLParser
@@ -467,9 +508,9 @@ async def web_fetch(url: str) -> str:
             truncated = len(response.content) > _MAX_FETCH_SIZE
 
             if "text/html" in content_type:
-                text = _html_to_text(content.decode("utf-8", errors="replace"))
+                text = _html_to_text(_decode_content(content, content_type))
             elif "text/plain" in content_type or "application/json" in content_type:
-                text = content.decode("utf-8", errors="replace")
+                text = _decode_content(content, content_type)
             else:
                 text = f"(非文本内容: {content_type}, 大小: {len(content)} 字节)"
 
