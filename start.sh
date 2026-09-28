@@ -186,9 +186,12 @@ log "NoneBot 启动中 (PID: $NONEBOT_PID)"
 # 等待启动完成
 sleep 3
 
-# ── 5.5 启动 WebUI 管理面板（独立进程，失败不影响机器人）──
-log "启动 WebUI 管理面板..."
-if bash "$SCRIPT_DIR/start_webui.sh" start; then
+# ── 5.5 重启 WebUI 管理面板（独立进程，失败不影响机器人）──
+# 用 restart 而非 start：面板已在运行时也强制重启，保证 git pull 后
+# 面板代码即时生效，且面板以干净状态重新收养本轮拉起的 NoneBot。
+# 面板未运行时 restart 等价于 start（stop 为空操作）。
+log "重启 WebUI 管理面板..."
+if bash "$SCRIPT_DIR/start_webui.sh" restart; then
     :
 else
     warn "WebUI 面板启动失败（不影响机器人）"
