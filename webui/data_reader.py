@@ -657,3 +657,92 @@ def wiki_cache_status() -> dict:
         "redeem_code": _dir_stats(REDEEM_DIR),
         "root": str(DATA),
     }
+
+
+# ── Wiki alias management ─────────────────────────────────────────
+# 权威别名字典（扁平 {alias: canonical_cn}），由 bot 的 name_resolver 使用。
+# 面板以「分组视图」{canonical: [alias...]} 展示/编辑，保存时扁平化全量替换，
+# 并调用 name_resolver.build_index() 重建拼音索引；bot 侧监听器随后热重载。
+
+_ALIAS_DIR = config.QQBOT_DIR / "config" / "characters"
+_ALIAS_FILES = {
+    "char": _ALIAS_DIR / "character_dic.json",
+    "bond": _ALIAS_DIR / "bonds_search_dic.json",
+}
+
+
+def wiki_aliases_read(kind: str) -> dict:
+    """Read the alias dictionary for kind (char|bond), inverted to groups.
+
+    Returns ``{canonical: [aliases...]}`` — aliases keep their original
+    case, canonical order follows first appearance in the file.
+    """
+    path = _ALIAS_FILES.get(kind)
+    if path is None:
+        return {"error": f"非法别名类型: {kind}"}
+    if not path.exists():
+        return {"error": f"别名字典不存在: {path.name}"}
+    try:
+        flat = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"error": f"读取失败: {e}"}
+    groups: dict[str, list[str]] = {}
+    for alias, canonical in flat.items():
+        groups.setdefault(str(canonical), []).append(str(alias))
+    return groups
+
+
+def wiki_aliases_save(kind: str, grouped: dict) -> dict:
+    """Validate + flatten + atomically replace the alias dictionary.
+
+    ``grouped`` is the full snapshot ``{canonical: [aliases...]}`` for this
+    kind. Alias uniqueness is enforced within the kind (an alias mapping to
+    two canonicals would silently hijack lookups). After a successful write
+    the pinyin index is rebuilt via name_resolver.build_index().
+    """
+    path = _ALIAS_FILES.get(kind)
+    if path is None:
+        return {"error": f"非法别名类型: {kind}"}
+
+    # ── validate + flatten ──
+    flat: dict[str, str] = {}
+    owner: dict[str, str] = {}  # lowercase alias → canonical (for dup check)
+    for canonical, aliases in grouped.items():
+        canonical = str(canonical).strip()
+        if not canonical:
+            return {"error": "角色/羁绊名（canonical）不能为空"}
+        if not isinstance(aliases, list):
+            return {"error": f"{canonical}: 别名必须是列表"}
+        for alias in aliases:
+            alias = str(alias).strip()
+            if not alias:
+                return {"error": f"{canonical}: 存在空别名"}
+            low = alias.lower()
+            if low in owner:
+                return {"error": f"别名「{alias}」已属于「{owner[low]}」，不能重复"}
+            owner[low] = canonical
+            flat[alias] = canonical
+
+    # ── backup + atomic write ──
+    try:
+        if path.exists():
+            shutil.copy2(path, str(path) + ".bak")
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(flat, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        return {"error": f"写入失败: {e}"}
+
+    # ── rebuild pinyin index (bot side only reads it from disk) ──
+    warning = None
+    try:
+        from tools.name_resolver import build_index
+        build_index()
+    except Exception as e:
+        warning = f"别名已保存，但拼音索引重建失败: {e}"
+
+    result = {"ok": True, "groups": len(grouped), "aliases": len(flat)}
+    if warning:
+        result["warning"] = warning
+    return result

@@ -6,7 +6,8 @@ Editable targets:
                                                    bot-side watcher (5 s)
   permissions    QQBot/.env  SUPERUSERS/VIP_USERS → effective immediately
                                                    (PermissionManager re-reads)
-  models         QQBot/config/models_settings.json → needs a NoneBot restart
+  models         QQBot/config/models_settings.json → hot-reloaded by the
+                                                   bot-side watcher (~10 s)
   group_features QQBot/data/group_features.json   → effective on next message
                                                    (GroupFeatures.refresh)
   personality    QQBot/data/personality_config.json + group_personality.json
@@ -202,7 +203,7 @@ def models_read() -> dict:
     return {
         "content": json.dumps(_mask_tree(data), ensure_ascii=False, indent=2),
         "note": "api_key 已脱敏；保存时保留 *** 占位的字段将维持原值。"
-                "修改模型配置后需重启 NoneBot 才生效。",
+                "保存后约 10 秒 bot 自动热重载，无需重启。",
     }
 
 
@@ -229,7 +230,92 @@ def models_write(raw: str) -> dict:
         tmp.replace(MODELS_FILE)
     except OSError as e:
         return {"error": str(e)}
-    return {"ok": True, "note": "已保存 — 需重启 NoneBot 生效"}
+    return {"ok": True, "note": "已保存 — bot 约 10 秒内自动热重载"}
+
+
+# ── Models: structured per-section edit (probe before write) ──────
+
+MODEL_SECTIONS = ("REASONING_MODEL", "FLASH_MODEL", "MULTIMODAL_MODEL",
+                  "AUDIO_MODEL", "OCR_MODEL")
+
+
+def models_section_prepare(section: str, data: dict) -> dict:
+    """Validate + unmask one model section against the on-disk config.
+
+    Does NOT write anything — the caller (main.py) probes the API first and
+    only commits via models_section_commit() when the probe passes.
+
+    Returns {"ok": True, "prepared_full": dict, "section_data": dict,
+             "old_section": dict, "needs_probe": bool} or {"error": str}.
+    """
+    from .model_probe import section_needs_probe
+
+    if section not in MODEL_SECTIONS:
+        return {"error": f"非法模型段: {section}"}
+    if not isinstance(data, dict):
+        return {"error": "config 必须是 JSON 对象"}
+
+    cleaned: dict = {}
+    for f in ("api_key", "api_base", "model"):
+        v = data.get(f, "")
+        if v is None:
+            v = ""
+        if not isinstance(v, str):
+            return {"error": f"{f} 必须是字符串"}
+        cleaned[f] = v.strip()
+    for f, cast in (("max_tokens", int), ("temperature", float)):
+        v = data.get(f)
+        if isinstance(v, bool) or v in (None, ""):
+            continue  # keep whatever the old section had
+        try:
+            cleaned[f] = cast(v)
+        except (TypeError, ValueError):
+            return {"error": f"{f} 必须是数字"}
+
+    if not MODELS_FILE.exists():
+        return {"error": "models_settings.json 不存在"}
+    try:
+        full = json.loads(MODELS_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return {"error": f"现有配置 JSON 损坏，请先用原始 JSON 编辑器修复: {e}"}
+    if not isinstance(full, dict):
+        return {"error": "现有配置顶层必须是 JSON 对象"}
+
+    old_section = full.get(section)
+    if not isinstance(old_section, dict):
+        old_section = {}
+
+    # masked '***' placeholders → stored originals (frontend convention)
+    cleaned = _unmask_merge(cleaned, old_section)
+    # preserve any extra section fields (e.g. provider-specific keys)
+    merged_section = {**old_section, **cleaned}
+
+    # Fully-empty credentials = section intentionally unconfigured (bot
+    # falls back to .env / disables the capability) — nothing to probe.
+    # A *partially* configured section stays probe-able so the probe's
+    # missing_config verdict blocks saving a half-broken config.
+    configured = bool(merged_section.get("api_key")) or \
+        bool(merged_section.get("api_base"))
+    needs_probe = configured and section_needs_probe(merged_section, old_section)
+
+    prepared_full = dict(full)
+    prepared_full[section] = merged_section
+    return {"ok": True, "prepared_full": prepared_full,
+            "section_data": merged_section, "old_section": old_section,
+            "needs_probe": needs_probe}
+
+
+def models_section_commit(prepared_full: dict) -> dict:
+    """Atomically write the full prepared config (backup first)."""
+    _backup(MODELS_FILE)
+    try:
+        tmp = MODELS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(prepared_full, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        tmp.replace(MODELS_FILE)
+    except OSError as e:
+        return {"error": str(e)}
+    return {"ok": True}
 
 
 # ── JSON configs: group_features / personality ───────────────────

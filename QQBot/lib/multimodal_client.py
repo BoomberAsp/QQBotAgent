@@ -86,6 +86,15 @@ class MultimodalClient:
         section = self._raw_config.get(name)
         return section if isinstance(section, dict) else None
 
+    def reload(self) -> None:
+        """Re-read config from disk.
+
+        All API methods read ``self._config`` / ``self._audio_config`` at
+        call time, so re-running ``_load_config()`` is sufficient for the
+        panel's model-config hot reload.
+        """
+        self._load_config()
+
     # ── Availability Check ──────────────────────────────────────────
 
     def is_available(self) -> bool:

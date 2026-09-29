@@ -996,11 +996,27 @@ _perm_manager = PermissionManager()
 # 有变化则调用 agent.reload_configs()。配合 WebUI 面板的配置热编辑：
 # 面板保存提示词后 5 秒内生效，无需重启机器人。
 # 带 5 秒冷却，防止连续写入触发抖动重载。
+# 同时监听别名字典（character_dic.json / bonds_search_dic.json）的 mtime：
+# WebUI 面板「别名管理」保存后（面板已同步重建拼音索引文件），这里让
+# name_resolver 单例重读字典 + 索引，并失效角色/羁绊详情缓存，
+# 使别名改动 5~10 秒内在 bot 侧生效、无需重启。
+# 还监听 models_settings.json：面板「模型配置」保存（已先通过 API 可用性
+# 验证）后，这里 reload 两个 ModelRouter 单例 + MultimodalClient 单例，
+# 并重挂启动时固化的 3 处 client 引用（agent/_profile_manager/_special_sessions）。
 @get_driver().on_startup
 async def _start_config_watcher():
+    from tools import name_resolver as _nr
+
+    _alias_files = [_nr._CHAR_DIC_PATH, _nr._BOND_DIC_PATH]
+    _models_file = _model_router._config_path
+
     async def _watch():
         last_mtimes: dict = {}
         last_reload = 0.0
+        last_alias_mtimes: dict = {}
+        last_alias_reload = 0.0
+        last_models_mtime = 0.0
+        last_models_reload = 0.0
         while True:
             await asyncio.sleep(5)
             try:
@@ -1019,6 +1035,49 @@ async def _start_config_watcher():
                     last_reload = time.time()
                     nonebot_logger.info("检测到配置文件变化，已热重载系统提示词")
                 last_mtimes = mtimes
+            except Exception:
+                pass
+            try:
+                alias_mtimes = {}
+                for p in _alias_files:
+                    try:
+                        alias_mtimes[p] = os.path.getmtime(p)
+                    except OSError:
+                        pass
+                if last_alias_mtimes and alias_mtimes != last_alias_mtimes \
+                        and time.time() - last_alias_reload > 5:
+                    _nr.get_resolver().reload()
+                    from tools import character_detail as _cd
+                    from tools import bond_detail as _bd
+                    _cd._invalidate()
+                    _bd._invalidate()
+                    last_alias_reload = time.time()
+                    nonebot_logger.info("检测到别名字典变化，已热重载别名索引与详情缓存")
+                last_alias_mtimes = alias_mtimes
+            except Exception:
+                pass
+            try:
+                try:
+                    models_mtime = os.path.getmtime(_models_file)
+                except OSError:
+                    models_mtime = 0.0
+                if last_models_mtime and models_mtime != last_models_mtime \
+                        and time.time() - last_models_reload > 5:
+                    _model_router.reload()
+                    # 模块级单例（tools 里 lazy import 的 model_router /
+                    # multimodal_client 与 _model_router 是不同实例）
+                    from lib.model_router import model_router as _gmr
+                    from lib.multimodal_client import multimodal_client as _gmc
+                    _gmr.reload()
+                    if _gmc is not None:
+                        _gmc.reload()
+                    # 重挂启动时固化的 client 引用
+                    agent.client = _model_router.reasoning_client
+                    _profile_manager.set_client(_model_router.flash_client)
+                    _special_sessions.set_client(_model_router.reasoning_client)
+                    last_models_reload = time.time()
+                    nonebot_logger.info("检测到 models_settings.json 变化，已热重载模型配置")
+                last_models_mtime = models_mtime
             except Exception:
                 pass
 

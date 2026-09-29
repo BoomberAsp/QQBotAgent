@@ -630,8 +630,68 @@ async def api_config_models_put(payload: RawPayload, request: Request):
     result = await asyncio.to_thread(config_editor.models_write, payload.content)
     if "error" in result:
         return JSONResponse(result, status_code=400)
-    audit.log_action("config.models_write", "修改模型配置（需重启 NoneBot）", _ip(request))
+    audit.log_action("config.models_write", "修改模型配置（原始 JSON）", _ip(request))
     return result
+
+
+class ModelSectionPayload(BaseModel):
+    section: str
+    config: dict
+
+
+@app.post("/api/config/models/test")
+async def api_config_models_test(payload: ModelSectionPayload, request: Request):
+    """Standalone connectivity probe for one model section (no write).
+
+    Masked api_key placeholders are unmasked against the on-disk value
+    first, so「测试连接」works without re-entering the key.
+    """
+    from .model_probe import probe_model
+    prepared = await asyncio.to_thread(config_editor.models_section_prepare,
+                                       payload.section, payload.config)
+    if "error" in prepared:
+        return JSONResponse(prepared, status_code=400)
+    sec = prepared["section_data"]
+    probe = await probe_model(sec.get("api_key", ""), sec.get("api_base", ""),
+                              sec.get("model", ""), section=payload.section)
+    audit.log_action("config.models_test",
+                     f"测试模型连接 {payload.section}: {probe['status']}",
+                     _ip(request))
+    if not probe["ok"]:
+        return JSONResponse({"error": probe["detail"], "probe": probe},
+                            status_code=400)
+    return {"ok": True, "probe": probe}
+
+
+@app.put("/api/config/models/section")
+async def api_config_models_section_put(payload: ModelSectionPayload,
+                                        request: Request):
+    """Probe-then-write one model section. A failed probe never touches disk."""
+    from .model_probe import probe_model
+    prepared = await asyncio.to_thread(config_editor.models_section_prepare,
+                                       payload.section, payload.config)
+    if "error" in prepared:
+        return JSONResponse(prepared, status_code=400)
+
+    probe = None
+    if prepared["needs_probe"]:
+        sec = prepared["section_data"]
+        probe = await probe_model(sec.get("api_key", ""), sec.get("api_base", ""),
+                                  sec.get("model", ""), section=payload.section)
+        if not probe["ok"]:
+            return JSONResponse(
+                {"error": f"API 验证失败，未保存: {probe['detail']}", "probe": probe},
+                status_code=400)
+
+    result = await asyncio.to_thread(config_editor.models_section_commit,
+                                     prepared["prepared_full"])
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("config.models_section_write",
+                     f"修改模型配置段 {payload.section}"
+                     f"{'（已验证 ' + str(probe['elapsed_ms']) + 'ms）' if probe else '（凭据未变，跳过验证）'}",
+                     _ip(request))
+    return {"ok": True, "probe": probe, "skipped": probe is None}
 
 
 @app.get("/api/config/group-features")
@@ -736,6 +796,31 @@ async def api_profile_put(uid: str, payload: dict, request: Request):
 @app.get("/api/wiki/cache-status")
 async def api_wiki_cache():
     return await asyncio.to_thread(data_reader.wiki_cache_status)
+
+
+@app.get("/api/wiki/aliases")
+async def api_wiki_aliases_get(kind: str = "char"):
+    result = await asyncio.to_thread(data_reader.wiki_aliases_read, kind)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class AliasPayload(BaseModel):
+    kind: str
+    aliases: dict  # {canonical: [alias...]} 全量快照
+
+
+@app.put("/api/wiki/aliases")
+async def api_wiki_aliases_put(payload: AliasPayload, request: Request):
+    result = await asyncio.to_thread(data_reader.wiki_aliases_save,
+                                     payload.kind, payload.aliases)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("wiki.aliases.save",
+                     f"保存{payload.kind}别名: {result.get('groups')} 组 / "
+                     f"{result.get('aliases')} 条", _ip(request))
+    return result
 
 
 # ── Playground / system-prompt preview API ────────────────────────

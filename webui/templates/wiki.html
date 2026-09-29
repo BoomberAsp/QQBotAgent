@@ -19,7 +19,19 @@
   </div>
 </div>
 
-<p class="muted">缓存文件由 bot 侧工具维护，此处仅只读展示；如数据过期可在 Web 终端手动删除对应 JSON 触发重建。</p>
+<div class="card" id="wk-aliases">
+  <div class="row">
+    <h2 class="card-title" style="margin:0">别名管理</h2>
+    <span class="spacer"></span>
+    <button class="btn btn-sm wk-kind active" data-kind="char">角色</button>
+    <button class="btn btn-sm wk-kind" data-kind="bond">羁绊</button>
+    <input type="text" id="wk-alias-q" placeholder="搜索名称或别名…" style="width:200px">
+  </div>
+  <p class="muted" id="wk-alias-stat" style="margin:8px 0 0"></p>
+  <div id="wk-alias-list" class="muted" style="margin-top:10px">加载中…</div>
+</div>
+
+<p class="muted">缓存文件由 bot 侧工具维护，统计卡片为只读展示；如数据过期可在 Web 终端手动删除对应 JSON 触发重建。别名保存后约 10 秒内 bot 自动生效，无需重启。</p>
 {% endblock %}
 
 {% block scripts %}

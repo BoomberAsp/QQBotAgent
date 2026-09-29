@@ -47,15 +47,32 @@
 
 <!-- 模型 -->
 <div class="cfg-pane" id="pane-models" style="display:none">
-  <div class="card" style="max-width:760px">
-    <div class="row" style="margin-bottom:8px">
-      <h2 class="card-title" style="margin:0">模型配置（models_settings.json）</h2>
-      <span class="spacer"></span>
-      <button class="btn btn-sm btn-primary" id="models-save">保存</button>
-    </div>
-    <textarea id="models-editor" class="code-editor" rows="24" style="width:100%"></textarea>
-    <p class="warn" style="margin:8px 0 0" id="models-note"></p>
+  <div class="row" style="margin-bottom:4px">
+    <h2 style="margin:0;font-size:15px">模型配置（models_settings.json）</h2>
+    <span class="spacer"></span>
+    <button class="btn btn-sm" id="models-reload">重新加载</button>
   </div>
+  <p class="muted" style="margin:0 0 14px">
+    保存前自动验证 API 可用性（最小真实调用），仅写入验证通过的配置；
+    api_key 留空表示维持原值。保存后约 10 秒 bot 自动热重载，无需重启。
+  </p>
+  <div id="model-cards" style="display:flex;flex-direction:column;gap:14px">
+    <p class="muted">加载中…</p>
+  </div>
+  <details style="margin-top:20px">
+    <summary class="muted" style="cursor:pointer;font-size:13px">
+      高级：原始 JSON 编辑（task_routing 等，保存不做 API 验证）
+    </summary>
+    <div class="card" style="margin-top:10px;max-width:760px">
+      <div class="row" style="margin-bottom:8px">
+        <h2 class="card-title" style="margin:0">原始 JSON</h2>
+        <span class="spacer"></span>
+        <button class="btn btn-sm btn-primary" id="models-save">保存原始 JSON</button>
+      </div>
+      <textarea id="models-editor" class="code-editor" rows="24" style="width:100%"></textarea>
+      <p class="warn" style="margin:8px 0 0" id="models-note"></p>
+    </div>
+  </details>
 </div>
 
 <!-- 群功能 -->
