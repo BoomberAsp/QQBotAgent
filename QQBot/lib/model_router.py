@@ -71,6 +71,24 @@ class ModelRouter:
         except Exception:
             return None
 
+    def reload(self) -> None:
+        """Re-read models_settings.json and rebuild all clients in place.
+
+        Called by the agent_router config watcher when the panel saves a
+        new model configuration, so changes take effect without a restart.
+        Property accessors read these attributes per call, and client
+        objects are pure config carriers (the httpx client is created per
+        request), so swapping them mid-flight is safe.
+        """
+        self._load_config()
+        self._reasoning_client = self._create_client(self._config.get("REASONING_MODEL", {}))
+        self._flash_client = self._create_client(self._config.get("FLASH_MODEL", {}))
+        self._multimodal_client = self._create_client(self._config.get("MULTIMODAL_MODEL", {}))
+        self._task_routing = self._config.get("task_routing", {})
+        # Drop the cached .env fallback so it is rebuilt on next access
+        if hasattr(self, "_default"):
+            del self._default
+
     # ── Client Access ─────────────────────────────────────────────────
 
     @property

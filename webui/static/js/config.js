@@ -124,29 +124,167 @@
     }
   });
 
-  // ── Models ─────────────────────────────────────────────────────
+  // ── Models: structured section cards + raw JSON fallback ───────
+  const MODEL_SECTIONS = [
+    { key: 'REASONING_MODEL', label: '推理模型 REASONING', desc: '复杂任务主推理' },
+    { key: 'FLASH_MODEL', label: '轻量模型 FLASH', desc: '复杂度分类与简单任务' },
+    { key: 'MULTIMODAL_MODEL', label: '多模态模型 MULTIMODAL', desc: '图片理解' },
+    { key: 'AUDIO_MODEL', label: '音频模型 AUDIO', desc: '语音/音频分析' },
+    { key: 'OCR_MODEL', label: 'OCR 模型', desc: '截图文字识别' },
+  ];
+
+  function attr(s) { return esc(s).replace(/"/g, '&quot;'); }
+
+  function modelCardHtml(sec, cfg) {
+    const s = cfg || {};
+    const maskedKey = s.api_key || '';   // already masked by backend
+    return `<div class="card" data-section="${attr(sec.key)}" style="max-width:640px;margin:0">
+      <div class="row" style="margin-bottom:8px">
+        <h2 class="card-title" style="margin:0">${esc(sec.label)}</h2>
+        <span class="spacer"></span>
+        <span class="muted" style="font-size:12px">${esc(sec.desc)}</span>
+      </div>
+      <label class="field"><span>api_base</span>
+        <input data-field="api_base" type="text" value="${attr(s.api_base || '')}"
+               placeholder="https://api.deepseek.com"></label>
+      <label class="field"><span>api_key（留空 = 维持原值）</span>
+        <input data-field="api_key" type="password" value=""
+               placeholder="${attr(maskedKey)}" autocomplete="new-password"></label>
+      <label class="field"><span>model</span>
+        <input data-field="model" type="text" value="${attr(s.model || '')}"></label>
+      <div class="row" style="gap:14px">
+        <label class="field" style="flex:1"><span>max_tokens</span>
+          <input data-field="max_tokens" type="number" min="1" step="any"
+                 value="${attr(s.max_tokens != null ? s.max_tokens : '')}"></label>
+        <label class="field" style="flex:1"><span>temperature</span>
+          <input data-field="temperature" type="number" min="0" max="2" step="any"
+                 value="${attr(s.temperature != null ? s.temperature : '')}"></label>
+      </div>
+      <div class="row" style="gap:10px;margin-top:2px">
+        <button class="btn btn-sm btn-test">测试连接</button>
+        <button class="btn btn-sm btn-primary btn-save">验证并保存本段</button>
+        <span class="probe-status muted" style="font-size:12.5px"></span>
+      </div>
+    </div>`;
+  }
+
+  function renderModelCards(cfg) {
+    document.getElementById('model-cards').innerHTML =
+      MODEL_SECTIONS.map(sec => modelCardHtml(sec, cfg[sec.key])).join('');
+  }
+
+  function readCardFields(card) {
+    const get = (name) => {
+      const el = card.querySelector(`[data-field="${name}"]`);
+      return el ? el.value.trim() : '';
+    };
+    // api_key convention: empty input → submit the masked placeholder,
+    // backend _unmask_merge restores the stored original.
+    const keyEl = card.querySelector('[data-field="api_key"]');
+    const out = {
+      api_base: get('api_base'),
+      api_key: (keyEl && keyEl.value) ? keyEl.value.trim() : (keyEl ? keyEl.placeholder : ''),
+      model: get('model'),
+    };
+    const mt = get('max_tokens'), tp = get('temperature');
+    if (mt !== '') out.max_tokens = Number(mt);
+    if (tp !== '') out.temperature = Number(tp);
+    return out;
+  }
+
   async function loadModels() {
     const note = document.getElementById('models-note');
+    const cards = document.getElementById('model-cards');
     try {
       const d = await api('/api/config/models');
       document.getElementById('models-editor').value = d.content;
       note.textContent = d.note || '';
+      try {
+        renderModelCards(JSON.parse(d.content));
+      } catch (pe) {
+        cards.innerHTML = `<div class="card err" style="max-width:640px;margin:0">
+          配置 JSON 解析失败，卡片不可用，请用下方「原始 JSON」修复：${esc(pe.message)}</div>`;
+      }
     } catch (e) {
       note.textContent = '加载失败: ' + e.message;
+      cards.innerHTML = `<p class="err">加载失败: ${esc(e.message)}</p>`;
     }
   }
 
+  function setCardStatus(card, text, cls) {
+    const el = card.querySelector('.probe-status');
+    el.textContent = text;
+    el.className = 'probe-status ' + cls;
+  }
+
+  document.getElementById('model-cards').addEventListener('click', async (ev) => {
+    const card = ev.target.closest('.card[data-section]');
+    if (!card) return;
+    const section = card.dataset.section;
+    const btns = card.querySelectorAll('button');
+
+    if (ev.target.closest('.btn-test')) {
+      btns.forEach(b => { b.disabled = true; });
+      setCardStatus(card, '测试中…', 'muted');
+      try {
+        const d = await api('/api/config/models/test', {
+          method: 'POST',
+          body: { section, config: readCardFields(card) },
+        });
+        const p = d.probe || {};
+        if (p.status === 'ok_with_warning') {
+          setCardStatus(card, `⚠ ${p.detail} (${p.elapsed_ms}ms)`, 'warn');
+        } else {
+          setCardStatus(card, `✓ 连接成功 (${p.elapsed_ms}ms)`, 'ok');
+        }
+      } catch (e) {
+        setCardStatus(card, '✗ ' + e.message, 'err');
+      } finally {
+        btns.forEach(b => { b.disabled = false; });
+      }
+      return;
+    }
+
+    if (ev.target.closest('.btn-save')) {
+      btns.forEach(b => { b.disabled = true; });
+      setCardStatus(card, '验证并保存中…', 'muted');
+      try {
+        const d = await api('/api/config/models/section', {
+          method: 'PUT',
+          body: { section, config: readCardFields(card) },
+        });
+        if (d.skipped) {
+          setCardStatus(card, '✓ 已保存（凭据未变，跳过验证）', 'ok');
+          toast('已保存，bot 约 10 秒内热重载', 'success', 5000);
+        } else {
+          const p = d.probe || {};
+          const mark = p.status === 'ok_with_warning' ? '⚠' : '✓';
+          setCardStatus(card, `${mark} 验证通过 (${p.elapsed_ms}ms)，已保存`,
+                        p.status === 'ok_with_warning' ? 'warn' : 'ok');
+          toast('验证通过并已保存，bot 约 10 秒内热重载', 'success', 5000);
+        }
+        setTimeout(loadModels, 1500);   // refresh masks + raw editor
+      } catch (e) {
+        setCardStatus(card, '✗ ' + e.message + '（未保存）', 'err');
+        toast(e.message, 'error', 5000);
+      } finally {
+        btns.forEach(b => { b.disabled = false; });
+      }
+    }
+  });
+
+  document.getElementById('models-reload').addEventListener('click', loadModels);
+
   document.getElementById('models-save').addEventListener('click', async () => {
     const note = document.getElementById('models-note');
-    if (!confirm('保存模型配置后需要重启 NoneBot 才生效，确认保存？')) return;
     try {
       const d = await api('/api/config/models', {
         method: 'PUT',
         body: { content: document.getElementById('models-editor').value },
       });
-      toast(d.note || '已保存', 'success', 5000);
+      toast((d.note || '已保存') + '（原始 JSON 未做 API 验证）', 'success', 5000);
       note.textContent = d.note || '';
-      loadModels();   // re-read merged content so masks are correct
+      loadModels();   // re-read merged content so masks/cards are correct
     } catch (e) {
       toast(e.message, 'error');
       note.textContent = e.message;
