@@ -225,6 +225,7 @@ class TestSessionManager:
         self.test_clear_context()
         self.test_delete()
         self.test_persistence()
+        self.test_external_delete()
 
     def test_create_and_get(self):
         from agent.session import SessionManager
@@ -324,6 +325,43 @@ class TestSessionManager:
             assert len(loaded.context) == 1
             assert loaded.context[0]["content"] == "persist me"
             print_pass("Session persistence to disk")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_external_delete(self):
+        """WebUI-style external delete must not be resurrected by the cache."""
+        from agent.session import SessionManager
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            mgr = SessionManager(persistence_dir=tmpdir)
+            session = mgr.get_or_create("u_del")
+            session.add_message("user", "旧上下文")
+            mgr.update("u_del", session)
+            path = os.path.join(tmpdir, "u_del.json")
+            assert os.path.exists(path)
+
+            # Panel deletes the file behind the bot's back → next
+            # get_or_create must drop the stale cache (empty context),
+            # and the following save must not restore the old content.
+            os.remove(path)
+            fresh = mgr.get_or_create("u_del")
+            assert len(fresh.context) == 0, "deleted session must lose its context"
+            fresh.add_message("user", "新消息")
+            mgr.update("u_del", fresh)
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            contents = [m["content"] for m in data["context"]]
+            assert contents == ["新消息"], contents
+
+            # Deletion landing mid-request (after get_or_create, before
+            # update) must be honored too — no write-back of stale context.
+            inflight = mgr.get_or_create("u_del")
+            os.remove(path)
+            inflight.add_message("user", "处理中")
+            mgr.update("u_del", inflight)
+            assert not os.path.exists(path), "mid-flight delete must not resurrect file"
+            print_pass("External session delete not resurrected (cache revalidation)")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -952,6 +990,7 @@ class TestUserProfile:
         self.test_merge_facts_dedup()
         self.test_merge_facts_cap()
         self.test_persistence()
+        self.test_external_edit_wins()
 
     def test_create_and_save(self):
         from agent.profile import UserProfile, ProfileManager
@@ -1046,6 +1085,45 @@ class TestUserProfile:
             assert "兴趣1" in loaded.interests
             assert loaded.preferences["lang"] == "zh"
             print_pass("Profile persistence to disk")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_external_edit_wins(self):
+        """WebUI-style external edit must not be reverted by the bot's cache."""
+        from agent.profile import ProfileManager
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            bot_mgr = ProfileManager(base_dir=tmpdir)
+            p = bot_mgr.get("u_panel")
+            p.nickname = "旧昵称"
+            p.interests = ["原神"]
+            bot_mgr.save(p)
+
+            # External process (panel) rewrites profile.json behind the bot
+            path = os.path.join(tmpdir, "u_panel", "profile.json")
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            data["nickname"] = "面板新昵称"
+            data["interests"] = ["星穹铁道"]
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            # Bump mtime so the change is detectable regardless of fs granularity
+            st = os.stat(path)
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+
+            got = bot_mgr.get("u_panel")
+            assert got.nickname == "面板新昵称", got.nickname
+            assert got.interests == ["星穹铁道"], got.interests
+
+            # Bot-side change + save preserves the panel edit (no clobber)
+            got.interests.append("崩铁")
+            bot_mgr.save(got)
+            with open(path, encoding="utf-8") as f:
+                data2 = json.load(f)
+            assert data2["nickname"] == "面板新昵称"
+            assert data2["interests"] == ["星穹铁道", "崩铁"]
+            print_pass("External profile edit wins over stale bot cache")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
