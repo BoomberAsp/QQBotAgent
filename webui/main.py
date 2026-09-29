@@ -738,6 +738,31 @@ async def api_wiki_cache():
     return await asyncio.to_thread(data_reader.wiki_cache_status)
 
 
+@app.get("/api/wiki/aliases")
+async def api_wiki_aliases_get(kind: str = "char"):
+    result = await asyncio.to_thread(data_reader.wiki_aliases_read, kind)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class AliasPayload(BaseModel):
+    kind: str
+    aliases: dict  # {canonical: [alias...]} 全量快照
+
+
+@app.put("/api/wiki/aliases")
+async def api_wiki_aliases_put(payload: AliasPayload, request: Request):
+    result = await asyncio.to_thread(data_reader.wiki_aliases_save,
+                                     payload.kind, payload.aliases)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("wiki.aliases.save",
+                     f"保存{payload.kind}别名: {result.get('groups')} 组 / "
+                     f"{result.get('aliases')} 条", _ip(request))
+    return result
+
+
 # ── Playground / system-prompt preview API ────────────────────────
 
 @app.get("/api/playground/options")

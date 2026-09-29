@@ -195,6 +195,16 @@ class NameResolver:
     """
 
     def __init__(self):
+        self.reload()
+
+    def reload(self) -> None:
+        """(Re)load alias dictionaries and pinyin indices from disk.
+
+        Called at init and again by the agent_router config watcher when
+        character_dic.json / bonds_search_dic.json change on disk (WebUI
+        alias-management panel saves), so alias edits take effect without
+        restarting the bot.
+        """
         self._choices = _load_pinyin_choices()
 
         # Load pre-built indices, or build on first use
