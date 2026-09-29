@@ -240,6 +240,10 @@ class ProfileManager:
         self._memory = None  # P1: TieredMemory engine, wired via set_memory()
         os.makedirs(base_dir, exist_ok=True)
         self._cache: Dict[str, UserProfile] = {}
+        # user_id → st_mtime_ns of profile.json as last seen by this process
+        # (load or own save). Used by get() to revalidate the cache against
+        # external writers (the WebUI panel edits profile.json directly).
+        self._cache_mtime: Dict[str, Optional[int]] = {}
 
         # ── Layer 3 batching state (per-user, in-memory only) ──
         # _recent: rolling context window (maxlen=EXTRACT_WINDOW_N) of turns,
@@ -271,9 +275,32 @@ class ProfileManager:
 
     # ── CRUD ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _stat_mtime(path: str) -> Optional[int]:
+        """st_mtime_ns of path, or None when missing/unreadable."""
+        try:
+            return os.stat(path).st_mtime_ns
+        except OSError:
+            return None
+
     def get(self, user_id: str) -> UserProfile:
-        """Get or create a user profile."""
+        """Get or create a user profile.
+
+        The in-memory cache is revalidated against the file's mtime on every
+        call: an external writer (WebUI panel editing profile.json) wins over
+        the cached copy, so panel edits are no longer silently reverted by
+        the next bot-side save. Unsaved in-memory deltas (e.g. touch() counts
+        since the last save) are the accepted loss when a reload happens.
+        """
+        path = self._path(user_id)
+        disk_mtime = self._stat_mtime(path)
+
         if user_id in self._cache:
+            if disk_mtime is not None and disk_mtime != self._cache_mtime.get(user_id):
+                reloaded = self._load(user_id)
+                if reloaded is not None:
+                    self._cache[user_id] = reloaded
+                    self._cache_mtime[user_id] = disk_mtime
             return self._cache[user_id]
 
         profile = self._load(user_id)
@@ -281,6 +308,7 @@ class ProfileManager:
             profile = UserProfile(user_id=user_id)
 
         self._cache[user_id] = profile
+        self._cache_mtime[user_id] = disk_mtime
         return profile
 
     def save(self, profile: UserProfile):
@@ -291,8 +319,11 @@ class ProfileManager:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(profile.to_dict(), f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+            self._cache_mtime[profile.user_id] = self._stat_mtime(path)
+        except Exception as e:
+            # Non-fatal, but no longer silent: a failed persist used to be
+            # invisible (panel showed "saved" while nothing was written).
+            logger.warning("[profile] save failed user={}: {}", profile.user_id, e)
 
     # ── Layer 3: batched observation + extraction (§7.1, P0) ──────
 
@@ -412,6 +443,10 @@ class ProfileManager:
             return
 
         # ── synchronous atomic apply (no await between read and write) ──
+        # Re-fetch the profile AFTER the LLM await: get() revalidates against
+        # disk, so a panel edit that landed while the call was in flight is
+        # picked up instead of being clobbered by the pre-await snapshot.
+        profile = self.get(user_id)
         snapshot_turns = list(turns)
         if self._apply_extraction(profile, user_id, extracted, snapshot_turns):
             self.save(profile)
