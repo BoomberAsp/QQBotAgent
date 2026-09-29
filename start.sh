@@ -129,6 +129,55 @@ else
     exit 1
 fi
 
+# ── 5.1 启动前清理存量 NoneBot 实例 ─────────────────────────────
+# 现象（2026-09-22 服务器排查证实）：已有实例占着 8081 时，`nb run` 插件
+# 加载日志一切正常，直到 uvicorn bind 才报 [Errno 98] address already in use
+# 退出；随后 `wait` 返回、脚本静默结束——观感即「WebUI 起来了、bot 起不来，
+# 必须在面板里重启」。故启动前按 stop.sh 同款匹配逻辑清掉存量实例。
+_nb_pids() { { pgrep -f "bin/nb run"; pgrep -f "nb run"; pgrep -f "nonebot\.load_from_toml"; pgrep -f "python.*bot\.py$"; pgrep -f "uvicorn.*8081"; } 2>/dev/null | sort -u || true; }
+OLD_PIDS=$(_nb_pids)
+if [ -n "$OLD_PIDS" ]; then
+    warn "检测到已在运行的 NoneBot 实例 (PID: $(echo $OLD_PIDS | tr '\n' ' '))，先停止..."
+    echo "$OLD_PIDS" | xargs kill 2>/dev/null || true
+    sleep 1
+    LEFT=$(_nb_pids)
+    if [ -n "$LEFT" ]; then
+        warn "仍未退出，强制结束: $(echo $LEFT | tr '\n' ' ')"
+        echo "$LEFT" | xargs kill -9 2>/dev/null || true
+    fi
+    log "旧 NoneBot 实例已停止"
+    # 同步面板状态：清 PID 文件 + 关看门狗 should_run，
+    # 避免面板看门狗与本轮启动竞争（与 stop.sh 行为一致）
+    rm -f "$SCRIPT_DIR/webui/data/nonebot.pid"
+    WD_STATE="$SCRIPT_DIR/webui/data/watchdog_state.json"
+    if [ -f "$WD_STATE" ]; then
+        WD_PY="$HOME/.virtualenvs/QQBotAgent/bin/python"
+        [ -x "$WD_PY" ] || WD_PY="$(command -v python3)"
+        "$WD_PY" - "$WD_STATE" <<'PYEOF' 2>/dev/null || true
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+try:
+    s = json.loads(p.read_text())
+    s.setdefault("processes", {}).setdefault("nonebot", {})["should_run"] = False
+    p.write_text(json.dumps(s, indent=2))
+except Exception:
+    pass
+PYEOF
+    fi
+fi
+
+# 等待 8081 端口真正释放（最长 10 秒）；仍被占用则明确报错退出，
+# 绝不再让 `nb run` 静默 bind 失败
+_port_8081_busy() { (exec 3<>/dev/tcp/127.0.0.1/8081) 2>/dev/null; }
+for _i in $(seq 1 10); do
+    _port_8081_busy || break
+    sleep 1
+done
+if _port_8081_busy; then
+    err "端口 8081 仍被占用，无法启动 NoneBot。请排查: ss -tlnp | grep 8081"
+    exit 1
+fi
+
 # 启动
 nb run &
 NONEBOT_PID=$!
@@ -137,9 +186,12 @@ log "NoneBot 启动中 (PID: $NONEBOT_PID)"
 # 等待启动完成
 sleep 3
 
-# ── 5.5 启动 WebUI 管理面板（独立进程，失败不影响机器人）──
-log "启动 WebUI 管理面板..."
-if bash "$SCRIPT_DIR/start_webui.sh" start; then
+# ── 5.5 重启 WebUI 管理面板（独立进程，失败不影响机器人）──
+# 用 restart 而非 start：面板已在运行时也强制重启，保证 git pull 后
+# 面板代码即时生效，且面板以干净状态重新收养本轮拉起的 NoneBot。
+# 面板未运行时 restart 等价于 start（stop 为空操作）。
+log "重启 WebUI 管理面板..."
+if bash "$SCRIPT_DIR/start_webui.sh" restart; then
     :
 else
     warn "WebUI 面板启动失败（不影响机器人）"

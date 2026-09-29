@@ -450,14 +450,20 @@ def task_detail(uid: str, task_id: str) -> dict:
 
 # ── Workspace ─────────────────────────────────────────────────────
 
+# Reuse the bot's PermissionManager as the single source of truth for roles.
+# QQBot/.env stores IDs in NoneBot JSON-array form (SUPERUSERS=["123", ...]);
+# the previous naive comma-split parsed those into '["123"' / '"456"]' which
+# never matched a bare uid, so every user showed as regular/100MB in the panel.
+# Import is safe: webui.config puts QQBot/ on sys.path, and agent.permissions
+# has no nonebot dependency. get_role() re-reads .env on every call, so panel
+# edits via the config page take effect without a restart (same as the bot).
+from agent.permissions import PermissionManager  # noqa: E402
+
+_permissions = PermissionManager()
+
+
 def _role_of(uid: str) -> str:
-    supers = {s.strip() for s in config.bot_env("SUPERUSERS", "").split(",") if s.strip()}
-    vips = {s.strip() for s in config.bot_env("VIP_USERS", "").split(",") if s.strip()}
-    if uid in supers:
-        return "admin"
-    if uid in vips:
-        return "vip"
-    return "regular"
+    return _permissions.get_role(uid).value
 
 
 _QUOTA_MB = {"admin": 2048, "vip": 500, "regular": 100}
