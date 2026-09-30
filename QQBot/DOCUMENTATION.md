@@ -71,6 +71,7 @@ QQBotAgent/
     │   ├── fact_filter.py   #   确定性事实过滤 (画像/记忆抽取前置)
     │   ├── profile.py       #   用户画像 (LLM 批量提取, mtime 重校验)
     │   ├── task_record.py   #   子任务结构化记录 (begin_task/finalize_subtask 配套)
+    │   ├── search_archive.py #  搜索结果存档 (search_web/web_fetch 全文落盘, recall_search_result 配套)
     │   ├── group_features.py #  群聊功能开关 (按群控制抽卡/图片/语音)
     │   ├── personality.py   #   人格管理 (多套人格切换)
     │   └── config/          #   智能体配置 (Markdown 文件)
@@ -134,6 +135,7 @@ QQBotAgent/
     │   ├── users/           #   用户画像 (JSON 文件)
     │   ├── token_usage/     #   Token 用量记录
     │   ├── task_log/        #   子任务结构化日志 ({uid}.jsonl)
+    │   ├── search_cache/    #   搜索结果存档 ({uid}/{id}.json, 7天TTL+50条上限, 不占工作区配额)
     │   ├── audit/           #   审计日志 (JSONL)
     │   ├── feedback/        #   用户反馈/Bug 报告
     │   ├── name_index/      #   角色名索引缓存
@@ -499,6 +501,7 @@ class UserRole(Enum):
 | 工具 | 管理员 | 会员 | 普通用户 |
 |------|:---:|:---:|:---:|
 | `search_web`, `get_time`, `get_weather` | ✅ | ✅ | ✅ |
+| `recall_search_result` (仅本人存档) | ✅ | ✅ | ✅ |
 | `read_file` (文本/PDF) | ✅ | ✅ | ✅ |
 | `summarize_pdf` | ✅ | ✅ | ✅ |
 | `geocode`, `reverse_geocode`, `search_poi`, `plan_route` | ✅ | ✅ | ✅ |
@@ -648,9 +651,9 @@ agent_router.py
             └── >300 字符 → _split_text() 句子边界拆分 → 逐块 _safe_send() (1s 间隔)
 ```
 
-#### 已注册工具 (29 个)
+#### 已注册工具 (30 个)
 
-**内置工具 (11 个)**:
+**内置工具 (12 个)**:
 
 | 工具名 | 来源 | 说明 |
 |--------|------|------|
@@ -665,6 +668,7 @@ agent_router.py
 | `get_user_info` | agent_router | 获取当前用户系统信息快照 (权限/会话/工作区/工具范围, 零 token 消耗) |
 | `delete_workspace_file` | builtin_tools | 删除工作区文件/空目录 (释放磁盘配额) |
 | `read_file` | file_tools | 读取用户上传的文件 (文本/PDF/图片/音频, 图片和音频可 AI 分析) |
+| `recall_search_result` | agent_router → search_archive | 按存档 id 取回 search_web/web_fetch 的完整结果 (7天保留, per-user 隔离) |
 
 **地图工具 (5 个)**:
 
@@ -704,9 +708,9 @@ agent_router.py
 | `finalize_subtask` | agent_router | 结束子任务并提交结构化结果 (详情归档到 `data/task_log/{uid}.jsonl`) |
 | `end_continuous_mode` | agent_router | 智能体主动结束群聊连续对话窗口 (用户表达告别意图时) |
 
-**注**: `check_weather` 已移除。天气查询通过专用的 `get_weather` 工具（高德地图 API）实现。`web_fetch` 用于直接抓取搜索结果中无法索引的网页。
+**注**: `check_weather` 已移除。天气查询通过专用的 `get_weather` 工具（高德地图 API）实现。`web_fetch` 用于直接抓取搜索结果中无法索引的网页。`search_web` / `web_fetch` 的完整结果会存档到 `data/search_cache/{uid}/{id}.json`（`agent/search_archive.py`，7 天 TTL + 每用户 50 条上限，save 时惰性清扫），返回文本末尾附 `[存档] id: xxx` 行；上下文折叠/压缩后模型可经 `recall_search_result` 按 id 取回全文而无需重搜。存档 id 只随 append-only 的工具消息流转、不进系统提示词，与 v2.26 的前缀缓存优化不冲突。
 
-**权限分布**: 29 个工具中 22 个为公共工具（`_PUBLIC_TOOLS`），4 个为会员工具（`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`shell_exec`）；`end_continuous_mode` 不固定归属，由连续对话上下文动态并入。注册分布：25 个在 `_build_tool_registry()`，其余 4 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask`）在模块级单独注册。
+**权限分布**: 30 个工具中 23 个为公共工具（`_PUBLIC_TOOLS`），4 个为会员工具（`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`shell_exec`）；`end_continuous_mode` 不固定归属，由连续对话上下文动态并入。注册分布：25 个在 `_build_tool_registry()`，其余 5 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask` / `recall_search_result`）在模块级单独注册。
 
 #### 配置看门狗（热重载）
 
@@ -879,6 +883,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 | `get_time()` | 返回当前日期时间 (含中文星期) | `datetime.now().strftime` |
 | `search_web(query, num_results=5)` | SearXNG 聚合搜索 (新闻/百科/知识) | `urllib.request` → SearXNG JSON API (`/search?format=json`)，15s 超时，安全搜索开启，中文优先 |
 | `web_fetch(url)` | 异步，抓取 HTTPS 网页并提取纯文本 | `httpx` → HTML→文本转换 (`html.parser`)，HTTPS only，2MB/8000字符/30s 限制 |
+| `recall_search_result(archive_id)` | 按 id 取回 search_web/web_fetch 的完整存档 | `agent/search_archive.py` → `data/search_cache/{uid}/{id}.json`；id 严格校验（12位hex，防路径穿越），按 contextvar user_id 作用域，过期/跨用户返回未找到；输出头带存档时间与距今小时数 |
 | `execute_code(code, timeout=30)` | 异步，执行 Python 代码 + 自动发送图表 | `subprocess.run` (独立 tmpdir)，扫描 .png/.svg 等图片 → 拷贝到 output/ → QQ 发送 |
 | `shell_exec(command, timeout=15)` | 异步，执行只读 shell 命令 (白名单+管道) | `subprocess.run(["bash", "-c", cmd])`，40+ 白名单命令，管道解析验证，危险字符拦截 |
 | `download_repo(repo_url)` | Git clone 仓库 (HTTPS only) | `subprocess.run(["git", "clone", url, path])`，已存在则 pull，120s 超时 |
@@ -1212,7 +1217,7 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 
 ## 九、测试系统
 
-`test_agent.py` 包含 **14 个测试套件, 98 个测试用例**（全部离线，使用 mock client，无网络依赖），覆盖所有核心组件:
+`test_agent.py` 包含 **15 个测试套件, 105 个测试用例**（全部离线，使用 mock client，无网络依赖），覆盖所有核心组件:
 
 | # | 测试套件 | 测试数 | 覆盖内容 |
 |---|----------|--------|----------|
@@ -1224,12 +1229,13 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 | 6 | `TestAgentCore` | 11 | 启动/提示词构建/纯文本/工具循环/会话持久化/清空/最大迭代/压缩回退/任务折叠/画像注入/MEDIUM 记忆注入 |
 | 7 | `TestDeepSeekClientParsing` | 3 | 解析纯文本/工具调用/混合响应 |
 | 8 | `TestBuiltinTools` | 4 | get_time/execute_code(成功/错误)/search_web |
-| 9 | `TestPersonality` | 4 | 人格优先级链/群人格模糊匹配/清除回退/歧义拒绝 |
-| 10 | `TestTokenLedger` | 7 | usage 解析（DeepSeek/DashScope 格式、缺失、缓存钳制）/记账/按日聚合/摘要格式化 |
-| 11 | `TestTieredMemory` | 20 | 三层状态机（入队/去重/强化前移/晋升/溢出淘汰/降级/安全网）/LONG 创建幂等+快照/judge 清单构成/注入规则（空态/低置信/top-N+最近晋升/字符上限）/逻辑时钟/持久化往返/全量加载 |
-| 12 | `TestMergedExtraction` | 5 | 合并 extract+judge 单次调用（候选路由/L2 过滤/judge 清单嵌入提示词/时钟推进/reinforce 晋升） |
-| 13 | `TestMemoryMigration` | 2 | 旧记忆 → 三层结构迁移（seed+归档、散落 legacy dump 归档） |
-| 14 | `TestCacheStability` | 6 | 前缀缓存稳定性（提示词头部用户不变量/易变内容置尾/画像变化头部字节稳定/历史头部迟滞修剪/压缩边界步进/无时间戳） |
+| 9 | `TestSearchArchive` | 7 | 存档 round-trip/用户隔离/路径穿越拒绝/TTL 过期（recall 拒绝+惰性清扫）/每用户上限/无上下文降级/helper 全链路（footer 携带可召回 id） |
+| 10 | `TestPersonality` | 4 | 人格优先级链/群人格模糊匹配/清除回退/歧义拒绝 |
+| 11 | `TestTokenLedger` | 7 | usage 解析（DeepSeek/DashScope 格式、缺失、缓存钳制）/记账/按日聚合/摘要格式化 |
+| 12 | `TestTieredMemory` | 20 | 三层状态机（入队/去重/强化前移/晋升/溢出淘汰/降级/安全网）/LONG 创建幂等+快照/judge 清单构成/注入规则（空态/低置信/top-N+最近晋升/字符上限）/逻辑时钟/持久化往返/全量加载 |
+| 13 | `TestMergedExtraction` | 5 | 合并 extract+judge 单次调用（候选路由/L2 过滤/judge 清单嵌入提示词/时钟推进/reinforce 晋升） |
+| 14 | `TestMemoryMigration` | 2 | 旧记忆 → 三层结构迁移（seed+归档、散落 legacy dump 归档） |
+| 15 | `TestCacheStability` | 6 | 前缀缓存稳定性（提示词头部用户不变量/易变内容置尾/画像变化头部字节稳定/历史头部迟滞修剪/压缩边界步进/无时间戳） |
 
 另有 `test_workspace.py`（11 个工作区/会话文件测试类）与 `test/` 下 8 个离线测试脚本（被 gitignore，仅存于开发机），由 `bash test.sh` 统一调度。
 
@@ -1849,4 +1855,26 @@ v2.26 基础上增加:
     按 st_mtime_ns 重校验, 面板编辑画像/清除临时会话不再被 bot 内存缓存静默回滚;
     extract_batch 在 LLM await 后重新 get(); 会话写回前检测外部删除
   - 配置看门狗扩为三组监听: *.md / 别名字典 / models_settings.json (各 5s 轮询+冷却)
+```
+
+### v2.28 — 搜索结果存档与按需召回 (2026-09-30)
+```
+v2.27 基础上增加:
+  - agent/search_archive.py: SearchArchive (仿 MemorySystem(base_dir) 构造),
+    search_web/web_fetch 完整结果落盘 data/search_cache/{uid}/{id}.json;
+    保留策略 7 天 TTL + 每用户 50 条 (save 时惰性清扫, mtime 升序删最旧),
+    独立于 workspace 配额; 存档失败静默, 不影响工具主流程
+  - builtin_tools.py: _archive_tool_result() 辅助 (双层 try/except 导入 contextvar),
+    search_web/web_fetch 成功返回末尾附「[存档] id: xxx」行 —
+    id 只随 append-only 工具消息流转、不进系统提示词, 与 v2.26 前缀缓存优化不冲突
+  - recall_search_result 工具 (agent_router 模块级注册, _PUBLIC_TOOLS):
+    上下文折叠/压缩后按 id 取回全文, 免去重搜; id 严格校验 (^[0-9a-f]{12}$,
+    防路径穿越) + contextvar user_id 作用域 (跨用户读取天然不可行);
+    输出头带存档时间与距今小时数供模型判断时效
+  - 补齐 TaskRecord「指针+落盘详情」设计的另一半: 折叠摘要 refs 可携带存档 id
+  - TOOLS.md: 新增 recall_search_result 章节; search_web/web_fetch 补 Archive 说明
+  - test_agent.py: 新增 TestSearchArchive 套件 (7 用例: round-trip/用户隔离/
+    路径穿越/TTL/上限/无上下文降级/helper 全链路), 14→15 套件, 98→105 用例
+
+工具数量: 29 → 30
 ```

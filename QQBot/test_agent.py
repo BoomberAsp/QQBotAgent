@@ -1545,6 +1545,152 @@ class TestBuiltinTools:
         print_pass("search_web returns results or graceful fallback (SearXNG)")
 
 
+class TestSearchArchive:
+    """Test SearchArchive: per-user persistence of search_web/web_fetch results."""
+
+    def run(self):
+        print_header("6b. SearchArchive Tests")
+
+        self.test_save_and_recall()
+        self.test_user_isolation()
+        self.test_path_traversal()
+        self.test_ttl_expiry()
+        self.test_per_user_cap()
+        self.test_archive_helper_no_context()
+        self.test_archive_helper_roundtrip()
+
+    def test_save_and_recall(self):
+        from agent.search_archive import SearchArchive
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            sa = SearchArchive(base_dir=tmpdir)
+            aid = sa.save("u1", "search_web", "Python tips", "full result text",
+                          raw=[{"url": "https://example.com"}])
+            assert aid and len(aid) == 12, f"bad archive id: {aid}"
+
+            rec = sa.recall("u1", aid)
+            assert rec is not None, "archive not recalled"
+            assert rec["content"] == "full result text"
+            assert rec["query"] == "Python tips"
+            assert rec["tool"] == "search_web"
+            assert rec["raw_results"] == [{"url": "https://example.com"}]
+            assert rec["iso_time"], "missing iso_time"
+            print_pass("save + recall round-trip preserves all fields")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_user_isolation(self):
+        from agent.search_archive import SearchArchive
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            sa = SearchArchive(base_dir=tmpdir)
+            aid = sa.save("user_A", "web_fetch", "https://x.dev", "A's page text")
+            assert sa.recall("user_A", aid) is not None
+            assert sa.recall("user_B", aid) is None, "cross-user recall must fail"
+            print_pass("archives are isolated per user")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_path_traversal(self):
+        from agent.search_archive import SearchArchive
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            sa = SearchArchive(base_dir=tmpdir)
+            aid_a = sa.save("userA", "search_web", "q", "A content")
+
+            # Traversal attempts from another user must all be rejected
+            assert sa.recall("userB", f"../userA/{aid_a}") is None
+            assert sa.recall("userA", f"{aid_a}/../../userA/{aid_a}") is None
+            assert sa.recall("userA", "not-a-valid-id") is None
+            assert sa.recall("userA", "") is None
+            assert sa.recall("userA", None) is None
+            print_pass("invalid / traversal archive ids are rejected")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_ttl_expiry(self):
+        from agent.search_archive import SearchArchive, TTL_SECONDS
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            sa = SearchArchive(base_dir=tmpdir)
+            old_id = sa.save("u1", "search_web", "old query", "old content")
+            old_path = os.path.join(tmpdir, "u1", f"{old_id}.json")
+            # Backdate mtime beyond the TTL
+            expired = time.time() - TTL_SECONDS - 3600
+            os.utime(old_path, (expired, expired))
+
+            # Expired archives read as gone even before the sweep
+            assert sa.recall("u1", old_id) is None, "expired archive must not recall"
+
+            # A new save triggers the lazy sweep and physically removes it
+            sa.save("u1", "search_web", "new query", "new content")
+            assert not os.path.exists(old_path), "expired file not swept"
+            print_pass("TTL expiry: recall refuses + lazy sweep removes file")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_per_user_cap(self):
+        from agent.search_archive import SearchArchive, MAX_PER_USER
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            sa = SearchArchive(base_dir=tmpdir)
+            last_id = None
+            for i in range(MAX_PER_USER + 5):
+                last_id = sa.save("u1", "search_web", f"query {i}", f"content {i}")
+            user_dir = os.path.join(tmpdir, "u1")
+            files = [f for f in os.listdir(user_dir) if f.endswith(".json")]
+            assert len(files) <= MAX_PER_USER, f"cap exceeded: {len(files)}"
+            # The newest archive always survives
+            assert sa.recall("u1", last_id) is not None
+            print_pass(f"per-user cap enforced (<= {MAX_PER_USER}, newest kept)")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_archive_helper_no_context(self):
+        from tools.builtin_tools import _archive_tool_result
+        from agent.context import _current_user_id
+
+        # No user context ("") → silent no-op, never raises.
+        # Explicitly pin the contextvar so a leaked set() from an earlier
+        # suite cannot divert archives into the real data dir.
+        token = _current_user_id.set("")
+        try:
+            result = _archive_tool_result("search_web", "q", "content")
+            assert result == "", f"expected empty footer without user context, got: {result!r}"
+            print_pass("_archive_tool_result degrades silently without user context")
+        finally:
+            _current_user_id.reset(token)
+
+    def test_archive_helper_roundtrip(self):
+        from agent import search_archive as sa_mod
+        from agent.context import _current_user_id
+        from tools.builtin_tools import _archive_tool_result
+
+        tmpdir = tempfile.mkdtemp()
+        old_default = sa_mod._default_archive
+        token = _current_user_id.set("u_helper")
+        try:
+            sa_mod._default_archive = sa_mod.SearchArchive(base_dir=tmpdir)
+            footer = _archive_tool_result("search_web", "测试查询", "完整结果文本",
+                                          raw=[{"title": "t"}])
+            assert "[存档] id:" in footer, f"missing archive footer: {footer!r}"
+            assert "recall_search_result" in footer
+
+            aid = footer.split("id:")[1].split()[0]
+            rec = sa_mod._default_archive.recall("u_helper", aid)
+            assert rec is not None and rec["content"] == "完整结果文本"
+            print_pass("_archive_tool_result persists + footer carries recallable id")
+        finally:
+            _current_user_id.reset(token)
+            sa_mod._default_archive = old_default
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 class TestPersonality:
     """Test PersonalityManager group-bound default resolution."""
 
@@ -2655,6 +2801,7 @@ def main():
         ("Agent Core (Mock LLM)", TestAgentCore()),
         ("DeepSeekClient Parsing", TestDeepSeekClientParsing()),
         ("Built-in Tools", TestBuiltinTools()),
+        ("SearchArchive", TestSearchArchive()),
         ("Personality Manager", TestPersonality()),
         ("TokenLedger", TestTokenLedger()),
         ("Cache Stability (Phase 3/4)", TestCacheStability()),

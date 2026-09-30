@@ -9,7 +9,7 @@
 - **特殊会话** — 每用户至多 10/3/1 个（按角色），百万 token 上下文窗口，快照+增量双层存储
 - **用户工作区** — 每用户独立文件空间，配额管理（3 级策略），跨会话隔离
 - **流式交互** — 群聊连续对话模式：@一次后 90 秒内免 @，消息自动续期
-- **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）
+- **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）；完整结果自动存档（7 天/每用户 50 条），上下文折叠后可经 `recall_search_result` 按 id 取回，无需重搜
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制，分级限制：管理员 60s/100KB，会员 15s/50KB）
 - **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
 - **用户系统** — 三层记忆引擎（SHORT / MEDIUM / LONG，`TieredMemory`）+ LLM 驱动用户画像提取（含确定性事实过滤 `fact_filter`）
@@ -253,6 +253,7 @@ QQBotAgent/
     │   ├── fact_filter.py  #   确定性事实过滤（画像/记忆抽取前置）
     │   ├── profile.py      #   用户画像（LLM 批量提取; mtime 重校验防面板编辑被缓存回滚）
     │   ├── task_record.py  #   子任务结构化记录（begin_task/finalize_subtask 配套）
+    │   ├── search_archive.py # 搜索结果存档（search_web/web_fetch 全文落盘, recall_search_result 配套）
     │   ├── group_features.py   # 群聊功能开关（按群控制抽卡/图片/语音）
     │   ├── personality.py      # 人格管理（多套人格切换）
     │   ├── permissions.py  #   权限管理（三层角色 + 工具过滤）
@@ -319,6 +320,7 @@ QQBotAgent/
         ├── workspace/      #   用户工作区（按 QQ 号隔离）
         ├── token_usage/    #   Token 用量记录
         ├── task_log/       #   子任务结构化日志（{uid}.jsonl，按需创建）
+        ├── search_cache/   #   搜索结果存档（{uid}/{id}.json，7天TTL+50条上限，不占工作区配额）
         ├── audit/          #   审计日志（JSONL）
         ├── feedback/       #   用户反馈/Bug 报告
         ├── name_index/     #   角色名索引缓存
@@ -446,7 +448,7 @@ class ContinuousSessionManager:
 | `TieredMemory` | `memory.py:385` | 三层记忆引擎（P1）：SHORT（近期原文，容量 50，不注入提示词，count≥3 晋升）/ MEDIUM（按频次排序的要点，容量 60，注入 top 15 条 ≤600 字符，count>10 晋升 LONG，age>30 降级回 SHORT）/ LONG（长期对象，P1 仅创建+持久化快照，查询/RAG 留待 P2）；每用户 `extraction_count` 逻辑时钟驱动 age 计算；LLM judge 将新候选归类为 new / reinforce_short / update / keep；存储为 `data/memory/tiers/{uid}.json`（原子写），LONG 快照另存 `tiers/long/{uid}/{id}.md`（write-once） |
 | `ProfileManager` | `profile.py` | 用户画像（昵称/兴趣/偏好三类槽位；`facts` 字段 P0 起休眠，不再提取与注入），Layer 1 LLM 提取 + Layer 2 `fact_filter` 确定性过滤 + Layer 3 批量调度（`observe_turn` 每 5 轮触发一次合并的 extract+judge flash 调用）；持久化到 `data/users/`；`get()` 命中缓存时按 `st_mtime_ns` 重校验，面板编辑的画像不会被 bot 内存缓存静默回滚 |
 
-## 已注册工具（29 个）
+## 已注册工具（30 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -478,9 +480,10 @@ class ContinuousSessionManager:
 | `plan_route` | 驾车/步行/公交路线规划 |
 | `begin_task` | 标记多轮工具型子任务起点（抽卡/测速），折叠问答避免污染上下文 |
 | `finalize_subtask` | 结束子任务并提交结构化结果（详情归档到任务日志） |
+| `recall_search_result` | 按存档 id 取回此前 search_web/web_fetch 的完整结果（7 天保留，仅限本人存档） |
 | `end_continuous_mode` | 智能体主动结束群聊连续对话窗口（用户表达告别意图时） |
 
-> 📝 **权限分布**：29 个工具中 22 个为公共工具（`_PUBLIC_TOOLS`，全员可用），4 个为会员工具（`_VIP_TOOLS`：`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`_ADMIN_TOOLS`：`shell_exec`）。`end_continuous_mode` 不固定归属任一层级，由连续对话上下文动态并入可用集合（`agent_router.py:1460-1462`）。注册分布：25 个在 `_build_tool_registry()`（`agent_router.py:528-897`），其余 4 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask`）在模块级单独注册。
+> 📝 **权限分布**：30 个工具中 23 个为公共工具（`_PUBLIC_TOOLS`，全员可用），4 个为会员工具（`_VIP_TOOLS`：`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`_ADMIN_TOOLS`：`shell_exec`）。`end_continuous_mode` 不固定归属任一层级，由连续对话上下文动态并入可用集合（`agent_router.py:1460-1462`）。注册分布：25 个在 `_build_tool_registry()`（`agent_router.py:528-897`），其余 5 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask` / `recall_search_result`）在模块级单独注册。
 
 ## 智能体配置
 
@@ -558,7 +561,7 @@ bash test.sh
 cd QQBot && python test_agent.py
 ```
 
-`test_agent.py` 共 **14 个测试套件**（`test_workspace.py` 另有 11 个工作区/会话文件测试类）：
+`test_agent.py` 共 **15 个测试套件**（`test_workspace.py` 另有 11 个工作区/会话文件测试类）：
 1. **TestToolRegistry** — 注册 / Schema / 同步异步执行 / 错误
 2. **TestSessionManager** — CRUD / 超时 / 裁剪 / 持久化 / 外部删除生效（面板清除临时会话不被缓存复活，含请求中途删除的跳过写回）
 3. **TestMemorySystem** — 保存 / 搜索 / 遗忘 / 列出（旧版 Markdown 记忆）
@@ -567,12 +570,13 @@ cd QQBot && python test_agent.py
 6. **TestProfileExtraction** — LLM 事实提取 + 确定性过滤（`fact_filter`）+ 批量调度（`observe_turn` / 单飞 / 删除触发冲刷）
 7. **TestDeepSeekClientParsing** — 响应解析（纯文本 / 工具调用 / 混合）
 8. **TestBuiltinTools** — get_time / execute_code / search_web
-9. **TestPersonality** — 人格优先级 / 模糊匹配 / 歧义拒绝
-10. **TestTokenLedger** — Token 用量记账（`lib/token_ledger.py`）
-11. **TestCacheStability** — 前缀缓存稳定性（提示词头部不变量 / 易变内容置尾 / 历史头部迟滞修剪 / 压缩边界）
-12. **TestTieredMemory** — 三层记忆引擎（SHORT / MEDIUM / LONG 状态机、注入规则、逻辑时钟、持久化）
-13. **TestMergedExtraction** — 合并的 extract+judge 单次 flash 调用
-14. **TestMemoryMigration** — 旧记忆 → 三层结构迁移（`scripts/migrate_memory_p1.py`）
+9. **TestSearchArchive** — 搜索结果存档（round-trip / 用户隔离 / 路径穿越拒绝 / TTL 过期 / 每用户上限 / 无上下文降级 / helper 全链路）
+10. **TestPersonality** — 人格优先级 / 模糊匹配 / 歧义拒绝
+11. **TestTokenLedger** — Token 用量记账（`lib/token_ledger.py`）
+12. **TestCacheStability** — 前缀缓存稳定性（提示词头部不变量 / 易变内容置尾 / 历史头部迟滞修剪 / 压缩边界）
+13. **TestTieredMemory** — 三层记忆引擎（SHORT / MEDIUM / LONG 状态机、注入规则、逻辑时钟、持久化）
+14. **TestMergedExtraction** — 合并的 extract+judge 单次 flash 调用
+15. **TestMemoryMigration** — 旧记忆 → 三层结构迁移（`scripts/migrate_memory_p1.py`）
 
 ## 安全模型
 

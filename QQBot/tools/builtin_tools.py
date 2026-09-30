@@ -134,6 +134,49 @@ def _notify_file_created(abs_path: str) -> None:
         cb(abs_path)
 
 
+def _archive_tool_result(tool: str, query: str, content: str, raw=None) -> str:
+    """Archive a full search_web/web_fetch result for later recall.
+
+    Persists the complete formatted result via agent.search_archive and
+    returns a footer line (carrying the archive id) to append to the tool
+    output. Returns an empty string when there is no user context (e.g.
+    direct unit-test calls) or archiving fails — archiving must never
+    break the tool main flow.
+
+    The footer rides the append-only tool message, so the id stays visible
+    in conversation context without touching the cached system prompt.
+    """
+    try:
+        from agent.context import _current_user_id
+    except ImportError:
+        try:
+            from QQBot.agent.context import _current_user_id
+        except ImportError:
+            return ""
+    try:
+        from agent.search_archive import get_default_archive
+    except ImportError:
+        try:
+            from QQBot.agent.search_archive import get_default_archive
+        except ImportError:
+            return ""
+    try:
+        user_id = _current_user_id.get()
+        if not user_id:
+            return ""
+        archive_id = get_default_archive().save(
+            user_id, tool, query, content, raw=raw
+        )
+        if not archive_id:
+            return ""
+        return (
+            f"\n\n[存档] id: {archive_id} — 完整结果已存档（7天内有效），"
+            "可调用 recall_search_result 工具取回全文"
+        )
+    except Exception:
+        return ""
+
+
 def _validate_path(file_path: str, must_exist: bool = True) -> tuple[str | None, str | None]:
     """Validate a file path is safe and within workspace.
 
@@ -294,7 +337,11 @@ def search_web(query: str, num_results: int = 5) -> str:
                 f"   来源: {engine} | URL: {url_str}"
             )
 
-        return "\n\n".join(lines)
+        formatted = "\n\n".join(lines)
+        return formatted + _archive_tool_result(
+            "search_web", query, formatted,
+            raw=results[:num_results],
+        )
 
     except urllib.request.HTTPError as e:
         return (
@@ -520,7 +567,8 @@ async def web_fetch(url: str) -> str:
             if len(text) > _MAX_FETCH_OUTPUT:
                 text = text[:_MAX_FETCH_OUTPUT] + f"\n\n... (输出已截断至 {_MAX_FETCH_OUTPUT} 字符)"
 
-            return text or "(页面内容为空)"
+            result_text = text or "(页面内容为空)"
+            return result_text + _archive_tool_result("web_fetch", url, result_text)
 
     except httpx.ConnectTimeout:
         return f"[WebFetch] 连接超时 ({_FETCH_TIMEOUT}秒): {url}"

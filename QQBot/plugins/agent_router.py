@@ -40,6 +40,7 @@ from agent.context import (
     _pending_task_fold,
 )
 from agent.task_record import build_record, build_compact_line, append_task_log
+from agent.search_archive import get_default_archive
 from agent.group_features import get_group_features
 from agent.permissions import PermissionManager, UserRole
 from agent.personality import get_personality_manager
@@ -1625,6 +1626,57 @@ _tool_registry.register(
             "follow_ups": {"type": "array", "items": {"type": "string"}, "description": "未完成事项或后续建议"},
         },
         "required": ["goal", "result"],
+    },
+)
+
+
+# ── Search result archive recall (recall_search_result) ──
+#
+# search_web / web_fetch archive their full results to data/search_cache/
+# (agent/search_archive.py) and append an archive id line to the tool return
+# text. The id rides the append-only message stream, so after context
+# folding/compression the model can still dereference it via this tool
+# instead of re-searching. Retention: 7 days / 50 per user, scoped by
+# contextvar user_id — never trust the id alone.
+
+def _recall_search_result(archive_id: str) -> str:
+    """Retrieve a full archived search_web/web_fetch result by its id."""
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "[recall] 无法取回：当前请求未设置用户上下文。"
+    record = get_default_archive().recall(user_id, archive_id)
+    if not record:
+        return (
+            "[recall] 未找到该存档：id 无效、已过期（保留期7天）或不属于当前用户。"
+            "建议重新调用 search_web 获取最新结果。"
+        )
+    try:
+        age_hours = max(0.0, (time.time() - float(record.get("ts", 0))) / 3600)
+        age_note = f"（距今约 {age_hours:.1f} 小时，时效敏感内容请酌情重新搜索）"
+    except (TypeError, ValueError):
+        age_note = ""
+    header = (
+        f"[recall] 存档时间: {record.get('iso_time', '未知')}{age_note}\n"
+        f"工具: {record.get('tool', '')} | 查询: {record.get('query', '')}\n\n"
+    )
+    return header + record.get("content", "")
+
+
+_tool_registry.register(
+    "recall_search_result", _recall_search_result,
+    "按存档 id 取回此前 search_web / web_fetch 的完整结果。当上下文中的搜索结果"
+    "已被折叠或压缩、而你需要其中的 URL 或细节时，优先用此工具取回存档而不是"
+    "重新搜索。存档 id 来自工具返回末尾的「[存档] id: xxx」行，保留 7 天，"
+    "仅限取回自己的存档。",
+    {
+        "type": "object",
+        "properties": {
+            "archive_id": {
+                "type": "string",
+                "description": "存档 id（12位十六进制，来自工具返回末尾的 [存档] 行）",
+            },
+        },
+        "required": ["archive_id"],
     },
 )
 

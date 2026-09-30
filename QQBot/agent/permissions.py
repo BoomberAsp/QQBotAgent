@@ -69,6 +69,7 @@ _PUBLIC_TOOLS: Set[str] = {
     "redeem_code",
     "begin_task",
     "finalize_subtask",
+    "recall_search_result",  # Reads own search archives only (user_id-scoped)
 }
 
 # Additional tools for VIP users (on top of _PUBLIC_TOOLS)
