@@ -40,6 +40,7 @@ from agent.context import (
     _pending_task_fold,
 )
 from agent.task_record import build_record, build_compact_line, append_task_log
+from agent.search_archive import get_default_archive
 from agent.group_features import get_group_features
 from agent.permissions import PermissionManager, UserRole
 from agent.personality import get_personality_manager
@@ -1629,6 +1630,57 @@ _tool_registry.register(
 )
 
 
+# ── Search result archive recall (recall_search_result) ──
+#
+# search_web / web_fetch archive their full results to data/search_cache/
+# (agent/search_archive.py) and append an archive id line to the tool return
+# text. The id rides the append-only message stream, so after context
+# folding/compression the model can still dereference it via this tool
+# instead of re-searching. Retention: 7 days / 50 per user, scoped by
+# contextvar user_id — never trust the id alone.
+
+def _recall_search_result(archive_id: str) -> str:
+    """Retrieve a full archived search_web/web_fetch result by its id."""
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "[recall] 无法取回：当前请求未设置用户上下文。"
+    record = get_default_archive().recall(user_id, archive_id)
+    if not record:
+        return (
+            "[recall] 未找到该存档：id 无效、已过期（保留期7天）或不属于当前用户。"
+            "建议重新调用 search_web 获取最新结果。"
+        )
+    try:
+        age_hours = max(0.0, (time.time() - float(record.get("ts", 0))) / 3600)
+        age_note = f"（距今约 {age_hours:.1f} 小时，时效敏感内容请酌情重新搜索）"
+    except (TypeError, ValueError):
+        age_note = ""
+    header = (
+        f"[recall] 存档时间: {record.get('iso_time', '未知')}{age_note}\n"
+        f"工具: {record.get('tool', '')} | 查询: {record.get('query', '')}\n\n"
+    )
+    return header + record.get("content", "")
+
+
+_tool_registry.register(
+    "recall_search_result", _recall_search_result,
+    "按存档 id 取回此前 search_web / web_fetch 的完整结果。当上下文中的搜索结果"
+    "已被折叠或压缩、而你需要其中的 URL 或细节时，优先用此工具取回存档而不是"
+    "重新搜索。存档 id 来自工具返回末尾的「[存档] id: xxx」行，保留 7 天，"
+    "仅限取回自己的存档。",
+    {
+        "type": "object",
+        "properties": {
+            "archive_id": {
+                "type": "string",
+                "description": "存档 id（12位十六进制，来自工具返回末尾的 [存档] 行）",
+            },
+        },
+        "required": ["archive_id"],
+    },
+)
+
+
 # ── Message Handlers ─────────────────────────────────────────────
 
 # Catch ALL messages. For group messages, we manually check for @mentions
@@ -1801,6 +1853,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
     # ── Detect and download file/image attachments ─────────────────
     file_context_parts = []
+    has_voice = False
     msg_id = str(event.message_id)
     for seg in event.message:
         if seg.type == "image":
@@ -1829,6 +1882,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
                 _record_file(msg_id, name, error=error)
 
         elif seg.type == "record":
+            has_voice = True
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
             if saved_path:
                 file_context_parts.append(
@@ -1844,8 +1898,12 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
     quota_warn = _quota_warning(user_id)
 
     # ── File-only messages: acknowledge and skip agent ─────────────
+    # Voice messages are exempt: a bare voice message is a conversational
+    # turn (the user expects the LLM to listen and respond), not a file
+    # upload awaiting later analysis. Skipping the agent for voice broke
+    # the pre-existing "语音直达 LLM" behavior (regression from f7e5f4e).
     has_files = bool(file_context_parts)
-    if has_files and not text_content and not reply_context:
+    if has_files and not has_voice and not text_content and not reply_context:
         names = []
         for part in file_context_parts:
             m = re.search(r"文件 (.+?)，", part) or re.search(r"上传了(\w+)，", part)
@@ -1875,6 +1933,13 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
     if context_prefix:
         if text_content:
             augmented_message = f"{context_prefix}\n用户说: {text_content}"
+        elif has_voice:
+            # Bare voice turn: instruct the agent to listen and respond,
+            # matching the pre-f7e5f4e behavior where 语音直达 LLM.
+            augmented_message = (
+                f"{context_prefix}\n用户发送了语音消息，请使用 read_file 工具"
+                f"分析音频内容，并根据其内容直接回应用户。"
+            )
         else:
             augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请根据用户意图选择合适的工具查看内容。"
     else:

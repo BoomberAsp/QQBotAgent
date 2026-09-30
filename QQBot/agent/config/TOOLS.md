@@ -35,6 +35,8 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 **Note**: The separate `check_weather` tool has been removed. Weather queries are handled through the dedicated `get_weather` tool (Amap API) or this unified search tool as a fallback.
 
+**Archive**: Every successful search is archived in full (7-day retention). The return text ends with a `[存档] id: xxx` line — keep that id in mind (or put it in `finalize_subtask`'s `refs`). If earlier search results were folded/compressed away and you need their URLs or details again, call `recall_search_result` with that id instead of re-searching.
+
 ---
 
 ## Tool: web_fetch
@@ -67,6 +69,8 @@ This document defines all tools available to the agent. Each tool has a name, de
 - Max text output: 8000 characters
 - Timeout: 30 seconds
 - Content types: HTML (converted to text), plain text, JSON. Other types return metadata only.
+
+**Archive**: Fetched page text is archived in full (7-day retention) with a `[存档] id: xxx` footer line. To re-read a page whose content was folded/compressed out of context, call `recall_search_result` with that id instead of fetching again.
 
 ---
 
@@ -725,3 +729,30 @@ This document defines all tools available to the agent. Each tool has a name, de
 ```
 
 **Note**: Even without a prior `begin_task` (or if its 15-minute window expired), calling this tool still archives the record and folds the current turn — only the setup-turn removal is skipped. For tool-heavy turns where you forgot to call it, the system auto-compresses long results into a degraded record anyway, but explicit finalization always produces the better record.
+
+---
+
+## Tool: recall_search_result
+
+**Description**: Retrieve the complete archived result of a previous `search_web` or `web_fetch` call by its archive id. Archives are kept for 7 days and are strictly per-user — you can only recall archives created by the current user's own tool calls.
+
+**When to use**:
+- Earlier search/fetch results were folded or compressed out of context, and you need their URLs, snippets or page text again
+- A `finalize_subtask` record's `refs` contain an archive id you now need to expand
+- Prefer this over re-searching when the archived content is what you already triaged; re-search instead when freshness matters (the recall output shows the archive age)
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "archive_id": {
+      "type": "string",
+      "description": "存档 id（12位十六进制，来自 search_web/web_fetch 返回末尾的 [存档] 行）"
+    }
+  },
+  "required": ["archive_id"]
+}
+```
+
+**Note**: The output header carries the archive timestamp and age in hours. For time-sensitive topics (news, prices, weather), weigh the age before reusing archived content — when in doubt, run a fresh `search_web`. If the id is invalid, expired, or belongs to another user, the tool says so; fall back to re-searching.

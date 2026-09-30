@@ -9,11 +9,11 @@
 - **特殊会话** — 每用户至多 10/3/1 个（按角色），百万 token 上下文窗口，快照+增量双层存储
 - **用户工作区** — 每用户独立文件空间，配额管理（3 级策略），跨会话隔离
 - **流式交互** — 群聊连续对话模式：@一次后 90 秒内免 @，消息自动续期
-- **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）
+- **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）；完整结果自动存档（7 天/每用户 50 条），上下文折叠后可经 `recall_search_result` 按 id 取回，无需重搜
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制，分级限制：管理员 60s/100KB，会员 15s/50KB）
 - **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
 - **用户系统** — 三层记忆引擎（SHORT / MEDIUM / LONG，`TieredMemory`）+ LLM 驱动用户画像提取（含确定性事实过滤 `fact_filter`）
-- **Web 管理面板** — FastAPI 后台（`webui/`）：进程管理、配置热编辑、记忆/画像查看、Token 用量看板、反馈处理、Playground
+- **Web 管理面板** — FastAPI 后台（`webui/`）：进程管理、配置热编辑（提示词/人格/.env/模型结构化表单+API 可用性探测）、记忆/画像编辑（与 bot 内存缓存 mtime 一致性校验）、Wiki 别名管理、Token 用量看板、反馈处理、Playground
 - **游戏工具** — 抽卡模拟（Wiki 自动爬取卡池数据）、团战截图测速（OCR 解析战斗截图，轻量/全量两种模式）、乱速概率计算、角色/羁绊查询（面板/技能/倍率）、兑换码查询（自动爬取+手动维护）
 - **地图服务** — 地址↔坐标转换、实时天气、POI搜索、路线规划（高德地图）
 - **群聊管理** — 按群开关功能（抽卡/图片/语音），超级用户可远程管理
@@ -83,7 +83,7 @@ USER_WORKSPACE_QUOTA_MB=500  # 每用户工作区配额 MB（默认，实际按�
 BUFF_DETECTOR_WORKERS=2  # 团战测速 buff 图标匹配并行线程数
 ```
 
-**多模型配置（可选）**：编辑 `QQBot/config/models_settings.json` 配置各模型（REASONING/FLASH/MULTIMODAL/AUDIO/OCR），留空则回退到 `.env` 的 DeepSeek 默认配置。参考 `QQBot/config/models_settings_example.json` 格式。
+**多模型配置（可选）**：编辑 `QQBot/config/models_settings.json` 配置各模型（REASONING/FLASH/MULTIMODAL/AUDIO/OCR），留空则回退到 `.env` 的 DeepSeek 默认配置。参考 `QQBot/config/models_settings_example.json` 格式。也可在 Web 管理面板「配置热管理 → 模型」中用结构化表单逐段编辑：保存前会以最小真实调用探测 API 可用性（仅验证通过的配置才落盘），保存后 bot 约 10 秒内自动热重载，无需重启。
 
 ### 4. 安装 NapCat（QQ 协议适配）
 
@@ -213,11 +213,12 @@ QQBotAgent/
 ├── searxng/                # SearXNG 搜索配置
 │   └── settings.yml        #   搜索引擎配置 (Bing / 国内优化)
 ├── webui/                  # ★ Web 管理面板（FastAPI，独立服务，绑定 127.0.0.1:8090）
-│   ├── main.py             #   面板入口（48 个 /api/ 端点 + 15 个页面路由 + 2 个 WebSocket；页面路由经 PAGES 循环注册）
+│   ├── main.py             #   面板入口（52 个 /api/ 端点 + 15 个页面路由 + 2 个 WebSocket；页面路由经 PAGES 循环注册）
 │   ├── auth.py             #   登录鉴权（scrypt 口令哈希 + 内存会话）
 │   ├── process_manager.py  #   进程管理（启动/停止 bot，看门狗状态持久化）
-│   ├── config_editor.py    #   配置热编辑（含密钥脱敏）
-│   ├── data_reader.py      #   记忆/画像/日志只读访问
+│   ├── config_editor.py    #   配置热编辑（含密钥脱敏；模型配置分段 prepare/commit + 原子写）
+│   ├── model_probe.py      #   模型 API 可用性探测（最小真实调用，分级判定，AUDIO/OCR 宽判）
+│   ├── data_reader.py      #   记忆/画像/会话/Wiki 别名等数据读写（写前备份）
 │   ├── log_viewer.py / audit.py / hardware_monitor.py / playground.py
 │   ├── requirements.txt    #   面板依赖（含 psutil；与 QQBot/requirements.txt 独立）
 │   ├── templates/ static/  #   前端页面（17 个模板）与静态资源
@@ -233,14 +234,14 @@ QQBotAgent/
     ├── requirements.txt    # Python 依赖
     ├── pyproject.toml      # NoneBot 项目配置
     ├── config.yml          # NoneBot 配置
-    ├── test_agent.py       # 测试套件（13 套件）
+    ├── test_agent.py       # 测试套件（14 套件）
     ├── test_workspace.py   # 工作区/会话文件测试（11 类）
     ├── DOCUMENTATION.md / PLAN.md / README.md   # 项目文档
     │
     ├── agent/              # 智能体核心
     │   ├── agent.py        #   主循环: Think→Act→Observe→Respond
     │   ├── tool_registry.py#   工具注册（OpenAI JSON Schema）
-    │   ├── session.py      #   会话管理（临时会话, per-user, 持久化）
+    │   ├── session.py      #   会话管理（临时会话, per-user, 持久化; mtime 重校验防面板编辑被缓存回滚）
     │   ├── special_session.py  # 特殊会话（百万 token, 快照+增量, 最多3个）
     │   ├── continuous_session.py  # 群聊连续对话窗口（90秒免@）
     │   ├── hardware.py     #   硬件自动检测 & 动态任务拒绝
@@ -250,8 +251,9 @@ QQBotAgent/
     │   ├── context.py      #   执行上下文（contextvars, 工具→QQ图片）
     │   ├── memory.py       #   长期记忆：MemorySystem（旧 Markdown）+ TieredMemory（三层引擎）
     │   ├── fact_filter.py  #   确定性事实过滤（画像/记忆抽取前置）
-    │   ├── profile.py      #   用户画像（LLM 自动提取）
+    │   ├── profile.py      #   用户画像（LLM 批量提取; mtime 重校验防面板编辑被缓存回滚）
     │   ├── task_record.py  #   子任务结构化记录（begin_task/finalize_subtask 配套）
+    │   ├── search_archive.py # 搜索结果存档（search_web/web_fetch 全文落盘, recall_search_result 配套）
     │   ├── group_features.py   # 群聊功能开关（按群控制抽卡/图片/语音）
     │   ├── personality.py      # 人格管理（多套人格切换）
     │   ├── permissions.py  #   权限管理（三层角色 + 工具过滤）
@@ -282,12 +284,12 @@ QQBotAgent/
     │   ├── ag_llm_resolver.py  # 拉/推条技能 LLM 解析
     │   ├── buff_vocab_dump.py  # buff 词表导出（模板采集辅助）
     │   ├── wiki_scraper.py #   Wiki 爬虫（角色/羁绊数据自动更新）
-    │   └── name_resolver.py#   角色别名解析（模糊匹配）
+    │   └── name_resolver.py#   角色别名解析（模糊匹配；别名字典可经面板编辑，watcher 热重载）
     │
     ├── lib/                # 库
     │   ├── deepseek_client.py   # DeepSeek API 客户端
-    │   ├── model_router.py      # 多模型路由器
-    │   ├── multimodal_client.py # 多模态客户端（图片理解 + 音频分析）
+    │   ├── model_router.py      # 多模型路由器（reload() 支持配置热重载）
+    │   ├── multimodal_client.py # 多模态客户端（图片理解 + 音频分析；reload() 热重载）
     │   ├── token_ledger.py      # Token 用量记账（WebUI 看板数据源）
     │   ├── ocr_engine.py        # OCR 引擎（BuffDetector / 技能冷却检测）
     │   ├── buff_alias.py        # buff 名称 → 图标标签别名映射
@@ -318,6 +320,7 @@ QQBotAgent/
         ├── workspace/      #   用户工作区（按 QQ 号隔离）
         ├── token_usage/    #   Token 用量记录
         ├── task_log/       #   子任务结构化日志（{uid}.jsonl，按需创建）
+        ├── search_cache/   #   搜索结果存档（{uid}/{id}.json，7天TTL+50条上限，不占工作区配额）
         ├── audit/          #   审计日志（JSONL）
         ├── feedback/       #   用户反馈/Bug 报告
         ├── name_index/     #   角色名索引缓存
@@ -361,7 +364,7 @@ User Message → agent_router
   └── 图片/音频 → MULTIMODAL_MODEL / AUDIO_MODEL（多模态理解）
 ```
 
-配置在 `QQBot/config/models_settings.json`，留空自动回退到 `.env` 默认。
+配置在 `QQBot/config/models_settings.json`，留空自动回退到 `.env` 默认。也可在 Web 面板「配置热管理 → 模型」用结构化表单编辑：保存前先对改动过的段做最小真实调用探测（`POST {api_base}/chat/completions`，max_tokens=8；401/403→密钥无效，连接失败→不可达，AUDIO/OCR 段对 400/422 宽判为「凭据有效但模型不接受纯文本探测」），仅验证通过的配置才写盘；写盘后 bot 侧 watcher（5s 轮询 mtime）触发 `ModelRouter.reload()` / `MultimodalClient.reload()` 并重挂固化引用，约 10 秒生效，无需重启。
 
 ### 群聊连续对话
 
@@ -413,6 +416,7 @@ class ModelRouter:
     async def classify_complexity(self, user_message) -> str   # "simple" | "complex"
     def get_client(self, task_type) -> DeepSeekClient           # triage/simple/complex/multimodal
     @property reasoning_client / flash_client / multimodal_client
+    def reload(self)                                            # 重读 models_settings.json 并原地重建三个 client（配置看门狗调用）
 ```
 
 ### ToolRegistry (`agent/tool_registry.py`)
@@ -439,12 +443,12 @@ class ContinuousSessionManager:
 
 | 类 | 文件 | 功能 |
 |---|---|---|
-| `Session` | `session.py` | per-user 对话上下文（最多 20 条），持久化到 `data/sessions/` |
-| `MemorySystem` | `memory.py` | 旧版长期记忆（Markdown 文件 + frontmatter），`search()` 按关键词子串匹配返回**全部**命中（无条数上限）；P1 起已被 `TieredMemory` 取代，仅保留用于迁移与兼容 |
-| `TieredMemory` | `memory.py:385` | 三层记忆引擎（P1）：SHORT（近期原文）/ MEDIUM（按频次排序的要点）/ LONG（仅创建+持久化，查询留待 P2）；存储为 `data/memory/tiers/{uid}.json`，LONG 快照另存 `tiers/long/{uid}/{id}.md` |
-| `ProfileManager` | `profile.py` | 用户画像，LLM 自动提取事实/兴趣（含 `fact_filter` 确定性过滤），持久化到 `data/users/` |
+| `Session` | `session.py` | per-user 对话上下文（最多 20 条 + 4 条迟滞缓冲，减少修剪对前缀缓存的破坏），持久化到 `data/sessions/`；缓存命中时按文件 `st_mtime_ns` 重校验——面板「清除临时会话」等外部删改优先于内存缓存，不会被陈旧写回复活 |
+| `MemorySystem` | `memory.py` | 旧版长期记忆（Markdown 文件 + frontmatter），`search()` 按关键词子串匹配返回**全部**命中（无条数上限）；P1 起 user 类记忆已由 `TieredMemory` 接管，`MemorySystem` 仍服务 knowledge/system 类与面板编辑（无内存缓存，每次操作直接读盘） |
+| `TieredMemory` | `memory.py:385` | 三层记忆引擎（P1）：SHORT（近期原文，容量 50，不注入提示词，count≥3 晋升）/ MEDIUM（按频次排序的要点，容量 60，注入 top 15 条 ≤600 字符，count>10 晋升 LONG，age>30 降级回 SHORT）/ LONG（长期对象，P1 仅创建+持久化快照，查询/RAG 留待 P2）；每用户 `extraction_count` 逻辑时钟驱动 age 计算；LLM judge 将新候选归类为 new / reinforce_short / update / keep；存储为 `data/memory/tiers/{uid}.json`（原子写），LONG 快照另存 `tiers/long/{uid}/{id}.md`（write-once） |
+| `ProfileManager` | `profile.py` | 用户画像（昵称/兴趣/偏好三类槽位；`facts` 字段 P0 起休眠，不再提取与注入），Layer 1 LLM 提取 + Layer 2 `fact_filter` 确定性过滤 + Layer 3 批量调度（`observe_turn` 每 5 轮触发一次合并的 extract+judge flash 调用）；持久化到 `data/users/`；`get()` 命中缓存时按 `st_mtime_ns` 重校验，面板编辑的画像不会被 bot 内存缓存静默回滚 |
 
-## 已注册工具（29 个）
+## 已注册工具（30 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -476,9 +480,10 @@ class ContinuousSessionManager:
 | `plan_route` | 驾车/步行/公交路线规划 |
 | `begin_task` | 标记多轮工具型子任务起点（抽卡/测速），折叠问答避免污染上下文 |
 | `finalize_subtask` | 结束子任务并提交结构化结果（详情归档到任务日志） |
+| `recall_search_result` | 按存档 id 取回此前 search_web/web_fetch 的完整结果（7 天保留，仅限本人存档） |
 | `end_continuous_mode` | 智能体主动结束群聊连续对话窗口（用户表达告别意图时） |
 
-> 📝 **权限分布**：29 个工具中 22 个为公共工具（`_PUBLIC_TOOLS`，全员可用），4 个为会员工具（`_VIP_TOOLS`：`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`_ADMIN_TOOLS`：`shell_exec`）。`end_continuous_mode` 不固定归属任一层级，由连续对话上下文动态并入可用集合（`agent_router.py:1460-1462`）。注册分布：25 个在 `_build_tool_registry()`（`agent_router.py:528-897`），其余 4 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask`）在模块级单独注册。
+> 📝 **权限分布**：30 个工具中 23 个为公共工具（`_PUBLIC_TOOLS`，全员可用），4 个为会员工具（`_VIP_TOOLS`：`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`_ADMIN_TOOLS`：`shell_exec`）。`end_continuous_mode` 不固定归属任一层级，由连续对话上下文动态并入可用集合（`agent_router.py:1460-1462`）。注册分布：25 个在 `_build_tool_registry()`（`agent_router.py:528-897`），其余 5 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask` / `recall_search_result`）在模块级单独注册。
 
 ## 智能体配置
 
@@ -516,7 +521,12 @@ class ContinuousSessionManager:
 | `USER.md` / `HEARTBEAT.md` | 代码中无任何引用，为历史遗留文件 |
 | `personalities/` | 人格定义目录（assistant / roxy_character / rubi），由 `personality.py` 按需加载，非系统提示词的一部分 |
 
-> 📝 **热重载实况**：`agent_router.py:999-1025` 有一个配置看门狗，每 5 秒遍历 `agent/config/` 下**所有** `*.md`（含 `personalities/`）的 mtime，变化即调用 `reload_configs()`（带 5 秒冷却）。但 `reload_configs()` 只重新读取上面 ① ② 类共 7 个文件并重建提示词，因此**只有修改 ① 类（SOUL/IDENTITY/AGENTS/MEMORY）才会即时改变 Agent 行为**；修改 ③ 类（HELP/FEATURES）在下次触发对应命令时生效；修改 ④ 类无效。配合 WebUI 面板的配置热编辑，保存后约 5 秒内生效，无需重启。
+> 📝 **热重载实况**：`agent_router.py:1007` 的配置看门狗每 5 秒轮询三组文件的 mtime（各自独立 5 秒冷却）：
+> 1. **`agent/config/*.md`（含 `personalities/`）** → `reload_configs()`。但它只重新读取上面 ① ② 类共 7 个文件并重建提示词，因此**只有修改 ① 类（SOUL/IDENTITY/AGENTS/MEMORY）才会即时改变 Agent 行为**；修改 ③ 类（HELP/FEATURES）在下次触发对应命令时生效；修改 ④ 类无效。
+> 2. **Wiki 别名字典（`config/characters/character_dic.json` / `bonds_search_dic.json`）** → `NameResolver.reload()` + 详情缓存失效。面板「Wiki 缓存」页可直接编辑别名，保存后 bot 侧自动跟随。
+> 3. **`config/models_settings.json`** → `model_router.reload()`（含模块级单例与 `MultimodalClient`）并重挂 3 处固化的 client 引用（`agent.client` / `_profile_manager` / `_special_sessions`）。面板保存模型配置后约 10 秒内生效。
+>
+> 配合 WebUI 面板的配置热编辑，以上修改均无需重启 bot。
 
 ## 添加新工具
 
@@ -551,20 +561,22 @@ bash test.sh
 cd QQBot && python test_agent.py
 ```
 
-`test_agent.py` 共 **13 个测试套件**（`test_workspace.py` 另有 11 个工作区/会话文件测试类）：
+`test_agent.py` 共 **15 个测试套件**（`test_workspace.py` 另有 11 个工作区/会话文件测试类）：
 1. **TestToolRegistry** — 注册 / Schema / 同步异步执行 / 错误
-2. **TestSessionManager** — CRUD / 超时 / 裁剪 / 持久化
+2. **TestSessionManager** — CRUD / 超时 / 裁剪 / 持久化 / 外部删除生效（面板清除临时会话不被缓存复活，含请求中途删除的跳过写回）
 3. **TestMemorySystem** — 保存 / 搜索 / 遗忘 / 列出（旧版 Markdown 记忆）
-4. **TestAgentCore** — 启动 / 提示词 / 工具循环 / 迭代上限 / 画像注入
-5. **TestUserProfile** — 用户画像创建 / 事实去重 / 持久化
-6. **TestProfileExtraction** — LLM 事实提取 + 确定性过滤（`fact_filter`）
+4. **TestAgentCore** — 启动 / 提示词 / 工具循环 / 迭代上限 / 画像与 MEDIUM 记忆注入
+5. **TestUserProfile** — 用户画像创建 / 事实去重 / 持久化 / 外部编辑优先（面板改画像后 bot 缓存按 mtime 重读，不被回滚）
+6. **TestProfileExtraction** — LLM 事实提取 + 确定性过滤（`fact_filter`）+ 批量调度（`observe_turn` / 单飞 / 删除触发冲刷）
 7. **TestDeepSeekClientParsing** — 响应解析（纯文本 / 工具调用 / 混合）
 8. **TestBuiltinTools** — get_time / execute_code / search_web
-9. **TestPersonality** — 人格优先级 / 模糊匹配 / 歧义拒绝
-10. **TestTokenLedger** — Token 用量记账（`lib/token_ledger.py`）
-11. **TestTieredMemory** — 三层记忆引擎（SHORT / MEDIUM / LONG）
-12. **TestMergedExtraction** — 合并的 extract+judge 单次 flash 调用
-13. **TestMemoryMigration** — 旧记忆 → 三层结构迁移（`scripts/migrate_memory_p1.py`）
+9. **TestSearchArchive** — 搜索结果存档（round-trip / 用户隔离 / 路径穿越拒绝 / TTL 过期 / 每用户上限 / 无上下文降级 / helper 全链路）
+10. **TestPersonality** — 人格优先级 / 模糊匹配 / 歧义拒绝
+11. **TestTokenLedger** — Token 用量记账（`lib/token_ledger.py`）
+12. **TestCacheStability** — 前缀缓存稳定性（提示词头部不变量 / 易变内容置尾 / 历史头部迟滞修剪 / 压缩边界）
+13. **TestTieredMemory** — 三层记忆引擎（SHORT / MEDIUM / LONG 状态机、注入规则、逻辑时钟、持久化）
+14. **TestMergedExtraction** — 合并的 extract+judge 单次 flash 调用
+15. **TestMemoryMigration** — 旧记忆 → 三层结构迁移（`scripts/migrate_memory_p1.py`）
 
 ## 安全模型
 

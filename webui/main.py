@@ -806,6 +806,14 @@ async def api_wiki_aliases_get(kind: str = "char"):
     return result
 
 
+@app.get("/api/wiki/aliases/missing")
+async def api_wiki_aliases_missing(kind: str = "char"):
+    result = await asyncio.to_thread(data_reader.wiki_aliases_missing, kind)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
 class AliasPayload(BaseModel):
     kind: str
     aliases: dict  # {canonical: [alias...]} 全量快照

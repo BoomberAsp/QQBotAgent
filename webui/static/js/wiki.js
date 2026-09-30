@@ -108,10 +108,85 @@
       if (r && r.warning) toast(r.warning, 'info', 6000);
       else toast(okMsg || '已保存', 'success');
       await loadAliases();
+      loadMissing();   // 保存可能使「待补录」条目落组，同步刷新
     } catch (e) {
       toast(e.message, 'error', 5000);
     }
   }
+
+  /* ── 待补录（已爬取但字典无分组）+ 新建分组 ───────────────── */
+
+  let missingItems = [];
+  let missingNote = '';
+
+  async function loadMissing() {
+    const box = document.getElementById('wk-alias-missing');
+    try {
+      const d = await api('/api/wiki/aliases/missing?kind=' + aliasKind);
+      missingItems = (d && d.items) || [];
+      missingNote = (d && d.note) || '';
+      renderMissing();
+    } catch (e) {
+      missingItems = [];
+      missingNote = '';
+      box.innerHTML = `<div class="warn" style="margin-top:8px">${esc(e.message)}</div>`;
+    }
+  }
+
+  function renderMissing() {
+    const box = document.getElementById('wk-alias-missing');
+    if (!missingItems.length) {
+      box.innerHTML = missingNote
+        ? `<p class="muted" style="margin:8px 0 0">${esc(missingNote)}</p>` : '';
+      return;
+    }
+    const what = aliasKind === 'char' ? '角色' : '羁绊';
+    box.innerHTML = `<div class="alias-group" style="margin-top:10px">
+      <div class="row">
+        <strong>待补录（${missingItems.length}）</strong>
+        <span class="muted">已从 wiki 爬取、但字典中尚无别名分组的${what}。
+          按译名一键创建分组（预填自别名 + 英文标题）；若译名用字不妥，创建后可在下方卡片中改名。</span>
+      </div>
+      ${missingItems.map((it, i) => `<div class="row" style="margin-top:6px">
+        <span class="mono muted">${esc(it.title_en)}</span>
+        <span>→ ${esc(it.canonical)}</span>
+        <span class="spacer"></span>
+        <button class="btn btn-sm missing-create" data-i="${i}">补录为分组</button>
+      </div>`).join('')}
+    </div>`;
+  }
+
+  /* 创建新分组：先以磁盘最新快照为基准刷新，避免陈旧快照全量覆盖 */
+  async function createGroup(canon, hintAliases) {
+    canon = String(canon || '').trim();
+    if (!canon) { toast('名称不能为空', 'error'); return; }
+    await loadAliases();
+    if (Object.prototype.hasOwnProperty.call(aliasSnapshot, canon)) {
+      toast(`「${canon}」组已存在`, 'error', 5000);
+      return;
+    }
+    const aliases = [...new Set(
+      (Array.isArray(hintAliases) && hintAliases.length ? hintAliases : [canon])
+        .map(a => String(a).trim()).filter(Boolean))];
+    if (!aliases.includes(canon)) aliases.unshift(canon);  // 自别名约定 canon→canon
+    const next = cloneSnapshot();
+    next[canon] = aliases;
+    await putAliases(next, `已创建分组「${canon}」`);
+  }
+
+  document.getElementById('wk-alias-missing').addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('.missing-create');
+    if (!btn) return;
+    const it = missingItems[Number(btn.dataset.i)];
+    if (!it) return;
+    await createGroup(it.canonical, it.aliases_hint);
+  });
+
+  document.getElementById('wk-alias-new').addEventListener('click', async () => {
+    const canon = prompt('新分组的规范名称（角色/羁绊中文名）：');
+    if (canon === null) return;
+    await createGroup(canon, [canon]);
+  });
 
   /* chip × → 删除单条别名（confirm 后立即保存） */
   document.getElementById('wk-alias-list').addEventListener('click', async (ev) => {
@@ -183,6 +258,7 @@
       document.querySelectorAll('.wk-kind').forEach(b =>
         b.classList.toggle('active', b === btn));
       loadAliases();
+      loadMissing();
     });
   });
 
@@ -193,4 +269,5 @@
   });
 
   loadAliases();
+  loadMissing();
 })();
