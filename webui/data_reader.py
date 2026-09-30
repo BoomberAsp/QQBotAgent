@@ -746,3 +746,64 @@ def wiki_aliases_save(kind: str, grouped: dict) -> dict:
     if warning:
         result["warning"] = warning
     return result
+
+
+# 详情缓存（wiki 爬取产物，envelope: {scraped_at, source_url, data: {英文标题: entry}}）。
+# 用于发现「已爬取但字典中尚无分组」的角色/羁绊。
+_ALIAS_DETAILS_FILES = {
+    "char": WIKI_CACHE_DIR / "character_details.json",
+    "bond": WIKI_CACHE_DIR / "bond_details.json",
+}
+
+
+def wiki_aliases_missing(kind: str) -> dict:
+    """List scraped entries that have no group in the alias dictionary yet.
+
+    Matching is by **English title** (the details-cache key) against the dic's
+    alias set — deterministic, and immune to LLM Chinese-translation variance
+    in ``name_cn`` (a character whose group already exists is never reported,
+    even if the cached translation uses different hanzi than the canonical).
+    Falls back to skipping entries whose ``name_cn`` already is a known
+    canonical. A missing/corrupt details cache yields an empty list + note
+    (bond_details.json is not present on every machine).
+
+    Returns ``{"items": [{canonical, title_en, aliases_hint}], "note"?}``
+    or ``{"error": ...}``.
+    """
+    if kind not in _ALIAS_FILES:
+        return {"error": f"非法别名类型: {kind}"}
+    details_path = _ALIAS_DETAILS_FILES[kind]
+    if not details_path.exists():
+        return {"items": [], "note": f"详情缓存不存在: {details_path.name}（尚未爬取）"}
+    try:
+        blob = json.loads(details_path.read_text(encoding="utf-8"))
+        data = blob.get("data", {}) if isinstance(blob, dict) else {}
+    except Exception as e:
+        return {"items": [], "note": f"详情缓存读取失败: {e}"}
+
+    # 已有别名 + 规范名集合（英文标题在字典中即以别名形式收录）
+    known: set[str] = set()
+    dic_path = _ALIAS_FILES[kind]
+    if dic_path.exists():
+        try:
+            flat = json.loads(dic_path.read_text(encoding="utf-8"))
+            known = {str(a) for a in flat} | {str(c) for c in flat.values()}
+        except Exception:
+            known = set()
+    known_low = {k.lower() for k in known}
+
+    items, seen = [], set()
+    for title, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        title = str(title)
+        if title in known or title.lower() in known_low:
+            continue
+        canon = str(entry.get("name_cn") or "").strip() or title
+        if canon in known or canon in seen:
+            continue
+        seen.add(canon)
+        hint = [canon] + ([title] if title != canon else [])
+        items.append({"canonical": canon, "title_en": title, "aliases_hint": hint})
+    items.sort(key=lambda x: x["canonical"])
+    return {"items": items}
