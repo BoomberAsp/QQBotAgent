@@ -64,3 +64,5 @@ QQBot/images/cal-speed-data/*
 # ── 退役组件（仅本地留档）────────────────────────
 # easyOCR 时代的逐数字模板，qwen3.5-ocr 切换后已无代码引用
 QQBot/config/ocr_digit_templates/
+# 运行时 LLM 翻译缓存（各机器独立再生，勿跟踪）
+QQBot/data/wiki_cache/name_mapping.json
