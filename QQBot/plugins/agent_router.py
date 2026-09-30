@@ -1801,6 +1801,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
     # ── Detect and download file/image attachments ─────────────────
     file_context_parts = []
+    has_voice = False
     msg_id = str(event.message_id)
     for seg in event.message:
         if seg.type == "image":
@@ -1829,6 +1830,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
                 _record_file(msg_id, name, error=error)
 
         elif seg.type == "record":
+            has_voice = True
             saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
             if saved_path:
                 file_context_parts.append(
@@ -1844,8 +1846,12 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
     quota_warn = _quota_warning(user_id)
 
     # ── File-only messages: acknowledge and skip agent ─────────────
+    # Voice messages are exempt: a bare voice message is a conversational
+    # turn (the user expects the LLM to listen and respond), not a file
+    # upload awaiting later analysis. Skipping the agent for voice broke
+    # the pre-existing "语音直达 LLM" behavior (regression from f7e5f4e).
     has_files = bool(file_context_parts)
-    if has_files and not text_content and not reply_context:
+    if has_files and not has_voice and not text_content and not reply_context:
         names = []
         for part in file_context_parts:
             m = re.search(r"文件 (.+?)，", part) or re.search(r"上传了(\w+)，", part)
@@ -1875,6 +1881,13 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
     if context_prefix:
         if text_content:
             augmented_message = f"{context_prefix}\n用户说: {text_content}"
+        elif has_voice:
+            # Bare voice turn: instruct the agent to listen and respond,
+            # matching the pre-f7e5f4e behavior where 语音直达 LLM.
+            augmented_message = (
+                f"{context_prefix}\n用户发送了语音消息，请使用 read_file 工具"
+                f"分析音频内容，并根据其内容直接回应用户。"
+            )
         else:
             augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请根据用户意图选择合适的工具查看内容。"
     else:
