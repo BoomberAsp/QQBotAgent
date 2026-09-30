@@ -314,6 +314,8 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 **Note**: The `/兑换码` and `/redeem-code` slash commands also trigger this feature directly without going through the agent. The tool is for natural-language requests like "有什么兑换码吗".
 
+**Note**: After returning the list, the tool automatically sends each code to the user as a separate standalone message (for easy copying). Do NOT repeat the full code list character-by-character in your reply — a brief summary (e.g. how many codes are available and the freshest ones) is enough.
+
 ---
 
 ## Tool: gacha_pull

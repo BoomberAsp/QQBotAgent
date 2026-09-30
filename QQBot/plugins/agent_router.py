@@ -858,8 +858,11 @@ def _build_tool_registry() -> ToolRegistry:
         if not codes:
             return "当前没有有效的兑换码。"
 
+        # Cap list size to protect the LLM context window
+        MAX_TOOL_CODES = 30
+        hidden = len(codes) - MAX_TOOL_CODES
         lines = ["当前有效兑换码:"]
-        for entry in codes:
+        for entry in codes[:MAX_TOOL_CODES]:
             code = entry.get("code", "")
             content = entry.get("content", "")
             valid = entry.get("valid", "")
@@ -869,6 +872,27 @@ def _build_tool_registry() -> ToolRegistry:
             if valid:
                 line += f" (有效期至: {valid})"
             lines.append(line)
+        if hidden > 0:
+            lines.append(f"  …另有 {hidden} 条较早的码未列出")
+
+        # Send each code as a standalone message so users can copy it directly
+        try:
+            from agent.context import _send_msg
+            send = _send_msg.get()
+            if send is not None:
+                await send("以下逐条发送兑换码，方便复制：")
+                for entry in codes[:MAX_TOOL_CODES]:
+                    code = entry.get("code", "")
+                    if not code:
+                        continue
+                    await asyncio.sleep(1.0)  # QQ rate limiting
+                    await send(code)
+                lines.append("（兑换码已逐条单独发送给用户，方便复制）")
+        except Exception as e:
+            import sys
+            print(f"[redeem_code] per-code send failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+
         return "\n".join(lines)
 
     registry.register(
@@ -2363,19 +2387,36 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
     if cmd not in ("/兑换码", "/redeem-code", "#兑换码", "#redeem-code"):
         return False
 
-    from plugins.check_redeem_code import get_redeem_codes, check_and_refresh
+    from plugins.check_redeem_code import (
+        get_redeem_codes, check_and_refresh, get_cache_info,
+    )
 
     # Trigger background refresh if stale, then use cached data
     refreshed = await check_and_refresh()
     codes = get_redeem_codes()
+    info = get_cache_info()
+
+    # Staleness footer: shown when cache is old (scrape failing / no fresh data)
+    stale_note = ""
+    if info.get("stale"):
+        iso = info.get("scraped_at_iso", "")
+        date_part = iso[:10] if iso else "未知时间"
+        stale_note = f"\n⚠ 数据截至 {date_part}（自动更新失败，可能不是最新）"
 
     if not codes:
-        status = " (已是最新)" if refreshed else ""
-        await _safe_send(f"现在还没有兑换码哦Σ( ° △ °){status}")
+        if stale_note:
+            await _safe_send(f"缓存里没有未过期的兑换码。{stale_note}")
+        else:
+            await _safe_send("现在还没有兑换码哦Σ( ° △ °)")
         return True
 
-    lines = ["当前有效兑换码:" if not refreshed else "当前有效兑换码 (已更新):", ""]
-    for entry in codes:
+    # Cap the list so a bloated cache can never produce an unsendable message
+    MAX_DISPLAY = 30
+    shown = codes[:MAX_DISPLAY]
+    hidden = len(codes) - len(shown)
+
+    lines = ["当前有效兑换码:", ""]
+    for entry in shown:
         code = entry.get("code", "")
         content = entry.get("content", "")
         valid = entry.get("valid", "")
@@ -2385,8 +2426,38 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
         if valid:
             line += f"\n  有效期至: {valid}"
         lines.append(line)
+    if hidden > 0:
+        lines.append(f"  …另有 {hidden} 条较早的码未显示")
+    if stale_note:
+        lines.append(stale_note)
 
-    await _safe_send("\n".join(lines))
+    # Split into ≤300-char chunks on line boundaries (QQ single-message limit)
+    chunks = []
+    current = ""
+    for ln in "\n".join(lines).split("\n"):
+        candidate = f"{current}\n{ln}" if current else ln
+        if len(candidate) <= 300:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = ln
+    if current:
+        chunks.append(current)
+
+    for i, chunk in enumerate(chunks):
+        await _safe_send(chunk)
+        if i < len(chunks) - 1:
+            await asyncio.sleep(1.0)  # QQ rate limiting
+
+    # Send each code as a standalone message so users can copy it directly
+    await _safe_send("以下逐条发送兑换码，方便复制：")
+    for i, entry in enumerate(shown):
+        code = entry.get("code", "")
+        if not code:
+            continue
+        await asyncio.sleep(1.0)  # QQ rate limiting
+        await _safe_send(code)
     return True
 
 
