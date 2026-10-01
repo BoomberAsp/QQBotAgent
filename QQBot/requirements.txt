@@ -40,3 +40,12 @@ pytest>=7.0.0
 # vllm>=0.6.0
 # transformers>=4.40.0
 # accelerate>=0.27.0
+
+# ── Optional: Redeem-code browser engine (ruyiPage) ──────────────
+# ruyiPage is intentionally NOT listed here. It drives a fingerprinted
+# Firefox to pierce ucngame's Cloudflare challenge and is installed into a
+# DEDICATED venv (~/.virtualenvs/ruyipage) so a browser crash can never
+# take down the bot and its heavy deps stay out of production.
+#   deps:    scripts/requirements-browser.txt
+#   install: bash scripts/install_redeem_browser.sh   (setup.sh offers this)
+#   enable:  REDEEM_CODE_BROWSER=ruyipage in QQBot/.env, then restart

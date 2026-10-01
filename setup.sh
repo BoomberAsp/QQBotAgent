@@ -265,6 +265,32 @@ start_searxng() {
     echo "  4. 如果 DNS 解析失败, 检查 docker-compose.yml 中的 dns 配置"
 }
 
+# ── 8. 安装兑换码浏览器引擎 (可选, ruyiPage) ────────────────────
+install_redeem_browser() {
+    echo -e "\n${YELLOW}[可选]${NC} 安装兑换码浏览器引擎 (ruyiPage)..."
+    echo -e "${GREEN}[INFO]${NC} 用于绕过 ucngame 的 Cloudflare 挑战, 自动刷新兑换码"
+    echo -e "${GREEN}[INFO]${NC} 装入独立 venv (~/.virtualenvs/ruyipage), 与主程序隔离, 不影响 bot"
+
+    if [ ! -f "scripts/install_redeem_browser.sh" ]; then
+        echo -e "${YELLOW}[WARN]${NC} 未找到 scripts/install_redeem_browser.sh, 跳过"
+        return
+    fi
+
+    # Best-effort: the engine is optional, so never abort setup if it fails.
+    # (install_redeem_browser.sh needs xvfb-run — installed with system deps —
+    #  and network for the ~80MB Firefox runtime; on a CN host set
+    #  REDEEM_BROWSER_PROXY, on a direct host export REDEEM_BROWSER_PROXY="".)
+    if bash scripts/install_redeem_browser.sh; then
+        echo -e "${GREEN}[OK]${NC} 浏览器引擎安装完成"
+        echo -e "${YELLOW}[提示]${NC} 如需启用自动刷新, 在 QQBot/.env 添加后重启 bot:"
+        echo "  REDEEM_CODE_BROWSER=ruyipage"
+        echo "  REDEEM_CODE_BROWSER_PYTHON=\$HOME/.virtualenvs/ruyipage/bin/python"
+    else
+        echo -e "${YELLOW}[WARN]${NC} 浏览器引擎安装失败 (可选组件, 不影响主程序与面板手动维护)"
+        echo -e "${YELLOW}[WARN]${NC} 可稍后手动重试: bash scripts/install_redeem_browser.sh"
+    fi
+}
+
 # ── Main ─────────────────────────────────────────────────────
 main() {
     detect_os
@@ -283,6 +309,14 @@ main() {
     setup_env
     setup_models
 
+    # 询问是否安装兑换码浏览器引擎 (可选, 独立 venv, 不影响主程序)
+    echo ""
+    read -p "是否安装兑换码浏览器引擎 (ruyiPage, 自动抓取兑换码)? [y/N]: " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        install_redeem_browser
+    fi
+
     echo -e "\n${BLUE}=========================================${NC}"
     echo -e "${GREEN}  安装完成!${NC}"
     echo -e "${BLUE}=========================================${NC}"
@@ -293,6 +327,7 @@ main() {
     echo -e "  3. 安装 NapCat: ${YELLOW}bash napcat.sh --docker n${NC}"
     echo -e "  4. 在 NapCat WebUI 中配置反向 WebSocket 连接到 ws://127.0.0.1:8081/onebot/v11/ws"
     echo -e "  5. 启动: ${YELLOW}bash start.sh${NC}"
+    echo -e "  (可选) 兑换码浏览器引擎: ${YELLOW}bash scripts/install_redeem_browser.sh${NC} 后在 .env 启用 REDEEM_CODE_BROWSER"
     echo ""
 }
 

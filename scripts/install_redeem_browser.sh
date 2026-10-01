@@ -22,9 +22,13 @@
 # ============================================================
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="${RUYIPAGE_VENV:-$HOME/.virtualenvs/ruyipage}"
 PROXY="${REDEEM_BROWSER_PROXY-http://127.0.0.1:1081}"   # note: no colon => empty allowed
 REPO="LoseNine/ruyipage"
+# Single source of truth for the engine's Python deps (keeps them out of the
+# bot venv's requirements.txt — see the file header for the isolation rationale).
+BROWSER_REQS="${REDEEM_BROWSER_REQS:-$SCRIPT_DIR/requirements-browser.txt}"
 
 BLUE='\033[0;34m'; GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 log()  { printf "${BLUE}[install-browser]${NC} %s\n" "$*"; }
@@ -53,13 +57,16 @@ fi
 PY="$VENV_DIR/bin/python"
 
 # ── 2. python packages ──────────────────────────────────────────
-log "installing ruyiPage + requests (pip)"
+if [ ! -f "$BROWSER_REQS" ]; then
+    err "requirements file not found: $BROWSER_REQS"; exit 1
+fi
+log "installing engine deps from $(basename "$BROWSER_REQS") (pip)"
 "$PY" -m pip install -q --upgrade pip
 # pip usually has a fast local mirror configured; try direct, then proxy.
-if ! "$PY" -m pip install -q ruyiPage requests 2>/dev/null; then
+if ! "$PY" -m pip install -q -r "$BROWSER_REQS" 2>/dev/null; then
     log "direct pip failed; retrying via proxy"
     HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" \
-        "$PY" -m pip install -q ruyiPage requests
+        "$PY" -m pip install -q -r "$BROWSER_REQS"
 fi
 RUYI_VER="$("$PY" -c 'import ruyipage;print(getattr(ruyipage,"__version__","?"))')"
 ok "ruyiPage $RUYI_VER installed in venv"
