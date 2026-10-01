@@ -107,7 +107,7 @@ _STATUS_TERM_CN = [
     ("Increase the Action Gauge", "行动值提升"),
     ("damage distribution effects", "伤害分配（分摊）效果"),
     ("ACC Up", "（基础）命中率提升"),
-    ("Morale", "战意"),
+    ("Morale", "战意值"),
     ("Injury", "创伤"),
     ("restore HP", "回复生命值"),
     ("Vigor", "气魄"),
@@ -176,7 +176,8 @@ _STATUS_TERM_CN = [
     ("Transfer", "转移"),
     ("rebound", "反弹"),
     ("favorable attribute", "有利属性"),
-    ("attribute counter", "不利属性")
+    ("attribute counter", "不利属性"),
+    ("Member","团员")
 ]
 
 # Wiki stat multipliers: the wiki's {{Member}} template computes level-60 stats
