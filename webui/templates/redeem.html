@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="alert-banner" id="rd-alert" style="display:none">
+  <span>⚠ <b>兑换码提醒</b>：<span id="rd-alert-text"></span></span>
+  <span class="spacer"></span>
+  <span class="muted" id="rd-alert-time"></span>
+  <button class="btn btn-sm" id="rd-alert-dismiss">忽略</button>
+</div>
+
+<div class="card">
+  <h2 class="card-title">推文解析</h2>
+  <p class="muted" style="margin:0 0 8px">
+    粘贴官方公告/推文文本（如 <code>兌換期限至 2026-10-14 08:00(UTC+8)　…序號：ArkXXXX</code>），
+    自动拆出兑换码 / 有效期 / 兑换内容，确认后入列。
+  </p>
+  <textarea id="rd-tweet" class="code-editor" rows="4" style="width:100%"
+            placeholder="兌換期限至 2026-10-14 08:00(UTC+8)&#10;🏁 極速的西爾維納登場紀念序號：Ark99u5XgYsp"></textarea>
+  <div class="row" style="margin-top:8px">
+    <button class="btn btn-sm" id="rd-parse">解析</button>
+    <span class="muted" id="rd-parse-hint"></span>
+  </div>
+</div>
+
+<div class="card" id="rd-edit" style="display:none">
+  <h2 class="card-title" id="rd-edit-title">添加兑换码</h2>
+  <div class="row" style="align-items:flex-end">
+    <div class="field" style="margin:0">
+      <span>兑换码 *</span>
+      <input type="text" id="rd-f-code" placeholder="Ark99u5XgYsp" style="width:220px">
+    </div>
+    <div class="field" style="margin:0;flex:1;min-width:220px">
+      <span>兑换内容（可留空）</span>
+      <input type="text" id="rd-f-content" placeholder="招募契约 x10" style="width:100%">
+    </div>
+    <div class="field" style="margin:0">
+      <span>有效期至（留空 = 长期）</span>
+      <input type="text" id="rd-f-valid" placeholder="2026-10-14" style="width:150px">
+    </div>
+    <button class="btn btn-primary btn-sm" id="rd-f-save">加入列表</button>
+    <button class="btn btn-ghost btn-sm" id="rd-f-cancel">取消</button>
+  </div>
+  <p class="muted" style="margin:8px 0 0">
+    有效期口径：所填日期 <b>08:00（北京时间）</b>失效（即 UTC 零点，与官方公告一致）。
+  </p>
+</div>
+
+<div class="card">
+  <div class="row">
+    <h2 class="card-title" style="margin:0">兑换码列表</h2>
+    <button class="btn btn-sm" id="rd-add">+ 添加</button>
+    <button class="btn btn-sm" id="rd-filter">只看限时</button>
+    <span class="spacer"></span>
+    <span class="muted mono" id="rd-meta">—</span>
+    <button class="btn btn-sm" id="rd-reload">重新加载</button>
+    <button class="btn btn-primary btn-sm" id="rd-save">保存全部</button>
+  </div>
+  <p class="muted" id="rd-dirty" style="margin:6px 0 0;display:none">
+    <span class="warn">● 有未保存的修改</span>
+  </p>
+  <div style="overflow-x:auto;margin-top:10px">
+    <table class="data-table" id="rd-table">
+      <thead>
+        <tr>
+          <th>兑换码</th><th>兑换内容</th><th>有效期至</th>
+          <th>添加日期</th><th>来源</th><th>分类</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="rd-tbody">
+        <tr><td colspan="7" class="muted">加载中…</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="muted" id="rd-stat" style="margin:8px 0 0"></p>
+</div>
+
+<p class="muted">
+  保存后 bot 立即生效（每次查询直接读盘）。手动添加/编辑的条目来源标记为 <code>panel</code>，
+  为权威数据：自动爬虫（ucngame，若恢复）不会覆盖其内容/有效期，过期清理也不会自动删除，
+  请在列表中手动删除失效条目。
+</p>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/redeem.js"></script>
+{% endblock %}

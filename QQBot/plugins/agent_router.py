@@ -848,60 +848,100 @@ def _build_tool_registry() -> ToolRegistry:
 
     # ── Redeem Code ────────────────────────────────────────────
 
-    async def _redeem_code_tool() -> str:
-        """Agent-facing tool: query valid redeem codes."""
-        from plugins.check_redeem_code import get_redeem_codes, check_and_refresh
+    async def _redeem_code_tool(scope: str = "time_limited") -> str:
+        """Agent-facing tool: query redeem codes by scope."""
+        from plugins.check_redeem_code import (
+            get_time_limited_codes, get_long_term_codes, check_and_refresh,
+            get_cache_info, format_expiry_display, _write_admin_alert,
+        )
 
         await check_and_refresh()
-        codes = get_redeem_codes()
-
-        if not codes:
-            return "当前没有有效的兑换码。"
 
         # Cap list size to protect the LLM context window
         MAX_TOOL_CODES = 30
-        hidden = len(codes) - MAX_TOOL_CODES
-        lines = ["当前有效兑换码:"]
-        for entry in codes[:MAX_TOOL_CODES]:
-            code = entry.get("code", "")
-            content = entry.get("content", "")
-            valid = entry.get("valid", "")
-            line = f"  {code}"
-            if content:
-                line += f" — {content}"
-            if valid:
-                line += f" (有效期至: {valid})"
-            lines.append(line)
-        if hidden > 0:
-            lines.append(f"  …另有 {hidden} 条较早的码未列出")
+        tl = get_time_limited_codes() if scope in ("time_limited", "all") else []
+        lt = get_long_term_codes() if scope in ("long_term", "all") else []
+        active = [c for c in tl if not c.get("recently_expired")]
+        recent_expired = [c for c in tl if c.get("recently_expired")]
 
-        # Send each code as a standalone message so users can copy it directly
-        try:
-            from agent.context import _send_msg
-            send = _send_msg.get()
-            if send is not None:
-                await send("以下逐条发送兑换码，方便复制：")
-                for entry in codes[:MAX_TOOL_CODES]:
-                    code = entry.get("code", "")
-                    if not code:
-                        continue
-                    await asyncio.sleep(1.0)  # QQ rate limiting
-                    await send(code)
-                lines.append("（兑换码已逐条单独发送给用户，方便复制）")
-        except Exception as e:
-            import sys
-            print(f"[redeem_code] per-code send failed: {type(e).__name__}: {e}",
-                  file=sys.stderr)
+        if scope == "time_limited" and not tl:
+            # No time-limited codes AND scraper failing → ping the admin
+            # via the WebUI panel alert banner.
+            if get_cache_info().get("stale"):
+                _write_admin_alert("no_valid_codes")
+                return ("当前兑换码均已过期，网页爬取失败，等待管理员添加。"
+                        "如需长期兑换码，请以 scope=long_term 重新调用。")
+            return ("当前没有有效的限时兑换码（7 天内也没有刚过期的）。"
+                    "如需长期兑换码，请以 scope=long_term 重新调用。")
+        if scope == "long_term" and not lt:
+            return "还没有收录长期有效的兑换码。"
+
+        lines = []
+        if scope in ("time_limited", "all"):
+            shown_active = active[:MAX_TOOL_CODES]
+            lines.append(f"【限时兑换码】当前有效 {len(active)} 条:")
+            for entry in shown_active:
+                line = f"  {entry.get('code', '')}"
+                if entry.get("content"):
+                    line += f" — 兑换内容: {entry['content']}"
+                if entry.get("valid"):
+                    line += f" (有效期至: {format_expiry_display(entry['valid'])})"
+                else:
+                    line += " (过期时间未知，尽快兑换)"
+                lines.append(line)
+            if len(active) > MAX_TOOL_CODES:
+                lines.append(f"  …另有 {len(active) - MAX_TOOL_CODES} 条未列出")
+            if recent_expired:
+                lines.append(f"  （另有 {len(recent_expired)} 条限时码已于 7 天内过期："
+                             + "、".join(e.get("code", "") for e in recent_expired[:10])
+                             + ("…" if len(recent_expired) > 10 else "") + "）")
+        if scope in ("long_term", "all"):
+            lines.append(f"【长期兑换码】无过期时间，共 {len(lt)} 条:")
+            for entry in lt[:MAX_TOOL_CODES]:
+                line = f"  {entry.get('code', '')}"
+                if entry.get("content"):
+                    line += f" — 兑换内容: {entry['content']}"
+                lines.append(line)
+            if len(lt) > MAX_TOOL_CODES:
+                lines.append(f"  …另有 {len(lt) - MAX_TOOL_CODES} 条未列出")
+
+        # Send each active time-limited code as a standalone message so users
+        # can copy it directly. Skipped for long_term/all — those lists can be
+        # huge; the user gets them as copyable list text instead.
+        if scope == "time_limited" and active[:MAX_TOOL_CODES]:
+            try:
+                from agent.context import _send_msg
+                send = _send_msg.get()
+                if send is not None:
+                    await send("以下逐条发送兑换码，方便复制：")
+                    for entry in active[:MAX_TOOL_CODES]:
+                        await asyncio.sleep(1.0)  # QQ rate limiting
+                        await send(entry["code"])
+                    lines.append("（限时兑换码已逐条单独发送给用户，方便复制；"
+                                 "你的回复中不必再逐字罗列它们）")
+            except Exception as e:
+                import sys
+                print(f"[redeem_code] per-code send failed: {type(e).__name__}: {e}",
+                      file=sys.stderr)
 
         return "\n".join(lines)
 
     registry.register(
         "redeem_code", _redeem_code_tool,
-        "查询当前有效的游戏兑换码列表。返回兑换码、奖励内容和有效期。"
-        "当用户询问兑换码相关问题时使用此工具。",
+        "查询游戏兑换码。默认返回当前有效的限时兑换码（含兑换内容与有效期）"
+        "及 7 天内刚过期的限时码；scope=long_term 返回长期有效（无过期时间）"
+        "的兑换码；scope=all 返回两类。当用户询问兑换码相关问题时使用此工具，"
+        "用户明确提到「长期兑换码」「永久码」时用 scope=long_term。",
         {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["time_limited", "long_term", "all"],
+                    "description": "time_limited=限时兑换码（默认）；long_term=长期兑换码；all=全部",
+                    "default": "time_limited",
+                },
+            },
             "required": [],
         },
     )
@@ -2378,60 +2418,8 @@ async def _safe_send(message, max_retries: int = 2, matcher=None):
         logger.warning(f"Failed to send message after {max_retries} retries: {last_error.info}")
 
 
-async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
-    """Handle /兑换码 / /redeem-code command — direct, no agent.
-
-    Returns True if the command was handled.
-    """
-    cmd = text.strip().split()[0] if text.strip() else ""
-    if cmd not in ("/兑换码", "/redeem-code", "#兑换码", "#redeem-code"):
-        return False
-
-    from plugins.check_redeem_code import (
-        get_redeem_codes, check_and_refresh, get_cache_info,
-    )
-
-    # Trigger background refresh if stale, then use cached data
-    refreshed = await check_and_refresh()
-    codes = get_redeem_codes()
-    info = get_cache_info()
-
-    # Staleness footer: shown when cache is old (scrape failing / no fresh data)
-    stale_note = ""
-    if info.get("stale"):
-        iso = info.get("scraped_at_iso", "")
-        date_part = iso[:10] if iso else "未知时间"
-        stale_note = f"\n⚠ 数据截至 {date_part}（自动更新失败，可能不是最新）"
-
-    if not codes:
-        if stale_note:
-            await _safe_send(f"缓存里没有未过期的兑换码。{stale_note}")
-        else:
-            await _safe_send("现在还没有兑换码哦Σ( ° △ °)")
-        return True
-
-    # Cap the list so a bloated cache can never produce an unsendable message
-    MAX_DISPLAY = 30
-    shown = codes[:MAX_DISPLAY]
-    hidden = len(codes) - len(shown)
-
-    lines = ["当前有效兑换码:", ""]
-    for entry in shown:
-        code = entry.get("code", "")
-        content = entry.get("content", "")
-        valid = entry.get("valid", "")
-        line = f"  {code}"
-        if content:
-            line += f"\n  内容: {content}"
-        if valid:
-            line += f"\n  有效期至: {valid}"
-        lines.append(line)
-    if hidden > 0:
-        lines.append(f"  …另有 {hidden} 条较早的码未显示")
-    if stale_note:
-        lines.append(stale_note)
-
-    # Split into ≤300-char chunks on line boundaries (QQ single-message limit)
+async def _send_text_chunks(lines: list):
+    """Send lines as ≤300-char chunks on line boundaries, 1s apart."""
     chunks = []
     current = ""
     for ln in "\n".join(lines).split("\n"):
@@ -2444,20 +2432,136 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
             current = ln
     if current:
         chunks.append(current)
-
     for i, chunk in enumerate(chunks):
         await _safe_send(chunk)
         if i < len(chunks) - 1:
             await asyncio.sleep(1.0)  # QQ rate limiting
 
-    # Send each code as a standalone message so users can copy it directly
+
+async def _send_codes_individually(codes: list):
+    """Send each code as a standalone message so users can copy it directly."""
+    entries = [c for c in codes if c.get("code")]
+    if not entries:
+        return
     await _safe_send("以下逐条发送兑换码，方便复制：")
-    for i, entry in enumerate(shown):
-        code = entry.get("code", "")
-        if not code:
-            continue
+    for entry in entries:
         await asyncio.sleep(1.0)  # QQ rate limiting
-        await _safe_send(code)
+        await _safe_send(entry["code"])
+
+
+async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
+    """Handle /兑换码 (time-limited) and /长期兑换码 commands — direct, no agent.
+
+    /兑换码       → currently-valid time-limited codes + codes expired ≤7 days
+    /长期兑换码   → codes with no known expiry (long-term / permanent)
+
+    Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    time_cmds = ("/兑换码", "/redeem-code", "#兑换码", "#redeem-code")
+    long_cmds = ("/长期兑换码", "#长期兑换码")
+    if cmd not in time_cmds and cmd not in long_cmds:
+        return False
+
+    from plugins.check_redeem_code import (
+        get_time_limited_codes, get_long_term_codes,
+        check_and_refresh, get_cache_info,
+        format_expiry_display, _write_admin_alert,
+    )
+
+    # Trigger background refresh if stale, then use cached data
+    await check_and_refresh()
+    info = get_cache_info()
+
+    # Staleness footer: shown when cache is old (scrape failing / no fresh data)
+    stale_note = ""
+    if info.get("stale"):
+        iso = info.get("scraped_at_iso", "")
+        date_part = iso[:10] if iso else "未知时间"
+        stale_note = f"⚠ 数据截至 {date_part}（自动更新失败，可能不是最新）"
+
+    # ── /长期兑换码 branch ──────────────────────────────────────
+    if cmd in long_cmds:
+        lt_codes = get_long_term_codes()
+        if not lt_codes:
+            msg = "还没有收录长期有效的兑换码。"
+            if stale_note:
+                msg += f"\n{stale_note}"
+            await _safe_send(msg)
+            return True
+
+        lines = [f"长期有效兑换码（无过期时间，共 {len(lt_codes)} 条）:", ""]
+        for entry in lt_codes:
+            line = f"  {entry.get('code', '')}"
+            if entry.get("content"):
+                line += f"\n  兑换内容: {entry['content']}"
+            lines.append(line)
+        lines.append("")
+        lines.append("（数量较多，不逐条发送；长按上方消息可复制）")
+        if stale_note:
+            lines.append(stale_note)
+        await _send_text_chunks(lines)
+        return True
+
+    # ── /兑换码 branch: time-limited codes ─────────────────────
+    codes = get_time_limited_codes()
+    active = [c for c in codes if not c.get("recently_expired")]
+    recent_expired = [c for c in codes if c.get("recently_expired")]
+
+    if not codes:
+        if info.get("stale"):
+            # No time-limited codes AND scraper failing → tell the user
+            # and raise the WebUI panel alert so the admin adds codes.
+            _write_admin_alert("no_valid_codes")
+            msg = "当前兑换码均已过期，网页爬取失败，等待管理员添加"
+        else:
+            msg = "当前没有有效的限时兑换码哦Σ( ° △ °)"
+        msg += "\n长期有效的兑换码请发送 /长期兑换码 查询。"
+        if stale_note:
+            msg += f"\n{stale_note}"
+        await _safe_send(msg)
+        return True
+
+    # Cap the active list so a bloated cache can never produce an
+    # unsendable message or an endless per-code flood
+    MAX_DISPLAY = 30
+    shown_active = active[:MAX_DISPLAY]
+    hidden = len(active) - len(shown_active)
+
+    lines = [f"当前有效限时兑换码（{len(active)} 条）:", ""]
+    for entry in shown_active:
+        line = f"  {entry.get('code', '')}"
+        if entry.get("content"):
+            line += f"\n  兑换内容: {entry['content']}"
+        if entry.get("valid"):
+            line += f"\n  有效期至: {format_expiry_display(entry['valid'])}"
+        else:
+            line += "\n  过期时间未知（新收录，建议尽快兑换）"
+        lines.append(line)
+
+    if recent_expired:
+        lines.append("")
+        lines.append(f"以下限时码已于 7 天内过期（{len(recent_expired)} 条）：")
+        for entry in recent_expired:
+            line = f"  {entry.get('code', '')}"
+            if entry.get("content"):
+                line += f"\n  兑换内容: {entry['content']}"
+            expired_disp = format_expiry_display(entry.get("valid", "")) or "?"
+            line += f"\n  已于 {expired_disp} 过期"
+            lines.append(line)
+
+    if hidden > 0:
+        lines.append(f"  …另有 {hidden} 条较早的码未显示")
+    lines.append("")
+    lines.append("长期有效的兑换码请发送 /长期兑换码")
+    if stale_note:
+        lines.append(stale_note)
+
+    await _send_text_chunks(lines)
+
+    # Send each active code as a standalone message (expired ones excluded —
+    # single-sending them would invite users to copy dead codes)
+    await _send_codes_individually(shown_active)
     return True
 
 

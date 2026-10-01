@@ -299,22 +299,29 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: redeem_code
 
-**Description**: Query currently valid game redeem/exchange codes. Returns code strings, reward descriptions, and expiry dates. Codes are automatically scraped and cached daily; expired codes (>7 days) are cleaned up automatically.
+**Description**: Query game redeem/exchange codes. Codes are maintained manually by the admin through the WebUI 兑换码管理 page (authoritative, source=panel), supplemented by a daily auto-scrape of ucngame.com when it is reachable (currently Cloudflare-blocked); scraped codes expired >7 days are cleaned up automatically, panel entries never are. Expiry semantics: a code's `valid` date means it expires at **08:00 (UTC+8)** that morning (UTC midnight), matching official announcements ("兌換期限至 2026-10-14 08:00(UTC+8)"). Two categories: **time-limited** codes (have an expiry date, or were first listed within the last 30 days — fresh event codes) and **long-term** codes (no known expiry and not recently listed; mixes permanent codes with old unverified ones). Default scope returns currently-valid time-limited codes plus time-limited codes that expired within the last 7 days. When no time-limited codes remain and the scraper is failing, the tool says the data awaits an admin update and notifies the WebUI panel.
 
-**When to use**: When the user asks about redeem codes, exchange codes, or 兑换码. Keywords: 兑换码, redeem code, CDK, 礼包码, CDKey.
+**When to use**: When the user asks about redeem codes, exchange codes, or 兑换码. Keywords: 兑换码, redeem code, CDK, 礼包码, CDKey. Use scope=long_term when the user explicitly asks for 长期兑换码/永久码.
 
 **Parameters**:
 ```json
 {
   "type": "object",
-  "properties": {},
+  "properties": {
+    "scope": {
+      "type": "string",
+      "enum": ["time_limited", "long_term", "all"],
+      "description": "time_limited=限时兑换码（默认）；long_term=长期兑换码；all=全部",
+      "default": "time_limited"
+    }
+  },
   "required": []
 }
 ```
 
-**Note**: The `/兑换码` and `/redeem-code` slash commands also trigger this feature directly without going through the agent. The tool is for natural-language requests like "有什么兑换码吗".
+**Note**: The `/兑换码` and `/redeem-code` slash commands (time-limited) and `/长期兑换码` (long-term) also trigger this feature directly without going through the agent. The tool is for natural-language requests like "有什么兑换码吗".
 
-**Note**: After returning the list, the tool automatically sends each code to the user as a separate standalone message (for easy copying). Do NOT repeat the full code list character-by-character in your reply — a brief summary (e.g. how many codes are available and the freshest ones) is enough.
+**Note**: With the default scope, after returning the list the tool automatically sends each active time-limited code to the user as a separate standalone message (for easy copying). Do NOT repeat the full code list character-by-character in your reply — a brief summary (e.g. how many codes are available and the freshest ones) is enough. For long_term/all scopes no per-code messages are sent; summarize the important codes in your reply.
 
 ---
 

@@ -51,6 +51,10 @@ python test/test_task_record.py
 TASKREC_EXIT=$?
 python test/test_character_lookup_and_heal.py
 CHARHEAL_EXIT=$?
+python test/test_redeem_code.py
+REDEEM_EXIT=$?
+python test/test_redeem_panel.py
+REDEEMPANEL_EXIT=$?
 cd "$SCRIPT_DIR/QQBot"
 
 EXIT_CODE=0
@@ -64,6 +68,8 @@ if [ $ALIAS_EXIT -ne 0 ]; then EXIT_CODE=$ALIAS_EXIT; fi
 if [ $CARDIMG_EXIT -ne 0 ]; then EXIT_CODE=$CARDIMG_EXIT; fi
 if [ $TASKREC_EXIT -ne 0 ]; then EXIT_CODE=$TASKREC_EXIT; fi
 if [ $CHARHEAL_EXIT -ne 0 ]; then EXIT_CODE=$CHARHEAL_EXIT; fi
+if [ $REDEEM_EXIT -ne 0 ]; then EXIT_CODE=$REDEEM_EXIT; fi
+if [ $REDEEMPANEL_EXIT -ne 0 ]; then EXIT_CODE=$REDEEMPANEL_EXIT; fi
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}=========================================${NC}"

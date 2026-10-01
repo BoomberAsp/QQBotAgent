@@ -5,21 +5,25 @@ Supports:
   - /兑换码, /redeem-code (direct NoneBot commands, skip agent)
   - Natural language → agent → redeem_code tool
   - Scraper with Beijing-time yesterday 18:00 staleness check
-  - Auto-cleanup: codes expired 7+ days are removed
-  - Manual maintenance: add codes directly to the JSON file
+  - Auto-cleanup: codes expired 7+ days are removed (panel entries exempt)
+  - Manual maintenance via the WebUI 兑换码管理 page — panel-authored
+    entries (_source="panel") are authoritative: the scraper never
+    overwrites them and cleanup never removes them.
 
-Data sources (tried in order, results merged):
-  - https://gamevoyant.com/codes/ark-recode-redeem-codes   (direct, JS data)
-  - https://cofregamers.com/en/ark-recode-redeem-code-list/ (needs proxy)
-  - https://ucngame.com/codes/ark-recode-redeem-codes/     (Cloudflare-blocked
-    since ~2026-09, kept as fallback)
+Data source:
+  - https://ucngame.com/codes/ark-recode-redeem-codes/ — the only
+    high-timeliness aggregator, but behind a Cloudflare JS challenge
+    since ~2026-09; kept as a dormant auto-fallback in case it recovers.
+    (gamevoyant / cofregamers were removed 2026-10: incomplete data.)
 
 Sources unreachable directly from the server are fetched through the proxy
 configured via REDEEM_CODE_PROXY (or HTTPS_PROXY) in QQBot/.env, e.g.:
   REDEEM_CODE_PROXY=http://127.0.0.1:1081
 
-Expiry dates are extracted from English prose in reward text
-("Valid until September 30th, 2026") so filtering and cleanup work.
+Expiry semantics: a `valid` date means UTC midnight of that day, i.e.
+08:00 (UTC+8) — official announcements read "兌換期限至 2026-10-14
+08:00(UTC+8)". Expiry dates in English prose ("Valid until September
+30th, 2026") are extracted so filtering and cleanup work.
 """
 
 import asyncio
@@ -38,6 +42,9 @@ _DATA_DIR = os.path.join(
     os.path.dirname(__file__), "..", "data", "redeem_code"
 )
 _CACHE_FILE = os.path.join(_DATA_DIR, "redeem_code.json")
+# Alert state file: written by the bot when no valid time-limited codes
+# remain and scraping failed; read/cleared by the WebUI 兑换码管理 page.
+_ALERT_FILE = os.path.join(_DATA_DIR, "admin_alert.json")
 
 # ── Scraper Config ────────────────────────────────────────────────
 
@@ -65,6 +72,73 @@ def get_redeem_codes() -> list[dict]:
     valid.sort(key=lambda e: e.get("_added", "") or e.get("valid", ""),
                reverse=True)
     return valid
+
+
+# Codes first seen within this many days count as time-limited event codes
+# even when the source provides no expiry date (event codes typically live
+# 2–4 weeks; permanent codes eventually age out of this window).
+_RECENT_DAYS = 30
+
+
+def get_time_limited_codes(grace_days: int = _CLEANUP_DAYS) -> list[dict]:
+    """Return time-limited codes.
+
+    Time-limited = has a known expiry date (`valid`), OR was first published
+    within the last _RECENT_DAYS days (fresh event codes whose expiry the
+    source doesn't state). Includes codes expired within `grace_days`.
+
+    Each returned entry gets a transient "recently_expired" bool key
+    (not persisted to the cache). Sorted: non-expired first, newest first.
+    """
+    entries = _load_cache()
+    now = datetime.now(BEIJING)
+    grace_cutoff = now - timedelta(days=grace_days)
+    recent_cutoff = (now - timedelta(days=_RECENT_DAYS)).strftime("%Y-%m-%d")
+    out = []
+    for entry in entries:
+        expiry = entry.get("valid", "")
+        parsed = _parse_date(expiry) if expiry else None
+        if parsed:
+            if parsed < grace_cutoff:
+                continue  # expired beyond the grace window
+            recently_expired = parsed < now
+        else:
+            # No expiry info → only count as time-limited if recently added
+            added = entry.get("_added", "") or ""
+            if not added or added < recent_cutoff:
+                continue  # old / undated → long-term bucket
+            recently_expired = False
+        item = dict(entry)
+        item["recently_expired"] = recently_expired
+        out.append(item)
+    out.sort(key=lambda e: e.get("valid", "") or e.get("_added", "") or "",
+             reverse=True)
+    out.sort(key=lambda e: e["recently_expired"])  # stable: active first
+    return out
+
+
+def get_long_term_codes() -> list[dict]:
+    """Return long-term codes: no known expiry AND not recently published.
+
+    This bucket mixes genuinely permanent codes with old unverified ones —
+    sources stop tracking expiry for codes they no longer check.
+    Sorted by publish date (_added), newest first.
+    """
+    entries = _load_cache()
+    recent_cutoff = (
+        datetime.now(BEIJING) - timedelta(days=_RECENT_DAYS)
+    ).strftime("%Y-%m-%d")
+    out = []
+    for entry in entries:
+        expiry = entry.get("valid", "")
+        if expiry and _parse_date(expiry):
+            continue  # has expiry info → time-limited bucket
+        added = entry.get("_added", "") or ""
+        if added and added >= recent_cutoff:
+            continue  # fresh event code → time-limited bucket
+        out.append(entry)
+    out.sort(key=lambda e: e.get("_added", "") or "", reverse=True)
+    return out
 
 
 def get_cache_info() -> dict:
@@ -153,8 +227,12 @@ def _save_cache(codes: list[dict], scraped_at: float = None):
         "source_url": _REDEEM_CODE_URL,
         "codes": codes,
     }
-    with open(_CACHE_FILE, "w", encoding="utf-8") as f:
+    # Atomic write (tmp + os.replace) — the WebUI panel writes the same
+    # file atomically; never leave a half-written cache behind.
+    tmp = _CACHE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _CACHE_FILE)
 
 
 # ── Staleness ─────────────────────────────────────────────────────
@@ -200,15 +278,21 @@ async def _refresh():
         code = entry["code"]
         if code in existing_by_code:
             # Update from scraper, but never blank out known data
-            # (sources differ in what fields they provide)
+            # (sources differ in what fields they provide).
             ex = existing_by_code[code]
-            if entry.get("content"):
-                ex["content"] = entry["content"]
-            if entry.get("valid"):
-                ex["valid"] = entry["valid"]
-            if entry.get("_added"):
+            # Panel-authored entries are authoritative (manually curated
+            # from official announcements) — the scraper may refresh
+            # _added (proof the code is still listed) but must not
+            # overwrite content/valid/_source.
+            is_panel = ex.get("_source") == "panel"
+            if not is_panel:
+                if entry.get("content"):
+                    ex["content"] = entry["content"]
+                if entry.get("valid"):
+                    ex["valid"] = entry["valid"]
+                ex["_source"] = entry.get("_source", "scraped")
+            if (entry.get("_added") or "") > (ex.get("_added") or ""):
                 ex["_added"] = entry["_added"]
-            ex["_source"] = entry.get("_source", "scraped")
         else:
             existing_by_code[code] = entry
 
@@ -295,20 +379,11 @@ async def _fetch_url(url: str, use_proxy: bool = False) -> str | None:
 
 # ── Source registry ───────────────────────────────────────────────
 # ucngame.com is behind a Cloudflare JS challenge since ~2026-09 and is
-# kept only as a fallback. gamevoyant works directly from the server;
-# cofregamers requires the proxy.
+# kept only as a dormant auto-fallback; the primary maintenance channel
+# is the WebUI 兑换码管理 page (panel entries). gamevoyant/cofregamers
+# were removed 2026-10 (incomplete, low-quality data).
 
 _SOURCES = [
-    {
-        "name": "gamevoyant",
-        "url": "https://gamevoyant.com/codes/ark-recode-redeem-codes",
-        "proxy": False,
-    },
-    {
-        "name": "cofregamers",
-        "url": "https://cofregamers.com/en/ark-recode-redeem-code-list/",
-        "proxy": True,
-    },
     {
         "name": "ucngame",
         "url": _REDEEM_CODE_URL,
@@ -331,12 +406,7 @@ async def _scrape() -> list[dict] | None:
         if html is None:
             continue
         ok_any = True
-        if src["name"] == "gamevoyant":
-            entries = _parse_gamevoyant(html)
-        elif src["name"] == "cofregamers":
-            entries = _parse_cofregamers(html)
-        else:
-            entries = _parse_html(html)
+        entries = _parse_html(html)
         for e in entries:
             e["_source"] = src["name"]
         print(f"[RedeemCode] {src['name']}: parsed {len(entries)} codes",
@@ -349,14 +419,26 @@ async def _scrape() -> list[dict] | None:
 
 
 def _dedupe_entries(entries: list[dict]) -> list[dict]:
-    """Dedupe scraped entries by code, preferring ones with expiry info."""
+    """Dedupe scraped entries by code, merging the best info per field.
+
+    - valid/content: first non-empty wins
+    - _added: newest wins (semantics: most recent date any source listed
+      or confirmed the code, so an active listing on one source outweighs
+      an old publish date on another)
+    """
     by_code = {}
     for entry in entries:
         code = entry["code"]
         if code not in by_code:
             by_code[code] = entry
-        elif not by_code[code].get("valid") and entry.get("valid"):
-            by_code[code] = entry
+            continue
+        ex = by_code[code]
+        if not ex.get("valid") and entry.get("valid"):
+            ex["valid"] = entry["valid"]
+        if not ex.get("content") and entry.get("content"):
+            ex["content"] = entry["content"]
+        if (entry.get("_added") or "") > (ex.get("_added") or ""):
+            ex["_added"] = entry["_added"]
     return list(by_code.values())
 
 
@@ -366,117 +448,6 @@ def _fullwidth_to_ascii(text: str) -> str:
         chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else c
         for c in text
     )
-
-
-_GV_ENTRY_RE = re.compile(
-    r'\{code:"([^"]+)",reward:"([^"]*)",status:"([^"]*)"\}'
-)
-
-_BARE_DATE_RE = re.compile(
-    r'([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4})'
-)
-
-
-def _parse_bare_date(text: str) -> str:
-    """Parse a bare 'Month Day, Year' date. Returns 'YYYY-MM-DD' or ''."""
-    if not text:
-        return ""
-    match = _BARE_DATE_RE.search(text)
-    if not match:
-        return ""
-    month = _MONTHS.get(match.group(1).lower())
-    if not month:
-        return ""
-    try:
-        return datetime(int(match.group(3)), month, int(match.group(2)),
-                        tzinfo=BEIJING).strftime("%Y-%m-%d")
-    except ValueError:
-        return ""
-
-
-def _parse_gamevoyant(html: str) -> list[dict]:
-    """Parse gamevoyant.com's embedded JS data.
-
-    Format: $R[n]={code:"...",reward:"...(Valid until September 30th, 2026)",
-                   status:"expired" | "expires:september 30, 2026" | ...}
-    """
-    codes = []
-    yesterday = (datetime.now(BEIJING) - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    for match in _GV_ENTRY_RE.finditer(html):
-        code = _fullwidth_to_ascii(match.group(1)).strip()
-        reward = _fullwidth_to_ascii(match.group(2))
-        status = match.group(3).strip().lower()
-
-        if not code or len(code) < 6:
-            continue
-
-        # Expiry: from status ("expires:<date>") or from prose in reward text
-        valid = ""
-        if status.startswith("expires:"):
-            valid = _parse_bare_date(status[len("expires:"):])
-        if not valid:
-            valid = _parse_prose_date(reward)
-        if status == "expired" and not valid:
-            # Source says expired but gave no date — mark with yesterday so
-            # display filtering and 7-day cleanup both work.
-            valid = yesterday
-
-        codes.append({
-            "code": code,
-            "content": _normalize_content(reward),
-            "valid": valid,
-            "_added": _parse_added_date(reward),
-        })
-
-    return codes
-
-
-_CG_ROW_RE = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
-_CG_CODE_RE = re.compile(r'data-codigo="([^"]+)"')
-_CG_REWARD_RE = re.compile(
-    r'<span class="recompensa-texto">(.*?)</span>', re.DOTALL | re.IGNORECASE,
-)
-
-
-def _parse_cofregamers(html: str) -> list[dict]:
-    """Parse cofregamers.com's active-code HTML table.
-
-    Rows: <td class="codigo-cell">...data-codigo="CODE"... +
-          <span class="recompensa-texto">reward</span>
-    The page lists active codes only; no per-code expiry is given.
-    """
-    # Page-level "Updated: <date>" applies to all listed codes
-    updated = ""
-    updated_match = re.search(
-        r'<span class="fecha-valor">\s*([^<]+?)\s*</span>', html, re.IGNORECASE,
-    )
-    if updated_match:
-        updated = _parse_bare_date(updated_match.group(1))
-
-    codes = []
-    seen = set()
-    for row in _CG_ROW_RE.findall(html):
-        code_match = _CG_CODE_RE.search(row)
-        if not code_match:
-            continue
-        code = _fullwidth_to_ascii(code_match.group(1)).strip()
-        # Keep only plausible ASCII codes
-        if not re.fullmatch(r'[A-Za-z0-9]{6,24}', code) or code in seen:
-            continue
-        seen.add(code)
-        content = ""
-        reward_match = _CG_REWARD_RE.search(row)
-        if reward_match:
-            reward = re.sub(r'<[^>]+>', '', reward_match.group(1)).strip()
-            content = _normalize_content(_fullwidth_to_ascii(reward))
-        codes.append({
-            "code": code,
-            "content": content,
-            "valid": "",  # unknown — page only lists currently-active codes
-            "_added": updated,
-        })
-    return codes
 
 
 def _parse_html(html: str) -> list[dict]:
@@ -563,7 +534,11 @@ def _parse_html(html: str) -> list[dict]:
 # ── Cleanup ───────────────────────────────────────────────────────
 
 def _cleanup_expired():
-    """Remove codes that expired more than _CLEANUP_DAYS days ago."""
+    """Remove codes that expired more than _CLEANUP_DAYS days ago.
+
+    Panel-authored entries (_source="panel") are exempt — the admin
+    decides when to delete them via the WebUI.
+    """
     entries = _load_cache()
     cutoff = datetime.now(BEIJING) - timedelta(days=_CLEANUP_DAYS)
     kept = []
@@ -571,7 +546,7 @@ def _cleanup_expired():
 
     for entry in entries:
         expiry = entry.get("valid", "")
-        if expiry:
+        if expiry and entry.get("_source") != "panel":
             parsed = _parse_date(expiry)
             if parsed and parsed < cutoff:
                 removed += 1
@@ -585,15 +560,33 @@ def _cleanup_expired():
 
 
 def _parse_date(date_str: str) -> datetime | None:
-    """Parse a date string (YYYY-MM-DD) into a datetime. Returns None on failure."""
+    """Parse a `valid` date (YYYY-MM-DD) into an expiry datetime.
+
+    Official semantics: codes expire at UTC midnight of the given date,
+    i.e. 08:00 (UTC+8) that morning — announcements read
+    "兌換期限至 2026-10-14 08:00(UTC+8)". Returns None on failure.
+    """
     if not date_str or not date_str.strip():
         return None
     try:
         return datetime.strptime(
             date_str.strip()[:10], "%Y-%m-%d"
-        ).replace(tzinfo=BEIJING)
+        ).replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+def format_expiry_display(date_str: str) -> str:
+    """Format a `valid` date for user display: '2026-10-14 08:00 (UTC+8)'.
+
+    Expiry is UTC midnight = 08:00 Beijing time on that date.
+    Returns '' for empty/unparseable input.
+    """
+    if not date_str or not date_str.strip():
+        return ""
+    if _parse_date(date_str) is None:
+        return date_str.strip()[:10]
+    return f"{date_str.strip()[:10]} 08:00 (UTC+8)"
 
 
 # ── English prose date extraction ────────────────────────────────
@@ -632,6 +625,15 @@ _GENERIC_CONTENT_RE = re.compile(
     r'^(?:redeem this gift code for exclusive rewards'
     r'|activate this code to access free rewards instantly)[!.]*$',
     re.IGNORECASE,
+)
+
+# "Redeem this gift code for <real reward>" — prefix to unwrap
+_GIFT_PREFIX_RE = re.compile(
+    r'^redeem this gift code for\s+(.+?)[!.]*$', re.IGNORECASE,
+)
+_EXCLUSIVE_REWARDS_RE = re.compile(r'^exclusive rewards$', re.IGNORECASE)
+_ACTIVATE_BOILER_RE = re.compile(
+    r'^activate this code to access free rewards instantly$', re.IGNORECASE,
 )
 
 # Parentheticals to strip from content: (Valid until ...), (Added on ...), (New)
@@ -677,13 +679,127 @@ def _month_day_year_to_iso(month_name: str, day: str, year: str) -> str:
 
 
 def _normalize_content(content: str) -> str:
-    """Strip date parentheticals and ucngame boilerplate from content.
+    """Strip date parentheticals and source boilerplate from content.
 
-    Returns '' when nothing informative is left.
+    Unwraps "Redeem this gift code for Recruit Contract x10" → "Recruit
+    Contract x10". Returns '' when nothing informative is left.
     """
     if not content:
         return ""
     cleaned = _CONTENT_PAREN_RE.sub("", content).strip()
-    if not cleaned or _GENERIC_CONTENT_RE.match(cleaned):
+    if not cleaned:
+        return ""
+    if _GENERIC_CONTENT_RE.match(cleaned):
+        return ""
+    match = _GIFT_PREFIX_RE.match(cleaned)
+    if match:
+        reward = match.group(1).strip(" .!")
+        if not reward or _EXCLUSIVE_REWARDS_RE.match(reward):
+            return ""
+        return reward
+    if _ACTIVATE_BOILER_RE.match(cleaned):
         return ""
     return cleaned
+
+
+# ── Official announcement (tweet) parsing ────────────────────────
+# Used by the WebUI 兑换码管理 page's paste-to-parse helper. Official
+# posts on X (@Arkrecode_ZH) look like:
+#   兌換期限至 2026-10-14 08:00(UTC+8)
+#   🏁 極速的西爾維納登場紀念序號：Ark99u5XgYsp
+# Parsing is line-based so the deadline line never leaks into content.
+
+_TWEET_DEADLINE_RE = re.compile(
+    r'(?:期限至|期限到|有效期[至到]?)\s*[:：]?\s*'
+    r'(\d{4})[-/年.](\d{1,2})[-/月.](\d{1,2})'
+)
+_TWEET_CODE_LABEL_RE = re.compile(
+    r'(?:序號|序号|兌換碼|兑换码|禮品碼|礼品码|禮包碼|礼包码)\s*[：:]\s*'
+    r'([A-Za-z0-9]{6,30})'
+)
+# Fallback when no label: first token that isn't pure digits
+_TWEET_CODE_FALLBACK_RE = re.compile(r'\b(?!\d+\b)[A-Za-z0-9]{8,20}\b')
+_TWEET_TRAIL_PUNCT_RE = re.compile(r'[\s，,。.、:：!！?？~～·…]+$')
+
+
+def parse_tweet_text(text: str) -> dict:
+    """Parse official announcement text into {"code", "valid", "content"}.
+
+    Tolerant of fullwidth obfuscation, traditional/simplified variants and
+    missing fields — unmatched fields come back as empty strings. Never
+    raises.
+    """
+    result = {"code": "", "valid": "", "content": ""}
+    if not text or not text.strip():
+        return result
+    try:
+        text = _fullwidth_to_ascii(text)
+
+        m = _TWEET_DEADLINE_RE.search(text)
+        if m:
+            try:
+                result["valid"] = datetime(
+                    int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                ).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        code_prefix = ""
+        for ln in lines:
+            m = _TWEET_CODE_LABEL_RE.search(ln)
+            if m:
+                result["code"] = m.group(1)
+                code_prefix = ln[:m.start()]
+                break
+        if not result["code"]:
+            stripped = re.sub(r'https?://\S+', ' ', text)
+            for ln in (l.strip() for l in stripped.splitlines()):
+                m = _TWEET_CODE_FALLBACK_RE.search(ln)
+                if m:
+                    result["code"] = m.group(0)
+                    code_prefix = ln[:m.start()]
+                    break
+
+        # Content = text preceding the code on its own line, minus
+        # leading emoji/punctuation, trailing punctuation and any
+        # deadline fragment.
+        raw = _TWEET_DEADLINE_RE.sub("", code_prefix)
+        raw = re.sub(r'^[^\w]+', '', raw.strip())
+        raw = _TWEET_TRAIL_PUNCT_RE.sub('', raw)
+        result["content"] = raw
+    except Exception:
+        pass
+    return result
+
+
+# ── Admin alert (bot → WebUI panel) ──────────────────────────────
+
+def _write_admin_alert(reason: str):
+    """Record an alert for the WebUI 兑换码管理 page banner.
+
+    Written when /兑换码 finds no valid time-limited codes AND the
+    scraper failed — the admin should add codes manually. The panel
+    clears the file when codes are saved (or via the dismiss button).
+    """
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    payload = {
+        "reason": reason,
+        "triggered_at": datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    tmp = _ALERT_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, _ALERT_FILE)
+    except OSError:
+        pass
+
+
+def _clear_admin_alert():
+    """Remove the alert state file (no-op if absent)."""
+    try:
+        if os.path.exists(_ALERT_FILE):
+            os.remove(_ALERT_FILE)
+    except OSError:
+        pass

@@ -217,6 +217,17 @@ textarea.code-editor { font-family: var(--mono); font-size: 13px; line-height: 1
 .badge-err { color: var(--red); border-color: var(--red); background: rgba(240, 97, 109, .08); }
 .badge-warn { color: var(--yellow); border-color: var(--yellow); background: rgba(240, 180, 41, .08); }
 
+/* ── Alert banner (兑换码管理员提醒等) ── */
+.alert-banner {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 16px; border-radius: 10px;
+  background: rgba(240, 180, 41, .08);
+  border: 1px solid var(--yellow);
+  color: var(--text);
+  font-size: 13.5px;
+}
+.alert-banner a { color: var(--yellow); font-weight: 600; }
+
 /* ── Wiki alias manager ── */
 .wk-kind.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 .alias-group {

@@ -1,6 +1,14 @@
 {% extends "base.html" %}
 
 {% block content %}
+<div class="alert-banner" id="rd-alert-banner" style="display:none;margin-bottom:16px">
+  <span>⚠ <b>兑换码提醒</b>：<span id="rd-alert-reason"></span>
+    <span class="muted" id="rd-alert-time"></span></span>
+  <span class="spacer"></span>
+  <a href="/redeem">前往管理</a>
+  <button class="btn btn-sm" id="rd-alert-dismiss-dash">忽略</button>
+</div>
+
 <div class="card-grid" id="stat-cards">
   <div class="card stat-card">
     <div class="stat-label">NoneBot</div>

@@ -94,6 +94,39 @@
     }
   }
 
+  /* Redeem-code admin alert banner (one-shot on load; not time-critical) */
+  async function checkRedeemAlert() {
+    try {
+      const d = await api('/api/redeem/alert');
+      const banner = document.getElementById('rd-alert-banner');
+      if (!banner) return;
+      if (d && d.reason) {
+        document.getElementById('rd-alert-reason').textContent =
+          d.reason === 'no_valid_codes'
+            ? '当前无有效限时兑换码，且网页爬取失败，等待手动添加'
+            : d.reason;
+        document.getElementById('rd-alert-time').textContent =
+          d.triggered_at ? `（${d.triggered_at}）` : '';
+        banner.style.display = '';
+      } else {
+        banner.style.display = 'none';
+      }
+    } catch (e) { /* transient */ }
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    const btn = document.getElementById('rd-alert-dismiss-dash');
+    if (btn) {
+      btn.addEventListener('click', async () => {
+        try {
+          await api('/api/redeem/alert/clear', { method: 'POST' });
+          document.getElementById('rd-alert-banner').style.display = 'none';
+        } catch (e) { /* transient */ }
+      });
+    }
+    checkRedeemAlert();
+  });
+
   refresh();
   setInterval(refresh, REFRESH_MS);
 })();

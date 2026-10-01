@@ -807,3 +807,138 @@ def wiki_aliases_missing(kind: str) -> dict:
         items.append({"canonical": canon, "title_en": title, "aliases_hint": hint})
     items.sort(key=lambda x: x["canonical"])
     return {"items": items}
+
+
+# ── Redeem code management (兑换码管理) ───────────────────────────
+# CRUD over QQBot/data/redeem_code/redeem_code.json — the bot plugin
+# (plugins/check_redeem_code.py) re-reads the file on every call, so
+# panel saves take effect immediately. Envelope keys (scraped_at etc.)
+# are preserved; only `codes` is replaced. Manual entries carry
+# _source="panel" and are authoritative on the bot side (the scraper
+# never overwrites them, cleanup never removes them).
+
+REDEEM_FILE = REDEEM_DIR / "redeem_code.json"
+REDEEM_ALERT_FILE = REDEEM_DIR / "admin_alert.json"
+
+_REDEEM_RECENT_DAYS = 30  # keep in sync with plugin _RECENT_DAYS
+
+
+def redeem_list() -> dict:
+    """Read the cache for the panel table, annotating 限时/长期 classes."""
+    data = {}
+    if REDEEM_FILE.exists():
+        try:
+            data = json.loads(REDEEM_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"error": f"缓存文件损坏: {e}", "codes": []}
+    codes = data.get("codes", [])
+    recent_cutoff = (
+        datetime.now() - timedelta(days=_REDEEM_RECENT_DAYS)
+    ).strftime("%Y-%m-%d")
+    for c in codes:
+        if not isinstance(c, dict):
+            continue
+        expiry = c.get("valid", "")
+        added = c.get("_added", "") or ""
+        if expiry:
+            c["_class"] = "限时"
+        elif added and added >= recent_cutoff:
+            c["_class"] = "限时"
+        else:
+            c["_class"] = "长期"
+    return {
+        "codes": codes,
+        "scraped_at": data.get("scraped_at", 0),
+        "scraped_at_iso": data.get("scraped_at_iso", ""),
+        "source_url": data.get("source_url", ""),
+        "alert": redeem_alert_status(),
+    }
+
+
+def redeem_save(codes) -> dict:
+    """Validate + save the codes array, preserving envelope keys.
+
+    `codes` is the full list snapshot from the panel. Clears the admin
+    alert on success (the admin has acted on it).
+    """
+    from . import config_editor
+
+    if not isinstance(codes, list):
+        return {"error": "codes 必须是数组"}
+    seen = set()
+    today = datetime.now().strftime("%Y-%m-%d")
+    for i, entry in enumerate(codes):
+        if not isinstance(entry, dict):
+            return {"error": f"第 {i + 1} 条不是对象"}
+        code = str(entry.get("code") or "").strip()
+        if not code:
+            return {"error": f"第 {i + 1} 条缺少兑换码"}
+        if code in seen:
+            return {"error": f"兑换码重复: {code}"}
+        seen.add(code)
+        entry["code"] = code
+        valid = str(entry.get("valid") or "").strip()[:10]
+        if valid:
+            try:
+                datetime.strptime(valid, "%Y-%m-%d")
+            except ValueError:
+                return {"error": f"{code}: 有效期格式应为 YYYY-MM-DD（{valid}）"}
+        entry["valid"] = valid
+        entry["content"] = str(entry.get("content") or "").strip()
+        if not entry.get("_added"):
+            entry["_added"] = today
+        if not entry.get("_source"):
+            entry["_source"] = "panel"
+        entry.pop("_class", None)  # transient annotation, never persisted
+
+    existing = {}
+    if REDEEM_FILE.exists():
+        try:
+            existing = json.loads(REDEEM_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+    envelope = {
+        "scraped_at": existing.get("scraped_at", 0),
+        "scraped_at_iso": existing.get("scraped_at_iso", ""),
+        "source_url": existing.get("source_url", ""),
+        "codes": codes,
+    }
+    raw = json.dumps(envelope, ensure_ascii=False, indent=2)
+    result = config_editor.json_config_write(REDEEM_FILE, raw)
+    if result.get("ok"):
+        redeem_alert_clear()
+    return result
+
+
+def redeem_parse_tweet(text: str) -> dict:
+    """Parse official announcement text via the bot plugin's parser.
+
+    Lazy import is safe: plugins/__init__.py is empty and
+    check_redeem_code has no nonebot imports (QQBot/ is on sys.path
+    via webui.config).
+    """
+    try:
+        from plugins.check_redeem_code import parse_tweet_text
+    except Exception as e:
+        return {"error": f"解析器不可用: {e}"}
+    return parse_tweet_text(text or "")
+
+
+def redeem_alert_status() -> dict:
+    """Current admin alert state ({} when none)."""
+    if not REDEEM_ALERT_FILE.exists():
+        return {}
+    try:
+        return json.loads(REDEEM_ALERT_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def redeem_alert_clear() -> dict:
+    """Dismiss the admin alert (no-op when absent)."""
+    try:
+        if REDEEM_ALERT_FILE.exists():
+            REDEEM_ALERT_FILE.unlink()
+    except OSError as e:
+        return {"error": str(e)}
+    return {"ok": True}

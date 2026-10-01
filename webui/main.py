@@ -60,13 +60,14 @@ PAGES = [
     ("/config", "配置热管理"),
     ("/playground", "Playground"),
     ("/wiki", "Wiki 缓存"),
+    ("/redeem", "兑换码管理"),
 ]
 
 # Pages fully implemented so far (others render the placeholder template)
 _IMPLEMENTED = {"/", "/processes", "/logs", "/terminal",
                 "/tokens", "/audit", "/feedback", "/sessions",
                 "/tasks", "/workspace", "/config", "/memory", "/wiki",
-                "/playground"}
+                "/playground", "/redeem"}
 
 _PUBLIC_PREFIXES = ("/static/", "/api/auth/")
 _PUBLIC_PATHS = {"/login", "/favicon.ico"}
@@ -828,6 +829,52 @@ async def api_wiki_aliases_put(payload: AliasPayload, request: Request):
     audit.log_action("wiki.aliases.save",
                      f"保存{payload.kind}别名: {result.get('groups')} 组 / "
                      f"{result.get('aliases')} 条", _ip(request))
+    return result
+
+
+# ── Redeem code management API ────────────────────────────────────
+
+@app.get("/api/redeem")
+async def api_redeem_list():
+    result = await asyncio.to_thread(data_reader.redeem_list)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class RedeemSavePayload(BaseModel):
+    codes: list  # 全量快照 [{code, content, valid, _added, _source}, ...]
+
+
+@app.put("/api/redeem")
+async def api_redeem_save(payload: RedeemSavePayload, request: Request):
+    result = await asyncio.to_thread(data_reader.redeem_save, payload.codes)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("redeem.save", f"保存兑换码列表: {len(payload.codes)} 条",
+                     _ip(request))
+    result["note"] = "已保存 — bot 每次查询都直接读盘，立即生效"
+    return result
+
+
+class TweetParsePayload(BaseModel):
+    text: str
+
+
+@app.post("/api/redeem/parse-tweet")
+async def api_redeem_parse_tweet(payload: TweetParsePayload):
+    return await asyncio.to_thread(data_reader.redeem_parse_tweet, payload.text)
+
+
+@app.get("/api/redeem/alert")
+async def api_redeem_alert():
+    return await asyncio.to_thread(data_reader.redeem_alert_status)
+
+
+@app.post("/api/redeem/alert/clear")
+async def api_redeem_alert_clear(request: Request):
+    result = await asyncio.to_thread(data_reader.redeem_alert_clear)
+    audit.log_action("redeem.alert_clear", "忽略兑换码管理员提醒", _ip(request))
     return result
 
 
