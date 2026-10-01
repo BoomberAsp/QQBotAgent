@@ -11,6 +11,8 @@ nb-cli>=0.7.0
 httpx
 aiohttp
 websockets
+# TLS-fingerprint impersonation for web_fetch anti-bot bypass (Tier 1)
+curl_cffi>=0.16
 
 # ── Data Processing ─────────────────────────────────────────────
 pandas

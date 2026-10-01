@@ -41,7 +41,7 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: web_fetch
 
-**Description**: Fetch and extract text content from a specified URL. Only HTTPS is allowed. HTML pages are automatically converted to plain text. When SearXNG can't find results for a specific URL, this tool can fetch the page directly.
+**Description**: Fetch and extract text content from a specified URL. Only HTTPS is allowed. HTML pages are automatically converted to plain text. When SearXNG can't find results for a specific URL, this tool can fetch the page directly. Requests are sent with a real Chrome TLS fingerprint (curl_cffi `chrome131` impersonation) so most anti-bot / WAF blocks based on TLS fingerprinting are bypassed transparently. If a page still returns an anti-bot challenge (Cloudflare "Just a moment…", 403/429/503, etc.), the result will say it was blocked rather than returning the challenge page.
 
 **When to use**:
 - SearXNG search returns no results for a known URL

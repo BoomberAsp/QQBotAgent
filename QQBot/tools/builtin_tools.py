@@ -506,17 +506,102 @@ def _html_to_text(html: str) -> str:
     return text.strip()
 
 
+# ── Anti-bot fetch helpers ─────────────────────────────────────────
+# Tier 1: curl_cffi TLS-fingerprint impersonation (chrome131). Plain httpx
+# with a bot UA trips JA3/WAF fingerprinting on many sites; impersonating a
+# real Chrome defeats most of that with no extra process. Tier 2 (optional,
+# WEB_FETCH_BROWSER) adds a ruyiPage headless-Firefox fallback for full
+# Cloudflare JS challenges — wired separately.
+_FETCH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# Substrings that betray an anti-bot interstitial instead of real content.
+_BLOCK_MARKERS = (
+    "cf-mitigated", "challenge-platform", "just a moment",
+    "checking your browser", "cf_chl", "turnstile",
+    "cf-browser-verification", "attention required",
+    "verify you are human", "verify you are a human",
+    "access denied", "please turn javascript on",
+    "enable javascript and cookies",
+)
+
+
+def _looks_blocked(status: int, text_sample: str) -> bool:
+    """Heuristic: did we hit an anti-bot wall rather than real content?"""
+    if status in (403, 429, 503):
+        return True
+    low = (text_sample or "")[:4096].lower()
+    return any(m in low for m in _BLOCK_MARKERS)
+
+
+async def _fetch_raw(url: str):
+    """Transport-level fetch.
+
+    Returns ``(content_bytes, status, content_type, final_url, full_len)``
+    on any HTTP response, or an error-message string on transport failure.
+    Prefers curl_cffi (chrome131 impersonation); falls back to httpx when
+    curl_cffi is unavailable. Never raises.
+    """
+    loop = asyncio.get_running_loop()
+    headers = {
+        "User-Agent": _FETCH_UA,
+        "Accept": "text/html,text/plain,application/json,*/*",
+        "Accept-Language": "zh-CN,en;q=0.9",
+    }
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        cffi_requests = None
+
+    if cffi_requests is not None:
+        def _run():
+            try:
+                resp = cffi_requests.get(
+                    url, impersonate="chrome131", timeout=_FETCH_TIMEOUT,
+                    allow_redirects=True, headers=headers,
+                )
+                content = resp.content or b""
+                ctype = (resp.headers.get("content-type", "") or "").lower()
+                return (content[:_MAX_FETCH_SIZE], resp.status_code,
+                        ctype, str(resp.url), len(content))
+            except Exception as e:  # noqa: BLE001
+                return f"[WebFetch] 抓取失败: {type(e).__name__}: {e}"
+        return await loop.run_in_executor(None, _run)
+
+    # httpx fallback (curl_cffi not installed)
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=headers,
+                                    timeout=_FETCH_TIMEOUT, follow_redirects=True)
+            content = resp.content or b""
+            ctype = (resp.headers.get("content-type", "") or "").lower()
+            return (content[:_MAX_FETCH_SIZE], resp.status_code,
+                    ctype, str(resp.url), len(content))
+    except httpx.ConnectTimeout:
+        return f"[WebFetch] 连接超时 ({_FETCH_TIMEOUT}秒): {url}"
+    except httpx.ReadTimeout:
+        return f"[WebFetch] 读取超时 ({_FETCH_TIMEOUT}秒): {url}"
+    except httpx.InvalidURL:
+        return f"[WebFetch] 无效的 URL: {url}"
+    except Exception as e:  # noqa: BLE001
+        return f"[WebFetch] 抓取失败: {type(e).__name__}: {e}"
+
+
 async def web_fetch(url: str) -> str:
     """Fetch content from a URL and return the extracted text.
 
     Only HTTPS URLs are accepted. HTML pages are parsed and converted
     to plain text. Non-HTML content is returned as-is (truncated).
 
+    Fetched via curl_cffi with Chrome TLS impersonation to defeat common
+    anti-bot blocking (httpx is used only if curl_cffi is unavailable).
+
     Args:
         url: The URL to fetch (HTTPS only).
     """
-    import httpx
-
     url = url.strip()
     if not url:
         return "[WebFetch] 请提供 URL。"
@@ -536,50 +621,42 @@ async def web_fetch(url: str) -> str:
     if ssrf_error:
         return ssrf_error
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url,
-                headers={
-                    "User-Agent": "QQBot-Agent/2.0",
-                    "Accept": "text/html,text/plain,application/json,*/*",
-                    "Accept-Language": "zh-CN,en;q=0.9",
-                },
-                timeout=_FETCH_TIMEOUT,
-                follow_redirects=True,
-            )
-            response.raise_for_status()
+    res = await _fetch_raw(url)
+    if isinstance(res, str):
+        return res  # transport-level error message
+    content, status, content_type, final_url, full_len = res
 
-            content_type = response.headers.get("content-type", "").lower()
-            content = response.content[:_MAX_FETCH_SIZE]
-            truncated = len(response.content) > _MAX_FETCH_SIZE
+    # Re-validate SSRF on the post-redirect final URL: a public URL may 30x
+    # to an internal address (curl_cffi/httpx follow redirects transparently).
+    if final_url and final_url != url:
+        redirect_ssrf = _check_ssrf(final_url)
+        if redirect_ssrf:
+            return redirect_ssrf
 
-            if "text/html" in content_type:
-                text = _html_to_text(_decode_content(content, content_type))
-            elif "text/plain" in content_type or "application/json" in content_type:
-                text = _decode_content(content, content_type)
-            else:
-                text = f"(非文本内容: {content_type}, 大小: {len(content)} 字节)"
+    # Detect anti-bot interstitials from a small decoded preview.
+    preview = _decode_content(content[:4096], content_type) if content else ""
+    if _looks_blocked(status, preview):
+        head = (f"[WebFetch] HTTP 错误 ({status}): {url}" if status >= 400
+                else f"[WebFetch] 未能获取真实内容: {url}")
+        return head + "（疑似被反爬拦截）"
+    if status >= 400:
+        return f"[WebFetch] HTTP 错误 ({status}): {url}"
 
-            if truncated:
-                text += f"\n\n... (内容已截断，原大小 {len(response.content)} 字节，限制 {_MAX_FETCH_SIZE} 字节)"
+    truncated = full_len > _MAX_FETCH_SIZE
+    if "text/html" in content_type:
+        text = _html_to_text(_decode_content(content, content_type))
+    elif "text/plain" in content_type or "application/json" in content_type:
+        text = _decode_content(content, content_type)
+    else:
+        text = f"(非文本内容: {content_type}, 大小: {len(content)} 字节)"
 
-            if len(text) > _MAX_FETCH_OUTPUT:
-                text = text[:_MAX_FETCH_OUTPUT] + f"\n\n... (输出已截断至 {_MAX_FETCH_OUTPUT} 字符)"
+    if truncated:
+        text += f"\n\n... (内容已截断，原大小 {full_len} 字节，限制 {_MAX_FETCH_SIZE} 字节)"
+    if len(text) > _MAX_FETCH_OUTPUT:
+        text = text[:_MAX_FETCH_OUTPUT] + f"\n\n... (输出已截断至 {_MAX_FETCH_OUTPUT} 字符)"
 
-            result_text = text or "(页面内容为空)"
-            return result_text + _archive_tool_result("web_fetch", url, result_text)
-
-    except httpx.ConnectTimeout:
-        return f"[WebFetch] 连接超时 ({_FETCH_TIMEOUT}秒): {url}"
-    except httpx.ReadTimeout:
-        return f"[WebFetch] 读取超时 ({_FETCH_TIMEOUT}秒): {url}"
-    except httpx.HTTPStatusError as e:
-        return f"[WebFetch] HTTP 错误 ({e.response.status_code}): {url}"
-    except httpx.InvalidURL:
-        return f"[WebFetch] 无效的 URL: {url}"
-    except Exception as e:
-        return f"[WebFetch] 抓取失败: {type(e).__name__}: {e}"
+    result_text = text or "(页面内容为空)"
+    return result_text + _archive_tool_result("web_fetch", url, result_text)
 
 
 # ── Code Execution ───────────────────────────────────────────────

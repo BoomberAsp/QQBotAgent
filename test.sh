@@ -55,6 +55,8 @@ python test/test_redeem_code.py
 REDEEM_EXIT=$?
 python test/test_redeem_panel.py
 REDEEMPANEL_EXIT=$?
+python test/test_web_fetch.py
+WEBFETCH_EXIT=$?
 cd "$SCRIPT_DIR/QQBot"
 
 EXIT_CODE=0
@@ -70,6 +72,7 @@ if [ $TASKREC_EXIT -ne 0 ]; then EXIT_CODE=$TASKREC_EXIT; fi
 if [ $CHARHEAL_EXIT -ne 0 ]; then EXIT_CODE=$CHARHEAL_EXIT; fi
 if [ $REDEEM_EXIT -ne 0 ]; then EXIT_CODE=$REDEEM_EXIT; fi
 if [ $REDEEMPANEL_EXIT -ne 0 ]; then EXIT_CODE=$REDEEMPANEL_EXIT; fi
+if [ $WEBFETCH_EXIT -ne 0 ]; then EXIT_CODE=$WEBFETCH_EXIT; fi
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}=========================================${NC}"
