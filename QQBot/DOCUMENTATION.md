@@ -36,7 +36,7 @@ QQBotAgent/
 │   └── settings.yml         #   搜索引擎配置 (Bing, 国内优化)
 │
 ├── webui/                   # ★ Web 管理面板（FastAPI 独立服务，绑定 127.0.0.1:8090）
-│   ├── main.py              #   面板入口（57 个 /api/ 端点 + 16 个页面路由 + 2 个 WebSocket）
+│   ├── main.py              #   面板入口（71 个 /api/ 端点 + 16 个页面路由 + 2 个 WebSocket）
 │   ├── auth.py              #   登录鉴权（scrypt 口令哈希 + 内存会话）
 │   ├── process_manager.py   #   进程管理（启动/停止 bot，看门狗状态持久化）
 │   ├── config_editor.py     #   配置热编辑（密钥脱敏；模型配置分段 prepare/commit + 原子写）
@@ -44,7 +44,7 @@ QQBotAgent/
 │   ├── data_reader.py       #   记忆/画像/会话/Wiki 别名/更新记录等数据读写（写前备份）
 │   ├── log_viewer.py / audit.py / hardware_monitor.py / playground.py
 │   ├── config.py            #   面板配置（从 QQBot/.env 读 USER_DATA_ROOT 等）
-│   ├── templates/ static/   #   前端页面（18 个模板）与静态资源
+│   ├── templates/ static/   #   前端页面（19 个模板）与静态资源
 │   └── data/                #   面板运行时数据（webui.pid / logs / watchdog_state.json）
 │
 └── QQBot/                   # NoneBot 机器人主体
@@ -1417,7 +1417,7 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 
 ## 十二、Web 管理面板 (WebUI)
 
-位于仓库根 `webui/`，是与 bot **独立的 FastAPI 进程**（`start_webui.sh` 管理，默认绑定 `127.0.0.1:8090`，经 SSH 隧道访问；scrypt 口令哈希 + 内存会话鉴权）。入口 `webui/main.py`：57 个 `/api/` 端点 + 16 个页面路由 + 2 个 WebSocket；页面配置见 `PAGES` 列表。
+位于仓库根 `webui/`，是与 bot **独立的 FastAPI 进程**（`start_webui.sh` 管理，默认绑定 `127.0.0.1:8090`，经 SSH 隧道访问；scrypt 口令哈希 + 内存会话鉴权）。入口 `webui/main.py`：71 个 `/api/` 端点 + 16 个页面路由 + 2 个 WebSocket；页面配置见 `PAGES` 列表。
 
 | 页面 | 功能 |
 |------|------|
