@@ -769,3 +769,28 @@ Anti-bot handling is a two-tier ladder:
 ```
 
 **Note**: The output header carries the archive timestamp and age in hours. For time-sensitive topics (news, prices, weather), weigh the age before reusing archived content — when in doubt, run a fresh `search_web`. If the id is invalid, expired, or belongs to another user, the tool says so; fall back to re-searching.
+
+---
+
+## Tool: get_changelog
+
+**Description**: Query the bot's own update records / changelog (更新记录 / 更新日志). Returns the most recent `count` entries (default 3, max 20) as structured plain text — each entry has a version, a date, and a list of typed change items (新增/修复/优化/调整/移除). The data is maintained by the admin through the WebUI 更新日志 page and read fresh from disk on every call, so it is always current. This is the bot's OWN changelog — not a game's or any third-party software's release notes.
+
+**When to use**: When the user asks what the bot itself has updated recently. Keywords: 更新日志, 更新记录, 最近有什么更新, 有哪些新功能, 这版更新了什么, 机器人升级了什么, changelog, what's new. Do NOT use it for game/third-party version questions — use `search_web` for those.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "count": {
+      "type": "integer",
+      "description": "返回最近多少条更新记录，默认3，最多20",
+      "default": 3
+    }
+  },
+  "required": []
+}
+```
+
+**Note**: The `/更新日志 [d]`, `/update record [d]` and `/changelog [d]` slash commands also trigger this feature directly without going through the agent (zero token cost). The tool is for natural-language requests like "最近有什么更新". Summarize the returned entries in your reply; the text is already user-ready plain text.

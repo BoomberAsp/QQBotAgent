@@ -13,7 +13,8 @@
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制，分级限制：管理员 60s/100KB，会员 15s/50KB）
 - **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
 - **用户系统** — 三层记忆引擎（SHORT / MEDIUM / LONG，`TieredMemory`）+ LLM 驱动用户画像提取（含确定性事实过滤 `fact_filter`）
-- **Web 管理面板** — FastAPI 后台（`webui/`）：进程管理、配置热编辑（提示词/人格/.env/模型结构化表单+API 可用性探测）、记忆/画像编辑（与 bot 内存缓存 mtime 一致性校验）、Wiki 别名管理、Token 用量看板、反馈处理、Playground
+- **Web 管理面板** — FastAPI 后台（`webui/`）：进程管理、配置热编辑（提示词/人格/.env/模型结构化表单+API 可用性探测）、记忆/画像编辑（与 bot 内存缓存 mtime 一致性校验）、Wiki 别名管理、Token 用量看板、反馈处理、更新记录编辑与群发、Playground
+- **更新记录** — 结构化更新日志（版本/日期/分类变更条目），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询，管理员在面板编辑并群发更新公告到 QQ 群
 - **游戏工具** — 抽卡模拟（Wiki 自动爬取卡池数据）、团战截图测速（OCR 解析战斗截图，轻量/全量两种模式）、乱速概率计算、角色/羁绊查询（面板/技能/倍率）、兑换码查询（自动爬取+手动维护）
 - **地图服务** — 地址↔坐标转换、实时天气、POI搜索、路线规划（高德地图）
 - **群聊管理** — 按群开关功能（抽卡/图片/语音），超级用户可远程管理
@@ -171,6 +172,7 @@ bash start.sh
 | `/clear` 或 `清除上下文` 或 `新对话` | 清除临时会话上下文（三个写法等价） |
 | `/status` | 查看 Agent 运行状态 |
 | `/功能` 或 `/features` | 渲染 `FEATURES.md` 为功能卡片图片返回（零 token） |
+| `/更新日志 [d]` 或 `/update record [d]` | 查看机器人最近 d 条更新记录（默认 3，最多 20）；也可自然语言询问「最近有什么更新」（落入 `get_changelog` 工具） |
 | `/管理工作区` | 触发智能体调用 `get_user_info` 展示工作区快照并引导清理（落入 Agent 处理，非拦截命令） |
 
 **反馈 & Bug 报告**（零 token 消耗，直达开发者）
@@ -213,15 +215,15 @@ QQBotAgent/
 ├── searxng/                # SearXNG 搜索配置
 │   └── settings.yml        #   搜索引擎配置 (Bing / 国内优化)
 ├── webui/                  # ★ Web 管理面板（FastAPI，独立服务，绑定 127.0.0.1:8090）
-│   ├── main.py             #   面板入口（52 个 /api/ 端点 + 15 个页面路由 + 2 个 WebSocket；页面路由经 PAGES 循环注册）
+│   ├── main.py             #   面板入口（57 个 /api/ 端点 + 16 个页面路由 + 2 个 WebSocket；页面路由经 PAGES 循环注册）
 │   ├── auth.py             #   登录鉴权（scrypt 口令哈希 + 内存会话）
 │   ├── process_manager.py  #   进程管理（启动/停止 bot，看门狗状态持久化）
 │   ├── config_editor.py    #   配置热编辑（含密钥脱敏；模型配置分段 prepare/commit + 原子写）
 │   ├── model_probe.py      #   模型 API 可用性探测（最小真实调用，分级判定，AUDIO/OCR 宽判）
-│   ├── data_reader.py      #   记忆/画像/会话/Wiki 别名等数据读写（写前备份）
+│   ├── data_reader.py      #   记忆/画像/会话/Wiki 别名/更新记录等数据读写（写前备份）
 │   ├── log_viewer.py / audit.py / hardware_monitor.py / playground.py
 │   ├── requirements.txt    #   面板依赖（含 psutil；与 QQBot/requirements.txt 独立）
-│   ├── templates/ static/  #   前端页面（17 个模板）与静态资源
+│   ├── templates/ static/  #   前端页面（18 个模板）与静态资源
 │   └── data/               #   面板运行时数据（webui.pid / logs / watchdog_state.json）
 ├── docs/                   # 开发文档（设计/审计/实现记录，含 implements-for-idea-8.md 等）
 ├── test/                   # 离线测试脚本（8 个）⚠ 被 .gitignore 忽略，仅存于开发机
@@ -284,7 +286,8 @@ QQBotAgent/
     │   ├── ag_llm_resolver.py  # 拉/推条技能 LLM 解析
     │   ├── buff_vocab_dump.py  # buff 词表导出（模板采集辅助）
     │   ├── wiki_scraper.py #   Wiki 爬虫（角色/羁绊数据自动更新）
-    │   └── name_resolver.py#   角色别名解析（模糊匹配；别名字典可经面板编辑，watcher 热重载）
+    │   ├── name_resolver.py#   角色别名解析（模糊匹配；别名字典可经面板编辑，watcher 热重载）
+    │   └── changelog.py    #   更新记录读写/格式化（纯 IO，命令+工具+群发轮询共用）
     │
     ├── lib/                # 库
     │   ├── deepseek_client.py   # DeepSeek API 客户端
@@ -326,6 +329,7 @@ QQBotAgent/
         ├── name_index/     #   角色名索引缓存
         ├── wiki_cache/     #   Wiki 爬取缓存（角色/羁绊/兑换码）
         ├── redeem_code/    #   兑换码缓存
+        ├── changelog/      #   更新记录（changelog.json 主数据 + known_groups/pending_broadcast/broadcast_status 面板↔bot 通信）
         └── personality_config.json # 人格选择持久化
 ```
 
@@ -448,7 +452,7 @@ class ContinuousSessionManager:
 | `TieredMemory` | `memory.py:385` | 三层记忆引擎（P1）：SHORT（近期原文，容量 50，不注入提示词，count≥3 晋升）/ MEDIUM（按频次排序的要点，容量 60，注入 top 15 条 ≤600 字符，count>10 晋升 LONG，age>30 降级回 SHORT）/ LONG（长期对象，P1 仅创建+持久化快照，查询/RAG 留待 P2）；每用户 `extraction_count` 逻辑时钟驱动 age 计算；LLM judge 将新候选归类为 new / reinforce_short / update / keep；存储为 `data/memory/tiers/{uid}.json`（原子写），LONG 快照另存 `tiers/long/{uid}/{id}.md`（write-once） |
 | `ProfileManager` | `profile.py` | 用户画像（昵称/兴趣/偏好三类槽位；`facts` 字段 P0 起休眠，不再提取与注入），Layer 1 LLM 提取 + Layer 2 `fact_filter` 确定性过滤 + Layer 3 批量调度（`observe_turn` 每 5 轮触发一次合并的 extract+judge flash 调用）；持久化到 `data/users/`；`get()` 命中缓存时按 `st_mtime_ns` 重校验，面板编辑的画像不会被 bot 内存缓存静默回滚 |
 
-## 已注册工具（30 个）
+## 已注册工具（31 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -481,9 +485,10 @@ class ContinuousSessionManager:
 | `begin_task` | 标记多轮工具型子任务起点（抽卡/测速），折叠问答避免污染上下文 |
 | `finalize_subtask` | 结束子任务并提交结构化结果（详情归档到任务日志） |
 | `recall_search_result` | 按存档 id 取回此前 search_web/web_fetch 的完整结果（7 天保留，仅限本人存档） |
+| `get_changelog` | 查询机器人自身的更新记录（自然语言通道；与 `/更新日志` 命令共用 `tools/changelog.py`） |
 | `end_continuous_mode` | 智能体主动结束群聊连续对话窗口（用户表达告别意图时） |
 
-> 📝 **权限分布**：30 个工具中 23 个为公共工具（`_PUBLIC_TOOLS`，全员可用），4 个为会员工具（`_VIP_TOOLS`：`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`_ADMIN_TOOLS`：`shell_exec`）。`end_continuous_mode` 不固定归属任一层级，由连续对话上下文动态并入可用集合（`agent_router.py:1460-1462`）。注册分布：25 个在 `_build_tool_registry()`（`agent_router.py:528-897`），其余 5 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask` / `recall_search_result`）在模块级单独注册。
+> 📝 **权限分布**：31 个工具中 24 个为公共工具（`_PUBLIC_TOOLS`，全员可用），4 个为会员工具（`_VIP_TOOLS`：`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`_ADMIN_TOOLS`：`shell_exec`）。`end_continuous_mode` 不固定归属任一层级，由连续对话上下文动态并入可用集合（`agent_router.py:1460-1462`）。注册分布：26 个在 `_build_tool_registry()`（`agent_router.py:528-977`），其余 5 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask` / `recall_search_result`）在模块级单独注册。
 
 ## 智能体配置
 

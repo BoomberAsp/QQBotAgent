@@ -966,6 +966,32 @@ def _build_tool_registry() -> ToolRegistry:
         },
     )
 
+    # ── Changelog（更新记录）──────────────────────────────────────
+    async def _get_changelog_tool(count: int = 3) -> str:
+        """Agent-facing tool: 返回机器人自身最近 count 条更新记录（纯文本）。"""
+        from tools.changelog import get_recent, format_for_qq
+        entries = get_recent(count)
+        return "\n".join(format_for_qq(entries, requested=count))
+
+    registry.register(
+        "get_changelog", _get_changelog_tool,
+        "查询机器人自身的更新记录/更新日志/版本变更。当用户询问"
+        "「最近有什么更新」「更新日志」「有哪些新功能」「这版更新了什么」"
+        "「机器人最近升级了什么」等关于本机器人版本变更的问题时使用此工具。"
+        "注意：这是机器人自己的更新记录，不是游戏或第三方软件的更新。",
+        {
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "description": "返回最近多少条更新记录，默认3，最多20",
+                    "default": 3,
+                },
+            },
+            "required": [],
+        },
+    )
+
     return registry
 
 
@@ -1154,6 +1180,135 @@ async def _start_config_watcher():
                 pass
 
     asyncio.create_task(_watch())
+
+
+@get_driver().on_startup
+async def _start_changelog_tasks():
+    """更新日志后台任务。
+
+    WebUI 是独立进程，无法访问 bot 对象，因此群发通过 **文件队列** 解耦：
+    面板写 pending_broadcast.json，本任务认领后用 bot.send_group_msg 发送，
+    并把结果回写 broadcast_status.json 供面板轮询显示。同时定期导出群列表
+    （群号+群名）到 known_groups.json，供面板的群发勾选框使用。
+    """
+    from tools import changelog as _cl
+
+    def _get_bot():
+        import nonebot
+        from nonebot.adapters.onebot.v11 import Bot as _Bot
+        bots = nonebot.get_bots()
+        return next((b for b in bots.values() if isinstance(b, _Bot)), None)
+
+    async def _fetch_group_list(bot):
+        try:
+            return await bot.get_group_list()
+        except Exception as e:
+            nonebot_logger.warning(f"[changelog] get_group_list 失败: {e}")
+            return None
+
+    async def _group_exporter():
+        # 启动后稍等 bot 上线，再首次导出；之后每 10 分钟刷新
+        await asyncio.sleep(15)
+        while True:
+            try:
+                bot = _get_bot()
+                if bot is not None:
+                    gl = await _fetch_group_list(bot)
+                    if gl is not None:
+                        groups = {}
+                        for g in gl:
+                            gid = str(g.get("group_id"))
+                            groups[gid] = {
+                                "name": g.get("group_name") or "",
+                                "member_count": g.get("member_count", 0),
+                            }
+                        _cl.write_known_groups(groups)
+            except Exception as e:
+                nonebot_logger.warning(f"[changelog] 群列表导出异常: {e}")
+            await asyncio.sleep(600)
+
+    async def _do_broadcast(payload):
+        bot = _get_bot()
+        if bot is None:
+            _cl.write_status({"state": "error", "error": "bot 未连接",
+                              "sent": 0, "failed": 0})
+            return
+
+        entries = _cl.load_entries()  # 文件顺序（面板新→旧），entry_index 与之对齐
+        idx = payload.get("entry_index", 0)
+        if not isinstance(idx, int) or idx < 0 or idx >= len(entries):
+            _cl.write_status({"state": "error", "error": "entry_index 越界",
+                              "sent": 0, "failed": 0})
+            return
+        entry = entries[idx]
+        text = "\n".join(_cl.format_announcement(entry))
+
+        targets = payload.get("targets") or []
+        if not isinstance(targets, list) or not targets:
+            _cl.write_status({"state": "error", "error": "未选择目标群",
+                              "sent": 0, "failed": 0})
+            return
+        if "all" in targets:
+            gl = await _fetch_group_list(bot)
+            if gl is None:
+                _cl.write_status({"state": "error", "error": "获取群列表失败",
+                                  "sent": 0, "failed": 0})
+                return
+            group_ids = [str(g.get("group_id")) for g in gl]
+        else:
+            group_ids = [str(t) for t in targets]
+
+        if not group_ids:
+            _cl.write_status({"state": "error", "error": "目标群为空",
+                              "sent": 0, "failed": 0})
+            return
+
+        _cl.write_status({"state": "sending", "total": len(group_ids),
+                          "sent": 0, "failed": 0})
+        chunks = _split_text(text, 300) or [text]
+        sent = failed = 0
+        for gid in group_ids:
+            ok = True
+            for j, chunk in enumerate(chunks):
+                try:
+                    await bot.send_group_msg(group_id=int(gid), message=chunk)
+                except Exception as e:
+                    ok = False
+                    nonebot_logger.warning(f"[changelog] 群发到 {gid} 失败: {e}")
+                    break
+                if j < len(chunks) - 1:
+                    await asyncio.sleep(1.0)  # 段间限速
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+            await asyncio.sleep(1.0)  # 群间限速
+
+        _cl.mark_broadcast(entry.get("created_at"))
+        _cl.write_status({
+            "state": "done", "total": len(group_ids),
+            "sent": sent, "failed": failed,
+            "entry_version": entry.get("version", ""),
+            "entry_date": entry.get("date", ""),
+            "finished_at": time.time(),
+        })
+
+    async def _broadcast_poller():
+        while True:
+            await asyncio.sleep(5)
+            try:
+                payload = _cl.claim_pending()
+                if payload is None:
+                    continue
+                try:
+                    await _do_broadcast(payload)
+                finally:
+                    _cl.finish_pending_claim()
+            except Exception as e:
+                nonebot_logger.warning(f"[changelog] 群发轮询异常: {e}")
+
+    asyncio.create_task(_group_exporter())
+    asyncio.create_task(_broadcast_poller())
 
 
 # Per-user busy flag — prevents concurrent message processing for the
@@ -1900,6 +2055,10 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             return
         # /功能 / /features command (direct, no agent)
         cmd_handled = await _handle_features_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /更新日志 [d] / /update record [d] command (direct, no agent, zero token)
+        cmd_handled = await _handle_changelog_command(text_content, user_id)
         if cmd_handled:
             return
         # /personality / /人格切换 command
@@ -2844,6 +3003,32 @@ async def _handle_features_command(text: str, user_id: str) -> bool:
     except Exception:
         await _safe_send("功能卡片渲染失败，请稍后重试。")
 
+    return True
+
+
+# 匹配 /更新日志 [d] / #更新日志 [d] / /update record [d] / /changelog [d] 等
+_CHANGELOG_CMD_RE = re.compile(
+    r"^\s*[/#](更新日志|更新记录|update\s+record|update\s+log|changelog)\s*(\d+)?\s*$",
+    re.IGNORECASE,
+)
+
+
+async def _handle_changelog_command(text: str, user_id: str) -> bool:
+    """Handle /更新日志 [d] / /update record [d] — direct, no agent, zero token.
+
+    d = 返回最近多少条更新记录（缺省 3，clamp 到 1..20）。数据源为
+    QQBot/data/changelog/changelog.json，由 WebUI 维护。
+    Returns True if the command was handled.
+    """
+    m = _CHANGELOG_CMD_RE.match(text or "")
+    if not m:
+        return False
+
+    from tools.changelog import get_recent, format_for_qq, DEFAULT_COUNT
+
+    d = int(m.group(2)) if m.group(2) else DEFAULT_COUNT
+    entries = get_recent(d)
+    await _send_text_chunks(format_for_qq(entries, requested=d))
     return True
 
 

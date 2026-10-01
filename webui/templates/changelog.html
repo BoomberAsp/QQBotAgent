@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+  <div class="row">
+    <h2 class="card-title" style="margin:0">更新记录</h2>
+    <button class="btn btn-sm" id="cl-add">+ 新增记录</button>
+    <span class="spacer"></span>
+    <span class="muted mono" id="cl-meta">—</span>
+    <button class="btn btn-sm" id="cl-reload">重新加载</button>
+    <button class="btn btn-primary btn-sm" id="cl-save">保存全部</button>
+  </div>
+  <p class="muted" id="cl-dirty" style="margin:6px 0 0;display:none">
+    <span class="warn">● 有未保存的修改</span>
+  </p>
+  <div id="cl-list" style="margin-top:10px">
+    <p class="muted">加载中…</p>
+  </div>
+  <p class="muted" id="cl-stat" style="margin:8px 0 0"></p>
+</div>
+
+<div class="card">
+  <h2 class="card-title">群发更新公告</h2>
+  <p class="muted" style="margin:0 0 10px">
+    选择一条<b>已保存</b>的更新记录与目标群，bot 会在约 5 秒内开始逐群发送（限速），进度见下方。
+    群发针对已保存的记录 —— 若有未保存修改，请先「保存全部」。
+  </p>
+  <div class="row" style="align-items:flex-end">
+    <div class="field" style="margin:0;min-width:280px;flex:1">
+      <span>选择记录</span>
+      <select id="cl-bc-entry" style="width:100%"></select>
+    </div>
+    <button class="btn btn-sm" id="cl-bc-refresh-groups">刷新群列表</button>
+    <span class="spacer"></span>
+    <button class="btn btn-primary btn-sm" id="cl-bc-send">发送到群聊</button>
+  </div>
+  <div style="margin-top:12px">
+    <label class="row" style="gap:6px;align-items:center;margin:0 0 8px">
+      <input type="checkbox" id="cl-bc-all"> <b>全部群</b>
+      <span class="muted" id="cl-groups-meta"></span>
+    </label>
+    <div id="cl-groups" class="row" style="flex-wrap:wrap;gap:12px"></div>
+  </div>
+  <div id="cl-bc-status" class="muted" style="margin-top:12px"></div>
+</div>
+
+<p class="muted">
+  更新记录以<b>结构化纯文本</b>发送给 QQ（不含 markdown）。用户可用命令
+  <code>/更新日志 [d]</code>、<code>/update record [d]</code>，或自然语言（如「最近有什么更新」）
+  查询最近 d 条（默认 3，最多 20）。数据源 <code>QQBot/data/changelog/changelog.json</code>，
+  bot 每次查询直接读盘，保存后立即生效。
+</p>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/changelog.js"></script>
+{% endblock %}

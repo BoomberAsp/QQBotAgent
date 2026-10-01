@@ -34,6 +34,7 @@ TASKLOG_DIR = DATA / "task_log"
 MEMORY_DIR = DATA / "memory"
 WIKI_CACHE_DIR = DATA / "wiki_cache"
 REDEEM_DIR = DATA / "redeem_code"
+CHANGELOG_DIR = DATA / "changelog"
 
 PAGE_SIZE_DEFAULT = 50
 _SEEN_FILE = config.WEBUI_DATA / "feedback_seen.json"
@@ -1148,3 +1149,165 @@ def redeem_alert_clear() -> dict:
     except OSError as e:
         return {"error": str(e)}
     return {"ok": True}
+
+
+# ── 更新日志（changelog）────────────────────────────────────────────
+# 数据源 QQBot/data/changelog/，bot 侧对应 QQBot/tools/changelog.py。
+# 面板是唯一编辑入口；群发通过文件队列交给 bot 后台轮询器执行（面板与 bot
+# 是独立进程，无法直接调用 bot.send_group_msg）。
+
+CHANGELOG_FILE = CHANGELOG_DIR / "changelog.json"
+KNOWN_GROUPS_FILE = CHANGELOG_DIR / "known_groups.json"
+PENDING_FILE = CHANGELOG_DIR / "pending_broadcast.json"
+STATUS_FILE = CHANGELOG_DIR / "broadcast_status.json"
+
+# 与 bot 侧 tools/changelog.py 的 CHANGE_TYPES 保持一致
+CHANGELOG_CHANGE_TYPES = ["新增", "修复", "优化", "调整", "移除"]
+
+
+def _atomic_write_json(path: Path, data) -> None:
+    """tmp + os.replace 原子写（与 bot 侧一致）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def changelog_list() -> dict:
+    """读取全部更新记录供面板编辑（新→旧）。缺失/损坏时返回空列表。"""
+    data = {}
+    if CHANGELOG_FILE.exists():
+        try:
+            data = json.loads(CHANGELOG_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"error": f"更新日志文件损坏: {e}", "entries": []}
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        entries = []
+    return {
+        "entries": [e for e in entries if isinstance(e, dict)],
+        "change_types": CHANGELOG_CHANGE_TYPES,
+        "note": "保存后 bot 立即生效（每次查询直接读盘）。分类条目类型："
+                + " / ".join(CHANGELOG_CHANGE_TYPES),
+    }
+
+
+def changelog_save(entries) -> dict:
+    """校验并全量保存更新记录快照。"""
+    from . import config_editor
+
+    if not isinstance(entries, list):
+        return {"error": "entries 必须是数组"}
+    now = time.time()
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            return {"error": f"第 {i + 1} 条不是对象"}
+        version = str(entry.get("version") or "").strip()
+        date = str(entry.get("date") or "").strip()
+        if not version and not date:
+            return {"error": f"第 {i + 1} 条至少需要版本号或日期"}
+        if date:
+            try:
+                datetime.strptime(date, "%Y-%m-%d")
+            except ValueError:
+                return {"error": f"第 {i + 1} 条日期格式应为 YYYY-MM-DD（{date}）"}
+        changes = entry.get("changes")
+        if changes is None:
+            changes = []
+        if not isinstance(changes, list):
+            return {"error": f"第 {i + 1} 条的 changes 必须是数组"}
+        clean_changes = []
+        for ch in changes:
+            if isinstance(ch, dict):
+                ctype = str(ch.get("type") or "").strip()
+                text = str(ch.get("text") or "").strip()
+            else:
+                ctype, text = "", str(ch).strip()
+            if not text:
+                continue
+            if ctype and ctype not in CHANGELOG_CHANGE_TYPES:
+                return {"error": f"第 {i + 1} 条含未知类型「{ctype}」"
+                                 f"（可选：{'/'.join(CHANGELOG_CHANGE_TYPES)}）"}
+            clean_changes.append({"type": ctype, "text": text})
+        if not clean_changes:
+            return {"error": f"第 {i + 1} 条至少要有一条变更内容"}
+        entry["version"] = version
+        entry["date"] = date
+        entry["changes"] = clean_changes
+        # created_at 作为稳定标识（群发回写 broadcast_at 时按此匹配）
+        if not isinstance(entry.get("created_at"), (int, float)):
+            entry["created_at"] = now - i  # 保证同批新增也有唯一且有序的标识
+        entry.pop("_class", None)
+
+    raw = json.dumps({"entries": entries}, ensure_ascii=False, indent=2)
+    result = config_editor.json_config_write(CHANGELOG_FILE, raw)
+    if result.get("ok"):
+        result["note"] = f"已保存 {len(entries)} 条更新记录 — bot 每次查询直接读盘，立即生效"
+    return result
+
+
+def changelog_groups() -> dict:
+    """读取 bot 导出的群列表（群号+群名），供群发勾选。"""
+    data = {}
+    if KNOWN_GROUPS_FILE.exists():
+        try:
+            data = json.loads(KNOWN_GROUPS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    groups = data.get("groups") if isinstance(data, dict) else None
+    out = []
+    if isinstance(groups, dict):
+        for gid, info in groups.items():
+            info = info if isinstance(info, dict) else {}
+            out.append({
+                "id": str(gid),
+                "name": info.get("name") or "",
+                "member_count": info.get("member_count", 0),
+            })
+    out.sort(key=lambda g: g["name"] or g["id"])
+    return {
+        "groups": out,
+        "updated_at": data.get("updated_at") if isinstance(data, dict) else None,
+        "note": "群列表由 bot 启动后每 10 分钟自动导出；若为空，请确认 bot 已连接。",
+    }
+
+
+def changelog_broadcast(entry_index, targets) -> dict:
+    """入队一次群发请求（写 pending_broadcast.json，由 bot 轮询器认领执行）。"""
+    if not isinstance(entry_index, int) or entry_index < 0:
+        return {"error": "entry_index 非法"}
+    entries = changelog_list().get("entries", [])
+    if entry_index >= len(entries):
+        return {"error": "entry_index 越界（请先保存后再群发）"}
+    if not isinstance(targets, list) or not targets:
+        return {"error": "请至少选择一个目标群"}
+    norm = []
+    for t in targets:
+        s = str(t).strip()
+        if not s:
+            continue
+        if s != "all" and not s.isdigit():
+            return {"error": f"非法群号: {s}"}
+        norm.append(s)
+    if not norm:
+        return {"error": "请至少选择一个目标群"}
+    # 避免覆盖尚未被认领的上一个请求
+    if PENDING_FILE.exists():
+        return {"error": "已有群发请求待处理，请稍后再试"}
+    _atomic_write_json(PENDING_FILE, {
+        "entry_index": entry_index,
+        "targets": norm,
+        "queued_at": time.time(),
+    })
+    return {"ok": True, "queued": True,
+            "note": "已入队 — bot 轮询器约 5 秒内开始发送，可在下方查看进度"}
+
+
+def changelog_broadcast_status() -> dict:
+    """读取最近一次群发的执行状态（供面板轮询显示进度/结果）。"""
+    if not STATUS_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}

@@ -67,6 +67,7 @@ _PUBLIC_TOOLS: Set[str] = {
     "bond_detail",
     "parse_battle_screenshots",
     "redeem_code",
+    "get_changelog",         # 机器人自身的更新记录，所有用户可查
     "begin_task",
     "finalize_subtask",
     "recall_search_result",  # Reads own search archives only (user_id-scoped)

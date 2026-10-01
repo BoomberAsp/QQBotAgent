@@ -61,13 +61,14 @@ PAGES = [
     ("/playground", "Playground"),
     ("/wiki", "Wiki 缓存"),
     ("/redeem", "兑换码管理"),
+    ("/changelog", "更新日志"),
 ]
 
 # Pages fully implemented so far (others render the placeholder template)
 _IMPLEMENTED = {"/", "/processes", "/logs", "/terminal",
                 "/tokens", "/audit", "/feedback", "/sessions",
                 "/tasks", "/workspace", "/config", "/memory", "/wiki",
-                "/playground", "/redeem"}
+                "/playground", "/redeem", "/changelog"}
 
 _PUBLIC_PREFIXES = ("/static/", "/api/auth/")
 _PUBLIC_PATHS = {"/login", "/favicon.ico"}
@@ -1036,6 +1037,57 @@ async def api_redeem_alert_clear(request: Request):
     result = await asyncio.to_thread(data_reader.redeem_alert_clear)
     audit.log_action("redeem.alert_clear", "忽略兑换码管理员提醒", _ip(request))
     return result
+
+
+# ── 更新日志（changelog）管理 API ─────────────────────────────────
+
+@app.get("/api/changelog")
+async def api_changelog_list():
+    result = await asyncio.to_thread(data_reader.changelog_list)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class ChangelogSavePayload(BaseModel):
+    entries: list  # 全量快照 [{version, date, changes:[{type,text}], created_at?, ...}]
+
+
+@app.put("/api/changelog")
+async def api_changelog_save(payload: ChangelogSavePayload, request: Request):
+    result = await asyncio.to_thread(data_reader.changelog_save, payload.entries)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("changelog.save", f"保存更新记录: {len(payload.entries)} 条",
+                     _ip(request))
+    return result
+
+
+@app.get("/api/changelog/groups")
+async def api_changelog_groups():
+    return await asyncio.to_thread(data_reader.changelog_groups)
+
+
+class ChangelogBroadcastPayload(BaseModel):
+    entry_index: int
+    targets: list  # ["all"] 或 ["<group_id>", ...]
+
+
+@app.post("/api/changelog/broadcast")
+async def api_changelog_broadcast(payload: ChangelogBroadcastPayload, request: Request):
+    result = await asyncio.to_thread(
+        data_reader.changelog_broadcast, payload.entry_index, payload.targets)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    tgt = "全部群" if "all" in payload.targets else f"{len(payload.targets)} 个群"
+    audit.log_action("changelog.broadcast",
+                     f"群发更新记录 #{payload.entry_index} 到 {tgt}", _ip(request))
+    return result
+
+
+@app.get("/api/changelog/broadcast/status")
+async def api_changelog_broadcast_status():
+    return await asyncio.to_thread(data_reader.changelog_broadcast_status)
 
 
 # ── Playground / system-prompt preview API ────────────────────────

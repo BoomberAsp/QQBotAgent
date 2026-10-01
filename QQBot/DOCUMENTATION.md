@@ -12,7 +12,8 @@
 - **特殊会话**: 每用户持久化会话（按角色：管理员 10 / 会员 3 / 普通 1），百万 token 上下文，快照+增量存储
 - **用户工作区**: 每用户独立文件空间，配额管理，跨会话隔离
 - **三层记忆引擎**: `TieredMemory`（SHORT/MEDIUM/LONG），LLM judge 归类 + 频次晋升/年龄降级状态机
-- **Web 管理面板**: FastAPI 独立服务（`webui/`），进程管理、配置热编辑、记忆/画像/别名管理、Token 看板、反馈处理、Playground
+- **Web 管理面板**: FastAPI 独立服务（`webui/`），进程管理、配置热编辑、记忆/画像/别名管理、Token 看板、反馈处理、更新记录编辑与群发、Playground
+- **更新记录**: 结构化更新日志（版本/日期/分类变更条目），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询，管理员在面板编辑并群发更新公告
 - **部署方式**: Docker Compose（含 NVIDIA GPU 支持）或手动部署
 
 ---
@@ -35,15 +36,15 @@ QQBotAgent/
 │   └── settings.yml         #   搜索引擎配置 (Bing, 国内优化)
 │
 ├── webui/                   # ★ Web 管理面板（FastAPI 独立服务，绑定 127.0.0.1:8090）
-│   ├── main.py              #   面板入口（52 个 /api/ 端点 + 15 个页面路由 + 2 个 WebSocket）
+│   ├── main.py              #   面板入口（57 个 /api/ 端点 + 16 个页面路由 + 2 个 WebSocket）
 │   ├── auth.py              #   登录鉴权（scrypt 口令哈希 + 内存会话）
 │   ├── process_manager.py   #   进程管理（启动/停止 bot，看门狗状态持久化）
 │   ├── config_editor.py     #   配置热编辑（密钥脱敏；模型配置分段 prepare/commit + 原子写）
 │   ├── model_probe.py       #   模型 API 可用性探测（最小真实调用 + 分级判定）
-│   ├── data_reader.py       #   记忆/画像/会话/Wiki 别名等数据读写（写前备份）
+│   ├── data_reader.py       #   记忆/画像/会话/Wiki 别名/更新记录等数据读写（写前备份）
 │   ├── log_viewer.py / audit.py / hardware_monitor.py / playground.py
 │   ├── config.py            #   面板配置（从 QQBot/.env 读 USER_DATA_ROOT 等）
-│   ├── templates/ static/   #   前端页面（17 个模板）与静态资源
+│   ├── templates/ static/   #   前端页面（18 个模板）与静态资源
 │   └── data/                #   面板运行时数据（webui.pid / logs / watchdog_state.json）
 │
 └── QQBot/                   # NoneBot 机器人主体
@@ -104,7 +105,8 @@ QQBotAgent/
     │   ├── ag_llm_resolver.py  # 拉/推条技能 LLM 解析
     │   ├── buff_vocab_dump.py  # buff 词表导出 (模板采集辅助)
     │   ├── wiki_scraper.py  #   Wiki 爬虫 (角色/羁绊数据 + buff 图标)
-    │   └── name_resolver.py #   角色别名解析 (模糊匹配; 别名字典支持面板编辑+热重载)
+    │   ├── name_resolver.py #   角色别名解析 (模糊匹配; 别名字典支持面板编辑+热重载)
+    │   └── changelog.py     #   更新记录读写/格式化 (纯 IO; 命令+工具+群发轮询共用)
     │
     ├── scripts/             # 运维脚本
     │   ├── migrate_memory_p1.py     # 旧记忆 → 三层结构迁移
@@ -141,6 +143,7 @@ QQBotAgent/
     │   ├── name_index/      #   角色名索引缓存
     │   ├── wiki_cache/      #   Wiki 爬取缓存 (角色/羁绊/兑换码)
     │   ├── redeem_code/     #   兑换码缓存
+    │   ├── changelog/       #   更新记录 (changelog.json 主数据 + known_groups/pending_broadcast/broadcast_status 面板↔bot 通信)
     │   ├── personality_config.json # 人格选择持久化
     │   └── workspace/       #   工作区 (代码执行/仓库/上传/输出, 按 QQ 号隔离)
     │
@@ -605,6 +608,7 @@ agent_router.py
 | `/羁绊详情 <名称>` | 查询羁绊详情并渲染卡片图片（零 token） |
 | `/刷新角色数据` | 仅管理员：强制后台刷新角色/羁绊数据库 |
 | `/功能` 或 `/features` | 渲染 `FEATURES.md` 为功能卡片图片（零 token） |
+| `/更新日志 [d]` 或 `/update record [d]`（亦支持 `#更新日志`、`/更新记录`、`/update log`、`/changelog`） | 查询机器人最近 d 条更新记录（默认 3，最多 20；零 token，读 `data/changelog/changelog.json`） |
 | `/管理工作区` | 引导智能体调用 `get_user_info` 展示工作区快照（落入 Agent 处理，非拦截命令） |
 | `/取消` 或 `#取消` 或 `/结束` 或 `#结束` | 退出群聊连续对话模式（四个写法等价） |
 | `#反馈 <内容>` | 提交使用反馈，自动附带用户上下文（零 token 消耗） |
@@ -651,9 +655,9 @@ agent_router.py
             └── >300 字符 → _split_text() 句子边界拆分 → 逐块 _safe_send() (1s 间隔)
 ```
 
-#### 已注册工具 (30 个)
+#### 已注册工具 (31 个)
 
-**内置工具 (12 个)**:
+**内置工具 (13 个)**:
 
 | 工具名 | 来源 | 说明 |
 |--------|------|------|
@@ -669,6 +673,7 @@ agent_router.py
 | `delete_workspace_file` | builtin_tools | 删除工作区文件/空目录 (释放磁盘配额) |
 | `read_file` | file_tools | 读取用户上传的文件 (文本/PDF/图片/音频, 图片和音频可 AI 分析) |
 | `recall_search_result` | agent_router → search_archive | 按存档 id 取回 search_web/web_fetch 的完整结果 (7天保留, per-user 隔离) |
+| `get_changelog` | agent_router → changelog | 查询机器人自身的更新记录 (自然语言通道, 与 `/更新日志` 命令共用 `tools/changelog.py`) |
 
 **地图工具 (5 个)**:
 
@@ -710,7 +715,7 @@ agent_router.py
 
 **注**: `check_weather` 已移除。天气查询通过专用的 `get_weather` 工具（高德地图 API）实现。`web_fetch` 用于直接抓取搜索结果中无法索引的网页。`search_web` / `web_fetch` 的完整结果会存档到 `data/search_cache/{uid}/{id}.json`（`agent/search_archive.py`，7 天 TTL + 每用户 50 条上限，save 时惰性清扫），返回文本末尾附 `[存档] id: xxx` 行；上下文折叠/压缩后模型可经 `recall_search_result` 按 id 取回全文而无需重搜。存档 id 只随 append-only 的工具消息流转、不进系统提示词，与 v2.26 的前缀缓存优化不冲突。
 
-**权限分布**: 30 个工具中 23 个为公共工具（`_PUBLIC_TOOLS`），4 个为会员工具（`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`shell_exec`）；`end_continuous_mode` 不固定归属，由连续对话上下文动态并入。注册分布：25 个在 `_build_tool_registry()`，其余 5 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask` / `recall_search_result`）在模块级单独注册。
+**权限分布**: 31 个工具中 24 个为公共工具（`_PUBLIC_TOOLS`），4 个为会员工具（`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`shell_exec`）；`end_continuous_mode` 不固定归属，由连续对话上下文动态并入。注册分布：26 个在 `_build_tool_registry()`，其余 5 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask` / `recall_search_result`）在模块级单独注册。
 
 #### 配置看门狗（热重载）
 
@@ -961,6 +966,17 @@ Agent 必须在以下情况拒绝 (礼貌):
 - **buff 模板集裁剪**：`lib/buff_alias.py` 从角色技能文案（`(x回合)` / `(x turns)` 时长标记）提取 buff 名并归一化到图标标签，使每个角色只在其「可能出现的 buff」子集内匹配；未知角色仅该行回退全量。
 - **技能分类与触发推断**：`tools/ag_skill_index.py`（Skill 类 + 阵营触发方式分类）、`tools/ag_trigger_engine.py`（行动值效果触发链推断）、`tools/ag_llm_resolver.py`（嵌套子技能条件的 L4 窄 LLM 回退）。
 - 团战/镜像匹配时同一角色可能同时出现在我方和敌方（同名不同阵营），属正常情况。
+
+### 5.8 `tools/changelog.py` — 更新记录 (纯 IO/格式化)
+
+面向用户的「更新记录」读写与格式化模块，无 nonebot 依赖，被三处共用：`/更新日志` 命令拦截、`get_changelog` LLM 工具、群发轮询器。数据存 `data/changelog/changelog.json`（结构 `{entries: [{version, date, changes: [{type, text}], created_at, broadcast_at}]}`，数组新→旧）。
+
+- **变更类型** `CHANGE_TYPES = ["新增", "修复", "优化", "调整", "移除"]`；面板下拉选择。
+- **读取**：`load_entries()` / `get_recent(d=3)`（clamp 1..20，按 `created_at` 降序，不足返回全部）。
+- **格式化**：`format_for_qq(entries, requested)` 生成 QQ 结构化纯文本（`【版本】 日期` 标题 + `  • 类型：内容` 条目，不含 markdown）；`format_announcement(entry)` 用于群发（加 `📢 更新公告` 头）。空数据返回「暂无更新记录」提示行。
+- **面板↔bot 通信**：`write_known_groups`/`read_known_groups`（群列表）、`claim_pending`（原子改名认领群发请求）/`finish_pending_claim`、`write_status`/`read_status`（群发结果回写）、`mark_broadcast`（群发成功回写 `broadcast_at`）。
+- **原子写** `_atomic_write_json`（tmp + `os.replace`）贯穿所有写操作。
+- 详细的面板/后台任务/文件队列设计见 §十二「更新记录 / 群发」。
 
 ---
 
@@ -1401,7 +1417,7 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 
 ## 十二、Web 管理面板 (WebUI)
 
-位于仓库根 `webui/`，是与 bot **独立的 FastAPI 进程**（`start_webui.sh` 管理，默认绑定 `127.0.0.1:8090`，经 SSH 隧道访问；scrypt 口令哈希 + 内存会话鉴权）。入口 `webui/main.py`：52 个 `/api/` 端点 + 15 个页面路由 + 2 个 WebSocket；页面配置见 `PAGES` 列表。
+位于仓库根 `webui/`，是与 bot **独立的 FastAPI 进程**（`start_webui.sh` 管理，默认绑定 `127.0.0.1:8090`，经 SSH 隧道访问；scrypt 口令哈希 + 内存会话鉴权）。入口 `webui/main.py`：57 个 `/api/` 端点 + 16 个页面路由 + 2 个 WebSocket；页面配置见 `PAGES` 列表。
 
 | 页面 | 功能 |
 |------|------|
@@ -1419,6 +1435,22 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | `/config` 配置热管理 | 提示词 `*.md`、人格、`.env`、模型（结构化表单 + API 探测，§11.6） |
 | `/playground` Playground | 面板内直接对话调试（进程内构造 client，无需 nonebot driver） |
 | `/wiki` Wiki 缓存 | 角色/羁绊数据浏览、**别名字典编辑**（`character_dic.json` / `bonds_search_dic.json`） |
+| `/changelog` 更新日志 | 编辑更新记录（版本/日期/分类变更条目，`data/changelog/changelog.json`）、勾选群聊**群发更新公告** |
+
+### 更新记录 / 群发（`data/changelog/`）
+
+面向用户的「更新记录」以结构化 JSON 存储，与开发者向的 `docs/更新日志.md`（git 提交整理）分开维护，面板是唯一编辑入口。面板与 bot 是两个进程，通过 `QQBot/data/changelog/` 下的共享文件通信（沿用 `redeem_code` 的文件队列范式）：
+
+| 文件 | 写入方 | 读取方 | 用途 |
+|------|--------|--------|------|
+| `changelog.json` | 面板 | bot + 面板 | 更新记录主数据（唯一真源，数组新→旧） |
+| `known_groups.json` | bot 后台任务 | 面板 | 群列表（群号+群名+成员数），供勾选 |
+| `pending_broadcast.json` | 面板 | bot 轮询器 | 群发请求队列（entry_index + targets） |
+| `broadcast_status.json` | bot 轮询器 | 面板 | 群发结果回写（供面板轮询显示进度） |
+
+- **读写工具** `tools/changelog.py`（纯 IO/格式化，无 nonebot 依赖）：`load_entries`/`save_entries`/`get_recent(d)`（默认 3，clamp 1..20）/`format_for_qq`/`format_announcement`/`mark_broadcast`，命令拦截、`get_changelog` 工具、群发轮询器三方共用。
+- **bot 后台任务**（`agent_router.py` `_start_changelog_tasks()`，`@get_driver().on_startup`）：① 群列表导出——启动 15s 后 + 每 600s 调 `bot.get_group_list()` 写 `known_groups.json`；② 群发轮询器——每 5s `claim_pending()`（原子改名为 `.processing` 认领）→ 解析 targets（`all` 现场枚举 / 指定群号）→ `_split_text` 分段 + `bot.send_group_msg` 逐群发送（群间 1s 限速）→ 回写 `broadcast_status.json` + `mark_broadcast`。
+- **面板端点**：`GET/PUT /api/changelog`、`GET /api/changelog/groups`、`POST /api/changelog/broadcast`、`GET /api/changelog/broadcast/status`（`data_reader.changelog_*`，保存经 `config_editor.json_config_write` 原子写）。
 
 ### 面板 ↔ bot 跨进程一致性
 
@@ -1432,6 +1464,7 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | MemorySystem `.md` | 无缓存 | 每次操作直接读盘，天然一致 |
 | 群功能开关 / 人格 JSON | 无常驻缓存 | 查询/toggle 前 `refresh()`；人格 set_* 均读盘→改→写 |
 | 提示词 `*.md` / `.env` / `models_settings.json` / 别名字典 | bot 只读 | 配置看门狗 mtime 热重载（§2.8），保存即生效 |
+| 更新记录 `changelog.json` | 无缓存 | bot 每次查询直接读盘，面板保存后下一条 `/更新日志` 即生效；群发经文件队列（`pending_broadcast.json` 原子改名认领）解耦 |
 | 特殊会话 | 无缓存 | 每次操作直接读盘 |
 
 面板写操作普遍**写前备份**（`.bak` / `BACKUP_DIR`）+ 原子写（tmp + replace），并记录面板侧审计日志。
@@ -1877,4 +1910,29 @@ v2.27 基础上增加:
     路径穿越/TTL/上限/无上下文降级/helper 全链路), 14→15 套件, 98→105 用例
 
 工具数量: 29 → 30
+```
+
+### v2.29 — 更新记录 / 更新日志 (2026-10-02)
+```
+v2.28 基础上增加:
+  - tools/changelog.py: 面向用户的更新记录读写/格式化 (纯 IO, 无 nonebot 依赖),
+    命令拦截 + get_changelog 工具 + 群发轮询器三方共用; 数据 data/changelog/changelog.json
+    (结构: entries[] = {version, date, changes[{type,text}], created_at, broadcast_at}, 新→旧);
+    变更类型 新增/修复/优化/调整/移除; get_recent(d) 默认 3, clamp 1..20;
+    format_for_qq 输出结构化纯文本 (不含 markdown, 遵循 SOUL.md #8)
+  - 双通道范式 (仿 redeem_code):
+    · /更新日志 [d] / /update record [d] (亦 #更新日志、/更新记录、/update log、/changelog)
+      命令直连拦截, 零 token (_handle_changelog_command, 接入 _handle_agent_message_impl 分发链)
+    · get_changelog 工具 (_build_tool_registry 注册, _PUBLIC_TOOLS) 供自然语言「最近有什么更新」
+  - 后台任务 _start_changelog_tasks() (@get_driver().on_startup, 两个协程):
+    · 群列表导出: 启动 15s 后 + 每 600s bot.get_group_list() → known_groups.json
+    · 群发轮询器: 每 5s claim_pending() (原子改名 .processing 认领) → _do_broadcast
+      (targets all 现场枚举 / 指定群号; _split_text 分段 + send_group_msg 逐群 1s 限速)
+      → 回写 broadcast_status.json + mark_broadcast
+  - webui: /changelog 页 (更新记录编辑 + 群发卡), data_reader.changelog_* (校验 + 原子写),
+    5 个端点 (GET/PUT /api/changelog, GET groups, POST broadcast, GET broadcast/status);
+    面板↔bot 经 data/changelog/ 共享文件解耦 (沿用 redeem_code 文件队列范式), bot 每次查询直接读盘
+  - 文档: HELP.md / FEATURES.md / TOOLS.md 补 /更新日志 与 get_changelog
+
+工具数量: 30 → 31
 ```
