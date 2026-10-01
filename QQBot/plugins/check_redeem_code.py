@@ -42,11 +42,14 @@ import asyncio
 import json
 import os
 import re
-import shutil
 import sys
-import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+
+try:
+    from lib import browser_fetch as bf
+except ImportError:  # pragma: no cover - QQBot/ not on sys.path
+    from QQBot.lib import browser_fetch as bf
 
 BEIJING = timezone(timedelta(hours=8))
 
@@ -400,13 +403,17 @@ def _get_proxy_url() -> str:
 # as an isolated subprocess under xvfb-run so a browser crash can never
 # take down the bot, and its heavy deps stay out of the production venv.
 #
+# The subprocess runner is shared with the web_fetch tool via
+# lib/browser_fetch.py (single process-wide concurrency cap + interpreter
+# resolution); this module only supplies the redeem-code-specific gating
+# env and fetch parameters.
+#
 # Opt-in via QQBot/.env (disabled by default → identical to old behavior):
 #   REDEEM_CODE_BROWSER=ruyipage
 #   REDEEM_CODE_BROWSER_PYTHON=~/.virtualenvs/ruyipage/bin/python  # dedicated venv
 #   REDEEM_CODE_BROWSER_TIMEOUT=90        # seconds for the whole fetch
+#   BROWSER_FETCH_MAX_CONCURRENCY=2       # shared cap (redeem + web_fetch)
 # Setup: scripts/install_redeem_browser.sh (venv + Firefox runtime).
-
-_BROWSER_FETCHER = os.path.join(os.path.dirname(__file__), "ruyipage_fetch.py")
 
 
 def _browser_engine() -> str:
@@ -415,24 +422,17 @@ def _browser_engine() -> str:
 
 
 def _browser_engine_enabled() -> bool:
-    """True when the ruyiPage browser engine is opted in."""
-    return _browser_engine() == "ruyipage"
+    """True when the ruyiPage browser engine is opted in for redeem codes."""
+    return bf.engine_enabled("REDEEM_CODE_BROWSER")
 
 
 def _browser_python() -> str:
-    """Interpreter that has ruyiPage installed.
+    """Interpreter that has ruyiPage installed (shared with web_fetch).
 
-    Defaults to a dedicated venv, falling back to the current interpreter
-    (so installing ruyiPage into the bot venv also works). Overridable via
-    REDEEM_CODE_BROWSER_PYTHON.
+    Delegates to browser_fetch.resolve_python(): BROWSER_FETCH_PYTHON →
+    REDEEM_CODE_BROWSER_PYTHON → dedicated venv → sys.executable.
     """
-    env = os.environ.get("REDEEM_CODE_BROWSER_PYTHON", "").strip()
-    if env:
-        return os.path.expanduser(env)
-    dedicated = os.path.expanduser("~/.virtualenvs/ruyipage/bin/python")
-    if os.path.exists(dedicated):
-        return dedicated
-    return sys.executable
+    return bf.resolve_python()
 
 
 def _browser_timeout() -> int:
@@ -443,91 +443,21 @@ def _browser_timeout() -> int:
 
 
 async def _fetch_url_browser(url: str) -> str | None:
-    """Fetch a Cloudflare-protected URL via the ruyiPage subprocess.
+    """Fetch a Cloudflare-protected URL via the shared ruyiPage runner.
 
-    Runs ``xvfb-run -a <python> ruyipage_fetch.py <url> <tmp>`` with a hard
-    timeout, reads the rendered HTML back from the temp file. Returns None
-    on any failure (engine disabled, xvfb/browser missing, timeout, non-zero
-    exit) so the caller can fall back to plain HTTP — never raises.
+    Thin delegate to ``browser_fetch.fetch_via_browser`` with the redeem-code
+    parameters (ucngame renders a large code table, so keep the 20000-byte
+    minimum and the table-wait heuristic). Returns None on any failure so the
+    caller falls back to plain HTTP — never raises.
     """
-    if not _browser_engine_enabled():
-        return None
-    if not os.path.exists(_BROWSER_FETCHER):
-        print(f"[RedeemCode] browser fetcher missing: {_BROWSER_FETCHER}",
-              file=sys.stderr)
-        return None
-    xvfb = shutil.which("xvfb-run")
-    if not xvfb:
-        print("[RedeemCode] xvfb-run not found; cannot run browser engine "
-              "(install xvfb or unset REDEEM_CODE_BROWSER)", file=sys.stderr)
-        return None
-
-    py = _browser_python()
-    timeout = _browser_timeout()
-    fd, out_path = tempfile.mkstemp(prefix="redeem_browser_", suffix=".html")
-    os.close(fd)
-    cmd = [xvfb, "-a", py, _BROWSER_FETCHER, url, out_path, str(timeout)]
-    print(f"[RedeemCode] browser engine fetch: {' '.join(cmd[:2])} ... {url}",
-          file=sys.stderr)
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout + 30,
-            )
-        except asyncio.TimeoutError:
-            print(f"[RedeemCode] browser fetch timed out after "
-                  f"{timeout + 30}s; killing", file=sys.stderr)
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                await proc.communicate()
-            except Exception:  # noqa: BLE001
-                pass
-            return None
-        if stderr:
-            # Surface the fetcher's own diagnostics (CF progress, result).
-            tail = stderr.decode("utf-8", "replace").strip().splitlines()[-6:]
-            for ln in tail:
-                print(f"[RedeemCode]   {ln}", file=sys.stderr)
-        if proc.returncode != 0:
-            print(f"[RedeemCode] browser fetch exit={proc.returncode} for {url}",
-                  file=sys.stderr)
-            return None
-        try:
-            with open(out_path, encoding="utf-8") as f:
-                html = f.read()
-        except OSError as e:
-            print(f"[RedeemCode] cannot read browser output: {e}", file=sys.stderr)
-            return None
-        if not html or len(html) < 1000:
-            print(f"[RedeemCode] browser returned empty/tiny HTML "
-                  f"({len(html)} bytes)", file=sys.stderr)
-            return None
-        print(f"[RedeemCode] browser engine OK: {len(html)} bytes from {url}",
-              file=sys.stderr)
-        return html
-    except Exception as e:  # noqa: BLE001
-        print(f"[RedeemCode] browser fetch error for {url}: "
-              f"{type(e).__name__}: {e}", file=sys.stderr)
-        if proc is not None:
-            try:
-                proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
-        return None
-    finally:
-        try:
-            os.remove(out_path)
-        except OSError:
-            pass
+    return await bf.fetch_via_browser(
+        url,
+        enable_flag_env="REDEEM_CODE_BROWSER",
+        timeout=_browser_timeout(),
+        min_content=20000,
+        require_table=True,
+        log_prefix="[RedeemCode]",
+    )
 
 
 async def _fetch_for_source(src: dict) -> str | None:

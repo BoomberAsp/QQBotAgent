@@ -590,14 +590,65 @@ async def _fetch_raw(url: str):
         return f"[WebFetch] 抓取失败: {type(e).__name__}: {e}"
 
 
+def _web_fetch_browser_timeout() -> int:
+    """Tier 2 per-fetch timeout (seconds). Shorter than the redeem-code
+    engine so a browser fallback can't stall the agent loop for long."""
+    try:
+        return int(os.environ.get("WEB_FETCH_BROWSER_TIMEOUT", "45"))
+    except ValueError:
+        return 45
+
+
+async def _try_browser_fetch(url: str):
+    """Tier 2: ruyiPage headless-Firefox fallback for full Cloudflare JS
+    challenges that curl_cffi can't clear.
+
+    Gated by WEB_FETCH_BROWSER=ruyipage (dormant by default → returns None,
+    so web_fetch behaves exactly like pure Tier 1). Shares the browser runner
+    and its process-wide concurrency cap with the redeem-code scraper.
+    Re-checks SSRF on the post-redirect final URL. Returns rendered HTML or
+    None — never raises.
+    """
+    try:
+        from lib import browser_fetch as bf
+    except ImportError:
+        try:
+            from QQBot.lib import browser_fetch as bf
+        except ImportError:
+            return None
+    if not bf.engine_enabled("WEB_FETCH_BROWSER"):
+        return None
+    return await bf.fetch_via_browser(
+        url,
+        enable_flag_env="WEB_FETCH_BROWSER",
+        timeout=_web_fetch_browser_timeout(),
+        min_content=1500,          # generic pages, not ucngame's big table
+        require_table=False,       # no <table>/data-code marker required
+        log_prefix="[WebFetch]",
+        ssrf_recheck=_check_ssrf,  # re-validate the final URL post-redirect
+    )
+
+
+def _finalize_web_text(text: str, url: str) -> str:
+    """Shared tail: clamp to the output limit and archive the result."""
+    if len(text) > _MAX_FETCH_OUTPUT:
+        text = text[:_MAX_FETCH_OUTPUT] + f"\n\n... (输出已截断至 {_MAX_FETCH_OUTPUT} 字符)"
+    result_text = text or "(页面内容为空)"
+    return result_text + _archive_tool_result("web_fetch", url, result_text)
+
+
 async def web_fetch(url: str) -> str:
     """Fetch content from a URL and return the extracted text.
 
     Only HTTPS URLs are accepted. HTML pages are parsed and converted
     to plain text. Non-HTML content is returned as-is (truncated).
 
-    Fetched via curl_cffi with Chrome TLS impersonation to defeat common
-    anti-bot blocking (httpx is used only if curl_cffi is unavailable).
+    Anti-bot ladder:
+      * Tier 1 (always on): curl_cffi chrome131 TLS impersonation defeats
+        JA3/WAF fingerprint blocks (httpx used only if curl_cffi missing).
+      * Tier 2 (opt-in via WEB_FETCH_BROWSER=ruyipage): when Tier 1 still
+        hits a Cloudflare JS challenge, fall back to a shared headless
+        Firefox subprocess. Dormant unless the admin enables it.
 
     Args:
         url: The URL to fetch (HTTPS only).
@@ -636,6 +687,13 @@ async def web_fetch(url: str) -> str:
     # Detect anti-bot interstitials from a small decoded preview.
     preview = _decode_content(content[:4096], content_type) if content else ""
     if _looks_blocked(status, preview):
+        # Tier 2: if the admin opted into the browser engine, try to pierce
+        # the challenge with a headless Firefox before giving up.
+        html = await _try_browser_fetch(url)
+        if html:
+            text = _html_to_text(html)
+            return _finalize_web_text(
+                text + "\n\n（注：本页经无头浏览器绕过反爬获取）", url)
         head = (f"[WebFetch] HTTP 错误 ({status}): {url}" if status >= 400
                 else f"[WebFetch] 未能获取真实内容: {url}")
         return head + "（疑似被反爬拦截）"
@@ -652,11 +710,7 @@ async def web_fetch(url: str) -> str:
 
     if truncated:
         text += f"\n\n... (内容已截断，原大小 {full_len} 字节，限制 {_MAX_FETCH_SIZE} 字节)"
-    if len(text) > _MAX_FETCH_OUTPUT:
-        text = text[:_MAX_FETCH_OUTPUT] + f"\n\n... (输出已截断至 {_MAX_FETCH_OUTPUT} 字符)"
-
-    result_text = text or "(页面内容为空)"
-    return result_text + _archive_tool_result("web_fetch", url, result_text)
+    return _finalize_web_text(text, url)
 
 
 # ── Code Execution ───────────────────────────────────────────────

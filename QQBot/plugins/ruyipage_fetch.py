@@ -15,10 +15,21 @@ out of the production venv (point REDEEM_CODE_BROWSER_PYTHON at a
 dedicated venv — see scripts/install_redeem_browser.sh).
 
 Usage:
-    xvfb-run -a <python> ruyipage_fetch.py <url> <out_file> [max_wait_s]
+    xvfb-run -a <python> ruyipage_fetch.py <url> <out_file> [max_wait_s] \
+        [--min-content N] [--no-table-wait] [--final-url-file PATH]
 
 Writes the final rendered HTML to ``<out_file>`` (a file, not stdout, so
 browser noise can't contaminate it). Diagnostics go to stderr.
+
+Optional flags (defaults reproduce the original ucngame/redeem-code
+behaviour exactly, so the redeem-code path is a no-op refactor):
+    --min-content N       success needs len(html) > N (default 20000;
+                          generic web_fetch passes ~1500)
+    --no-table-wait       don't require a <table>/data-code marker before
+                          declaring success (ucngame renders its code table
+                          via shortcodes; generic pages have no such marker)
+    --final-url-file P    write the final page.url (post-redirect) to P so
+                          the caller can re-run its SSRF check on it
 
 Exit codes:
     0  success — Cloudflare cleared and real content captured
@@ -56,16 +67,56 @@ def _log(msg: str) -> None:
     print(f"[ruyipage_fetch] {msg}", file=sys.stderr, flush=True)
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) < 3:
-        _log("usage: ruyipage_fetch.py <url> <out_file> [max_wait_s]")
-        return 2
-    url = argv[1]
-    out_file = argv[2]
+def _parse_args(argv: list[str]):
+    """Light manual parse keeping ``<url> <out_file> [max_wait]`` positional
+    compatibility while accepting the optional generic-mode flags anywhere.
+    Returns (url, out_file, max_wait, min_content, require_table,
+    final_url_file)."""
+    pos: list[str] = []
+    min_content = _MIN_CONTENT
+    require_table = True
+    final_url_file = None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--min-content":
+            i += 1
+            try:
+                min_content = int(argv[i])
+            except (ValueError, IndexError):
+                min_content = _MIN_CONTENT
+        elif a.startswith("--min-content="):
+            try:
+                min_content = int(a.split("=", 1)[1])
+            except ValueError:
+                min_content = _MIN_CONTENT
+        elif a == "--no-table-wait":
+            require_table = False
+        elif a == "--final-url-file":
+            i += 1
+            if i < len(argv):
+                final_url_file = argv[i]
+        elif a.startswith("--final-url-file="):
+            final_url_file = a.split("=", 1)[1]
+        else:
+            pos.append(a)
+        i += 1
+    url = pos[0] if len(pos) > 0 else None
+    out_file = pos[1] if len(pos) > 1 else None
     try:
-        max_wait = int(argv[3]) if len(argv) > 3 else 60
+        max_wait = int(pos[2]) if len(pos) > 2 else 60
     except ValueError:
         max_wait = 60
+    return url, out_file, max_wait, min_content, require_table, final_url_file
+
+
+def main(argv: list[str]) -> int:
+    url, out_file, max_wait, min_content, require_table, final_url_file = \
+        _parse_args(argv)
+    if not url or not out_file:
+        _log("usage: ruyipage_fetch.py <url> <out_file> [max_wait_s] "
+             "[--min-content N] [--no-table-wait] [--final-url-file PATH]")
+        return 2
 
     try:
         import ruyipage
@@ -140,20 +191,22 @@ def main(argv: list[str]) -> int:
             cur = len(html)
             cf = _cf_present(html)
             has_table = ("<table" in html.lower()) or ("data-code" in html.lower())
+            # generic mode (--no-table-wait) never gates on the table marker
+            table_ok = has_table or not require_table
             try:
                 title = page.title
             except Exception:  # noqa: BLE001
                 title = "?"
             _log(f"[{i:2d}] len={cur:6d} cf={cf!s:5} table={has_table!s:5} "
                  f"title={str(title)[:50]!r}")
-            if (not cf) and cur > _MIN_CONTENT:
+            if (not cf) and cur > min_content:
                 if cur == last_len:
                     stable += 1
                 else:
                     stable = 0
-                # Stop once content stopped growing and the table is present,
-                # or after enough stable reads even without a table marker.
-                if (stable >= 3 and has_table) or stable >= 6:
+                # Stop once content stopped growing and the table is present
+                # (ucngame mode), or after enough stable reads regardless.
+                if (stable >= 3 and table_ok) or stable >= 6:
                     _log(f"content stabilized at {cur} bytes "
                          f"(table={has_table})")
                     break
@@ -171,11 +224,26 @@ def main(argv: list[str]) -> int:
             _log(f"failed to write {out_file}: {e}")
             return 5
 
+        # Report the post-redirect final URL so the caller can re-check SSRF
+        # against it (the initial URL may 302 to an internal/metadata address).
+        if final_url_file:
+            try:
+                final_url = page.url or ""
+            except Exception as e:  # noqa: BLE001
+                final_url = ""
+                _log(f"page.url raised: {type(e).__name__}: {e}")
+            try:
+                with open(final_url_file, "w", encoding="utf-8") as f:
+                    f.write(final_url)
+            except OSError as e:
+                _log(f"failed to write {final_url_file}: {e}")
+
         cf_final = _cf_present(html)
-        ok = (not cf_final) and len(html) > _MIN_CONTENT
+        ok = (not cf_final) and len(html) > min_content
         codes = len(re.findall(r'\bArk[A-Za-z0-9]{6,14}\b', html))
         _log(f"RESULT elapsed={elapsed:.1f}s len={len(html)} "
-             f"cf={cf_final} ark_tokens={codes} ok={ok} -> {out_file}")
+             f"cf={cf_final} ark_tokens={codes} ok={ok} "
+             f"min_content={min_content} table={require_table} -> {out_file}")
         return 0 if ok else 3
     except Exception as e:  # noqa: BLE001
         _log(f"unrecoverable error: {type(e).__name__}: {e}")

@@ -41,7 +41,11 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: web_fetch
 
-**Description**: Fetch and extract text content from a specified URL. Only HTTPS is allowed. HTML pages are automatically converted to plain text. When SearXNG can't find results for a specific URL, this tool can fetch the page directly. Requests are sent with a real Chrome TLS fingerprint (curl_cffi `chrome131` impersonation) so most anti-bot / WAF blocks based on TLS fingerprinting are bypassed transparently. If a page still returns an anti-bot challenge (Cloudflare "Just a moment…", 403/429/503, etc.), the result will say it was blocked rather than returning the challenge page.
+**Description**: Fetch and extract text content from a specified URL. Only HTTPS is allowed. HTML pages are automatically converted to plain text. When SearXNG can't find results for a specific URL, this tool can fetch the page directly.
+
+Anti-bot handling is a two-tier ladder:
+- **Tier 1 (always on)**: requests carry a real Chrome TLS fingerprint (curl_cffi `chrome131` impersonation), so most anti-bot / WAF blocks based on TLS fingerprinting are bypassed transparently.
+- **Tier 2 (opt-in)**: if Tier 1 still hits a full Cloudflare JS challenge ("Just a moment…", 403/429/503), and the administrator has enabled `WEB_FETCH_BROWSER`, the page is re-fetched through a headless Firefox that solves the challenge. When the browser engine is off (the default) or also fails, the result reports that the page was blocked rather than returning the challenge page.
 
 **When to use**:
 - SearXNG search returns no results for a known URL
@@ -67,7 +71,7 @@ This document defines all tools available to the agent. Each tool has a name, de
 - Protocol: HTTPS only (HTTP, FTP, etc. are rejected)
 - Max response size: 2 MB (larger responses are truncated)
 - Max text output: 8000 characters
-- Timeout: 30 seconds
+- Timeout: 30 seconds (Tier 1 HTTP). The optional Tier 2 browser fallback adds up to `WEB_FETCH_BROWSER_TIMEOUT` (default 45s) and only runs when Tier 1 is blocked.
 - Content types: HTML (converted to text), plain text, JSON. Other types return metadata only.
 
 **Archive**: Fetched page text is archived in full (7-day retention) with a `[存档] id: xxx` footer line. To re-read a page whose content was folded/compressed out of context, call `recall_search_result` with that id instead of fetching again.

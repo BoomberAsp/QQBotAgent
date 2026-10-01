@@ -282,9 +282,15 @@ install_redeem_browser() {
     #  REDEEM_BROWSER_PROXY, on a direct host export REDEEM_BROWSER_PROXY="".)
     if bash scripts/install_redeem_browser.sh; then
         echo -e "${GREEN}[OK]${NC} 浏览器引擎安装完成"
-        echo -e "${YELLOW}[提示]${NC} 如需启用自动刷新, 在 QQBot/.env 添加后重启 bot:"
+        echo -e "${YELLOW}[提示]${NC} 如需启用兑换码自动刷新, 在 QQBot/.env 添加后重启 bot:"
         echo "  REDEEM_CODE_BROWSER=ruyipage"
         echo "  REDEEM_CODE_BROWSER_PYTHON=\$HOME/.virtualenvs/ruyipage/bin/python"
+        echo -e "${YELLOW}[提示]${NC} 同一引擎也可给 web_fetch 工具做抗反爬兜底 (Tier 2, 击穿 Cloudflare),"
+        echo -e "       在 QQBot/.env 添加后重启 bot (这些行 .env.example 里已有, 取消注释即可):"
+        echo "  WEB_FETCH_BROWSER=ruyipage            # 仅被反爬挡住时才回退浏览器, 默认休眠"
+        echo "  WEB_FETCH_BROWSER_TIMEOUT=45          # 单次浏览器抓取超时(秒), 比兑换码短"
+        echo "  BROWSER_FETCH_MAX_CONCURRENCY=2       # 兑换码+web_fetch 共享的整机 Firefox 并发上限"
+        echo "  BROWSER_FETCH_PYTHON=\$HOME/.virtualenvs/ruyipage/bin/python  # 共享解释器(回退 REDEEM_CODE_BROWSER_PYTHON)"
     else
         echo -e "${YELLOW}[WARN]${NC} 浏览器引擎安装失败 (可选组件, 不影响主程序与面板手动维护)"
         echo -e "${YELLOW}[WARN]${NC} 可稍后手动重试: bash scripts/install_redeem_browser.sh"
@@ -327,7 +333,8 @@ main() {
     echo -e "  3. 安装 NapCat: ${YELLOW}bash napcat.sh --docker n${NC}"
     echo -e "  4. 在 NapCat WebUI 中配置反向 WebSocket 连接到 ws://127.0.0.1:8081/onebot/v11/ws"
     echo -e "  5. 启动: ${YELLOW}bash start.sh${NC}"
-    echo -e "  (可选) 兑换码浏览器引擎: ${YELLOW}bash scripts/install_redeem_browser.sh${NC} 后在 .env 启用 REDEEM_CODE_BROWSER"
+    echo -e "  (可选) ruyiPage 浏览器引擎: ${YELLOW}bash scripts/install_redeem_browser.sh${NC} 后在 .env 启用"
+    echo -e "         REDEEM_CODE_BROWSER (兑换码自动刷新) 和/或 WEB_FETCH_BROWSER (web_fetch 抗反爬兜底)"
     echo ""
 }
 
