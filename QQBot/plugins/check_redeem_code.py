@@ -13,8 +13,20 @@ Supports:
 Data source:
   - https://ucngame.com/codes/ark-recode-redeem-codes/ — the only
     high-timeliness aggregator, but behind a Cloudflare JS challenge
-    since ~2026-09; kept as a dormant auto-fallback in case it recovers.
-    (gamevoyant / cofregamers were removed 2026-10: incomplete data.)
+    since ~2026-09. Plain HTTP cannot pass it; the optional ruyiPage
+    browser engine can (see below). (gamevoyant / cofregamers were
+    removed 2026-10: incomplete data.)
+
+Browser engine (Cloudflare bypass, opt-in): ucngame's JS challenge defeats
+curl_cffi/httpx (403 direct and via proxy). Setting REDEEM_CODE_BROWSER=
+ruyipage in QQBot/.env makes the scraper drive a fingerprinted Firefox
+(ruyipage_fetch.py subprocess under xvfb-run) that auto-solves the challenge
+— verified from both residential and Tencent Cloud datacenter IPs. It is
+isolated in a subprocess + dedicated venv so a browser crash can't take down
+the bot. When the flag is unset the engine is off and behavior is unchanged
+(ucngame dormant, panel is the primary source). Setup:
+  scripts/install_redeem_browser.sh
+Env: REDEEM_CODE_BROWSER, REDEEM_CODE_BROWSER_PYTHON, REDEEM_CODE_BROWSER_TIMEOUT.
 
 Sources unreachable directly from the server are fetched through the proxy
 configured via REDEEM_CODE_PROXY (or HTTPS_PROXY) in QQBot/.env, e.g.:
@@ -30,7 +42,9 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -161,17 +175,76 @@ def get_cache_info() -> dict:
     return {"scraped_at": scraped_at, "scraped_at_iso": iso, "stale": _is_stale()}
 
 
+# ── Background refresh state ──────────────────────────────────────
+#
+# When the browser engine (ruyiPage) is enabled, a refresh can take
+# 12–120s (cold Firefox launch under xvfb + Cloudflare challenge + lazy
+# render wait). Awaiting that inline would hang one user's /兑换码 reply
+# for minutes. So when the browser engine is on, we fire the refresh as a
+# detached background task and return immediately with the cached data;
+# the next call picks up the freshened cache. The fast HTTP-only path
+# stays inline (unchanged) so existing behavior/tests are preserved.
+_refresh_in_flight = False
+_refresh_task = None
+
+
 async def check_and_refresh() -> bool:
-    """Check cache staleness and trigger background scrape if needed.
+    """Check cache staleness and trigger a scrape if needed.
 
     Returns True if a refresh was triggered (not whether it succeeded).
     Call get_redeem_codes() afterwards to get the best available data.
+
+    With the browser engine enabled the refresh runs as a non-blocking
+    background task (a cold Firefox+Cloudflare fetch can take >60s and must
+    not hang the caller); a single in-flight refresh is deduplicated. The
+    default HTTP path is awaited inline as before.
     """
-    if _is_stale():
+    if not _is_stale():
+        return False
+
+    if _browser_engine_enabled():
+        global _refresh_in_flight, _refresh_task
+        if _refresh_in_flight:
+            # Already refreshing in the background; don't stack another
+            # browser launch. Caller serves cached data meanwhile.
+            return True
+        _refresh_in_flight = True
+        _refresh_task = asyncio.create_task(_background_refresh())
+        return True
+
+    await _refresh()
+    _cleanup_expired()
+    return True
+
+
+async def _background_refresh():
+    """Run a full refresh without blocking the caller.
+
+    Retains a module-level task reference (via check_and_refresh) so the
+    event loop can't garbage-collect it mid-flight. Always clears the
+    in-flight flag, and swallows exceptions (a failed browser fetch must
+    never surface as an unhandled task error).
+    """
+    global _refresh_in_flight
+    try:
         await _refresh()
         _cleanup_expired()
-        return True
-    return False
+    except Exception as e:  # noqa: BLE001
+        print(f"[RedeemCode] background refresh failed: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+    finally:
+        _refresh_in_flight = False
+
+
+def is_refresh_in_flight() -> bool:
+    """True while a background (browser-engine) refresh is still running.
+
+    Lets callers tell "scrape is in progress" apart from "scrape failed",
+    so they don't show a false '自动更新失败 / 等待管理员添加' message or
+    raise a spurious no_valid_codes alert for a refresh that is about to
+    succeed. Always False on the inline HTTP path (which blocks to finish).
+    """
+    return _refresh_in_flight
 
 
 # ── Cache I/O ─────────────────────────────────────────────────────
@@ -299,6 +372,11 @@ async def _refresh():
     merged = list(existing_by_code.values())
     _save_cache(merged, scraped_at=time.time())
 
+    # A successful scrape invalidates any "no_valid_codes" admin alert the
+    # bot wrote while this (possibly background) refresh was in flight —
+    # the alert's premise was "scraping failed", which is no longer true.
+    _clear_admin_alert()
+
     print(f"[RedeemCode] Refresh complete: {len(scraped)} scraped, "
           f"{len(merged)} total in cache", file=sys.stderr)
 
@@ -312,6 +390,156 @@ def _get_proxy_url() -> str:
     return (os.environ.get("REDEEM_CODE_PROXY", "")
             or os.environ.get("HTTPS_PROXY", "")
             or os.environ.get("https_proxy", "")).strip()
+
+
+# ── Browser engine (Cloudflare bypass via ruyiPage) ───────────────
+# ucngame sits behind a Cloudflare JS challenge that plain HTTP clients
+# (curl_cffi/httpx) cannot pass — direct/proxy both return 403. ruyiPage
+# drives a fingerprinted Firefox that auto-solves the challenge with zero
+# interaction (verified from both residential and datacenter IPs). It runs
+# as an isolated subprocess under xvfb-run so a browser crash can never
+# take down the bot, and its heavy deps stay out of the production venv.
+#
+# Opt-in via QQBot/.env (disabled by default → identical to old behavior):
+#   REDEEM_CODE_BROWSER=ruyipage
+#   REDEEM_CODE_BROWSER_PYTHON=~/.virtualenvs/ruyipage/bin/python  # dedicated venv
+#   REDEEM_CODE_BROWSER_TIMEOUT=90        # seconds for the whole fetch
+# Setup: scripts/install_redeem_browser.sh (venv + Firefox runtime).
+
+_BROWSER_FETCHER = os.path.join(os.path.dirname(__file__), "ruyipage_fetch.py")
+
+
+def _browser_engine() -> str:
+    """Configured browser engine name (lowercased), '' if none."""
+    return os.environ.get("REDEEM_CODE_BROWSER", "").strip().lower()
+
+
+def _browser_engine_enabled() -> bool:
+    """True when the ruyiPage browser engine is opted in."""
+    return _browser_engine() == "ruyipage"
+
+
+def _browser_python() -> str:
+    """Interpreter that has ruyiPage installed.
+
+    Defaults to a dedicated venv, falling back to the current interpreter
+    (so installing ruyiPage into the bot venv also works). Overridable via
+    REDEEM_CODE_BROWSER_PYTHON.
+    """
+    env = os.environ.get("REDEEM_CODE_BROWSER_PYTHON", "").strip()
+    if env:
+        return os.path.expanduser(env)
+    dedicated = os.path.expanduser("~/.virtualenvs/ruyipage/bin/python")
+    if os.path.exists(dedicated):
+        return dedicated
+    return sys.executable
+
+
+def _browser_timeout() -> int:
+    try:
+        return int(os.environ.get("REDEEM_CODE_BROWSER_TIMEOUT", "90"))
+    except ValueError:
+        return 90
+
+
+async def _fetch_url_browser(url: str) -> str | None:
+    """Fetch a Cloudflare-protected URL via the ruyiPage subprocess.
+
+    Runs ``xvfb-run -a <python> ruyipage_fetch.py <url> <tmp>`` with a hard
+    timeout, reads the rendered HTML back from the temp file. Returns None
+    on any failure (engine disabled, xvfb/browser missing, timeout, non-zero
+    exit) so the caller can fall back to plain HTTP — never raises.
+    """
+    if not _browser_engine_enabled():
+        return None
+    if not os.path.exists(_BROWSER_FETCHER):
+        print(f"[RedeemCode] browser fetcher missing: {_BROWSER_FETCHER}",
+              file=sys.stderr)
+        return None
+    xvfb = shutil.which("xvfb-run")
+    if not xvfb:
+        print("[RedeemCode] xvfb-run not found; cannot run browser engine "
+              "(install xvfb or unset REDEEM_CODE_BROWSER)", file=sys.stderr)
+        return None
+
+    py = _browser_python()
+    timeout = _browser_timeout()
+    fd, out_path = tempfile.mkstemp(prefix="redeem_browser_", suffix=".html")
+    os.close(fd)
+    cmd = [xvfb, "-a", py, _BROWSER_FETCHER, url, out_path, str(timeout)]
+    print(f"[RedeemCode] browser engine fetch: {' '.join(cmd[:2])} ... {url}",
+          file=sys.stderr)
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout + 30,
+            )
+        except asyncio.TimeoutError:
+            print(f"[RedeemCode] browser fetch timed out after "
+                  f"{timeout + 30}s; killing", file=sys.stderr)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.communicate()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        if stderr:
+            # Surface the fetcher's own diagnostics (CF progress, result).
+            tail = stderr.decode("utf-8", "replace").strip().splitlines()[-6:]
+            for ln in tail:
+                print(f"[RedeemCode]   {ln}", file=sys.stderr)
+        if proc.returncode != 0:
+            print(f"[RedeemCode] browser fetch exit={proc.returncode} for {url}",
+                  file=sys.stderr)
+            return None
+        try:
+            with open(out_path, encoding="utf-8") as f:
+                html = f.read()
+        except OSError as e:
+            print(f"[RedeemCode] cannot read browser output: {e}", file=sys.stderr)
+            return None
+        if not html or len(html) < 1000:
+            print(f"[RedeemCode] browser returned empty/tiny HTML "
+                  f"({len(html)} bytes)", file=sys.stderr)
+            return None
+        print(f"[RedeemCode] browser engine OK: {len(html)} bytes from {url}",
+              file=sys.stderr)
+        return html
+    except Exception as e:  # noqa: BLE001
+        print(f"[RedeemCode] browser fetch error for {url}: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        return None
+    finally:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+
+
+async def _fetch_for_source(src: dict) -> str | None:
+    """Fetch a source's HTML: browser engine first (if flagged + enabled),
+    then plain HTTP as fallback. Returns HTML or None."""
+    if src.get("browser") and _browser_engine_enabled():
+        html = await _fetch_url_browser(src["url"])
+        if html:
+            return html
+        print(f"[RedeemCode] browser engine failed for {src.get('name')}; "
+              f"falling back to HTTP", file=sys.stderr)
+    return await _fetch_url(src["url"], use_proxy=src.get("proxy", False))
 
 
 async def _fetch_url(url: str, use_proxy: bool = False) -> str | None:
@@ -378,9 +606,11 @@ async def _fetch_url(url: str, use_proxy: bool = False) -> str | None:
 
 
 # ── Source registry ───────────────────────────────────────────────
-# ucngame.com is behind a Cloudflare JS challenge since ~2026-09 and is
-# kept only as a dormant auto-fallback; the primary maintenance channel
-# is the WebUI 兑换码管理 page (panel entries). gamevoyant/cofregamers
+# ucngame.com is behind a Cloudflare JS challenge since ~2026-09. Plain
+# HTTP (direct or proxy) returns 403; only the ruyiPage browser engine
+# (browser:True) can pass it. With REDEEM_CODE_BROWSER unset the engine is
+# off and ucngame stays a dormant fallback; the primary maintenance channel
+# is then the WebUI 兑换码管理 page (panel entries). gamevoyant/cofregamers
 # were removed 2026-10 (incomplete, low-quality data).
 
 _SOURCES = [
@@ -388,6 +618,7 @@ _SOURCES = [
         "name": "ucngame",
         "url": _REDEEM_CODE_URL,
         "proxy": False,
+        "browser": True,   # needs ruyiPage to clear the Cloudflare challenge
     },
 ]
 
@@ -402,7 +633,7 @@ async def _scrape() -> list[dict] | None:
     ok_any = False
 
     for src in _SOURCES:
-        html = await _fetch_url(src["url"], use_proxy=src["proxy"])
+        html = await _fetch_for_source(src)
         if html is None:
             continue
         ok_any = True

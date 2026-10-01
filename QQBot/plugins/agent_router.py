@@ -853,6 +853,7 @@ def _build_tool_registry() -> ToolRegistry:
         from plugins.check_redeem_code import (
             get_time_limited_codes, get_long_term_codes, check_and_refresh,
             get_cache_info, format_expiry_display, _write_admin_alert,
+            is_refresh_in_flight,
         )
 
         await check_and_refresh()
@@ -865,6 +866,12 @@ def _build_tool_registry() -> ToolRegistry:
         recent_expired = [c for c in tl if c.get("recently_expired")]
 
         if scope == "time_limited" and not tl:
+            # A browser-engine refresh may still be running in the background
+            # (check_and_refresh returns immediately). Don't report failure or
+            # raise an alert for a scrape that hasn't finished yet.
+            if is_refresh_in_flight():
+                return ("兑换码正在后台更新中，请稍等片刻再试。"
+                        "如需长期兑换码，请以 scope=long_term 重新调用。")
             # No time-limited codes AND scraper failing → ping the admin
             # via the WebUI panel alert banner.
             if get_cache_info().get("stale"):
@@ -2466,19 +2473,25 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
     from plugins.check_redeem_code import (
         get_time_limited_codes, get_long_term_codes,
         check_and_refresh, get_cache_info,
-        format_expiry_display, _write_admin_alert,
+        format_expiry_display, _write_admin_alert, is_refresh_in_flight,
     )
 
-    # Trigger background refresh if stale, then use cached data
+    # Trigger a refresh if stale, then use cached data. With the browser
+    # engine enabled this returns immediately while the scrape runs in the
+    # background (in_flight True); the HTTP path blocks until done.
     await check_and_refresh()
     info = get_cache_info()
+    in_flight = is_refresh_in_flight()
 
-    # Staleness footer: shown when cache is old (scrape failing / no fresh data)
+    # Staleness footer: shown when cache is old (scrape failing / in progress)
     stale_note = ""
     if info.get("stale"):
         iso = info.get("scraped_at_iso", "")
         date_part = iso[:10] if iso else "未知时间"
-        stale_note = f"⚠ 数据截至 {date_part}（自动更新失败，可能不是最新）"
+        if in_flight:
+            stale_note = f"⚠ 数据截至 {date_part}，正在后台更新中…"
+        else:
+            stale_note = f"⚠ 数据截至 {date_part}（自动更新失败，可能不是最新）"
 
     # ── /长期兑换码 branch ──────────────────────────────────────
     if cmd in long_cmds:
@@ -2509,6 +2522,13 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
     recent_expired = [c for c in codes if c.get("recently_expired")]
 
     if not codes:
+        if in_flight:
+            # Background (browser-engine) refresh still running — don't claim
+            # failure or alert the admin for a scrape that hasn't finished.
+            msg = ("兑换码正在后台更新中，请稍等片刻再试～"
+                   "\n长期有效的兑换码请发送 /长期兑换码 查询。")
+            await _safe_send(msg)
+            return True
         if info.get("stale"):
             # No time-limited codes AND scraper failing → tell the user
             # and raise the WebUI panel alert so the admin adds codes.
