@@ -94,6 +94,11 @@ def main(argv: list[str]) -> int:
         opts.enable_marionette(False)          # BiDi, not marionette
         opts.set_window_size(1920, 1080)
         opts.set_timeouts(page_load=60000, script=30000)
+        # Disable HTTP/3 (QUIC). On some networks Firefox's HTTP/3 negotiation
+        # fails with NS_ERROR_NET_HTTP3_PROTOCOL_ERROR and the page never loads
+        # (stuck on "Problem loading page", ~1.3KB). Cloudflare does not require
+        # HTTP/3, so forcing HTTP/2 fallback makes the fetch reliable.
+        opts.set_pref("network.http.http3.enabled", False)
         # NOTE: smart_fingerprint() intentionally skipped — it needs the
         # `requests` package and a matching geo (fails on CN servers with
         # CountryMismatchError), and CF is bypassed fine without it.
