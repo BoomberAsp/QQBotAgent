@@ -6,7 +6,7 @@ skills (located via their turn-duration markers), and aligns each distinct name
 against the two existing translation tables:
 
 * ``lib/status_icons.py: STATUS_ICON_CN``  (icon file name → Chinese label)
-* ``tools/wiki_scraper.py: _STATUS_TERM_CN`` (English term → Chinese term)
+* ``tools/wiki_glossary.py: status_terms`` (English term → Chinese term)
 
 Output reveals the alias gaps — skill-text names that do not map cleanly onto an
 icon label — which is the raw material for building the character→buff-icon
@@ -19,7 +19,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import os
 import re
@@ -31,21 +30,9 @@ _PROJECT = os.path.dirname(_THIS)
 sys.path.insert(0, _PROJECT)
 
 from lib.status_icons import STATUS_ICON_CN  # noqa: E402  (filename -> CN label)
+from tools.wiki_glossary import load_glossary  # noqa: E402  (status_terms table)
 
 _DEFAULT_CACHE = os.path.join(_PROJECT, "data", "wiki_cache", "character_details.json")
-_WIKI_SCRAPER = os.path.join(_THIS, "wiki_scraper.py")
-
-
-def _extract_module_list(path: str, varname: str) -> list:
-    """Extract a module-level list literal without importing (avoids deps)."""
-    with open(path, encoding="utf-8") as f:
-        tree = ast.parse(f.read())
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for t in node.targets:
-                if isinstance(t, ast.Name) and t.id == varname:
-                    return ast.literal_eval(node.value)
-    return []
 
 
 # ── Duration markers ─────────────────────────────────────────────────
@@ -68,7 +55,7 @@ _TAIL_CLEAN = re.compile(
 
 def _known_labels() -> tuple[dict[str, str], set[str], set[str]]:
     icon_cn = dict(STATUS_ICON_CN)              # filename -> CN
-    terms = _extract_module_list(_WIKI_SCRAPER, "_STATUS_TERM_CN")
+    terms = [tuple(pair) for pair in load_glossary()["status_terms"]]
     term_en_to_cn = {en: cn for en, cn in terms}
     icon_set = set(icon_cn.values())
     term_set = set(term_en_to_cn.values())

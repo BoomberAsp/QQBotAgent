@@ -23,8 +23,12 @@ _CACHE_PATH = os.path.join(
     os.path.dirname(__file__), "..", "data", "wiki_cache", "character_details.json"
 )
 
-# Module-level lazy index (rebuilt only once per process)
+# Module-level lazy index, rebuilt when the cache file's mtime changes — the
+# panel writes character_details.json directly (manual corrections / LLM
+# re-translation), and a stale in-memory copy would shadow those edits (same
+# revalidation pattern as profile/session, commit f9c36c7).
 _data: dict | None = None
+_data_mtime: float | None = None
 _by_cn_name: dict = {}
 _by_cn_name_norm: dict = {}
 _by_title: dict = {}
@@ -51,9 +55,14 @@ _images_ensured = False
 
 def _load() -> dict:
     """Lazily load character_details.json and rebuild lookup indexes."""
-    global _data, _by_cn_name, _by_cn_name_norm, _by_title, _by_id
-    if _data is not None:
+    global _data, _data_mtime, _by_cn_name, _by_cn_name_norm, _by_title, _by_id
+    try:
+        mtime = os.path.getmtime(_CACHE_PATH)
+    except OSError:
+        mtime = None
+    if _data is not None and mtime == _data_mtime:
         return _data
+    _data_mtime = mtime
 
     _data = {}
     if os.path.exists(_CACHE_PATH):

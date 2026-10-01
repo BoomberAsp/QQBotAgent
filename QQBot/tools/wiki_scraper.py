@@ -24,6 +24,7 @@ from urllib.parse import urlencode
 from curl_cffi import requests as cffi_requests
 
 from lib.status_icons import STATUS_ICON_CN, STATUS_ICON_DIR
+from tools.wiki_glossary import build_prompt_glossary, load_glossary
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -68,167 +69,10 @@ OPENRUBI_CHAR_DIC = os.path.join(OPENRUBI_CHAR_DIR, "character_dic.json")
 OPENRUBI_MEMBERS_INFO = os.path.join(OPENRUBI_CHAR_DIR, "members_info.json")
 OPENRUBI_BONDS_INFO = os.path.join(OPENRUBI_CHAR_DIR, "bonds_info.json")
 
-# Status-effect / game-term → Chinese (deterministic, applied before LLM translation).
-# Longer phrases first so "ATK Down" is replaced before "ATK" would match inside it.
-_STATUS_TERM_CN = [
-    ("Effect Resistance", "效果抵抗"),
-    ("Effect Hit Rate", "效果命中"),
-    ("SPD Down", "速度下降"),
-    ("ATK Down", "攻击力下降"),
-    ("DEF Down", "防御力下降"),
-    ("SPD Up", "速度提升"),
-    ("ATK Up", "攻击力提升"),
-    ("DEF Up", "防御力提升"),
-    ("Provoke", "嘲讽"),
-    ("Immunity", "免疫"),
-    ("Shield", "护盾"),
-    ("Stun", "眩晕"),
-    ("Silence", "沉默"),
-    ("Poison", "中毒"),
-    ("Burn", "灼烧"),
-    ("Bleed", "流血"),
-    ("Recovery", "持续恢复"),
-    ("Speed", "速度"),
-    ("ATK", "攻击力"),
-    ("DEF", "防御力"),
-    ("HP", "生命值"),
-    ("Additional damage", "追加伤害"),
-    ("Upon hit", "技能命中时"),
-    ("ACC", "（基础）命中率"),
-    ("Lock On", "锁定"),
-    ("Foresight", "看破"),
-    ("Ignore Effect RES", "无视效果抵抗"),
-    ("Astrogen", "星源力"),
-    ("Flanking", "追加攻击"),
-    ("Extra Turn", "额外回合"),
-    ("Stealth", "潜伏"),
-    ("Penetrate", "贯穿（一定防御力）"),
-    ("Extinction", "灭绝"),
-    ("Increase the Action Gauge", "行动值提升"),
-    ("damage distribution effects", "伤害分配（分摊）效果"),
-    ("ACC Up", "（基础）命中率提升"),
-    ("Morale", "战意值"),
-    ("Injury", "创伤"),
-    ("restore HP", "回复生命值"),
-    ("Vigor", "气魄"),
-    ("Hits", "命中的攻击"),
-    ("Crit", "暴击"),
-    ("Unbuffable", "无法强化"),
-    ("Immortal", "不屈"),
-    ("Revived", "复活"),
-    ("fatal blow", "致命伤害"),
-    ("removing all buffs", "驱散所有正向状态"),
-    ("Seal/Passiveless", "被动无效"),
-    ("ACC Down", "（基础）命中率下降"),
-    ("damage taken is reduced", "伤害量下降"),
-    ("Counter", "反击"),
-    ("Evasion Up", "闪避率提升"),
-    ("reduce the Cooldown", "冷却减少"),
-    ("At the start of the battle", "进入战斗时"),
-    ("Invincible", "无敌"),
-    ("stealing (one/two/etc.) buff(s)", "窃取（一个/两个/等）正向状态"),
-    ("Blink", "瞬动"),
-    ("Bomb", "炸弹"),
-    ("lower their Action Gauge", "造成行动值降低"),
-    ("Ignite (the burn and bomb)", "激发"),
-    ("DMG RED effect", "伤害量下降效果"),
-    ("Curse", "诅咒"),
-    ("Unhealable", "禁疗"),
-    ("Resurgence", "回生"),
-    ("Unremovable", "不可解除"),
-    ("Lifesteal", "吸血"),
-    ("increase their Skill Cooldowns", "技能冷却时间延长"),
-    ("Sleep", "沉睡"),
-    ("Confusion", "迷乱"),
-    ("Focus", "集中力"),
-    ("Crit RES Up", "暴击抵抗"),
-    ("Defiant", "遇强则强"),
-    ("Hinder", "妨碍"),
-    ("Skill Nullifier", "技能免疫"),
-    ("Restrict", "拘禁"),
-    ("Frostburn", "冰灼"),
-    ("Stellar Sigil", "星链标记"),
-    ("Flanking Boost", "追击强化"),
-    ("Flanking", "追击"),
-    ("decreasing the duration of their buffs", "减少正向状态时间"),
-    ("Guard", "守护"),
-    ("fixed damage", "固定伤害"),
-    ("copy buffs", "复制正向状态"),
-    ("Random Buff", "随机正向状态"),
-    ("extending the duration of all debuffs", "负向状态延长"),
-    ("Immobilizing Debuffs", "无法行动类型负向状态"),
-    ("Pain Threshold", "受伤上限"),
-    ("Hibiscus Morning Dew", "扶桑晓露"),
-    ("Crit DMG Up", "暴击伤害提升"),
-    ("Performance Mode", "公演模式"),
-    ("Arrogant Bullying", "自视甚高的欺侮"),
-    ("Flow State", "心流状态"),
-    ("Active", "主动技"),
-    ("Passive", "被动技"),
-    ("Resuscitate", "复苏"),
-    ("ADD DMG RED", "追加伤害下降"),
-    ("Shield Conversion", "护盾转换"),
-    ("Cluster", "凝聚"),
-    ("reducing the debuffs", "负向状态时间减少"),
-    ("Jumpy Pumpkins", "鬼跳南瓜"),
-    ("FXXK YXU", "FXXK YXU"),
-    ("Targeted Taunt", "指定嘲讽"),
-    ("Transfer", "转移"),
-    ("rebound", "反弹"),
-    ("favorable attribute", "有利属性"),
-    ("attribute counter", "不利属性"),
-    ("Member","团员")
-]
-
-# Wiki stat multipliers: the wiki's {{Member}} template computes level-60 stats
-# from growth ratios with these constants (verified against all 198 openrubi
-# characters — zero mismatches across 792 stat values).
-#   ATK:   round(ATK_ratio * 608)
-#   HP:    round(HP_ratio  * 4960)
-#   DEF:   round(DEF_ratio * 617)
-#   SPD:   round(SPD_ratio * 100)
-_STAT_MULTIPLIERS = {"ATK": 608, "HP": 4960, "DEF": 617, "SPD": 100}
-
-# Deterministic element/class translation maps (user-confirmed)
-ELEMENT_CN = {"Flame": "火", "Water": "水", "Nature": "木", "Light": "光", "Dark": "暗"}
-CLASS_CN = {
-    "Warrior": "战士",
-    "Caster": "术士",
-    "Defender": "重装",
-    "Medic": "医疗",
-    "Sniper": "狙击",
-    "Vanguard": "先锋",
-}
-
-# Western zodiac constellation names (identity field)
-CONSTELLATION_CN = {
-    "Aries": "白羊座", "Taurus": "金牛座", "Gemini": "双子座",
-    "Cancer": "巨蟹座", "Leo": "狮子座", "Virgo": "处女座",
-    "Libra": "天秤座", "Scorpio": "天蝎座", "Scorpius": "天蝎座",
-    "Sagittarius": "射手座", "Capricorn": "摩羯座", "Capricornus": "摩羯座",
-    "Aquarius": "水瓶座", "Pisces": "双鱼座",
-}
-
-# openrubi Discipline stat keys → (Chinese label, is_percentage).
-# Used to render openrubi's numeric Discipline dict into Chinese talent text
-# for seeded entries (no LLM), closing the discs gap openrubi leaves English.
-DISCIPLINE_STAT_CN = {
-    "ATK%": ("攻击力", True),
-    "HP%": ("生命值", True),
-    "DEF%": ("防御力", True),
-    "Speed": ("速度", False),
-    "Effect_Hit_Rate": ("效果命中", True),
-    "Effect_RES": ("效果抵抗", True),
-    "Crit_Rate": ("暴击率", True),
-    "Crit_DMG": ("暴击伤害", True),
-}
-
-# Bond economy values are deterministic by star count (from Template:Bond's
-# {{#switch: {{{Stars}}}} markup). No wiki field stores them — they are
-# computed at render time, so we reproduce the mapping here.
-BOND_SELL_GOLD = {"5": "12500", "4": "4200", "3": "2100"}
-BOND_SELL_FRAGMENT = {"5": "30", "4": "8", "3": "1"}
-BOND_XP_VALUE = {"5": "1030", "4": "850", "3": "680"}
+# Translation term tables (status terms, element/class/constellation maps,
+# discipline stats, bond economy values, stat multipliers, LLM prompt
+# glossaries) live in tools/wiki_glossary.py — loaded from
+# config/translation_glossary.json (panel-editable) with built-in defaults.
 
 # Potential growth params are deterministic (never LLM-translated), so they are
 # excluded from the re-translation source hash. Otherwise introducing them would
@@ -902,7 +746,7 @@ class WikiScraper:
         # Deterministic game-term → Chinese (word-boundary match, longest first).
         # Runs here so both the English fallback and the LLM input see Chinese
         # terms, preventing mixed-language descriptions.
-        for en, cn in _STATUS_TERM_CN:
+        for en, cn in load_glossary()["status_terms"]:
             text = re.sub(r"\b" + re.escape(en) + r"\b", cn, text)
         # {{Example}} → 示例
         text = text.replace("{{Example}}", "示例")
@@ -1173,11 +1017,12 @@ class WikiScraper:
     @staticmethod
     def _apply_deterministic_maps(entry: dict):
         """Fill element/class/constellation/stats_max via fixed maps (no LLM)."""
-        entry["element"] = ELEMENT_CN.get(entry.get("element_en", ""), entry.get("element_en", ""))
-        entry["class_cn"] = CLASS_CN.get(entry.get("class_en", ""), entry.get("class_en", ""))
+        g = load_glossary()
+        entry["element"] = g["element"].get(entry.get("element_en", ""), entry.get("element_en", ""))
+        entry["class_cn"] = g["class"].get(entry.get("class_en", ""), entry.get("class_en", ""))
         const = entry.get("constellation", "").strip()
         if const:
-            entry["constellation"] = CONSTELLATION_CN.get(
+            entry["constellation"] = g["constellation"].get(
                 const[:1].upper() + const[1:], const
             )
         # Compute level-60 max stats from wiki growth ratios
@@ -1194,7 +1039,7 @@ class WikiScraper:
         """
         stats = entry.get("stats") or {}
         stats_max = {}
-        for key, mult in _STAT_MULTIPLIERS.items():
+        for key, mult in load_glossary()["stat_multipliers"].items():
             raw = stats.get(key, "")
             if raw:
                 try:
@@ -1322,7 +1167,7 @@ class WikiScraper:
             if idx < 0 or idx >= 6 or not isinstance(stats, dict):
                 continue
             for key, val in stats.items():
-                label, is_pct = DISCIPLINE_STAT_CN.get(key, (key, False))
+                label, is_pct = load_glossary()["discipline_stat"].get(key, [key, False])
                 suffix = "%" if is_pct else ""
                 discs[idx] = f"{label} +{val}{suffix}"
                 break  # single-stat nodes; keep the first if ever multiple
@@ -1365,6 +1210,45 @@ class WikiScraper:
         return entry
 
     # ── Character Detail Translation ──────────────────────────────
+
+    async def force_retranslate(self, kind: str, entries: list[dict]) -> dict:
+        """Force a full re-translation of already-cached entries (panel-driven).
+
+        The normal refresh pipeline skips fields that already hold Chinese
+        text (the merge guard only backfills fields still equal to their
+        English source), so a plain re-run cannot upgrade an existing
+        translation. This resets the LLM-translated fields back to their
+        English source and re-runs the standard pipeline, which means:
+
+          - the current glossary (config/translation_glossary.json) is applied;
+          - names go through the openrubi → name_mapping → LLM lookup chain
+            again (cached mappings win — consistency over novelty);
+          - ``_src_hash`` is untouched (the English source does not change).
+
+        Manual corrections on the entry ARE overwritten — callers should
+        confirm with the user first. Mutates entries in place; the caller is
+        responsible for validating the result (e.g. LLM failure leaves fields
+        at their English source) and persisting them. Requires
+        ``self.llm_client``.
+        """
+        if kind not in ("char", "bond"):
+            return {"error": f"非法重翻译类型: {kind}"}
+        if not self.llm_client:
+            return {"error": "未配置 LLM 客户端，无法重翻译"}
+        if kind == "char":
+            for c in entries:
+                c["name_cn"] = c.get("title", "")
+                c["desc"] = c.get("desc_en", "")
+                c["discs"] = list(c.get("discs_en", []))
+                for s in c.get("skills", []) or []:
+                    for key in ("name", "des", "des2", "burst"):
+                        s[key] = s.get(key + "_en", "")
+            await self._translate_character_details(entries)
+        else:
+            for b in entries:
+                b["name_cn"] = b.get("title", "")
+            await self._translate_bond_details(entries)
+        return {"entries": len(entries)}
 
     async def _translate_character_details(self, chars: list[dict]):
         """Translate English character entries to Chinese (name + free-text).
@@ -1498,14 +1382,7 @@ class WikiScraper:
             return
 
         fewshot = self._build_fewshot()
-        glossary = (
-            "术语参考：ATK=攻击力，DEF=防御力，HP=生命值，Speed=速度，"
-            "ATK Down=攻击力下降，DEF Down=防御力下降，SPD Down=速度下降，"
-            "ATK Up=攻击力提升，DEF Up=防御力提升，SPD Up=速度提升，"
-            "Provoke=嘲讽，Immunity=免疫，Shield=护盾，Stun=眩晕，Silence=沉默，"
-            "Poison=中毒，Burn=灼烧，Bleed=流血，Barrier=屏障，Recovery=恢复，"
-            "Effect Hit Rate=效果命中，Effect Resistance=效果抵抗。"
-        )
+        glossary = build_prompt_glossary("char")
 
         total = len(chars)
         for i in range(0, total, 4):
@@ -1823,11 +1700,12 @@ class WikiScraper:
     @staticmethod
     def _apply_bond_deterministic(entry: dict, release_map: dict | None = None):
         """Fill class CN + deterministic sell/XP + release date (no LLM)."""
-        entry["class_cn"] = CLASS_CN.get(entry.get("class_en", ""), entry.get("class_en", ""))
+        g = load_glossary()
+        entry["class_cn"] = g["class"].get(entry.get("class_en", ""), entry.get("class_en", ""))
         stars = str(entry.get("stars", ""))
-        entry["sell_gold"] = BOND_SELL_GOLD.get(stars, "")
-        entry["sell_fragment"] = BOND_SELL_FRAGMENT.get(stars, "")
-        entry["xp_value"] = BOND_XP_VALUE.get(stars, "")
+        entry["sell_gold"] = g["bond_sell_gold"].get(stars, "")
+        entry["sell_fragment"] = g["bond_sell_fragment"].get(stars, "")
+        entry["xp_value"] = g["bond_xp_value"].get(stars, "")
         if release_map:
             entry["release"] = WikiScraper._normalize_release_date(
                 release_map.get(entry.get("title", ""), "")
@@ -1908,11 +1786,7 @@ class WikiScraper:
         """Batch-translate desc/effect/notes/obtain (+ unmapped name) via LLM."""
         if not self.llm_client:
             return
-        glossary = (
-            "术语参考：ATK=攻击力，DEF=防御力，HP=生命值，Shield=护盾，"
-            "Immune=免疫，Provoke=嘲讽，Stun=眩晕，Bleed=流血，Burn=灼烧，"
-            "Poison=中毒，Revive=复活，Barrier=屏障，Recovery=恢复。"
-        )
+        glossary = build_prompt_glossary("bond")
         total = len(bonds)
         for i in range(0, total, 4):
             batch = bonds[i : i + 4]
@@ -2240,7 +2114,7 @@ class WikiScraper:
     def _strip_wiki_markup(text: str) -> str:
         """Remove wiki/HTML markup → plain text, keeping English.
 
-        Like ``_clean_markup`` but without the ``_STATUS_TERM_CN`` translation,
+        Like ``_clean_markup`` but without the status-terms glossary translation,
         so Battle_Mechanics effect text is stored in English (groundwork) and
         translated later.
         """

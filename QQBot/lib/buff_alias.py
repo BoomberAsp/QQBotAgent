@@ -82,31 +82,19 @@ _EN_DUR = re.compile(r"[(\[]\s*\d+\s*[-–~]?\s*\d*\s*turns?\s*[)\]]")
 # Trailing CJK run before a marker (the buff name sits at its end).
 _CJK_RUN = re.compile(r"[\u4e00-\u9fff]{2,12}$")
 
-# English status term → Chinese (from wiki_scraper._STATUS_TERM_CN), loaded
-# lazily so importing this module does not pull in wiki_scraper's deps.
-_EN_TERMS: list[tuple[str, str]] | None = None
-
-
 def _load_en_terms() -> list[tuple[str, str]]:
-    global _EN_TERMS
-    if _EN_TERMS is not None:
-        return _EN_TERMS
+    """English status term → Chinese pairs from the editable glossary.
+
+    Read through ``tools.wiki_glossary.load_glossary()`` (light json/os deps
+    only, mtime-cached) instead of the old AST parse of wiki_scraper's source,
+    so panel edits to ``config/translation_glossary.json`` take effect on the
+    next battle-text scan without a bot restart.
+    """
     try:
-        import ast
-        import os
-        path = os.path.join(os.path.dirname(__file__), "..", "tools", "wiki_scraper.py")
-        with open(path, encoding="utf-8") as f:
-            tree = ast.parse(f.read())
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
-                for t in node.targets:
-                    if isinstance(t, ast.Name) and t.id == "_STATUS_TERM_CN":
-                        _EN_TERMS = [(en, cn) for en, cn in ast.literal_eval(node.value)]
-                        return _EN_TERMS
+        from tools.wiki_glossary import load_glossary
+        return [(en, cn) for en, cn in load_glossary()["status_terms"]]
     except Exception:
-        pass
-    _EN_TERMS = []
-    return _EN_TERMS
+        return []
 
 
 def _extract_cn_labels(text: str) -> set[str]:
