@@ -242,6 +242,37 @@ textarea.code-editor { font-family: var(--mono); font-size: 13px; line-height: 1
 }
 .alias-chip .x:hover { color: var(--red); }
 
+/* ── Wiki 翻译术语表编辑器 ── */
+.gl-table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+.gl-table td { padding: 3px 6px 3px 0; vertical-align: middle; }
+.gl-table input[type="text"] { width: 100%; }
+.gl-en { width: 32%; }
+.gl-cn { width: 52%; }
+.gl-row-btns { white-space: nowrap; text-align: right; }
+.gl-row-btns .btn { padding: 2px 7px; }
+
+/* ── Wiki 详情编辑（人工修正 / 重翻译）── */
+.wk-dt-kind.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.wk-dt-cols { display: flex; gap: 14px; align-items: flex-start; }
+#wk-dt-list { width: 255px; flex: none; max-height: 580px; overflow: auto; }
+#wk-dt-editor { flex: 1; min-width: 320px; max-height: 580px; overflow: auto; }
+.dt-item {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 5px 8px; margin-bottom: 6px; cursor: pointer;
+}
+.dt-item:hover { border-color: var(--accent); }
+.dt-item.active { border-color: var(--accent); background: var(--accent-soft); }
+.dt-item .t2 { font-size: 11.5px; }
+.dt-field { margin-bottom: 10px; }
+.dt-field label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 3px; }
+.dt-field textarea { width: 100%; }
+.dt-field input[type="text"] { width: 100%; }
+.dt-skill {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; margin-bottom: 10px;
+}
+.manual-pill { color: var(--yellow); border-color: var(--yellow); }
+
 @media (max-width: 860px) {
   .layout { flex-direction: column; }
   .sidebar { width: 100%; height: auto; position: static; flex-direction: row; align-items: center; }

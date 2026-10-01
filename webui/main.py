@@ -832,6 +832,166 @@ async def api_wiki_aliases_put(payload: AliasPayload, request: Request):
     return result
 
 
+# ── Wiki 翻译术语表 API ───────────────────────────────────────────
+# 存储/校验/原子写在 QQBot/tools/wiki_glossary.py（bot 与面板共用一套规则）；
+# bot 侧全部消费点按 mtime 热读，保存后无需重启即生效。
+
+@app.get("/api/wiki/glossary")
+async def api_wiki_glossary_get():
+    result = await asyncio.to_thread(data_reader.wiki_glossary_read)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+@app.get("/api/wiki/glossary/default")
+async def api_wiki_glossary_default():
+    result = await asyncio.to_thread(data_reader.wiki_glossary_default)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class GlossaryPayload(BaseModel):
+    tables: dict  # {table_name: pairs|map|...} 全量快照
+
+
+@app.put("/api/wiki/glossary")
+async def api_wiki_glossary_put(payload: GlossaryPayload, request: Request):
+    result = await asyncio.to_thread(data_reader.wiki_glossary_save, payload.tables)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("wiki.glossary.save",
+                     f"保存翻译术语表: {result.get('tables')} 张", _ip(request))
+    return result
+
+
+# ── Wiki 详情缓存编辑 / LLM 重翻译 API ────────────────────────────
+
+@app.get("/api/wiki/details")
+async def api_wiki_details_list(kind: str = "char", q: str = ""):
+    result = await asyncio.to_thread(data_reader.wiki_details_list, kind, q)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+@app.get("/api/wiki/details/entry")
+async def api_wiki_details_entry(kind: str = "char", title: str = ""):
+    result = await asyncio.to_thread(data_reader.wiki_details_entry, kind, title)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class DetailFieldsPayload(BaseModel):
+    kind: str
+    title: str
+    fields: dict  # {点分路径: 新值} — 白名单校验在 data_reader
+
+
+@app.put("/api/wiki/details/entry")
+async def api_wiki_details_entry_put(payload: DetailFieldsPayload, request: Request):
+    result = await asyncio.to_thread(data_reader.wiki_details_save_fields,
+                                     payload.kind, payload.title, payload.fields)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("wiki.details.edit",
+                     f"人工修正 {payload.kind}/{payload.title}: "
+                     f"{result.get('applied')} 字段", _ip(request))
+    return result
+
+
+# 重翻译 = 面板进程内的后台任务（playground 同款 raw FLASH 配置 →
+# DeepSeekClient → WikiScraper.force_retranslate），in-flight guard 防并发，
+# 前端 2s 轮询 status。写回前重读磁盘最新副本，仅替换目标 entry。
+
+_retranslate_jobs: dict[str, dict] = {}  # "kind:title" → {state, message, started, elapsed?}
+
+
+async def _run_retranslate(kind: str, title: str):
+    job = _retranslate_jobs[f"{kind}:{title}"]
+    try:
+        block = playground._load_model_block("flash")
+        if "_error" in block:
+            raise RuntimeError(block["_error"])
+        api_key = block.get("api_key")
+        api_base = block.get("api_base")
+        model = block.get("model")
+        if not api_key or not api_base:
+            raise RuntimeError("models_settings.json 缺少 api_key / api_base")
+
+        import copy
+        from lib.deepseek_client import DeepSeekClient
+        from lib.token_ledger import set_usage_context
+        from tools.wiki_scraper import WikiScraper
+
+        client = DeepSeekClient(api_key=api_key, api_base=api_base, model=model)
+        try:
+            set_usage_context("panel", "", "wiki-retranslate")
+        except Exception:
+            pass
+        scraper = WikiScraper(llm_client=client)
+
+        # 从磁盘取最新 entry 副本（不用请求时的快照，避免遮蔽期间的 bot 刷新）
+        fresh = await asyncio.to_thread(data_reader.wiki_details_entry, kind, title)
+        if "error" in fresh:
+            raise RuntimeError(fresh["error"])
+        work = copy.deepcopy(fresh["entry"])
+        work.pop("_manual_fields", None)  # 重翻译后是机翻文本，清除人工修正标记
+
+        result = await scraper.force_retranslate(kind, [work])
+        if result.get("error"):
+            raise RuntimeError(result["error"])
+
+        write = await asyncio.to_thread(
+            data_reader.wiki_details_replace_entry, kind, title, work)
+        if "error" in write:
+            raise RuntimeError(write["error"])
+        job["state"] = "done"
+        job["message"] = f"重翻译完成: {work.get('name_cn') or title}"
+    except Exception as e:
+        job["state"] = "error"
+        job["message"] = f"{type(e).__name__}: {e}"
+    finally:
+        job["elapsed"] = round(time.time() - job["started"], 1)
+
+
+class RetranslatePayload(BaseModel):
+    kind: str
+    title: str
+
+
+@app.post("/api/wiki/details/retranslate")
+async def api_wiki_details_retranslate(payload: RetranslatePayload, request: Request):
+    kind, title = payload.kind, payload.title
+    if kind not in ("char", "bond"):
+        return JSONResponse({"error": f"非法详情类型: {kind}"}, status_code=400)
+    key = f"{kind}:{title}"
+    job = _retranslate_jobs.get(key)
+    if job and job.get("state") == "running":
+        return {"ok": True, "state": "running", "note": "该条目已在重翻译中"}
+    check = await asyncio.to_thread(data_reader.wiki_details_entry, kind, title)
+    if "error" in check:
+        return JSONResponse(check, status_code=400)
+    _retranslate_jobs[key] = {"state": "running", "message": "", "started": time.time()}
+    asyncio.create_task(_run_retranslate(kind, title))
+    audit.log_action("wiki.retranslate", f"发起 LLM 重翻译 {kind}/{title}", _ip(request))
+    return {"ok": True, "state": "running"}
+
+
+@app.get("/api/wiki/details/retranslate/status")
+async def api_wiki_details_retranslate_status(kind: str = "char", title: str = ""):
+    job = _retranslate_jobs.get(f"{kind}:{title}")
+    if not job:
+        return {"state": "idle"}
+    return {
+        "state": job["state"],  # idle|running|done|error
+        "message": job.get("message", ""),
+        "elapsed": job.get("elapsed") or round(time.time() - job["started"], 1),
+    }
+
+
 # ── Redeem code management API ────────────────────────────────────
 
 @app.get("/api/redeem")

@@ -809,6 +809,212 @@ def wiki_aliases_missing(kind: str) -> dict:
     return {"items": items}
 
 
+# ── Wiki 翻译术语表（glossary）─────────────────────────────────────
+# 术语表的唯一 owner 是 QQBot/tools/wiki_glossary.py（校验/备份/原子写都在
+# 那边，保证 bot 与面板走同一套规则）；面板侧只做转调。bot 全部消费点按
+# mtime 热读，保存后无需重启即生效。
+
+def wiki_glossary_read() -> dict:
+    """当前生效术语表 + 来源徽标 + 表结构（供前端渲染行编辑器）。"""
+    try:
+        from tools.wiki_glossary import (TABLE_LABELS, TABLE_SHAPES,
+                                         glossary_source, load_glossary)
+        return {
+            "glossary": load_glossary(),
+            "source": glossary_source(),          # "file" | "builtin"
+            "shapes": dict(TABLE_SHAPES),
+            "labels": dict(TABLE_LABELS),
+        }
+    except Exception as e:
+        return {"error": f"读取术语表失败: {e}"}
+
+
+def wiki_glossary_save(tables: dict) -> dict:
+    """校验 + 备份 + 原子写术语表文件（转调 bot 模块，规则唯一）。"""
+    try:
+        from tools.wiki_glossary import save_glossary
+        return save_glossary(tables)
+    except Exception as e:
+        return {"error": f"保存术语表失败: {e}"}
+
+
+def wiki_glossary_default() -> dict:
+    """内置默认术语表（面板「恢复内置默认」预览/提交用）。"""
+    try:
+        from tools.wiki_glossary import default_glossary
+        return {"glossary": default_glossary()}
+    except Exception as e:
+        return {"error": f"读取内置默认失败: {e}"}
+
+
+# ── Wiki 详情缓存编辑（人工修正 / 重翻译写回）────────────────────
+# 字段级人工修正：白名单路径（char: name_cn/desc/discs/skills.{i}.子字段；
+# bond: name_cn/desc/effect/notes/obtain），被改字段记入 entry 的
+# ``_manual_fields``（UI 徽标 + 重翻译 confirm 提示）。整条 LLM 重翻译由
+# main.py 的后台任务执行（force_retranslate），写回走 wiki_details_replace_entry。
+
+# 可人工修正的字段白名单（skills 子字段单独校验）
+_DETAIL_TOP_FIELDS = {
+    "char": ("name_cn", "desc", "discs"),
+    "bond": ("name_cn", "desc", "effect", "notes", "obtain"),
+}
+_DETAIL_SKILL_FIELDS = ("name", "des", "des2", "burst")
+
+
+def _details_load(kind: str) -> tuple[Path | None, dict | None, str | None]:
+    """Return (path, envelope, error) for a kind's details cache."""
+    path = _ALIAS_DETAILS_FILES.get(kind)
+    if path is None:
+        return None, None, f"非法详情类型: {kind}"
+    if not path.exists():
+        return path, None, f"详情缓存不存在: {path.name}（尚未爬取）"
+    try:
+        blob = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(blob, dict) or not isinstance(blob.get("data"), dict):
+            return path, None, "详情缓存格式异常（缺少 data 对象）"
+        return path, blob, None
+    except Exception as e:
+        return path, None, f"详情缓存读取失败: {e}"
+
+
+def _details_write_atomic(path: Path, blob: dict) -> str | None:
+    """Backup + atomic replace; returns error string or None."""
+    try:
+        if path.exists():
+            shutil.copy2(path, str(path) + ".bak")
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(blob, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return None
+    except Exception as e:
+        return f"写入失败: {e}"
+
+
+def wiki_details_list(kind: str, q: str = "") -> dict:
+    """Summary rows for the panel's entry picker: title/name_cn/id/stars/…
+
+    ``q`` filters title/name_cn case-insensitively. A missing cache yields an
+    empty list + note (bond_details.json is not present on every machine).
+    """
+    path, blob, err = _details_load(kind)
+    if err:
+        if path is not None and not path.exists():
+            return {"items": [], "note": err}
+        return {"error": err}
+    q = (q or "").strip().lower()
+    items = []
+    for title, entry in blob["data"].items():
+        if not isinstance(entry, dict):
+            continue
+        name_cn = str(entry.get("name_cn") or "")
+        if q and q not in str(title).lower() and q not in name_cn.lower():
+            continue
+        items.append({
+            "title": str(title),
+            "name_cn": name_cn,
+            "id": str(entry.get("id") or ""),
+            "stars": int(entry.get("stars") or 0),
+            "has_cn": bool(name_cn and name_cn != title),
+            "manual": bool(entry.get("_manual_fields")),
+        })
+    items.sort(key=lambda x: x["title"])
+    return {"items": items, "total": len(blob["data"])}
+
+
+def wiki_details_entry(kind: str, title: str) -> dict:
+    """Full entry for the field editor (or ``{"error": ...}``)."""
+    _, blob, err = _details_load(kind)
+    if err:
+        return {"error": err}
+    entry = blob["data"].get(title)
+    if not isinstance(entry, dict):
+        return {"error": f"条目不存在: {title}"}
+    return {"kind": kind, "title": title, "entry": entry}
+
+
+def wiki_details_save_fields(kind: str, title: str, fields: dict) -> dict:
+    """Apply whitelisted manual edits to one entry and persist atomically.
+
+    ``fields`` keys are dotted paths: ``name_cn`` / ``desc`` / ``discs``
+    (list[str], char only) / ``skills.{i}.{name|des|des2|burst}`` (char) or
+    ``name_cn/desc/effect/notes/obtain`` (bond). Every applied path is
+    recorded in ``entry["_manual_fields"]`` so the UI can badge it and the
+    retranslate confirm can warn that LLM re-translation overwrites it.
+    Re-reads the freshest on-disk copy before applying (bot background
+    refresh may have written in between).
+    """
+    if kind not in _DETAIL_TOP_FIELDS:
+        return {"error": f"非法详情类型: {kind}"}
+    if not fields:
+        return {"error": "没有要保存的字段"}
+    path, blob, err = _details_load(kind)
+    if err:
+        return {"error": err}
+    entry = blob["data"].get(title)
+    if not isinstance(entry, dict):
+        return {"error": f"条目不存在: {title}"}
+
+    top_ok = _DETAIL_TOP_FIELDS[kind]
+    applied = []
+    for key, value in fields.items():
+        parts = str(key).split(".")
+        if parts[0] == "skills":
+            if kind != "char" or len(parts) != 3:
+                return {"error": f"非法字段路径: {key}"}
+            try:
+                idx = int(parts[1])
+            except ValueError:
+                return {"error": f"非法技能序号: {key}"}
+            skills = entry.get("skills") or []
+            if not (0 <= idx < len(skills)) or not isinstance(skills[idx], dict):
+                return {"error": f"技能序号越界: {key}"}
+            if parts[2] not in _DETAIL_SKILL_FIELDS:
+                return {"error": f"非法技能字段: {key}"}
+            if not isinstance(value, str):
+                return {"error": f"{key}: 值必须是字符串"}
+            skills[idx][parts[2]] = value
+        elif len(parts) == 1 and parts[0] in top_ok:
+            if parts[0] == "discs":
+                if (not isinstance(value, list)
+                        or not all(isinstance(v, str) for v in value)):
+                    return {"error": "discs: 值必须是字符串列表"}
+                entry["discs"] = value
+            else:
+                if not isinstance(value, str):
+                    return {"error": f"{key}: 值必须是字符串"}
+                entry[parts[0]] = value
+        else:
+            return {"error": f"字段不在白名单内: {key}"}
+        applied.append(str(key))
+
+    manual = set(entry.get("_manual_fields") or []) | set(applied)
+    entry["_manual_fields"] = sorted(manual)
+    err = _details_write_atomic(path, blob)
+    if err:
+        return {"error": err}
+    return {"ok": True, "applied": len(applied),
+            "manual_fields": entry["_manual_fields"]}
+
+
+def wiki_details_replace_entry(kind: str, title: str, entry: dict) -> dict:
+    """Replace one entry wholesale (LLM re-translation write-back path).
+
+    Re-reads the freshest on-disk envelope first so a concurrent bot refresh
+    of *other* entries isn't clobbered; only ``data[title]`` is replaced.
+    """
+    path, blob, err = _details_load(kind)
+    if err:
+        return {"error": err}
+    if title not in blob["data"]:
+        return {"error": f"条目不存在（可能已被刷新移除）: {title}"}
+    blob["data"][title] = entry
+    err = _details_write_atomic(path, blob)
+    if err:
+        return {"error": err}
+    return {"ok": True}
+
+
 # ── Redeem code management (兑换码管理) ───────────────────────────
 # CRUD over QQBot/data/redeem_code/redeem_code.json — the bot plugin
 # (plugins/check_redeem_code.py) re-reads the file on every call, so

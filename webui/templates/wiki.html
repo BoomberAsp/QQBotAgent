@@ -33,6 +33,40 @@
   <div id="wk-alias-list" class="muted" style="margin-top:10px">加载中…</div>
 </div>
 
+<div class="card" id="wk-glossary">
+  <div class="row">
+    <h2 class="card-title" style="margin:0">翻译术语表</h2>
+    <span class="pill" id="wk-gl-source">—</span>
+    <span class="spacer"></span>
+    <button class="btn btn-sm btn-ghost" id="wk-gl-restore" title="用内置默认覆盖术语表文件（旧文件保留 .bak）">恢复内置默认</button>
+    <button class="btn btn-sm btn-primary" id="wk-gl-save">保存术语表</button>
+  </div>
+  <p class="muted" style="margin:8px 0 0">
+    存于 <span class="mono">config/translation_glossary.json</span>（git 跟踪，服务器改动需定期 commit+push 回流）。
+    bot 按文件 mtime 热读，保存后无需重启即生效；LLM 提示词「术语参考」由 prompt_terms 两张表生成。
+    有序表（status_terms / prompt_terms）的行序即正则替换优先级，可用 ↑↓ 调整。
+  </p>
+  <div class="tab-bar" id="wk-gl-tabs" style="margin:12px 0 0"></div>
+  <div id="wk-gl-editor" class="muted">加载中…</div>
+</div>
+
+<div class="card" id="wk-details">
+  <div class="row">
+    <h2 class="card-title" style="margin:0">详情编辑</h2>
+    <span class="muted">字段级人工修正 · 整条 LLM 重翻译</span>
+    <span class="spacer"></span>
+    <button class="btn btn-sm wk-dt-kind active" data-kind="char">角色</button>
+    <button class="btn btn-sm wk-dt-kind" data-kind="bond">羁绊</button>
+    <input type="text" id="wk-dt-q" placeholder="搜索英文名 / 中文名…" style="width:220px">
+  </div>
+  <div class="wk-dt-cols" style="margin-top:10px">
+    <div id="wk-dt-list" class="muted">加载中…</div>
+    <div id="wk-dt-editor" class="muted">← 选择左侧条目进行编辑</div>
+  </div>
+  <p class="muted" id="wk-dt-status" style="margin:8px 0 0"></p>
+  <p class="muted" style="margin:4px 0 0">人工修正写回详情缓存 JSON，bot 侧按 mtime 热读即时生效；角色侧常规周刷新不会覆盖人工修正（merge guard），但「整条 LLM 重翻译」会覆盖全部中文字段。</p>
+</div>
+
 <p class="muted">缓存文件由 bot 侧工具维护，统计卡片为只读展示；如数据过期可在 Web 终端手动删除对应 JSON 触发重建。别名保存后约 10 秒内 bot 自动生效，无需重启。</p>
 {% endblock %}
 
