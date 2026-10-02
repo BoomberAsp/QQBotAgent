@@ -1284,16 +1284,34 @@ async def _start_changelog_tasks():
                 failed += 1
             await asyncio.sleep(1.0)  # 群间限速
 
-        _cl.mark_broadcast(entry.get("created_at"))
-        _cl.write_status({
-            "state": "done", "total": len(group_ids),
+        # 仅当至少成功发出一个群时才回写 broadcast_at，避免"全部失败仍标记已群发"
+        all_failed = sent == 0
+        if not all_failed:
+            _cl.mark_broadcast(entry.get("created_at"))
+        status = {
+            "state": "error" if all_failed else "done",
+            "total": len(group_ids),
             "sent": sent, "failed": failed,
             "entry_version": entry.get("version", ""),
             "entry_date": entry.get("date", ""),
             "finished_at": time.time(),
-        })
+        }
+        if all_failed:
+            status["error"] = "所有目标群发送失败"
+        _cl.write_status(status)
 
     async def _broadcast_poller():
+        # 启动恢复：清理上次进程崩溃残留的认领文件，并把可能卡住的 "sending"
+        # 状态改写为中断，避免面板无限轮询"发送中…"。
+        if _cl.recover_stale_claim():
+            st = _cl.read_status()
+            if isinstance(st, dict) and st.get("state") == "sending":
+                _cl.write_status({
+                    "state": "error",
+                    "error": "上次群发在发送途中被中断（bot 重启），请重新发起",
+                    "sent": st.get("sent", 0), "failed": st.get("failed", 0),
+                })
+            nonebot_logger.warning("[changelog] 已清理残留的群发认领文件")
         while True:
             await asyncio.sleep(5)
             try:

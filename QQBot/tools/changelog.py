@@ -221,6 +221,21 @@ def finish_pending_claim() -> None:
     _safe_remove(PENDING_FILE + ".processing")
 
 
+def recover_stale_claim() -> bool:
+    """启动恢复：删除上次进程崩溃可能残留的 ``.processing`` 认领文件。
+
+    正常流程下认领文件会在 ``finish_pending_claim()`` 被清理；若 bot 在群发
+    途中退出，``.processing`` 会残留、且 ``broadcast_status.json`` 可能永远停在
+    ``"sending"``。轮询器启动时调用本函数清理残留，返回是否清理了文件（调用方
+    据此把卡住的 sending 状态改写为中断，避免面板无限轮询）。
+    """
+    processing = PENDING_FILE + ".processing"
+    if os.path.exists(processing):
+        _safe_remove(processing)
+        return True
+    return False
+
+
 def write_status(status: Dict[str, Any]) -> None:
     """回写群发结果，供 WebUI 轮询显示。"""
     status = dict(status)

@@ -974,7 +974,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 - **变更类型** `CHANGE_TYPES = ["新增", "修复", "优化", "调整", "移除"]`；面板下拉选择。
 - **读取**：`load_entries()` / `get_recent(d=3)`（clamp 1..20，按 `created_at` 降序，不足返回全部）。
 - **格式化**：`format_for_qq(entries, requested)` 生成 QQ 结构化纯文本（`【版本】 日期` 标题 + `  • 类型：内容` 条目，不含 markdown）；`format_announcement(entry)` 用于群发（加 `📢 更新公告` 头）。空数据返回「暂无更新记录」提示行。
-- **面板↔bot 通信**：`write_known_groups`/`read_known_groups`（群列表）、`claim_pending`（原子改名认领群发请求）/`finish_pending_claim`、`write_status`/`read_status`（群发结果回写）、`mark_broadcast`（群发成功回写 `broadcast_at`）。
+- **面板↔bot 通信**：`write_known_groups`/`read_known_groups`（群列表）、`claim_pending`（原子改名认领群发请求）/`finish_pending_claim`/`recover_stale_claim`（启动清理崩溃残留的 `.processing`）、`write_status`/`read_status`（群发结果回写）、`mark_broadcast`（仅当至少成功发出一群时回写 `broadcast_at`）。
 - **原子写** `_atomic_write_json`（tmp + `os.replace`）贯穿所有写操作。
 - 详细的面板/后台任务/文件队列设计见 §十二「更新记录 / 群发」。
 
@@ -1449,7 +1449,7 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | `broadcast_status.json` | bot 轮询器 | 面板 | 群发结果回写（供面板轮询显示进度） |
 
 - **读写工具** `tools/changelog.py`（纯 IO/格式化，无 nonebot 依赖）：`load_entries`/`save_entries`/`get_recent(d)`（默认 3，clamp 1..20）/`format_for_qq`/`format_announcement`/`mark_broadcast`，命令拦截、`get_changelog` 工具、群发轮询器三方共用。
-- **bot 后台任务**（`agent_router.py` `_start_changelog_tasks()`，`@get_driver().on_startup`）：① 群列表导出——启动 15s 后 + 每 600s 调 `bot.get_group_list()` 写 `known_groups.json`；② 群发轮询器——每 5s `claim_pending()`（原子改名为 `.processing` 认领）→ 解析 targets（`all` 现场枚举 / 指定群号）→ `_split_text` 分段 + `bot.send_group_msg` 逐群发送（群间 1s 限速）→ 回写 `broadcast_status.json` + `mark_broadcast`。
+- **bot 后台任务**（`agent_router.py` `_start_changelog_tasks()`，`@get_driver().on_startup`）：① 群列表导出——启动 15s 后 + 每 600s 调 `bot.get_group_list()` 写 `known_groups.json`；② 群发轮询器——启动先 `recover_stale_claim()` 清理崩溃残留并把卡住的 `sending` 改写为中断；随后每 5s `claim_pending()`（原子改名为 `.processing` 认领）→ 解析 targets（`all` 现场枚举 / 指定群号）→ `_split_text` 分段 + `bot.send_group_msg` 逐群发送（群间 1s 限速）→ 回写 `broadcast_status.json`；仅当至少成功发出一群时才 `mark_broadcast`（全失败则状态置 `error`，不误标"已群发"）。
 - **面板端点**：`GET/PUT /api/changelog`、`GET /api/changelog/groups`、`POST /api/changelog/broadcast`、`GET /api/changelog/broadcast/status`（`data_reader.changelog_*`，保存经 `config_editor.json_config_write` 原子写）。
 
 ### 面板 ↔ bot 跨进程一致性
