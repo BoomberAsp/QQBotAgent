@@ -136,8 +136,10 @@ a { color: var(--accent-2); text-decoration: none; }
   position: relative;
   min-height: 100svh;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 56px;
   overflow: hidden;
   padding: calc(var(--nav-h) + 40px) 24px 80px;
 }
@@ -181,8 +183,38 @@ a { color: var(--accent-2); text-decoration: none; }
 }
 .hero-inner {
   position: relative;
-  max-width: 860px;
-  text-align: center;
+  width: 100%;
+  max-width: 1040px;
+  display: grid;
+  grid-template-columns: 1.12fr .88fr;
+  gap: 52px;
+  align-items: center;
+}
+.hero-copy { text-align: left; }
+.hero-copy .hero-actions { justify-content: flex-start; }
+.hero-art { position: relative; }
+.hero-art img {
+  display: block;
+  width: 100%;
+  max-height: 62vh;
+  object-fit: cover;
+  object-position: 50% 45%;
+  border-radius: 20px;
+  border: 1px solid var(--line-strong);
+  box-shadow: 0 0 70px -12px rgba(79, 141, 255, .45), var(--shadow);
+  animation: float 7s ease-in-out infinite;
+}
+.hero-art::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 20px;
+  background: linear-gradient(200deg, rgba(34, 211, 238, .12), transparent 45%);
+  pointer-events: none;
+}
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
 }
 .hero-badge {
   display: inline-block;
@@ -200,6 +232,8 @@ a { color: var(--accent-2); text-decoration: none; }
   font-weight: 900;
   letter-spacing: .04em;
   line-height: 1.05;
+  /* 渐变裁字时背景只绘制到 padding box，行高过紧会把 y 的下伸部切掉 */
+  padding-bottom: .16em;
   background: var(--grad);
   background-size: 220% 100%;
   -webkit-background-clip: text;
@@ -217,7 +251,7 @@ a { color: var(--accent-2); text-decoration: none; }
   font-weight: 600;
 }
 .hero-sub {
-  margin: 14px auto 0;
+  margin: 14px 0 0;
   max-width: 620px;
   color: var(--text-dim);
 }
@@ -250,7 +284,9 @@ a { color: var(--accent-2); text-decoration: none; }
 }
 .btn-ghost:hover { border-color: var(--accent-2); background: rgba(34, 211, 238, .08); }
 .hero-stats {
-  margin-top: 64px;
+  position: relative;
+  width: 100%;
+  max-width: 1040px;
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 14px;
@@ -679,6 +715,12 @@ a { color: var(--accent-2); text-decoration: none; }
   }
   .nav.open .nav-links { transform: none; opacity: 1; pointer-events: auto; }
   .nav-link { padding: 10px 12px; }
+  .hero { gap: 40px; }
+  .hero-inner { grid-template-columns: 1fr; gap: 34px; }
+  .hero-copy { text-align: center; }
+  .hero-copy .hero-actions { justify-content: center; }
+  .hero-art { order: -1; max-width: 300px; margin: 0 auto; }
+  .hero-art img { max-height: 46vh; }
   .guide-card { grid-template-columns: 1fr; padding: 24px; }
   .guide-num { font-size: 2rem; }
   .grid-2, .grid-3 { grid-template-columns: 1fr; }

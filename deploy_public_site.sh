@@ -37,8 +37,9 @@ fi
 RELOAD=1
 [ "${1:-}" = "--no-reload" ] && RELOAD=0
 
-# 需要同步的静态条目（不含 changelog.json —— 那是面板的产物）
-ITEMS=(index.html style.css app.js assets)
+# 需要同步的静态条目（不含 changelog.json —— 那是面板的产物；
+# examples 只同步网页播放用的 mp4 与封面，原始 mkv 不上站）
+ITEMS=(index.html style.css app.js assets examples/mp4 examples/posters)
 
 echo "源目录:   $SRC"
 echo "nginx root: $DST"
@@ -56,7 +57,8 @@ fi
 # 同步静态文件（保留 changelog.json 等面板产物）
 for item in "${ITEMS[@]}"; do
     if [ -e "$SRC/$item" ]; then
-        sudo cp -a "$SRC/$item" "$DST/"
+        sudo mkdir -p "$DST/$(dirname "$item")"
+        sudo cp -a "$SRC/$item" "$DST/$(dirname "$item")/"
         info "同步 $item"
     else
         warn "源缺少 $item，跳过"
