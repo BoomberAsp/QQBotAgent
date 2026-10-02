@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Roxy · QQ 智能助手</title>
+<meta name="description" content="Roxy 是一个挂在 QQ 群里的 AI 智能助手：问答、搜索、翻译、游戏资料查询、兑换码、文件阅读，还会记住你。">
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+<!-- ── 首屏 hero ─────────────────────────────────────────────── -->
+<header class="hero">
+  <div class="hero-inner">
+    <div class="hero-badge">QQ 群智能助手</div>
+    <h1>Roxy</h1>
+    <p class="slogan">把 AI 装进你的 QQ 群——会聊天、会查资料、会玩游戏，还会记住你。</p>
+    <p class="hero-hint">不需要记任何命令，像和朋友说话一样 @ 它即可。</p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="#howto">怎么用</a>
+      <a class="btn btn-ghost" href="#changelog">更新记录</a>
+    </div>
+  </div>
+</header>
+
+<main>
+
+  <!-- ── 它能帮你做什么（场景卡，大白话）──────────────────────── -->
+  <section class="section" id="what">
+    <h2>它能帮你做什么</h2>
+    <p class="section-sub">不用懂技术，下面这些场景直接说就行。</p>
+    <div class="grid">
+      <div class="card">
+        <div class="card-ico">💬</div>
+        <h3>有问必答</h3>
+        <p>聊天、答疑、写文案、解释代码、翻译中英日……把它当一个随叫随到的聪明朋友。</p>
+      </div>
+      <div class="card">
+        <div class="card-ico">🔍</div>
+        <h3>查资料</h3>
+        <p>搜全网、查实时天气、看当前时间、抓网页内容，一句话搞定。</p>
+      </div>
+      <div class="card">
+        <div class="card-ico">🎮</div>
+        <h3>游戏助手</h3>
+        <p>Ark Recode 兑换码、角色/羁绊资料、抽卡模拟、战斗测速，攻略党福音。</p>
+      </div>
+      <div class="card">
+        <div class="card-ico">📄</div>
+        <h3>读文件看图</h3>
+        <p>把 PDF、文档、截图、语音丢给它，它能读懂并告诉你里面是什么。</p>
+      </div>
+      <div class="card">
+        <div class="card-ico">🧠</div>
+        <h3>会记住你</h3>
+        <p>聊过的事它会记下来，下次不用重复介绍自己；说得越多它越懂你。</p>
+      </div>
+      <div class="card">
+        <div class="card-ico">🗂️</div>
+        <h3>专属空间</h3>
+        <p>每个人有独立工作区，长对话可以存成「会话」随时接着聊。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 怎么用（命令 chip 可复制 + 自然语言说法）─────────────── -->
+  <section class="section" id="howto">
+    <h2>怎么用</h2>
+    <p class="section-sub">
+      最简单的方式：在群里 <b>@Roxy</b> 然后直接说需求。
+      下面也列出了一些快捷命令——点一下即可复制，粘贴到 QQ 发送。
+    </p>
+
+    <div class="howto-list">
+
+      <div class="howto">
+        <div class="howto-head">
+          <h3>看最近更新了什么</h3>
+        </div>
+        <div class="chips">
+          <button class="chip" data-copy="/更新日志">/更新日志</button>
+        </div>
+        <p class="nl">也可以直接说：<span class="nl-q">「最近有什么更新？」</span></p>
+      </div>
+
+      <div class="howto">
+        <div class="howto-head">
+          <h3>查游戏兑换码</h3>
+        </div>
+        <div class="chips">
+          <button class="chip" data-copy="/兑换码">/兑换码</button>
+          <button class="chip" data-copy="/长期兑换码">/长期兑换码</button>
+        </div>
+        <p class="nl">也可以直接说：<span class="nl-q">「现在有什么能用的兑换码？」</span></p>
+      </div>
+
+      <div class="howto">
+        <div class="howto-head">
+          <h3>查角色 / 羁绊资料</h3>
+        </div>
+        <div class="chips">
+          <button class="chip" data-copy="/角色详情 露比">/角色详情 露比</button>
+          <button class="chip" data-copy="/羁绊详情 "> /羁绊详情 &lt;名称&gt;</button>
+        </div>
+        <p class="nl">也可以直接说：<span class="nl-q">「露比这个角色强度怎么样？」</span></p>
+      </div>
+
+      <div class="howto">
+        <div class="howto-head">
+          <h3>看完整功能 / 命令列表</h3>
+        </div>
+        <div class="chips">
+          <button class="chip" data-copy="/功能">/功能</button>
+          <button class="chip" data-copy="/帮助">/帮助</button>
+        </div>
+        <p class="nl">也可以直接说：<span class="nl-q">「你都会些什么？」</span></p>
+      </div>
+
+      <div class="howto">
+        <div class="howto-head">
+          <h3>长对话存成会话，下次接着聊</h3>
+        </div>
+        <div class="chips">
+          <button class="chip" data-copy="/新会话">/新会话</button>
+          <button class="chip" data-copy="/会话列表">/会话列表</button>
+        </div>
+        <p class="nl">也可以直接说：<span class="nl-q">「帮我把这段对话存起来。」</span></p>
+      </div>
+
+    </div>
+    <p class="copy-tip" id="copy-tip" hidden>已复制 ✓</p>
+  </section>
+
+  <!-- ── 演示（截图/GIF，缺失时占位降级）─────────────────────── -->
+  <section class="section" id="demo">
+    <h2>实际效果演示</h2>
+    <p class="section-sub">真实 QQ 对话截图，看看 Roxy 在群里是怎么说话的。</p>
+    <div class="demo-gallery" id="demo-gallery"></div>
+  </section>
+
+  <!-- ── 更新记录（自动同步自 changelog.json）────────────────── -->
+  <section class="section" id="changelog">
+    <h2>更新记录</h2>
+    <p class="section-sub">机器人每次更新都会自动同步到这里。</p>
+    <div id="changelog-box" class="changelog-box">
+      <p class="muted">加载中…</p>
+    </div>
+  </section>
+
+</main>
+
+<!-- ── 页脚：反馈入口 ────────────────────────────────────────── -->
+<footer class="footer">
+  <p><b>遇到问题或有想法？</b></p>
+  <p>在群里发送 <button class="chip chip-inline" data-copy="#反馈 ">#反馈 &lt;内容&gt;</button>
+     或 <button class="chip chip-inline" data-copy="#bug ">#bug &lt;内容&gt;</button>，
+     会自动附上上下文发给管理员。</p>
+  <p class="muted">Roxy 的回答并非总是准确无误，请理性判断。</p>
+</footer>
+
+<script src="./app.js"></script>
+</body>
+</html>

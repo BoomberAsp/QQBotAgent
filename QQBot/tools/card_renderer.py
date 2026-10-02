@@ -1109,3 +1109,145 @@ def render_feature_card(md_path: str, out_path: str | None = None) -> str | None
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     canvas.convert("RGB").save(out_path, "PNG")
     return out_path
+
+
+# ── Changelog card ────────────────────────────────────────────────
+
+_CHANGELOG_CARD_PATH = os.path.join(_CACHE_DIR, "changelog_card.png")
+
+# 变更类型 → badge 颜色（与面板下拉/CHANGE_TYPES 一致）
+_CHANGELOG_TYPE_COLORS = {
+    "新增": (76, 175, 80),    # green
+    "修复": (232, 80, 58),    # red
+    "优化": (58, 140, 232),   # blue
+    "调整": (232, 181, 58),   # gold
+    "移除": (110, 116, 132),  # gray
+}
+
+
+def _changelog_head(entry: dict) -> str:
+    """版本 pill 文案：【version】 date（缺失字段优雅降级）。"""
+    version = str(entry.get("version") or "").strip()
+    date = str(entry.get("date") or "").strip()
+    if version and date:
+        return f"【{version}】 {date}"
+    if version:
+        return f"【{version}】"
+    if date:
+        return f"【{date}】"
+    return "【更新】"
+
+
+def _changelog_entry_items(entry: dict) -> list:
+    """把单条更新记录拆成 [(type, text), ...]（跳过空文本）。
+
+    无结构化 changes 时回退到 note/text 字段（与 tools/changelog.py 的
+    _format_entry_lines 保持一致的容错）。
+    """
+    items = []
+    changes = entry.get("changes")
+    if isinstance(changes, list) and changes:
+        for ch in changes:
+            if isinstance(ch, dict):
+                ctype = str(ch.get("type") or "").strip()
+                text = str(ch.get("text") or "").strip()
+            else:
+                ctype, text = "", str(ch).strip()
+            if text:
+                items.append((ctype, text))
+    else:
+        note = str(entry.get("note") or entry.get("text") or "").strip()
+        for ln in note.splitlines():
+            if ln.strip():
+                items.append(("", ln.strip()))
+    return items
+
+
+def render_changelog_card(entries: list, out_path: str | None = None,
+                          title: str = "更新记录",
+                          site_url: str | None = None) -> str | None:
+    """把更新记录渲染成暗色主题卡片图（复用 help/feature 卡的风格）。
+
+    每条记录一个版本 pill + 若干带类型 badge 的变更行；badge 颜色按变更类型
+    （新增/修复/优化/调整/移除）区分，变更文本按像素宽自动换行。返回 PNG 路径；
+    entries 为空时返回 ``None``。``site_url`` 非空时作为副标题（公开站点短链）。
+    """
+    if not entries:
+        return None
+
+    probe = ImageDraw.Draw(Image.new("RGBA", (W, 10)))
+
+    subtitle = site_url or "发送 /更新日志 查看历史更新"
+
+    title_h = _lh(52)
+    sub_h = _lh(22)
+    pill_h = _lh(26) + 20
+    row_font = 24
+    badge_font = 20
+    row_gap = 10
+    line_h = _lh(row_font)
+
+    badge_x = PAD + 10
+    right_edge = W - PAD
+
+    # measure + prepare wrapped rows
+    render = []
+    total_h = PAD + title_h + sub_h + GAP
+    for idx, entry in enumerate(entries):
+        head = _changelog_head(entry)
+        color = _HELP_SECTION_COLORS[idx % len(_HELP_SECTION_COLORS)]
+        total_h += pill_h + GAP // 2
+        prepared = []
+        for ctype, text in _changelog_entry_items(entry):
+            if ctype:
+                badge_w = _tw(probe, ctype, badge_font) + 24
+                badge_color = _CHANGELOG_TYPE_COLORS.get(ctype, _DEFAULT_ELEMENT_COLOR)
+                text_x = badge_x + badge_w + 14
+            else:
+                badge_w, badge_color, text_x = 0, None, badge_x
+            lines = _wrap(probe, text, row_font, max(right_edge - text_x, 40)) or [""]
+            prepared.append((ctype, badge_w, badge_color, text_x, lines))
+            total_h += len(lines) * line_h + row_gap
+        render.append((color, head, prepared))
+        total_h += GAP
+    total_h += PAD
+
+    canvas = Image.new("RGBA", (W, total_h), _BG + (255,))
+    draw = ImageDraw.Draw(canvas)
+
+    y = PAD
+    draw.text((PAD, y), title, font=_font(52), fill=_TEXT)
+    y += title_h
+    draw.text((PAD, y), subtitle, font=_font(22), fill=_TEXT_FAINT)
+    y += sub_h + GAP
+
+    for color, head, prepared in render:
+        # version pill header
+        pill_w = _tw(draw, head, 26) + 44
+        draw.rounded_rectangle((PAD, y, PAD + pill_w, y + pill_h),
+                               radius=pill_h // 2, fill=color + (255,))
+        draw.text((PAD + 22, y + (pill_h - _lh(26)) // 2),
+                  head, font=_font(26), fill=(255, 255, 255, 255))
+        y += pill_h + GAP // 2
+
+        for ctype, badge_w, badge_color, text_x, lines in prepared:
+            if ctype and badge_color:
+                badge_h = _lh(badge_font) + 8
+                badge_y = y + (line_h - badge_h) // 2
+                draw.rounded_rectangle(
+                    (badge_x, badge_y, badge_x + badge_w, badge_y + badge_h),
+                    radius=badge_h // 2, fill=badge_color + (255,))
+                draw.text((badge_x + 12, badge_y + (badge_h - _lh(badge_font)) // 2),
+                          ctype, font=_font(badge_font), fill=(255, 255, 255, 255))
+            for i, ln in enumerate(lines):
+                draw.text((text_x, y + i * line_h), ln,
+                          font=_font(row_font), fill=_TEXT_DIM)
+            y += len(lines) * line_h + row_gap
+
+        y += GAP
+
+    if out_path is None:
+        out_path = _CHANGELOG_CARD_PATH
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.convert("RGB").save(out_path, "PNG")
+    return out_path

@@ -1243,7 +1243,37 @@ def changelog_save(entries) -> dict:
     result = config_editor.json_config_write(CHANGELOG_FILE, raw)
     if result.get("ok"):
         result["note"] = f"已保存 {len(entries)} 条更新记录 — bot 每次查询直接读盘，立即生效"
+        _export_public_changelog(entries)
     return result
+
+
+def _export_public_changelog(entries) -> None:
+    """保存成功后把更新记录脱敏导出为公开站点 changelog.json（保存即同步）。
+
+    公开数据**只含** version/date/changes —— 剔除 created_at/broadcast_at/
+    _class 等内部字段，绝不导出群列表/用户/任何敏感数据。写入
+    ``config.PUBLIC_SITE_DIR/changelog.json``（nginx root 指向该目录即发布）。
+    导出失败静默（本模块无 logger），绝不阻断保存主流程。
+    """
+    try:
+        public_entries = []
+        for e in entries:
+            public_entries.append({
+                "version": str(e.get("version") or "").strip(),
+                "date": str(e.get("date") or "").strip(),
+                "changes": [
+                    {"type": str(ch.get("type") or "").strip(),
+                     "text": str(ch.get("text") or "").strip()}
+                    for ch in (e.get("changes") or []) if isinstance(ch, dict)
+                ],
+            })
+        _atomic_write_json(config.PUBLIC_SITE_DIR / "changelog.json", {
+            "generated_at": time.time(),
+            "change_types": CHANGELOG_CHANGE_TYPES,
+            "entries": public_entries,
+        })
+    except Exception:
+        pass  # 公开站点导出是锦上添花，失败绝不影响保存
 
 
 def changelog_groups() -> dict:

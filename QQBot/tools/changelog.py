@@ -135,10 +135,19 @@ def _format_entry_lines(entry: Dict[str, Any]) -> List[str]:
     return lines
 
 
-def format_for_qq(entries: List[Dict[str, Any]], requested: Optional[int] = None) -> List[str]:
+def _site_tail(site_url: Optional[str]) -> List[str]:
+    """公开站点指路尾行（纯文本、不含 markdown）。site_url 为空时不加。"""
+    if not site_url:
+        return []
+    return ["", f"📖 使用说明与演示：{site_url}"]
+
+
+def format_for_qq(entries: List[Dict[str, Any]], requested: Optional[int] = None,
+                  site_url: Optional[str] = None) -> List[str]:
     """把更新记录列表格式化为可直接 _send_text_chunks 的纯文本行。
 
     entries 为空时返回空态提示。requested 用于标题里说明"最近 N 条"。
+    site_url 非空时在末尾追加一行公开站点指路（降低 /命令 使用门槛）。
     """
     if not entries:
         return ["暂无更新记录。"]
@@ -153,12 +162,14 @@ def format_for_qq(entries: List[Dict[str, Any]], requested: Optional[int] = None
         if i > 0:
             lines.append("")
         lines.extend(_format_entry_lines(entry))
+    lines.extend(_site_tail(site_url))
     return lines
 
 
-def format_announcement(entry: Dict[str, Any]) -> List[str]:
+def format_announcement(entry: Dict[str, Any],
+                        site_url: Optional[str] = None) -> List[str]:
     """群发公告抬头 + 单条记录内容（结构化纯文本，供广播使用）。"""
-    return ["📢 更新公告", ""] + _format_entry_lines(entry)
+    return ["📢 更新公告", ""] + _format_entry_lines(entry) + _site_tail(site_url)
 
 
 # ── 群发状态回写 ────────────────────────────────────────────────────

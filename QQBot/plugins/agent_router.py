@@ -91,7 +91,7 @@ from tools.legacy_tools import (
 from tools.character_detail import character_detail, character_detail_with_card
 from tools.bond_detail import bond_detail, bond_detail_with_card
 from tools.battle_parser import parse_battle_screenshots
-from tools.card_renderer import render_help_card, render_feature_card
+from tools.card_renderer import render_help_card, render_feature_card, render_changelog_card
 
 # ── Configuration Paths ───────────────────────────────────────────
 
@@ -100,6 +100,8 @@ _CONFIG_DIR = os.path.join(_AGENT_DIR, "agent", "config")
 _DATA_DIR = os.path.join(_AGENT_DIR, "data")
 _USER_DATA_ROOT = os.environ.get("USER_DATA_ROOT", os.path.join(_AGENT_DIR, "data", "users_store"))
 _HELP_MD_PATH = os.path.join(_CONFIG_DIR, "HELP.md")
+# 公开使用站点（bot.oneweblog.cn）短链，随更新公告文本/卡片指路。可经 .env 覆盖。
+_PUBLIC_SITE_URL = os.environ.get("BOT_PUBLIC_SITE_URL", "https://bot.oneweblog.cn")
 
 
 # ── File logging (launcher-independent) ──────────────────────────
@@ -1241,7 +1243,7 @@ async def _start_changelog_tasks():
                               "sent": 0, "failed": 0})
             return
         entry = entries[idx]
-        text = "\n".join(_cl.format_announcement(entry))
+        text = "\n".join(_cl.format_announcement(entry, site_url=_PUBLIC_SITE_URL))
 
         targets = payload.get("targets") or []
         if not isinstance(targets, list) or not targets:
@@ -1266,8 +1268,29 @@ async def _start_changelog_tasks():
         _cl.write_status({"state": "sending", "total": len(group_ids),
                           "sent": 0, "failed": 0})
         chunks = _split_text(text, 300) or [text]
+
+        # 卡片在循环外渲染一次（best-effort）；渲染失败则仅发文本
+        from nonebot.adapters.onebot.v11 import MessageSegment
+        card_path = None
+        try:
+            card_path = await asyncio.to_thread(
+                render_changelog_card, [entry], title="更新公告",
+                site_url=_PUBLIC_SITE_URL)
+        except Exception:
+            card_path = None
+
         sent = failed = 0
         for gid in group_ids:
+            # 先发卡片图（best-effort；失败降级为仅文本，不计入 failed）
+            if card_path:
+                try:
+                    await bot.send_group_msg(
+                        group_id=int(gid),
+                        message=MessageSegment.image(Path(card_path)))
+                    await asyncio.sleep(1.0)
+                except Exception as e:
+                    nonebot_logger.warning(
+                        f"[changelog] 群发卡片到 {gid} 失败（降级文本）: {e}")
             ok = True
             for j, chunk in enumerate(chunks):
                 try:
@@ -3046,7 +3069,18 @@ async def _handle_changelog_command(text: str, user_id: str) -> bool:
 
     d = int(m.group(2)) if m.group(2) else DEFAULT_COUNT
     entries = get_recent(d)
-    await _send_text_chunks(format_for_qq(entries, requested=d))
+    await _send_text_chunks(format_for_qq(entries, requested=d, site_url=_PUBLIC_SITE_URL))
+
+    # 2. Render and send the changelog card (best-effort; text already sent)
+    try:
+        from nonebot.adapters.onebot.v11 import MessageSegment
+        card_path = await asyncio.to_thread(
+            render_changelog_card, entries, site_url=_PUBLIC_SITE_URL)
+        if card_path:
+            await asyncio.sleep(1.0)
+            await _safe_send(MessageSegment.image(Path(card_path)))
+    except Exception:
+        pass  # 卡片是锦上添花，渲染/发送失败绝不影响文本回复
     return True
 
 

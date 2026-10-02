@@ -13,7 +13,7 @@
 - **用户工作区**: 每用户独立文件空间，配额管理，跨会话隔离
 - **三层记忆引擎**: `TieredMemory`（SHORT/MEDIUM/LONG），LLM judge 归类 + 频次晋升/年龄降级状态机
 - **Web 管理面板**: FastAPI 独立服务（`webui/`），进程管理、配置热编辑、记忆/画像/别名管理、Token 看板、反馈处理、更新记录编辑与群发、Playground
-- **更新记录**: 结构化更新日志（版本/日期/分类变更条目），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询，管理员在面板编辑并群发更新公告
+- **更新记录**: 结构化更新日志（版本/日期/分类变更条目），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询，管理员在面板编辑并群发更新公告；QQ 端以图片卡片呈现，并同步脱敏快照到公开站点 `bot.oneweblog.cn`
 - **部署方式**: Docker Compose（含 NVIDIA GPU 支持）或手动部署
 
 ---
@@ -46,6 +46,13 @@ QQBotAgent/
 │   ├── config.py            #   面板配置（从 QQBot/.env 读 USER_DATA_ROOT 等）
 │   ├── templates/ static/   #   前端页面（19 个模板）与静态资源
 │   └── data/                #   面板运行时数据（webui.pid / logs / watchdog_state.json）
+│
+├── public_site/             # ★ 公开使用站点（bot.oneweblog.cn，纯静态只读，无登录/无后端）
+│   ├── index.html / style.css / app.js   # 单页：场景 / 怎么用 / 演示 / 更新记录
+│   ├── changelog.json       #   ← 自动生成（WebUI 保存时脱敏导出），勿手改
+│   └── assets/              #   演示截图/GIF（缺失时占位降级）
+│
+├── docs/                    # 开发者向文档（更新日志.md、bot-site-nginx.md 等）
 │
 └── QQBot/                   # NoneBot 机器人主体
     ├── .env                 # NoneBot 环境配置 (含 DeepSeek/OneBot 密钥) ⚠ git-ignored
@@ -973,7 +980,8 @@ Agent 必须在以下情况拒绝 (礼貌):
 
 - **变更类型** `CHANGE_TYPES = ["新增", "修复", "优化", "调整", "移除"]`；面板下拉选择。
 - **读取**：`load_entries()` / `get_recent(d=3)`（clamp 1..20，按 `created_at` 降序，不足返回全部）。
-- **格式化**：`format_for_qq(entries, requested)` 生成 QQ 结构化纯文本（`【版本】 日期` 标题 + `  • 类型：内容` 条目，不含 markdown）；`format_announcement(entry)` 用于群发（加 `📢 更新公告` 头）。空数据返回「暂无更新记录」提示行。
+- **格式化**：`format_for_qq(entries, requested, site_url=None)` 生成 QQ 结构化纯文本（`【版本】 日期` 标题 + `  • 类型：内容` 条目，不含 markdown）；`format_announcement(entry, site_url=None)` 用于群发（加 `📢 更新公告` 头）。两者 `site_url` 非空时在末尾追加一行公开站点指路（`📖 使用说明与演示：<url>`，纯文本）。空数据返回「暂无更新记录」提示行。
+- **图片卡片**：`card_renderer.render_changelog_card(entries, out_path=None, title="更新记录", site_url=None)` 复用 help/feature 卡骨架渲染暗色 PNG（版本 pill 循环色 + 变更类型 badge 色 + 像素宽换行），命令/群发在文本后 best-effort 追加发送；`entries` 空返回 `None`。
 - **面板↔bot 通信**：`write_known_groups`/`read_known_groups`（群列表）、`claim_pending`（原子改名认领群发请求）/`finish_pending_claim`/`recover_stale_claim`（启动清理崩溃残留的 `.processing`）、`write_status`/`read_status`（群发结果回写）、`mark_broadcast`（仅当至少成功发出一群时回写 `broadcast_at`）。
 - **原子写** `_atomic_write_json`（tmp + `os.replace`）贯穿所有写操作。
 - 详细的面板/后台任务/文件队列设计见 §十二「更新记录 / 群发」。
@@ -1451,6 +1459,8 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 - **读写工具** `tools/changelog.py`（纯 IO/格式化，无 nonebot 依赖）：`load_entries`/`save_entries`/`get_recent(d)`（默认 3，clamp 1..20）/`format_for_qq`/`format_announcement`/`mark_broadcast`，命令拦截、`get_changelog` 工具、群发轮询器三方共用。
 - **bot 后台任务**（`agent_router.py` `_start_changelog_tasks()`，`@get_driver().on_startup`）：① 群列表导出——启动 15s 后 + 每 600s 调 `bot.get_group_list()` 写 `known_groups.json`；② 群发轮询器——启动先 `recover_stale_claim()` 清理崩溃残留并把卡住的 `sending` 改写为中断；随后每 5s `claim_pending()`（原子改名为 `.processing` 认领）→ 解析 targets（`all` 现场枚举 / 指定群号）→ `_split_text` 分段 + `bot.send_group_msg` 逐群发送（群间 1s 限速）→ 回写 `broadcast_status.json`；仅当至少成功发出一群时才 `mark_broadcast`（全失败则状态置 `error`，不误标"已群发"）。
 - **面板端点**：`GET/PUT /api/changelog`、`GET /api/changelog/groups`、`POST /api/changelog/broadcast`、`GET /api/changelog/broadcast/status`（`data_reader.changelog_*`，保存经 `config_editor.json_config_write` 原子写）。
+- **公开站点同步**（`public_site/` → `bot.oneweblog.cn`）：面板每次保存成功（`changelog_save` 的 `result.ok` 分支）调 `data_reader._export_public_changelog(entries)`，把**脱敏**快照（仅 version/date/changes；剔除 created_at/broadcast_at/_class，绝不含群列表/用户数据）原子写 `<PUBLIC_SITE_DIR>/changelog.json`；nginx root 指向该目录即发布（示例见 `docs/bot-site-nginx.md`）。导出失败静默，不阻断保存。站点为纯静态只读单页（index.html/style.css/app.js），`app.js` fetch `./changelog.json` 渲染「更新记录」区，缺失/404 优雅降级显示「暂无更新记录」。
+- **QQ 图片卡片 + 指路短链**：命令 `/更新日志` 与群发 `_do_broadcast` 在文本后 best-effort 追加 `render_changelog_card` 渲染的 PNG（群发在循环外渲染一次、逐群先发图再发文本；发卡失败降级为仅文本、不计入 failed）。指路短链 `_PUBLIC_SITE_URL`（env `BOT_PUBLIC_SITE_URL`，默认 `https://bot.oneweblog.cn`）经 `format_for_qq`/`format_announcement` 的 `site_url` 参数附到文本尾行，降低 /命令 使用门槛。
 
 ### 面板 ↔ bot 跨进程一致性
 
@@ -1935,4 +1945,29 @@ v2.28 基础上增加:
   - 文档: HELP.md / FEATURES.md / TOOLS.md 补 /更新日志 与 get_changelog
 
 工具数量: 30 → 31
+```
+
+### v2.30 — 更新公告图片卡片 + 公开站点 (2026-10-02)
+```
+v2.29 基础上增加:
+  - tools/card_renderer.py: render_changelog_card(entries, out_path, title, site_url)
+    复用 help/feature 卡骨架渲染暗色 PNG (版本 pill 循环色 + 变更类型 badge 色
+    新增绿/修复红/优化蓝/调整金/移除灰 + _wrap 像素宽换行 + 站点短链副标题);
+    entries 空返回 None; 输出 data/wiki_cache/changelog_card.png
+  - QQ 端发卡 (agent_router.py):
+    · /更新日志 命令: 文本后 best-effort 追加卡片 (asyncio.to_thread 渲染 + _safe_send 图)
+    · 群发 _do_broadcast: 循环外渲染一次, 逐群先发图再发文本; 发卡失败降级仅文本不计 failed
+    · 指路短链 _PUBLIC_SITE_URL (env BOT_PUBLIC_SITE_URL, 默认 https://bot.oneweblog.cn)
+  - tools/changelog.py: format_for_qq / format_announcement 增可选 site_url,
+    非空时尾部追加纯文本指路行「📖 使用说明与演示：<url>」(不含 markdown)
+  - 公开站点 public_site/ (bot.oneweblog.cn, 纯静态只读, 独立于 admin webui):
+    index.html/style.css/app.js 单页 (hero 场景卡 / 怎么用: 命令 chip 点击复制+自然语言说法 /
+    演示 assets 缺失占位降级 / 更新记录 fetch changelog.json / 反馈页脚)
+  - webui: config.PUBLIC_SITE_DIR (env WEBUI_PUBLIC_SITE_DIR) / PUBLIC_SITE_BASE_URL;
+    data_reader._export_public_changelog 在 changelog_save 成功分支把脱敏快照
+    (仅 version/date/changes, 剔除 created_at/broadcast_at/_class, 绝不含群/用户数据)
+    原子写 <PUBLIC_SITE_DIR>/changelog.json, 失败静默不阻断保存 → 保存即同步
+  - docs/bot-site-nginx.md: nginx server 示例 (静态服务 + changelog.json no-cache + HTTPS)
+
+工具数量: 31 (不变)
 ```

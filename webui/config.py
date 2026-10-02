@@ -43,6 +43,11 @@ def bot_env(key: str, default: str = "") -> str:
 
 USER_DATA_ROOT = Path(bot_env("USER_DATA_ROOT", str(ROOT / "data" / "users")))
 
+# 公开使用站点（bot.oneweblog.cn）：面板每次保存更新记录时向 PUBLIC_SITE_DIR
+# 导出脱敏 changelog.json；nginx root 指向该目录即完成发布（见 docs/bot-site-nginx.md）。
+PUBLIC_SITE_DIR = Path(os.environ.get("WEBUI_PUBLIC_SITE_DIR", str(ROOT / "public_site")))
+PUBLIC_SITE_BASE_URL = os.environ.get("WEBUI_PUBLIC_SITE_URL", "https://bot.oneweblog.cn")
+
 # ── Panel server ──────────────────────────────────────────────────
 
 HOST = os.environ.get("WEBUI_HOST", "127.0.0.1")
