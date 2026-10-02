@@ -3,159 +3,404 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Roxy · QQ 智能助手</title>
-<meta name="description" content="Roxy 是一个挂在 QQ 群里的 AI 智能助手：问答、搜索、翻译、游戏资料查询、兑换码、文件阅读，还会记住你。">
+<title>Roxy · QQ 群智能助手</title>
+<meta name="description" content="Roxy 是挂在 QQ 群里的 LLM 智能助手：问答、聚合搜索、翻译、地图路线、游戏资料与兑换码、文件与语音理解，还会记住你。本站提供使用说明、实际演示、命令大全与更新日志。">
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>
 
-<!-- ── 首屏 hero ─────────────────────────────────────────────── -->
-<header class="hero">
+<!-- 顶部导航 -->
+<nav class="nav" id="nav">
+  <div class="nav-inner">
+    <a class="nav-logo" href="#intro">Roxy<span class="nav-logo-dot"></span></a>
+    <div class="nav-links" id="nav-links">
+      <a href="#intro" class="nav-link">介绍</a>
+      <a href="#guide" class="nav-link">使用说明</a>
+      <a href="#demos" class="nav-link">使用案例</a>
+      <a href="#commands" class="nav-link">命令大全</a>
+      <a href="#changelog" class="nav-link">更新日志</a>
+      <a href="#feedback" class="nav-link">反馈</a>
+      <a href="#join" class="nav-link">加入我们</a>
+    </div>
+    <button class="nav-toggle" id="nav-toggle" aria-label="展开菜单" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+</nav>
+
+<!-- 首屏 -->
+<header class="hero" id="intro">
+  <div class="hero-glow hero-glow-a"></div>
+  <div class="hero-glow hero-glow-b"></div>
+  <div class="hero-grid"></div>
   <div class="hero-inner">
-    <div class="hero-badge">QQ 群智能助手</div>
-    <h1>Roxy</h1>
-    <p class="slogan">把 AI 装进你的 QQ 群——会聊天、会查资料、会玩游戏，还会记住你。</p>
-    <p class="hero-hint">不需要记任何命令，像和朋友说话一样 @ 它即可。</p>
-    <div class="hero-actions">
-      <a class="btn btn-primary" href="#howto">怎么用</a>
-      <a class="btn btn-ghost" href="#changelog">更新记录</a>
+    <p class="hero-badge reveal">QQ 群智能助手 · LLM Agent 架构</p>
+    <h1 class="reveal">Roxy</h1>
+    <p class="hero-slogan reveal">把 AI 装进你的 QQ 群。</p>
+    <p class="hero-sub reveal">
+      会聊天、会搜全网、会翻中英日、会规划路线、会读 PDF 和语音，
+      还是 Ark Re:Code 的资料库与兑换码播报员——并且会记住你。
+    </p>
+    <div class="hero-actions reveal">
+      <a class="btn btn-primary" href="#guide">开始使用</a>
+      <a class="btn btn-ghost" href="#demos">看实际演示</a>
+    </div>
+    <div class="hero-stats reveal">
+      <div class="stat"><b>20</b><span>轮工具调用 / 单次请求</span></div>
+      <div class="stat"><b>3</b><span>种可切换人格</span></div>
+      <div class="stat"><b>90s</b><span>群聊免 @ 追问窗口</span></div>
+      <div class="stat"><b>0</b><span>系统命令 token 消耗</span></div>
     </div>
   </div>
+  <div class="hero-scroll-hint" aria-hidden="true"></div>
 </header>
 
 <main>
 
-  <!-- ── 它能帮你做什么（场景卡，大白话）──────────────────────── -->
-  <section class="section" id="what">
-    <h2>它能帮你做什么</h2>
-    <p class="section-sub">不用懂技术，下面这些场景直接说就行。</p>
-    <div class="grid">
-      <div class="card">
-        <div class="card-ico">💬</div>
-        <h3>有问必答</h3>
-        <p>聊天、答疑、写文案、解释代码、翻译中英日……把它当一个随叫随到的聪明朋友。</p>
-      </div>
-      <div class="card">
-        <div class="card-ico">🔍</div>
-        <h3>查资料</h3>
-        <p>搜全网、查实时天气、看当前时间、抓网页内容，一句话搞定。</p>
-      </div>
-      <div class="card">
-        <div class="card-ico">🎮</div>
-        <h3>游戏助手</h3>
-        <p>Ark Recode 兑换码、角色/羁绊资料、抽卡模拟、战斗测速，攻略党福音。</p>
-      </div>
-      <div class="card">
-        <div class="card-ico">📄</div>
-        <h3>读文件看图</h3>
-        <p>把 PDF、文档、截图、语音丢给它，它能读懂并告诉你里面是什么。</p>
-      </div>
-      <div class="card">
-        <div class="card-ico">🧠</div>
-        <h3>会记住你</h3>
-        <p>聊过的事它会记下来，下次不用重复介绍自己；说得越多它越懂你。</p>
-      </div>
-      <div class="card">
-        <div class="card-ico">🗂️</div>
-        <h3>专属空间</h3>
-        <p>每个人有独立工作区，长对话可以存成「会话」随时接着聊。</p>
+<!-- 介绍 -->
+<section class="section" id="about">
+  <div class="section-head reveal">
+    <h2>它是谁</h2>
+    <p class="section-sub">一个跑在 QQ 里的多模型智能体，而不是关键词复读机。</p>
+  </div>
+  <div class="grid grid-3">
+    <div class="card reveal">
+      <h3>智能体循环</h3>
+      <p>每条消息都经过「思考 → 行动 → 观察 → 回应」循环：先想该用什么工具，调用后阅读结果，再组织成回答。最多 20 轮工具调用，复杂任务也能拆解完成。</p>
+    </div>
+    <div class="card reveal">
+      <h3>多模型路由</h3>
+      <p>简单问题走快速模型秒回，复杂推理自动切换到强力模型；图片与语音另有专用多模态模型处理。你只管说话，路由交给它。</p>
+    </div>
+    <div class="card reveal">
+      <h3>长期记忆与画像</h3>
+      <p>三层记忆引擎自动从对话中提取事实：重复确认的会被强化记住，长期不用的逐渐衰减。聊过的事不用重复介绍第二遍。</p>
+    </div>
+    <div class="card reveal">
+      <h3>三种人格</h3>
+      <p>助手 Roxy、角色 Roxy、露比三种人格提示词驱动，<code>/人格切换</code> 即时切换，群聊还可由管理员绑定默认人格。</p>
+    </div>
+    <div class="card reveal">
+      <h3>专属工作区</h3>
+      <p>每个 QQ 号拥有独立文件空间（代码 / 上传 / 输出 / 项目子目录），按权限分配 100MB 至 2GB 配额，互不可见。</p>
+    </div>
+    <div class="card reveal">
+      <h3>本地部署 · 隐私优先</h3>
+      <p>基于 NoneBot2 + NapCat（OneBot V11）自建部署，文件操作全部限制在沙箱工作区内，对话数据仅本地存储、不用于训练。</p>
+    </div>
+  </div>
+</section>
+
+<!-- 使用说明 -->
+<section class="section" id="guide">
+  <div class="section-head reveal">
+    <h2>使用说明</h2>
+    <p class="section-sub">从零到熟练：怎么说话、怎么用命令、会话怎么管。</p>
+  </div>
+
+  <div class="guide-stack">
+
+    <div class="guide-card reveal">
+      <div class="guide-num">01</div>
+      <div class="guide-body">
+        <h3>怎么开始对话</h3>
+        <p><b>私聊</b>：直接发消息即可，无需 @。<b>群聊</b>：发送 <code>@Roxy + 内容</code> 触发。</p>
+        <p>不需要记任何命令。搜索、翻译、天气、路线、查资料……像和朋友说话一样直接提需求，它会自己决定调用哪些工具。</p>
       </div>
     </div>
-  </section>
 
-  <!-- ── 怎么用（命令 chip 可复制 + 自然语言说法）─────────────── -->
-  <section class="section" id="howto">
-    <h2>怎么用</h2>
-    <p class="section-sub">
-      最简单的方式：在群里 <b>@Roxy</b> 然后直接说需求。
-      下面也列出了一些快捷命令——点一下即可复制，粘贴到 QQ 发送。
-    </p>
-
-    <div class="howto-list">
-
-      <div class="howto">
-        <div class="howto-head">
-          <h3>看最近更新了什么</h3>
-        </div>
-        <div class="chips">
-          <button class="chip" data-copy="/更新日志">/更新日志</button>
-        </div>
-        <p class="nl">也可以直接说：<span class="nl-q">「最近有什么更新？」</span></p>
+    <div class="guide-card reveal">
+      <div class="guide-num">02</div>
+      <div class="guide-body">
+        <h3>群聊免 @ 窗口（连续对话）</h3>
+        <p>在群里 @ 过它一次之后，会开启一个 <b>90 秒</b>的连续对话窗口：窗口内继续发消息<b>不需要再 @</b>，它会直接接话。</p>
+        <ul>
+          <li>每发一条消息，90 秒倒计时<b>重新计满</b>——只要聊得够快，窗口一直续着。</li>
+          <li>90 秒内没人说话，窗口自动关闭，恢复「必须 @ 才理你」。</li>
+          <li>想提前退出：发送 <button class="chip chip-inline" data-copy="/取消">/取消</button> 或 <button class="chip chip-inline" data-copy="#取消">#取消</button>。</li>
+          <li>窗口按「群 + 人」独立计算，你在 A 群的窗口不影响 B 群。</li>
+        </ul>
       </div>
-
-      <div class="howto">
-        <div class="howto-head">
-          <h3>查游戏兑换码</h3>
-        </div>
-        <div class="chips">
-          <button class="chip" data-copy="/兑换码">/兑换码</button>
-          <button class="chip" data-copy="/长期兑换码">/长期兑换码</button>
-        </div>
-        <p class="nl">也可以直接说：<span class="nl-q">「现在有什么能用的兑换码？」</span></p>
-      </div>
-
-      <div class="howto">
-        <div class="howto-head">
-          <h3>查角色 / 羁绊资料</h3>
-        </div>
-        <div class="chips">
-          <button class="chip" data-copy="/角色详情 露比">/角色详情 露比</button>
-          <button class="chip" data-copy="/羁绊详情 "> /羁绊详情 &lt;名称&gt;</button>
-        </div>
-        <p class="nl">也可以直接说：<span class="nl-q">「露比这个角色强度怎么样？」</span></p>
-      </div>
-
-      <div class="howto">
-        <div class="howto-head">
-          <h3>看完整功能 / 命令列表</h3>
-        </div>
-        <div class="chips">
-          <button class="chip" data-copy="/功能">/功能</button>
-          <button class="chip" data-copy="/帮助">/帮助</button>
-        </div>
-        <p class="nl">也可以直接说：<span class="nl-q">「你都会些什么？」</span></p>
-      </div>
-
-      <div class="howto">
-        <div class="howto-head">
-          <h3>长对话存成会话，下次接着聊</h3>
-        </div>
-        <div class="chips">
-          <button class="chip" data-copy="/新会话">/新会话</button>
-          <button class="chip" data-copy="/会话列表">/会话列表</button>
-        </div>
-        <p class="nl">也可以直接说：<span class="nl-q">「帮我把这段对话存起来。」</span></p>
-      </div>
-
     </div>
-    <p class="copy-tip" id="copy-tip" hidden>已复制 ✓</p>
-  </section>
 
-  <!-- ── 演示（截图/GIF，缺失时占位降级）─────────────────────── -->
-  <section class="section" id="demo">
-    <h2>实际效果演示</h2>
-    <p class="section-sub">真实 QQ 对话截图，看看 Roxy 在群里是怎么说话的。</p>
-    <div class="demo-gallery" id="demo-gallery"></div>
-  </section>
-
-  <!-- ── 更新记录（自动同步自 changelog.json）────────────────── -->
-  <section class="section" id="changelog">
-    <h2>更新记录</h2>
-    <p class="section-sub">机器人每次更新都会自动同步到这里。</p>
-    <div id="changelog-box" class="changelog-box">
-      <p class="muted">加载中…</p>
+    <div class="guide-card reveal">
+      <div class="guide-num">03</div>
+      <div class="guide-body">
+        <h3>命令特殊符怎么输入</h3>
+        <p>系统命令以<b>半角斜杠 <code>/</code></b> 开头（如 <code>/帮助</code>），反馈类以<b>半角井号 <code>#</code></b> 开头（如 <code>#反馈</code>）。规则只有三条：</p>
+        <ul>
+          <li>符号必须是消息的<b>第一个字符</b>，前面不能有空格或其他内容。</li>
+          <li>必须用<b>半角</b>符号。全角的 <code>／</code> 和 <code>＃</code> 不会被识别，会被当成普通聊天内容交给 AI。</li>
+          <li>命令由系统直接处理、<b>不经过 AI、零 token 消耗</b>，所以响应几乎即时；没命中命令的文本才会进入智能体循环。</li>
+        </ul>
+      </div>
     </div>
-  </section>
+
+    <div class="guide-card reveal">
+      <div class="guide-num">04</div>
+      <div class="guide-body">
+        <h3>临时会话 vs 特殊会话</h3>
+        <p>这是<b>两套完全独立</b>的存储系统，不是同一系统的两种模式：</p>
+        <table class="table">
+          <thead>
+            <tr><th></th><th>临时会话（默认）</th><th>特殊会话（手动创建）</th></tr>
+          </thead>
+          <tbody>
+            <tr><th>创建方式</th><td>发消息即存在，无需操作</td><td><code>/新会话 [名称]</code> 创建，或 <code>/保存为会话 &lt;名称&gt;</code> 把临时对话存档</td></tr>
+            <tr><th>上下文容量</th><td>只保留最近 <b>20 条</b>消息，更早的被挤掉</td><td>完整上下文持久保存，长对话不丢细节</td></tr>
+            <tr><th>过期策略</th><td><b>30 分钟</b>不活跃自动过期清空</td><td>永久保存，直到你 <code>/删除会话</code></td></tr>
+            <tr><th>数量限制</th><td>每人 1 个</td><td>按权限：管理员 10 个 / VIP 3 个 / 普通 1 个</td></tr>
+            <tr><th>管理命令</th><td><code>/clear</code> 或发「新对话」清空重来</td><td><code>/切换会话</code> <code>/会话列表</code> <code>/重命名会话</code> <code>/删除会话</code> <code>/结束会话</code></td></tr>
+            <tr><th>适用场景</th><td>随口一问、短平快任务</td><td>长篇项目讨论、攻略整理、需要隔天接着聊的内容</td></tr>
+          </tbody>
+        </table>
+        <p class="muted">在特殊会话中发送 <code>/结束会话</code>（或 <code>/临时会话</code>）即退回临时模式，特殊会话本身不会被删除。</p>
+      </div>
+    </div>
+
+    <div class="guide-card reveal">
+      <div class="guide-num">05</div>
+      <div class="guide-body">
+        <h3>权限三级</h3>
+        <table class="table">
+          <thead><tr><th>级别</th><th>能力</th><th>工作区</th><th>特殊会话</th></tr></thead>
+          <tbody>
+            <tr><th>普通</th><td>搜索 / 天气 / 翻译 / 地图 / 文件阅读 / 游戏工具等基础能力</td><td>100MB</td><td>1 个</td></tr>
+            <tr><th>VIP</th><td>追加网页抓取、图片分析、语音识别、代码执行（15s）、仓库下载</td><td>500MB</td><td>3 个</td></tr>
+            <tr><th>管理员</th><td>全部能力，含 Shell 只读白名单与完整代码执行（60s）</td><td>2GB</td><td>10 个</td></tr>
+          </tbody>
+        </table>
+        <p class="muted">权限由管理员在后台配置。想知道自己当前的权限、会话与工作区用量？直接问它「我的信息」。</p>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- 使用案例 -->
+<section class="section" id="demos">
+  <div class="section-head reveal">
+    <h2>使用案例</h2>
+    <p class="section-sub">真实 QQ 录屏，无剪辑加速。点开即看 Roxy 怎么接话。</p>
+  </div>
+  <div class="demo-grid">
+
+    <figure class="demo-card reveal">
+      <video controls preload="metadata" playsinline poster="./examples/posters/怎么用.jpg" src="./examples/mp4/怎么用.mp4"></video>
+      <figcaption>
+        <h3>第一次见面：怎么用</h3>
+        <p>私聊发一句「怎么用?」，Roxy 自我介绍并给出常用命令入口——不需要任何前置知识。</p>
+      </figcaption>
+    </figure>
+
+    <figure class="demo-card reveal">
+      <video controls preload="metadata" playsinline poster="./examples/posters/网页查询.jpg" src="./examples/mp4/网页查询.mp4"></video>
+      <figcaption>
+        <h3>聚合搜索网页</h3>
+        <p>让它查一个线上问题：SearXNG 聚合多引擎检索，阅读结果后给出带出处的结论。</p>
+      </figcaption>
+    </figure>
+
+    <figure class="demo-card reveal">
+      <video controls preload="metadata" playsinline poster="./examples/posters/路线规划.jpg" src="./examples/mp4/路线规划.mp4"></video>
+      <figcaption>
+        <h3>自然语言路线规划</h3>
+        <p>「从 A 到 B 怎么走」一句话触发高德路线规划，驾车 / 步行 / 公交方案带距离与耗时。</p>
+      </figcaption>
+    </figure>
+
+    <figure class="demo-card reveal">
+      <video controls preload="metadata" playsinline poster="./examples/posters/兑换码.jpg" src="./examples/mp4/兑换码.mp4"></video>
+      <figcaption>
+        <h3>查游戏兑换码</h3>
+        <p><code>/兑换码</code> 直查当前有效的限时码，逐条单发方便复制；数据由管理员人工维护，过期 7 天内仍会提示。</p>
+      </figcaption>
+    </figure>
+
+    <figure class="demo-card reveal">
+      <video controls preload="metadata" playsinline poster="./examples/posters/角色详情.jpg" src="./examples/mp4/角色详情.mp4"></video>
+      <figcaption>
+        <h3>查角色详情</h3>
+        <p><code>/角色详情 露比</code> 直接返回面板成长、技能与倍率资料并附卡片图，不走智能体、秒回。</p>
+      </figcaption>
+    </figure>
+
+    <figure class="demo-card reveal">
+      <video controls preload="metadata" playsinline poster="./examples/posters/创建特殊会话.jpg" src="./examples/mp4/创建特殊会话.mp4"></video>
+      <figcaption>
+        <h3>创建特殊会话</h3>
+        <p><code>/新会话 测试</code> 开一个持久会话：上下文完整保存，隔天回来接着聊也不丢。</p>
+      </figcaption>
+    </figure>
+
+    <figure class="demo-card reveal">
+      <video controls preload="metadata" playsinline poster="./examples/posters/退出特殊会话.jpg" src="./examples/mp4/退出特殊会话.mp4"></video>
+      <figcaption>
+        <h3>退出特殊会话</h3>
+        <p><code>/结束会话</code> 退回临时模式。会话本体仍在 <code>/会话列表</code> 里，随时 <code>/切换会话</code> 回去。</p>
+      </figcaption>
+    </figure>
+
+    <figure class="demo-card reveal">
+      <video controls preload="metadata" playsinline poster="./examples/posters/清空上下文.jpg" src="./examples/mp4/清空上下文.mp4"></video>
+      <figcaption>
+        <h3>清空上下文</h3>
+        <p><code>/clear</code> 把临时会话抹干净重新开始——换话题前的好习惯。</p>
+      </figcaption>
+    </figure>
+
+  </div>
+</section>
+
+<!-- 命令大全 -->
+<section class="section" id="commands">
+  <div class="section-head reveal">
+    <h2>命令大全</h2>
+    <p class="section-sub">所有命令均为半角符号开头、系统直处理、零 token。点击命令可复制。</p>
+  </div>
+
+  <div class="cmd-groups">
+
+    <div class="cmd-group reveal">
+      <h3>会话管理</h3>
+      <div class="cmd-rows">
+        <div class="cmd-row"><button class="chip" data-copy="/新会话 ">/新会话 [名称]</button><span>创建特殊会话，名称留空则自动命名</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/切换会话 ">/切换会话 &lt;名称&gt;</button><span>切换到已有特殊会话</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/会话列表">/会话列表</button><span>查看全部特殊会话（<code>/会话</code> 同义）</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/重命名会话 ">/重命名会话 &lt;旧名&gt; &lt;新名&gt;</button><span>重命名特殊会话</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/删除会话 ">/删除会话 &lt;名称&gt;</button><span>删除特殊会话，60 秒内二次确认</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/保存为会话 ">/保存为会话 &lt;名称&gt;</button><span>把当前临时对话存档为特殊会话</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/结束会话">/结束会话</button><span>退出特殊会话回临时模式（<code>/临时会话</code> 同义）</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/clear">/clear</button><span>清空临时会话上下文（发「新对话」同义）</span></div>
+      </div>
+    </div>
+
+    <div class="cmd-group reveal">
+      <h3>人格与功能</h3>
+      <div class="cmd-rows">
+        <div class="cmd-row"><button class="chip" data-copy="/人格切换">/人格切换</button><span>查看当前人格与可用列表</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/人格切换 ">/人格切换 &lt;名称&gt;</button><span>切换人格，支持模糊匹配（如「露比」）</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/功能">/功能</button><span>在 QQ 内查看完整功能一览（<code>/features</code> 同义）</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/更新日志">/更新日志 [d]</button><span>查看最近 d 条更新（默认 3、最多 20；<code>/update record</code> 同义）</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/status">/status</button><span>查看机器人运行状态</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/帮助">/帮助</button><span>显示系统命令列表（<code>/help</code> <code>/命令</code> 同义）</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/管理工作区">/管理工作区</button><span>查看工作区占用并引导清理</span></div>
+      </div>
+    </div>
+
+    <div class="cmd-group reveal">
+      <h3>游戏工具（Ark Re:Code）</h3>
+      <div class="cmd-rows">
+        <div class="cmd-row"><button class="chip" data-copy="/兑换码">/兑换码</button><span>当前有效限时码 + 7 天内刚过期的，逐条单发（<code>/redeem-code</code> 同义）</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/长期兑换码">/长期兑换码</button><span>查询无过期时间的长期码</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/角色详情 ">/角色详情 &lt;名称&gt;</button><span>角色面板 / 技能 / 倍率，附卡片图，秒回</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/羁绊详情 ">/羁绊详情 &lt;名称&gt;</button><span>羁绊类别 / 星级 / 属性 / 技能 / 获取方式</span></div>
+        <div class="cmd-row"><span class="chip chip-static">自然语言</span><span>抽卡模拟（4 种卡池）、战斗测速、乱速概率，直接说即可</span></div>
+      </div>
+    </div>
+
+    <div class="cmd-group reveal">
+      <h3>群聊与群管理</h3>
+      <div class="cmd-rows">
+        <div class="cmd-row"><button class="chip" data-copy="/取消">/取消</button><span>退出群聊连续对话（免 @ 窗口），<code>#取消</code> 同义</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/toggle">/toggle</button><span>查看本群功能开关与默认人格（仅群聊 + 管理员）</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/toggle ">/toggle &lt;功能&gt; &lt;on|off&gt;</button><span>开关 gacha / image / voice（仅管理员）</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="/toggle personality ">/toggle personality &lt;名称&gt;</button><span>设置本群默认人格；参数填「默认」则清除</span></div>
+      </div>
+    </div>
+
+    <div class="cmd-group reveal">
+      <h3>反馈</h3>
+      <div class="cmd-rows">
+        <div class="cmd-row"><button class="chip" data-copy="#反馈 ">#反馈 &lt;内容&gt;</button><span>提交功能建议，自动附上下文快照给管理员</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="#bug ">#bug &lt;内容&gt;</button><span>提交 Bug 报告，自动附上下文快照</span></div>
+        <div class="cmd-row"><button class="chip" data-copy="#建议 ">#建议 &lt;内容&gt;</button><span>提交改进建议，自动附上下文快照</span></div>
+      </div>
+    </div>
+
+  </div>
+  <p class="copy-tip" id="copy-tip" hidden>已复制</p>
+</section>
+
+<!-- 更新日志 -->
+<section class="section" id="changelog">
+  <div class="section-head reveal">
+    <h2>更新日志</h2>
+    <p class="section-sub">每次发版自动同步到本页，无需人工搬运。</p>
+  </div>
+  <div id="changelog-box" class="timeline">
+    <p class="muted">加载中…</p>
+  </div>
+</section>
+
+<!-- 反馈方式 -->
+<section class="section" id="feedback">
+  <div class="section-head reveal">
+    <h2>反馈方式</h2>
+    <p class="section-sub">Bug、建议、想要的功能，都有一条直达管理员的通道。</p>
+  </div>
+  <div class="grid grid-2">
+    <div class="card reveal">
+      <h3>群内命令反馈（推荐）</h3>
+      <p>在任意会话中发送以下命令，内容会<b>自动附带当前对话上下文快照</b>直达管理员，复现问题不用截图：</p>
+      <div class="chips">
+        <button class="chip" data-copy="#反馈 ">#反馈 &lt;内容&gt;</button>
+        <button class="chip" data-copy="#bug ">#bug &lt;内容&gt;</button>
+        <button class="chip" data-copy="#建议 ">#建议 &lt;内容&gt;</button>
+      </div>
+    </div>
+    <div class="card reveal">
+      <h3>项目层面反馈</h3>
+      <p>部署问题、代码建议、合作意向：直接在 GitHub 仓库提 Issue，
+         或通过「加入我们」板块的联系人 QQ 沟通。</p>
+      <p>命令反馈适合「机器人刚才答错了」这类现场问题；Issue 适合需要讨论与排期的事。</p>
+    </div>
+  </div>
+</section>
+
+<!-- 加入我们 -->
+<section class="section" id="join">
+  <div class="section-head reveal">
+    <h2>加入我们</h2>
+    <p class="section-sub">开源项目，欢迎一切有计算机程序设计基础的朋友。</p>
+  </div>
+
+  <div class="join-hero card reveal">
+    <h3>QQBotAgent · MIT License</h3>
+    <p>NoneBot2 + NapCat（OneBot V11）+ 多模型路由的 QQ 智能体框架。
+       会写 Python、会调 Prompt、会前端、会运维、甚至只会提 Issue——都算数。</p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="https://github.com/BoomberAsp/QQBotAgent" target="_blank" rel="noopener">GitHub 仓库</a>
+      <span class="join-qq">联系人 QQ：<button class="chip chip-inline" data-copy="2578260985">2578260985</button>（添加请备注来意）</span>
+    </div>
+  </div>
+
+  <h3 class="roadmap-title reveal">路线规划：基于 RAG 的游戏专精智能体</h3>
+  <div class="grid grid-3">
+    <div class="card roadmap reveal">
+      <span class="roadmap-tag">规划中</span>
+      <h3>崩坏：星穹铁道 · 全知剧情智能体</h3>
+      <p>检索增强生成驱动的剧情问答：角色背景、事件脉络、文本细节，问啥答啥并给出出处。</p>
+    </div>
+    <div class="card roadmap reveal">
+      <span class="roadmap-tag">规划中</span>
+      <h3>崩坏：星穹铁道 · 强度玩法智能体</h3>
+      <p>配队、遗器、轴与伤害期望：基于结构化游戏数据的强度分析与玩法建议。</p>
+    </div>
+    <div class="card roadmap reveal">
+      <span class="roadmap-tag">规划中</span>
+      <h3>Ark Re:Code · 强度玩法智能体</h3>
+      <p>在现有兑换码 / 角色 / 羁绊资料库之上，叠加 RAG 检索的强度与玩法决策支持。</p>
+    </div>
+  </div>
+</section>
 
 </main>
 
-<!-- ── 页脚：反馈入口 ────────────────────────────────────────── -->
 <footer class="footer">
-  <p><b>遇到问题或有想法？</b></p>
-  <p>在群里发送 <button class="chip chip-inline" data-copy="#反馈 ">#反馈 &lt;内容&gt;</button>
-     或 <button class="chip chip-inline" data-copy="#bug ">#bug &lt;内容&gt;</button>，
-     会自动附上上下文发给管理员。</p>
+  <p class="footer-brand">Roxy · QQBotAgent</p>
   <p class="muted">Roxy 的回答并非总是准确无误，请理性判断。</p>
+  <p class="muted">本站为纯静态只读站点，不收集任何访问数据。</p>
 </footer>
 
 <script src="./app.js"></script>
