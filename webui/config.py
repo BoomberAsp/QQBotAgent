@@ -45,8 +45,10 @@ USER_DATA_ROOT = Path(bot_env("USER_DATA_ROOT", str(ROOT / "data" / "users")))
 
 # 公开使用站点（bot.oneweblog.cn）：面板每次保存更新记录时向 PUBLIC_SITE_DIR
 # 导出脱敏 changelog.json；nginx root 指向该目录即完成发布（见 docs/bot-site-nginx.md）。
-PUBLIC_SITE_DIR = Path(os.environ.get("WEBUI_PUBLIC_SITE_DIR", str(ROOT / "public_site")))
-PUBLIC_SITE_BASE_URL = os.environ.get("WEBUI_PUBLIC_SITE_URL", "https://bot.oneweblog.cn")
+# 与 USER_DATA_ROOT 同经 bot_env 读取 —— 部署专属路径（如 /var/www/bot-oneweblog）写在
+# gitignore 的 QQBot/.env 里，不硬编码进版本库脚本；缺省回落到仓库内 public_site。
+PUBLIC_SITE_DIR = Path(bot_env("WEBUI_PUBLIC_SITE_DIR", str(ROOT / "public_site")))
+PUBLIC_SITE_BASE_URL = bot_env("WEBUI_PUBLIC_SITE_URL", "https://bot.oneweblog.cn")
 
 # ── Panel server ──────────────────────────────────────────────────
 
