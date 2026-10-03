@@ -164,6 +164,21 @@
     </div>
 
     <div class="guide-card reveal">
+      <div class="guide-num">03</div>
+      <div class="guide-body">
+        <h3>团战测速工具怎么使用？</h3>
+        <p>使用自然语言描述你的测速意图，并尽量在<b>同一消息中</b>附带<b>两张</b>团战行动值截图：</p>
+        <ul>
+          <li>Roxy 会自主判断行动值截图<b>是否有效</b></li>
+          <li>如果分开文本与图片发送（如手机端），需要手动引用发送的图片，并告知 Roxy</li>
+          <li>如果文本信息中<b>没有</b>携带有效的我方成员速度，Roxy 会提示你</li>
+          <li>Roxy 会根据角色技能的推拉条情况，自动修正行动值，面对<b>概率触发</b>（考虑效果命中/技能本身的随机）的推拉条行为，会向你确认</li>
+          <li>全量测速 与 精简测速 有何区别？ 全量测速会自主判断角色技能，用于确认测速图片的有效性与行动值的有效性，耗时更长；精简测速仅根据图片所示的行动值进行计算，需要人工检查，相应速度更快</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="guide-card reveal">
       <div class="guide-num">05</div>
       <div class="guide-body">
         <h3>权限三级</h3>
@@ -218,7 +233,7 @@
       <video controls preload="metadata" playsinline poster="./examples/posters/兑换码.jpg" src="./examples/mp4/兑换码.mp4"></video>
       <figcaption>
         <h3>查游戏兑换码</h3>
-        <p><code>/兑换码</code> 直查当前有效的限时码，逐条单发方便复制；数据由管理员人工维护，过期 7 天内仍会提示。</p>
+        <p><code>/兑换码</code> 直查当前有效的限时码，逐条单发方便复制；数据由 自动爬取 + 管理员人工 维护，过期 7 天内仍会提示。</p>
       </figcaption>
     </figure>
 
@@ -226,7 +241,7 @@
       <video controls preload="metadata" playsinline poster="./examples/posters/角色详情.jpg" src="./examples/mp4/角色详情.mp4"></video>
       <figcaption>
         <h3>查角色详情</h3>
-        <p><code>/角色详情 露比</code> 直接返回面板成长、技能与倍率资料并附卡片图，不走智能体、秒回。</p>
+        <p><code>/角色详情 露比</code> 信息自动爬取 + LLM翻译 + 制卡。直接返回面板成长、技能与倍率资料并附卡片图，不走智能体、秒回。</p>
       </figcaption>
     </figure>
 
