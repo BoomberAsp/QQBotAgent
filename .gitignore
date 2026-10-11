@@ -60,6 +60,7 @@ QQBot/docs/
 # ── 本地验证数据与脚本（Idea 8 测速）────────────
 # test/ 下的校验脚本、GT、缓存、接触片均为开发产物
 /test/
+
 # cal-speed-data 里的战斗截图（49 张验证集）不入库，
 # 但 *图标.png 是 BuffDetector 的运行时模板，必须保留。
 QQBot/images/cal-speed-data/*
@@ -70,3 +71,6 @@ QQBot/images/cal-speed-data/*
 QQBot/config/ocr_digit_templates/
 # 运行时 LLM 翻译缓存（各机器独立再生，勿跟踪）
 QQBot/data/wiki_cache/name_mapping.json
+
+# 可被管理员在服务器上修改的别名映射文件
+QQBot/config/characters/character_dic.json

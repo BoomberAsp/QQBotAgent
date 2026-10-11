@@ -115,6 +115,20 @@ PROCESSES = {
     },
 }
 
+# ── NapCat 登录二维码 ──────────────────────────────────────────────
+# NapCat 需要扫码登录时，会把二维码 PNG 写到 cachePath/qrcode.png，并自带
+# 一个 WebUI（默认 6099 端口）暴露 /QQLogin/CheckLoginStatus 判断登录态。
+# 全部可用环境变量覆盖，缺省匹配当前部署路径（见 config.py 顶部约定）。
+
+_NAPCAT_HOME = Path(os.path.expanduser(
+    os.environ.get("NAPCAT_HOME", "~/Napcat/opt/QQ/resources/app/app_launcher/napcat")))
+NAPCAT_QRCODE_PATH = Path(os.environ.get(
+    "WEBUI_NAPCAT_QRCODE", str(_NAPCAT_HOME / "cache" / "qrcode.png")))
+NAPCAT_WEBUI_CONFIG = Path(os.environ.get(
+    "WEBUI_NAPCAT_WEBUI_CONFIG", str(_NAPCAT_HOME / "config" / "webui.json")))
+NAPCAT_HTTP_BASE = os.environ.get("NAPCAT_HTTP_BASE", "http://127.0.0.1:6099")
+
+
 # ── Auth ──────────────────────────────────────────────────────────
 
 AUTH_FILE = WEBUI_DATA / "auth.json"
