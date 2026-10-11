@@ -42,7 +42,26 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="QQBotAgent WebUI", docs_url=None, redoc_url=None,
               lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=str(config.WEBUI_DIR / "static")), name="static")
+
+
+class _NoCacheStatic(StaticFiles):
+    """StaticFiles that forces the browser to revalidate on every load.
+
+    The panel is deployed by editing files in place, so a stale cached
+    processes.js/app.css silently hides new features (e.g. the NapCat QR
+    card). Sending ``no-cache`` makes the browser send a conditional
+    request each time → 304 when unchanged, fresh 200 after a deploy.
+    Negligible cost for an admin UI; avoids the whole class of stale-asset
+    bugs without per-file cache-busting query strings.
+    """
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
+
+
+app.mount("/static", _NoCacheStatic(directory=str(config.WEBUI_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(config.WEBUI_DIR / "templates"))
 
 # Pages shown in the sidebar: (route, title)
