@@ -630,8 +630,13 @@ function download_napcat() {
 }
 
 function get_qq_target_version() {
-    #固定 3.2.19-39038
-    linuxqq_target_version="3.2.19-39038"
+    #固定 3.2.34-53644 (2026-10-02 更新)
+    # 注意: 腾讯会周期性抬高最低可登录 NTQQ 版本, pin 的旧版本会触发登录
+    #       error 45 "QQ版本过低"; 且旧版 deb 的 CDN 对象可能被删(404 NoSuchKey),
+    #       导致下载到一个几百字节的错误 XML, dpkg-deb 报 "not a Debian format archive"。
+    # 取当前可用版本: 看 https://cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/linuxConfig.js
+    #       或 AUR linuxqq PKGBUILD, 拼 qqdl.gtimg.cn/qqfile/QQNT/<ver>/<channel>/<md5前缀>/linuxqq_<ver>-<build>_<arch>.deb
+    linuxqq_target_version="3.2.34-53644"
 }
 
 function compare_linuxqq_versions() {
@@ -751,18 +756,18 @@ function install_linuxqq_rootless() {
 
     if [ "${system_arch}" = "amd64" ]; then
         if [ "${package_installer}" = "rpm" ]; then
-            qq_download_url="https://dldir1.qq.com/qqfile/qq/QQNT/c773cdf7/linuxqq_3.2.19-39038_x86_64.rpm"
+            qq_download_url="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/9ee04bef/linuxqq_3.2.34-53644_x86_64.rpm"
             qq_package_file="QQ.rpm"
         elif [ "${package_installer}" = "dpkg" ]; then
-            qq_download_url="https://dldir1.qq.com/qqfile/qq/QQNT/c773cdf7/linuxqq_3.2.19-39038_amd64.deb"
+            qq_download_url="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/9ee04bef/linuxqq_3.2.34-53644_amd64.deb"
             qq_package_file="QQ.deb"
         fi
     elif [ "${system_arch}" = "arm64" ]; then
         if [ "${package_installer}" = "rpm" ]; then
-            qq_download_url="https://dldir1.qq.com/qqfile/qq/QQNT/c773cdf7/linuxqq_3.2.19-39038_aarch64.rpm"
+            qq_download_url="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/9ee04bef/linuxqq_3.2.34-53644_aarch64.rpm"
             qq_package_file="QQ.rpm"
         elif [ "${package_installer}" = "dpkg" ]; then
-            qq_download_url="https://dldir1.qq.com/qqfile/qq/QQNT/c773cdf7/linuxqq_3.2.19-39038_arm64.deb"
+            qq_download_url="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/9ee04bef/linuxqq_3.2.34-53644_arm64.deb"
             qq_package_file="QQ.deb"
         fi
     fi

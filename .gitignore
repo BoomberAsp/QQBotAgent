@@ -52,6 +52,10 @@ __pycache__/
 /Assignment4_QQ_Agent_Requirements_Simplified(1).md
 /docs/
 QQBot/docs/
+/docs/next_step_for_deepscientist.md
+/Cache-Hit-Rate-Plan.md
+/Profile-Fact-Extraction-Plan.md
+/Web-UI-Plan.md
 
 # ── 本地验证数据与脚本（Idea 8 测速）────────────
 # test/ 下的校验脚本、GT、缓存、接触片均为开发产物
