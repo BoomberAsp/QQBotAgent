@@ -28,6 +28,18 @@
     </tbody>
   </table>
 </div>
+
+<div class="card" id="napcat-qr-card" hidden>
+  <div class="row">
+    <h2 class="card-title" style="margin:0">NapCat 登录</h2>
+    <span id="qr-state" class="pill">—</span>
+  </div>
+  <div class="qr-wrap" id="qr-wrap">
+    <img id="qr-img" alt="QQ 登录二维码" />
+    <div class="qr-overlay" id="qr-overlay"><span>已成功登录</span></div>
+  </div>
+  <p class="muted" id="qr-hint" style="margin:0">使用手机 QQ 扫码登录</p>
+</div>
 {% endblock %}
 
 {% block scripts %}

@@ -20,13 +20,14 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from . import (audit, auth, config, config_editor, data_reader,
-               hardware_monitor, log_viewer, playground, process_manager)
+               hardware_monitor, log_viewer, napcat_login, playground,
+               process_manager)
 from .config import HOST, PORT
 
 
@@ -365,6 +366,24 @@ async def api_watchdog(payload: WatchdogPayload, request: Request):
                      "看门狗" + ("开启" if payload.enabled else "关闭"),
                      request.client.host if request.client else "")
     return {"ok": True, "enabled": payload.enabled}
+
+
+# ── NapCat 登录二维码 API ─────────────────────────────────────────
+
+@app.get("/api/napcat/qrcode")
+async def api_napcat_qrcode():
+    """登录态 + 二维码文件状态（前端每 3s 轮询）。"""
+    return await napcat_login.status()
+
+
+@app.get("/api/napcat/qrcode.png")
+async def api_napcat_qrcode_png():
+    """二维码图片本体。禁止缓存，前端用 ?t=<mtime> 破缓存。"""
+    path = config.NAPCAT_QRCODE_PATH
+    if not path.exists():
+        return JSONResponse({"error": "no_qrcode"}, status_code=404)
+    return FileResponse(path, media_type="image/png",
+                        headers={"Cache-Control": "no-store"})
 
 
 # ── Log viewer API ────────────────────────────────────────────────

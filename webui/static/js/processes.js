@@ -3,6 +3,50 @@
   const body = document.getElementById('proc-body');
   let watchdog = { enabled: false };
 
+  // ── NapCat 登录二维码 ──────────────────────────────────
+  const qrCard = document.getElementById('napcat-qr-card');
+  const qrState = document.getElementById('qr-state');
+  const qrWrap = document.getElementById('qr-wrap');
+  const qrImg = document.getElementById('qr-img');
+  const qrHint = document.getElementById('qr-hint');
+  let lastMtime = 0;
+
+  const QR_STATES = {
+    logged_in: { cls: 'pill badge-ok', text: '已登录' },
+    waiting: { cls: 'pill badge-warn', text: '等待扫码' },
+    unknown: { cls: 'pill badge-warn', text: '状态未知' },
+    stopped: { cls: 'pill badge-err', text: '未运行' },
+  };
+
+  async function loadQr() {
+    let s;
+    try { s = await api('/api/napcat/qrcode'); } catch (e) { return; }
+
+    // 二维码仅在 NapCat 运行时才有意义。
+    const show = s.process === 'running';
+    qrCard.hidden = !show;
+    if (!show) return;
+
+    const st = QR_STATES[s.login] || QR_STATES.unknown;
+    qrState.className = st.cls;
+    qrState.textContent = st.text;
+
+    const done = s.login === 'logged_in';
+    qrWrap.classList.toggle('logged-in', done);
+
+    const qr = s.qrcode || {};
+    if (qr.exists && qr.mtime !== lastMtime) {
+      lastMtime = qr.mtime;
+      qrImg.src = `/api/napcat/qrcode.png?t=${qr.mtime}`;
+    }
+    qrImg.style.display = qr.exists ? '' : 'none';
+
+    if (done) qrHint.textContent = '该 QQ 已成功登录';
+    else if (s.login_error) qrHint.textContent = `登录异常：${s.login_error}`;
+    else if (!qr.exists) qrHint.textContent = '正在生成二维码…';
+    else qrHint.textContent = '使用手机 QQ 扫码登录';
+  }
+
   function statePill(info) {
     const st = info.state;
     const cls = st === 'running' ? 'badge-ok' : st === 'unavailable' ? 'badge-warn' : 'badge-err';
@@ -63,6 +107,9 @@
       toast(e.message, 'error');
     }
     setTimeout(load, 800);  // give the process a moment to settle
+    if (name === 'napcat' && (act === 'start' || act === 'restart')) {
+      setTimeout(loadQr, 800);  // 触发启动/重启后尽快尝试拉二维码
+    }
   });
 
   document.getElementById('wd-toggle').addEventListener('click', async () => {
@@ -78,4 +125,7 @@
 
   load();
   setInterval(load, 5000);
+
+  loadQr();
+  setInterval(loadQr, 3000);   // 比进程轮询更密，贴合 NapCat 二维码刷新节奏
 })();

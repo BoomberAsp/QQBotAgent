@@ -273,6 +273,24 @@ textarea.code-editor { font-family: var(--mono); font-size: 13px; line-height: 1
 }
 .manual-pill { color: var(--yellow); border-color: var(--yellow); }
 
+/* NapCat 登录二维码 */
+.qr-wrap {
+  position: relative; width: 200px; height: 200px; margin: 12px 0;
+}
+.qr-wrap img {
+  width: 100%; height: 100%; object-fit: contain;
+  border-radius: 8px; background: #fff; padding: 6px;
+  transition: filter .4s, opacity .4s;
+}
+.qr-overlay {
+  position: absolute; inset: 0; display: none;
+  align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, .45); border-radius: 8px;
+  color: #fff; font-size: 18px; font-weight: 600; text-align: center;
+}
+.qr-wrap.logged-in img { filter: grayscale(1); opacity: .5; }
+.qr-wrap.logged-in .qr-overlay { display: flex; }
+
 @media (max-width: 860px) {
   .layout { flex-direction: column; }
   .sidebar { width: 100%; height: auto; position: static; flex-direction: row; align-items: center; }
