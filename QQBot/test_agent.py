@@ -116,6 +116,7 @@ class TestToolRegistry:
         self.test_execute_sync()
         self.test_execute_async()
         self.test_execute_error()
+        self.test_error_sanitization()
         self.test_unregister()
         self.test_contains()
 
@@ -196,6 +197,56 @@ class TestToolRegistry:
         result = asyncio.run(registry.execute("nonexistent", {}))
         assert "[Error]" in result
         print_pass("Nonexistent tool error handling")
+
+    def test_error_sanitization(self):
+        """P1-2: raw exception text must never reach the model."""
+        from lib.errors import ToolError
+        registry = self.ToolRegistry()
+
+        secret = "RuntimeError at /home/windows11/QQBotAgent/.env DB_PASSWORD=hunter2"
+
+        def leaky():
+            raise RuntimeError(secret)
+
+        registry.register("leaky", leaky, "Leaks internals", {"type": "object", "properties": {}})
+        result = asyncio.run(registry.execute("leaky", {}))
+        assert "[Error]" in result, result
+        assert "hunter2" not in result and "/home/" not in result, \
+            f"Raw exception leaked to model: {result}"
+        assert "诊断编号" in result, f"Expected diagnostic code in: {result}"
+        print_pass("Internal tool errors sanitized (no raw exception text)")
+
+        def classified():
+            raise ToolError("not_found", "未找到角色「阿米娅」，请检查名称后重试。")
+
+        registry.register("classified", classified, "ToolError", {"type": "object", "properties": {}})
+        result = asyncio.run(registry.execute("classified", {}))
+        assert result == "[Error] 未找到角色「阿米娅」，请检查名称后重试。", result
+        print_pass("ToolError safe message passes through verbatim")
+
+        def slow():
+            raise TimeoutError("connect to 10.0.0.1:8080 timed out")
+
+        registry.register("slow", slow, "Times out", {"type": "object", "properties": {}})
+        result = asyncio.run(registry.execute("slow", {}))
+        assert "暂时不可用" in result and "10.0.0.1" not in result, result
+        print_pass("Timeouts classified as unavailable without leaking details")
+
+        def needs(x, y):
+            return x + y
+
+        registry.register("needs", needs, "Two args", {"type": "object", "properties": {}})
+        result = asyncio.run(registry.execute("needs", {"x": 1}))
+        assert result.startswith("[Error] Invalid arguments"), result
+        print_pass("Argument binding errors remain actionable")
+
+        def internal_type_bug(x):
+            return None + x  # TypeError INSIDE the tool → internal, not invalid_args
+
+        registry.register("buggy", internal_type_bug, "Internal bug", {"type": "object", "properties": {}})
+        result = asyncio.run(registry.execute("buggy", {"x": 1}))
+        assert "执行失败" in result and "unsupported operand" not in result, result
+        print_pass("Internal TypeErrors are not misreported as argument errors")
 
     def test_unregister(self):
         registry = self.ToolRegistry()

@@ -58,6 +58,7 @@ from agent.quota_cleanup import (
     format_cleanup_prompt,
     resolve_targets,
 )
+from lib.errors import log_exception
 from lib.model_router import ModelRouter
 from lib.token_ledger import set_usage_context
 from tools.builtin_tools import (
@@ -2348,7 +2349,8 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
     except asyncio.TimeoutError:
         await _safe_send("抱歉，思考超时了。请尝试用更简单的方式提问~")
     except Exception as e:
-        await _safe_send(f"处理消息时出现错误: {str(e)}")
+        code = log_exception("agent message handling failed", e)
+        await _safe_send(f"处理消息时出现内部错误（诊断编号 {code}）。请稍后重试；若持续出现请用 #bug 反馈。")
 
 
 # ── Continuous Mode Handler ───────────────────────────────────────
@@ -2594,7 +2596,8 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, group_id))
         await _safe_send(f"抱歉，{_short}思考时间超过您的配额时长了。请尝试用更简单的方式提问~", matcher=continuous_router)
     except Exception as e:
-        await _safe_send(f"处理消息时出现错误: {str(e)}", matcher=continuous_router)
+        code = log_exception("continuous agent message handling failed", e)
+        await _safe_send(f"处理消息时出现内部错误（诊断编号 {code}）。请稍后重试；若持续出现请用 #bug 反馈。", matcher=continuous_router)
 
 
 async def _safe_send(message, max_retries: int = 2, matcher=None):
@@ -2963,9 +2966,8 @@ async def _handle_personality_command(text: str, user_id: str, event: MessageEve
     except ValueError as e:
         await _safe_send(str(e))
     except Exception as e:
-        from nonebot import logger
-        logger.error(f"Personality switch error: {e}")
-        await _safe_send(f"人格切换失败，请稍后重试。如果问题持续存在，请使用 #bug 反馈。")
+        code = log_exception("personality switch failed", e)
+        await _safe_send(f"人格切换失败（诊断编号 {code}），请稍后重试。如果问题持续存在，请使用 #bug 反馈。")
 
     return True
 
