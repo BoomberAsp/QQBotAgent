@@ -307,9 +307,12 @@ class Agent:
                     messages.append(tr)
 
                 # ── Detect repeated tool failures (anti-infinite-loop) ──
+                # "[Error]" covers registry-level failures (bad arguments,
+                # ToolError, unregistered tool) sanitized in tool_registry.
                 _error_prefixes = (
-                    "[Git Error]", "[Search", "[WebFetch", "[Code Error",
-                    "[Shell", "[Security", "[SSRF", "[PDF Error",
+                    "[Error]", "[Git Error]", "[Search", "[WebFetch",
+                    "[Code Error", "[Shell", "[Security", "[SSRF",
+                    "[PDF Error",
                 )
                 for tc in response["tool_calls"]:
                     tn = tc["function"]["name"]
