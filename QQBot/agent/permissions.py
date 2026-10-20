@@ -110,9 +110,12 @@ class PermissionManager:
         }
 
         # execute_code limits per role
+        # max_output capped at 16KB for all roles (Cache-Plan Phase6-B1):
+        # oversized stdout is re-paid at full price every in-run iteration
+        # and the model cannot digest 25K+ tokens of raw output anyway.
         self._code_limits: Dict[UserRole, CodeLimits] = {
-            UserRole.ADMIN: CodeLimits(max_timeout=60, max_output=100 * 1024, max_memory_mb=256),
-            UserRole.VIP: CodeLimits(max_timeout=15, max_output=50 * 1024, max_memory_mb=128),
+            UserRole.ADMIN: CodeLimits(max_timeout=60, max_output=16 * 1024, max_memory_mb=256),
+            UserRole.VIP: CodeLimits(max_timeout=15, max_output=16 * 1024, max_memory_mb=128),
         }
 
         # Resource quotas per role

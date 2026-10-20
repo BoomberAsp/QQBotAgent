@@ -1633,6 +1633,8 @@ class TestBuiltinTools:
         self.test_get_time()
         self.test_execute_code_success()
         self.test_execute_code_error()
+        self.test_execute_code_output_cap()
+        self.test_read_file_segmented()
         self.test_search_web()
 
     def test_get_time(self):
@@ -1662,6 +1664,56 @@ class TestBuiltinTools:
         result = asyncio.run(execute_code("1/0"))
         assert "ZeroDivisionError" in result or "Error" in result
         print_pass("execute_code handles runtime errors")
+
+    def test_execute_code_output_cap(self):
+        """Phase6-B1: 200KB stdout must be capped at 16KB with guidance."""
+        import asyncio
+        from tools.builtin_tools import execute_code, MAX_OUTPUT_SIZE
+
+        assert MAX_OUTPUT_SIZE == 16384, "MAX_OUTPUT_SIZE should be 16KB"
+        result = asyncio.run(execute_code("print('x' * 200000)"))
+        assert "已截断" in result
+        assert "聚合" in result, "truncation notice should guide toward aggregation"
+        assert len(result) < MAX_OUTPUT_SIZE + 2000, (
+            f"result should stay near the 16KB cap, got {len(result)}"
+        )
+        print_pass("execute_code caps output at 16KB with aggregation guidance")
+
+    def test_read_file_segmented(self):
+        """Phase6-B1: large text reads are segmented via offset with exact continuity."""
+        import asyncio
+        import os
+        from tools.builtin_tools import _get_workspace_root
+        from tools.file_tools import read_file
+
+        ws = _get_workspace_root()
+        os.makedirs(ws, exist_ok=True)
+        rel = "_test_segmented.txt"
+        path = os.path.join(ws, rel)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("".join(f"{i:07d}\n" for i in range(20000)))  # 160K chars
+        try:
+            sep = "─" * 40 + "\n\n"
+            raw = open(path, encoding="utf-8").read()
+
+            r1 = asyncio.run(read_file(rel))
+            assert "已截断" in r1 and "offset=50000" in r1, (
+                "first segment should advertise the next offset"
+            )
+            body1 = r1.split(sep, 1)[1]
+            assert body1 == raw[:50000]
+
+            r2 = asyncio.run(read_file(rel, offset=50000))
+            assert "分段读取" in r2 and "offset=100000" in r2
+            body2 = r2.split(sep, 1)[1]
+            assert body2 == raw[50000:100000], "segments must be byte-exact continuous"
+
+            # offset beyond EOF → empty body, no crash
+            r3 = asyncio.run(read_file(rel, offset=len(raw) + 10))
+            assert isinstance(r3, str) and r3
+            print_pass("read_file segmented reading (offset) is exact and continuous")
+        finally:
+            os.remove(path)
 
     def test_search_web(self):
         from tools.builtin_tools import search_web
