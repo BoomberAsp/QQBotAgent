@@ -2991,6 +2991,460 @@ class TestMemoryMigration:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── P0: Bond system / dual-plane routing tests ────────────────────
+
+class TestBondManager:
+    """Test agent/bond.py — EXP/level/mood settlement + rendering."""
+
+    def run(self):
+        print_header("16. Bond Manager Tests (P0)")
+        self.test_level_curve()
+        self.test_first_turn_settlement()
+        self.test_daily_first_only_once()
+        self.test_long_session_bonus_once()
+        self.test_mood_decay_to_baseline()
+        self.test_daily_soft_cap_diminishing()
+        self.test_format_status_and_prompt()
+        self.test_reset()
+        self.test_persistence_reload()
+
+    def _mgr(self, tmp):
+        from agent.bond import BondManager
+        return BondManager(
+            base_dir=os.path.join(tmp, "bonds"),
+            config_path=os.path.join(tmp, "no_such_config.json"),
+        )
+
+    def test_level_curve(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            assert m.level_for_exp(0) == 1
+            assert m.level_for_exp(99) == 1
+            assert m.level_for_exp(100) == 2
+            assert m.level_for_exp(7999) == 9
+            assert m.level_for_exp(8000) == 10
+            assert m.title_for(1) == "陌生"
+            assert m.title_for(10) == "灵魂伴侣"
+            nxt = m.next_threshold(1)
+            assert nxt["level"] == 2 and nxt["exp"] == 100
+            assert m.next_threshold(10) is None
+            assert m.current_threshold(2) == 100
+            print_pass("level curve / thresholds / titles")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_first_turn_settlement(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            r = m.settle_turn("u1", "rubi")
+            assert r["is_first_today"] is True
+            # first_chat(20) + mood-weighted per-msg(~3)
+            assert r["exp_gained"] >= 21, r
+            assert r["exp"] == r["exp_gained"]
+            assert r["level"] == 1
+            print_pass("first-turn settlement grants daily-first + per-msg EXP")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_daily_first_only_once(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            r1 = m.settle_turn("u1", "rubi")
+            r2 = m.settle_turn("u1", "rubi")
+            assert r1["is_first_today"] is True
+            assert r2["is_first_today"] is False
+            # second turn only earns per-msg (much less than first-turn bundle)
+            assert r2["exp_gained"] < r1["exp_gained"]
+            print_pass("daily-first EXP granted only once per day")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_long_session_bonus_once(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            m.settle_turn("u1", "rubi", turn_count=0)   # consume daily-first
+            r2 = m.settle_turn("u1", "rubi", turn_count=10)  # long-session bonus
+            r3 = m.settle_turn("u1", "rubi", turn_count=10)  # already earned
+            assert r2["exp_gained"] >= 30, r2
+            assert r3["exp_gained"] < 10, r3
+            print_pass("long-session bonus fires once per day")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_mood_decay_to_baseline(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            st = m.get_state("u1", "rubi")
+            now = time.time()
+            st["mood"] = 100.0
+            st["mood_updated"] = now - 3600  # 1h ago → decay 5
+            assert abs(m._decayed_mood(st, now) - 95.0) < 0.1
+            st["mood_updated"] = now - 48 * 3600  # clamps to baseline 60
+            assert abs(m._decayed_mood(st, now) - 60.0) < 0.01
+            st["mood"] = 0.0
+            st["mood_updated"] = now - 48 * 3600  # rises back to baseline
+            assert abs(m._decayed_mood(st, now) - 60.0) < 0.01
+            assert m._mood_label(90) == "极佳"
+            assert m._mood_label(20) == "低落"
+            print_pass("mood decays toward baseline both directions + labels")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_daily_soft_cap_diminishing(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            from datetime import datetime
+            m = self._mgr(tmp)
+            today = datetime.now().strftime("%Y-%m-%d")
+            # at soft cap → halved
+            st = m.get_state("u1", "rubi")
+            m._roll_daily(st, today)
+            st["daily"]["first_done"] = True
+            st["daily"]["chat_exp"] = 150
+            st["mood"] = 60.0
+            st["mood_updated"] = time.time()
+            r_cap = m.settle_turn("u1", "rubi")
+            # beyond 2× cap → quartered
+            st["daily"]["chat_exp"] = 300
+            st["mood"] = 60.0
+            st["mood_updated"] = time.time()
+            r_2cap = m.settle_turn("u1", "rubi")
+            assert r_cap["exp_gained"] <= 2, r_cap
+            assert r_2cap["exp_gained"] < r_cap["exp_gained"], (r_cap, r_2cap)
+            print_pass("daily soft-cap diminishing returns (halve → quarter)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_format_status_and_prompt(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            m.settle_turn("u1", "rubi")
+            status = m.format_status("u1", "rubi", display_name="露比")
+            assert "羁绊" in status and "露比" in status and "Lv" in status
+            prompt = m.build_prompt_context("u1", "rubi", char_short_name="露比")
+            assert "羁绊状态" in prompt
+            # unknown character (create=False) → first-meet copy
+            fresh = m.build_prompt_context("nobody", "nochar")
+            assert "刚刚开始" in fresh
+            print_pass("format_status + build_prompt_context rendering")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_reset(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            m.settle_turn("u1", "rubi")
+            assert m.get_state("u1", "rubi", create=False) is not None
+            m.reset("u1", "rubi")
+            assert m.get_state("u1", "rubi", create=False) is None
+            print_pass("reset clears one character's bond")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_persistence_reload(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            m.settle_turn("u1", "rubi")
+            exp1 = m.get_state("u1", "rubi")["exp"]
+            # A fresh manager (cold cache) must read the same value from disk
+            m2 = self._mgr(tmp)
+            exp2 = m2.get_state("u1", "rubi", create=False)["exp"]
+            assert exp1 == exp2 and exp1 > 0
+            print_pass("bond state persists to disk + reloads on cold cache")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestPersonalityMeta:
+    """Test personality card mode/task_voice metadata parsing."""
+
+    def run(self):
+        print_header("17. Personality Mode Metadata Tests (P0)")
+        self.test_mode_and_voice()
+
+    def test_mode_and_voice(self):
+        from agent.personality import PersonalityManager
+        tmp = tempfile.mkdtemp(prefix="pmeta_")
+        try:
+            pdir = os.path.join(tmp, "personalities")
+            os.makedirs(pdir, exist_ok=True)
+            cards = {
+                "assistant": "# 助手 Roxy\n\n没有元数据的普通卡片。",
+                "rubi": "# 露比 (Rubi)\n\n<!-- mode: split | task_voice: character -->\n\n角色内容。",
+                "tpl": "# 模板角色\n\n<!-- mode: split | task_voice: template -->\n\n内容。",
+            }
+            for key, body in cards.items():
+                with open(os.path.join(pdir, f"{key}.md"), "w", encoding="utf-8") as f:
+                    f.write(body)
+            pm = PersonalityManager(personalities_dir=pdir)
+            # defaults for a card without metadata
+            assert pm.get_mode("assistant") == "unified"
+            assert pm.get_task_voice("assistant") == "character"
+            # split + character voice
+            assert pm.get_mode("rubi") == "split"
+            assert pm.get_task_voice("rubi") == "character"
+            # split + template voice
+            assert pm.get_mode("tpl") == "split"
+            assert pm.get_task_voice("tpl") == "template"
+            print_pass("mode/task_voice parsed from card metadata (+ defaults)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestModelRouterClassify:
+    """Test ModelRouter.classify — dual-axis (plane + complexity) parsing."""
+
+    def run(self):
+        print_header("18. ModelRouter.classify Tests (P0)")
+        self.test_parsing_and_fallbacks()
+
+    def _router_with(self, response=None, raises=False):
+        from lib.model_router import ModelRouter
+        router = ModelRouter(config_path="/nonexistent/models.json")
+        client = AsyncMock()
+        if raises:
+            client.chat_completion = AsyncMock(side_effect=RuntimeError("boom"))
+        else:
+            client.chat_completion = AsyncMock(return_value=response)
+        router.get_client = MagicMock(return_value=client)
+        return router
+
+    def test_parsing_and_fallbacks(self):
+        # canonical two-axis
+        r = self._router_with("plane=social complexity=simple")
+        assert asyncio.run(r.classify("你好")) == {"plane": "social", "complexity": "simple"}
+        r = self._router_with("plane=task complexity=complex")
+        assert asyncio.run(r.classify("搜一下")) == {"plane": "task", "complexity": "complex"}
+        # colon + comma separators
+        r = self._router_with("plane: task, complexity: simple")
+        out = asyncio.run(r.classify("x"))
+        assert out["plane"] == "task" and out["complexity"] == "simple"
+        # plane present but complexity missing → default complex
+        r = self._router_with("plane=social")
+        out = asyncio.run(r.classify("x"))
+        assert out == {"plane": "social", "complexity": "complex"}
+        # legacy single-axis: complex → task plane
+        r = self._router_with("complex")
+        assert asyncio.run(r.classify("x")) == {"plane": "task", "complexity": "complex"}
+        # legacy single-axis: "complexity: simple" must NOT match \bcomplex\b
+        r = self._router_with("complexity: simple")
+        out = asyncio.run(r.classify("x"))
+        assert out == {"plane": "social", "complexity": "simple"}, out
+        # unparsable → safe fallback (task/complex)
+        r = self._router_with("hello world")
+        assert asyncio.run(r.classify("x")) == {"plane": "task", "complexity": "complex"}
+        # exception → safe fallback
+        r = self._router_with(raises=True)
+        assert asyncio.run(r.classify("x")) == {"plane": "task", "complexity": "complex"}
+        print_pass("classify parses plane+complexity, legacy & error fallbacks")
+
+
+class TestDelegation:
+    """Test agent/delegation.py — dual-plane task delegation + revoicing."""
+
+    def run(self):
+        print_header("19. Delegation / Dual-Plane Tests (P0)")
+        self.test_guards()
+        self.test_run_delegated_isolation()
+        self.test_revoice()
+        self.test_repatch()
+
+    def test_guards(self):
+        from agent.delegation import run_delegated_task
+        from agent.context import _delegate_depth
+        # missing user
+        r = asyncio.run(run_delegated_task(
+            "x", agent=None, model_router=None, perm_manager=None, user_id=""))
+        assert r.startswith("[Error]")
+        # empty task
+        r = asyncio.run(run_delegated_task(
+            "   ", agent=None, model_router=None, perm_manager=None, user_id="u1"))
+        assert "任务描述为空" in r
+        # nested delegate rejected
+        tok = _delegate_depth.set(1)
+        try:
+            r = asyncio.run(run_delegated_task(
+                "x", agent=None, model_router=None, perm_manager=None, user_id="u1"))
+            assert "嵌套" in r
+        finally:
+            _delegate_depth.reset(tok)
+        print_pass("delegation guards: no user / empty task / nested")
+
+    def test_run_delegated_isolation(self):
+        from agent.delegation import run_delegated_task
+        from agent.context import (
+            _current_personality, _current_bond_context, _delegate_depth,
+        )
+        captured = {}
+
+        class _MockAgent:
+            async def run(self, message, user_id, **kwargs):
+                captured["message"] = message
+                captured["kwargs"] = kwargs
+                captured["personality"] = _current_personality.get()
+                captured["bond"] = _current_bond_context.get()
+                captured["depth"] = _delegate_depth.get()
+                return "任务完成结果"
+
+        class _Role:
+            value = "vip"
+
+        class _MockPerm:
+            def get_role(self, uid):
+                return _Role()
+            def get_allowed_tools(self, role):
+                return {"web_search", "execute_code", "delegate_task"}
+
+        class _MockRouter:
+            flash_client = object()
+            reasoning_client = object()
+            async def classify_complexity(self, task):
+                return "simple"
+
+        p_tok = _current_personality.set("rubi")
+        b_tok = _current_bond_context.set("BONDCTX")
+        try:
+            r = asyncio.run(run_delegated_task(
+                "  do the thing  ",
+                agent=_MockAgent(), model_router=_MockRouter(),
+                perm_manager=_MockPerm(), user_id="u1",
+                disabled_tools={"execute_code"},
+            ))
+            assert r == "任务完成结果"
+            assert captured["message"] == "do the thing"  # stripped
+            kw = captured["kwargs"]
+            assert kw["persist"] is False
+            assert kw["session_type"] == "temporary"
+            assert "delegate_task" not in kw["allowed_tools"]
+            assert "execute_code" not in kw["allowed_tools"]
+            assert "web_search" in kw["allowed_tools"]
+            # task plane runs as neutral assistant, no bond, depth guard set
+            assert captured["personality"] == "assistant"
+            assert captured["bond"] == ""
+            assert captured["depth"] == 1
+            # contextvars restored after the delegated run
+            assert _current_personality.get() == "rubi"
+            assert _current_bond_context.get() == "BONDCTX"
+            assert _delegate_depth.get() == 0
+            print_pass("run_delegated_task isolation + contextvar restore")
+        finally:
+            _current_personality.reset(p_tok)
+            _current_bond_context.reset(b_tok)
+
+    def test_revoice(self):
+        from agent.delegation import revoice_task_result, template_opening
+
+        class _RVClient:
+            def __init__(self, resp):
+                self.resp = resp
+            async def chat_completion(self, message, history=None,
+                                      timeout_set=180.0, purpose="chat"):
+                return self.resp
+
+        # LLM success → opening + verbatim body
+        r = asyncio.run(revoice_task_result(
+            client=_RVClient("锵锵，结果来啦！"), persona_content="PERSONA",
+            short_name="露比", user_request="查天气", response="今天晴天",
+            use_llm=True))
+        assert r == "锵锵，结果来啦！\n\n今天晴天", r
+        # LLM error-prefix → template fallback, body preserved
+        r2 = asyncio.run(revoice_task_result(
+            client=_RVClient("思考超时了"), persona_content="P",
+            short_name="露比", user_request="q", response="BODY", use_llm=True))
+        assert r2.endswith("\n\nBODY")
+        assert "思考超时" not in r2.split("\n\n")[0]
+        # LLM output too long → template fallback
+        r3 = asyncio.run(revoice_task_result(
+            client=_RVClient("x" * 200), persona_content="P",
+            short_name="露比", user_request="q", response="B", use_llm=True))
+        assert r3.endswith("\n\nB") and len(r3.split("\n\n")[0]) <= 120
+        # use_llm=False → template (client ignored)
+        r4 = asyncio.run(revoice_task_result(
+            client=_RVClient("should not be used"), persona_content="P",
+            short_name="露比", user_request="q", response="B", use_llm=False))
+        assert r4.endswith("\n\nB")
+        # empty response → just the opening
+        r5 = asyncio.run(revoice_task_result(
+            client=None, persona_content="", short_name="露比",
+            user_request="q", response="", use_llm=False))
+        assert "露比" in r5
+        assert "露比" in template_opening("露比")
+        print_pass("revoice: LLM opening, template fallbacks, verbatim body")
+
+    def test_repatch(self):
+        from agent.delegation import repatch_last_assistant
+
+        class _Sess:
+            def __init__(self, ctx):
+                self.context = ctx
+
+        class _SM:
+            def __init__(self, sess):
+                self.sess = sess
+                self.updated = False
+            def get(self, uid):
+                return self.sess
+            def update(self, uid, sess):
+                self.updated = True
+
+        # verbatim match → replaced
+        sess = _Sess([{"role": "user", "content": "hi"},
+                      {"role": "assistant", "content": "RAW"}])
+        sm = _SM(sess)
+        assert repatch_last_assistant(sm, "u1", "RAW", "开场白\n\nRAW") is True
+        assert sess.context[-1]["content"] == "开场白\n\nRAW"
+        assert sm.updated is True
+        # non-match (already folded) → untouched
+        sess2 = _Sess([{"role": "assistant", "content": "COMPRESSED"}])
+        sm2 = _SM(sess2)
+        assert repatch_last_assistant(sm2, "u1", "RAW", "NEW") is False
+        assert sess2.context[-1]["content"] == "COMPRESSED"
+        # no session
+        class _SMNone:
+            def get(self, uid):
+                return None
+        assert repatch_last_assistant(_SMNone(), "u1", "a", "b") is False
+        print_pass("repatch_last_assistant verbatim-guard")
+
+
+class TestAgentPersist:
+    """Test Agent.run(persist=False) isolated execution (delegate_task plane)."""
+
+    def run(self):
+        print_header("20. Agent persist=False Isolation Tests (P0)")
+        asyncio.run(self.test_persist_flag())
+
+    async def test_persist_flag(self):
+        from agent.tool_registry import ToolRegistry
+        from agent.agent import Agent
+
+        mock_client = MockDeepSeekClient()
+        mock_client.plain_response = "隔离结果"
+        agent = Agent(
+            deepseek_client=mock_client,
+            tool_registry=ToolRegistry(),
+            config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+        )
+        # persist=False → detached session, nothing registered with the manager
+        resp = await agent.run("task", "iso_user", persist=False)
+        assert resp == "隔离结果"
+        assert agent.sessions.get("iso_user") is None
+        # persist=True (default) → session written back
+        resp2 = await agent.run("hello", "persist_user")
+        assert resp2 == "隔离结果"
+        sess = agent.sessions.get("persist_user")
+        assert sess is not None and len(sess.context) >= 2
+        print_pass("persist=False isolates session; persist=True writes back")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -3014,6 +3468,11 @@ def main():
         ("Personality Manager", TestPersonality()),
         ("TokenLedger", TestTokenLedger()),
         ("Cache Stability (Phase 3/4)", TestCacheStability()),
+        ("Bond Manager (P0)", TestBondManager()),
+        ("Personality Mode Metadata (P0)", TestPersonalityMeta()),
+        ("ModelRouter.classify (P0)", TestModelRouterClassify()),
+        ("Delegation / Dual-Plane (P0)", TestDelegation()),
+        ("Agent persist=False (P0)", TestAgentPersist()),
     ]
 
     passed = 0

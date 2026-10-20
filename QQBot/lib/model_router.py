@@ -12,6 +12,7 @@ or missing, all clients fall back to the default .env DeepSeek config.
 
 import json
 import os
+import re
 from typing import Dict, Optional
 
 from .deepseek_client import DeepSeekClient
@@ -185,6 +186,65 @@ class ModelRouter:
         except Exception:
             # Any error → complex (safety first)
             return "complex"
+
+    # ── Plane + Complexity Classification (Bond-System-Design.md §3.3) ──
+
+    async def classify(self, user_message: str) -> Dict[str, str]:
+        """Classify a message on two axes in ONE triage call.
+
+        Returns {"plane": "social"|"task", "complexity": "simple"|"complex"}:
+        - plane:      social = 闲聊/角色扮演/情感交流（角色面独立回答）;
+                      task   = 需要工具执行的任务（路由到任务面）
+        - complexity: 与 classify_complexity 相同语义
+
+        Used by the dual-plane router for split-mode personalities. Any error
+        or unparsable result falls back to {"task", "complex"} — the existing
+        full-capability path, so a triage failure never degrades task handling.
+        """
+        classify_prompt = self._task_routing.get(
+            "classify_prompt",
+            "请对下面的用户消息做两个判断，只回复一行，格式为 \"plane=xxx complexity=xxx\"。\n\n"
+            "1. plane（对话平面）:\n"
+            "- social: 闲聊、角色扮演、情感交流、问候感谢、关于你自身设定或状态的问题\n"
+            "- task: 需要搜索实时信息、执行代码、读写文件、查询数据、翻译文档等工具任务，"
+            "或需要多步推理的复杂问题\n"
+            "2. complexity（复杂度）:\n"
+            "- simple: 直接回答即可\n"
+            "- complex: 需要深度推理或多步工具调用\n\n"
+            "用户消息: {user_message}\n\n判断:",
+        )
+        prompt = classify_prompt.replace("{user_message}", user_message)
+        fallback = {"plane": "task", "complexity": "complex"}
+
+        try:
+            client = self.get_client("triage")
+            result = await client.chat_completion(
+                message=prompt,
+                timeout_set=30.0,
+                purpose="triage",
+            )
+            text = (result or "").strip().lower()
+
+            plane_m = re.search(r"plane\s*[=:：]\s*(social|task)", text)
+            comp_m = re.search(r"complexity\s*[=:：]\s*(simple|complex)", text)
+
+            if plane_m:
+                out = {
+                    "plane": plane_m.group(1),
+                    "complexity": comp_m.group(1) if comp_m else "complex",
+                }
+                return out
+
+            # 未解析出 plane —— 兼容旧式单轴回复（triage_prompt 被面板覆盖时）：
+            # complex → 任务面；simple → 角色面（误判由 delegate_task 兜底）。
+            # 词边界匹配，避免 "complexity" 误中 "complex"。
+            if re.search(r"\bcomplex\b", text):
+                return {"plane": "task", "complexity": "complex"}
+            if re.search(r"\bsimple\b", text):
+                return {"plane": "social", "complexity": "simple"}
+            return dict(fallback)
+        except Exception:
+            return dict(fallback)
 
     # ── Status ─────────────────────────────────────────────────────────
 

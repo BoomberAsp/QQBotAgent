@@ -189,6 +189,7 @@ class Agent:
         session_type: str = "temporary",
         allowed_tools: Optional[set] = None,
         user_role: Optional[str] = None,
+        persist: bool = True,
     ) -> str:
         """Process a user message through the agent loop.
 
@@ -200,18 +201,28 @@ class Agent:
             progress_callback: Optional async/sync callback to report
                                progress before each tool execution round.
             session_type: "temporary", "special", or "continuous".
+            persist: When False, runs in isolated mode (used by the
+                     delegate_task task plane, Bond-System-Design.md §3.5):
+                     a detached in-memory session with empty context — the
+                     run neither reads the user's conversation history nor
+                     writes back to it, and profile extraction is skipped.
 
         Returns:
             The agent's final response string.
         """
         # Determine which session to use
-        if session_type == "special" and self.special_sessions:
+        if persist and session_type == "special" and self.special_sessions:
             special_session = self.special_sessions.get_active(user_id)
         else:
             special_session = None
 
-        # Get or create temporary session (always — used as fallback)
-        session = self.sessions.get_or_create(user_id)
+        if persist:
+            # Get or create temporary session (always — used as fallback)
+            session = self.sessions.get_or_create(user_id)
+        else:
+            # Isolated run: detached in-memory session, never registered with
+            # the SessionManager, never persisted.
+            session = Session(user_id=user_id)
 
         # Build messages: system prompt + history + current message
         messages = self._build_messages(session, user_message, special_session, role_hint=user_role)
@@ -357,6 +368,12 @@ class Agent:
                 final_content = response.get("content", "")
                 reasoning = response.get("reasoning_content")
 
+                # Isolated run (delegate_task task plane): no session write,
+                # no TaskRecord folding, no profile extraction — the caller
+                # owns how the result is used and re-voiced.
+                if not persist:
+                    return final_content
+
                 # ── Persist to session (TaskRecord-aware) ────────
                 # Three modes:
                 #  1. Explicit finalize_subtask → fold the task's setup turns and
@@ -452,6 +469,7 @@ class Agent:
         """
         from agent.context import (
             _current_personality, _personality_transition, _current_group_context,
+            _current_bond_context,
         )
         from agent.personality import get_personality_manager
 
@@ -518,6 +536,14 @@ class Agent:
         transition_note = _personality_transition.get()
         if transition_note:
             volatile.append(transition_note)
+
+        # Character-plane bond state (level/title/mood/companionship stats).
+        # Split personalities only, rebuilt per turn by agent_router — lives
+        # in the L4 volatile tail, never in the cached L0-L2 prefix
+        # (Bond-System-Design.md §6).
+        bond_ctx = _current_bond_context.get()
+        if bond_ctx:
+            volatile.append(bond_ctx)
 
         # Special session marker (message count changes every turn)
         if special_session:

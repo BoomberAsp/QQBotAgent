@@ -37,7 +37,12 @@ from agent.context import (
     _current_user_id, _current_group_id,
     _current_group_context, _current_personality,
     _personality_transition, _on_file_created, _current_quota_bytes,
-    _pending_task_fold,
+    _pending_task_fold, _current_bond_context, _delegate_depth,
+)
+from agent.bond import BondManager
+from agent.delegation import (
+    SOCIAL_TOOLS, run_delegated_task, revoice_task_result, repatch_last_assistant,
+    _LLM_ERROR_PREFIXES,
 )
 from agent.task_record import build_record, build_compact_line, append_task_log
 from agent.search_archive import get_default_archive
@@ -610,13 +615,18 @@ def _build_tool_registry() -> ToolRegistry:
     registry.register(
         "read_file", read_file,
         "读取用户上传的文件内容。支持文本文件（代码、日志、配置等）、PDF文件、图片和语音/音频消息。"
-        "文本和PDF返回文字内容，图片返回基础信息+AI分析，音频返回元数据+AI转录和情绪分析（需配置音频模型）。",
+        "文本和PDF返回文字内容，图片返回基础信息+AI分析，音频返回元数据+AI转录和情绪分析（需配置音频模型）。"
+        "大文本文件单次最多返回 50K 字符，截断时会提示下一段的 offset，可分段续读。",
         {
             "type": "object",
             "properties": {
                 "file_path": {
                     "type": "string",
                     "description": "文件路径。用户上传的文件会自动保存到 data/workspace/uploads/ 目录。",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "（可选）分段读取的字符偏移量，仅对文本文件生效。上次读取被截断时，按截断提示传入对应 offset 继续读下一段；不传默认从头读。",
                 },
             },
             "required": ["file_path"],
@@ -995,6 +1005,61 @@ def _build_tool_registry() -> ToolRegistry:
         },
     )
 
+    # ── 双平面路由: 角色面兜底委托工具（Bond-System-Design.md §3.3）──
+    # 只在角色面（split 人格 + social 平面）的 allowed_tools 中出现；
+    # 任务面/统一人格的 allowed_tools 不含它 —— schema 过滤 + agent 内
+    # _execute_tool_calls 硬拒绝 + delegation 内 _delegate_depth 守卫，
+    # 三层防线确保单层嵌套、任务面无法再委派。
+    async def _delegate_task_tool(task: str) -> str:
+        user_id = _current_user_id.get()
+        group_id = _current_group_id.get()
+        disabled: set = set()
+        if group_id:
+            try:
+                gf = get_group_features()
+                gf.refresh()
+                disabled = gf.get_disabled_tools(group_id)
+            except Exception:
+                disabled = set()
+
+        async def _inner_progress(msg: str):
+            cb = _send_msg.get()
+            if cb is not None:
+                ret = cb(msg)
+                if asyncio.iscoroutine(ret):
+                    await ret
+
+        return await run_delegated_task(
+            task,
+            agent=agent,
+            model_router=_model_router,
+            perm_manager=_perm_manager,
+            user_id=user_id,
+            group_id=group_id,
+            disabled_tools=disabled,
+            progress_callback=_inner_progress,
+        )
+
+    registry.register(
+        "delegate_task", _delegate_task_tool,
+        "把需要工具能力的任务（搜索实时信息、抓取网页、执行代码、读写文件、"
+        "查询数据、翻译等）委托给任务智能体执行，并返回其结果。"
+        "凡用户请求涉及实时信息、计算、代码、文件操作，必须调用此工具获取结果，"
+        "再以你自己的口吻转达给用户；绝不能凭记忆编造此类内容。"
+        "注意：任务智能体看不到你们的对话历史，task 描述必须自包含全部必要上下文"
+        "（用户原话、相关文件路径、前情摘要等）。",
+        {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "交给任务智能体的完整任务描述，必须自包含所有必要上下文",
+                },
+            },
+            "required": ["task"],
+        },
+    )
+
     return registry
 
 
@@ -1090,6 +1155,12 @@ agent = Agent(
 _continuous_sessions = ContinuousSessionManager(timeout_minutes=1.5)
 
 _perm_manager = PermissionManager()
+
+# ── Bond System（Bond-System-Design.md §4，P0）─────────────────────
+# 好感/心情/陪伴统计核心。data/bonds/{user_id}.json 持久化，
+# mtime 校验缓存（外部写入优先，同 ProfileManager 纪律）。
+# 结算钩子在回复成功发送后调用；仅 split 模式人格参与。
+_bond_manager = BondManager(base_dir=os.path.join(_DATA_DIR, "bonds"))
 
 
 # ── Config hot-reload watcher ──────────────────────────────────────
@@ -2159,6 +2230,10 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         cmd_handled = await _handle_personality_command(text_content, user_id, event)
         if cmd_handled:
             return
+        # /好感度 #好感度 /bond command (direct, no agent, zero token)
+        cmd_handled = await _handle_bond_command(text_content, user_id, event)
+        if cmd_handled:
+            return
         cmd_handled = await _handle_session_command(text_content, user_id)
         if cmd_handled:
             return
@@ -2288,10 +2363,24 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         pass
 
     try:
-        # ── Triage: classify complexity and route to appropriate model ──
+        # ── Dual-plane routing: resolve persona & its mode first ──
+        # split persona → each message is triaged to social (角色面) or task
+        # (任务面) plane; unified persona → single plane (existing behavior).
+        group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+        pm = get_personality_manager()
+        persona_key = pm.resolve_effective_personality(user_id, group_id)
+        persona_mode = pm.get_mode(persona_key)
+
+        # ── Triage: classify complexity (and plane, for split personas) ──
         is_special = augmented_message in ["/clear", "清除上下文", "新对话", "/status"]
+        plane = "task"
         if not is_special:
-            complexity = await _model_router.classify_complexity(augmented_message)
+            if persona_mode == "split":
+                _cls = await _model_router.classify(augmented_message)
+                plane = _cls.get("plane", "task")
+                complexity = _cls.get("complexity", "complex")
+            else:
+                complexity = await _model_router.classify_complexity(augmented_message)
             if complexity == "simple":
                 client = _model_router.flash_client
             else:
@@ -2316,7 +2405,6 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         code_limits = _perm_manager.get_code_limits(role)
 
         # Resolve group feature restrictions
-        group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
         if group_id:
             gf = get_group_features()
             gf.refresh()
@@ -2348,9 +2436,29 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         if code_limits:
             _current_code_limits.set(code_limits.to_dict())
 
-        # Set personality contextvar
-        pm = get_personality_manager()
-        _current_personality.set(pm.resolve_effective_personality(user_id, group_id))
+        # ── Plane context (Bond-System-Design.md §3) ──
+        # character_plane: split persona routed to social → L2 = 角色卡,
+        #   tools = SOCIAL_TOOLS only (delegate_task fallback), bond state
+        #   injected into the L4 volatile tail.
+        # Otherwise (split→task plane, or unified persona): L2 = neutral
+        #   "assistant" for split task plane (globally-shared cache prefix),
+        #   or the full persona for unified; no bond injection.
+        character_plane = (persona_mode == "split" and plane == "social")
+        if character_plane:
+            client = _model_router.flash_client
+            allowed_tools = set(SOCIAL_TOOLS)
+            _current_personality.set(persona_key)
+            _current_bond_context.set(
+                _bond_manager.build_prompt_context(
+                    user_id, persona_key, pm.get_short_name(persona_key)
+                )
+            )
+        else:
+            _current_bond_context.set("")
+            _current_personality.set(
+                "assistant" if persona_mode == "split" else persona_key
+            )
+        _delegate_depth.set(0)
         _personality_transition.set(_personality_switch_marker.get(user_id, ""))
 
         # Idea 3 — suggest upgrading a long temporary session to a special session.
@@ -2381,8 +2489,40 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         finally:
             _send_msg.reset(token)
 
+        # ── Revoicing layer (Bond-System-Design.md §3.3) ──
+        # Only the split persona's *task plane* output needs re-voicing: the
+        # task agent answered as neutral Roxy, so wrap its result in the
+        # character's voice (opening line) while passing the body verbatim.
+        # The social plane already speaks in character; unified personas are
+        # never re-voiced.
+        if persona_mode == "split" and not character_plane:
+            # Restore persona so _send_response's disclaimer is signed by the
+            # character and revoice speaks in the character's voice.
+            _current_personality.set(persona_key)
+            _use_llm_voice = (
+                not group_id and pm.get_task_voice(persona_key) == "character"
+            )
+            raw_response = response
+            response = await revoice_task_result(
+                client=_model_router.flash_client,
+                persona_content=pm.load(persona_key) or "",
+                short_name=pm.get_short_name(persona_key),
+                user_request=text_content or augmented_message,
+                response=response,
+                use_llm=_use_llm_voice,
+            )
+            # Best-effort: rewrite the persisted assistant turn so stored
+            # session history reads in the character's voice (verbatim-match
+            # guard inside skips it if the turn was already folded/compressed).
+            if session_type == "temporary":
+                repatch_last_assistant(_session_manager, user_id, raw_response, response)
+
         # Send response (split long messages)
         await _send_response(response)
+
+        # ── Bond settlement hook (both planes accrue 好感度) ──
+        if persona_mode == "split":
+            await _settle_bond_turn(user_id, persona_key)
 
         # Auto-name special session after first interaction
         if session_type == "special" and _pending_naming.pop(user_id, False):
@@ -2457,6 +2597,10 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
     if text_content in ["/取消", "#取消", "/结束", "#结束"]:
         _continuous_sessions.end(group_id, user_id)
         await _safe_send("已结束连续对话模式，之后需要@我才能触发~", matcher=continuous_router)
+        return
+
+    # /好感度 #好感度 /bond (direct, no agent, zero token)
+    if await _handle_bond_command(text_content, user_id, event, matcher=continuous_router):
         return
 
     # ── Handle pending delete confirmation (intercept before agent) ──
@@ -2581,8 +2725,18 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         augmented_message = f"{continuous_prefix}\n用户说: {text_content}"
 
     try:
-        # Triage and route
-        complexity = await _model_router.classify_complexity(augmented_message)
+        # ── Dual-plane routing (Bond-System-Design.md §3) ──
+        pm = get_personality_manager()
+        persona_key = pm.resolve_effective_personality(user_id, group_id)
+        persona_mode = pm.get_mode(persona_key)
+
+        plane = "task"
+        if persona_mode == "split":
+            _cls = await _model_router.classify(augmented_message)
+            plane = _cls.get("plane", "task")
+            complexity = _cls.get("complexity", "complex")
+        else:
+            complexity = await _model_router.classify_complexity(augmented_message)
         if complexity == "simple":
             client = _model_router.flash_client
         else:
@@ -2605,12 +2759,8 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             if code_limits:
                 _current_code_limits.set(code_limits.to_dict())
 
-            # Set personality contextvar
-            pm = get_personality_manager()
-            _current_personality.set(pm.resolve_effective_personality(user_id, group_id))
-            _personality_transition.set(_personality_switch_marker.get(user_id, ""))
-
-            # Resolve group feature restrictions
+            # Resolve group feature restrictions (BEFORE plane context so the
+            # role-tool subtraction lands on the task plane's allowed set)
             gf = get_group_features()
             gf.refresh()
             disabled_tools = gf.get_disabled_tools(group_id)
@@ -2631,6 +2781,26 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
                     f"{augmented_message}"
                 )
 
+            # ── Plane context ──
+            character_plane = (persona_mode == "split" and plane == "social")
+            if character_plane:
+                client = _model_router.flash_client
+                # Social plane keeps only delegate_task (+ window control).
+                allowed_tools = set(SOCIAL_TOOLS) | {"end_continuous_mode"}
+                _current_personality.set(persona_key)
+                _current_bond_context.set(
+                    _bond_manager.build_prompt_context(
+                        user_id, persona_key, pm.get_short_name(persona_key)
+                    )
+                )
+            else:
+                _current_bond_context.set("")
+                _current_personality.set(
+                    "assistant" if persona_mode == "split" else persona_key
+                )
+            _delegate_depth.set(0)
+            _personality_transition.set(_personality_switch_marker.get(user_id, ""))
+
             response = await asyncio.wait_for(
                 agent.run(augmented_message, user_id, client=client,
                            progress_callback=lambda msg: _safe_send(msg, matcher=continuous_router),
@@ -2641,7 +2811,25 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         finally:
             _send_msg.reset(token)
 
+        # ── Revoicing layer (task plane of split persona; group → template) ──
+        if persona_mode == "split" and not character_plane:
+            _current_personality.set(persona_key)
+            raw_response = response
+            response = await revoice_task_result(
+                client=_model_router.flash_client,
+                persona_content=pm.load(persona_key) or "",
+                short_name=pm.get_short_name(persona_key),
+                user_request=text_content or augmented_message,
+                response=response,
+                use_llm=False,
+            )
+            repatch_last_assistant(_session_manager, user_id, raw_response, response)
+
         await _send_response(response, matcher=continuous_router)
+
+        # ── Bond settlement hook ──
+        if persona_mode == "split":
+            await _settle_bond_turn(user_id, persona_key, matcher=continuous_router)
 
     except asyncio.TimeoutError:
         _pm = get_personality_manager()
@@ -3021,6 +3209,91 @@ async def _handle_personality_command(text: str, user_id: str, event: MessageEve
         code = log_exception("personality switch failed", e)
         await _safe_send(f"人格切换失败（诊断编号 {code}），请稍后重试。如果问题持续存在，请使用 #bug 反馈。")
 
+    return True
+
+
+# ── Bond system helpers (Bond-System-Design.md §3-4) ──────────────
+
+async def _settle_bond_turn(user_id: str, persona_key: str, matcher=None):
+    """好感结算钩子：split 人格每轮对话结束后累计 EXP/心情，升级时发庆祝。
+
+    结算失败必须静默——它是增益功能，绝不能因抛错中断已生成回复的发送。
+    turn_count 用于「长聊奖励」（≥long_session_turns 当日一次性加成）。
+    """
+    try:
+        try:
+            turn_count = _session_manager.message_count(user_id) // 2
+        except Exception:
+            turn_count = 0
+        result = _bond_manager.settle_turn(user_id, persona_key, turn_count=turn_count)
+        for up in result.get("level_ups", []):
+            await _send_level_up_notice(user_id, persona_key, up, matcher=matcher)
+    except Exception as e:
+        log_exception("bond settlement failed", e)
+
+
+async def _send_level_up_notice(user_id: str, persona_key: str, up: dict, matcher=None):
+    """羁绊升级庆祝：角色口吻一句话（flash）+ 等级提示；LLM 失败降级固定文案。"""
+    pm = get_personality_manager()
+    short = pm.get_short_name(persona_key)
+    fallback = f"✨ 你与 {short} 的羁绊达到了 Lv{up['level']}（{up['title']}）！"
+    opening = None
+    try:
+        persona_content = pm.load(persona_key) or ""
+        if persona_content:
+            system = (
+                persona_content
+                + "\n\n---\n你正在扮演上述角色。你与用户的羁绊刚刚提升到了新的等级，"
+                  "请写一句符合角色性格的简短庆祝/感慨，表达你们的关系更近了一步。"
+            )
+            prompt = (
+                f"羁绊提升到了 Lv{up['level']}（{up['title']}）。"
+                f"请以角色口吻写一句话庆祝。要求：不超过60字；不使用markdown；只输出这句话本身。"
+            )
+            raw = await _model_router.flash_client.chat_completion(
+                message=prompt,
+                history=[{"role": "system", "content": system}],
+                timeout_set=15.0,
+                purpose="bond_levelup",
+            )
+            candidate = (raw or "").strip()
+            if (
+                candidate
+                and not candidate.startswith(_LLM_ERROR_PREFIXES)
+                and len(candidate) <= 120
+                and "\n" not in candidate
+            ):
+                opening = candidate
+    except Exception:
+        opening = None
+    if opening:
+        await _safe_send(f"{opening}\n\n{fallback}", matcher=matcher)
+    else:
+        await _safe_send(fallback, matcher=matcher)
+
+
+async def _handle_bond_command(
+    text: str, user_id: str, event: MessageEvent, matcher=None
+) -> bool:
+    """Handle /好感度 #好感度 /bond — 直接展示当前角色羁绊状态，零 token。"""
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/好感度", "#好感度", "/bond"):
+        return False
+    pm = get_personality_manager()
+    group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+    persona_key = pm.resolve_effective_personality(user_id, group_id)
+    display = pm.get_display_name(persona_key)
+    if pm.get_mode(persona_key) != "split":
+        await _safe_send(
+            f"当前人格「{display}」未启用羁绊养成。\n"
+            f"用 /人格切换 切换到支持养成的角色后再查询好感度哦~",
+            matcher=matcher,
+        )
+        return True
+    await _safe_send(
+        _bond_manager.format_status(user_id, persona_key, display_name=display),
+        matcher=matcher,
+    )
     return True
 
 
