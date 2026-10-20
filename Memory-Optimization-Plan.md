@@ -156,11 +156,23 @@ persona 事实清单（每类 3-5 条）：
 QQBot/benchmarks/memory/
 ├── scenarios/        # L1 JSON 场景流
 ├── personas/         # L2 persona 卡 + fact sheet（带类别标签）
-├── bench_engine.py   # L1 runner（零依赖，挂 test.sh）
+├── bench_engine.py   # L1 runner（零依赖，挂 test.sh；报告/基线/对比已并入，
+│                     #   不再单设 report.py——L1 报告逻辑 ~100 行不值得独立模块）
 ├── bench_pipeline.py # L2 runner（需 BENCH_API_KEY，env 门控）
-├── report.py         # 指标 → markdown 表 + JSON
 └── baselines/        # 基线快照进 git，对比模式出回归表
 ```
+
+> **批次 0 L1 实施记录（2026-10-20）**：7 场景（survival_curve / short_capacity /
+> medium_capacity / episodic_canary / long_reachability / injection_stability /
+> persistence_roundtrip）。场景 JSON 支持 loop 宏 + `{expr}` 安全求值（ast，无 eval）、
+> track 存活曲线采样、probe 搅动率采样、save/reload 持久化步骤；旧引擎缺失 API 以
+> `api_missing` 如实 FAIL（worktree@0c6e39b 复跑即"优化前"基线）。
+> **基线答案**：Q1 = 3 次提及晋升（cycle 3）、age>30 于 cycle 35 降级、普通流量下
+> cycle 85 彻底不可达（1 抽取批次≈5 轮对话 → 降级≈175 轮、消失≈425 轮）；
+> Q2 = 一次性事件 cycle 51 被 SHORT 容量淘汰，存活率 0（CANARY-FAIL 如实记录，⑤ 的回归门）；
+> Q3 = churn mean 3.1% 字节/轮、68% 的轮次注入块有字节变化（⑥ 的基线数字）。
+> 批次 1 前后对比：long_reachability、persistence_roundtrip FAIL→PASS（IMPROVED），
+> 其余动力学数字逐项一致（批次 1 未扰动晋升/降级/容量行为），回归 0。
 
 - **基线先行**：任何记忆架构改动动手前跑 L1+L2 存基线，改完跑对比——与 Cache-Hit-Rate-Plan 阶段 2 同一套方法论，共享 prefix-hash 与 TokenLedger 基础设施；
   ⚠️ 实际执行偏离（用户 2026-10-20 决定）：批次 1（①②⑦⑧）先于 benchmark 实施，以单测代偿验证；批次 0 建基线时需**额外回补**"优化后 vs 优化前"的对照口径（旧行为可由 git 历史复现）；

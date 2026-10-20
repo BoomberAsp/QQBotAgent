@@ -1,0 +1,23 @@
+{
+  "id": "long_reachability",
+  "title": "LONG 可达性（① 回归门）：twin 降级+淘汰后，LONG 副本仍可经索引与 recall 读到；旧引擎应如实 FAIL(api_missing)",
+  "kind": "gate",
+  "user": "bench_longreach",
+  "steps": [
+    {"track": "钟离"},
+    {"ingest": [["用户是原神活跃玩家，主玩钟离", "new", null]], "repeat": 11,
+     "snapshot_turns": [["我玩原神，主玩钟离", "钟离很稳"]]},
+    {"checkpoint": {"desc": "count>10 创建 LONG（twin 保留，活跃层为 MEDIUM）", "long_count": {"gte": 1}}},
+    {"checkpoint": {"desc": "twin 仍在 MEDIUM", "tier_of": {"find": "钟离", "equals": "medium"}}},
+    {"tick": 30},
+    {"ingest": [["清扫触发1号", "new", null]]},
+    {"checkpoint": {"desc": "age>30 twin 降级回 SHORT", "tier_of": {"find": "钟离", "equals": "short"}}},
+    {"loop": {"var": "n", "from": 1, "to": 55, "body": [
+      {"ingest": [["长期压力填充{n}号", "new", null]]}
+    ]}},
+    {"checkpoint": {"desc": "SHORT 淘汰后 twin 消失——只剩 LONG 副本（twin 漏洞触发点）", "tier_of": {"find": "钟离", "equals": "long"}}},
+    {"checkpoint": {"desc": "① 索引注入：LONG 条目标题可见", "long_index_contains": "原神"}},
+    {"checkpoint": {"desc": "① recall：关键词命中 LONG 全文", "recall": {"query": "钟离", "expect_hits": 1, "contains": "原神"}}},
+    {"checkpoint": {"desc": "① recall：标题子串命中", "recall": {"query": "用户是原神活跃玩家", "expect_hits": 1}}}
+  ]
+}

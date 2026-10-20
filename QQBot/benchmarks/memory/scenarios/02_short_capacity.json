@@ -1,0 +1,16 @@
+{
+  "id": "short_capacity",
+  "title": "容量压力：SHORT 灌满 50，尾部（最旧）先淘汰",
+  "kind": "gate",
+  "user": "bench_shortcap",
+  "steps": [
+    {"loop": {"var": "n", "from": 1, "to": 60, "body": [
+      {"ingest": [["短期事实{n}号", "new", null]], "tick": 0}
+    ]}},
+    {"checkpoint": {"desc": "SHORT 封顶 50", "short_count": 50}},
+    {"checkpoint": {"desc": "最先插入的 1 号已从尾部淘汰", "tier_of": {"find": "短期事实1号", "equals": "gone"}}},
+    {"checkpoint": {"desc": "前 10 条（60-50）均淘汰", "tier_of": {"find": "短期事实10号", "equals": "gone"}}},
+    {"checkpoint": {"desc": "11 号是最旧存活者（边界）", "tier_of": {"find": "短期事实11号", "equals": "short"}}},
+    {"checkpoint": {"desc": "最新 60 号存活", "tier_of": {"find": "短期事实60号", "equals": "short"}}}
+  ]
+}

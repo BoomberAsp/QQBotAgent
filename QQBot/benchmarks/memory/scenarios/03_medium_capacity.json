@@ -1,0 +1,17 @@
+{
+  "id": "medium_capacity",
+  "title": "容量压力：MEDIUM 灌满 60，MEDIUM_MAX 安全网按最高 age 优先降级",
+  "kind": "gate",
+  "user": "bench_medcap",
+  "steps": [
+    {"loop": {"var": "n", "from": 1, "to": 65, "body": [
+      {"ingest": [["中期事实{n}号", "new", null]], "repeat": 3, "tick": 0}
+    ]}},
+    {"checkpoint": {"desc": "MEDIUM 封顶 60（65 晋升 → 5 条被安全网降级）", "medium_count": 60}},
+    {"checkpoint": {"desc": "最旧 1 号被降级回 SHORT（age 并列时按插入序）", "tier_of": {"find": "中期事实1号", "equals": "short"}}},
+    {"checkpoint": {"desc": "5 号是最后被降级的", "tier_of": {"find": "中期事实5号", "equals": "short"}}},
+    {"checkpoint": {"desc": "6 号是最旧存活 MEDIUM（边界）", "tier_of": {"find": "中期事实6号", "equals": "medium"}}},
+    {"checkpoint": {"desc": "最新 65 号存活", "tier_of": {"find": "中期事实65号", "equals": "medium"}}},
+    {"checkpoint": {"desc": "降级者落回 SHORT（count 重置由单测覆盖）", "short_count": 5}}
+  ]
+}

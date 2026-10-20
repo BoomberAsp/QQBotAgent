@@ -1,0 +1,400 @@
+{
+ "meta": {
+  "engine_commit": "fc933f1",
+  "ts": "2026-10-20 22:34:09",
+  "python": "3.12.3",
+  "schema_version": 1
+ },
+ "results": [
+  {
+   "id": "survival_curve",
+   "title": "Q1 低频关键事实存活曲线：晋升→老化降级→SHORT 淘汰全链路",
+   "kind": "metric",
+   "status": "PASS",
+   "checkpoints": [
+    {
+     "desc": "3 次强化后晋升 MEDIUM",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('跑步')=medium, want ['medium']"
+    },
+    {
+     "desc": "age≈11 仍为 MEDIUM（阈值 30）",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('跑步')=medium, want ['medium']"
+    },
+    {
+     "desc": "age>30 的下次 ingest 清扫降级回 SHORT",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('跑步')=short, want ['short']"
+    },
+    {
+     "desc": "SHORT 容量压力淘汰后彻底消失（Q1 曲线终点）",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('跑步')=gone, want ['gone']"
+    }
+   ],
+   "metrics": {
+    "tracked": {
+     "跑步": {
+      "never_observed": false,
+      "transitions": [
+       {
+        "cycle": 0,
+        "tier": "gone"
+       },
+       {
+        "cycle": 1,
+        "tier": "short"
+       },
+       {
+        "cycle": 3,
+        "tier": "medium"
+       },
+       {
+        "cycle": 35,
+        "tier": "short"
+       },
+       {
+        "cycle": 85,
+        "tier": "gone"
+       }
+      ],
+      "final_tier": "gone",
+      "promoted_at_cycle": 3,
+      "demoted_at_cycle": 35,
+      "gone_at_cycle": 85,
+      "survived_cycles": 85
+     }
+    },
+    "total_cycles": 95
+   }
+  },
+  {
+   "id": "short_capacity",
+   "title": "容量压力：SHORT 灌满 50，尾部（最旧）先淘汰",
+   "kind": "gate",
+   "status": "PASS",
+   "checkpoints": [
+    {
+     "desc": "SHORT 封顶 50",
+     "assert": "short_count",
+     "ok": true,
+     "reason": "short_count=50, want 50"
+    },
+    {
+     "desc": "最先插入的 1 号已从尾部淘汰",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('短期事实1号')=gone, want ['gone']"
+    },
+    {
+     "desc": "前 10 条（60-50）均淘汰",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('短期事实10号')=gone, want ['gone']"
+    },
+    {
+     "desc": "11 号是最旧存活者（边界）",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('短期事实11号')=short, want ['short']"
+    },
+    {
+     "desc": "最新 60 号存活",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('短期事实60号')=short, want ['short']"
+    }
+   ],
+   "metrics": {
+    "total_cycles": 60
+   }
+  },
+  {
+   "id": "medium_capacity",
+   "title": "容量压力：MEDIUM 灌满 60，MEDIUM_MAX 安全网按最高 age 优先降级",
+   "kind": "gate",
+   "status": "PASS",
+   "checkpoints": [
+    {
+     "desc": "MEDIUM 封顶 60（65 晋升 → 5 条被安全网降级）",
+     "assert": "medium_count",
+     "ok": true,
+     "reason": "medium_count=60, want 60"
+    },
+    {
+     "desc": "最旧 1 号被降级回 SHORT（age 并列时按插入序）",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('中期事实1号')=short, want ['short']"
+    },
+    {
+     "desc": "5 号是最后被降级的",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('中期事实5号')=short, want ['short']"
+    },
+    {
+     "desc": "6 号是最旧存活 MEDIUM（边界）",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('中期事实6号')=medium, want ['medium']"
+    },
+    {
+     "desc": "最新 65 号存活",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('中期事实65号')=medium, want ['medium']"
+    },
+    {
+     "desc": "降级者落回 SHORT（count 重置由单测覆盖）",
+     "assert": "short_count",
+     "ok": true,
+     "reason": "short_count=5, want 5"
+    }
+   ],
+   "metrics": {
+    "total_cycles": 195
+   }
+  },
+  {
+   "id": "episodic_canary",
+   "title": "Q2 一次性事件存活率（预期当前 CANARY-FAIL：频率驱动晋升救不了单次事件，⑤ 的回归门）",
+   "kind": "canary",
+   "status": "CANARY_FAIL",
+   "checkpoints": [
+    {
+     "desc": "期望：一次性重要事件在 60 周期普通流量后仍可达（当前引擎做不到）",
+     "assert": "tier_of",
+     "ok": false,
+     "reason": "tier_of('吵架')=gone, want ['short', 'medium', 'long']"
+    }
+   ],
+   "metrics": {
+    "tracked": {
+     "吵架": {
+      "never_observed": false,
+      "transitions": [
+       {
+        "cycle": 0,
+        "tier": "gone"
+       },
+       {
+        "cycle": 1,
+        "tier": "short"
+       },
+       {
+        "cycle": 51,
+        "tier": "gone"
+       }
+      ],
+      "final_tier": "gone",
+      "promoted_at_cycle": null,
+      "demoted_at_cycle": 1,
+      "gone_at_cycle": 51,
+      "survived_cycles": 51
+     }
+    },
+    "total_cycles": 61
+   }
+  },
+  {
+   "id": "long_reachability",
+   "title": "LONG 可达性（① 回归门）：twin 降级+淘汰后，LONG 副本仍可经索引与 recall 读到；旧引擎应如实 FAIL(api_missing)",
+   "kind": "gate",
+   "status": "PASS",
+   "checkpoints": [
+    {
+     "desc": "count>10 创建 LONG（twin 保留，活跃层为 MEDIUM）",
+     "assert": "long_count",
+     "ok": true,
+     "reason": "long_count=1, want {'gte': 1}"
+    },
+    {
+     "desc": "twin 仍在 MEDIUM",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('钟离')=medium, want ['medium']"
+    },
+    {
+     "desc": "age>30 twin 降级回 SHORT",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('钟离')=short, want ['short']"
+    },
+    {
+     "desc": "SHORT 淘汰后 twin 消失——只剩 LONG 副本（twin 漏洞触发点）",
+     "assert": "tier_of",
+     "ok": true,
+     "reason": "tier_of('钟离')=long, want ['long']"
+    },
+    {
+     "desc": "① 索引注入：LONG 条目标题可见",
+     "assert": "long_index_contains",
+     "ok": true,
+     "reason": ""
+    },
+    {
+     "desc": "① recall：关键词命中 LONG 全文",
+     "assert": "recall",
+     "ok": true,
+     "reason": ""
+    },
+    {
+     "desc": "① recall：标题子串命中",
+     "assert": "recall",
+     "ok": true,
+     "reason": ""
+    }
+   ],
+   "metrics": {
+    "tracked": {
+     "钟离": {
+      "never_observed": false,
+      "transitions": [
+       {
+        "cycle": 0,
+        "tier": "gone"
+       },
+       {
+        "cycle": 1,
+        "tier": "short"
+       },
+       {
+        "cycle": 3,
+        "tier": "medium"
+       },
+       {
+        "cycle": 42,
+        "tier": "short"
+       },
+       {
+        "cycle": 92,
+        "tier": "long"
+       }
+      ],
+      "final_tier": "long",
+      "promoted_at_cycle": 3,
+      "demoted_at_cycle": 42,
+      "gone_at_cycle": null,
+      "survived_cycles": 97
+     }
+    },
+    "total_cycles": 97
+   }
+  },
+  {
+   "id": "injection_stability",
+   "title": "Q3 注入块逐轮字节搅动率：20 条 MEDIUM 轮转强化 40 周期，probe 记录 churn（⑥ 的基线数字）",
+   "kind": "metric",
+   "status": "PASS",
+   "checkpoints": [
+    {
+     "desc": "注入行数 ≤15",
+     "assert": "injection_shape",
+     "ok": true,
+     "reason": "injection shape lines=15 body_chars=186, spec {'max_lines': 15, 'max_body_chars': 600}"
+    },
+    {
+     "desc": "20 条 MEDIUM 全部保留（无降级：age 每轮被强化重置）",
+     "assert": "medium_count",
+     "ok": true,
+     "reason": "medium_count=20, want 20"
+    },
+    {
+     "desc": "强化不产生 LONG（count 最高 5，阈值 >10）",
+     "assert": "long_count",
+     "ok": true,
+     "reason": "long_count=0, want 0"
+    }
+   ],
+   "metrics": {
+    "churn": {
+     "probes": 41,
+     "changed_pairs": 27,
+     "any_change_rate": 0.675,
+     "mean_byte_churn": 0.0306,
+     "max_byte_churn": 0.0851
+    },
+    "final_injection_bytes": 213,
+    "final_long_index_bytes": 0,
+    "total_cycles": 100
+   }
+  },
+  {
+   "id": "persistence_roundtrip",
+   "title": "持久化：三层混合状态 save→reload 后计数、注入字节、LONG 索引与 recall 全部一致",
+   "kind": "gate",
+   "status": "PASS",
+   "checkpoints": [
+    {
+     "desc": "reload 前：LONG 1 / MEDIUM 2（甲 twin+乙）/ SHORT 1（丙）",
+     "assert": "long_count",
+     "ok": true,
+     "reason": "long_count=1, want 1"
+    },
+    {
+     "desc": "reload 前：LONG 1 / MEDIUM 2（甲 twin+乙）/ SHORT 1（丙）",
+     "assert": "medium_count",
+     "ok": true,
+     "reason": "medium_count=2, want 2"
+    },
+    {
+     "desc": "reload 前：LONG 1 / MEDIUM 2（甲 twin+乙）/ SHORT 1（丙）",
+     "assert": "short_count",
+     "ok": true,
+     "reason": "short_count=1, want 1"
+    },
+    {
+     "desc": "reload 后计数一致",
+     "assert": "long_count",
+     "ok": true,
+     "reason": "long_count=1, want 1"
+    },
+    {
+     "desc": "reload 后计数一致",
+     "assert": "medium_count",
+     "ok": true,
+     "reason": "medium_count=2, want 2"
+    },
+    {
+     "desc": "reload 后计数一致",
+     "assert": "short_count",
+     "ok": true,
+     "reason": "short_count=1, want 1"
+    },
+    {
+     "desc": "MEDIUM 注入逐字节一致",
+     "assert": "injection_same_as_probe",
+     "ok": true,
+     "reason": "injection bytes drifted across reload"
+    },
+    {
+     "desc": "LONG 索引逐字节一致（write-once 字段）",
+     "assert": "long_index_same_as_probe",
+     "ok": true,
+     "reason": "long_index bytes drifted across reload"
+    },
+    {
+     "desc": "LONG 索引内容可读",
+     "assert": "long_index_contains",
+     "ok": true,
+     "reason": ""
+    },
+    {
+     "desc": "recall 跨 reload 可用",
+     "assert": "recall",
+     "ok": true,
+     "reason": ""
+    }
+   ],
+   "metrics": {
+    "total_cycles": 15
+   }
+  }
+ ]
+}
