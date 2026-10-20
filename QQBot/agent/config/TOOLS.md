@@ -772,6 +772,33 @@ Anti-bot handling is a two-tier ladder:
 
 ---
 
+## Tool: recall_memory
+
+**Description**: Retrieve the full content of the current user's high-confidence long-term memories (长期记忆) by id or keyword. The system prompt only carries a compact index of these memories (`[id] 标题（时间）`); this tool expands an index entry into its full summary plus the archived conversation snapshot. Strictly per-user — you can only recall the current user's own memories.
+
+**When to use**:
+- The long-term memory index in the system prompt lists an entry relevant to the conversation, and you need its details (full summary or original conversation snapshot)
+- The user references a past event/agreement with "还记得…吗 / 之前说过…" and the index shows a matching title
+- Prefer this over asking the user to repeat themselves when a plausible index entry exists
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "记忆 id（可只写前缀，如 L3f2a）或标题/摘要关键词"
+    }
+  },
+  "required": ["query"]
+}
+```
+
+**Note**: Returns up to 3 matches, newest first, each with a snapshot timestamp — weigh the age before treating the content as current (the user may have changed since). Long snapshots are truncated. If nothing matches, say so honestly and fall back to asking the user; never fabricate memory content.
+
+---
+
 ## Tool: get_changelog
 
 **Description**: Query the bot's own update records / changelog (更新记录 / 更新日志). Returns the most recent `count` entries (default 3, max 20) as structured plain text — each entry has a version, a date, and a list of typed change items (新增/修复/优化/调整/移除). The data is maintained by the admin through the WebUI 更新日志 page and read fresh from disk on every call, so it is always current. This is the bot's OWN changelog — not a game's or any third-party software's release notes.

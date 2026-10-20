@@ -989,6 +989,12 @@ class TestAgentCore:
                 id="m1", content="用户正在做力量训练，按酸痛程度分割训练循环",
                 count=6, entry_extraction_index=0,
             ))
+            # ① P2-lite: a LONG entry must also reach the tail via the index.
+            from agent.memory import LongObject
+            st.long.append(LongObject(
+                id="l9", title="用户长期偏好记录", summary="长期偏好摘要",
+                snapshot_turns=[("旧对话", "旧回复")], snapshot_time=time.time(),
+            ))
 
             agent = Agent(
                 deepseek_client=mock_client,
@@ -1024,7 +1030,14 @@ class TestAgentCore:
             # rsplit guard is kept merely as belt-and-braces.
             medium_block = tail.rsplit("## 用户记忆（中期）", 1)[1]
             assert "(低置信)" not in medium_block, "count>=5 must NOT be low-confidence"
-            print_pass("P1 MEDIUM-tier memory injected into L4 tail")
+            # LONG index (Memory-Optimization-Plan ①): one-line-per-entry, with
+            # the recall_memory hint; full text/snapshot must NOT leak into the tail.
+            assert "用户长期记忆索引" in tail, f"LONG index missing: {tail[-400:]}"
+            assert "[l9] 用户长期偏好记录" in tail, "LONG index line missing"
+            assert "recall_memory" in tail, "LONG index must hint the recall tool"
+            assert "长期偏好摘要" not in tail, (
+                "index must stay one-line; full text only via recall_memory")
+            print_pass("P1 MEDIUM-tier memory + LONG index injected into L4 tail")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1219,6 +1232,7 @@ class TestProfileExtraction:
         asyncio.run(self.test_observe_turn_flush_at_k())
         asyncio.run(self.test_single_flight())
         asyncio.run(self.test_delete_flush())
+        asyncio.run(self.test_buffer_crash_recovery())
 
     # ── Layer 2 ──────────────────────────────────────────────────
 
@@ -1278,6 +1292,11 @@ class TestProfileExtraction:
             # facts wrongly deleted from user 1114144652 in the 2026-09-14 cleanup).
             "用户正在通过饮食调整降血脂",
             "用户正在做力量训练，按酸痛程度自由分割训练循环",
+            # ⑧: user corrections of old memories must survive L2 — they carry
+            # the highest-value signal (judge="update"), so no pattern may catch
+            # "改为/不再/改X了" phrasing.
+            "用户已把每周跑步三次改为每周游泳三次",
+            "用户不再熬夜了，现在晚上十一点睡觉",
         ]
         for text in legit:
             r = filter_candidate(text)
@@ -1305,7 +1324,12 @@ class TestProfileExtraction:
                       "new_interests", "new_preferences",
                       # P1: the merged extract+judge call always advertises the
                       # memory_candidates schema (§12.1), even with no judge_list.
-                      "memory_candidates", "reinforce_short", "matched_id"]:
+                      "memory_candidates", "reinforce_short", "matched_id",
+                      # ② negative list: re-derivable public info → don't store
+                      # (litmus-style second criterion + few-shot 例6).
+                      "可再推导测试", "例6", "流浪者",
+                      # ⑧ user corrections → judge="update" (few-shot 例7).
+                      "例7", "纠正"]:
             assert token in prompt, f"prompt missing {token!r}"
         # No judge_list → the "暂无已有记忆" branch tells the model to use judge="new".
         assert "暂无已有记忆" in prompt, "empty judge_list must use the no-memory branch"
@@ -1316,7 +1340,10 @@ class TestProfileExtraction:
             judge_list=[{"id": "abc123", "content": "用户喜欢原神", "count": 4, "tier": "medium"}],
         )
         for token in ["abc123", "用户喜欢原神", "已有记忆",
-                      "new", "reinforce_short", "update", "keep"]:
+                      "new", "reinforce_short", "update", "keep",
+                      # ⑧: the judge_list branch must spell out the correction
+                      # → update routing rule.
+                      "纠正"]:
             assert token in jp, f"judge prompt missing {token!r}"
         assert "暂无已有记忆" not in jp, "non-empty judge_list must NOT use the no-memory branch"
         print_pass("Layer1 prompt: litmus + few-shot + memory_candidates schema + judge list")
@@ -1446,6 +1473,56 @@ class TestProfileExtraction:
             assert len(c2.calls) == 0, "transient delete must NOT extract"
             assert m2._pending_n["u3"] == 0, "tail must be dropped"
             print_pass("Layer3 delete-flush: >K forces tail, ≤K drops (Decision J)")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_buffer_crash_recovery(self):
+        """⑦: the Layer-3 buffer mirrors to buffer.json and survives restarts."""
+        tmpdir = tempfile.mkdtemp()
+        buf = os.path.join(tmpdir, "u", "buffer.json")
+        try:
+            from agent.profile import ProfileManager, PROFILE_BATCH_K
+            # "process 1": buffer K-1 turns, then die (object dropped, no flush)
+            c1 = _GatedProfileClient("{}")
+            m1 = ProfileManager(base_dir=tmpdir, llm_client=c1)
+            for i in range(PROFILE_BATCH_K - 1):
+                m1.observe_turn("u", f"m{i}", "r")
+            await asyncio.sleep(0)
+            assert len(c1.calls) == 0
+            with open(buf, encoding="utf-8") as f:
+                blob = json.load(f)
+            assert blob["pending_n"] == PROFILE_BATCH_K - 1, blob
+            assert len(blob["turns"]) == PROFILE_BATCH_K - 1
+
+            # "process 2": restore on first observe; the Kth turn flushes ONCE
+            # with the pre-crash turns included in the extraction window
+            c2 = _GatedProfileClient('{"new_interests": ["原神"]}')
+            m2 = ProfileManager(base_dir=tmpdir, llm_client=c2)
+            m2.observe_turn("u", "mK", "r")
+            await asyncio.sleep(0.05)
+            assert len(c2.calls) == 1, "restored pending must flush at the Kth turn"
+            assert "m0" in c2.calls[0]["prompt"] and "mK" in c2.calls[0]["prompt"], (
+                "pre-crash turns must reach the extraction window")
+            assert "原神" in m2.get("u").interests
+
+            # flush persisted pending_n=0 → "process 3" must NOT double-extract
+            with open(buf, encoding="utf-8") as f:
+                assert json.load(f)["pending_n"] == 0
+            c3 = _GatedProfileClient("{}")
+            m3 = ProfileManager(base_dir=tmpdir, llm_client=c3)
+            m3.observe_turn("u", "after", "r")
+            await asyncio.sleep(0.02)
+            assert len(c3.calls) == 0, "pending=0 must restore (no double extraction)"
+            assert m3._pending_n["u"] == 1
+
+            # corrupt buffer file → ignored, fresh buffer, no crash
+            with open(buf, "w") as f:
+                f.write("{corrupt")
+            c4 = _GatedProfileClient("{}")
+            m4 = ProfileManager(base_dir=tmpdir, llm_client=c4)
+            m4.observe_turn("u", "fresh", "r")
+            assert m4._pending_n["u"] == 1 and len(m4._recent["u"]) == 1
+            print_pass("Layer3 ⑦: buffer survives restarts, flush-once, corrupt-tolerant")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -2237,6 +2314,8 @@ class TestTieredMemory:
         self.test_injection_low_confidence_label()
         self.test_injection_top_n_plus_recent()
         self.test_injection_token_cap()
+        self.test_long_index_injection()
+        self.test_recall_long_lookup_and_stats()
         self.test_touch_extraction_count()
         self.test_persistence_roundtrip()
         self.test_load_all()
@@ -2530,6 +2609,85 @@ class TestTieredMemory:
             assert body <= MEDIUM_INJECT_TOKEN_CAP, f"body {body} exceeds cap"
             assert len(bullets) >= 1
             print_pass(f"injection: truncates at MEDIUM_INJECT_TOKEN_CAP ({MEDIUM_INJECT_TOKEN_CAP})")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── LONG index + recall (P2-lite ①) ─────────────────────────
+
+    def test_long_index_injection(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import LongObject, LONG_INJECT_MAX_LINES
+            tm = self._tm(tmp)
+            assert tm.build_long_index("nobody") == "", "no LONG → empty index"
+            st = tm._get_state("u")
+            now = time.time()
+            for i in range(LONG_INJECT_MAX_LINES + 5):
+                st.long.append(LongObject(
+                    id=f"l{i:02d}", title=f"长期事实{i}", summary="s",
+                    snapshot_turns=[], snapshot_time=now + i,
+                ))
+            block = tm.build_long_index("u")
+            assert "用户长期记忆索引" in block and "recall_memory" in block
+            lines = [ln for ln in block.splitlines() if ln.startswith("- [")]
+            assert len(lines) == LONG_INJECT_MAX_LINES, (
+                f"expected {LONG_INJECT_MAX_LINES} index lines, got {len(lines)}")
+            # newest first; entries beyond the cap are dropped entirely
+            assert "[l24] 长期事实24" in lines[0], lines[0]
+            assert "l00" not in block and "l04" not in block, "oldest beyond cap must be dropped"
+            # one-line format: id + title + （YYYY-MM）
+            assert f"（{time.strftime('%Y-%m', time.localtime(now + 24))}）" in lines[0], lines[0]
+            # byte-stable across calls (write-once fields only)
+            assert block == tm.build_long_index("u"), "index must be byte-stable"
+            print_pass(f"LONG index: '' when empty; {LONG_INJECT_MAX_LINES} lines newest-first; byte-stable")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_recall_long_lookup_and_stats(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import (TieredMemory, LongObject, LONG_RECALL_MAX_MATCHES,
+                                      LONG_RECALL_SNAPSHOT_CAP, LONG_RECALL_QUERY_LOG_CAP)
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            now = time.time()
+            big_turns = [("很长的用户消息" * 40, "很长的回复" * 40) for _ in range(5)]
+            st.long.append(LongObject(id="lab123", title="原神抽卡记录", summary="用户小保底歪了",
+                                      snapshot_turns=big_turns, snapshot_time=now))
+            st.long.append(LongObject(id="lcd456", title="健身计划", summary="用户正在练腿",
+                                      snapshot_turns=[("今天练腿", "加油")], snapshot_time=now - 100))
+            tm.save_user("u")
+
+            # id-prefix match + snapshot rendering capped with truncation marker
+            hits = tm.recall_long("u", "lab")
+            assert len(hits) == 1 and hits[0][0].id == "lab123"
+            assert len(hits[0][1]) <= LONG_RECALL_SNAPSHOT_CAP + 30 and "已截断" in hits[0][1]
+            # keyword match (title/summary, substring)
+            assert [lo.id for lo, _ in tm.recall_long("u", "练腿")] == ["lcd456"]
+            # miss / wrong user / blank query → []
+            assert tm.recall_long("u", "不存在的关键词") == []
+            assert tm.recall_long("other", "lab") == [], "recall must be user-scoped"
+            assert tm.recall_long("u", "   ") == []
+
+            # stats bumped + persisted + query_log capped
+            assert st.long[0].query_count == 1 and st.long[0].query_log
+            for _ in range(LONG_RECALL_QUERY_LOG_CAP + 5):
+                tm.recall_long("u", "lab")
+            assert len(st.long[0].query_log) == LONG_RECALL_QUERY_LOG_CAP
+            tm2 = TieredMemory(base_dir=tmp)
+            tm2.load_all()
+            lo2 = next(lo for lo in tm2._get_state("u").long if lo.id == "lab123")
+            assert lo2.query_count == st.long[0].query_count, "query stats must persist"
+
+            # max-matches cap, newest first; snapshot-less → placeholder text
+            st.long.clear()
+            for i in range(LONG_RECALL_MAX_MATCHES + 2):
+                st.long.append(LongObject(id=f"k{i}", title="共同关键词", summary="x",
+                                          snapshot_turns=[], snapshot_time=now + i))
+            hits = tm.recall_long("u", "共同关键词")
+            assert [lo.id for lo, _ in hits] == ["k4", "k3", "k2"], [lo.id for lo, _ in hits]
+            assert hits[0][1] == "（无对话快照）"
+            print_pass("recall_long: id-prefix/keyword, user-scoped, capped newest-first, stats persisted")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

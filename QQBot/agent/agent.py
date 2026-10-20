@@ -547,11 +547,15 @@ class Agent:
         # memories are reinforced/updated). NOTE: legacy shared knowledge/
         # system memories are no longer injected here (out of P1 scope,
         # Decision 8 — audit prod knowledge/ + system/ before deploy).
-        # LONG-index injection is P2.
+        # LONG-tier: one-line index (P2-lite, Memory-Optimization-Plan ①) —
+        # byte-stable across turns; full text via the recall_memory tool.
         if self.tiered_memory:
             medium_block = self.tiered_memory.build_medium_injection(user_id)
             if medium_block:
                 volatile.append(medium_block)
+            long_index = self.tiered_memory.build_long_index(user_id)
+            if long_index:
+                volatile.append(long_index)
 
         messages.append({"role": "system", "content": "\n\n".join(volatile)})
 

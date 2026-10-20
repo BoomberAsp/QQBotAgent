@@ -1949,6 +1949,58 @@ _tool_registry.register(
 )
 
 
+# ── LONG-tier memory recall (recall_memory) ──
+#
+# P2-lite of the three-tier memory engine (Memory-Optimization-Plan ①).
+# The system prompt carries a one-line index of the user's LONG memories;
+# this tool dereferences an index line into the full entry + the original
+# conversation snapshot. Scoped by contextvar user_id — never trust the id
+# alone. Same pattern as recall_search_result above.
+
+def _recall_memory(query: str) -> str:
+    """Retrieve the current user's own LONG-tier memory by id or keyword."""
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "[recall] 无法取回：当前请求未设置用户上下文。"
+    matches = _tiered_memory.recall_long(user_id, query)
+    if not matches:
+        return (
+            "[recall] 未找到匹配的长期记忆：id 无效或关键词不匹配。"
+            "可换用「用户长期记忆索引」中的其他 id/关键词；仅限取回当前用户自己的记忆。"
+        )
+    parts = []
+    for lo, snapshot_text in matches:
+        when = (
+            time.strftime("%Y-%m-%d", time.localtime(lo.snapshot_time))
+            if lo.snapshot_time else "未知"
+        )
+        parts.append(
+            f"[长期记忆 {lo.id}]（快照时间 {when}）\n"
+            f"{lo.summary}\n"
+            f"对话快照（{len(lo.snapshot_turns)} 轮）:\n{snapshot_text}"
+        )
+    return "\n\n".join(parts)
+
+
+_tool_registry.register(
+    "recall_memory", _recall_memory,
+    "按 id 或关键词取回当前用户的长期记忆全文与对话快照。系统提示词中的"
+    "「用户长期记忆索引」列出了每条记忆的 id 与标题；当索引里的某条记忆与"
+    "当前问题相关、而你需要完整细节或当时的对话原文时，调用此工具。"
+    "仅限取回当前用户自己的长期记忆。",
+    {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "长期记忆 id（来自索引行 [id]），或标题/内容关键词",
+            },
+        },
+        "required": ["query"],
+    },
+)
+
+
 # ── Message Handlers ─────────────────────────────────────────────
 
 # Catch ALL messages. For group messages, we manually check for @mentions

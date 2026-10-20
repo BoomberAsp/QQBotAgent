@@ -306,8 +306,11 @@ class MemorySystem:
 #            age = extraction_count - entry_extraction_index; demote back to
 #            SHORT at age>MEDIUM_DOWNGRADE_AGE; promote to LONG at
 #            count>MEDIUM_LONG_THRESHOLD.
-#   LONG   — snapshot + provenance. P1 = create + persist ONLY (no index
-#            injection, no query tool, no cap demotion — those are P2, §11).
+#   LONG   — snapshot + provenance. P1 was create + persist only; P2-lite
+#            (Memory-Optimization-Plan ①) added one-line index injection
+#            (build_long_index) + the recall_memory query tool (recall_long),
+#            fixing the dead-end where a demoted MEDIUM twin made the LONG
+#            copy unreachable. Cap demotion remains P2 (§11).
 #
 # A per-user `extraction_count` logical clock drives age. It is incremented once
 # per SUCCESSFUL extract_batch (ProfileManager calls touch_extraction_count).
@@ -333,6 +336,12 @@ MEDIUM_INJECT_RECENT_SLOTS = 3
 MEDIUM_INJECT_TOKEN_CAP = 600       # chars
 LOW_CONFIDENCE_THRESHOLD = 5        # count < 5 → "(低置信)" label
 JUDGE_MEDIUM_LIST_CAP = 40
+
+# ── LONG-tier index + recall constants (Memory-Optimization-Plan ①) ──
+LONG_INJECT_MAX_LINES = 20          # index lines injected into the L4 tail
+LONG_RECALL_MAX_MATCHES = 3         # entries returned per recall_memory call
+LONG_RECALL_SNAPSHOT_CAP = 1200     # chars of conversation snapshot per entry
+LONG_RECALL_QUERY_LOG_CAP = 20      # query_log entries kept per LONG object
 
 TIER_SCHEMA_VERSION = 1
 
@@ -361,14 +370,14 @@ class MediumItem:
 
 @dataclass
 class LongObject:
-    """A LONG-tier snapshot. P1: created + persisted only (queried in P2)."""
+    """A LONG-tier snapshot. P2-lite: indexed into the prompt + recall_long()."""
     id: str
     title: str
     summary: str
     snapshot_turns: List[Tuple[str, str]]
     snapshot_time: float
-    query_count: int = 0                                  # P2 (tracked, unused in P1)
-    query_log: List[Any] = field(default_factory=list)    # P2
+    query_count: int = 0                                  # bumped by recall_long
+    query_log: List[Any] = field(default_factory=list)    # capped recall audit trail
     linked_medium_id: str = ""                            # back-ref to MEDIUM twin (Decision G: twin kept)
 
 
@@ -659,6 +668,89 @@ class TieredMemory:
         if not lines:
             return ""
         return "\n## 用户记忆（中期）\n" + "\n".join(lines)
+
+    def build_long_index(self, user_id: str) -> str:
+        """Build the LONG-tier one-line-per-entry index block (P2-lite).
+
+        Rationale (Memory-Optimization-Plan ①): LONG entries used to be
+        write-only — when the MEDIUM twin age-demoted, the highest-confidence
+        fact in the system became unreachable. The index gives the model
+        *visibility* (one stable line per entry, Claude Code MEMORY.md
+        pattern); the recall_memory tool gives it *access* (full text +
+        conversation snapshot).
+
+        Lines derive only from write-once fields (id/title/snapshot_time),
+        so the block is byte-stable across turns — minimal L4-tail churn.
+        Returns "" when the user has no LONG entries. Capped at
+        LONG_INJECT_MAX_LINES (newest first) to bound the tail budget.
+        """
+        st = self._get_state(user_id)
+        if not st.long:
+            return ""
+        entries = sorted(st.long, key=lambda lo: -lo.snapshot_time)[:LONG_INJECT_MAX_LINES]
+        lines = []
+        for lo in entries:
+            when = (
+                time.strftime("%Y-%m", time.localtime(lo.snapshot_time))
+                if lo.snapshot_time else ""
+            )
+            suffix = f"（{when}）" if when else ""
+            lines.append(f"- [{lo.id}] {lo.title}{suffix}")
+        return (
+            "\n## 用户长期记忆索引（高置信度）\n"
+            + "\n".join(lines)
+            + "\n（需要某条长期记忆的全文与对话快照时，调用 recall_memory 传入其 id 或关键词。）"
+        )
+
+    def recall_long(self, user_id: str, query: str) -> List[Tuple["LongObject", str]]:
+        """Look up the user's OWN LONG entries by id-prefix or keyword.
+
+        Returns up to LONG_RECALL_MAX_MATCHES pairs of (LongObject, formatted
+        snapshot text capped at LONG_RECALL_SNAPSHOT_CAP chars), newest first.
+        Empty list when nothing matches.
+
+        Scoped strictly to this user's state — an id from another user never
+        resolves. Each successful recall bumps query_count, appends a capped
+        query_log entry and persists (query stats feed P2 ranking decisions).
+        Synchronous like every TieredMemory method (§12.1 concurrency model).
+        """
+        st = self._get_state(user_id)
+        q = (query or "").strip()
+        if not q or not st.long:
+            return []
+
+        matches = [lo for lo in st.long if lo.id == q or lo.id.startswith(q)]
+        if not matches:
+            q_lower = q.lower()
+            matches = [
+                lo for lo in st.long
+                if q_lower in lo.title.lower() or q_lower in lo.summary.lower()
+            ]
+        if not matches:
+            return []
+
+        matches.sort(key=lambda lo: -lo.snapshot_time)
+        matches = matches[:LONG_RECALL_MAX_MATCHES]
+        for lo in matches:
+            lo.query_count += 1
+            lo.query_log.append({"ts": time.time(), "query": q[:80]})
+            del lo.query_log[:-LONG_RECALL_QUERY_LOG_CAP]
+        self.save_user(user_id)
+        return [(lo, self._format_snapshot_text(lo)) for lo in matches]
+
+    @staticmethod
+    def _format_snapshot_text(lo: "LongObject") -> str:
+        """Render snapshot turns to text, capped at LONG_RECALL_SNAPSHOT_CAP."""
+        lines: List[str] = []
+        total = 0
+        for um, ar in lo.snapshot_turns:
+            piece = f"用户: {um}\n助手(Roxy): {ar}"
+            if total + len(piece) > LONG_RECALL_SNAPSHOT_CAP:
+                lines.append("…（快照过长，已截断）")
+                break
+            lines.append(piece)
+            total += len(piece)
+        return "\n".join(lines) if lines else "（无对话快照）"
 
     # ── persistence ───────────────────────────────────────────────
 
