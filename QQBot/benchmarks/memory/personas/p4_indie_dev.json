@@ -52,7 +52,7 @@
      "keywords": ["腱鞘炎"], "mentions": 1,
      "utterances": ["我有腱鞘炎，医生让我控制打字时长"]},
     {"category": "critical_lowfreq", "fid": "cl2", "expect": "in_store",
-     "keywords": ["合伙人", "欠", "违约金"], "mentions": 1,
+     "keywords": ["合伙人", ["欠", "违约金", "背负"]], "mentions": 1,
      "utterances": ["之前被合伙人坑过，欠了一屁股违约金，现在打官司"]},
     {"category": "critical_lowfreq", "fid": "cl3", "expect": "in_store",
      "keywords": [["第一款游戏", "第一款", "首作"], ["亏损", "亏了三万", "亏了", "赔了"]], "mentions": 1,
@@ -81,7 +81,7 @@
     {"category": "contradiction", "fid": "ct3", "expect": "single_value",
      "keywords": ["用", "windows", "开发"], "mentions": 2,
      "utterances": ["我用 windows 开发"],
-     "contradicts": {"keywords": ["换", "linux"], "mentions": 2,
+     "contradicts": {"keywords": ["linux"], "mentions": 2,
                      "utterances": ["说反了，我两年多前就换 linux 开发了"]}},
 
     {"category": "implanted_false", "fid": "if1", "expect": "absent",

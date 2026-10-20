@@ -255,8 +255,8 @@ def _implant_hits(keywords, corpus):
 # （如「原本养的猫团团已送回老家」）——是合法的状态更新，不算旧值残留。
 # 原始话语不含这些词，纯陈旧条目几乎不会带上它们（p1 冒烟实测校准）。
 _CORRECTION_MARKERS = (
-    "原本", "以前", "之前", "不再", "已经不", "已送", "送走", "送人",
-    "结束", "退役", "搬到", "换成", "改为", "早搬", "早毕业",
+    "原本", "以前", "之前", "此前", "不再", "已经不", "已送", "送走", "送人",
+    "结束", "停止", "打破", "退役", "搬到", "换成", "改为", "改用", "早搬", "早毕业",
 )
 
 
@@ -292,7 +292,11 @@ def _classify_replacement(old_kws, new_kws, corpus):
         status, passed = "STALE", False
     else:
         status, passed = "LOST", False
-    evidence = (new_only or merged or old_only or updated_old)[:2]
+    # 失败时优先展示肇事条目（残留的纯旧值）；通过时展示新状态证据
+    if passed:
+        evidence = (new_only or merged or updated_old or old_only)[:2]
+    else:
+        evidence = (old_only + updated_old + merged + new_only)[:2]
     return status, passed, evidence
 
 
@@ -614,6 +618,16 @@ async def amain(args):
     print("\n" + "=" * 64)
     table, totals = summary_table(all_runs, None)
     print(table)
+    # 基线 JSON 先落盘（关键产物），报告 md 其次；两者都自动建父目录
+    if args.save_baseline:
+        path = Path(args.save_baseline)
+        if path.is_dir() or str(path).endswith("/"):
+            path = path / "l2_baseline.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(summary, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        print(f"\n基线已保存 {path}")
+
     if args.report:
         report = ["# L2 管线 benchmark 报告", "",
                   f"生成: {meta['generated_at']}  engine@{meta['engine_commit']}"
@@ -623,17 +637,10 @@ async def amain(args):
                 pid, run, next(p for p in personas if p["id"] == pid)))
         report.append("## 汇总\n")
         report.append(table)
-        Path(args.report).write_text("\n".join(report), encoding="utf-8")
-        print(f"\n报告已写入 {args.report}")
-
-    if args.save_baseline:
-        path = Path(args.save_baseline)
-        if path.is_dir() or str(path).endswith("/"):
-            path = path / "l2_baseline.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(summary, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-        print(f"基线已保存 {path}")
+        rp = Path(args.report)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text("\n".join(report), encoding="utf-8")
+        print(f"报告已写入 {rp}")
 
     if args.compare:
         base = json.loads(Path(args.compare).read_text(encoding="utf-8"))

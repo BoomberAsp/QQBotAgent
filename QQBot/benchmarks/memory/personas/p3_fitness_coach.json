@@ -76,7 +76,7 @@
     {"category": "contradiction", "fid": "ct2", "expect": "single_value",
      "keywords": ["练", "拳击"], "mentions": 2,
      "utterances": ["我最近在主练拳击"],
-     "contradicts": {"keywords": ["拳击", "停了", "力量举"], "mentions": 2,
+     "contradicts": {"keywords": ["力量举"], "mentions": 2,
                      "utterances": ["拳击早停了，说错了，我现在专攻力量举"]}},
     {"category": "contradiction", "fid": "ct3", "expect": "single_value",
      "keywords": ["三十岁"], "mentions": 2,

@@ -191,6 +191,26 @@ QQBot/benchmarks/memory/
 > BENCH_API_KEY env 门控，**不进 test.sh**；退出码恒 0（诊断），--strict 才判 1。
 > 开放式 QA（向 bot 提问核对记忆）推迟到 L3。跑法：
 > `BENCH_API_KEY=sk-xxx python benchmarks/memory/bench_pipeline.py --save-baseline baselines/l2_post_batch1.json`。
+>
+> **L2 基线结果（2026-10-21，engine@e69f011，deepseek-chat，两次全量运行总数一致）**：
+> **106/126 = 84%**，canary 17/18，泄漏 5，每 persona 24 批次 / ~66k token（cache 命中 ~68%）/ ~27s。
+> 满分项：re_derivable 18/18、implanted_false 18/18 全 absent（② 负面清单+石蕊测试有效）；
+> critical_lowfreq 18/18 全存（单次提及的关键事实进 SHORT 存活）。
+> **失败画像（20 项计分失败，全部为真实管线缺陷，打分工件已在冒烟阶段校准清零）**：
+> ⑴ **纠正后旧值残留 ×11**（主要失败模式）：明确纠正到达后 judge 走 "new" 而非
+>   "update"+matched_id，旧 SHORT 条目带着 count 继续存活并与新值并存
+>   （「用户住在杭州」+「已搬到南京」）——⑧ 的 prompt 级修复命中率不足，
+>   需要引擎级兜底（ingest 前矛盾扫描/近重复合并，候选新优化点 ⑨）；
+> ⑵ **profile.preferences 槽位无纠正路径 ×4**（结构性缺口）：「只看日漫」「从不氪金」
+>   「不喝咖啡」「安卓手机」等偏好槽写入后永不修订——抽取规则只允许"新增"偏好，
+>   需支持 revise/delete 槽位（候选新优化点 ⑩）；
+> ⑶ **重复 junk 晋升 ×5**：3-5 次提及的一次性抱怨（腿酸/快递/门票/蛋白粉）过了
+>   Layer1 并被 count 机制晋升 MEDIUM——重复提及 ≠ 石蕊测试通过，负面清单对
+>   "一次性状态抱怨"拦截不稳定（p3 三条全漏）。
+> 波动说明：LLM 抽取非确定，两次运行总分同为 84% 但逐 fact 有 ±3 项漂移；
+> 基线应在**类别级**解读，逐 fact 对比仅用于抓大回归。
+> p5 ct2 基线状态 STALE 为标签工件（「氪金」改写躲过关键词「氪了」），卡片与
+> marker 已修，修复后同场景判 CONTRADICTED——同为 FAIL，不影响总数。
 
 - **基线先行**：任何记忆架构改动动手前跑 L1+L2 存基线，改完跑对比——与 Cache-Hit-Rate-Plan 阶段 2 同一套方法论，共享 prefix-hash 与 TokenLedger 基础设施；
   ⚠️ 实际执行偏离（用户 2026-10-20 决定）：批次 1（①②⑦⑧）先于 benchmark 实施，以单测代偿验证；批次 0 建基线时需**额外回补**"优化后 vs 优化前"的对照口径（旧行为可由 git 历史复现）；
@@ -285,7 +305,7 @@ QQBot/benchmarks/memory/
 
 | 批次 | 内容 | 前置 | 验收 |
 |---|---|---|---|
-| **0** | benchmark L1（含 episodic canary、LONG 可达性、存活曲线）+ L2 persona 与 runner | 无 | 基线快照进 `baselines/`；canary 与 LONG 场景**如实记录失败** |
+| **0** ✅ 已完成（2026-10-21） | benchmark L1（含 episodic canary、LONG 可达性、存活曲线）+ L2 persona 与 runner | 无 | 基线快照进 `baselines/`（L1 双基线 + L2 post_batch1: **84%**，canary 17/18 如实记录）；L2 失败画像见 §3.5：纠正残留 ×11 / 偏好槽无纠正 ×4 / 重复 junk 晋升 ×5 → 候选优化点 ⑨⑩ |
 | **1** ✅ 已实施（2026-10-20，先于批次 0，用户决定） | ① LONG 索引+recall；② 负面清单；⑦ 缓冲落盘；⑧ 纠正处理（追加） | ~~批次 0~~ → 单测代偿（test_agent.py 15/15） | L1 两个失败场景转正；L2 假晋升率对比基线下降（**待批次 0 建基线后回补验证**） |
 | **2** | ④ category 类型化（含迁移脚本）→ ③ 时效标注 | 批次 1（避免同期多变量） | L2 evolving/critical 类别指标 |
 | **3** | ⑤ episode 通道（随 Bond P0/P5 排期） | ④ | episodic canary 转正；`salient_episode` 存活率 |
