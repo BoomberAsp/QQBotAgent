@@ -251,13 +251,24 @@ def _implant_hits(keywords, corpus):
     return out
 
 
+# 修正语气标记：旧话题条目若含这些词，说明 LLM 已把它改写成“旧状态已结束”
+# （如「原本养的猫团团已送回老家」）——是合法的状态更新，不算旧值残留。
+# 原始话语不含这些词，纯陈旧条目几乎不会带上它们（p1 冒烟实测校准）。
+_CORRECTION_MARKERS = (
+    "原本", "以前", "之前", "不再", "已经不", "已送", "送走", "送人",
+    "结束", "退役", "搬到", "换成", "改为", "早搬", "早毕业",
+)
+
+
 def _classify_replacement(old_kws, new_kws, corpus):
     """evolved / single_value 共用的替换判定。
 
-    条目分三类：纯旧（含旧组不含新组）/ 纯新 / 融合（两组都含，如
-    「本命从初音换成崩铁」——视为新状态在场，不视为旧残留）。
+    条目分四类：纯旧（含旧组不含新组）/ 纯新 / 融合（两组都含，如
+    「本命从初音换成崩铁」——视为新状态在场）/ 改写旧（纯旧但带修正语气
+    标记，如「原本养的猫已送回老家」——合法更新，不算残留）。
+    LLM 也可能把演化拆成两条（改写旧条目 + 新建新条目），同样不算矛盾。
     """
-    old_only, new_only, merged = [], [], []
+    old_only, new_only, merged, updated_old = [], [], [], []
     for src, txt in corpus:
         t = txt.lower()
         a = _group_match(old_kws, t)
@@ -265,7 +276,10 @@ def _classify_replacement(old_kws, new_kws, corpus):
         if a and b:
             merged.append((src, txt))
         elif a:
-            old_only.append((src, txt))
+            if any(m in t for m in _CORRECTION_MARKERS):
+                updated_old.append((src, txt))
+            else:
+                old_only.append((src, txt))
         elif b:
             new_only.append((src, txt))
     new_present = bool(new_only or merged)
@@ -278,7 +292,7 @@ def _classify_replacement(old_kws, new_kws, corpus):
         status, passed = "STALE", False
     else:
         status, passed = "LOST", False
-    evidence = (new_only or merged or old_only)[:2]
+    evidence = (new_only or merged or old_only or updated_old)[:2]
     return status, passed, evidence
 
 
@@ -321,6 +335,7 @@ def score_persona(persona, tm, profile, user_id):
                 r["canary"] = True
                 r["status"] = "CANARY-OK" if found else "CANARY-FAIL"
                 r["passed"] = None  # 不计分
+                r["evidence"] = _evidence_str(hits)
             elif expect == "in_store":
                 r.update(passed=found, canary=False,
                          status="FOUND" if found else "MISSING",
