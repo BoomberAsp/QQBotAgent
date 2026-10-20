@@ -174,6 +174,24 @@ QQBot/benchmarks/memory/
 > 批次 1 前后对比：long_reachability、persistence_roundtrip FAIL→PASS（IMPROVED），
 > 其余动力学数字逐项一致（批次 1 未扰动晋升/降级/容量行为），回归 0。
 
+> **批次 0 L2 实施记录（2026-10-20）**：`bench_pipeline.py` + 6 persona 卡
+> （p1 手游学生 / p2 二胎职场妈妈 / p3 健身教练 / p4 独立开发者 / p5 二次元 / p6 退休教师）
+> + 共享闲聊干扰池 `fillers.json`（55 条）。每 persona 24 条 ground-truth 事实
+> × 8 类别（stable_preference / evolving_fact / one_shot_junk / re_derivable /
+> critical_lowfreq / salient_episode / contradiction / implanted_false）。
+> 走**真实生产管线**（observe_turn → Layer1 LLM 抽取+judge → Layer2 过滤 → 三层引擎），
+> 确定性脚本：事实事件占偶数轮 round-robin（同事实跨批次间隔 ≈42 轮，考验 judge 路由
+> 而非同批去重），pre 45 提及（轮 2-90）→ post 12 提及（evolves/contradicts，轮 92-114）
+> → 共 120 轮/persona ≈ 24 抽取批次。打分 = 关键词组匹配（元素间 AND、元素内同义备选
+> OR——对抗 LLM 改写漂移；implanted_false 用 OR+否定前缀护栏，「不能吃辣」不误报植入词
+> 「能吃辣」）；语料 = short/medium 内容 + long title/summary + 画像槽位，**不含** long
+> 快照原文（避免 absent 类假阳性）。evolved/single_value 共用替换判定：融合改写
+> （「本命从初音换成崩铁」）算新状态在场 → MERGED 通过；独立旧值残留 → CONTRADICTED/STALE 失败。
+> canary 只报告不计分。BenchClient 本地累计 token（不碰生产 TokenLedger）；
+> BENCH_API_KEY env 门控，**不进 test.sh**；退出码恒 0（诊断），--strict 才判 1。
+> 开放式 QA（向 bot 提问核对记忆）推迟到 L3。跑法：
+> `BENCH_API_KEY=sk-xxx python benchmarks/memory/bench_pipeline.py --save-baseline baselines/l2_post_batch1.json`。
+
 - **基线先行**：任何记忆架构改动动手前跑 L1+L2 存基线，改完跑对比——与 Cache-Hit-Rate-Plan 阶段 2 同一套方法论，共享 prefix-hash 与 TokenLedger 基础设施；
   ⚠️ 实际执行偏离（用户 2026-10-20 决定）：批次 1（①②⑦⑧）先于 benchmark 实施，以单测代偿验证；批次 0 建基线时需**额外回补**"优化后 vs 优化前"的对照口径（旧行为可由 git 历史复现）；
 - 不用真实用户聊天记录做 ground truth（隐私 + 标注成本）；如需真实分布基线，仅用 admin 自己的会话且只统计聚合指标（假晋升率、注入尺寸），不做逐条对错判定；
