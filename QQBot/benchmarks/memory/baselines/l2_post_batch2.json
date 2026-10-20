@@ -1,0 +1,1788 @@
+{
+  "meta": {
+    "generated_at": "2026-10-21 02:22:58",
+    "engine_commit": "c4c1517",
+    "model": "deepseek-chat",
+    "api_base": "https://api.deepseek.com/v1",
+    "note": "L2 端到端（真实 LLM），打分确定性；LLM 抽取本身非确定，同一引擎多次运行结果可有小幅波动。"
+  },
+  "totals": {
+    "pass": 111,
+    "total": 126,
+    "canary_ok": 16,
+    "canary_total": 18,
+    "leaks": 3
+  },
+  "personas": {
+    "p1_gamer_student": {
+      "results": {
+        "cl1": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl1",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户对花生过敏，且过敏症状严重"
+        },
+        "cl2": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户心脏不太好，医生嘱咐不要通宵"
+        },
+        "cl3": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl3",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户的弟弟患有哮喘，家里不能长时间养带毛的宠物"
+        },
+        "ct1": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct1",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=8,age=2)] 用户已经搬出学校宿舍，现在在校外租房住"
+        },
+        "ct2": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct2",
+          "passed": false,
+          "status": "CONTRADICTED",
+          "canary": false,
+          "evidence": "[short] 用户不喝咖啡，嫌苦 | [medium(c=3,age=2)] 用户现在每天喝两杯美式咖啡，已经离不开咖啡了"
+        },
+        "ct3": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct3",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[preference] 专业 计算机"
+        },
+        "ef1": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef1",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[medium(c=7,age=3)] 用户的猫送回老家给爸妈养了，现在养了一只柴犬叫旺财"
+        },
+        "ef2": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef2",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[preference] 设备 iPhone"
+        },
+        "ef3": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef3",
+          "passed": false,
+          "status": "CONTRADICTED",
+          "canary": false,
+          "evidence": "[short] 用户作息特别规律，每天六点早起 | [medium(c=3,age=2)] 用户开学后变成熬夜党，经常凌晨两点才睡"
+        },
+        "if1": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if1",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if2": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if2",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if3": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if3",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "j1": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j1",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "j2": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j2",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "j3": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j3",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd1": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd1",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd2": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd2",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd3": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd3",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "se1": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se1",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户昨天和室友大吵一架后和好，感觉反而更了解彼此"
+        },
+        "se2": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se2",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户暑假和好朋友去看了人生第一场演唱会，觉得特别难忘"
+        },
+        "se3": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se3",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户第一次深渊满星，感到非常激动"
+        },
+        "sp1": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp1",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=5,age=9)] 用户玩任何游戏都只玩辅助位，从不玩输出位"
+        },
+        "sp2": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=4,age=9)] 用户每天坚持完成原神的日常任务，一天不落"
+        },
+        "sp3": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp3",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=5,age=8)] 用户打游戏不打排位，只玩休闲匹配"
+        }
+      },
+      "category_stats": {
+        "stable_preference": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "evolving_fact": {
+          "pass": 2,
+          "fail": 1,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "one_shot_junk": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "re_derivable": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "critical_lowfreq": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "salient_episode": {
+          "pass": 0,
+          "fail": 0,
+          "total": 0,
+          "canary_ok": 3,
+          "canary_total": 3
+        },
+        "contradiction": {
+          "pass": 2,
+          "fail": 1,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "implanted_false": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        }
+      },
+      "store_stats": {
+        "short": 8,
+        "medium": 9,
+        "long": 0,
+        "extraction_count": 24,
+        "interests": 3,
+        "preferences": 3
+      },
+      "usage": {
+        "calls": 24,
+        "input_tokens": 71314,
+        "output_tokens": 2286,
+        "cached_tokens": 51584,
+        "api_errors": 0
+      },
+      "turns": 120,
+      "api_errors": 0
+    },
+    "p2_working_mom": {
+      "results": {
+        "cl1": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl1",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户对青霉素过敏"
+        },
+        "cl2": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户怀二胎时得过妊娠糖尿病，现在很注意控糖"
+        },
+        "cl3": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl3",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户的小儿子有先天性心脏病，需要定期复查"
+        },
+        "ct1": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct1",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=7,age=2)] 用户不是独生女，有一个姐姐"
+        },
+        "ct2": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct2",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=6,age=2)] 用户家原本养的两条狗上个月已送人，现在家里没有宠物"
+        },
+        "ct3": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct3",
+          "passed": false,
+          "status": "CONTRADICTED",
+          "canary": false,
+          "evidence": "[short] 用户住在杭州 | [medium(c=3,age=1)] 用户全家去年已搬到南京居住"
+        },
+        "ef1": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef1",
+          "passed": false,
+          "status": "CONTRADICTED",
+          "canary": false,
+          "evidence": "[short] 用户的女儿在上幼儿园，曾参加幼儿园演出 | [medium(c=6,age=3)] 用户的女儿今年九月升小学了，适应得还不错"
+        },
+        "ef2": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef2",
+          "passed": false,
+          "status": "CONTRADICTED",
+          "canary": false,
+          "evidence": "[medium(c=3,age=14)] 用户每天开车通勤，单程四十分钟 | [short] 用户换工作了，现在改坐地铁通勤"
+        },
+        "ef3": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef3",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=5,age=2)] 用户上个月转行做保险了，此前从事财务工作十年"
+        },
+        "if1": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if1",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if2": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if2",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if3": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if3",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "j1": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j1",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "j2": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j2",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "j3": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j3",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd1": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd1",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd2": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd2",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd3": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd3",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "se1": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se1",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户的女儿在上幼儿园，曾参加幼儿园演出"
+        },
+        "se2": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se2",
+          "canary": true,
+          "status": "CANARY-FAIL",
+          "passed": null,
+          "evidence": ""
+        },
+        "se3": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se3",
+          "canary": true,
+          "status": "CANARY-FAIL",
+          "passed": null,
+          "evidence": ""
+        },
+        "sp1": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp1",
+          "passed": false,
+          "canary": false,
+          "status": "MISSING",
+          "evidence": ""
+        },
+        "sp2": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=4,age=9)] 用户不喝奶茶，觉得太甜受不了 | [preference] 饮品偏好 不喝奶茶（觉得太甜）"
+        },
+        "sp3": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp3",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=5,age=8)] 用户全家周末固定去爬山，两年没断过"
+        }
+      },
+      "category_stats": {
+        "stable_preference": {
+          "pass": 2,
+          "fail": 1,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "evolving_fact": {
+          "pass": 1,
+          "fail": 2,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "one_shot_junk": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "re_derivable": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "critical_lowfreq": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "salient_episode": {
+          "pass": 0,
+          "fail": 0,
+          "total": 0,
+          "canary_ok": 1,
+          "canary_total": 3
+        },
+        "contradiction": {
+          "pass": 2,
+          "fail": 1,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "implanted_false": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        }
+      },
+      "store_stats": {
+        "short": 8,
+        "medium": 9,
+        "long": 0,
+        "extraction_count": 24,
+        "interests": 1,
+        "preferences": 1
+      },
+      "usage": {
+        "calls": 24,
+        "input_tokens": 70881,
+        "output_tokens": 2056,
+        "cached_tokens": 52864,
+        "api_errors": 0
+      },
+      "turns": 120,
+      "api_errors": 0
+    },
+    "p3_fitness_coach": {
+      "results": {
+        "cl1": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl1",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户海鲜过敏，吃虾蟹会起疹子 | [preference] 过敏 海鲜过敏（虾蟹），会起疹子"
+        },
+        "cl2": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户年轻时做过腰椎手术，做硬拉必须戴护具"
+        },
+        "cl3": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl3",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户的妻子是素食主义者，家里做饭要分两套"
+        },
+        "ct1": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct1",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[medium(c=7,age=2)] 用户现在负重30公斤做引体向上"
+        },
+        "ct2": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct2",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=6,age=2)] 用户已停止拳击训练，现在专攻力量举"
+        },
+        "ct3": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct3",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[medium(c=5,age=1)] 用户今年三十五岁"
+        },
+        "ef1": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef1",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=7,age=3)] 用户已结束减脂期，现在开始增肌，采用热量盈余饮食"
+        },
+        "ef2": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef2",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[medium(c=6,age=3)] 用户膝盖已康复，深蹲重量重回150公斤"
+        },
+        "ef3": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef3",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=6,age=2)] 用户已辞去连锁健身房私人教练的工作，自己开了一家私教工作室"
+        },
+        "if1": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if1",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if2": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if2",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if3": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if3",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "j1": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j1",
+          "passed": false,
+          "canary": false,
+          "status": "LEAKED",
+          "evidence": "[medium(c=3,age=8)] 用户今天腿酸得走路费劲"
+        },
+        "j2": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j2",
+          "passed": false,
+          "canary": false,
+          "status": "LEAKED",
+          "evidence": "[medium(c=4,age=7)] 用户喝蛋白粉，最近蛋白粉喝完了准备再买"
+        },
+        "j3": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j3",
+          "passed": false,
+          "canary": false,
+          "status": "LEAKED",
+          "evidence": "[medium(c=5,age=6)] 用户所在健身房的跑步机又坏了，物业维修慢"
+        },
+        "rd1": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd1",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd2": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd2",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd3": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd3",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "se1": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se1",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户练了八年，昨天第一次深蹲起两倍体重"
+        },
+        "se2": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se2",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户是私人教练，带过一个学员三年，该学员昨天跑完人生第一个全马"
+        },
+        "se3": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se3",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户上个月在省赛拿了季军，差一点进国家队选拔"
+        },
+        "sp1": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp1",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=4,age=9)] 用户吃饭必须高蛋白，以鸡胸肉为主食 | [preference] 饮食 必须高蛋白，鸡胸肉为主食"
+        },
+        "sp2": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=4,age=9)] 用户习惯早上五点起来锻炼，认为晚上锻炼影响睡眠"
+        },
+        "sp3": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp3",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=5,age=8)] 用户滴酒不沾，尤其在备赛期不喝酒"
+        }
+      },
+      "category_stats": {
+        "stable_preference": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "evolving_fact": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "one_shot_junk": {
+          "pass": 0,
+          "fail": 3,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "re_derivable": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "critical_lowfreq": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "salient_episode": {
+          "pass": 0,
+          "fail": 0,
+          "total": 0,
+          "canary_ok": 3,
+          "canary_total": 3
+        },
+        "contradiction": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "implanted_false": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        }
+      },
+      "store_stats": {
+        "short": 6,
+        "medium": 12,
+        "long": 0,
+        "extraction_count": 24,
+        "interests": 1,
+        "preferences": 2
+      },
+      "usage": {
+        "calls": 24,
+        "input_tokens": 73566,
+        "output_tokens": 2854,
+        "cached_tokens": 52352,
+        "api_errors": 0
+      },
+      "turns": 120,
+      "api_errors": 0
+    },
+    "p4_indie_dev": {
+      "results": {
+        "cl1": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl1",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户患有腱鞘炎，医生建议其控制打字时长"
+        },
+        "cl2": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户曾被合伙人坑害，背负违约金，目前正在打官司"
+        },
+        "cl3": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl3",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户的第一款游戏亏损三万块，约占其全部积蓄的三分之一"
+        },
+        "ct1": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct1",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[medium(c=7,age=2)] 用户改变了不做外包的做法，音乐现已外包，美术以前也外包过"
+        },
+        "ct2": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct2",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[medium(c=6,age=2)] 用户计划改变，目前正在洽谈将游戏移植到 Switch"
+        },
+        "ct3": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct3",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=5,age=1)] 用户做游戏已改用 Linux 系统进行开发，两年多前就从 Windows 换过来了"
+        },
+        "ef1": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef1",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[medium(c=6,age=3)] 用户的第二款游戏已于上个月上架，销量一般"
+        },
+        "ef2": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef2",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[medium(c=3,age=3)] 用户上个月招了一名全职美术，不再独自包揽美术工作"
+        },
+        "ef3": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef3",
+          "passed": false,
+          "status": "CONTRADICTED",
+          "canary": false,
+          "evidence": "[short] 用户在老家远程办公，生活在小城市，生活成本较低 | [medium(c=3,age=2)] 用户为了谈游戏发行已从生活三年的老家搬回深圳"
+        },
+        "if1": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if1",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if2": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if2",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if3": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if3",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "j1": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j1",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "j2": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j2",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "j3": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j3",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd1": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd1",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd2": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd2",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd3": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd3",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "se1": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se1",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户收到玩家第一条长评好评，看哭了，觉得值了"
+        },
+        "se2": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se2",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户去年参加 game jam，48 小时做完一个游戏并获得名次"
+        },
+        "se3": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se3",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户三年前辞职做独立开发，把工牌留在工位直接走了，一点不后悔"
+        },
+        "sp1": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp1",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=5,age=9)] 用户做游戏只使用 Godot 引擎，不使用其他引擎 | [interest] Godot 引擎"
+        },
+        "sp2": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=4,age=9)] 用户效率最高的时段是深夜，代码都在凌晨编写"
+        },
+        "sp3": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp3",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=5,age=8)] 用户的游戏全部采用像素风，这是其个人标志性风格 | [interest] 像素风"
+        }
+      },
+      "category_stats": {
+        "stable_preference": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "evolving_fact": {
+          "pass": 2,
+          "fail": 1,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "one_shot_junk": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "re_derivable": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "critical_lowfreq": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "salient_episode": {
+          "pass": 0,
+          "fail": 0,
+          "total": 0,
+          "canary_ok": 3,
+          "canary_total": 3
+        },
+        "contradiction": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "implanted_false": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        }
+      },
+      "store_stats": {
+        "short": 7,
+        "medium": 10,
+        "long": 0,
+        "extraction_count": 24,
+        "interests": 3,
+        "preferences": 2
+      },
+      "usage": {
+        "calls": 24,
+        "input_tokens": 72786,
+        "output_tokens": 2439,
+        "cached_tokens": 54272,
+        "api_errors": 0
+      },
+      "turns": 120,
+      "api_errors": 0
+    },
+    "p5_acg_fan": {
+      "results": {
+        "cl1": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl1",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户眼角膜受过伤，不能戴隐形眼镜，cos 只能戴框架改"
+        },
+        "cl2": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户对乳胶过敏，购买道具手套时需注意材质"
+        },
+        "cl3": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl3",
+          "passed": false,
+          "canary": false,
+          "status": "MISSING",
+          "evidence": ""
+        },
+        "ct1": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct1",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=7,age=2)] 用户最近开始追国漫，追了好几部，打破之前只看日漫的习惯"
+        },
+        "ct2": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct2",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=6,age=2)] 用户为了崩坏：星穹铁道的流萤氪了好几个648，已不再是完全不氪金的白嫖党"
+        },
+        "ct3": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct3",
+          "passed": false,
+          "status": "CONTRADICTED",
+          "canary": false,
+          "evidence": "[short] 用户在上海读书 | [short] 用户已从上海毕业，回到成都生活，上海是上学时的事"
+        },
+        "ef1": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef1",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=7,age=3)] 用户的本命从初音未来换成了崩坏：星穹铁道的流萤，初音仍留在心里但已不是第一本命"
+        },
+        "ef2": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef2",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=5,age=3)] 用户加入了 cos 社团，现在逛漫展都跟社团一起，不再一个人去"
+        },
+        "ef3": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef3",
+          "passed": false,
+          "status": "CONTRADICTED",
+          "canary": false,
+          "evidence": "[short] 用户正在学板绘，自认为画得很烂 | [medium(c=3,age=2)] 用户的板绘水平已经练出来，现在开始接约稿赚外快"
+        },
+        "if1": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if1",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if2": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if2",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if3": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if3",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "j1": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j1",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "j2": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j2",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "j3": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j3",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd1": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd1",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd2": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd2",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd3": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd3",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "se1": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se1",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户上周第一次上台 cos 走秀，虽然紧张腿抖但下台时感到特别爽"
+        },
+        "se2": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se2",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户和认识四年的网友第一次面基，聊到展馆关门也不觉得尴尬"
+        },
+        "se3": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se3",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户养猫，最贵的一只手办被猫推下去摔碎了，心痛到失眠三天"
+        },
+        "sp1": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp1",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=4,age=9)] 用户玩 cosplay 已有五年，每个月至少出一套 | [interest] cosplay"
+        },
+        "sp2": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=4,age=9)] 用户收藏手办只买正版，不碰盗版"
+        },
+        "sp3": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp3",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=5,age=8)] 用户追番从不看解说剪辑，只看原片"
+        }
+      },
+      "category_stats": {
+        "stable_preference": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "evolving_fact": {
+          "pass": 2,
+          "fail": 1,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "one_shot_junk": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "re_derivable": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "critical_lowfreq": {
+          "pass": 2,
+          "fail": 1,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "salient_episode": {
+          "pass": 0,
+          "fail": 0,
+          "total": 0,
+          "canary_ok": 3,
+          "canary_total": 3
+        },
+        "contradiction": {
+          "pass": 2,
+          "fail": 1,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "implanted_false": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        }
+      },
+      "store_stats": {
+        "short": 9,
+        "medium": 8,
+        "long": 0,
+        "extraction_count": 24,
+        "interests": 7,
+        "preferences": 2
+      },
+      "usage": {
+        "calls": 24,
+        "input_tokens": 73325,
+        "output_tokens": 2429,
+        "cached_tokens": 53760,
+        "api_errors": 0
+      },
+      "turns": 120,
+      "api_errors": 0
+    },
+    "p6_retired_teacher": {
+      "results": {
+        "cl1": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl1",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户对磺胺类药物过敏，年轻时曾因过敏休克过一次"
+        },
+        "cl2": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户与老伴曾庆祝金婚纪念，他给老伴写了一幅长卷，老伴去世前看到了 | [short] 用户的老伴五年前去世，目前独自生活"
+        },
+        "cl3": {
+          "category": "critical_lowfreq",
+          "expect": "in_store",
+          "fid": "cl3",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[short] 用户左耳戴助听器，希望对话尽量用文字 | [preference] 交流方式 偏好文字交流（左耳戴助听器）"
+        },
+        "ct1": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct1",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=7,age=2)] 用户是退休语文老师，教了四十年书（不是数学老师）"
+        },
+        "ct2": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct2",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[medium(c=6,age=2)] 用户现在也用微信了，还在老年大学群里天天发早安"
+        },
+        "ct3": {
+          "category": "contradiction",
+          "expect": "single_value",
+          "fid": "ct3",
+          "passed": true,
+          "status": "EVOLVED",
+          "canary": false,
+          "evidence": "[medium(c=5,age=1)] 用户的孙女正在上小学三年级（不是初中）"
+        },
+        "ef1": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef1",
+          "passed": false,
+          "status": "LOST",
+          "canary": false,
+          "evidence": ""
+        },
+        "ef2": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef2",
+          "passed": true,
+          "status": "MERGED",
+          "canary": false,
+          "evidence": "[medium(c=4,age=3)] 用户上个月从老家县城搬到省城儿子家住，帮忙带孙女"
+        },
+        "ef3": {
+          "category": "evolving_fact",
+          "expect": "evolved",
+          "fid": "ef3",
+          "passed": false,
+          "status": "CONTRADICTED",
+          "canary": false,
+          "evidence": "[short] 用户血压有点偏高，正在观察中 | [medium(c=3,age=2)] 用户确诊高血压，开始每天吃降压药"
+        },
+        "if1": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if1",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if2": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if2",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "if3": {
+          "category": "implanted_false",
+          "expect": "absent",
+          "fid": "if3",
+          "passed": true,
+          "status": "ABSENT",
+          "canary": false,
+          "evidence": ""
+        },
+        "j1": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j1",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "j2": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j2",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "j3": {
+          "category": "one_shot_junk",
+          "expect": "absent",
+          "fid": "j3",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd1": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd1",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd2": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd2",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "rd3": {
+          "category": "re_derivable",
+          "expect": "absent",
+          "fid": "rd3",
+          "passed": true,
+          "canary": false,
+          "status": "ABSENT",
+          "evidence": ""
+        },
+        "se1": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se1",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户教了三十年书，上月第一批学生（已五十多岁）回来看望他"
+        },
+        "se2": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se2",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户的颜体书法在县里书法比赛获得一等奖"
+        },
+        "se3": {
+          "category": "salient_episode",
+          "expect": "canary",
+          "fid": "se3",
+          "canary": true,
+          "status": "CANARY-OK",
+          "passed": null,
+          "evidence": "[short] 用户与老伴曾庆祝金婚纪念，他给老伴写了一幅长卷，老伴去世前看到了"
+        },
+        "sp1": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp1",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=4,age=9)] 用户退休后每天写一小时毛笔字，主练颜体"
+        },
+        "sp2": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp2",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=4,age=9)] 用户听了一辈子京剧，最爱程派 | [interest] 京剧（程派）"
+        },
+        "sp3": {
+          "category": "stable_preference",
+          "expect": "in_store",
+          "fid": "sp3",
+          "passed": true,
+          "canary": false,
+          "status": "FOUND",
+          "evidence": "[medium(c=6,age=2)] 用户一点辣都不能吃，肠胃不行 | [preference] 饮食 完全不能吃辣（肠胃不好）"
+        }
+      },
+      "category_stats": {
+        "stable_preference": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "evolving_fact": {
+          "pass": 1,
+          "fail": 2,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "one_shot_junk": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "re_derivable": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "critical_lowfreq": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "salient_episode": {
+          "pass": 0,
+          "fail": 0,
+          "total": 0,
+          "canary_ok": 3,
+          "canary_total": 3
+        },
+        "contradiction": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        },
+        "implanted_false": {
+          "pass": 3,
+          "fail": 0,
+          "total": 3,
+          "canary_ok": 0,
+          "canary_total": 0
+        }
+      },
+      "store_stats": {
+        "short": 7,
+        "medium": 9,
+        "long": 0,
+        "extraction_count": 24,
+        "interests": 2,
+        "preferences": 2
+      },
+      "usage": {
+        "calls": 24,
+        "input_tokens": 72056,
+        "output_tokens": 2113,
+        "cached_tokens": 53760,
+        "api_errors": 0
+      },
+      "turns": 120,
+      "api_errors": 0
+    }
+  }
+}

@@ -343,12 +343,137 @@ LONG_RECALL_MAX_MATCHES = 3         # entries returned per recall_memory call
 LONG_RECALL_SNAPSHOT_CAP = 1200     # chars of conversation snapshot per entry
 LONG_RECALL_QUERY_LOG_CAP = 20      # query_log entries kept per LONG object
 
+# ── Ingest-level deterministic guards (Memory-Optimization-Plan ⑨) ──
+# Both fire ONLY on the judge="new" path inside _add_short, after the exact-dup
+# guard — a deterministic backstop for the two failure classes L2 exposed as
+# stable across runs:
+#   M2: explicit corrections the LLM judged "new" → the stale old value survived
+#       alongside the corrected one (all 6 persona ct3 facts failed, both versions)
+#   M1: repeated junk re-phrasings piling up as parallel SHORT items that each
+#       independently promote to MEDIUM (p2's 南京-work triple)
+# Deliberately narrow: 已经/现在/其实 are NOT correction markers — compatible
+# restatements must not clobber existing facts; routing those stays the LLM
+# judge's job (update/keep). False-positive guards live in test_agent.py
+# (花生过敏 vs 海鲜过敏 must coexist; 已经在玩原神五年 must not replace 每天肝原神).
+CORRECTION_MARKERS = ("不是", "而非", "不再", "说错", "纠正", "记错", "收回",
+                      "改成", "改为", "换成", "搬到", "搬回", "转行", "戒",
+                      "停用", "改口")
+NEARDUP_MERGE_DICE = 0.6            # char-bigram Dice ≥ this → same fact, re-phrased
+NEARDUP_MERGE_OVERLAP = 0.6         # OR containment ≥ this (a short variant of a
+                                    # longer embellished entry — Dice alone dilutes:
+                                    # 今年三十五岁 vs 今年三十岁,刚过完生日 = 0.43
+                                    # Dice but 0.60 overlap). Measured guard pairs
+                                    # stay ≤ 0.33: 花生/海鲜过敏 0.22, 杭州/南京
+                                    # 0.25→(0.33 for the bare pair), 原神五年/
+                                    # 每天肝日常 0.33, 咖啡/茶 0.17, 女儿幼儿园/
+                                    # 升小学 0.13.
+STALE_VARIANT_OVERLAP = 0.30        # ⑨ M2/M2b eligibility bar (Dice OR containment,
+                                    # PLUS ≥1 strong shared bigram — see
+                                    # _is_stale_variant). The first L2 batch-2 run
+                                    # used "any distinctive shared bigram" and
+                                    # over-fired badly: p4's 游戏-topic correction
+                                    # swept 第一款游戏亏损三万块 (shares only 游戏,
+                                    # 0.09) and every salient episode; p2's 升小学
+                                    # correction replaced the FUSED episode entry
+                                    # 有一个上幼儿园的女儿,曾因女儿演出感动落泪
+                                    # (0.18), erasing the canary. Measured: true
+                                    # variants score ≥ 0.30 (住在杭州/家住杭州 0.33,
+                                    # p4 ct1 外包 correction 0.31, 独生女 chain
+                                    # 0.5-1.0, 会计专业 0.7, 教数学 containment 0.5,
+                                    # 氪金 containment 0.63); harmful pairs stay
+                                    # ≤ 0.25 (fused-episode 0.18, 会计证考过了 0.25,
+                                    # 花生/海鲜 0.22, topic-word-only 0.09-0.15,
+                                    # 住在杭州/住在南京 rejected by the strong-bigram
+                                    # gate — their only share 住在 is stop-mixed).
+# Chars so generic that a bigram made of them carries no topic identity
+# (用户/每天/喜欢/的是…). A bigram is STRONG when BOTH chars are outside this set
+# (会计 strong even though 会 is generic; 住在/喜欢 stop-mixed → weak): weak
+# shares mark sentence-pattern overlap, not same-fact identity (see
+# _is_stale_variant — 住在杭州 vs 住在南京 share only 住在 and must not match).
+_BIGRAM_STOP_CHARS = frozenset("用户是我他她它的在了和与有都很非常就还也就都这那个一每天会喜欢说讲")
+
 TIER_SCHEMA_VERSION = 1
 
 
 def _new_id() -> str:
     """Stable-enough short id for tier items (uuid4 hex[:12])."""
     return uuid.uuid4().hex[:12]
+
+
+# ── ⑨ bigram helpers (pure stdlib, deterministic — safe on the sync ingest path) ──
+
+def _norm_bigram_text(text: str) -> str:
+    """Normalize for bigram comparison: drop a leading 用户, lowercase, keep alnum."""
+    t = (text or "").strip().lower()
+    if t.startswith("用户"):
+        t = t[2:]
+    return "".join(ch for ch in t if ch.isalnum())
+
+
+def _char_bigrams(text: str) -> set:
+    t = _norm_bigram_text(text)
+    if len(t) < 2:
+        return {t} if t else set()
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def _bigram_dice(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return 2.0 * len(a & b) / (len(a) + len(b))
+
+
+def _digit_signature(text: str) -> str:
+    """ASCII digit string of a fact, or "" when it carries none."""
+    return "".join(ch for ch in (text or "") if ch.isdigit())
+
+
+def _is_near_dup(a: set, b: set) -> bool:
+    """⑨ M1 criterion: Dice ≥ NEARDUP_MERGE_DICE OR containment ≥ NEARDUP_MERGE_OVERLAP.
+
+    Containment rescues the short-variant-vs-embellished-entry case where Dice
+    is diluted by the longer tail (measured on L2 baseline p3-ct3 data:
+    0.46 Dice / 0.75 overlap). Guard pairs stay far below both bars
+    (花生/海鲜过敏 0.25 Dice / 0.25 overlap; 杭州/南京 0.25/0.25;
+    原神五年/每天肝日常 0.14/0.40).
+    """
+    if not a or not b:
+        return False
+    inter = len(a & b)
+    if inter == 0:
+        return False
+    return (2.0 * inter / (len(a) + len(b)) >= NEARDUP_MERGE_DICE
+            or inter / min(len(a), len(b)) >= NEARDUP_MERGE_OVERLAP)
+
+
+def _is_stale_variant(a: set, b: set) -> bool:
+    """⑨ M2/M2b eligibility: a and b look like two wordings of the SAME fact.
+
+    Two gates, BOTH required:
+      - ≥1 STRONG shared bigram (neither char in _BIGRAM_STOP_CHARS). A
+        stop-mixed share like 住在/喜欢/每天 carries a generic pattern, not a
+        topic: 住在杭州 vs 住在南京 share only 住在 (Dice 0.33) yet are different
+        facts, while every measured genuine variant pair shares a strong
+        bigram (杭州, 独生, 会计, 外包, 3号…).
+      - Dice ≥ STALE_VARIANT_OVERLAP OR containment ≥ STALE_VARIANT_OVERLAP.
+        The weaker first-run bar ("any distinctive shared bigram") let a topic
+        word (游戏/儿子) alone qualify unrelated facts — measured over-fire in
+        the L2 batch-2 run (see the STALE_VARIANT_OVERLAP comment). Containment
+        (inter/min) keeps SHORT atomic facts eligible (教数学 vs 教的是语文不是
+        数学: Dice 0.125 but containment 0.5) while fused episode entries stay
+        protected (their unique 演出/感动/落泪 tail dilutes both ratios: 0.18).
+    """
+    if not a or not b:
+        return False
+    shared = a & b
+    inter = len(shared)
+    if inter == 0:
+        return False
+    if not any(bg[0] not in _BIGRAM_STOP_CHARS and bg[1] not in _BIGRAM_STOP_CHARS
+               for bg in shared):
+        return False
+    return (2.0 * inter / (len(a) + len(b)) >= STALE_VARIANT_OVERLAP
+            or inter / min(len(a), len(b)) >= STALE_VARIANT_OVERLAP)
 
 
 @dataclass
@@ -490,6 +615,8 @@ class TieredMemory:
         summary = {
             "new_short": 0, "reinforced_short": 0, "promoted_to_medium": 0,
             "reinforced_medium": 0, "promoted_to_long": 0, "demoted_to_short": 0,
+            "corrected_in_place": 0, "near_dup_merged": 0,   # ⑨ guard hits
+            "stale_swept": 0,                                # ⑨ M2b sibling drops
         }
 
         for cand in candidates:
@@ -532,12 +659,16 @@ class TieredMemory:
             return "", None, None
 
     def _add_short(self, st: UserTierState, content: str, turns, summary: dict):
-        """Insert a new SHORT item at the front, with a cheap exact-dup guard.
+        """Insert a new SHORT item at the front, with three deterministic guards.
 
-        The exact-dup guard is defense-in-depth against an LLM that lazily marks
-        everything "new" (Risk: judge-quality degradation). Semantic near-dupes
-        are the LLM judge's job (it sees SHORT in the judge list); we only catch
-        verbatim duplicates here.
+        All guards are defense-in-depth against an LLM judge that lazily marks
+        everything "new" (Risk: judge-quality degradation). Deep-semantic
+        routing stays the judge's job (it sees SHORT/MEDIUM in its list); here
+        we only fire on unambiguous surface signals, in order:
+          1. exact dup (verbatim)         → reinforce the existing item
+          2. ⑨ M2 correction replacement  → replace the corrected item in place
+          3. ⑨ M1 near-dup merge (Dice)   → reinforce the existing item
+          4. otherwise                    → new SHORT item at count=1
         """
         cl = content.strip().lower()
         for m in st.medium:
@@ -548,10 +679,140 @@ class TieredMemory:
             if s.content.strip().lower() == cl:
                 self._reinforce_short_item(st, s, turns, summary)
                 return
+
+        cand_bg = _char_bigrams(content)
+
+        # ⑨ M2 — correction replacement: the candidate carries a narrow
+        # correction marker AND looks like a re-wording of an existing entry
+        # (_is_stale_variant bar) → the corrected sentence supersedes that
+        # entry's content in place (count+1, age reset via the normal reinforce
+        # path), instead of coexisting with the stale old value. Sibling
+        # restatements of the same stale fact (same bar against the OLD
+        # content, e.g. an earlier phrasing-divergent variant) are swept out
+        # with it — otherwise they survive as parallel stale copies. Entries
+        # below the bar (topic-word-only overlap, fused episode entries) are
+        # never touched: a correction that can't be surface-matched falls
+        # through to M1/add and stays the LLM update-judge's job.
+        target = self._find_correction_target(st, content, cand_bg)
+        if target is not None:
+            # Sweep only at FIRST correction of this entry. On reinforcement
+            # passes the target content is already the corrected sentence,
+            # whose entities (姐姐…) overlap compatible adjacent facts — sweeping
+            # then would eat them (measured: 用户的姐姐是老师 lost).
+            if not any(mk in target.content for mk in CORRECTION_MARKERS):
+                self._sweep_stale_siblings(st, target, summary)
+            target.content = content
+            summary["corrected_in_place"] += 1
+            if isinstance(target, MediumItem):
+                self._reinforce_medium_item(st, target, turns, summary)
+            else:
+                self._reinforce_short_item(st, target, turns, summary)
+            return
+
+        # ⑨ M1 — near-dup merge: a verbatim-ish re-phrasing of an existing fact
+        # (_is_near_dup) reinforces ONE item instead of piling up parallel
+        # SHORT entries that each independently promote to MEDIUM. Wording is
+        # RECENCY-WINS (candidate replaces content): near-dup pairs that differ
+        # only in a value ("今年三十岁" → "今年三十五岁", no surface correction
+        # marker) keep the newer fact instead of the stale first-seen one. For
+        # true re-phrasings the swap is a no-op semantically.
+        #
+        # Digit guard: differing ASCII digit signatures ("事实1号" vs "事实10号",
+        # 手机号/门牌号/编号…) mark ENUMERATED variants, not re-phrasings — never
+        # merge those (a true identifier correction carries an M2 marker like
+        # 改成/换成 and rides the replacement path above). Chinese-numeral value
+        # changes (三十→三十五) have no ASCII digits and still merge recency-wins.
+        cand_digits = _digit_signature(content)
+        for m in st.medium:
+            other_digits = _digit_signature(m.content)
+            if (cand_digits and other_digits and cand_digits != other_digits):
+                continue
+            if _is_near_dup(cand_bg, _char_bigrams(m.content)):
+                summary["near_dup_merged"] += 1
+                m.content = content
+                self._reinforce_medium_item(st, m, turns, summary)
+                return
+        for s in st.short:
+            other_digits = _digit_signature(s.content)
+            if (cand_digits and other_digits and cand_digits != other_digits):
+                continue
+            if _is_near_dup(cand_bg, _char_bigrams(s.content)):
+                summary["near_dup_merged"] += 1
+                s.content = content
+                self._reinforce_short_item(st, s, turns, summary)
+                return
+
         st.short.insert(0, ShortItem(id=_new_id(), content=content, count=1))
         summary["new_short"] += 1
         while len(st.short) > SHORT_MAX:
             st.short.pop()
+
+    @staticmethod
+    def _find_correction_target(st: UserTierState, content: str,
+                                cand_bg: set) -> Optional[Any]:
+        """⑨ M2 scan: locate the existing entry this candidate explicitly corrects.
+
+        Two gates, BOTH required:
+          - candidate contains one of the narrow CORRECTION_MARKERS
+          - _is_stale_variant(candidate, entry) — distinctive shared bigram AND
+            Dice/containment ≥ STALE_VARIANT_OVERLAP (two wordings of one fact).
+            Fused episode entries (有一个上幼儿园的女儿,曾因女儿演出感动落泪) score
+            below the bar against a 升小学 correction and are never replaced —
+            the first L2 batch-2 run's looser gate erased p2/p4 canaries this way.
+
+        Among all gate-passing entries the BEST match wins (most shared bigrams,
+        Dice as tiebreak, MEDIUM before SHORT on equal scores): a correction
+        sentence often mentions a new entity too ("不是独生女，有一个姐姐"), and
+        first-match could wrongly target a compatible adjacent fact ("姐姐是老师")
+        instead of the contradicted one ("是独生女"). Returns None when no entry
+        passes, so compatible restatements ("已经在玩原神五年" vs "每天肝原神日常")
+        fall through to the near-dup/add paths untouched.
+        """
+        if not any(mk in content for mk in CORRECTION_MARKERS):
+            return None
+        best, best_key = None, None
+        for tier, lst in ((1, st.medium), (0, st.short)):
+            for item in lst:
+                item_bg = _char_bigrams(item.content)
+                if not _is_stale_variant(cand_bg, item_bg):
+                    continue
+                key = (len(cand_bg & item_bg), _bigram_dice(cand_bg, item_bg), tier)
+                if best_key is None or key > best_key:
+                    best, best_key = item, key
+        return best
+
+    @staticmethod
+    def _sweep_stale_siblings(st: UserTierState, target: Any, summary: dict):
+        """⑨ M2b: drop sibling restatements of the fact being corrected.
+
+        Keyed on the TARGET'S OLD content (pre-correction wording only — the
+        caller skips the sweep on reinforcement passes): entries passing the
+        _is_stale_variant bar against the superseded fact are restatements of it
+        and would otherwise survive as parallel stale copies. The bar is
+        deliberately below near-dup but above topic-word level: 住在杭州 vs
+        家住杭州 (Dice/containment 0.33) are the same stale fact under
+        differently-phrased variants — the exact multi-variant failure the L2
+        baseline showed for p2 ct1/ct3 — while 游戏音乐外包 vs 第一款游戏亏损三万块
+        (shares only 游戏, 0.10) must NOT sweep. The first L2 batch-2 run used
+        "any distinctive shared bigram" here and halved p4's store (cl3 + all
+        3 canaries lost); the numeric bar is the fix.
+
+        Compatible facts related to the NEW sentence (用户的姐姐是老师 when the
+        correction mentions 姐姐) share nothing with the OLD content and are
+        safe. The earlier accepted-residual-risk case is now resolved by the
+        bar: 用户的会计证考过了 vs old 是会计专业 scores 0.22/0.25 → kept.
+        """
+        old_bg = _char_bigrams(target.content)
+        swept = 0
+        for lst in (st.medium, st.short):
+            keep = [item for item in lst
+                    if item is target
+                    or not _is_stale_variant(old_bg, _char_bigrams(item.content))]
+            if len(keep) != len(lst):
+                swept += len(lst) - len(keep)
+                lst[:] = keep
+        if swept:
+            summary["stale_swept"] = summary.get("stale_swept", 0) + swept
 
     def _reinforce_short_item(self, st: UserTierState, item: ShortItem, turns, summary: dict):
         item.count += 1

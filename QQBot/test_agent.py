@@ -1228,6 +1228,7 @@ class TestProfileExtraction:
         self.test_prompt_no_new_facts()
         self.test_format_conversation_window()
         self.test_apply_extraction_filters_interests()
+        self.test_updated_preferences_revision()
         # Layer 3 — batching / single-flight / delete-flush
         asyncio.run(self.test_observe_turn_flush_at_k())
         asyncio.run(self.test_single_flight())
@@ -1329,7 +1330,10 @@ class TestProfileExtraction:
                       # (litmus-style second criterion + few-shot 例6).
                       "可再推导测试", "例6", "流浪者",
                       # ⑧ user corrections → judge="update" (few-shot 例7).
-                      "例7", "纠正"]:
+                      "例7", "纠正",
+                      # ⑩ preference-slot revision path (few-shot 例8):
+                      # rule-4 amendment + schema field + null-delete semantics.
+                      "updated_preferences", "例8", "null"]:
             assert token in prompt, f"prompt missing {token!r}"
         # No judge_list → the "暂无已有记忆" branch tells the model to use judge="new".
         assert "暂无已有记忆" in prompt, "empty judge_list must use the no-memory branch"
@@ -1390,6 +1394,35 @@ class TestProfileExtraction:
             # empty extraction → changed False (no writes)
             assert mgr._apply_extraction(mgr.get("u_noop"), "u_noop", {}) is False
             print_pass("Layer1 _apply_extraction: L2-filters interests, sets nickname/prefs, changed flag")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_updated_preferences_revision(self):
+        """⑩: updated_preferences overwrites an existing slot, null deletes it,
+        unknown-key delete is a no-op — the rule-4 "write-once preferences"
+        blind spot the L2 baseline exposed as stable staleness (×4, both versions)."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            from agent.profile import ProfileManager
+            mgr = ProfileManager(base_dir=tmpdir)
+            prof = mgr.get("u_upd")
+            prof.preferences.update({"设备": "安卓手机", "饮品": "不喝咖啡", "语言": "中文"})
+            changed = mgr._apply_extraction(prof, "u_upd", {
+                "updated_preferences": {"设备": "iPhone", "饮品": None, "不存在的键": None},
+            })
+            assert changed is True
+            assert prof.preferences.get("设备") == "iPhone", prof.preferences
+            assert "饮品" not in prof.preferences, "null must delete the slot"
+            assert "不存在的键" not in prof.preferences, "unknown-key delete is a no-op"
+            assert prof.preferences.get("语言") == "中文", "untouched slots stay"
+            # same-value update → changed False (no spurious writes)
+            assert mgr._apply_extraction(prof, "u_upd",
+                                         {"updated_preferences": {"设备": "iPhone"}}) is False
+            # non-dict payload is ignored defensively
+            assert mgr._apply_extraction(prof, "u_upd",
+                                         {"updated_preferences": "iPhone"}) is False
+            assert prof.preferences.get("设备") == "iPhone"
+            print_pass("⑩ updated_preferences: overwrite / null-delete / no-op / idempotent")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -2371,6 +2404,15 @@ class TestTieredMemory:
         self.test_touch_extraction_count()
         self.test_persistence_roundtrip()
         self.test_load_all()
+        self.test_correction_replaces_stale_short()
+        self.test_correction_sweeps_stale_variants_keeps_adjacent()
+        self.test_correction_targets_medium_and_resets_age()
+        self.test_correction_requires_marker()
+        self.test_neardup_merge_recency_wins()
+        self.test_neardup_guard_distinct_facts_coexist()
+        self.test_neardup_digit_guard_enumerations()
+        self.test_correction_spares_fused_episode_entry()
+        self.test_correction_no_topic_word_sweep()
 
     # ── SHORT ────────────────────────────────────────────────────
 
@@ -2443,12 +2485,17 @@ class TestTieredMemory:
         try:
             from agent.memory import SHORT_MAX
             tm = self._tm(tmp)
-            for i in range(SHORT_MAX + 10):
-                tm.ingest_candidates("u", [(f"独特事实编号{i}", "new", None)])
+            # ⑨ note: "编号{i}" items differ by ONE char — normally the numeric-
+            # correction pattern M1 collapses (三十岁→三十五岁); the ASCII digit
+            # guard keeps distinct enumerations separate, so this stays a valid
+            # 60-distinct-item overflow fixture.
+            contents = [f"独特事实编号{i}" for i in range(SHORT_MAX + 10)]
+            for c in contents:
+                tm.ingest_candidates("u", [(c, "new", None)])
             st = tm._get_state("u")
             assert len(st.short) == SHORT_MAX, f"SHORT must cap at {SHORT_MAX}, got {len(st.short)}"
             # newest survives at front, oldest evicted from tail
-            assert st.short[0].content == f"独特事实编号{SHORT_MAX + 9}"
+            assert st.short[0].content == contents[-1]
             assert all(f"编号0" not in x.content for x in st.short), "oldest should be evicted"
             print_pass("SHORT: overflow evicts oldest from tail (cap SHORT_MAX)")
         finally:
@@ -2797,6 +2844,244 @@ class TestTieredMemory:
             assert tm2.load_all() == 3
             assert tm2._get_state("bob").short[0].content == "bob 事实"
             print_pass("load_all: reloads every persisted user at startup")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── ⑨ ingest-level deterministic guards (Memory-Optimization-Plan) ──
+
+    def _drive(self, tm, uid, contents):
+        """Ingest each content as judge="new" (the path ⑨ guards), ticking the clock."""
+        summaries = []
+        for c in contents:
+            summaries.append(tm.ingest_candidates(uid, [(c, "new", None)], []))
+            tm.touch_extraction_count(uid)
+        return summaries
+
+    def _all_contents(self, tm, uid):
+        st = tm._get_state(uid)
+        return [s.content for s in st.short] + [m.content for m in st.medium]
+
+    def test_correction_replaces_stale_short(self):
+        """⑨ M2: L2 ct3 pattern — an explicit correction judged "new" must
+        replace the stale value in place, never coexist with it."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            ss = self._drive(tm, "u", [
+                "用户是会计专业的学生",
+                "用户是会计专业的学生",              # exact-dup → count=2
+                "用户是计算机专业的学生，不是会计专业",  # correction, judge="new"
+            ])
+            st = tm._get_state("u")
+            assert ss[2]["corrected_in_place"] == 1, ss[2]
+            assert len(st.short) + len(st.medium) == 1, self._all_contents(tm, "u")
+            assert "不是会计专业" in self._all_contents(tm, "u")[0]
+            # replaced in place: count inherited+1 (=3 → promoted), age anchored
+            assert st.medium and st.medium[0].count == 3, [(m.content, m.count) for m in st.medium]
+            assert st.medium[0].entry_extraction_index == st.extraction_count - 1
+            print_pass("⑨ M2: explicit correction replaces stale SHORT value in place")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_correction_sweeps_stale_variants_keeps_adjacent(self):
+        """⑨ M2b: differently-phrased stale variants (住在杭州/家住杭州) are all
+        swept; a compatible adjacent fact (姐姐是老师) survives both orderings."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            self._drive(tm, "u", [
+                "用户是独生女",
+                "用户的姐姐是老师",                  # compatible adjacent — must survive
+                "用户不是独生女，有一个姐姐",
+                "用户不是独生女，她有一个亲姐姐",
+            ])
+            contents = self._all_contents(tm, "u")
+            assert "用户的姐姐是老师" in contents, contents
+            assert not any(c == "用户是独生女" for c in contents), contents
+            assert sum(1 for c in contents if "独生女" in c) == 1, contents
+            print_pass("⑨ M2b: stale variants swept, topic-adjacent compatible fact kept")
+
+            tm2 = self._tm(tempfile.mkdtemp())
+            self._drive(tm2, "v", [
+                "用户住在杭州",
+                "用户家住杭州",                     # stale variant, Dice-only 0.33 with the above
+                "用户全家去年已从杭州搬到南京居住",
+                "用户全家去年搬到了南京住",
+            ])
+            contents2 = self._all_contents(tm2, "v")
+            assert not any("住在杭州" in c or "家住杭州" in c for c in contents2), contents2
+            assert sum(1 for c in contents2 if "南京" in c) == 1, contents2
+            print_pass("⑨ M2b: phrasing-divergent stale variants (住在/家住) fully cleared")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_correction_targets_medium_and_resets_age(self):
+        """⑨ M2 on the MEDIUM tier: content replaced, count+1, age reset to 0."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            for _ in range(3):                      # promote to MEDIUM at count=3
+                tm.ingest_candidates("u", [("用户是健身教练", "new", None)], [])
+                tm.touch_extraction_count("u")
+            for _ in range(5):                      # let it age
+                tm.ingest_candidates("u", [], [])
+                tm.touch_extraction_count("u")
+            st = tm._get_state("u")
+            assert len(st.medium) == 1 and st.medium[0].count == 3
+            age_before = st.extraction_count - st.medium[0].entry_extraction_index
+            assert age_before >= 5, age_before
+            tm.ingest_candidates("u", [("用户已转行，现在是快递员，不再是健身教练", "new", None)], [])
+            assert len(st.medium) == 1 and not st.short
+            assert st.medium[0].content == "用户已转行，现在是快递员，不再是健身教练"
+            assert st.medium[0].count == 4, "count inherited (+1), not restarted"
+            assert st.extraction_count - st.medium[0].entry_extraction_index == 0, \
+                f"correction resets age (was {age_before})"
+            print_pass("⑨ M2: MEDIUM-tier correction replaces content, count+1, age resets")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_correction_requires_marker(self):
+        """⑨ M2 gate 1: without a narrow correction marker, compatible
+        restatements must NOT clobber existing entries (no 已经/现在/其实 markers)."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            ss = self._drive(tm, "u", [
+                "用户每天肝原神日常",
+                "用户已经在玩原神五年了",            # shares 原神 topic, no narrow marker
+                "用户喜欢喝美式咖啡",
+                "用户不喝咖啡，只喝茶",              # 不 alone is NOT a marker (不是/不再 are)
+            ])
+            assert all(s["corrected_in_place"] == 0 for s in ss), ss
+            contents = self._all_contents(tm, "u")
+            assert len(contents) == 4, contents
+            print_pass("⑨ M2: no marker → no replacement (compatible facts coexist)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_neardup_merge_recency_wins(self):
+        """⑨ M1: unmarked numeric correction (三十岁→三十五岁) merges via the
+        containment rule and keeps the NEWER wording (recency-wins)."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            ss = self._drive(tm, "u", [
+                "用户今年三十岁",
+                "用户今年三十岁，刚过完生日",         # near-dup merge (Dice 0.62)
+                "用户今年三十五岁",                  # overlap 0.60 with embellished variant
+                "用户今年三十五岁了",
+            ])
+            assert ss[1]["near_dup_merged"] == 1 and ss[2]["near_dup_merged"] == 1, ss
+            st = tm._get_state("u")
+            contents = self._all_contents(tm, "u")
+            assert len(contents) == 1, contents
+            assert "三十五" in contents[0] and "三十岁" not in contents[0], contents
+            print_pass("⑨ M1: numeric near-dup chain collapses to one recency-wins item")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_neardup_guard_distinct_facts_coexist(self):
+        """⑨ M1 guards (measured from L2 baseline data): same-template allergy
+        pair, city pair, and evolving-fact pair must all stay separate."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import _char_bigrams, _is_near_dup
+            # unit-level: guard pairs far below both thresholds
+            guards = [
+                ("用户对花生过敏", "用户对海鲜过敏"),                     # Dice 0.25 / ovl 0.25
+                ("用户对花生过敏，吃了会休克", "用户对海鲜过敏，吃虾蟹起疹子"),  # 0.21 / 0.22
+                ("用户住在杭州", "用户住在南京"),                        # 0.25 / 0.33
+                ("用户每天肝原神日常", "用户已经在玩原神五年了"),           # 0.14 / 0.33
+                ("用户有一个上幼儿园的女儿", "用户的女儿今年九月升小学，适应得还不错"),
+            ]
+            for a, b in guards:
+                assert not _is_near_dup(_char_bigrams(a), _char_bigrams(b)), (a, b)
+            # end-to-end: repeated mentions of both allergies stay two items
+            tm = self._tm(tmp)
+            self._drive(tm, "u", [
+                "用户对花生过敏", "用户对海鲜过敏",
+                "用户对花生过敏，吃了会休克", "用户对海鲜过敏，吃虾蟹起疹子",
+            ])
+            contents = self._all_contents(tm, "u")
+            assert sum(1 for c in contents if "花生" in c) == 1, contents
+            assert sum(1 for c in contents if "海鲜" in c) == 1, contents
+            print_pass("⑨ M1: guard pairs (allergy template/city/evolving) never merge")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_neardup_digit_guard_enumerations(self):
+        """⑨ M1 digit guard: differing ASCII digit signatures mark ENUMERATED
+        variants (编号1号/编号10号 share 0.70 bigrams!) — they must coexist,
+        while identifier corrections still ride the M2 marker path."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            self._drive(tm, "u", [
+                "中期事实1号", "中期事实10号", "中期事实100号",
+            ])
+            contents = self._all_contents(tm, "u")
+            assert len(contents) == 3, f"digit variants must not merge: {contents}"
+            # same digits, near-dup template → merges as usual
+            self._drive(tm, "v", ["用户住在3号楼", "用户住在3号楼房子里"])
+            contents_v = self._all_contents(tm, "v")
+            assert len(contents_v) == 1, contents_v
+            # identifier correction with M2 marker still replaces (the corrected
+            # sentence restates the identifier topic → containment 0.5 ≥ 0.33)
+            self._drive(tm, "w", ["用户住在3号楼", "用户不住3号楼了，改成住5号楼"])
+            contents_w = self._all_contents(tm, "w")
+            assert len(contents_w) == 1 and "5号楼" in contents_w[0], contents_w
+            print_pass("⑨ M1: digit guard keeps enumerations, M2 still corrects identifiers")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_correction_spares_fused_episode_entry(self):
+        """⑨ M2 bar (L2 batch-2 p2 se1 regression): extraction often FUSES an
+        episode into a fact entry (有一个上幼儿园的女儿,曾因女儿演出感动落泪).
+        A later 升小学 correction shares 女儿/幼儿/儿园 with it but scores
+        0.18/0.21 — below STALE_VARIANT_OVERLAP → the fused entry (and its
+        canary episode) must survive untouched; the correction lands as new."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            fused = "用户有一个上幼儿园的女儿，曾因女儿演出感动落泪"
+            ss = self._drive(tm, "u", [
+                fused,
+                "用户女儿今年九月升小学了，不再是幼儿园的小朋友",
+            ])
+            assert ss[1]["corrected_in_place"] == 0, ss[1]
+            assert ss[1].get("stale_swept", 0) == 0, ss[1]
+            contents = self._all_contents(tm, "u")
+            assert fused in contents, contents          # episode detail preserved
+            assert any("升小学" in c for c in contents), contents
+            assert len(contents) == 2, contents
+            print_pass("⑨ M2: fused episode entry spared by correction below the variant bar")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_correction_no_topic_word_sweep(self):
+        """⑨ M2b bar (L2 batch-2 p4 regression): a correction sharing only a
+        topic word (游戏, Dice 0.09-0.15) must neither target nor sweep
+        unrelated same-topic facts — the loose first-run bar halved p4's store
+        (cl3 亏损三万块 + all 3 salient episodes lost). The genuine stale entry
+        (从来不用外包…自己做, containment 0.36) IS still replaced."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            stale = "用户从来不用外包，游戏素材全自己做"
+            cl3 = "用户的第一款游戏亏损三万块"
+            ss = self._drive(tm, "u", [
+                stale,
+                cl3,
+                "用户的游戏音乐不再自己做，改为外包",
+            ])
+            assert ss[2]["corrected_in_place"] == 1, ss[2]
+            assert ss[2].get("stale_swept", 0) == 0, ss[2]
+            contents = self._all_contents(tm, "u")
+            assert cl3 in contents, contents            # topic-adjacent fact survives
+            assert not any("从来不用外包" in c for c in contents), contents
+            assert any("改为外包" in c for c in contents), contents
+            assert len(contents) == 2, contents
+            print_pass("⑨ M2b: topic-word-only overlap neither targets nor sweeps")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

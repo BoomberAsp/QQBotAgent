@@ -173,7 +173,9 @@ class UserProfile:
 # 根因（截图/助手解读当证据、一次性抽卡结果、bot 状态、瞬时决策态、可再推导的
 # 公开信息）；一个正例演示「用户自述持久兴趣」该抽取。反例是主力——模型已证明
 # 会无视纯文字禁令。例6 对应 Memory-Optimization-Plan ②（可再推导测试），
-# 例7 对应 ⑧（用户纠正 → judge="update"，chat-export 冲突消解改进点）。
+# 例7 对应 ⑧（用户纠正 → judge="update"，chat-export 冲突消解改进点），
+# 例8 对应 ⑩（画像偏好槽位被推翻 → updated_preferences 覆盖/null 删除——
+# 修规则4「只抽新信息」让陈旧槽位永不修订的死角，L2 两版本稳定复现 ×4）。
 _PROFILE_FEW_SHOT = """例1（截图/助手解读 ≠ 用户事实 → {}）
 输入:
 <conversation>
@@ -241,7 +243,19 @@ _PROFILE_FEW_SHOT = """例1（截图/助手解读 ≠ 用户事实 → {}）
 输出: {"memory_candidates": [{"content": "用户已把每周跑步三次改为每周游泳三次", "judge": "update", "matched_id": "m7"}]}
 （用户明确纠正/更新旧信息时，必须给 update：content 写纠正后的完整事实句，
 matched_id 指向被纠正的条目——绝不能无视纠正让旧记忆存活，也不要另建一条
-与之矛盾的新记忆。若「已有记忆」里找不到可纠正的条目，则用 judge="new"。）"""
+与之矛盾的新记忆。若「已有记忆」里找不到可纠正的条目，则用 judge="new"。）
+
+例8（用户推翻 existing 画像里的偏好槽位 → updated_preferences；对应 Memory-Optimization-Plan ⑩）
+输入（假设 existing 画像为 {"preferences": {"设备": "安卓手机", "饮品": "不喝咖啡"}}）:
+<conversation>
+用户: 我上周换 iPhone 了，以后别给我推安卓教程；咖啡也戒了，改喝茶
+助手(Roxy): 好的，之后按 iOS 的来，茶饮推荐也安排……
+</conversation>
+输出: {"updated_preferences": {"设备": "iPhone", "饮品": null}}
+（existing 里已有的偏好槽位被用户推翻或修改时，必须用 updated_preferences 覆盖旧值；
+偏好彻底不成立（戒了/不再/改成别的了）就把值设为 null 删除该槽位。规则4的
+「只抽新信息」绝不意味着让旧槽位永远残留；也不要把修正值塞进 new_preferences
+造成新旧并存。键名必须与 existing 画像里的键完全一致。）"""
 
 
 class ProfileManager:
@@ -564,6 +578,29 @@ class ProfileManager:
             )
             changed = True
 
+        # updated_preferences (⑩): revise or delete EXISTING slots. Rule 4's
+        # "only extract NEW info" made preferences write-once — L2 showed stale
+        # values (设备:安卓手机 / 从不氪金 / 只看日漫) surviving explicit
+        # contradiction in BOTH engine versions. value None → slot no longer
+        # holds → delete. Keys must match existing ones exactly (the model sees
+        # the full existing profile in the prompt); an unknown key on update
+        # simply creates the slot, on delete is a no-op.
+        upd_prefs = extracted.get("updated_preferences")
+        if upd_prefs and isinstance(upd_prefs, dict):
+            for k, v in upd_prefs.items():
+                key = str(k)[:50]
+                if v is None:
+                    if profile.preferences.pop(key, None) is not None:
+                        changed = True
+                        logger.debug("[profile] pref-delete user={} key={!r}", user_id, key)
+                else:
+                    new_val = str(v)[:100]
+                    if profile.preferences.get(key) != new_val:
+                        profile.preferences[key] = new_val
+                        changed = True
+                        logger.debug("[profile] pref-update user={} key={!r} val={!r}",
+                                     user_id, key, new_val)
+
         # P1: route memory_candidates into the three-tier engine. The Layer-2
         # filter runs on candidate content BEFORE ingestion (§4 principle I).
         if self._memory:
@@ -702,7 +739,10 @@ class ProfileManager:
             "3. 每条候选必须【自包含】：把指代（该项目/这个/上面说的）解析成明确的命名实体；"
             "无法解析成一句独立成立的话，就丢弃。\n"
             "4. nickname/new_interests/new_preferences 只抽取 existing 画像里没有的【新】信息；"
-            "memory_candidates 则须对照「已有记忆」判定 judge（见下）。\n"
+            "但若用户【推翻或修改】了 existing 画像里已有的偏好（如换了手机、开始喝咖啡了），"
+            "必须用 updated_preferences 覆盖旧值（偏好不再成立则填 null 删除）——"
+            "「只抽新信息」绝不意味着让旧槽位永远残留，也不要把修正值塞进 new_preferences；\n"
+            "   memory_candidates 则须对照「已有记忆」判定 judge（见下）。\n"
             "5. 客观、不臆测：记「玩原神」，不记「可能是开发者」。\n"
             "6. 只抽取关于用户的，不抽取关于助手(Roxy)的。\n"
             "7. 没有新信息就返回 {}。\n\n"
@@ -711,6 +751,7 @@ class ProfileManager:
             '  "nickname": "用户提到的名字或希望被怎样称呼",\n'
             '  "new_interests": ["用户表现出的持久兴趣/话题", ...],\n'
             '  "new_preferences": {"语言/回复风格等偏好键": "偏好值"},\n'
+            '  "updated_preferences": {"existing画像里已有的偏好键": "修正后的新值；该偏好已不成立则为 null"},\n'
             '  "memory_candidates": [\n'
             '    {"content": "关于用户的精炼、自包含事实句（通过石蕊测试）",\n'
             '     "judge": "new | reinforce_short | update | keep",\n'

@@ -232,6 +232,26 @@ QQBot/benchmarks/memory/
 > **批次 1 验收回补结论**：② 达成（假晋升率：rd 类 2/18 → 0/18）；⑧ 部分达成
 > （ef 类 +4 方向正确，ct 类无法在单跑分辨率下证明，且稳定失败核指向需要 ⑨）；
 > ①⑦ 不经 L2 路径（L1 已验证）。
+>
+> **L2 批次 1.5 结果（⑨⑩ 后，2026-10-21，engine 未提交版 + 收紧后门槛，vs post_batch1）**：
+> **111/126 = 88%**（+5，超出 ±4 单跑分辨率），canary 16/18，泄漏 5 → **3**，
+> token ~448k（cache ~71%），每 persona 24 批次不变。
+> **contradiction 类别 7/18 → 16/18（+9，零回归）**——失败画像 ⑴「纠正后旧值残留 ×11」
+> 修掉 9 条；剩余 2 条（p2 ct3 杭州→南京、p5 ct3 上海→成都）正是 ⑨ 记录的已知边界：
+> 纠正句与旧值零词面重叠，引擎无法配对，仍归 LLM update 判定。
+> ⑩ 打通：p4 ct3「开发操作系统 Linux」、p6 ct2 微信偏好槽以 [preference] 修订形态通过。
+> **首跑过度开火事故（方法论记录）**：初版 M2/M2b 用「≥1 distinctive 共享 bigram」门槛，
+> 分数虚高（114/126）但 p4 被 topic-word 清扫砍掉 cl3 + 全部 3 条 canary（store 18→9），
+> p2 融合情节条目被就地覆盖——收紧为 strong-bigram + 0.30 数值门槛后 p4 canary 3/3、
+> cl3 恢复，代价是 3 分虚高回落（那 3 分本就是吃掉情节换来的）。
+> **波动与观察项**：ef 类 15/18 → 11/18（-4，两次 batch-2 运行回归成员不同、仅 p6 ef1/ef3
+> 重叠——LLM update 判定波动叠加 store 形态变化，非 ⑨ 直接机制：涉案对 Dice 均 ≤0.23
+> 不触发合并），列为下一批次观察项（④③ 落地后按类别复核）；p2 se2/se3 单次提及
+> canary 两跑不稳定（se3 两次都丢）——单次提及情节的抽取留存本就是 ⑤ episode
+> 通道（salience 取代 frequency）要解的问题；p2 sp1 / p5 cl3 各 1 条 MISSING 为抽取
+> 波动（无任何 ⑨ 路径可解释：涉案条目无标记、无强共享 bigram）。
+> junk 泄漏 p1 j3 / p5 j3 转 ABSENT 但 p3 三条照旧——与批次 0 结论一致：重复 junk
+> 晋升不归 ⑨ 管，根治等 Layer1 负面清单加强或 ④ 类型化。
 
 - **基线先行**：任何记忆架构改动动手前跑 L1+L2 存基线，改完跑对比——与 Cache-Hit-Rate-Plan 阶段 2 同一套方法论，共享 prefix-hash 与 TokenLedger 基础设施；
   ⚠️ 实际执行偏离（用户 2026-10-20 决定）：批次 1（①②⑦⑧）先于 benchmark 实施，以单测代偿验证；批次 0 建基线时需**额外回补**"优化后 vs 优化前"的对照口径（旧行为可由 git 历史复现）；
@@ -276,6 +296,26 @@ QQBot/benchmarks/memory/
 #### ⑧ 用户纠正处理（chat-export 冲突消解改进点，批次 1 追加） ✅ 已实施（2026-10-20）
 
 > 来源：docs/chat-export-1792425090111.json 的"负面反馈/冲突消解"建议。做法：Layer1 judge 路由加一条纠正规则（用户纠正/推翻已有记忆 → 必须 judge="update" + matched_id，content=纠正后完整事实句，禁止无视纠正或另建矛盾新记忆）+ few-shot 例7（"不跑步改游泳" → update m7）。已核实纠正句（"改为/不再/现在…"）不被 L2 任何规则误杀（transient_state 类别此前已整体移除），并在 L2-X 单测加两条纠正句防回归。
+
+#### ⑨ 引擎级纠正替换 + 近重复合并（ingest 兜底，L2 稳定失败核驱动） ✅ 已实施（2026-10-21）
+
+> 来源：L2 两版本稳定复现的失败核 ⑴「纠正后旧值残留 ×11」——⑧ 的 prompt 级路由不可靠（模型照样输出 judge="new"），需要引擎级确定性兜底。全部在 `memory.py` `_add_short` 的 judge="new" 路径上做，纯 stdlib 字符二元组（char-bigram）比较，无 LLM 调用、无 schema 改动。
+>
+> **守卫链（精确重复 → M2 → M1 → 新增）**：
+> - **M2 纠正替换**：候选含窄纠正标记（`CORRECTION_MARKERS`：不是/而非/不再/说错/纠正/记错/收回/改成/改为/换成/搬到/搬回/转行/戒/停用/改口——刻意排除 已经/现在/其实，兼容重述仍归 LLM judge 管）且与某存量条目构成 `_is_stale_variant` → 原条目 content 就地替换 + 走既有 reinforce 路径（count+1、age 归零、该晋升晋升）。多候选取 best-match（共享 bigram 数 → Dice → MEDIUM 优先），防纠正句里的新实体（"有一个姐姐"）错配相邻兼容事实（"姐姐是老师"）。
+> - **M2b 陈旧变体清扫**：仅首次纠正时（目标 content 已含标记则跳过，防增强轮误扫），以目标**旧内容**为键，把与之构成 `_is_stale_variant` 的兄弟条目一并清掉——修「同一陈旧事实多措辞变体并存」（住在杭州/家住杭州，L2 p2 ct1/ct3 实测形态）。
+> - **M1 近重复合并**：无标记但 Dice ≥ 0.6 或 containment ≥ 0.6 → 合并为一条，**措辞 recency-wins**（候选覆盖存量）——无标记数值修正（今年三十岁→今年三十五岁，containment 0.60）保留新值而非首见值；真复述场景覆盖是语义 no-op。**数字守卫**：双方 ASCII 数字签名都非空且不同 → 视为枚举变体（事实1号 vs 事实10号 bigram 重合 0.70！）永不合并；中文数字值变化（三十→三十五）无 ASCII 数字照常合并；标识符纠正带 M2 标记走替换路径。
+>
+> **`_is_stale_variant` 门槛的两次收紧（L2 batch-2 实测教训）**：首跑用「≥1 个 distinctive 共享 bigram」当门槛，**过度开火**——p4 的 游戏-topic 纠正把只共享「游戏」的 第一款游戏亏损三万块（0.09）连带 3 条 salient episode 全扫掉（store 18→9，cl3 MISSING + canary 0/3）；p2 的 升小学 纠正把**融合条目**「有一个上幼儿园的女儿,曾因女儿演出感动落泪」（0.18）就地覆盖，抹掉 canary 情节。修复：数值门槛（Dice 或 containment ≥ `STALE_VARIANT_OVERLAP`=0.30）**加**「≥1 个 strong 共享 bigram（双字都不在停用字集）」——住在杭州/住在南京 只共享停混 bigram「住在」被 strong 门拒掉，真变体对（杭州 0.33、独生女链 0.5-1.0、会计 0.7、p4 ct1 外包 0.31、教数学 containment 0.5、氪金 containment 0.63）全数通过，有害对（融合条目 0.18、会计证考过了 0.25、花生/海鲜 0.22、topic-only 0.09-0.15）全数拒绝，19/19 实测对分类正确。
+>
+> 单测：TestTieredMemory 新增 10 项（M2 替换/晋升/age 归零、M2b 清扫变体+保相邻、无标记不触发、M1 recency-wins 数值链、守卫对共存、数字守卫枚举、融合条目保护、topic-word 不清扫——后两项直接编码 L2 batch-2 首跑回归）；L1 六个 gate 场景全绿，churn 0.031/any 0.68 与 ⑥ 参考基线一致（⑨ 不搅动注入排序）。07_persistence_roundtrip 场景的 甲/乙/丙 事实加装饰尾巴（避免与 M1 模板碰撞，checkpoint 用子串匹配不需改）。
+> 已知边界（记录不修）：纠正句与旧值零词面重叠时（独自住在老家县城 → 搬到省城儿子家住）引擎无法配对，仍依赖 LLM update 判定；junk 重复晋升 ×5 不归 ⑨ 管（合并只会巩固它们，根治靠负面清单/Layer1）。
+
+#### ⑩ profile.preferences 槽位修订路径 ✅ 已实施（2026-10-21）
+
+> 来源：L2 两版本稳定复现的失败核 ⑵「偏好槽写入后永不修订 ×4」（只看日漫/从不氪金/不喝咖啡/安卓手机）——抽取规则 4「只抽新信息」让陈旧槽位成为结构性死角。
+> 做法（全部在 `profile.py`）：抽取 JSON schema 新增 `updated_preferences: {key: new_value | null}` 字段（null = 偏好不再成立，删除槽位）；规则 4 补文「用户推翻/修改 existing 画像里的偏好时必须用 updated_preferences 覆盖，键名与 existing 完全一致，不要把修正值塞进 new_preferences 造成新旧并存」；few-shot 例8（设备:安卓手机→iPhone + 饮品→null）；`_apply_extraction` 应用路径：精确键匹配，null 走 `pop`（键不存在则 no-op 不置 changed），值变更才写 + `changed=True`（幂等，同值重写不触发落盘）。模型在 prompt 里能看到完整 existing 画像 dump，键对齐可行。
+> 单测：TestProfileExtraction 新增 test_updated_preferences_revision（覆盖/删除/no-op/未提及槽位不动/同值幂等/非 dict 防御）+ prompt token 锁定（updated_preferences/例8/null）。L2 验证：batch-2 首跑 p4 ct3「开发操作系统 Linux」以 [preference] 形态 EVOLVED、p6 ct2 微信偏好槽同步修正——偏好修订路径在真实管线打通。
 
 ### 第二梯队：schema 改动，是 ③⑤ 的地基
 
@@ -328,6 +368,7 @@ QQBot/benchmarks/memory/
 |---|---|---|---|
 | **0** ✅ 已完成（2026-10-21） | benchmark L1（含 episodic canary、LONG 可达性、存活曲线）+ L2 persona 与 runner | 无 | 基线快照进 `baselines/`（L1 双基线 + L2 post_batch1: **84%**，canary 17/18 如实记录）；L2 失败画像见 §3.5：纠正残留 ×11 / 偏好槽无纠正 ×4 / 重复 junk 晋升 ×5 → 候选优化点 ⑨⑩ |
 | **1** ✅ 已实施（2026-10-20，先于批次 0，用户决定） | ① LONG 索引+recall；② 负面清单；⑦ 缓冲落盘；⑧ 纠正处理（追加） | ~~批次 0~~ → 单测代偿（test_agent.py 15/15） | ✅ 已回补验证（L2 pre/post 对照，2026-10-21，§3.5）：L1 两场景转正；② 达成（rd 泄漏 2/18→0）；⑧ 部分达成（ef +4，ct 稳定失败核 → 候选 ⑨） |
+| **1.5** ✅ 已完成（2026-10-21） | ⑨ 引擎级纠正替换+近重复合并（M2/M2b/M1+数字守卫，strong-bigram 0.30 门槛）；⑩ preferences 槽位修订路径（updated_preferences 覆盖/null 删除） | 批次 0 基线（L2 稳定失败核 ⑴⑵ 驱动） | ✅ L2 post_batch2 vs post_batch1（§3.5）：84%→**88%**（+5 超分辨率），ct 类 7/18→**16/18** 零回归，泄漏 5→3，canary 16/18；ef 类 -4 列观察项；L1 全绿 churn 不变；test_agent.py 20/20 套件（⑨ 10 项 + ⑩ 1 项新单测） |
 | **2** | ④ category 类型化（含迁移脚本）→ ③ 时效标注 | 批次 1（避免同期多变量） | L2 evolving/critical 类别指标 |
 | **3** | ⑤ episode 通道（随 Bond P0/P5 排期） | ④ | episodic canary 转正；`salient_episode` 存活率 |
 | **4** | ⑥ 排序稳定化（视 Q3 数据决定做不做）；多模态扩展位启用（随 Bond P4/P5） | 批次 0 基线 | 搅动率下降且 QA 不降 |
