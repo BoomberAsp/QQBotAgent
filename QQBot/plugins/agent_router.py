@@ -9,7 +9,8 @@ agent/turn.py (moved verbatim). This plugin keeps only OneBot glue:
   - driver on_startup hooks: config hot-reload watcher, changelog
     broadcast / group-list export (both need OneBot bot APIs)
   - on_message / on_notice matchers with their platform-specific guards
-    (@-mention detection, continuous-mode window, poke filtering)
+    (@-mention detection, continuous-mode window, poke filtering),
+    converting events to agent.inbound views via adapters.onebot
   - matcher-slot registration into agent.turn (bottom of this file)
 """
 
@@ -39,6 +40,7 @@ from agent.turn import (
     # turn entry points (busy-guarded)
     run_agent_turn, run_continuous_turn, _handle_poke,
 )
+from adapters.onebot import build_view
 from lib.errors import log_exception
 from tools.card_renderer import render_changelog_card
 
@@ -315,9 +317,10 @@ agent_router = on_message(priority=1, block=False)
 @agent_router.handle()
 async def handle_agent_message(bot: Bot, event: MessageEvent):
     """Route incoming QQ messages through the Agent."""
-    user_id = str(event.user_id)
-
-    # Manual @mention check for group messages (more reliable than to_me())
+    # Manual @mention check for group messages (more reliable than to_me()).
+    # Kept on the raw event ON PURPOSE: build_view() computes the reply
+    # context (with [REPLY_DIAG] stderr output), which must not run for
+    # messages not directed at the bot.
     if isinstance(event, GroupMessageEvent):
         bot_qq = str(event.self_id)
         is_at_bot = any(
@@ -327,7 +330,7 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
         if not is_at_bot and not event.is_tome():
             return  # Not directed at bot, skip silently
 
-    await run_agent_turn(bot, event, user_id)
+    await run_agent_turn(build_view(bot, event))
 
 
 # ── Continuous Mode Handler ───────────────────────────────────────
@@ -343,9 +346,6 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
     if not isinstance(event, GroupMessageEvent):
         return
 
-    user_id = str(event.user_id)
-    group_id = str(event.group_id)
-
     # Skip messages that @ the bot — agent_router (priority=1) already handled them
     if event.is_tome():
         return
@@ -353,7 +353,7 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
     if any(seg.type == "at" and seg.data.get("qq") == bot_qq for seg in event.message):
         return  # agent_router will handle this (manual @mention detection)
 
-    await run_continuous_turn(bot, event, user_id, group_id)
+    await run_continuous_turn(build_view(bot, event))
 
 
 # ── P2: 戳一戳互动（Bond-System-Design.md §4.4 / §12）─────────────────

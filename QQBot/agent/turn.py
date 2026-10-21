@@ -3,16 +3,17 @@ Turn logic — the platform-independent core of the QQBot message pipeline.
 
 Stage-1 of the QQ-official worktree plan (feature/qq-official): moved
 verbatim out of plugins/agent_router.py so a second entry adapter (QQ
-official bot API) can share one kernel. This is a PURE MOVE — no logic
-changes; every line came from the plugin file unchanged except for the
-matcher-slot renames noted below.
+official bot API) can share one kernel.
 
-Temporary OneBot couplings still living here (removed in stage 2/3):
-  - _build_reply_context() parses OneBot reply segments / [CQ:reply]
-  - _download_voice() / _download_and_save_file() take a OneBot ``bot``
-    and call NapCat-specific actions
+Stage-2: the inbound side is now platform-agnostic — the entry points
+consume agent.inbound.InboundMessage views built by adapters/onebot.py,
+which also absorbed _build_reply_context / _download_voice /
+_download_and_save_file / _get_uploads_dir (all OneBot/NapCat-specific).
+
+Temporary OneBot couplings still living here (removed in stage 3):
   - _safe_send() retries on OneBot ActionFailed
   - card/image sends construct onebot.v11 MessageSegment at call sites
+  - _forced_refresh_wiki_data() grabs a Bot via nonebot.get_bots()
 
 Outbound sending goes through matcher slots (default_matcher /
 continuous_matcher / poke_matcher) assigned by the entry plugin at
@@ -37,13 +38,14 @@ import time
 import uuid
 
 import httpx
-# Stage-1 temporary OneBot imports (see module docstring). The entry
-# plugin passes its Bot/Event objects straight through to the handlers.
-from nonebot.adapters.onebot.v11 import (
-    Bot, GroupMessageEvent, MessageEvent, ActionFailed,
-)
+# Stage-3 temporary OneBot import: _safe_send() still retries on
+# ActionFailed and card sends construct MessageSegment at call sites.
+# Inbound events no longer reach this module — the entry plugin
+# converts them to agent.inbound.InboundMessage views (stage 2).
+from nonebot.adapters.onebot.v11 import ActionFailed
 
 from agent.agent import Agent
+from agent.inbound import InboundMessage
 from agent.continuous_session import ContinuousSessionManager
 from agent.context import (
     _send_msg, _current_user_workspace,
@@ -175,388 +177,10 @@ _init_workspace()
 
 
 # ── File Download Helpers ──────────────────────────────────────────
+# Stage 2: _get_uploads_dir / _download_voice / _download_and_save_file
+# moved to adapters/onebot.py (OneBot/NapCat-specific by nature). The
+# turn kernel consumes them through view.load_attachments().
 
-def _get_uploads_dir() -> str:
-    """Get the uploads directory at runtime, respecting user workspace contextvar.
-
-    Unlike the module-level WORKSPACE_UPLOADS constant (frozen at import time),
-    this checks _current_user_workspace on every call so files are saved to the
-    correct per-user workspace during special sessions.
-    """
-    user_ws = _current_user_workspace.get()
-    if user_ws:
-        return os.path.join(user_ws, "uploads")
-    # Fallback: shared workspace default
-    return os.path.join(_AGENT_DIR, "data", "workspace", "uploads")
-
-
-async def _download_voice(bot, seg_data: dict, message_id: str = "", max_size_mb: int = 50) -> tuple:
-    """Download a QQ voice message.
-
-    Args:
-        bot: NoneBot2 OneBot V11 Bot instance.
-        seg_data: The ``data`` dict from the record message segment.
-        message_id: The QQ message ID (some NapCat versions require this).
-        max_size_mb: Maximum file size in MB.
-
-    Returns:
-        (saved_path, error_message) — one is None, the other is not.
-    """
-    file_id = seg_data.get("file", "")
-    if not file_id:
-        return None, "语音文件 ID 为空，无法下载。"
-
-    max_size_bytes = max_size_mb * 1024 * 1024
-    _ensure_workspace_dirs()
-    uploads_dir = _get_uploads_dir()
-    os.makedirs(uploads_dir, exist_ok=True)
-    save_path = os.path.join(
-        uploads_dir,
-        f"{uuid.uuid4().hex[:8]}-{file_id}"
-    )
-
-    diag = []  # Collect diagnostics for the final error message
-
-    # ── Strategy 1: read local file directly ──────────────────────
-    for field in ("path", "url"):
-        local = seg_data.get(field, "")
-        if not local:
-            diag.append(f"[{field}] 字段为空")
-            continue
-        try:
-            with open(local, "rb") as src:
-                data = src.read()
-            if len(data) == 0:
-                diag.append(f"[{field}] 文件为空: {local}")
-                continue
-            if len(data) > max_size_bytes:
-                return None, f"语音文件过大 ({len(data) / 1024 / 1024:.1f} MB)，无法处理。"
-            with open(save_path, "wb") as dst:
-                dst.write(data)
-            return save_path, None
-        except FileNotFoundError:
-            diag.append(f"[{field}] 文件不存在: {local[:120]}")
-        except PermissionError:
-            diag.append(f"[{field}] 无权限读取: {local[:120]}")
-        except (IOError, OSError) as e:
-            diag.append(f"[{field}] IO错误: {e} — {local[:120]}")
-
-    # ── Strategy 2: OneBot get_record API ──────────────────────────
-    # Build base params: file / file_id + optional message_id
-    base_params = {}
-    if message_id:
-        base_params["message_id"] = message_id
-
-    # NapCat may use non-standard action/param names — try combinations
-    for action in ("get_record", "get_file", "getRecord", "download_file"):
-        for param_name in ("file", "file_id"):
-            params = {param_name: file_id, **base_params}
-            try:
-                result = await bot.call_api(action, **params)
-            except Exception as e:
-                diag.append(f"[API {action} {param_name}=] 异常: {e}")
-                continue
-
-            if isinstance(result, dict):
-                url_or_data = result.get("file", "") or result.get("path", "") or ""
-            elif isinstance(result, str):
-                url_or_data = result
-            else:
-                diag.append(f"[API {action} {param_name}=] 返回类型异常: {type(result).__name__}")
-                continue
-
-            if not url_or_data:
-                diag.append(f"[API {action} {param_name}=] 无 file/path 字段: {json.dumps(result, ensure_ascii=False)[:200]}")
-                continue
-
-            try:
-                if url_or_data.startswith("base64://"):
-                    import base64
-                    data = base64.b64decode(url_or_data[len("base64://"):])
-                elif url_or_data.startswith(("http://", "https://")):
-                    async with httpx.AsyncClient() as client:
-                        response = await client.get(url_or_data, timeout=120.0, follow_redirects=True)
-                        response.raise_for_status()
-                        data = response.content
-                elif os.path.isfile(url_or_data):
-                    with open(url_or_data, "rb") as src:
-                        data = src.read()
-                else:
-                    diag.append(f"[API {action} {param_name}=] 无法识别返回格式: {url_or_data[:120]}")
-                    continue
-
-                if len(data) > max_size_bytes:
-                    return None, f"语音文件过大 ({len(data) / 1024 / 1024:.1f} MB)，无法处理。"
-
-                with open(save_path, "wb") as dst:
-                    dst.write(data)
-                return save_path, None
-
-            except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
-                diag.append(f"[API {action} {param_name}=] 下载失败: {e}")
-                continue
-            except Exception as e:
-                diag.append(f"[API {action} {param_name}=] 处理返回值出错: {e}")
-                continue
-
-    # ── Strategy 3: NapCat HTTP API ────────────────────────────────
-    napcat_base = os.environ.get("NAPCAT_HTTP_BASE", "http://127.0.0.1:6099")
-    http_endpoints = (
-        ("POST", "/api/get_record"),
-        ("POST", "/api/getRecord"),
-        ("POST", "/api/record"),
-        ("POST", "/api/onebot/get_record"),
-        ("GET",  "/api/get_record"),
-    )
-    for method, endpoint in http_endpoints:
-        try:
-            async with httpx.AsyncClient() as client:
-                if method == "GET":
-                    resp = await client.get(
-                        f"{napcat_base.rstrip('/')}{endpoint}",
-                        params={"file": file_id},
-                        timeout=10.0,
-                    )
-                else:
-                    resp = await client.post(
-                        f"{napcat_base.rstrip('/')}{endpoint}",
-                        json={"file": file_id},
-                        timeout=10.0,
-                    )
-                if resp.status_code != 200:
-                    diag.append(f"[HTTP {method} {endpoint}] HTTP {resp.status_code}")
-                    continue
-
-                # Try to extract file data from various response shapes
-                body = resp.text
-                result = None
-                try:
-                    result = resp.json()
-                except Exception:
-                    pass
-
-                file_data = ""
-                if isinstance(result, dict):
-                    file_data = (
-                        result.get("file", "") or
-                        result.get("data", {}).get("file", "") if isinstance(result.get("data"), dict) else "" or
-                        result.get("result", {}).get("file", "") if isinstance(result.get("result"), dict) else "" or
-                        str(result)
-                    )
-                elif isinstance(result, str):
-                    file_data = result
-
-                if file_data and file_data.startswith("base64://"):
-                    import base64
-                    data = base64.b64decode(file_data[len("base64://"):])
-                elif file_data and os.path.isfile(str(file_data)):
-                    with open(str(file_data), "rb") as src:
-                        data = src.read()
-                elif file_data and len(file_data) > 100:
-                    # Might be raw base64 (without the base64:// prefix)
-                    try:
-                        import base64
-                        data = base64.b64decode(file_data)
-                    except Exception:
-                        # Also try raw binary response
-                        if resp.content and len(resp.content) > 10:
-                            data = resp.content
-                        else:
-                            diag.append(f"[HTTP {method} {endpoint}] 无法解析响应: {body[:120]}")
-                            continue
-                elif resp.content and len(resp.content) > 10:
-                    # Response might be raw binary (the audio file itself)
-                    data = resp.content
-                else:
-                    diag.append(f"[HTTP {method} {endpoint}] 无法解析响应: {body[:120]}")
-                    continue
-
-                if len(data) <= max_size_bytes:
-                    with open(save_path, "wb") as dst:
-                        dst.write(data)
-                    return save_path, None
-
-        except Exception as e:
-            diag.append(f"[HTTP {method} {endpoint}] 异常: {e}")
-            continue
-
-    return None, f"语音下载失败。诊断: {'; '.join(diag)}"
-
-
-async def _download_and_save_file(
-    url: str, filename: str, max_size_mb: int = 50,
-    bot=None, file_id: str = "",
-) -> tuple:
-    """Download a file from QQ and save to workspace uploads.
-
-    When the direct ``url`` is available it is used first (standard for
-    group-chat files).  When ``url`` is empty (common in private chats) the
-    function falls back to the OneBot ``get_file`` API if *bot* and *file_id*
-    are provided.
-
-    Args:
-        url: Download URL from the message segment (may be empty).
-        filename: Original filename (used for extension detection).
-        max_size_mb: Maximum file size in MB.
-        bot: Optional OneBot V11 Bot instance for API fallback.
-        file_id: File ID from the message segment for API fallback.
-
-    Returns:
-        (saved_path, error_message) — one is None, the other is not.
-    """
-    # ── Pick uploads dir at runtime (respects per-user workspace) ──
-    _ensure_workspace_dirs()
-    uploads_dir = _get_uploads_dir()
-    os.makedirs(uploads_dir, exist_ok=True)
-
-    # Generate safe filename: uuid8 prefix + sanitized original name
-    ext = os.path.splitext(filename)[1] or ""
-    safe_name = re.sub(r'[^\w\-_.]', '_', os.path.splitext(filename)[0])
-    if not safe_name:
-        safe_name = "file"
-    unique_name = f"{uuid.uuid4().hex[:8]}-{safe_name}{ext}"
-    save_path = os.path.join(uploads_dir, unique_name)
-
-    max_size_bytes = max_size_mb * 1024 * 1024
-
-    # ── Helper: detect file type from magic bytes ─────────────────
-    def _magic_ext(data: bytes) -> str:
-        if data[:4] == b'%PDF':
-            return ".pdf"
-        if data[:4] == b'\x89PNG':
-            return ".png"
-        if data[:3] == b'\xff\xd8\xff':
-            return ".jpg"
-        if data[:6] in (b'GIF87a', b'GIF89a'):
-            return ".gif"
-        if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
-            return ".webp"
-        if data[:2] == b'BM':
-            return ".bmp"
-        return ""
-
-    # ── Strategy 1: direct URL download ──────────────────────────
-    if url:
-        try:
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            }
-            async with httpx.AsyncClient(headers=headers) as client:
-                response = await client.get(url, timeout=120.0, follow_redirects=True)
-                response.raise_for_status()
-
-                content_length = len(response.content)
-                if content_length > max_size_bytes:
-                    return None, (
-                        f"文件过大 ({content_length / 1024 / 1024:.1f} MB)，"
-                        f"超过限制 ({max_size_mb} MB)。请压缩后重试。"
-                    )
-
-                # Determine actual extension: Content-Type first, then magic bytes
-                content_type = response.headers.get("content-type", "")
-                ct_map = {
-                    "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
-                    "image/webp": ".webp", "image/bmp": ".bmp",
-                    "application/pdf": ".pdf",
-                }
-                for ct_prefix, ct_ext in ct_map.items():
-                    if ct_prefix in content_type and not save_path.endswith(ct_ext):
-                        save_path = save_path + ct_ext
-                        break
-                else:
-                    # Content-Type didn't match — try magic bytes
-                    magic_ext = _magic_ext(response.content)
-                    if magic_ext and not save_path.endswith(magic_ext):
-                        save_path = save_path + magic_ext
-
-                with open(save_path, "wb") as f:
-                    f.write(response.content)
-
-                return save_path, None
-
-        except httpx.HTTPStatusError as e:
-            # QQ CDN URLs may return 400/403 with default headers — fall back to API
-            if e.response.status_code in (400, 403) and bot is not None and file_id:
-                pass  # Fall through to Strategy 2 below
-            else:
-                return None, f"下载失败 (HTTP {e.response.status_code}): {e.response.reason_phrase}"
-        except httpx.TimeoutException:
-            return None, "下载超时 (120秒)。文件可能过大或网络不稳定。"
-        except httpx.RequestError as e:
-            return None, f"网络请求失败: {e}"
-        except IOError as e:
-            return None, f"文件保存失败: {e}"
-        except Exception as e:
-            return None, f"下载文件时出现意外错误: {e}"
-
-    # ── Strategy 2: OneBot get_file API fallback (private chats) ──
-    if bot is not None and file_id:
-        diag = []
-        for action in ("get_file", "getFile", "download_file"):
-            for param_name in ("file", "file_id"):
-                try:
-                    result = await bot.call_api(action, **{param_name: file_id})
-                except Exception as e:
-                    diag.append(f"[API {action} {param_name}=] 异常: {e}")
-                    continue
-
-                if isinstance(result, dict):
-                    file_data = result.get("file", "") or result.get("path", "") or result.get("url", "") or ""
-                elif isinstance(result, str):
-                    file_data = result
-                else:
-                    diag.append(f"[API {action} {param_name}=] 返回类型异常: {type(result).__name__}")
-                    continue
-
-                if not file_data:
-                    diag.append(f"[API {action} {param_name}=] 无 file/path/url 字段: {json.dumps(result, ensure_ascii=False)[:200]}")
-                    continue
-
-                try:
-                    import base64
-                    if file_data.startswith("base64://"):
-                        data = base64.b64decode(file_data[len("base64://"):])
-                    elif file_data.startswith(("http://", "https://")):
-                        async with httpx.AsyncClient() as client:
-                            resp = await client.get(file_data, timeout=120.0, follow_redirects=True)
-                            resp.raise_for_status()
-                            data = resp.content
-                    elif os.path.isfile(file_data):
-                        with open(file_data, "rb") as src:
-                            data = src.read()
-                    else:
-                        diag.append(f"[API {action} {param_name}=] 无法识别返回格式: {file_data[:120]}")
-                        continue
-
-                    if len(data) > max_size_bytes:
-                        return None, f"文件过大 ({len(data) / 1024 / 1024:.1f} MB)，超过限制 ({max_size_mb} MB)。"
-
-                    with open(save_path, "wb") as f:
-                        f.write(data)
-
-                    # Fix extension from magic bytes if missing
-                    magic_ext = _magic_ext(data)
-                    if magic_ext and not save_path.endswith(magic_ext):
-                        new_path = save_path + magic_ext
-                        os.rename(save_path, new_path)
-                        save_path = new_path
-
-                    return save_path, None
-
-                except Exception as e:
-                    diag.append(f"[API {action} {param_name}=] 处理返回值出错: {e}")
-                    continue
-
-        return None, f"文件下载失败 (API fallback 已尝试 {len(diag)} 次)。诊断: {'; '.join(diag)}"
-
-    if not url and not file_id:
-        return None, "文件缺少下载地址和文件 ID，可能未成功上传或 QQ 客户端限制了文件传输。"
-    if not url:
-        return None, "文件下载地址为空（私聊文件可能需通过 OneBot API 下载，但缺少 bot 连接）。"
 
 
 # ── Build Tool Registry ──────────────────────────────────────────
@@ -1509,107 +1133,11 @@ async def _auto_cleanup_after(user_id: str, deadline: float) -> None:
     await _execute_cleanup_plan(user_id, plan, plan["candidates"], 0.8)
 
 
-def _build_reply_context(event: MessageEvent) -> str:
-    """Extract reply/quote context from a message's reply segment.
+# Stage 2: _build_reply_context moved to adapters/onebot.py as
+# build_reply_context() — reply-segment / [CQ:reply] parsing is
+# OneBot-specific. The entry plugin pre-computes it into
+# view.reply_context.
 
-    Returns a string for injection into the augmented message, or "" if
-    there is no reply segment.
-    """
-    # ── Diagnostic: log all message segments ───────────────────────
-    import sys
-    seg_types = [seg.type for seg in event.message]
-    print(f"[REPLY_DIAG] msg_id={event.message_id}  seg_types={seg_types}", file=sys.stderr, flush=True)
-
-    for seg in event.message:
-        if seg.type != "reply":
-            continue
-        reply_id = str(seg.data.get("id", ""))
-        reply_text = seg.data.get("text", "") or seg.data.get("message", "") or ""
-
-        parts = []
-
-        # ── Diagnostic: log reply lookup ──────────────────────────
-        print(f"[REPLY_DIAG] reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
-
-        if reply_text:
-            parts.append(f"[用户引用了消息: \"{reply_text}\"]")
-        elif reply_id:
-            parts.append(f"[用户回复了消息 {reply_id}]")
-
-        # Check if the replied-to message had files
-        if reply_id and reply_id in _recent_files:
-            files = _recent_files[reply_id]
-            for f in files:
-                if f.get("error"):
-                    parts.append(
-                        f"[用户引用了文件 \"{f['name']}\"，"
-                        f"但该文件之前下载失败（{f['error']}）。"
-                        f"请告知用户文件无法读取，建议重新上传。]"
-                    )
-                else:
-                    parts.append(
-                        f"[用户引用了文件 \"{f['name']}\"。"
-                        f"请根据用户意图选择合适的工具处理此文件："
-                        f"战斗截图测速/行动值分析用 parse_battle_screenshots，"
-                        f"一般图片或文档用 read_file，"
-                        f"忽略对话历史中关于其他文件的提及。"
-                        f"文件路径: {f['path']}]"
-                    )
-
-        return "\n".join(parts) if parts else ""
-
-    # ── Fallback: extract reply id from multiple sources ─────────
-    import re as _re
-
-    # 1) Try event.reply attribute (OneBot V11 field)
-    event_reply = getattr(event, 'reply', None)
-    if event_reply is not None:
-        # event.reply can be a dict {'message_id': ..., ...} or a Reply object
-        if isinstance(event_reply, dict):
-            reply_id = str(event_reply.get('message_id', '') or event_reply.get('id', ''))
-        else:
-            reply_id = str(getattr(event_reply, 'message_id', '') or getattr(event_reply, 'id', ''))
-        if reply_id:
-            print(f"[REPLY_DIAG] event.reply: reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
-            if reply_id in _recent_files:
-                files = _recent_files[reply_id]
-                parts = []
-                for f in files:
-                    parts.append(
-                        f"[用户引用了文件 \"{f['name']}\"。"
-                        f"请根据用户意图选择合适的工具处理此文件："
-                        f"战斗截图测速/行动值分析用 parse_battle_screenshots，"
-                        f"一般图片或文档用 read_file，"
-                        f"忽略对话历史中关于其他文件的提及。"
-                        f"文件路径: {f['path']}]"
-                    )
-                return "\n".join(parts) if parts else ""
-            else:
-                return f"[用户回复了消息 {reply_id}]"
-
-    # 2) Parse [CQ:reply,id=XXX] or [reply:id=XXX] from raw message
-    raw_msg = getattr(event, 'raw_message', '') or str(event.message)
-    m = _re.search(r'\[(?:CQ:)?reply[,:]id=(\d+)\]', raw_msg)
-    if m:
-        reply_id = m.group(1)
-        print(f"[REPLY_DIAG] regex fallback: reply_id={reply_id!r}  recent_keys={list(_recent_files.keys())!r}  match={reply_id in _recent_files}", file=sys.stderr, flush=True)
-        if reply_id in _recent_files:
-            files = _recent_files[reply_id]
-            parts = []
-            for f in files:
-                parts.append(
-                    f"[用户引用了文件 \"{f['name']}\"。"
-                    f"请根据用户意图选择合适的工具处理此文件："
-                    f"战斗截图测速/行动值分析用 parse_battle_screenshots，"
-                    f"一般图片或文档用 read_file，"
-                    f"忽略对话历史中关于其他文件的提及。"
-                    f"文件路径: {f['path']}]"
-                )
-            return "\n".join(parts) if parts else ""
-        else:
-            return f"[用户回复了消息 {reply_id}]"
-
-    return ""
 
 
 # ── User Info Tool ─────────────────────────────────────────────────
@@ -1948,32 +1476,33 @@ _tool_registry.register(
 
 
 # ── Turn entry points (busy-guard wrappers) ────────────────────────
-# The platform-specific guards (@-mention detection, poke filtering)
-# stay in plugins/agent_router.py; the bodies below were moved verbatim
-# out of the plugin handlers.
+# Platform-specific guards (@-mention detection, poke filtering) and
+# event->view conversion live in plugins/agent_router.py +
+# adapters/onebot.py; everything below consumes InboundMessage views.
 
-async def run_agent_turn(bot: Bot, event: MessageEvent, user_id: str):
+async def run_agent_turn(view: InboundMessage):
     """Run one agent turn under the per-user busy guard."""
+    user_id = view.user_id
     # ── Per-user concurrency guard ──
     if user_id in _user_busy:
-        _gid = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
         _pm = get_character_registry()
-        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, _gid))
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, view.group_id))
         await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~")
         return
     _user_busy.add(user_id)
     try:
-        return await _handle_agent_message_impl(bot, event, user_id)
+        return await handle_agent_turn(view)
     finally:
         _user_busy.discard(user_id)
 
 
-async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str):
+async def handle_agent_turn(view: InboundMessage):
     """Inner implementation — called under per-user busy guard."""
+    user_id = view.user_id
 
     # Token-usage attribution: set before triage so every LLM call of this
     # turn (triage / agent_loop / profile extraction) is tied to this user.
-    _gid = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+    _gid = view.group_id
     set_usage_context(user_id, _gid, "group" if _gid else "private")
 
     # Set user workspace for tool scoping
@@ -1981,7 +1510,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
     _current_user_workspace.set(_workspace_manager.get_workspace(user_id))
     _on_file_created.set(lambda p: _record_session_file(user_id, p))
 
-    text_content = event.get_plaintext().strip()
+    text_content = view.text
 
     # ── Handle pending delete confirmation (bare text, no / prefix) ──
     pending_delete = _pending_delete_confirm.get(user_id)
@@ -2074,13 +1603,12 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         # The continuous_router (priority=2) skips @mentioned messages, so this
         # must also be handled here when the user @-mentions the bot; otherwise
         # the command falls through to the agent loop and never ends the window.
-        if (isinstance(event, GroupMessageEvent)
-                and text_content in ("/取消", "#取消", "/结束", "#结束")):
-            _continuous_sessions.end(str(event.group_id), user_id)
+        if view.is_group and text_content in ("/取消", "#取消", "/结束", "#结束"):
+            _continuous_sessions.end(view.group_id, user_id)
             await _safe_send("已结束连续对话模式，之后需要@我才能触发~")
             return
         # /toggle command (group only, superuser only)
-        cmd_handled = await _handle_toggle_command(text_content, user_id, event)
+        cmd_handled = await _handle_toggle_command(text_content, user_id, view)
         if cmd_handled:
             return
         # /兑换码 / /redeem-code command (direct, no agent)
@@ -2108,11 +1636,11 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         if cmd_handled:
             return
         # /personality / /人格切换 command
-        cmd_handled = await _handle_personality_command(text_content, user_id, event)
+        cmd_handled = await _handle_personality_command(text_content, user_id, view)
         if cmd_handled:
             return
         # /好感度 #好感度 /bond command (direct, no agent, zero token)
-        cmd_handled = await _handle_bond_command(text_content, user_id, event)
+        cmd_handled = await _handle_bond_command(text_content, user_id, view)
         if cmd_handled:
             return
         cmd_handled = await _handle_session_command(text_content, user_id)
@@ -2126,53 +1654,48 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
     if await _handle_cleanup_flow(user_id, text_content):
         return
 
-    # ── Detect reply/quote context ─────────────────────────────────
-    reply_context = _build_reply_context(event)
+    # ── Detect reply/quote context (built by adapters/onebot.py) ───
+    reply_context = view.reply_context
     if reply_context:
         import sys; print(f"[REPLY_DIAG] reply_context built ({len(reply_context)} chars): {reply_context[:300]}", file=sys.stderr, flush=True)
 
     # ── Detect and download file/image attachments ─────────────────
+    # Stage 2: the segment walk + NapCat download calls moved to
+    # adapters/onebot.py (OneBotAttachmentResolver). This loop keeps the
+    # prompt strings and _recent_files bookkeeping byte-identical.
     file_context_parts = []
     has_voice = False
-    msg_id = str(event.message_id)
-    for seg in event.message:
-        if seg.type == "image":
-            url = seg.data.get("url", "")
-            file_id = seg.data.get("file", "")
-            saved_path, error = await _download_and_save_file(url, f"image-{file_id}", bot=bot, file_id=file_id)
-            if saved_path:
-                file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
-                _record_file(msg_id, f"image-{file_id}", saved_path)
-                _record_session_file(user_id, saved_path)
-            elif error:
-                file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
-                _record_file(msg_id, f"image-{file_id}", error=error)
+    msg_id = view.message_id
+    for att in await view.load_attachments():
+        if att.kind == "image":
+            if att.path:
+                file_context_parts.append(f"[用户上传了图片，已保存至: {att.path}]")
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+            elif att.error:
+                file_context_parts.append(f"[用户上传了图片，但下载失败: {att.error}]")
+                _record_file(msg_id, att.name, error=att.error)
 
-        elif seg.type == "file":
-            url = seg.data.get("url", "")
-            name = seg.data.get("name") or seg.data.get("filename") or seg.data.get("file_name") or seg.data.get("title") or seg.data.get("file") or "file"
-            file_id = seg.data.get("file_id", "")
-            saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
-            if saved_path:
-                file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
-                _record_file(msg_id, name, saved_path)
-                _record_session_file(user_id, saved_path)
-            elif error:
-                file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
-                _record_file(msg_id, name, error=error)
+        elif att.kind == "file":
+            if att.path:
+                file_context_parts.append(f"[用户上传了文件 {att.name}，已保存至: {att.path}]")
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+            elif att.error:
+                file_context_parts.append(f"[用户上传了文件 {att.name}，但下载失败: {att.error}]")
+                _record_file(msg_id, att.name, error=att.error)
 
-        elif seg.type == "record":
+        elif att.kind == "voice":
             has_voice = True
-            saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
-            if saved_path:
+            if att.path:
                 file_context_parts.append(
-                    f"[用户发送了语音消息，已保存至: {saved_path}]"
+                    f"[用户发送了语音消息，已保存至: {att.path}]"
                 )
-                _record_file(msg_id, "语音消息", saved_path)
-                _record_session_file(user_id, saved_path)
-            elif error:
-                file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
-                _record_file(msg_id, "语音消息", error=error)
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+            elif att.error:
+                file_context_parts.append(f"[用户发送了语音消息，但下载失败: {att.error}]")
+                _record_file(msg_id, att.name, error=att.error)
 
     # ── Quota warning after any upload ─────────────────────────────
     quota_warn = _quota_warning(user_id)
@@ -2236,7 +1759,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
 
     # Send thinking indicator (non-critical, ignore send failures)
     try:
-        _gid = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+        _gid = view.group_id
         _pm = get_character_registry()
         _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, _gid))
         await _safe_send(f"{_short} 正在思考...")
@@ -2247,7 +1770,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         # ── Dual-plane routing: resolve persona & its mode first ──
         # split persona → each message is triaged to social (角色面) or task
         # (任务面) plane; unified persona → single plane (existing behavior).
-        group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+        group_id = view.group_id
         pm = get_character_registry()
         persona_key = pm.resolve_effective_personality(user_id, group_id)
         persona_mode = pm.get_mode(persona_key)
@@ -2438,8 +1961,8 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
                 pass
 
         # Start continuous session window for group chats (5 min)
-        if isinstance(event, GroupMessageEvent):
-            _continuous_sessions.start(str(event.group_id), user_id)
+        if view.is_group:
+            _continuous_sessions.start(view.group_id, user_id)
 
     except asyncio.TimeoutError:
         await _safe_send("抱歉，思考超时了。请尝试用更简单的方式提问~")
@@ -2448,8 +1971,10 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         await _safe_send(f"处理消息时出现内部错误（诊断编号 {code}）。请稍后重试；若持续出现请用 #bug 反馈。")
 
 
-async def run_continuous_turn(bot: Bot, event: MessageEvent, user_id: str, group_id: str):
+async def run_continuous_turn(view: InboundMessage):
     """Run one continuous-mode turn (active-window check + busy guard)."""
+    user_id = view.user_id
+    group_id = view.group_id
     # Check if user is in continuous mode
     if not _continuous_sessions.is_active(group_id, user_id):
         return
@@ -2462,18 +1987,20 @@ async def run_continuous_turn(bot: Bot, event: MessageEvent, user_id: str, group
         return
     _user_busy.add(user_id)
     try:
-        return await _handle_continuous_message_impl(bot, event, user_id, group_id)
+        return await handle_continuous_turn(view)
     finally:
         _user_busy.discard(user_id)
 
 
-async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id: str, group_id: str):
+async def handle_continuous_turn(view: InboundMessage):
     """Inner implementation — called under per-user busy guard."""
+    user_id = view.user_id
+    group_id = view.group_id
 
-    # Token-usage attribution (see _handle_agent_message_impl).
+    # Token-usage attribution (see handle_agent_turn).
     set_usage_context(user_id, group_id, "group")
 
-    text_content = event.get_plaintext().strip()
+    text_content = view.text
 
     # Cancel detection: slash/hash commands
     if text_content in ["/取消", "#取消", "/结束", "#结束"]:
@@ -2482,7 +2009,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
         return
 
     # /好感度 #好感度 /bond (direct, no agent, zero token)
-    if await _handle_bond_command(text_content, user_id, event, matcher=continuous_matcher):
+    if await _handle_bond_command(text_content, user_id, view, matcher=continuous_matcher):
         return
 
     # ── Handle pending delete confirmation (intercept before agent) ──
@@ -2529,49 +2056,42 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
     # ── Detect reply/quote context and file attachments ────────────
     # These run BEFORE the text guard so files are always saved and
     # recorded, even for file-only messages that may be replied to later.
-    reply_context = _build_reply_context(event)
+    reply_context = view.reply_context
     if reply_context:
         print(f"[REPLY_DIAG] continuous reply_context built ({len(reply_context)} chars): {reply_context[:300]}")
 
+    # Stage 2: downloads moved to adapters/onebot.py (see handle_agent_turn).
     file_context_parts = []
-    msg_id = str(event.message_id)
-    for seg in event.message:
-        if seg.type == "image":
-            url = seg.data.get("url", "")
-            file_id = seg.data.get("file", "")
-            saved_path, error = await _download_and_save_file(url, f"image-{file_id}", bot=bot, file_id=file_id)
-            if saved_path:
-                file_context_parts.append(f"[用户上传了图片，已保存至: {saved_path}]")
-                _record_file(msg_id, f"image-{file_id}", saved_path)
-                _record_session_file(user_id, saved_path)
-            elif error:
-                file_context_parts.append(f"[用户上传了图片，但下载失败: {error}]")
-                _record_file(msg_id, f"image-{file_id}", error=error)
+    msg_id = view.message_id
+    for att in await view.load_attachments():
+        if att.kind == "image":
+            if att.path:
+                file_context_parts.append(f"[用户上传了图片，已保存至: {att.path}]")
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+            elif att.error:
+                file_context_parts.append(f"[用户上传了图片，但下载失败: {att.error}]")
+                _record_file(msg_id, att.name, error=att.error)
 
-        elif seg.type == "file":
-            url = seg.data.get("url", "")
-            name = seg.data.get("name") or seg.data.get("filename") or seg.data.get("file_name") or seg.data.get("title") or seg.data.get("file") or "file"
-            file_id = seg.data.get("file_id", "")
-            saved_path, error = await _download_and_save_file(url, name, bot=bot, file_id=file_id)
-            if saved_path:
-                file_context_parts.append(f"[用户上传了文件 {name}，已保存至: {saved_path}]")
-                _record_file(msg_id, name, saved_path)
-                _record_session_file(user_id, saved_path)
-            elif error:
-                file_context_parts.append(f"[用户上传了文件 {name}，但下载失败: {error}]")
-                _record_file(msg_id, name, error=error)
+        elif att.kind == "file":
+            if att.path:
+                file_context_parts.append(f"[用户上传了文件 {att.name}，已保存至: {att.path}]")
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+            elif att.error:
+                file_context_parts.append(f"[用户上传了文件 {att.name}，但下载失败: {att.error}]")
+                _record_file(msg_id, att.name, error=att.error)
 
-        elif seg.type == "record":
-            saved_path, error = await _download_voice(bot, seg.data, str(event.message_id))
-            if saved_path:
+        elif att.kind == "voice":
+            if att.path:
                 file_context_parts.append(
-                    f"[用户发送了语音消息，已保存至: {saved_path}]"
+                    f"[用户发送了语音消息，已保存至: {att.path}]"
                 )
-                _record_file(msg_id, "语音消息", saved_path)
-                _record_session_file(user_id, saved_path)
-            elif error:
-                file_context_parts.append(f"[用户发送了语音消息，但下载失败: {error}]")
-                _record_file(msg_id, "语音消息", error=error)
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+            elif att.error:
+                file_context_parts.append(f"[用户发送了语音消息，但下载失败: {att.error}]")
+                _record_file(msg_id, att.name, error=att.error)
 
     # ── Quota warning after any upload this turn ───────────────────
     if file_context_parts:
@@ -3030,7 +2550,7 @@ async def _handle_refresh_data_command(text: str, user_id: str) -> bool:
     return True
 
 
-async def _handle_personality_command(text: str, user_id: str, event: MessageEvent) -> bool:
+async def _handle_personality_command(text: str, user_id: str, view: InboundMessage) -> bool:
     """Handle /personality / /人格切换 command for personality switching.
 
     Returns True if the command was handled.
@@ -3042,7 +2562,7 @@ async def _handle_personality_command(text: str, user_id: str, event: MessageEve
     pm = get_character_registry()
     personalities = pm.list_personalities(user_id=user_id)
     args = args.strip()
-    group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+    group_id = view.group_id
 
     # /personality — show current and available
     if not args:
@@ -3287,14 +2807,14 @@ async def _poke_reaction(persona_key: str, short: str):
 
 
 async def _handle_bond_command(
-    text: str, user_id: str, event: MessageEvent, matcher=None
+    text: str, user_id: str, view: InboundMessage, matcher=None
 ) -> bool:
     """Handle /好感度 #好感度 /bond — 直接展示当前角色羁绊状态，零 token。"""
     cmd = text.strip().split()[0] if text.strip() else ""
     if cmd not in ("/好感度", "#好感度", "/bond"):
         return False
     pm = get_character_registry()
-    group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+    group_id = view.group_id
     persona_key = pm.resolve_effective_personality(user_id, group_id)
     display = pm.get_display_name(persona_key)
     if pm.get_mode(persona_key) != "split":
@@ -3425,7 +2945,7 @@ async def _handle_changelog_command(text: str, user_id: str) -> bool:
     return True
 
 
-async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -> bool:
+async def _handle_toggle_command(text: str, user_id: str, view: InboundMessage) -> bool:
     """Handle /toggle command for group feature management.
 
     Only works in group chats, only for superusers.
@@ -3436,11 +2956,11 @@ async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -
         return False
 
     # Only in group chats
-    if not isinstance(event, GroupMessageEvent):
+    if not view.is_group:
         await _safe_send("此命令仅在群聊中可用。")
         return True
 
-    group_id = str(event.group_id)
+    group_id = view.group_id
     gf = get_group_features()
     gf.refresh()
 
