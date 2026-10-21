@@ -4393,6 +4393,310 @@ class TestCharCreationInterview:
         print_pass("L4 interview injected only for char_creation metadata")
 
 
+# ── P2: Bond content / gift / poke / events tests ─────────────────
+
+_P2_CARD = """# 测试角色
+
+<!-- mode: split | task_voice: character -->
+
+## Core Personality
+
+一个测试用角色。
+
+## Gift Preferences
+
+- 喜爱: 草莓蛋糕、向日葵、蓝色发饰
+- 普通: 巧克力、红茶
+- 讨厌: 苦药、辣到冒火的东西
+
+## Bond Tiers
+
+### Lv3 · 熟悉
+
+第三级解锁的档案内容A。
+
+### Lv5 · 密友
+
+第五级解锁的档案内容B。
+
+### Lv7 · 暧昧
+
+第七级解锁的档案内容C。
+"""
+
+
+class TestBondContent:
+    """Test agent/bond_content.py — card parsing (gift prefs / tiers / address)."""
+
+    def run(self):
+        print_header("24. Bond Content Parsing (P2)")
+        self.test_gift_preferences()
+        self.test_match_gift()
+        self.test_bond_tiers()
+        self.test_address_directive()
+        self.test_builtin_cards_parse()
+
+    def test_gift_preferences(self):
+        from agent import bond_content as bc
+        prefs = bc.parse_gift_preferences(_P2_CARD)
+        assert prefs["loved"] == ["草莓蛋糕", "向日葵", "蓝色发饰"], prefs
+        assert prefs["normal"] == ["巧克力", "红茶"], prefs
+        assert prefs["disliked"] == ["苦药", "辣到冒火的东西"], prefs
+        # no section → empty
+        empty = bc.parse_gift_preferences("# x\n\n## Core\n\nhi")
+        assert empty == {"loved": [], "normal": [], "disliked": []}
+        # 未设定 skipped
+        unset = bc.parse_gift_preferences(
+            "## Gift Preferences\n- 喜爱: 未设定\n- 普通: 茶\n"
+        )
+        assert unset["loved"] == [] and unset["normal"] == ["茶"]
+        print_pass("parse_gift_preferences (三档 + 未设定 skip + empty)")
+
+    def test_match_gift(self):
+        from agent import bond_content as bc
+        prefs = bc.parse_gift_preferences(_P2_CARD)
+        assert bc.match_gift("草莓蛋糕", prefs) == "loved"
+        assert bc.match_gift("一朵向日葵", prefs) == "loved"   # substring
+        assert bc.match_gift("苦药", prefs) == "disliked"
+        assert bc.match_gift("巧克力", prefs) == "normal"
+        assert bc.match_gift("奇怪的石头", prefs) == "normal"  # unmatched default
+        assert bc.match_gift("", prefs) == "normal"
+        print_pass("match_gift (loved/disliked/normal + default)")
+
+    def test_bond_tiers(self):
+        from agent import bond_content as bc
+        tiers = bc.parse_bond_tiers(_P2_CARD)
+        assert [t["level"] for t in tiers] == [3, 5, 7], tiers
+        assert [t["title"] for t in tiers] == ["熟悉", "密友", "暧昧"], tiers
+        assert "档案内容A" in tiers[0]["body"]
+        assert [t["level"] for t in bc.unlocked_tiers(_P2_CARD, 5)] == [3, 5]
+        assert [t["level"] for t in bc.unlocked_tiers(_P2_CARD, 2)] == []
+        assert [t["level"] for t in bc.tiers_unlocking_at(_P2_CARD, 7)] == [7]
+        txt = bc.unlocked_tiers_text(_P2_CARD, 5)
+        assert "【熟悉】" in txt and "【密友】" in txt and "【暧昧】" not in txt
+        assert bc.unlocked_tiers_text(_P2_CARD, 1) == ""
+        print_pass("parse/unlocked/unlocking_at/text tiers by level")
+
+    def test_address_directive(self):
+        from agent import bond_content as bc
+        assert "刚认识" in bc.address_directive(1)
+        assert "熟悉" in bc.address_directive(3)
+        assert "亲密" in bc.address_directive(5)
+        assert "最亲密" in bc.address_directive(7)
+        assert bc.address_directive(10) == bc.address_directive(7)
+        print_pass("address_directive tiers by level")
+
+    def test_builtin_cards_parse(self):
+        """Official builtin cards must expose gift prefs + structured tiers."""
+        from agent import bond_content as bc
+        base = os.path.join(os.path.dirname(__file__), "agent", "config", "personalities")
+        for fname in ("rubi.md", "roxy_character.md"):
+            card = open(os.path.join(base, fname), encoding="utf-8").read()
+            prefs = bc.parse_gift_preferences(card)
+            assert prefs["loved"] and prefs["disliked"], f"{fname} gift prefs"
+            tiers = bc.parse_bond_tiers(card)
+            assert len(tiers) >= 3, f"{fname} needs structured Bond Tiers"
+            assert all(isinstance(t["level"], int) for t in tiers)
+        print_pass("builtin rubi/roxy_character cards parse (gifts + tiers)")
+
+
+class TestBondGiftPoke:
+    """Test bond.py give_gift/poke settlement + social_tools.give_gift."""
+
+    def run(self):
+        print_header("25. Bond Gift / Poke Settlement (P2)")
+        self.test_gift_tiers_exp()
+        self.test_gift_daily_cap()
+        self.test_poke_exp_and_cap()
+        self.test_gift_level_up()
+        asyncio.run(self.test_give_gift_tool())
+
+    def _mgr(self, tmp):
+        from agent.bond import BondManager
+        return BondManager(
+            base_dir=os.path.join(tmp, "bonds"),
+            config_path=os.path.join(tmp, "no_such_config.json"),
+        )
+
+    def test_gift_tiers_exp(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            r_loved = m.give_gift("u1", "rubi", "loved")
+            assert r_loved["accepted"] and r_loved["exp_gained"] == 30, r_loved
+            r_normal = m.give_gift("u2", "rubi", "normal")
+            assert r_normal["exp_gained"] == 15, r_normal
+            r_bad = m.give_gift("u3", "rubi", "disliked")
+            assert r_bad["exp_gained"] == 5, r_bad
+            # mood deltas differ by tier
+            assert m.get_state("u1", "rubi")["mood"] > m.get_state("u3", "rubi")["mood"]
+            print_pass("give_gift EXP by tier (loved30/normal15/disliked5) + mood")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_gift_daily_cap(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            for _ in range(3):
+                assert m.give_gift("u1", "rubi", "normal")["accepted"]
+            r4 = m.give_gift("u1", "rubi", "loved")
+            assert r4["accepted"] is False and r4["reason"] == "daily_limit", r4
+            assert r4["gifts_today"] == 3 and r4["daily_gift_limit"] == 3
+            print_pass("give_gift daily cap (3/day) blocks further gifts")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_poke_exp_and_cap(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            r1 = m.poke("u1", "rubi")
+            assert r1["accepted"] and r1["exp_gained"] == 5, r1
+            m.poke("u1", "rubi")
+            m.poke("u1", "rubi")
+            r4 = m.poke("u1", "rubi")
+            assert r4["accepted"] is False and r4["reason"] == "daily_limit", r4
+            assert r4["daily_poke_limit"] == 3
+            print_pass("poke grants 5 EXP + daily cap (3/day)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_gift_level_up(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            st = m.get_state("u1", "rubi")
+            st["exp"] = 95  # just below Lv2 (100)
+            m._save("u1")
+            r = m.give_gift("u1", "rubi", "loved")  # +30 → 125 → Lv2
+            assert r["level"] == 2, r
+            assert any(u["level"] == 2 for u in r["level_ups"]), r
+            print_pass("give_gift can trigger level-up (returned in level_ups)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def test_give_gift_tool(self):
+        from tools.social_tools import give_gift
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            # loved gift → positive observation with EXP + reaction instruction
+            obs = await give_gift(
+                user_id="u1", gift_name="草莓蛋糕", char_id="rubi",
+                card_content=_P2_CARD, bond_manager=m,
+            )
+            assert "草莓蛋糕" in obs and "好感 +30" in obs, obs
+            assert "角色口吻" in obs, obs
+            # disliked gift → different tone, lower EXP
+            obs2 = await give_gift(
+                user_id="u1", gift_name="苦药", char_id="rubi",
+                card_content=_P2_CARD, bond_manager=m,
+            )
+            assert "不太喜欢" in obs2 and "好感 +5" in obs2, obs2
+            # error paths
+            assert (await give_gift(user_id="", gift_name="x", char_id="rubi",
+                                    card_content="", bond_manager=m)).startswith("[Error]")
+            assert (await give_gift(user_id="u1", gift_name="  ", char_id="rubi",
+                                    card_content="", bond_manager=m)).startswith("[Error]")
+            # daily cap message (u1 already got 2; push to limit)
+            m.give_gift("u1", "rubi", "normal")  # 3rd
+            capped = await give_gift(
+                user_id="u1", gift_name="巧克力", char_id="rubi",
+                card_content=_P2_CARD, bond_manager=m,
+            )
+            assert "上限" in capped and "明天再来" in capped, capped
+            print_pass("social_tools.give_gift observation + tiers + cap + errors")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestBondEvents:
+    """Test bond.py bond_events log + dynamic build_prompt_context (P2)."""
+
+    def run(self):
+        print_header("26. Bond Events & Dynamic Prompt Context (P2)")
+        self.test_append_and_recent()
+        self.test_recent_cap_and_strip()
+        self.test_prompt_context_dynamic_sections()
+        self.test_prompt_context_no_state()
+
+    def _mgr(self, tmp):
+        from agent.bond import BondManager
+        return BondManager(
+            base_dir=os.path.join(tmp, "bonds"),
+            config_path=os.path.join(tmp, "no_such_config.json"),
+        )
+
+    def test_append_and_recent(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            assert m.recent_events("u1", "rubi") == []  # none yet
+            m.append_event("u1", "rubi", "用户送了「草莓蛋糕」给你，你非常喜爱")
+            ev = m.recent_events("u1", "rubi")
+            assert len(ev) == 1 and "草莓蛋糕" in ev[0], ev
+            # timestamp stripped
+            assert not ev[0].startswith("-") and "20" not in ev[0][:4]
+            # empty text ignored
+            m.append_event("u1", "rubi", "   ")
+            assert len(m.recent_events("u1", "rubi")) == 1
+            print_pass("append_event writes + recent_events reads (ts stripped)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_recent_cap_and_strip(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            for i in range(5):
+                m.append_event("u1", "rubi", f"事件{i}")
+            last3 = m.recent_events("u1", "rubi", 3)
+            assert last3 == ["事件2", "事件3", "事件4"], last3
+            # per-character isolation
+            m.append_event("u1", "roxy", "另一个角色的事件")
+            assert "另一个角色" not in " ".join(m.recent_events("u1", "rubi"))
+            assert m.recent_events("u1", "roxy") == ["另一个角色的事件"]
+            print_pass("recent_events caps at n + isolates per character")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_prompt_context_dynamic_sections(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            m.settle_turn("u1", "rubi")  # create state
+            m.append_event("u1", "rubi", "用户戳了戳你")
+            ctx = m.build_prompt_context(
+                "u1", "rubi", "露比",
+                unlocked_text="【熟悉】\n档案内容A",
+                address_line="称呼演化: 你们已经熟悉",
+                recent=["用户戳了戳你"],
+            )
+            assert "羁绊状态" in ctx
+            assert "露比" in ctx
+            assert "档案内容A" in ctx and "已解锁的羁绊档案" in ctx
+            assert "称呼演化" in ctx
+            assert "最近的共同经历" in ctx and "用户戳了戳你" in ctx
+            print_pass("build_prompt_context injects unlocked/address/recent")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_prompt_context_no_state(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            ctx = m.build_prompt_context(
+                "u1", "rubi", "露比", address_line="称呼演化: 你们刚认识不久",
+            )
+            assert "初次相识" in ctx
+            assert "称呼演化" in ctx  # address still injected with no state
+            assert "已解锁的羁绊档案" not in ctx  # no unlocked_text passed
+            print_pass("build_prompt_context graceful with no bond state")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -4424,6 +4728,9 @@ def main():
         ("CharacterRegistry (P1)", TestCharacterRegistry()),
         ("create_character Tool (P1)", TestCreateCharacterTool()),
         ("Char-Creation Interview (P1)", TestCharCreationInterview()),
+        ("Bond Content Parsing (P2)", TestBondContent()),
+        ("Bond Gift / Poke (P2)", TestBondGiftPoke()),
+        ("Bond Events & Dynamic Context (P2)", TestBondEvents()),
     ]
 
     passed = 0

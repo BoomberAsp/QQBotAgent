@@ -21,12 +21,13 @@ _load_dotenv(_ENV_FILE)
 import asyncio
 import json
 import os
+import random
 import re
 import time
 import uuid
 
 import httpx
-from nonebot import on_message, get_driver
+from nonebot import on_message, on_notice, get_driver
 from nonebot import logger as nonebot_logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageEvent, Message, ActionFailed
 from agent.agent import Agent
@@ -40,6 +41,7 @@ from agent.context import (
     _pending_task_fold, _current_bond_context, _delegate_depth,
 )
 from agent.bond import BondManager
+from agent import bond_content
 from agent.delegation import (
     SOCIAL_TOOLS, run_delegated_task, revoice_task_result, repatch_last_assistant,
     _LLM_ERROR_PREFIXES,
@@ -99,6 +101,7 @@ from tools.bond_detail import bond_detail, bond_detail_with_card
 from tools.battle_parser import parse_battle_screenshots
 from tools.card_renderer import render_help_card, render_feature_card, render_changelog_card
 from tools.creation_tools import create_character as _create_character_impl
+from tools.social_tools import give_gift as _give_gift_impl
 
 # ── Configuration Paths ───────────────────────────────────────────
 
@@ -1123,6 +1126,43 @@ def _build_tool_registry() -> ToolRegistry:
                 "bond_levels": {"type": "string", "description": "各羁绊等级的态度变化/解锁档案描述（可选）"},
             },
             "required": ["name", "personality", "speech_style", "appearance"],
+        },
+    )
+
+    # ── 角色面社交工具：送礼（Bond-System-Design.md §4.4, P2）──
+    # 只在角色面（split + social）allowed_tools 中出现（SOCIAL_TOOLS）。当前
+    # 角色 persona_key 从 _current_personality 取；角色卡经 registry.load 取，
+    # 用于礼物偏好匹配；好感结算走全局 _bond_manager。
+    async def _give_gift_tool(gift_name: str) -> str:
+        user_id = _current_user_id.get()
+        persona_key = _current_personality.get()
+        card = ""
+        try:
+            card = get_character_registry().load(persona_key) or ""
+        except Exception:
+            card = ""
+        return await _give_gift_impl(
+            user_id=user_id,
+            gift_name=gift_name,
+            char_id=persona_key,
+            card_content=card,
+            bond_manager=_bond_manager,
+        )
+
+    registry.register(
+        "give_gift", _give_gift_tool,
+        "当用户在对话中送给你礼物（例如「送你一朵花」「给你买了蛋糕」）时调用此工具，"
+        "把礼物名填入 gift_name。工具会根据你对该礼物的喜好结算好感与心情，并返回结果，"
+        "你再以角色口吻自然回应。仅凭对话中的真实送礼意图调用，不要臆造。",
+        {
+            "type": "object",
+            "properties": {
+                "gift_name": {
+                    "type": "string",
+                    "description": "用户送出的礼物名称（从用户消息里提炼，如「一朵花」「草莓蛋糕」）",
+                },
+            },
+            "required": ["gift_name"],
         },
     )
 
@@ -2559,9 +2599,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             allowed_tools = set(SOCIAL_TOOLS)
             _current_personality.set(persona_key)
             _current_bond_context.set(
-                _bond_manager.build_prompt_context(
-                    user_id, persona_key, pm.get_short_name(persona_key)
-                )
+                _build_bond_context(user_id, persona_key, pm)
             )
         else:
             _current_bond_context.set("")
@@ -2908,9 +2946,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
                 allowed_tools = set(SOCIAL_TOOLS) | {"end_continuous_mode"}
                 _current_personality.set(persona_key)
                 _current_bond_context.set(
-                    _bond_manager.build_prompt_context(
-                        user_id, persona_key, pm.get_short_name(persona_key)
-                    )
+                    _build_bond_context(user_id, persona_key, pm)
                 )
             else:
                 _current_bond_context.set("")
@@ -3338,6 +3374,35 @@ async def _handle_personality_command(text: str, user_id: str, event: MessageEve
 
 # ── Bond system helpers (Bond-System-Design.md §3-4) ──────────────
 
+def _build_bond_context(user_id: str, persona_key: str, pm) -> str:
+    """Assemble the L4 bond block for the character plane (P2 dynamic layer).
+
+    角色卡解析（已解锁档案/称呼演化）与共同经历日志都汇入
+    build_prompt_context。任何一步失败都降级为「只有基础羁绊状态」，绝不
+    因增益功能抛错阻断角色面回复。
+    """
+    short_name = pm.get_short_name(persona_key)
+    unlocked_text = ""
+    address_line = ""
+    recent = None
+    try:
+        card = pm.load(persona_key) or ""
+        state = _bond_manager.get_state(user_id, persona_key, create=False)
+        level = int((state or {}).get("level", 1))
+        if card:
+            unlocked_text = bond_content.unlocked_tiers_text(card, level)
+            address_line = bond_content.address_directive(level)
+        recent = _bond_manager.recent_events(user_id, persona_key, 3) or None
+    except Exception as e:
+        log_exception("bond dynamic context failed", e)
+    return _bond_manager.build_prompt_context(
+        user_id, persona_key, short_name,
+        unlocked_text=unlocked_text,
+        address_line=address_line,
+        recent=recent,
+    )
+
+
 async def _settle_bond_turn(user_id: str, persona_key: str, matcher=None):
     """好感结算钩子：split 人格每轮对话结束后累计 EXP/心情，升级时发庆祝。
 
@@ -3350,8 +3415,30 @@ async def _settle_bond_turn(user_id: str, persona_key: str, matcher=None):
         except Exception:
             turn_count = 0
         result = _bond_manager.settle_turn(user_id, persona_key, turn_count=turn_count)
-        for up in result.get("level_ups", []):
+        level_ups = result.get("level_ups", [])
+        if level_ups:
+            card = ""
+            try:
+                card = get_character_registry().load(persona_key) or ""
+            except Exception:
+                card = ""
+        for up in level_ups:
+            lv = up.get("level")
+            _bond_manager.append_event(
+                user_id, persona_key,
+                f"羁绊提升到了 Lv{lv}（{up.get('title', '')}）",
+            )
             await _send_level_up_notice(user_id, persona_key, up, matcher=matcher)
+            # Bond Tier 分段档案解锁（方舟式）：该等级若有新档案，追加事件+提示
+            for tier in bond_content.tiers_unlocking_at(card, int(lv)):
+                title = str(tier.get("title", "")).strip()
+                _bond_manager.append_event(
+                    user_id, persona_key, f"解锁了新的羁绊档案「{title}」"
+                )
+                await _safe_send(
+                    f"🔓 羁绊档案解锁：Lv{lv} ·《{title}》",
+                    matcher=matcher,
+                )
     except Exception as e:
         log_exception("bond settlement failed", e)
 
@@ -3394,6 +3481,112 @@ async def _send_level_up_notice(user_id: str, persona_key: str, up: dict, matche
         await _safe_send(f"{opening}\n\n{fallback}", matcher=matcher)
     else:
         await _safe_send(fallback, matcher=matcher)
+
+
+# ── P2: 戳一戳互动（Bond-System-Design.md §4.4 / §12）─────────────────
+poke_router = on_notice(priority=5, block=False)
+
+# LLM 反应失败/群聊默认使用的模板（{name} = 角色短名）
+_POKE_REACTIONS = (
+    "欸？{name}被你戳了一下，回头看了你一眼～",
+    "{name}揉了揉被戳的地方，无奈地笑了笑。",
+    "别戳啦～{name}在呢。",
+    "{name}眨了眨眼：「怎么啦？」",
+)
+
+
+@poke_router.handle()
+async def handle_poke(bot: Bot, event):
+    """QQ「戳一戳」→ split 人格结算好感 + 角色口吻摸头反应。
+
+    仅处理戳bot本体的 poke 通知；增益功能，全程静默容错，绝不抛出中断。
+    """
+    try:
+        from nonebot.adapters.onebot.v11 import PokeNotifyEvent
+    except Exception:
+        return
+    if not isinstance(event, PokeNotifyEvent):
+        return
+    if getattr(event, "sub_type", "") != "poke":
+        return
+    # 只响应「戳了bot自己」；戳别人不触发
+    if event.target_id != event.self_id:
+        return
+    try:
+        user_id = str(event.user_id)
+        group_id = str(event.group_id) if getattr(event, "group_id", None) else ""
+        await _handle_poke(user_id, group_id, private=not group_id)
+    except Exception as e:
+        log_exception("poke handling failed", e)
+
+
+async def _handle_poke(user_id: str, group_id: str, private: bool):
+    pm = get_character_registry()
+    persona_key = pm.resolve_effective_personality(user_id, group_id)
+    if pm.get_mode(persona_key) != "split":
+        return  # 羁绊养成仅 split 人格
+    short = pm.get_short_name(persona_key)
+
+    result = _bond_manager.poke(user_id, persona_key)
+    if not result.get("accepted"):
+        # 每日上限：仅模板轻提示，不调 LLM
+        await _safe_send(
+            f"{short}：「今天已经被你戳够啦，明天再来找我玩～」",
+            matcher=poke_router,
+        )
+        return
+
+    _bond_manager.append_event(user_id, persona_key, "用户戳了戳你，你回应了")
+    for up in result.get("level_ups", []):
+        _bond_manager.append_event(
+            user_id, persona_key,
+            f"羁绊提升到了 Lv{up['level']}（{up['title']}）",
+        )
+
+    # 私聊用角色口吻 LLM 反应；群聊默认模板（省 token，与 revoice 策略一致）
+    reaction = None
+    if private:
+        reaction = await _poke_reaction(persona_key, short)
+    if not reaction:
+        reaction = random.choice(_POKE_REACTIONS).format(name=short)
+    await _safe_send(reaction, matcher=poke_router)
+
+    for up in result.get("level_ups", []):
+        await _send_level_up_notice(user_id, persona_key, up, matcher=poke_router)
+
+
+async def _poke_reaction(persona_key: str, short: str):
+    """In-character one-liner for a poke (flash). None → caller falls back."""
+    try:
+        persona_content = get_character_registry().load(persona_key) or ""
+        if not persona_content:
+            return None
+        system = (
+            persona_content
+            + "\n\n---\n你正在扮演上述角色。用户刚刚「戳了戳」你（QQ 的戳一戳互动，"
+              "类似轻轻碰你一下/摸头），请写一句符合角色性格的简短自然反应。"
+        )
+        prompt = (
+            "用户戳了戳你。请以角色口吻写一句简短反应。"
+            "要求：不超过40字；不使用markdown；不报任何数值；只输出这句话本身。"
+        )
+        raw = await _model_router.flash_client.chat_completion(
+            message=prompt,
+            history=[{"role": "system", "content": system}],
+            timeout_set=15.0,
+            purpose="poke_reaction",
+        )
+        candidate = (raw or "").strip()
+        if (
+            candidate
+            and not candidate.startswith(_LLM_ERROR_PREFIXES)
+            and len(candidate) <= 120
+            and "\n" not in candidate
+        ):
+            return candidate
+    except Exception:
+        pass
+    return None
 
 
 async def _handle_bond_command(

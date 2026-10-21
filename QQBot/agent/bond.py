@@ -49,6 +49,17 @@ _DEFAULTS: Dict[str, Any] = {
     "exp_mood_min": 0.8,
     "exp_mood_max": 1.2,
     "reunion_days": 14,            # ≥N 天未见 → reunion 标记（事件文案为 P3）
+    # ── P2: 互动动作（礼物 / 戳一戳）──
+    "gift_exp_loved": 30,          # 送到喜爱
+    "gift_exp_normal": 15,         # 普通礼物
+    "gift_exp_disliked": 5,        # 送到讨厌（仍有正反馈，只是最低档）
+    "daily_gift_limit": 3,         # 每日送礼计数上限
+    "gift_mood_loved": 8.0,
+    "gift_mood_normal": 4.0,
+    "gift_mood_disliked": -3.0,
+    "poke_exp": 5,                 # 戳一戳（摸头）
+    "daily_poke_limit": 3,
+    "poke_mood": 3.0,
 }
 
 # 角色面动态层固定提示：历史中的任务结果来自任务智能体（中立口吻），
@@ -67,9 +78,18 @@ def _safe_id(id_str: str) -> str:
 class BondManager:
     """Per (user, character) bond state: EXP/level/mood/stats."""
 
-    def __init__(self, base_dir: str, config_path: Optional[str] = None):
+    def __init__(
+        self,
+        base_dir: str,
+        config_path: Optional[str] = None,
+        events_dir: Optional[str] = None,
+    ):
         self.base_dir = base_dir
         os.makedirs(base_dir, exist_ok=True)
+        # 共同经历日志根目录（默认与 bonds/ 同级的 bond_events/）
+        self.events_dir = events_dir or os.path.join(
+            os.path.dirname(os.path.abspath(base_dir)), "bond_events"
+        )
         if config_path is None:
             config_path = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -382,12 +402,130 @@ class BondManager:
             for lv in range(level_before + 1, level_after + 1)
         ]
 
+    # ── P2: 互动动作（礼物 / 戳一戳）───────────────────────────────
+
+    def _apply_mood(self, state: dict, now: float, delta: float):
+        cur = self._decayed_mood(state, now)
+        state["mood"] = max(0.0, min(100.0, cur + float(delta)))
+        state["mood_updated"] = now
+
+    def give_gift(
+        self, user_id: str, char_id: str, tier: str = "normal"
+    ) -> Dict[str, Any]:
+        """送礼结算：按偏好档位给 EXP + 心情，受每日次数上限约束。
+
+        tier ∈ {loved, normal, disliked}（由 bond_content.match_gift 判定）。
+        返回 {accepted, tier, exp_gained, level_ups, gifts_today, level, exp}；
+        超限时 accepted=False，不给分。
+        """
+        tier = tier if tier in ("loved", "normal", "disliked") else "normal"
+        now = time.time()
+        today = datetime.now().strftime("%Y-%m-%d")
+        state = self.get_state(user_id, char_id)
+        self._roll_daily(state, today)
+        daily = state["daily"]
+        limit = int(self._config["daily_gift_limit"])
+        gifts_today = int(daily.get("gifts", 0))
+        if gifts_today >= limit:
+            return {
+                "accepted": False, "reason": "daily_limit", "tier": tier,
+                "gifts_today": gifts_today, "daily_gift_limit": limit,
+                "level": self.level_for_exp(int(state.get("exp", 0))),
+            }
+        exp = int(self._config[f"gift_exp_{tier}"])
+        daily["gifts"] = gifts_today + 1
+        level_ups = self.add_exp(user_id, char_id, exp)
+        stats = state.setdefault("stats", {})
+        stats["gifts"] = int(stats.get("gifts", 0)) + 1
+        self._apply_mood(state, now, float(self._config[f"gift_mood_{tier}"]))
+        self._save(user_id)
+        return {
+            "accepted": True, "tier": tier, "exp_gained": exp,
+            "level_ups": level_ups, "gifts_today": daily["gifts"],
+            "daily_gift_limit": limit,
+            "level": self.level_for_exp(int(state["exp"])), "exp": state["exp"],
+        }
+
+    def poke(self, user_id: str, char_id: str) -> Dict[str, Any]:
+        """戳一戳（摸头）结算：小额 EXP + 心情，受每日次数上限约束。"""
+        now = time.time()
+        today = datetime.now().strftime("%Y-%m-%d")
+        state = self.get_state(user_id, char_id)
+        self._roll_daily(state, today)
+        daily = state["daily"]
+        limit = int(self._config["daily_poke_limit"])
+        pokes_today = int(daily.get("pokes", 0))
+        if pokes_today >= limit:
+            return {
+                "accepted": False, "reason": "daily_limit",
+                "pokes_today": pokes_today, "daily_poke_limit": limit,
+                "level": self.level_for_exp(int(state.get("exp", 0))),
+            }
+        exp = int(self._config["poke_exp"])
+        daily["pokes"] = pokes_today + 1
+        level_ups = self.add_exp(user_id, char_id, exp)
+        stats = state.setdefault("stats", {})
+        stats["pokes"] = int(stats.get("pokes", 0)) + 1
+        self._apply_mood(state, now, float(self._config["poke_mood"]))
+        self._save(user_id)
+        return {
+            "accepted": True, "exp_gained": exp, "level_ups": level_ups,
+            "pokes_today": daily["pokes"], "daily_poke_limit": limit,
+            "level": self.level_for_exp(int(state["exp"])), "exp": state["exp"],
+        }
+
+    # ── P2: 共同经历日志（bond_events，喂动态层「最近共同经历」）──
+
+    def _event_path(self, user_id: str, char_id: str) -> str:
+        return os.path.join(
+            self.events_dir, _safe_id(user_id), f"{_safe_id(char_id)}.md"
+        )
+
+    def append_event(self, user_id: str, char_id: str, text: str):
+        """Append one shared-memory line. Silent on failure (增益功能不阻断)。"""
+        text = (text or "").strip()
+        if not text:
+            return
+        try:
+            path = self._event_path(user_id, char_id)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"- {ts} {text}\n")
+        except (IOError, OSError):
+            pass
+
+    _EVENT_LINE_RE = re.compile(r"^-\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*(.*)$")
+
+    def recent_events(self, user_id: str, char_id: str, n: int = 3) -> List[str]:
+        """Return the last ``n`` shared-memory texts (timestamp stripped)."""
+        try:
+            with open(self._event_path(user_id, char_id), "r", encoding="utf-8") as f:
+                raw = [ln.strip() for ln in f if ln.strip()]
+        except (FileNotFoundError, IOError, OSError):
+            return []
+        out: List[str] = []
+        for ln in raw[-n:]:
+            m = self._EVENT_LINE_RE.match(ln)
+            out.append(m.group(1).strip() if m else ln.lstrip("- ").strip())
+        return [o for o in out if o]
+
     # ── Prompt injection (动态层，Bond-System-Design.md §6) ──────
 
     def build_prompt_context(
-        self, user_id: str, char_id: str, char_short_name: str = ""
+        self,
+        user_id: str,
+        char_id: str,
+        char_short_name: str = "",
+        unlocked_text: str = "",
+        address_line: str = "",
+        recent: Optional[List[str]] = None,
     ) -> str:
-        """Build the L4 volatile bond block for the character plane."""
+        """Build the L4 volatile bond block for the character plane.
+
+        P2 追加动态段：称呼演化指令、已解锁 Bond Tiers 档案、最近共同经历
+        （均来自调用方注入，保持 bond.py 与角色卡解析解耦）。
+        """
         state = self.get_state(user_id, char_id, create=False)
         header = "## 羁绊状态（你与当前用户）"
         if state is None:
@@ -396,7 +534,8 @@ class BondManager:
                 f"好感等级: Lv{self._config['levels'][0][0]} "
                 f"{self.title_for(self._config['levels'][0][0])}（初次相识）\n"
                 f"你们的故事才刚刚开始，友好而自然地相处吧。\n"
-                f"{_TASK_RESULT_NOTE}"
+                + (f"{address_line}\n" if address_line else "")
+                + f"{_TASK_RESULT_NOTE}"
             )
         now = time.time()
         mood = self._decayed_mood(state, now)
@@ -407,18 +546,33 @@ class BondManager:
             progress = f"（{exp}/{nxt['exp']} → Lv{nxt['level']} {nxt['title']}）"
         else:
             progress = "（已满级）"
-        first_met = state.get("stats", {}).get("first_met")
+        stats = state.get("stats", {})
+        first_met = stats.get("first_met")
         days = max(1, int((now - float(first_met)) // 86400) + 1) if first_met else 1
-        msgs = int(state.get("stats", {}).get("msgs", 0))
-        return (
-            f"{header}\n"
-            f"好感等级: Lv{level} {self.title_for(level)}{progress}\n"
+        msgs = int(stats.get("msgs", 0))
+        gifts = int(stats.get("gifts", 0))
+        parts = [
+            header,
+            f"好感等级: Lv{level} {self.title_for(level)}{progress}",
             f"心情: {int(round(mood))}/100（{self._mood_label(mood)}），"
-            f"请让语气自然贴合当前心情。\n"
+            f"请让语气自然贴合当前心情。",
             f"陪伴: 相识第 {days} 天 · 累计互动 {msgs} 条消息"
-            + (f" · 用户常唤你「{char_short_name}」" if char_short_name else "")
-            + f"\n{_TASK_RESULT_NOTE}"
-        )
+            + (f" · 收礼 {gifts} 次" if gifts else "")
+            + (f" · 用户常唤你「{char_short_name}」" if char_short_name else ""),
+        ]
+        if address_line:
+            parts.append(address_line)
+        if unlocked_text:
+            parts.append(
+                "已解锁的羁绊档案（你可以自然地提及或透露这些背景，"
+                "但不要生硬背诵）:\n" + unlocked_text
+            )
+        if recent:
+            parts.append(
+                "最近的共同经历:\n" + "\n".join(f"- {e}" for e in recent)
+            )
+        parts.append(_TASK_RESULT_NOTE)
+        return "\n".join(parts)
 
     # ── User-facing status (/好感度 指令) ─────────────────────────
 
@@ -445,19 +599,30 @@ class BondManager:
             progress_line = f"进度: {bar} {exp}/{nxt['exp']} → Lv{nxt['level']} {nxt['title']}"
         else:
             progress_line = "进度: ▰▰▰▰▰▰▰▰▰▰ 已达最高等级"
-        first_met = state.get("stats", {}).get("first_met")
+        stats = state.get("stats", {})
+        first_met = stats.get("first_met")
         days = max(1, int((now - float(first_met)) // 86400) + 1) if first_met else 1
-        msgs = int(state.get("stats", {}).get("msgs", 0))
+        msgs = int(stats.get("msgs", 0))
+        gifts_total = int(stats.get("gifts", 0))
         self._roll_daily(state, datetime.now().strftime("%Y-%m-%d"))
-        chat_today = int(state.get("daily", {}).get("chat_exp", 0))
+        daily = state.get("daily", {})
+        chat_today = int(daily.get("chat_exp", 0))
         cap = int(self._config["daily_chat_soft_cap"])
+        gifts_today = int(daily.get("gifts", 0))
+        pokes_today = int(daily.get("pokes", 0))
+        gift_line = (
+            f"\n今日互动: 送礼 {gifts_today}/{int(self._config['daily_gift_limit'])}"
+            f" · 戳一戳 {pokes_today}/{int(self._config['daily_poke_limit'])}"
+        )
         return (
             f"💗 与「{name}」的羁绊\n"
             f"等级: Lv{level} {self.title_for(level)}\n"
             f"{progress_line}\n"
             f"心情: {int(round(mood))}/100（{self._mood_label(mood)}）\n"
-            f"陪伴: 相识第 {days} 天 · 累计互动 {msgs} 条消息\n"
-            f"今日聊天好感: {chat_today}/{cap}（超出后收益递减）"
+            f"陪伴: 相识第 {days} 天 · 累计互动 {msgs} 条消息"
+            + (f" · 累计收礼 {gifts_total} 次" if gifts_total else "")
+            + f"\n今日聊天好感: {chat_today}/{cap}（超出后收益递减）"
+            + gift_line
         )
 
     # ── Admin ─────────────────────────────────────────────────────

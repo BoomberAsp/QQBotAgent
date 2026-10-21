@@ -18,10 +18,12 @@ import random
 from typing import Any, Callable, Dict, List, Optional, Set
 
 # 角色面（社交平面）工具白名单。注意：这些工具不出现在 permissions.py 的
-# 角色工具集中——delegate_task 只通过路由层的 allowed_tools 下发给角色面，
-# 任务面/统一人格的 allowed_tools 不含它，_execute_tool_calls 的第二层
-# 硬拒绝即是防递归的兜底防线。
-SOCIAL_TOOLS: frozenset = frozenset({"delegate_task"})
+# 角色工具集中——它们只通过路由层的 allowed_tools 下发给角色面，任务面/统一
+# 人格的 allowed_tools 不含它们，_execute_tool_calls 的第二层硬拒绝即是兜底防线。
+# delegate_task: 角色面把工具任务委托给任务面（agent-as-tool，需防递归）；
+# give_gift: 送礼互动（P2），任务面 run_delegated_task 只减 delegate_task，
+#   give_gift 本就不在角色工具集里，天然不会泄漏到任务面。
+SOCIAL_TOOLS: frozenset = frozenset({"delegate_task", "give_gift"})
 
 DEFAULT_TASK_TIMEOUT = 240.0
 
