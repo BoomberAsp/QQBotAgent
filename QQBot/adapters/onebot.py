@@ -13,22 +13,78 @@ Converts OneBot events into agent.inbound.InboundMessage views:
     its file path / download-failure note
 
 The download helpers and reply parser below were moved VERBATIM out of
-agent/turn.py (pure stage-2 sink; no logic changes). Outbound sending
-still goes through turn.py's matcher slots until stage 3 (Sender).
+agent/turn.py (pure stage-2 sink; no logic changes).
+
+Stage 3 adds the outbound side: OneBotSender implements the
+agent.outbound.Sender protocol on top of a NoneBot matcher
+(matcher.send() resolves the current bot/event from NoneBot's matcher
+context at call time — the same mechanism turn.py relied on before).
+OneBot ActionFailed is translated to the platform-agnostic SendFailed
+so the kernel's retry loop no longer imports OneBot. This is now the
+ONLY module (besides the entry plugin's broadcast task) that constructs
+MessageSegment objects for turn replies.
 """
 import json
 import os
 import re
 import uuid
+from pathlib import Path
 
 import httpx
 
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageEvent
+from nonebot.adapters.onebot.v11 import (
+    ActionFailed, Bot, GroupMessageEvent, MessageEvent, MessageSegment,
+)
 
 from agent.context import _current_user_workspace
 from agent.inbound import Attachment, InboundMessage
+from agent.outbound import OutImage, SendFailed
 from agent.turn import _AGENT_DIR, _recent_files
 from tools.builtin_tools import _ensure_workspace_dirs
+
+
+# ── Outbound sender (stage 3) ──────────────────────────────────────
+
+class OneBotSender:
+    """agent.outbound.Sender for OneBot V11, wrapping one NoneBot matcher.
+
+    The plugin registers one sender per matcher (default/continuous/poke)
+    into turn.py's sender slots. Send semantics:
+      - send_text:     matcher.send(str)            — as before
+      - send_image:    matcher.send(MessageSegment.image(Path|url))
+      - send_markdown: plain text (OneBot/QQ has no native markdown)
+    ActionFailed → SendFailed (retryable in _safe_send); any other
+    exception propagates and is treated as non-retryable there, exactly
+    like the pre-stage-3 _safe_send did.
+    """
+
+    platform = "onebot"
+    # OneBot has no per-turn reply quota; part of the Sender contract.
+    max_messages_per_turn = 100
+
+    def __init__(self, matcher):
+        self._matcher = matcher
+
+    async def send_text(self, text: str) -> None:
+        try:
+            await self._matcher.send(text)
+        except ActionFailed as e:
+            raise SendFailed(str(e), info=getattr(e, "info", None)) from e
+
+    async def send_image(self, img: OutImage) -> None:
+        if img.path:
+            seg = MessageSegment.image(Path(img.path))
+        elif img.url:
+            seg = MessageSegment.image(img.url)
+        else:
+            raise ValueError(f"OutImage has neither path nor url (label={img.label!r})")
+        try:
+            await self._matcher.send(seg)
+        except ActionFailed as e:
+            raise SendFailed(str(e), info=getattr(e, "info", None)) from e
+
+    async def send_markdown(self, text: str) -> None:
+        await self.send_text(text)
 
 
 # ── Reply/quote context (OneBot-specific; entry layer computes it) ──

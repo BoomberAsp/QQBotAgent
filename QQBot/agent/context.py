@@ -1,13 +1,17 @@
 """
 Agent execution context — Context variables for cross-layer communication.
 
-Allows tools to send images/segments through the QQ chat without
+Allows tools to send images/text through the current chat without
 modifying every intermediate function signature (agent → tool_registry → tool).
 Also carries the current user's workspace path for scoped file operations.
 """
+from __future__ import annotations
 
 import contextvars
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent.outbound import Sender
 
 # Current user's QQ ID.
 # Set by agent_router before each agent.run() call.
@@ -16,9 +20,12 @@ _current_user_id: contextvars.ContextVar[str] = (
     contextvars.ContextVar("_current_user_id", default="")
 )
 
-# Coroutine function that can send MessageSegment or str to QQ
-_send_msg: contextvars.ContextVar[Optional[Callable[[Any], Any]]] = (
-    contextvars.ContextVar("_send_msg", default=None)
+# Platform-agnostic outbound Sender (agent/outbound.py) that tools use
+# to push images/text directly to the current chat. Set by agent/turn.py
+# before each agent.run() call (stage 3; replaces the old _send_msg
+# coroutine callback, which was _safe_send in disguise).
+_current_sender: contextvars.ContextVar[Optional["Sender"]] = (
+    contextvars.ContextVar("_current_sender", default=None)
 )
 
 # Current user's isolated workspace root path.

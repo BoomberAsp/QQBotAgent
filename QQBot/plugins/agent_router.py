@@ -11,7 +11,7 @@ agent/turn.py (moved verbatim). This plugin keeps only OneBot glue:
   - on_message / on_notice matchers with their platform-specific guards
     (@-mention detection, continuous-mode window, poke filtering),
     converting events to agent.inbound views via adapters.onebot
-  - matcher-slot registration into agent.turn (bottom of this file)
+  - sender-slot registration into agent.turn (bottom of this file)
 """
 
 # ── Load .env into os.environ BEFORE any module-level reads ──────
@@ -40,7 +40,7 @@ from agent.turn import (
     # turn entry points (busy-guarded)
     run_agent_turn, run_continuous_turn, _handle_poke,
 )
-from adapters.onebot import build_view
+from adapters.onebot import OneBotSender, build_view
 from lib.errors import log_exception
 from tools.card_renderer import render_changelog_card
 
@@ -385,10 +385,11 @@ async def handle_poke(bot: Bot, event):
         log_exception("poke handling failed", e)
 
 
-# ── Matcher-slot registration (stage-1 seam) ──────────────────────
-# agent/turn.py sends outbound messages through these matchers
-# (_safe_send default + the continuous/poke paths). Assigning them
-# here keeps turn.py free of plugin imports — no circular dependency.
-turn.default_matcher = agent_router
-turn.continuous_matcher = continuous_router
-turn.poke_matcher = poke_router
+# ── Sender-slot registration (stage-3 seam) ───────────────────────
+# agent/turn.py sends outbound messages through agent.outbound.Sender
+# implementations; OneBotSender wraps each NoneBot matcher (_safe_send
+# default + the continuous/poke paths). Assigning them here keeps
+# turn.py free of plugin imports — no circular dependency.
+turn.default_sender = OneBotSender(agent_router)
+turn.continuous_sender = OneBotSender(continuous_router)
+turn.poke_sender = OneBotSender(poke_router)

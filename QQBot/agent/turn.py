@@ -10,13 +10,17 @@ consume agent.inbound.InboundMessage views built by adapters/onebot.py,
 which also absorbed _build_reply_context / _download_voice /
 _download_and_save_file / _get_uploads_dir (all OneBot/NapCat-specific).
 
-Temporary OneBot couplings still living here (removed in stage 3):
-  - _safe_send() retries on OneBot ActionFailed
-  - card/image sends construct onebot.v11 MessageSegment at call sites
+Stage-3: the outbound side is now platform-agnostic — _safe_send()
+dispatches on the agent.outbound contract (str → send_text, OutImage →
+send_image) and retries only on SendFailed. Each entry adapter supplies
+a Sender implementation (adapters/onebot.py::OneBotSender now; stage 4
+adds QQOfficialSender, which turns OutImage.path into a base64 upload).
+
+Temporary OneBot couplings still living here (escape hatches):
   - _forced_refresh_wiki_data() grabs a Bot via nonebot.get_bots()
 
-Outbound sending goes through matcher slots (default_matcher /
-continuous_matcher / poke_matcher) assigned by the entry plugin at
+Outbound sending goes through sender slots (default_sender /
+continuous_sender / poke_sender) assigned by the entry plugin at
 import time — this keeps turn.py free of plugin imports (no cycle).
 """
 
@@ -38,17 +42,13 @@ import time
 import uuid
 
 import httpx
-# Stage-3 temporary OneBot import: _safe_send() still retries on
-# ActionFailed and card sends construct MessageSegment at call sites.
-# Inbound events no longer reach this module — the entry plugin
-# converts them to agent.inbound.InboundMessage views (stage 2).
-from nonebot.adapters.onebot.v11 import ActionFailed
 
 from agent.agent import Agent
 from agent.inbound import InboundMessage
+from agent.outbound import OutImage, SendFailed
 from agent.continuous_session import ContinuousSessionManager
 from agent.context import (
-    _send_msg, _current_user_workspace,
+    _current_sender, _current_user_workspace,
     _current_user_role, _current_code_limits,
     _current_user_id, _current_group_id,
     _current_group_context, _current_personality,
@@ -118,14 +118,41 @@ from tools.card_renderer import render_help_card, render_feature_card, render_ch
 from tools.creation_tools import create_character as _create_character_impl
 from tools.social_tools import give_gift as _give_gift_impl
 
-# ── Matcher slots (assigned by the entry plugin at import time) ────
-# _safe_send() and the continuous/poke paths send through NoneBot
-# matchers, which live in plugins/agent_router.py. The plugin assigns
-# these right after creating its matchers; keeping them as module vars
-# avoids a turn -> plugin circular import.
-default_matcher = None      # agent_router      (priority=1 on_message)
-continuous_matcher = None   # continuous_router (priority=2 on_message)
-poke_matcher = None         # poke_router       (on_notice)
+# ── Sender slots (assigned by the entry plugin at import time) ─────
+# _safe_send() and the continuous/poke paths send through
+# agent.outbound.Sender implementations; the entry plugin wraps its
+# platform matchers in them (adapters/onebot.py::OneBotSender now).
+# The plugin assigns these right after creating its matchers; keeping
+# them as module vars avoids a turn -> plugin circular import.
+default_sender = None       # agent_router      (priority=1 on_message)
+continuous_sender = None    # continuous_router (priority=2 on_message)
+poke_sender = None          # poke_router       (on_notice)
+
+
+class _ToolSender:
+    """Bridge exposed to tools via the _current_sender contextvar.
+
+    Tools expect an agent.outbound.Sender, but pre-stage-3 they sent
+    through _safe_send (retry + backoff + non-retryable-error logging).
+    Routing tool sends back through _safe_send keeps that behavior
+    identical; the platform Sender in the slot does the actual
+    translation. sender=None → _safe_send falls back to default_sender.
+    """
+
+    platform = "kernel"
+    max_messages_per_turn = 100
+
+    def __init__(self, sender=None):
+        self._sender = sender
+
+    async def send_text(self, text: str) -> None:
+        await _safe_send(text, sender=self._sender)
+
+    async def send_image(self, img: OutImage) -> None:
+        await _safe_send(img, sender=self._sender)
+
+    async def send_markdown(self, text: str) -> None:
+        await _safe_send(text, sender=self._sender)
 
 
 # ── Configuration Paths ───────────────────────────────────────────
@@ -581,13 +608,13 @@ def _build_tool_registry() -> ToolRegistry:
         # huge; the user gets them as copyable list text instead.
         if scope == "time_limited" and active[:MAX_TOOL_CODES]:
             try:
-                from agent.context import _send_msg
-                send = _send_msg.get()
-                if send is not None:
-                    await send("以下逐条发送兑换码，方便复制：")
+                from agent.context import _current_sender
+                sender = _current_sender.get()
+                if sender is not None:
+                    await sender.send_text("以下逐条发送兑换码，方便复制：")
                     for entry in active[:MAX_TOOL_CODES]:
                         await asyncio.sleep(1.0)  # QQ rate limiting
-                        await send(entry["code"])
+                        await sender.send_text(entry["code"])
                     lines.append("（限时兑换码已逐条单独发送给用户，方便复制；"
                                  "你的回复中不必再逐字罗列它们）")
             except Exception as e:
@@ -674,11 +701,9 @@ def _build_tool_registry() -> ToolRegistry:
                 disabled = set()
 
         async def _inner_progress(msg: str):
-            cb = _send_msg.get()
-            if cb is not None:
-                ret = cb(msg)
-                if asyncio.iscoroutine(ret):
-                    await ret
+            sender = _current_sender.get()
+            if sender is not None:
+                await sender.send_text(msg)
 
         return await run_delegated_task(
             task,
@@ -1806,9 +1831,7 @@ async def handle_agent_turn(view: InboundMessage):
         # Run the agent loop with timeout
         async def _progress(msg: str):
             await _safe_send(msg)
-        async def _send_image(seg):
-            await _safe_send(seg)
-        token = _send_msg.set(_send_image)
+        token = _current_sender.set(_ToolSender())
 
         # Resolve user permissions
         role = _perm_manager.get_role(user_id)
@@ -1904,7 +1927,7 @@ async def handle_agent_turn(view: InboundMessage):
                 timeout=300.0,
             )
         finally:
-            _send_msg.reset(token)
+            _current_sender.reset(token)
 
         # ── Revoicing layer (Bond-System-Design.md §3.3) ──
         # Only the split persona's *task plane* output needs re-voicing: the
@@ -1983,7 +2006,7 @@ async def run_continuous_turn(view: InboundMessage):
     if user_id in _user_busy:
         _pm = get_character_registry()
         _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, group_id))
-        await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~", matcher=continuous_matcher)
+        await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~", sender=continuous_sender)
         return
     _user_busy.add(user_id)
     try:
@@ -2005,11 +2028,11 @@ async def handle_continuous_turn(view: InboundMessage):
     # Cancel detection: slash/hash commands
     if text_content in ["/取消", "#取消", "/结束", "#结束"]:
         _continuous_sessions.end(group_id, user_id)
-        await _safe_send("已结束连续对话模式，之后需要@我才能触发~", matcher=continuous_matcher)
+        await _safe_send("已结束连续对话模式，之后需要@我才能触发~", sender=continuous_sender)
         return
 
     # /好感度 #好感度 /bond (direct, no agent, zero token)
-    if await _handle_bond_command(text_content, user_id, view, matcher=continuous_matcher):
+    if await _handle_bond_command(text_content, user_id, view, sender=continuous_sender):
         return
 
     # ── Handle pending delete confirmation (intercept before agent) ──
@@ -2042,14 +2065,14 @@ async def handle_continuous_turn(view: InboundMessage):
                     if summary:
                         msg += "\n" + summary
                     msg += f"\n当前特殊会话: {len(sessions)}/{max_sess}"
-                    await _safe_send(msg, matcher=continuous_matcher)
+                    await _safe_send(msg, sender=continuous_sender)
                 except ValueError as e:
-                    await _safe_send(str(e), matcher=continuous_matcher)
+                    await _safe_send(str(e), sender=continuous_sender)
             else:
                 _pending_delete_confirm.pop(user_id, None)
                 await _safe_send(
                     "确认已超时（60秒），请重新发起 /删除会话。",
-                    matcher=continuous_matcher
+                    sender=continuous_sender
                 )
             return
 
@@ -2144,9 +2167,7 @@ async def handle_continuous_turn(view: InboundMessage):
         else:
             client = _model_router.reasoning_client
 
-        async def _send_image(seg):
-            await _safe_send(seg, matcher=continuous_matcher)
-        token = _send_msg.set(_send_image)
+        token = _current_sender.set(_ToolSender(continuous_sender))
         try:
             # Resolve user permissions
             role = _perm_manager.get_role(user_id)
@@ -2203,13 +2224,13 @@ async def handle_continuous_turn(view: InboundMessage):
 
             response = await asyncio.wait_for(
                 agent.run(augmented_message, user_id, client=client,
-                           progress_callback=lambda msg: _safe_send(msg, matcher=continuous_matcher),
+                           progress_callback=lambda msg: _safe_send(msg, sender=continuous_sender),
                            allowed_tools=allowed_tools,
                            user_role=role.value),
                 timeout=300.0,
             )
         finally:
-            _send_msg.reset(token)
+            _current_sender.reset(token)
 
         # ── Revoicing layer (task plane of split persona; group → template) ──
         if persona_mode == "split" and not character_plane:
@@ -2225,36 +2246,39 @@ async def handle_continuous_turn(view: InboundMessage):
             )
             repatch_last_assistant(_session_manager, user_id, raw_response, response)
 
-        await _send_response(response, matcher=continuous_matcher)
+        await _send_response(response, sender=continuous_sender)
 
         # ── Bond settlement hook ──
         if persona_mode == "split":
-            await _settle_bond_turn(user_id, persona_key, matcher=continuous_matcher)
+            await _settle_bond_turn(user_id, persona_key, sender=continuous_sender)
 
     except asyncio.TimeoutError:
         _pm = get_character_registry()
         _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, group_id))
-        await _safe_send(f"抱歉，{_short}思考时间超过您的配额时长了。请尝试用更简单的方式提问~", matcher=continuous_matcher)
+        await _safe_send(f"抱歉，{_short}思考时间超过您的配额时长了。请尝试用更简单的方式提问~", sender=continuous_sender)
     except Exception as e:
         code = log_exception("continuous agent message handling failed", e)
-        await _safe_send(f"处理消息时出现内部错误（诊断编号 {code}）。请稍后重试；若持续出现请用 #bug 反馈。", matcher=continuous_matcher)
+        await _safe_send(f"处理消息时出现内部错误（诊断编号 {code}）。请稍后重试；若持续出现请用 #bug 反馈。", sender=continuous_sender)
 
 
-async def _safe_send(message, max_retries: int = 2, matcher=None):
-    """Send a message (str or MessageSegment) with retry on timeout.
+async def _safe_send(message, max_retries: int = 2, sender=None):
+    """Send a message (str or OutImage) with retry on SendFailed.
 
     Args:
-        message: Message text (str) or MessageSegment (e.g. image).
-        max_retries: Number of retry attempts on ActionFailed.
-        matcher: Optional matcher to use for sending. Defaults to default_matcher.
+        message: Message text (str) or agent.outbound.OutImage.
+        max_retries: Number of retry attempts on SendFailed.
+        sender: Optional Sender to use. Defaults to default_sender.
     """
-    sender = matcher or default_matcher
+    s = sender or default_sender
     last_error = None
     for attempt in range(max_retries):
         try:
-            await sender.send(message)
+            if isinstance(message, OutImage):
+                await s.send_image(message)
+            else:
+                await s.send_text(message)
             return
-        except ActionFailed as e:
+        except SendFailed as e:
             last_error = e
             if attempt < max_retries - 1:
                 await asyncio.sleep(1.0 * (attempt + 1))  # Exponential backoff
@@ -2445,9 +2469,7 @@ async def _handle_character_detail_command(text: str, user_id: str) -> bool:
 
     text_result, card_path = await character_detail_with_card(rest)
     if card_path:
-        from pathlib import Path
-        from nonebot.adapters.onebot.v11 import MessageSegment
-        await _safe_send(MessageSegment.image(Path(card_path)))
+        await _safe_send(OutImage(path=card_path, label="character card"))
     else:
         await _safe_send(text_result)
     return True
@@ -2469,9 +2491,7 @@ async def _handle_bond_detail_command(text: str, user_id: str) -> bool:
 
     text_result, card_path = await bond_detail_with_card(rest)
     if card_path:
-        from pathlib import Path
-        from nonebot.adapters.onebot.v11 import MessageSegment
-        await _safe_send(MessageSegment.image(Path(card_path)))
+        await _safe_send(OutImage(path=card_path, label="bond card"))
     else:
         await _safe_send(text_result)
     return True
@@ -2648,7 +2668,7 @@ def _build_bond_context(user_id: str, persona_key: str, pm) -> str:
     )
 
 
-async def _settle_bond_turn(user_id: str, persona_key: str, matcher=None):
+async def _settle_bond_turn(user_id: str, persona_key: str, sender=None):
     """好感结算钩子：split 人格每轮对话结束后累计 EXP/心情，升级时发庆祝。
 
     结算失败必须静默——它是增益功能，绝不能因抛错中断已生成回复的发送。
@@ -2673,7 +2693,7 @@ async def _settle_bond_turn(user_id: str, persona_key: str, matcher=None):
                 user_id, persona_key,
                 f"羁绊提升到了 Lv{lv}（{up.get('title', '')}）",
             )
-            await _send_level_up_notice(user_id, persona_key, up, matcher=matcher)
+            await _send_level_up_notice(user_id, persona_key, up, sender=sender)
             # Bond Tier 分段档案解锁（方舟式）：该等级若有新档案，追加事件+提示
             for tier in bond_content.tiers_unlocking_at(card, int(lv)):
                 title = str(tier.get("title", "")).strip()
@@ -2682,13 +2702,13 @@ async def _settle_bond_turn(user_id: str, persona_key: str, matcher=None):
                 )
                 await _safe_send(
                     f"🔓 羁绊档案解锁：Lv{lv} ·《{title}》",
-                    matcher=matcher,
+                    sender=sender,
                 )
     except Exception as e:
         log_exception("bond settlement failed", e)
 
 
-async def _send_level_up_notice(user_id: str, persona_key: str, up: dict, matcher=None):
+async def _send_level_up_notice(user_id: str, persona_key: str, up: dict, sender=None):
     """羁绊升级庆祝：角色口吻一句话（flash）+ 等级提示；LLM 失败降级固定文案。"""
     pm = get_character_registry()
     short = pm.get_short_name(persona_key)
@@ -2723,9 +2743,9 @@ async def _send_level_up_notice(user_id: str, persona_key: str, up: dict, matche
     except Exception:
         opening = None
     if opening:
-        await _safe_send(f"{opening}\n\n{fallback}", matcher=matcher)
+        await _safe_send(f"{opening}\n\n{fallback}", sender=sender)
     else:
-        await _safe_send(fallback, matcher=matcher)
+        await _safe_send(fallback, sender=sender)
 
 
 # LLM 反应失败/群聊默认使用的模板（{name} = 角色短名）
@@ -2749,7 +2769,7 @@ async def _handle_poke(user_id: str, group_id: str, private: bool):
         # 每日上限：仅模板轻提示，不调 LLM
         await _safe_send(
             f"{short}：「今天已经被你戳够啦，明天再来找我玩～」",
-            matcher=poke_matcher,
+            sender=poke_sender,
         )
         return
 
@@ -2766,10 +2786,10 @@ async def _handle_poke(user_id: str, group_id: str, private: bool):
         reaction = await _poke_reaction(persona_key, short)
     if not reaction:
         reaction = random.choice(_POKE_REACTIONS).format(name=short)
-    await _safe_send(reaction, matcher=poke_matcher)
+    await _safe_send(reaction, sender=poke_sender)
 
     for up in result.get("level_ups", []):
-        await _send_level_up_notice(user_id, persona_key, up, matcher=poke_matcher)
+        await _send_level_up_notice(user_id, persona_key, up, sender=poke_sender)
 
 
 async def _poke_reaction(persona_key: str, short: str):
@@ -2807,7 +2827,7 @@ async def _poke_reaction(persona_key: str, short: str):
 
 
 async def _handle_bond_command(
-    text: str, user_id: str, view: InboundMessage, matcher=None
+    text: str, user_id: str, view: InboundMessage, sender=None
 ) -> bool:
     """Handle /好感度 #好感度 /bond — 直接展示当前角色羁绊状态，零 token。"""
     cmd = text.strip().split()[0] if text.strip() else ""
@@ -2821,12 +2841,12 @@ async def _handle_bond_command(
         await _safe_send(
             f"当前人格「{display}」未启用羁绊养成。\n"
             f"用 /人格切换 切换到支持养成的角色后再查询好感度哦~",
-            matcher=matcher,
+            sender=sender,
         )
         return True
     await _safe_send(
         _bond_manager.format_status(user_id, persona_key, display_name=display),
-        matcher=matcher,
+        sender=sender,
     )
     return True
 
@@ -2896,10 +2916,9 @@ async def _handle_features_command(text: str, user_id: str) -> bool:
     features_path = os.path.join(_CONFIG_DIR, "FEATURES.md")
 
     try:
-        from nonebot.adapters.onebot.v11 import MessageSegment
         card_path = await asyncio.to_thread(render_feature_card, features_path)
         if card_path:
-            await _safe_send(MessageSegment.image(Path(card_path)))
+            await _safe_send(OutImage(path=card_path, label="feature card"))
         else:
             await _safe_send("功能表为空或不存在，请联系管理员。")
     except Exception:
@@ -2934,12 +2953,11 @@ async def _handle_changelog_command(text: str, user_id: str) -> bool:
 
     # 2. Render and send the changelog card (best-effort; text already sent)
     try:
-        from nonebot.adapters.onebot.v11 import MessageSegment
         card_path = await asyncio.to_thread(
             render_changelog_card, entries, site_url=_PUBLIC_SITE_URL)
         if card_path:
             await asyncio.sleep(1.0)
-            await _safe_send(MessageSegment.image(Path(card_path)))
+            await _safe_send(OutImage(path=card_path, label="changelog card"))
     except Exception:
         pass  # 卡片是锦上添花，渲染/发送失败绝不影响文本回复
     return True
@@ -3410,10 +3428,9 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         await _send_markdown_doc(_HELP_MD_PATH, label="帮助文档")
         # 2. Render and send the help card (best-effort; text already sent)
         try:
-            from nonebot.adapters.onebot.v11 import MessageSegment
             card_path = await asyncio.to_thread(render_help_card, _HELP_MD_PATH)
             if card_path:
-                await _safe_send(MessageSegment.image(Path(card_path)))
+                await _safe_send(OutImage(path=card_path, label="help card"))
         except Exception:
             pass
         return True
@@ -3522,12 +3539,12 @@ async def _handle_special_command(command: str, user_id: str):
         )
 
 
-async def _send_response(response: str, matcher=None):
+async def _send_response(response: str, sender=None):
     """Send response, splitting long messages into chunks with rate limiting.
 
     Args:
         response: The response text to send.
-        matcher: Optional matcher to use for sending. Defaults to default_matcher.
+        sender: Optional Sender to use. Defaults to default_sender.
     """
     if not response:
         return
@@ -3542,14 +3559,14 @@ async def _send_response(response: str, matcher=None):
     # Shorter chunks + longer delays to avoid QQ rate limiting
     max_len = 300
     if len(response) <= max_len:
-        await _safe_send(response, matcher=matcher)
+        await _safe_send(response, sender=sender)
     else:
         # Split on sentence boundaries when possible
         chunks = _split_text(response, max_len)
         for i, chunk in enumerate(chunks):
             if not chunk.strip():
                 continue
-            await _safe_send(chunk.strip(), matcher=matcher)
+            await _safe_send(chunk.strip(), sender=sender)
             if i < len(chunks) - 1:
                 await asyncio.sleep(1.0)  # Longer delay between chunks for QQ rate limit
 
