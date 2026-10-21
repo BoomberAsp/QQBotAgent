@@ -2,9 +2,12 @@
 # Install: pip install -r requirements.txt
 
 # ── NoneBot2 Core ────────────────────────────────────────────────
-nonebot2>=2.4.0
+nonebot2>=2.5.0
 nonebot-adapter-onebot>=2.4.0
-nonebot2[fastapi]
+# QQ 官方机器人适配器（阶段四）；会把 cryptography 升到 ≥43
+nonebot-adapter-qq>=1.7.3
+# websockets 必需：QQ 官方适配器走 WS 网关（DRIVER=~fastapi+~httpx+~websockets）
+nonebot2[fastapi,websockets]
 nb-cli>=0.7.0
 
 # ── HTTP & WebSocket ─────────────────────────────────────────────

@@ -74,3 +74,5 @@ QQBot/data/wiki_cache/name_mapping.json
 
 # 可被管理员在服务器上修改的别名映射文件
 QQBot/config/characters/character_dic.json
+# ── QQ 官方机器人凭据（AppSecret，绝不入库）────────────
+bot-secret/

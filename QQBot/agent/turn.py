@@ -45,10 +45,11 @@ import httpx
 
 from agent.agent import Agent
 from agent.inbound import InboundMessage
-from agent.outbound import OutImage, SendFailed
+from agent.outbound import OutImage, OutProgress, SendFailed
 from agent.continuous_session import ContinuousSessionManager
 from agent.context import (
-    _current_sender, _current_user_workspace,
+    _current_sender, _turn_sender, _current_platform,
+    _current_user_workspace,
     _current_user_role, _current_code_limits,
     _current_user_id, _current_group_id,
     _current_group_context, _current_personality,
@@ -153,6 +154,9 @@ class _ToolSender:
 
     async def send_markdown(self, text: str) -> None:
         await _safe_send(text, sender=self._sender)
+
+    async def send_progress(self, text: str) -> None:
+        await _safe_send(OutProgress(text), sender=self._sender)
 
 
 # ── Configuration Paths ───────────────────────────────────────────
@@ -703,7 +707,7 @@ def _build_tool_registry() -> ToolRegistry:
         async def _inner_progress(msg: str):
             sender = _current_sender.get()
             if sender is not None:
-                await sender.send_text(msg)
+                await sender.send_progress(msg)
 
         return await run_delegated_task(
             task,
@@ -1507,6 +1511,9 @@ _tool_registry.register(
 
 async def run_agent_turn(view: InboundMessage):
     """Run one agent turn under the per-user busy guard."""
+    # Platform identity (stage 4, §7.7): PermissionManager.get_role() picks
+    # the openid tables for qq_official, the QQ-number tables for onebot.
+    _current_platform.set(view.platform)
     user_id = view.user_id
     # ── Per-user concurrency guard ──
     if user_id in _user_busy:
@@ -1830,7 +1837,7 @@ async def handle_agent_turn(view: InboundMessage):
 
         # Run the agent loop with timeout
         async def _progress(msg: str):
-            await _safe_send(msg)
+            await _safe_send(OutProgress(msg))
         token = _current_sender.set(_ToolSender())
 
         # Resolve user permissions
@@ -1996,6 +2003,7 @@ async def handle_agent_turn(view: InboundMessage):
 
 async def run_continuous_turn(view: InboundMessage):
     """Run one continuous-mode turn (active-window check + busy guard)."""
+    _current_platform.set(view.platform)
     user_id = view.user_id
     group_id = view.group_id
     # Check if user is in continuous mode
@@ -2224,7 +2232,7 @@ async def handle_continuous_turn(view: InboundMessage):
 
             response = await asyncio.wait_for(
                 agent.run(augmented_message, user_id, client=client,
-                           progress_callback=lambda msg: _safe_send(msg, sender=continuous_sender),
+                           progress_callback=lambda msg: _safe_send(OutProgress(msg), sender=continuous_sender),
                            allowed_tools=allowed_tools,
                            user_role=role.value),
                 timeout=300.0,
@@ -2262,19 +2270,23 @@ async def handle_continuous_turn(view: InboundMessage):
 
 
 async def _safe_send(message, max_retries: int = 2, sender=None):
-    """Send a message (str or OutImage) with retry on SendFailed.
+    """Send a message (str, OutImage or OutProgress) with retry on SendFailed.
 
     Args:
-        message: Message text (str) or agent.outbound.OutImage.
+        message: Message text (str), agent.outbound.OutImage or OutProgress.
         max_retries: Number of retry attempts on SendFailed.
-        sender: Optional Sender to use. Defaults to default_sender.
+        sender: Optional Sender to use. Falls back to the _turn_sender
+            contextvar (QQ official entry binds a per-event sender there)
+            and then to default_sender.
     """
-    s = sender or default_sender
+    s = sender or _turn_sender.get() or default_sender
     last_error = None
     for attempt in range(max_retries):
         try:
             if isinstance(message, OutImage):
                 await s.send_image(message)
+            elif isinstance(message, OutProgress):
+                await s.send_progress(message.text)
             else:
                 await s.send_text(message)
             return
