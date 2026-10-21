@@ -4160,6 +4160,239 @@ class TestAgentPersist:
         print_pass("persist=False isolates session; persist=True writes back")
 
 
+class TestCharacterRegistry:
+    """Test agent/character_registry.py — UGC overlay on PersonalityManager."""
+
+    def run(self):
+        print_header("21. CharacterRegistry Tests (P1)")
+        self._setup()
+        try:
+            self.test_discover_builtin_only()
+            self.test_crud_and_scope()
+            self.test_group_and_default()
+            self.test_purge_references()
+        finally:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _setup(self):
+        from agent.character_registry import CharacterRegistry
+        self.tmp = tempfile.mkdtemp(prefix="creg_")
+        pdir = os.path.join(self.tmp, "personalities")
+        os.makedirs(pdir, exist_ok=True)
+        with open(os.path.join(pdir, "assistant.md"), "w", encoding="utf-8") as f:
+            f.write("# 助手 Roxy\n\nbase")
+        with open(os.path.join(pdir, "rubi.md"), "w", encoding="utf-8") as f:
+            f.write("# 露比 (Rubi)\n\n<!-- mode: split | task_voice: character -->\n\nx")
+        self.reg = CharacterRegistry(
+            personalities_dir=pdir,
+            characters_dir=os.path.join(self.tmp, "characters"),
+        )
+
+    def _mk(self, char_id, name, author):
+        card = f"# {name}\n<!-- mode: split | task_voice: character -->\n\n内容"
+        meta = {"char_id": char_id, "display_name": name, "author": author,
+                "created_at": 0, "visibility": "private", "voice_id": None, "source": "ugc"}
+        self.reg.register_character(char_id, card, meta)
+
+    def test_discover_builtin_only(self):
+        # _discover() must never leak UGC (protects get_default fallback)
+        self._mk("星野爱_abc123", "星野爱", "u1")
+        assert set(self.reg._discover()) == {"assistant", "rubi"}
+        assert self.reg.is_ugc("星野爱_abc123")
+        assert self.reg.get_mode("星野爱_abc123") == "split"
+        assert self.reg.get_display_name("星野爱_abc123") == "星野爱"
+        print_pass("_discover() builtin-only; UGC load/mode/display via registry")
+
+    def test_crud_and_scope(self):
+        self._mk("c_aaa111", "爱丽丝", "u1")
+        # owner-scoped resolve: own vs other
+        assert self.reg.resolve_name("爱丽丝", user_id="u1") == "c_aaa111"
+        assert self.reg.resolve_name("爱丽丝", user_id="u2") is None
+        # exact char_id (owner only)
+        assert self.reg.resolve_name("c_aaa111", user_id="u1") == "c_aaa111"
+        assert self.reg.resolve_name("c_aaa111", user_id="u2") is None
+        # builtin still resolves
+        assert self.reg.resolve_name("rubi", user_id="u1") == "rubi"
+        # list: builtins + own UGC only
+        keys_u1 = {e["key"] for e in self.reg.list_personalities(user_id="u1")}
+        keys_u2 = {e["key"] for e in self.reg.list_personalities(user_id="u2")}
+        assert "c_aaa111" in keys_u1 and "c_aaa111" not in keys_u2
+        assert {"assistant", "rubi"} <= keys_u2
+        # set_user_personality is owner-scoped
+        self.reg.set_user_personality("u1", "爱丽丝")
+        assert self.reg.resolve_effective_personality("u1") == "c_aaa111"
+        # u2 cannot resolve u1's char → falls back to default
+        try:
+            self.reg.set_user_personality("u2", "爱丽丝")
+            assert False, "u2 should not resolve u1's UGC"
+        except ValueError:
+            pass
+        # delete
+        assert self.reg.delete("c_aaa111") is True
+        assert self.reg.is_ugc("c_aaa111") is False
+        assert self.reg.delete("c_aaa111") is False
+        print_pass("UGC CRUD + owner-scoped resolve/list/set (privacy)")
+
+    def test_group_and_default(self):
+        self._mk("c_bbb222", "群角色", "admin1")
+        # owner can bind their UGC to a group
+        self.reg.set_group_personality("g1", "群角色", owner_id="admin1")
+        assert self.reg.get_group_personality("g1") == "c_bbb222"
+        # another user in that group resolves it (group layer = any existing key)
+        assert self.reg.resolve_effective_personality("u9", "g1") == "c_bbb222"
+        # non-owner cannot bind someone else's UGC
+        try:
+            self.reg.set_group_personality("g2", "群角色", owner_id="other")
+            assert False
+        except ValueError:
+            pass
+        # get_default unaffected by UGC
+        assert self.reg.get_default() in {"assistant", "rubi"}
+        print_pass("group binding owner-scoped at set; get_default builtin-only")
+
+    def test_purge_references(self):
+        self._mk("c_ccc333", "待删", "u1")
+        self.reg.set_user_personality("u1", "待删")
+        self.reg.set_group_personality("g5", "待删", owner_id="u1")
+        assert self.reg.resolve_effective_personality("u1") == "c_ccc333"
+        removed = self.reg.purge_references("c_ccc333")
+        assert removed == 2, removed
+        # references gone → fall back to default / unset
+        assert self.reg.resolve_effective_personality("u1") != "c_ccc333"
+        assert self.reg.get_group_personality("g5") is None
+        self.reg.delete("c_ccc333")
+        print_pass("purge_references clears user settings + group bindings")
+
+
+class TestCreateCharacterTool:
+    """Test tools/creation_tools.py — create_character validate/review/write."""
+
+    def run(self):
+        print_header("22. create_character Tool Tests (P1)")
+        asyncio.run(self._run_async())
+
+    def _reg(self):
+        from agent.character_registry import CharacterRegistry
+        tmp = tempfile.mkdtemp(prefix="ccreate_")
+        self._tmps.append(tmp)
+        pdir = os.path.join(tmp, "personalities")
+        os.makedirs(pdir, exist_ok=True)
+        with open(os.path.join(pdir, "assistant.md"), "w", encoding="utf-8") as f:
+            f.write("# 助手 Roxy\nbase")
+        return CharacterRegistry(
+            personalities_dir=pdir, characters_dir=os.path.join(tmp, "characters")
+        )
+
+    def _perm(self, max_chars=1):
+        from agent.permissions import UserRole
+        class P:
+            def get_role(self, u): return UserRole.REGULAR
+            def get_max_characters(self, r): return max_chars
+        return P()
+
+    def _client(self, resp):
+        class C:
+            async def chat_completion(self, message, history, timeout_set, purpose):
+                return resp
+        return C()
+
+    async def _run_async(self):
+        from tools.creation_tools import create_character, build_card, validate_fields
+        self._tmps = []
+        try:
+            good = dict(name="星野爱", personality="温柔", speech_style="轻声",
+                        appearance="粉发蓝瞳", gift_loved=["花"])
+            # validation: missing required
+            assert validate_fields(dict(name="A", personality="p")) is not None
+            assert validate_fields(good) is None
+            # card structure carries required metadata + delegate_task wording
+            card = build_card(good)
+            assert card.startswith("# 星野爱")
+            assert "mode: split | task_voice: character" in card
+            assert "delegate_task" in card
+            assert "Appearance Anchor" in card and "Gift Preferences" in card
+
+            # success (no review client → fail-open path)
+            reg = self._reg()
+            res = await create_character(user_id="u1", fields=good, registry=reg,
+                                         perm_manager=self._perm(max_chars=3), review_client=None)
+            assert res.startswith("✅"), res
+            assert len(reg._ugc_ids()) == 1
+
+            # quota block (reg already holds 1 char from the success above)
+            res = await create_character(user_id="u1", fields=dict(good, name="第二个"),
+                                         registry=reg, perm_manager=self._perm(max_chars=1),
+                                         review_client=None)
+            assert res.startswith("[Error]"), res
+
+            # name collision
+            reg2 = self._reg()
+            await create_character(user_id="u1", fields=good, registry=reg2,
+                                   perm_manager=self._perm(max_chars=3), review_client=None)
+            res = await create_character(user_id="u1", fields=good, registry=reg2,
+                                         perm_manager=self._perm(max_chars=3), review_client=None)
+            assert res.startswith("[Error]") and "已拥有" in res
+
+            # review REJECT → fail-closed (nothing written)
+            reg3 = self._reg()
+            res = await create_character(user_id="u1", fields=dict(good, name="坏"),
+                                         registry=reg3, perm_manager=self._perm(max_chars=3),
+                                         review_client=self._client("REJECT: 违规"))
+            assert res.startswith("[Error]") and len(reg3._ugc_ids()) == 0
+
+            # review infra error → fail-open (written)
+            reg4 = self._reg()
+            res = await create_character(user_id="u1", fields=dict(good, name="正常"),
+                                         registry=reg4, perm_manager=self._perm(max_chars=3),
+                                         review_client=self._client("调用DeepSeek API时出错: x"))
+            assert res.startswith("✅") and len(reg4._ugc_ids()) == 1
+
+            print_pass("validate/card/quota/collision/review reject+fail-open/success")
+        finally:
+            for t in self._tmps:
+                shutil.rmtree(t, ignore_errors=True)
+
+
+class TestCharCreationInterview:
+    """Test agent.py L4 interview injection for char_creation sessions."""
+
+    def run(self):
+        print_header("23. Char-Creation Interview Injection (P1)")
+        asyncio.run(self._run_async())
+
+    async def _run_async(self):
+        from agent.tool_registry import ToolRegistry
+        from agent.agent import Agent
+        from agent.session import Session
+        from agent.special_session import SpecialSession
+
+        agent = Agent(
+            deepseek_client=MockDeepSeekClient(),
+            tool_registry=ToolRegistry(),
+            config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+        )
+        sess = Session(user_id="u1")
+
+        def _tail(sp):
+            msgs = agent._build_messages(sess, "你好", sp)
+            # last system message = L4 volatile tail
+            sys_msgs = [m for m in msgs if m["role"] == "system"]
+            return sys_msgs[-1]["content"]
+
+        # creation session → interview instructions present
+        creation = SpecialSession(session_id="c1", user_id="u1", name="角色创作",
+                                  metadata={"kind": "char_creation"})
+        tail = _tail(creation)
+        assert "角色创作访谈" in tail and "create_character" in tail
+
+        # ordinary special session → marker present, interview absent
+        normal = SpecialSession(session_id="s1", user_id="u1", name="普通会话")
+        tail2 = _tail(normal)
+        assert "特殊会话模式" in tail2 and "角色创作访谈" not in tail2
+
+        print_pass("L4 interview injected only for char_creation metadata")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -4188,6 +4421,9 @@ def main():
         ("ModelRouter.classify (P0)", TestModelRouterClassify()),
         ("Delegation / Dual-Plane (P0)", TestDelegation()),
         ("Agent persist=False (P0)", TestAgentPersist()),
+        ("CharacterRegistry (P1)", TestCharacterRegistry()),
+        ("create_character Tool (P1)", TestCreateCharacterTool()),
+        ("Char-Creation Interview (P1)", TestCharCreationInterview()),
     ]
 
     passed = 0

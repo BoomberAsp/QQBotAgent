@@ -132,6 +132,13 @@ class PermissionManager:
             UserRole.REGULAR: 1,
         }
 
+        # UGC character creation quota per role (Bond-System-Design.md §5.2)
+        self._max_characters: Dict[UserRole, int] = {
+            UserRole.ADMIN: 10,
+            UserRole.VIP: 3,
+            UserRole.REGULAR: 1,
+        }
+
     # Resolve the project .env path at module load time
     # permissions.py is at QQBot/agent/permissions.py, so parent.parent = QQBot/
     _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
@@ -232,3 +239,7 @@ class PermissionManager:
     def get_max_special_sessions(self, role: UserRole) -> int:
         """Return max special sessions for the given role."""
         return self._max_sessions.get(role, 1)
+
+    def get_max_characters(self, role: UserRole) -> int:
+        """Return max UGC characters the role may own."""
+        return self._max_characters.get(role, 1)

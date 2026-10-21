@@ -41,6 +41,36 @@ _AUTO_COMPRESS_TOOLS = {"gacha_pull", "parse_battle_screenshots", "calculate_spe
 MAX_FOLD_MESSAGES = 8
 
 
+# UGC 角色创作访谈指令（Bond-System-Design.md §5.1, P1）。注入在 L4 易变尾部，
+# 仅当特殊会话 metadata.kind == "char_creation" 时生效；create_character 工具
+# 由 agent_router 在该类会话中通过 allowed_tools 下发。逐项收集、一次一问、
+# 支持「跳过」/「随机」，收齐后调用 create_character 落盘。
+_CHAR_CREATION_INTERVIEW_INSTRUCTIONS = (
+    "## 角色创作访谈（进行中）\n"
+    "用户正在创建一个自定义角色（自创人格）。你的任务是**逐项访谈**收集设定，"
+    "全部收齐后调用 `create_character` 工具一次性落盘。规则：\n"
+    "1. **一次只问一项**，等用户回答后再问下一项；语气友好、简洁，可适当举例启发。\n"
+    "2. 需要收集的字段（按顺序）：\n"
+    "   - `name` 角色名（必填）\n"
+    "   - `gender` 性别（可跳过）\n"
+    "   - `personality` 性格关键词与描述（必填）\n"
+    "   - `worldview` 世界观背景（可跳过，默认现代日常）\n"
+    "   - `relationship` 角色与用户的关系设定（可跳过）\n"
+    "   - `greeting` 对用户的初始称呼/开场白（可跳过）\n"
+    "   - `speech_style` 说话风格 + 一两句示例台词（必填）\n"
+    "   - `appearance` 外观锚点：发型/发色/瞳色/服饰等固定特征（必填）\n"
+    "   - `gift_loved` / `gift_normal` / `gift_disliked` 喜爱/普通/讨厌的礼物（可跳过）\n"
+    "   - `bond_levels` 各羁绊等级的态度变化或解锁档案（可跳过）\n"
+    "3. 用户说「跳过」→ 该字段留空继续；说「随机」→ 你代为拟定一个合理值并简短告知，然后继续。\n"
+    "4. 允许用户随时修改已回答的字段（以最新值为准）。\n"
+    "5. 全部收集/确认后，调用 `create_character`，把各字段原样填入对应参数"
+    "（礼物偏好填字符串数组）。工具会做安全审查与配额校验。\n"
+    "6. 若工具返回以 `[Error]` 开头的结果，向用户说明原因并协助调整后重试；"
+    "成功则把工具返回的提示转达给用户，并建议用 `/人格切换 <角色名>` 开始相处。\n"
+    "7. 访谈期间不要处理与创角无关的任务请求；如用户想退出，提示 `/结束会话`。"
+)
+
+
 def _display_tool_name(tool_call: dict) -> str:
     """Return a human-facing tool name for the progress message.
 
@@ -471,7 +501,7 @@ class Agent:
             _current_personality, _personality_transition, _current_group_context,
             _current_bond_context,
         )
-        from agent.personality import get_personality_manager
+        from agent.character_registry import get_character_registry
 
         user_id = special_session.user_id if special_session else session.user_id
 
@@ -483,7 +513,9 @@ class Agent:
         # block into per-personality prefixes (B5). ──
         persona_name = _current_personality.get()
         if persona_name:
-            pm = get_personality_manager()
+            # CharacterRegistry: builtin personalities + user-owned UGC
+            # characters (Bond-System-Design.md §5, P1)
+            pm = get_character_registry()
             persona_content = pm.load(persona_name)
             if persona_content:
                 system_content += "\n\n---\n\n" + persona_content
@@ -555,6 +587,11 @@ class Agent:
                 f"你处于特殊会话模式，拥有完整的对话上下文记忆。"
                 f"如果任务已完成，可以建议用户使用 /结束会话 退出特殊会话模式。"
             )
+            # UGC character interview session (Bond-System-Design.md §5.1, P1):
+            # creation sessions carry metadata {"kind": "char_creation"} and
+            # get create_character in allowed_tools (agent_router).
+            if (special_session.metadata or {}).get("kind") == "char_creation":
+                volatile.append(_CHAR_CREATION_INTERVIEW_INSTRUCTIONS)
 
         # Workspace quota usage (changes whenever the user writes files)
         if self.workspaces:

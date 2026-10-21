@@ -48,7 +48,7 @@ from agent.task_record import build_record, build_compact_line, append_task_log
 from agent.search_archive import get_default_archive
 from agent.group_features import get_group_features
 from agent.permissions import PermissionManager, UserRole
-from agent.personality import get_personality_manager
+from agent.character_registry import get_character_registry
 from agent.hardware import HardwareDetector
 from agent.special_session import SpecialSessionManager
 from agent.tool_registry import ToolRegistry
@@ -98,6 +98,7 @@ from tools.character_detail import character_detail, character_detail_with_card
 from tools.bond_detail import bond_detail, bond_detail_with_card
 from tools.battle_parser import parse_battle_screenshots
 from tools.card_renderer import render_help_card, render_feature_card, render_changelog_card
+from tools.creation_tools import create_character as _create_character_impl
 
 # ── Configuration Paths ───────────────────────────────────────────
 
@@ -1060,6 +1061,71 @@ def _build_tool_registry() -> ToolRegistry:
         },
     )
 
+    # ── UGC 角色创作工具（Bond-System-Design.md §5.1, P1）──
+    # 仅在「创建角色」访谈特殊会话（metadata.kind == char_creation）中，由路由
+    # 层通过 allowed_tools 下发；其它场景 schema 过滤掉、_execute_tool_calls 硬
+    # 拒绝。user_id / registry / 审查用 flash client 全部在调用时经模块全局解析。
+    async def _create_character_tool(
+        name: str,
+        personality: str,
+        speech_style: str,
+        appearance: str,
+        gender: str = "",
+        worldview: str = "",
+        relationship: str = "",
+        greeting: str = "",
+        gift_loved: list = None,
+        gift_normal: list = None,
+        gift_disliked: list = None,
+        bond_levels: str = "",
+    ) -> str:
+        fields = {
+            "name": name, "personality": personality,
+            "speech_style": speech_style, "appearance": appearance,
+            "gender": gender, "worldview": worldview,
+            "relationship": relationship, "greeting": greeting,
+            "gift_loved": gift_loved or [], "gift_normal": gift_normal or [],
+            "gift_disliked": gift_disliked or [], "bond_levels": bond_levels,
+        }
+        uid = _current_user_id.get()
+        result = await _create_character_impl(
+            user_id=uid,
+            fields=fields,
+            registry=get_character_registry(),
+            perm_manager=_perm_manager,
+            review_client=_model_router.flash_client,
+        )
+        # Flag success so the handler auto-closes the interview session post-run.
+        if uid and not result.startswith("[Error]"):
+            _pending_char_creation_done[uid] = True
+        return result
+
+    registry.register(
+        "create_character", _create_character_tool,
+        "创建用户自创角色（UGC 人格）。仅在角色创作访谈会话中、收集齐角色设定后调用一次，"
+        "把访谈得到的各字段原样填入。工具会做安全审查与配额校验，成功后角色即可用 "
+        "/人格切换 选用。必填：name（角色名）、personality（性格）、speech_style（说话风格与示例台词）、"
+        "appearance（外观锚点）；其余字段用户未提供可留空或省略。",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "角色名（≤24字符）"},
+                "gender": {"type": "string", "description": "性别（可选）"},
+                "personality": {"type": "string", "description": "性格关键词与描述（必填）"},
+                "worldview": {"type": "string", "description": "世界观背景（可选，默认现代日常）"},
+                "relationship": {"type": "string", "description": "角色与用户的关系设定（可选）"},
+                "greeting": {"type": "string", "description": "对用户的初始称呼/开场白（可选）"},
+                "speech_style": {"type": "string", "description": "说话风格描述与示例台词（必填）"},
+                "appearance": {"type": "string", "description": "外观锚点：发型/发色/瞳色/服饰等固定特征（必填）"},
+                "gift_loved": {"type": "array", "items": {"type": "string"}, "description": "喜爱的礼物（≤10项，可选）"},
+                "gift_normal": {"type": "array", "items": {"type": "string"}, "description": "普通的礼物（可选）"},
+                "gift_disliked": {"type": "array", "items": {"type": "string"}, "description": "讨厌的礼物（可选）"},
+                "bond_levels": {"type": "string", "description": "各羁绊等级的态度变化/解锁档案描述（可选）"},
+            },
+            "required": ["name", "personality", "speech_style", "appearance"],
+        },
+    )
+
     return registry
 
 
@@ -1118,6 +1184,13 @@ _pending_naming: dict = {}
 
 # Track pending deletion confirmations: user_id -> (session_name, expiry_timestamp)
 _pending_delete_confirm: dict = {}
+
+# Track pending UGC character deletion: user_id -> (char_id, expiry_timestamp)
+_pending_char_delete_confirm: dict = {}
+
+# Set by the create_character tool closure on success; the message handler
+# pops it after the run to auto-close the interview special session.
+_pending_char_creation_done: dict = {}
 
 # Track pending personality-switch choice: user_id -> (old_display, new_display)
 # Set by /人格切换, resolved on the user's next message: "清空" clears context,
@@ -2098,7 +2171,7 @@ async def handle_agent_message(bot: Bot, event: MessageEvent):
     # ── Per-user concurrency guard ──
     if user_id in _user_busy:
         _gid = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
-        _pm = get_personality_manager()
+        _pm = get_character_registry()
         _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, _gid))
         await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~")
         return
@@ -2160,6 +2233,28 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
             else:
                 _pending_delete_confirm.pop(user_id, None)
                 await _safe_send("确认已超时（60秒），请重新发起 /删除会话。")
+            return
+
+    # ── Handle pending UGC character deletion confirmation (bare text) ──
+    pending_char = _pending_char_delete_confirm.get(user_id)
+    if pending_char:
+        expected = f"确认删除角色 {pending_char[0]}"
+        if text_content == expected or text_content == f"/{expected}":
+            _pending_char_delete_confirm.pop(user_id, None)
+            if time.time() < pending_char[1]:
+                registry = get_character_registry()
+                char_id = registry.resolve_name(pending_char[0], user_id=user_id)
+                if (char_id and registry.is_ugc(char_id)
+                        and (registry.get_meta(char_id) or {}).get("author") == user_id):
+                    display = registry.get_display_name(char_id)
+                    registry.delete(char_id)
+                    purged = registry.purge_references(char_id)
+                    note = f"\n（已解除 {purged} 处人格设置引用）" if purged else ""
+                    await _safe_send(f"已删除自创角色「{display}」。{note}")
+                else:
+                    await _safe_send(f"未找到你的自创角色「{pending_char[0]}」。")
+            else:
+                await _safe_send("确认已超时（60秒），请重新发起 /删除角色。")
             return
 
     # ── Handle pending personality-switch choice (keep vs clear) ────
@@ -2356,7 +2451,7 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
     # Send thinking indicator (non-critical, ignore send failures)
     try:
         _gid = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
-        _pm = get_personality_manager()
+        _pm = get_character_registry()
         _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, _gid))
         await _safe_send(f"{_short} 正在思考...")
     except Exception:
@@ -2367,14 +2462,25 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         # split persona → each message is triaged to social (角色面) or task
         # (任务面) plane; unified persona → single plane (existing behavior).
         group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
-        pm = get_personality_manager()
+        pm = get_character_registry()
         persona_key = pm.resolve_effective_personality(user_id, group_id)
         persona_mode = pm.get_mode(persona_key)
 
+        # Detect session type (also gates the UGC creation interview below)
+        active_special = _special_sessions.get_active(user_id)
+        session_type = "special" if active_special else "temporary"
+        is_creation = bool(active_special) and (
+            (active_special.metadata or {}).get("kind") == "char_creation"
+        )
+
         # ── Triage: classify complexity (and plane, for split personas) ──
+        # Creation interviews skip triage entirely: neutral assistant persona,
+        # flash model, only create_character exposed (Bond-System-Design.md §5.1).
         is_special = augmented_message in ["/clear", "清除上下文", "新对话", "/status"]
         plane = "task"
-        if not is_special:
+        if is_creation:
+            client = _model_router.flash_client
+        elif not is_special:
             if persona_mode == "split":
                 _cls = await _model_router.classify(augmented_message)
                 plane = _cls.get("plane", "task")
@@ -2394,10 +2500,6 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         async def _send_image(seg):
             await _safe_send(seg)
         token = _send_msg.set(_send_image)
-
-        # Detect session type
-        active_special = _special_sessions.get_active(user_id)
-        session_type = "special" if active_special else "temporary"
 
         # Resolve user permissions
         role = _perm_manager.get_role(user_id)
@@ -2443,8 +2545,16 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         # Otherwise (split→task plane, or unified persona): L2 = neutral
         #   "assistant" for split task plane (globally-shared cache prefix),
         #   or the full persona for unified; no bond injection.
-        character_plane = (persona_mode == "split" and plane == "social")
-        if character_plane:
+        character_plane = (
+            persona_mode == "split" and plane == "social" and not is_creation
+        )
+        if is_creation:
+            # UGC creation interview: neutral assistant persona (globally-shared
+            # cache prefix), only the create_character tool exposed, no bond.
+            allowed_tools = {"create_character"}
+            _current_bond_context.set("")
+            _current_personality.set("assistant")
+        elif character_plane:
             client = _model_router.flash_client
             allowed_tools = set(SOCIAL_TOOLS)
             _current_personality.set(persona_key)
@@ -2494,8 +2604,8 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         # task agent answered as neutral Roxy, so wrap its result in the
         # character's voice (opening line) while passing the body verbatim.
         # The social plane already speaks in character; unified personas are
-        # never re-voiced.
-        if persona_mode == "split" and not character_plane:
+        # never re-voiced. Creation interviews stay neutral (no revoice).
+        if persona_mode == "split" and not character_plane and not is_creation:
             # Restore persona so _send_response's disclaimer is signed by the
             # character and revoice speaks in the character's voice.
             _current_personality.set(persona_key)
@@ -2520,8 +2630,17 @@ async def _handle_agent_message_impl(bot: Bot, event: MessageEvent, user_id: str
         # Send response (split long messages)
         await _send_response(response)
 
+        # ── Creation session auto-close: once create_character succeeded this
+        # turn (the tool closure flags it), leave the interview session so the
+        # next /人格切换 works cleanly. ──
+        if is_creation and _pending_char_creation_done.pop(user_id, False):
+            try:
+                _special_sessions.end_active(user_id)
+            except Exception:
+                pass
+
         # ── Bond settlement hook (both planes accrue 好感度) ──
-        if persona_mode == "split":
+        if persona_mode == "split" and not is_creation:
             await _settle_bond_turn(user_id, persona_key)
 
         # Auto-name special session after first interaction
@@ -2574,7 +2693,7 @@ async def handle_continuous_message(bot: Bot, event: MessageEvent):
 
     # ── Per-user concurrency guard ──
     if user_id in _user_busy:
-        _pm = get_personality_manager()
+        _pm = get_character_registry()
         _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, group_id))
         await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~", matcher=continuous_router)
         return
@@ -2726,7 +2845,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
 
     try:
         # ── Dual-plane routing (Bond-System-Design.md §3) ──
-        pm = get_personality_manager()
+        pm = get_character_registry()
         persona_key = pm.resolve_effective_personality(user_id, group_id)
         persona_mode = pm.get_mode(persona_key)
 
@@ -2832,7 +2951,7 @@ async def _handle_continuous_message_impl(bot: Bot, event: MessageEvent, user_id
             await _settle_bond_turn(user_id, persona_key, matcher=continuous_router)
 
     except asyncio.TimeoutError:
-        _pm = get_personality_manager()
+        _pm = get_character_registry()
         _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, group_id))
         await _safe_send(f"抱歉，{_short}思考时间超过您的配额时长了。请尝试用更简单的方式提问~", matcher=continuous_router)
     except Exception as e:
@@ -3159,8 +3278,8 @@ async def _handle_personality_command(text: str, user_id: str, event: MessageEve
     if cmd not in ("/personality", "/人格切换"):
         return False
 
-    pm = get_personality_manager()
-    personalities = pm.list_personalities()
+    pm = get_character_registry()
+    personalities = pm.list_personalities(user_id=user_id)
     args = args.strip()
     group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
 
@@ -3177,8 +3296,13 @@ async def _handle_personality_command(text: str, user_id: str, event: MessageEve
         lines = [f"当前人格: {current_display} ({current_key}，{source})", "", "可用人格:"]
         for p in personalities:
             marker = " ← 当前" if p["key"] == current_key else ""
-            lines.append(f"  {p['display_name']} ({p['key']}){marker}")
-        lines.append(f"\n使用 /人格切换 <名称> 切换，例如: /人格切换 {personalities[0]['display_name']}")
+            tag = "　[自创]" if p.get("source") == "ugc" else ""
+            lines.append(f"  {p['display_name']} ({p['key']}){tag}{marker}")
+        lines.append(
+            "\n使用 /人格切换 <名称> 切换，例如: /人格切换 "
+            f"{personalities[0]['display_name']}"
+        )
+        lines.append("用 /创建角色 访谈式创建你自己的角色。")
         await _safe_send("\n".join(lines))
         return True
 
@@ -3234,7 +3358,7 @@ async def _settle_bond_turn(user_id: str, persona_key: str, matcher=None):
 
 async def _send_level_up_notice(user_id: str, persona_key: str, up: dict, matcher=None):
     """羁绊升级庆祝：角色口吻一句话（flash）+ 等级提示；LLM 失败降级固定文案。"""
-    pm = get_personality_manager()
+    pm = get_character_registry()
     short = pm.get_short_name(persona_key)
     fallback = f"✨ 你与 {short} 的羁绊达到了 Lv{up['level']}（{up['title']}）！"
     opening = None
@@ -3279,7 +3403,7 @@ async def _handle_bond_command(
     cmd = text.strip().split()[0] if text.strip() else ""
     if cmd not in ("/好感度", "#好感度", "/bond"):
         return False
-    pm = get_personality_manager()
+    pm = get_character_registry()
     group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
     persona_key = pm.resolve_effective_personality(user_id, group_id)
     display = pm.get_display_name(persona_key)
@@ -3447,7 +3571,7 @@ async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -
             label = FEATURE_LABELS[key]
             state = "开启" if features[key] else "关闭"
             lines.append(f"  {label}: {state}")
-        pm = get_personality_manager()
+        pm = get_character_registry()
         group_key = pm.get_group_personality(group_id)
         if group_key:
             lines.append(f"  默认人格: {pm.get_display_name(group_key)} ({group_key})")
@@ -3460,7 +3584,7 @@ async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -
 
     # /toggle personality [名称|默认] — group default personality
     if args == "personality" or args.startswith("personality "):
-        pm = get_personality_manager()
+        pm = get_character_registry()
         rest = args[len("personality"):].strip()
         if not rest:
             group_key = pm.get_group_personality(group_id)
@@ -3484,7 +3608,8 @@ async def _handle_toggle_command(text: str, user_id: str, event: MessageEvent) -
             await _safe_send(f"已清除本群默认人格，回落到全局默认「{pm.get_display_name(global_key)}」。")
             return True
         try:
-            resolved = pm.set_group_personality(group_id, rest)
+            # owner_id=user_id lets a superuser bind their own UGC characters
+            resolved = pm.set_group_personality(group_id, rest, owner_id=user_id)
             await _safe_send(f"已设置本群默认人格为「{pm.get_display_name(resolved)}」。")
         except ValueError as e:
             await _safe_send(str(e))
@@ -3521,6 +3646,116 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
     """
     cmd, _, args = text.partition(" ")
     args = args.strip()
+
+    # ── /创建角色 ──────────────────────────────────────────────
+    # 访谈式 UGC 角色创作（Bond-System-Design.md §5.1, P1）。占用一个特殊会话
+    # 槽，metadata.kind = char_creation 触发 agent L4 访谈指令 + create_character。
+    if cmd in ("/创建角色", "#创建角色"):
+        registry = get_character_registry()
+        role = _perm_manager.get_role(user_id)
+        # Already in a creation interview?
+        active = _special_sessions.get_active(user_id)
+        if active and (active.metadata or {}).get("kind") == "char_creation":
+            await _safe_send(
+                "你已经在一个角色创作访谈中了，直接回答我的问题即可；"
+                "想放弃请用 /结束会话 退出。"
+            )
+            return True
+        # Character quota
+        max_chars = _perm_manager.get_max_characters(role)
+        owned = registry.list_ugc(user_id)
+        if len(owned) >= max_chars:
+            names = "、".join(registry.get_display_name(m["char_id"]) for m in owned) or "无"
+            await _safe_send(
+                f"你的自创角色数量已达上限（{len(owned)}/{max_chars}）：{names}。\n"
+                "请先用 /删除角色 <名称> 清理，再创建新角色。"
+            )
+            return True
+        # Special-session slot quota (creation session occupies one)
+        max_sessions = _perm_manager.get_max_special_sessions(role)
+        sessions = _special_sessions.list_sessions(user_id)
+        if len(sessions) >= max_sessions:
+            await _safe_send(
+                f"创建角色需要占用一个特殊会话槽，但你已达到上限（{len(sessions)}/{max_sessions}）。\n"
+                "请先用 /删除会话 <名称> 清理一个会话后再试。"
+            )
+            return True
+        try:
+            session = _special_sessions.create(
+                user_id, "角色创作", metadata={"kind": "char_creation"}
+            )
+            _special_sessions.switch_to(user_id, session.name)
+            _temp_session_files.pop(user_id, None)
+            seed = (
+                "开始创作你的专属角色吧！我会逐项问你一些设定，"
+                "每项都可以直接回答；也可以说「跳过」用默认值，或「随机」让我替你拟一个。\n\n"
+                f"（当前自创角色 {len(owned)}/{max_chars}；随时可用 /结束会话 放弃创作）\n\n"
+                "第一项：给你的角色起个名字吧（不超过 24 个字）。"
+            )
+            # Record the greeting as the assistant's first interview turn so the
+            # session context stays coherent (zero-LLM seeding).
+            _special_sessions.add_message(user_id, "assistant", seed)
+            await _safe_send(seed)
+        except Exception as e:
+            code = log_exception("create-character session failed", e)
+            await _safe_send(f"启动角色创作失败（诊断编号 {code}），请稍后重试。")
+        return True
+
+    # ── /删除角色 <名称> ───────────────────────────────────────
+    # 删除自己的 UGC 角色（二次确认）。保留 bond 好感数据（重逢仍在）。
+    if cmd in ("/删除角色", "#删除角色"):
+        registry = get_character_registry()
+        if not args:
+            owned = registry.list_ugc(user_id)
+            if not owned:
+                await _safe_send("你还没有自创角色。用 /创建角色 访谈式创建一个吧~")
+                return True
+            lines = ["你的自创角色:"]
+            for m in owned:
+                lines.append(f"  {registry.get_display_name(m['char_id'])} ({m['char_id']})")
+            lines.append("\n用法: /删除角色 <名称>")
+            await _safe_send("\n".join(lines))
+            return True
+
+        confirm_key = f"确认删除角色 {args}"
+        if text == confirm_key:
+            pending = _pending_char_delete_confirm.get(user_id)
+            if pending and time.time() < pending[1] and pending[0] == args:
+                char_id = registry.resolve_name(args, user_id=user_id)
+                _pending_char_delete_confirm.pop(user_id, None)
+                if not (char_id and registry.is_ugc(char_id)
+                        and (registry.get_meta(char_id) or {}).get("author") == user_id):
+                    await _safe_send(f"未找到你的自创角色「{args}」。")
+                    return True
+                display = registry.get_display_name(char_id)
+                registry.delete(char_id)
+                purged = registry.purge_references(char_id)
+                note = f"\n（已解除 {purged} 处人格设置引用）" if purged else ""
+                await _safe_send(
+                    f"已删除自创角色「{display}」。{note}\n"
+                    "该角色的好感度记录已保留，若日后重建同名角色不会自动继承。"
+                )
+                return True
+            _pending_char_delete_confirm.pop(user_id, None)
+            await _safe_send("确认已超时（60秒）或已失效，请重新发起 /删除角色。")
+            return True
+
+        # First call — resolve + request confirmation
+        char_id = registry.resolve_name(args, user_id=user_id)
+        if not (char_id and registry.is_ugc(char_id)
+                and (registry.get_meta(char_id) or {}).get("author") == user_id):
+            await _safe_send(
+                f"未找到你的自创角色「{args}」。\n"
+                "（只能删除你自己创建的角色；内置人格请用 /人格切换 切换。）"
+            )
+            return True
+        display = registry.get_display_name(char_id)
+        _pending_char_delete_confirm[user_id] = (args, time.time() + 60)
+        await _safe_send(
+            f"确认删除自创角色「{display}」？此操作不可撤销（好感度记录会保留）。\n"
+            f"请回复「确认删除角色 {args}」来执行（60秒内有效）。"
+        )
+        return True
 
     # ── /新会话 [名称] ─────────────────────────────────────────
     if cmd in ("/新会话", "#新会话"):
@@ -3867,8 +4102,8 @@ async def _handle_special_command(command: str, user_id: str):
     elif command == "/status":
         status = agent.get_status()
         tool_list = "\n  ".join(status["tool_names"])
-        _short = get_personality_manager().get_short_name(
-            get_personality_manager().get_user_personality(user_id)
+        _short = get_character_registry().get_short_name(
+            get_character_registry().get_user_personality(user_id)
         )
         await _safe_send(
             f"{_short} 状态:\n"
@@ -3888,7 +4123,7 @@ async def _send_response(response: str, matcher=None):
         return
 
     # Append disclaimer to every agent response
-    _pm = get_personality_manager()
+    _pm = get_character_registry()
     _persona = _current_personality.get() or _pm.get_default()
     _short = _pm.get_short_name(_persona)
     disclaimer = f"\n\n{_short} 的回答并非总是准确无误，请理性判断。"
