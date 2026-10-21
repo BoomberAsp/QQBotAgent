@@ -2413,6 +2413,23 @@ class TestTieredMemory:
         self.test_neardup_digit_guard_enumerations()
         self.test_correction_spares_fused_episode_entry()
         self.test_correction_no_topic_word_sweep()
+        # ④ write-time typing (category)
+        self.test_category_defaults_to_fact()
+        self.test_category_explicit_all_four()
+        self.test_category_invalid_or_hallucinated_keeps_existing()
+        self.test_category_reinforce_does_not_retype()
+        self.test_category_update_retypes()
+        self.test_category_survives_promote_and_demote()
+        self.test_critical_demote_age_3x()
+        self.test_category_persistence_roundtrip()
+        self.test_load_v1_file_defaults()
+        self.test_get_judge_list_includes_category()
+        # ③ staleness annotation
+        self.test_staleness_label_stale_fact()
+        self.test_staleness_label_fresh_fact_unlabelled()
+        self.test_staleness_label_scoped_to_fact_only()
+        self.test_staleness_label_legacy_ts0_unlabelled()
+        self.test_staleness_label_cross_year_format()
 
     # ── SHORT ────────────────────────────────────────────────────
 
@@ -2640,8 +2657,9 @@ class TestTieredMemory:
             # MEDIUM first, sorted by count desc; then SHORT
             assert [x["id"] for x in jl] == ["m2", "m1", "s1"], [x["id"] for x in jl]
             assert jl[0]["tier"] == "medium" and jl[2]["tier"] == "short"
-            assert all(set(x) == {"id", "content", "count", "tier"} for x in jl)
-            print_pass("judge list: MEDIUM(top by count) + SHORT, each {id,content,count,tier}")
+            assert all(set(x) == {"id", "content", "count", "tier", "category"} for x in jl)
+            assert all(x["category"] == "fact" for x in jl), "④ default category surfaced"
+            print_pass("judge list: MEDIUM(top by count) + SHORT, each {id,content,count,tier,category}")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -3082,6 +3100,366 @@ class TestTieredMemory:
             assert any("改为外包" in c for c in contents), contents
             assert len(contents) == 2, contents
             print_pass("⑨ M2b: topic-word-only overlap neither targets nor sweeps")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── ④ write-time typing (category) — Memory-Optimization-Plan batch 2 ──
+
+    def _items(self, tm, uid):
+        st = tm._get_state(uid)
+        return list(st.short) + list(st.medium)
+
+    def _by_content(self, tm, uid, sub):
+        for it in self._items(tm, uid):
+            if sub in it.content:
+                return it
+        return None
+
+    def test_category_defaults_to_fact(self):
+        """④ a candidate with no category (dict w/o key, or legacy 3-tuple)
+        creates a SHORT item typed `fact`."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            tm.ingest_candidates("u", [
+                {"content": "用户住在杭州", "judge": "new"},          # dict, no category
+                ("用户是程序员", "new", None),                        # legacy 3-tuple
+            ], [])
+            for sub in ("住在杭州", "程序员"):
+                it = self._by_content(tm, "u", sub)
+                assert it is not None and it.category == "fact", (sub, it and it.category)
+            print_pass("④ category: absent/legacy candidate defaults to 'fact'")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_explicit_all_four(self):
+        """④ all four VALID_CATEGORIES round-trip through a dict candidate,
+        and a 4-tuple carries category too."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import VALID_CATEGORIES
+            tm = self._tm(tmp)
+            tm.ingest_candidates("u", [
+                {"content": "用户对青霉素过敏", "judge": "new", "category": "critical"},
+                {"content": "用户喜欢简短回复", "judge": "new", "category": "preference"},
+                {"content": "用户上周去了漫展", "judge": "new", "category": "event"},
+                ("用户住在杭州", "new", None, "fact"),               # 4-tuple form
+            ], [])
+            got = {self._by_content(tm, "u", s).category: s
+                   for s in ("青霉素过敏", "简短回复", "漫展", "住在杭州")}
+            assert set(got) == set(VALID_CATEGORIES), got
+            assert got["critical"] == "青霉素过敏" and got["preference"] == "简短回复"
+            assert got["event"] == "漫展" and got["fact"] == "住在杭州"
+            print_pass("④ category: preference/fact/event/critical all stored (dict + 4-tuple)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_invalid_or_hallucinated_keeps_existing(self):
+        """④ an invalid tag normalizes to None → existing item KEEPS its category
+        on update; a brand-new item with an invalid tag falls back to `fact`."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import _norm_category
+            assert _norm_category("CRITICAL") == "critical", "case/space normalized"
+            assert _norm_category("  Preference ") == "preference"
+            for bad in ("allergy", "", None, 42, "facts"):
+                assert _norm_category(bad) is None, bad
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            from agent.memory import MediumItem
+            st.medium.append(MediumItem(id="m1", content="用户对青霉素过敏",
+                                        count=4, entry_extraction_index=st.extraction_count,
+                                        category="critical"))
+            # update carrying a hallucinated tag must NOT clobber the critical type
+            tm.ingest_candidates("u", [
+                {"content": "用户对青霉素和头孢都过敏", "judge": "update",
+                 "matched_id": "m1", "category": "allergy"},
+            ], [])
+            assert st.medium[0].category == "critical", st.medium[0].category
+            assert "头孢" in st.medium[0].content, "content still refined"
+            # new item with invalid tag → fact
+            tm.ingest_candidates("u", [
+                {"content": "用户养了一只猫", "judge": "new", "category": "pet"},
+            ], [])
+            assert self._by_content(tm, "u", "养了一只猫").category == "fact"
+            print_pass("④ category: invalid/hallucinated tag → keep existing / default fact")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_reinforce_does_not_retype(self):
+        """④ pure reinforcement (reinforce_short / keep) never re-types: the
+        stored category survives even if the judge supplies a different tag,
+        because reinforce doesn't pass category to the item."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import ShortItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.short.append(ShortItem(id="s1", content="用户住在杭州", count=1,
+                                      category="fact"))
+            # reinforce_short path ignores category entirely
+            tm.ingest_candidates("u", [
+                {"content": "用户住在杭州", "judge": "reinforce_short",
+                 "matched_id": "s1", "category": "critical"},
+            ], [])
+            it = st.short[0]
+            assert it.count == 2 and it.category == "fact", (it.count, it.category)
+            print_pass("④ category: reinforce_short keeps stored type (no silent re-type)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_update_retypes(self):
+        """④ an `update` judge with a valid category DOES re-type (a fact can
+        legitimately be promoted to critical when new detail arrives)."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m1", content="用户吃药要注意",
+                                        count=4, entry_extraction_index=st.extraction_count,
+                                        category="fact"))
+            tm.ingest_candidates("u", [
+                {"content": "用户对青霉素过敏，用错会休克", "judge": "update",
+                 "matched_id": "m1", "category": "critical"},
+            ], [])
+            assert st.medium[0].category == "critical", st.medium[0].category
+            print_pass("④ category: update re-types fact → critical")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_survives_promote_and_demote(self):
+        """④ category + last_confirmed_ts ride along on SHORT→MEDIUM promotion
+        and MEDIUM→SHORT age-demotion (both directions preserve typing)."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MEDIUM_DOWNGRADE_AGE
+            tm = self._tm(tmp)
+            # promote a critical fact to MEDIUM (count reaches 3)
+            for _ in range(3):
+                tm.ingest_candidates("u", [
+                    {"content": "用户对青霉素过敏", "judge": "new", "category": "critical"},
+                ], [])
+                tm.touch_extraction_count("u")
+            st = tm._get_state("u")
+            assert st.medium and st.medium[0].category == "critical", "promote carries category"
+            ts_before = st.medium[0].last_confirmed_ts
+            assert ts_before > 0, "promoted item carries a last_confirmed_ts"
+            # age it past the *fact* threshold but within critical's 3× window
+            st.extraction_count = st.medium[0].entry_extraction_index + MEDIUM_DOWNGRADE_AGE + 1
+            tm.ingest_candidates("u", [], [])
+            assert st.medium and st.medium[0].category == "critical", \
+                "critical must NOT demote at fact-age (3× window)"
+            print_pass("④ category: promote carries type; critical resists fact-age demotion")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_critical_demote_age_3x(self):
+        """④ CATEGORY_DEMOTE_AGE: at age 31 a `fact` demotes but a `critical`
+        of the same age stays in MEDIUM (critical = base × 3)."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import (MediumItem, MEDIUM_DOWNGRADE_AGE,
+                                      CATEGORY_DEMOTE_AGE)
+            assert CATEGORY_DEMOTE_AGE["critical"] == MEDIUM_DOWNGRADE_AGE * 3
+            assert CATEGORY_DEMOTE_AGE["fact"] == MEDIUM_DOWNGRADE_AGE
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            age = MEDIUM_DOWNGRADE_AGE + 1                      # 31
+            st.extraction_count = age
+            st.medium.append(MediumItem(id="f", content="普通事实", count=6,
+                                        entry_extraction_index=0, category="fact"))
+            st.medium.append(MediumItem(id="c", content="用户过敏禁忌", count=6,
+                                        entry_extraction_index=0, category="critical"))
+            tm.ingest_candidates("u", [], [])
+            ids = {m.id for m in st.medium}
+            assert "f" not in ids, "fact demotes at age 31"
+            assert "c" in ids, "critical survives age 31 (3× window)"
+            assert any(s.id == "f" and s.category == "fact" for s in st.short), \
+                "demoted fact lands in SHORT keeping its category"
+            print_pass("④ category: critical demote age = 3× fact; demoted item keeps type")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_persistence_roundtrip(self):
+        """④③ save_user/load_user round-trip category + last_confirmed_ts."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory, ShortItem, MediumItem
+            tm = TieredMemory(base_dir=tmp)
+            st = tm._get_state("u")
+            st.short.append(ShortItem(id="s1", content="短期禁忌", count=2,
+                                      category="critical", last_confirmed_ts=12345.0))
+            st.medium.append(MediumItem(id="m1", content="中期偏好", count=6,
+                                        entry_extraction_index=1,
+                                        category="preference", last_confirmed_ts=67890.0))
+            tm.save_user("u")
+            tm2 = TieredMemory(base_dir=tmp)
+            tm2.load_all()
+            st2 = tm2._get_state("u")
+            assert st2.short[0].category == "critical"
+            assert st2.short[0].last_confirmed_ts == 12345.0
+            assert st2.medium[0].category == "preference"
+            assert st2.medium[0].last_confirmed_ts == 67890.0
+            print_pass("④③ persistence: category + last_confirmed_ts round-trip")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_load_v1_file_defaults(self):
+        """④ a legacy schema-v1 tier file (no category/ts keys) loads with
+        category=fact and last_confirmed_ts=0.0 — no crash, no label."""
+        tmp = tempfile.mkdtemp()
+        try:
+            import json as _json
+            from agent.memory import TieredMemory
+            tiers = os.path.join(tmp, "tiers")
+            os.makedirs(tiers, exist_ok=True)
+            v1 = {
+                "user_id": "u", "extraction_count": 5, "schema_version": 1,
+                "short": [{"id": "s1", "content": "老短期事实", "count": 2}],
+                "medium": [{"id": "m1", "content": "老中期事实", "count": 6,
+                            "entry_extraction_index": 1}],
+                "long": [],
+            }
+            with open(os.path.join(tiers, "u.json"), "w", encoding="utf-8") as f:
+                _json.dump(v1, f, ensure_ascii=False)
+            tm = TieredMemory(base_dir=tmp)
+            tm.load_all()
+            st = tm._get_state("u")
+            assert st.short[0].category == "fact" and st.short[0].last_confirmed_ts == 0.0
+            assert st.medium[0].category == "fact" and st.medium[0].last_confirmed_ts == 0.0
+            # ts=0 → never labelled
+            assert tm._staleness_suffix(st.medium[0], now=None) == ""
+            print_pass("④ load: legacy v1 file defaults to fact/ts=0 (unlabelled)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_get_judge_list_includes_category(self):
+        """④ get_judge_list surfaces category so the judge can respect typing."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem, ShortItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m1", content="中期禁忌", count=6,
+                                        entry_extraction_index=0, category="critical"))
+            st.short.append(ShortItem(id="s1", content="短期经历", count=1,
+                                      category="event"))
+            rows = {r["id"]: r for r in tm.get_judge_list("u")}
+            assert rows["m1"]["category"] == "critical" and rows["m1"]["tier"] == "medium"
+            assert rows["s1"]["category"] == "event" and rows["s1"]["tier"] == "short"
+            print_pass("④ get_judge_list: category surfaced per row")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── ③ staleness annotation「截至 X 月」— Memory-Optimization-Plan batch 2 ──
+
+    def test_staleness_label_stale_fact(self):
+        """③ a `fact` older than STALE_LABEL_AFTER_DAYS gets a （截至 X 月）label."""
+        tmp = tempfile.mkdtemp()
+        try:
+            import time as _time
+            from agent.memory import TieredMemory, MediumItem, STALE_LABEL_AFTER_DAYS
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            now = _time.time()
+            stale_ts = now - (STALE_LABEL_AFTER_DAYS + 5) * 86400.0
+            st.medium.append(MediumItem(id="m1", content="用户住在杭州", count=6,
+                                        entry_extraction_index=0, category="fact",
+                                        last_confirmed_ts=stale_ts))
+            block = tm.build_medium_injection("u")
+            month = _time.localtime(stale_ts).tm_mon
+            assert f"（截至 {month} 月）" in block, block
+            line = [ln for ln in block.splitlines() if "住在杭州" in ln][0]
+            assert line.endswith(f"（截至 {month} 月）"), line
+            print_pass("③ label: stale fact renders （截至 X 月） in injection")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_staleness_label_fresh_fact_unlabelled(self):
+        """③ a fact confirmed within the window carries NO label."""
+        tmp = tempfile.mkdtemp()
+        try:
+            import time as _time
+            from agent.memory import TieredMemory, MediumItem, STALE_LABEL_AFTER_DAYS
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            fresh_ts = _time.time() - (STALE_LABEL_AFTER_DAYS - 5) * 86400.0
+            st.medium.append(MediumItem(id="m1", content="用户住在杭州", count=6,
+                                        entry_extraction_index=0, category="fact",
+                                        last_confirmed_ts=fresh_ts))
+            block = tm.build_medium_injection("u")
+            assert "截至" not in block, block
+            print_pass("③ label: fresh fact (< window) is unlabelled")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_staleness_label_scoped_to_fact_only(self):
+        """③ critical/preference/event NEVER get the label even when stale —
+        hedging an allergy is dangerous; preference has ⑩; event is past-tense."""
+        tmp = tempfile.mkdtemp()
+        try:
+            import time as _time
+            from agent.memory import (TieredMemory, MediumItem,
+                                      STALE_LABEL_AFTER_DAYS, STALE_LABEL_CATEGORIES)
+            assert STALE_LABEL_CATEGORIES == ("fact",)
+            tm = self._tm(tmp)
+            now = _time.time()
+            stale = now - (STALE_LABEL_AFTER_DAYS + 400) * 86400.0   # >1y stale
+            for i, cat in enumerate(("critical", "preference", "event")):
+                item = MediumItem(id=f"m{i}", content=f"{cat}条目", count=6,
+                                  entry_extraction_index=0, category=cat,
+                                  last_confirmed_ts=stale)
+                assert tm._staleness_suffix(item, now=now) == "", (cat, "must stay unlabelled")
+            fact = MediumItem(id="mf", content="fact条目", count=6,
+                              entry_extraction_index=0, category="fact",
+                              last_confirmed_ts=stale)
+            assert tm._staleness_suffix(fact, now=now) != "", "stale fact IS labelled"
+            print_pass("③ label: scoped to category=fact only (critical/pref/event exempt)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_staleness_label_legacy_ts0_unlabelled(self):
+        """③ last_confirmed_ts == 0.0 (legacy/unknown) → no label regardless of age."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory, MediumItem
+            tm = self._tm(tmp)
+            item = MediumItem(id="m1", content="老事实", count=6,
+                              entry_extraction_index=0, category="fact",
+                              last_confirmed_ts=0.0)
+            assert tm._staleness_suffix(item) == ""
+            print_pass("③ label: ts=0 (unknown age) never labelled")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_staleness_label_cross_year_format(self):
+        """③ a confirmation from a PRIOR year includes the year: （截至 YYYY 年 X 月）;
+        same-year omits it."""
+        tmp = tempfile.mkdtemp()
+        try:
+            import time as _time
+            from agent.memory import TieredMemory, MediumItem
+            tm = self._tm(tmp)
+            now = _time.mktime(_time.localtime())               # ~today
+            cur_year = _time.localtime(now).tm_year
+            # same-year stale: 60 days ago (still this year unless run in Jan/Feb)
+            same = MediumItem(id="a", content="x", count=6, entry_extraction_index=0,
+                              category="fact", last_confirmed_ts=now - 60 * 86400.0)
+            same_lbl = tm._staleness_suffix(same, now=now)
+            same_year = _time.localtime(now - 60 * 86400.0).tm_year
+            if same_year == cur_year:
+                assert "年" not in same_lbl and "月" in same_lbl, same_lbl
+            # prior-year stale: 400 days ago → must include the year
+            prior_ts = now - 400 * 86400.0
+            prior = MediumItem(id="b", content="y", count=6, entry_extraction_index=0,
+                               category="fact", last_confirmed_ts=prior_ts)
+            lbl = tm._staleness_suffix(prior, now=now)
+            py = _time.localtime(prior_ts).tm_year
+            pm = _time.localtime(prior_ts).tm_mon
+            assert lbl == f"（截至 {py} 年 {pm} 月）", lbl
+            assert py != cur_year, "400d ago must be a different year for this assertion"
+            print_pass("③ label: cross-year format （截至 YYYY 年 X 月）, same-year omits year")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

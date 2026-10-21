@@ -209,8 +209,9 @@ _PROFILE_FEW_SHOT = """例1（截图/助手解读 ≠ 用户事实 → {}）
 用户: 我最近迷上原神了，天天肝
 助手(Roxy): 原神挺耐玩的，注意别太肝……
 </conversation>
-输出: {"new_interests": ["原神"], "memory_candidates": [{"content": "用户最近迷上原神，每天都玩", "judge": "new"}]}
-（用户本人陈述的持久兴趣，石蕊测试通过。话题词「原神」进 new_interests；完整事实句进 memory_candidates。）
+输出: {"new_interests": ["原神"], "memory_candidates": [{"content": "用户最近迷上原神，每天都玩", "judge": "new", "category": "fact"}]}
+（用户本人陈述的持久兴趣，石蕊测试通过。话题词「原神」进 new_interests；完整事实句进 memory_candidates。
+「迷上原神每天玩」是持久习惯属性 → category=fact。）
 
 例5（瞬时决策态 / 犹豫中 → {}）
 输入:
@@ -240,10 +241,11 @@ _PROFILE_FEW_SHOT = """例1（截图/助手解读 ≠ 用户事实 → {}）
 用户: 我现在不跑步了，改游泳了，还是一周三次
 助手(Roxy): 游泳也很好，对膝盖负担小……
 </conversation>
-输出: {"memory_candidates": [{"content": "用户已把每周跑步三次改为每周游泳三次", "judge": "update", "matched_id": "m7"}]}
+输出: {"memory_candidates": [{"content": "用户已把每周跑步三次改为每周游泳三次", "judge": "update", "matched_id": "m7", "category": "fact"}]}
 （用户明确纠正/更新旧信息时，必须给 update：content 写纠正后的完整事实句，
 matched_id 指向被纠正的条目——绝不能无视纠正让旧记忆存活，也不要另建一条
-与之矛盾的新记忆。若「已有记忆」里找不到可纠正的条目，则用 judge="new"。）
+与之矛盾的新记忆。若「已有记忆」里找不到可纠正的条目，则用 judge="new"。
+运动习惯是持久属性 → category=fact；纠正替换时也要给出 category 覆盖旧类型。）
 
 例8（用户推翻 existing 画像里的偏好槽位 → updated_preferences；对应 Memory-Optimization-Plan ⑩）
 输入（假设 existing 画像为 {"preferences": {"设备": "安卓手机", "饮品": "不喝咖啡"}}）:
@@ -255,7 +257,17 @@ matched_id 指向被纠正的条目——绝不能无视纠正让旧记忆存活
 （existing 里已有的偏好槽位被用户推翻或修改时，必须用 updated_preferences 覆盖旧值；
 偏好彻底不成立（戒了/不再/改成别的了）就把值设为 null 删除该槽位。规则4的
 「只抽新信息」绝不意味着让旧槽位永远残留；也不要把修正值塞进 new_preferences
-造成新旧并存。键名必须与 existing 画像里的键完全一致。）"""
+造成新旧并存。键名必须与 existing 画像里的键完全一致。）
+
+例9（category 分类：critical / preference / event；对应 Memory-Optimization-Plan ④）
+输入:
+<conversation>
+用户: 提醒一下我对青霉素过敏，别推荐含它的药；另外回复尽量简短，我上周刚做完近视手术
+助手(Roxy): 记下了，会避开青霉素类，回复也从简……
+</conversation>
+输出: {"new_preferences": {"回复风格": "简短"}, "memory_candidates": [{"content": "用户对青霉素过敏", "judge": "new", "category": "critical"}, {"content": "用户上周做了近视手术", "judge": "new", "category": "event"}]}
+（过敏禁忌记错代价高 → critical，此类记忆更耐降级；一次性、有明确时间点的经历 → event；
+「回复简短」是互动偏好，走 new_preferences 槽位，不必再进 memory_candidates。）"""
 
 
 class ProfileManager:
@@ -624,6 +636,7 @@ class ProfileManager:
                     "content": content,
                     "judge": c.get("judge", "new"),
                     "matched_id": c.get("matched_id"),
+                    "category": c.get("category"),   # ④ may be None → engine defaults/keeps
                 })
         dropped = []
         ingest_list = norm
@@ -755,7 +768,8 @@ class ProfileManager:
             '  "memory_candidates": [\n'
             '    {"content": "关于用户的精炼、自包含事实句（通过石蕊测试）",\n'
             '     "judge": "new | reinforce_short | update | keep",\n'
-            '     "matched_id": "仅 reinforce_short/update/keep 时填，对应已有记忆的 id"}\n'
+            '     "matched_id": "仅 reinforce_short/update/keep 时填，对应已有记忆的 id",\n'
+            '     "category": "preference | fact | event | critical"}\n'
             "  ]\n"
             "}\n\n"
             "## memory_candidates 规则\n"
@@ -767,7 +781,14 @@ class ProfileManager:
             "4. 用户纠正旧信息时（\"你记错了\"\"我已经不X了\"）必须输出 memory_candidates：\n"
             "   已有记忆里有对应条目 → judge=\"update\" + matched_id，content 为纠正后的完整\n"
             "   事实句；找不到对应条目 → judge=\"new\"。无视纠正是最差的结果。\n"
-            "5. 没有值得长期记住的事实就省略 memory_candidates。\n\n"
+            "5. 没有值得长期记住的事实就省略 memory_candidates。\n"
+            "6. category 四选一（不确定就填 fact，它是默认类）：\n"
+            "   - critical：涉及健康安全/过敏禁忌/家庭重大变故/重大财务或法律/绝对不能触碰的话题，\n"
+            "     记错或遗忘代价高（如「用户对青霉素过敏」「用户父亲去年过世」）。此类记忆更耐降级。\n"
+            "   - preference：用户对互动方式或内容消费的偏好（如「用户喜欢简短回复」「用户爱吃辣」）。\n"
+            "   - event：一次性、有明确时间点的经历（如「用户上周去了上海漫展」「用户今年换了工作」）。\n"
+            "   - fact：以上都不是的持久属性/身份/习惯（如「用户住在杭州」「用户是程序员」）——默认类。\n"
+            "   category 只在 new/update/纠正替换时由你给出；纯 reinforce_short/keep 无需重判类型。\n\n"
             "## few-shot\n"
             + _PROFILE_FEW_SHOT + "\n\n"
             f"## existing 画像\n{json.dumps(existing, ensure_ascii=False)}\n\n"

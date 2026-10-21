@@ -343,6 +343,34 @@ LONG_RECALL_MAX_MATCHES = 3         # entries returned per recall_memory call
 LONG_RECALL_SNAPSHOT_CAP = 1200     # chars of conversation snapshot per entry
 LONG_RECALL_QUERY_LOG_CAP = 20      # query_log entries kept per LONG object
 
+# ── ④ write-time categories (Memory-Optimization-Plan batch 2) ──
+# Layer-1 extraction tags every memory_candidate; stored on ShortItem/MediumItem
+# (TIER_SCHEMA_VERSION 2, migration: scripts/migrate_memory_p2_categories.py,
+# legacy files lazy-load with defaults). Unlocks per plan §④: critical's own
+# demotion age (×3), ③'s staleness label scoping, and (batch 3/4) the ⑤ episode
+# channel + ⑥ grouped rendering — the taxonomy deliberately matches what Bond
+# §8.2 needs (event ≈ episode, the rest ≈ asset) so the schema moves once.
+VALID_CATEGORIES = ("preference", "fact", "event", "critical")
+DEFAULT_CATEGORY = "fact"
+CATEGORY_DEMOTE_AGE = {             # MEDIUM age-demote threshold per category
+    "preference": MEDIUM_DOWNGRADE_AGE,
+    "fact": MEDIUM_DOWNGRADE_AGE,
+    "event": MEDIUM_DOWNGRADE_AGE,
+    "critical": MEDIUM_DOWNGRADE_AGE * 3,   # plan §④: health/allergy/taboo facts
+}                                           # must not age out 3× faster than chat
+
+# ── ③ staleness label (Memory-Optimization-Plan batch 2) ──
+# Injection rendering appends （截至 X 月）to fact-category MEDIUM entries whose
+# last confirmation is older than this — "memory = an assertion true as of write
+# time" made visible, so the model hedges stale claims instead of asserting them
+# in present tense. Scoped to `fact` ONLY: preference has the ⑩ revision path,
+# critical must stay authoritative (hedging an allergy is dangerous), event is
+# inherently past-tense. Byte-stability: the label derives from the item's
+# write-once last_confirmed_ts + the current date, so an injected line changes
+# exactly once (when it crosses the threshold), never per-turn.
+STALE_LABEL_AFTER_DAYS = 30
+STALE_LABEL_CATEGORIES = ("fact",)
+
 # ── Ingest-level deterministic guards (Memory-Optimization-Plan ⑨) ──
 # Both fire ONLY on the judge="new" path inside _add_short, after the exact-dup
 # guard — a deterministic backstop for the two failure classes L2 exposed as
@@ -392,12 +420,23 @@ STALE_VARIANT_OVERLAP = 0.30        # ⑨ M2/M2b eligibility bar (Dice OR contai
 # _is_stale_variant — 住在杭州 vs 住在南京 share only 住在 and must not match).
 _BIGRAM_STOP_CHARS = frozenset("用户是我他她它的在了和与有都很非常就还也就都这那个一每天会喜欢说讲")
 
-TIER_SCHEMA_VERSION = 1
+TIER_SCHEMA_VERSION = 2             # v2: category + last_confirmed_ts on items (④③)
 
 
 def _new_id() -> str:
     """Stable-enough short id for tier items (uuid4 hex[:12])."""
     return uuid.uuid4().hex[:12]
+
+
+def _norm_category(value: Any) -> Optional[str]:
+    """④ Normalize an LLM-supplied category. Returns None when absent/invalid
+    (callers then KEEP an existing item's category), DEFAULT_CATEGORY is only
+    applied at item creation — a hallucinated tag must never silently re-type
+    an entry, and missing tags must not downgrade critical/preference items."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip().lower()
+    return v if v in VALID_CATEGORIES else None
 
 
 # ── ⑨ bigram helpers (pure stdlib, deterministic — safe on the sync ingest path) ──
@@ -482,6 +521,9 @@ class ShortItem:
     id: str
     content: str
     count: int = 1
+    category: str = DEFAULT_CATEGORY          # ④ VALID_CATEGORIES member
+    last_confirmed_ts: float = 0.0            # ③ wall-clock of last create/reinforce/
+                                              #    update; 0 = unknown (legacy) → no label
 
 
 @dataclass
@@ -491,6 +533,8 @@ class MediumItem:
     content: str
     count: int
     entry_extraction_index: int
+    category: str = DEFAULT_CATEGORY          # ④
+    last_confirmed_ts: float = 0.0            # ③
 
 
 @dataclass
@@ -580,15 +624,19 @@ class TieredMemory:
     def get_judge_list(self, user_id: str) -> List[dict]:
         """MEDIUM (top JUDGE_MEDIUM_LIST_CAP by count) + SHORT (all), for the LLM judge.
 
-        Each dict: {"id", "content", "count", "tier"}. The LLM returns one of
-        new / reinforce_short / update / keep with matched_id referencing these.
+        Each dict: {"id", "content", "count", "tier", "category"}. The LLM returns
+        one of new / reinforce_short / update / keep with matched_id referencing
+        these. ④ `category` is surfaced so the judge can factor existing typing
+        into its decision (e.g. don't re-type a `critical` health fact as `fact`).
         """
         st = self._get_state(user_id)
         out: List[dict] = []
         for m in sorted(st.medium, key=lambda x: -x.count)[:JUDGE_MEDIUM_LIST_CAP]:
-            out.append({"id": m.id, "content": m.content, "count": m.count, "tier": "medium"})
+            out.append({"id": m.id, "content": m.content, "count": m.count,
+                        "tier": "medium", "category": m.category})
         for s in st.short:
-            out.append({"id": s.id, "content": s.content, "count": s.count, "tier": "short"})
+            out.append({"id": s.id, "content": s.content, "count": s.count,
+                        "tier": "short", "category": s.category})
         return out
 
     # ── core ingestion (synchronous state machine) ────────────────
@@ -602,9 +650,13 @@ class TieredMemory:
         """Route filtered candidates into the tier state machine. Synchronous, no await.
 
         Args:
-            candidates: list of (content, judge, matched_id) tuples OR dicts with
-                keys content/judge/matched_id. judge ∈ {new, reinforce_short,
-                update, keep}. An invalid/missing matched_id falls back to "new".
+            candidates: list of (content, judge, matched_id) tuples, 4-tuples
+                with a trailing category, OR dicts with keys content/judge/
+                matched_id/category (④: category ∈ VALID_CATEGORIES; absent or
+                invalid → new items default to `fact`, existing items KEEP their
+                category — reinforce/keep never re-types). judge ∈ {new,
+                reinforce_short, update, keep}. An invalid/missing matched_id
+                falls back to "new".
             snapshot_turns: the K turns of this batch, stored on any LONG object
                 created during this ingestion (Decision: snapshot = current batch).
 
@@ -620,7 +672,7 @@ class TieredMemory:
         }
 
         for cand in candidates:
-            content, judge, matched_id = self._unpack_candidate(cand)
+            content, judge, matched_id, category = self._unpack_candidate(cand)
             content = (content or "").strip()[:300]
             if not content:
                 continue
@@ -629,37 +681,53 @@ class TieredMemory:
             if judge == "reinforce_short":
                 item = self._find_short(st, matched_id)
                 if item is None:
-                    self._add_short(st, content, turns, summary)   # fallback: hallucinated id
+                    self._add_short(st, content, turns, summary, category)   # fallback: hallucinated id
                 else:
                     self._reinforce_short_item(st, item, turns, summary)
             elif judge in ("update", "keep"):
                 med = self._find_medium(st, matched_id)
                 if med is None:
-                    self._add_short(st, content, turns, summary)   # fallback: hallucinated id
+                    self._add_short(st, content, turns, summary, category)   # fallback: hallucinated id
                 else:
                     if judge == "update":
                         med.content = content                      # LLM-refined version
+                        if category:                               # ④ update may re-type
+                            med.category = category
                     self._reinforce_medium_item(st, med, turns, summary)
             else:
                 # "new" (or any unknown judge value) → enter SHORT at count=1
-                self._add_short(st, content, turns, summary)
+                self._add_short(st, content, turns, summary, category)
 
         self._run_demotions(st, summary)
         return summary
 
     @staticmethod
-    def _unpack_candidate(cand: Any) -> Tuple[str, Optional[str], Optional[str]]:
-        """Accept either a (content, judge, matched_id) tuple or a dict."""
+    def _unpack_candidate(cand: Any) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+        """Accept a dict, a (content, judge, matched_id) 3-tuple (legacy callers
+        and benchmarks) or a 4-tuple with category. category is normalized here:
+        invalid/hallucinated tags become None (= keep existing / default on create)."""
         if isinstance(cand, dict):
-            return cand.get("content", ""), cand.get("judge"), cand.get("matched_id")
+            return (cand.get("content", ""), cand.get("judge"), cand.get("matched_id"),
+                    _norm_category(cand.get("category")))
+        try:
+            content, judge, matched_id, category = cand
+            return content, judge, matched_id, _norm_category(category)
+        except (ValueError, TypeError):
+            pass
         try:
             content, judge, matched_id = cand
-            return content, judge, matched_id
+            return content, judge, matched_id, None
         except (ValueError, TypeError):
-            return "", None, None
+            return "", None, None, None
 
-    def _add_short(self, st: UserTierState, content: str, turns, summary: dict):
+    def _add_short(self, st: UserTierState, content: str, turns, summary: dict,
+                   category: Optional[str] = None):
         """Insert a new SHORT item at the front, with three deterministic guards.
+
+        ④ category (normalized, None = unspecified): applied on NEW-item creation
+        (default `fact`) and on M2/M1 content replacement (the corrected/merged
+        sentence may legitimately change the fact's nature, e.g. fact→critical);
+        pure reinforcement of an unchanged entry keeps the stored category.
 
         All guards are defense-in-depth against an LLM judge that lazily marks
         everything "new" (Risk: judge-quality degradation). Deep-semantic
@@ -702,6 +770,8 @@ class TieredMemory:
             if not any(mk in target.content for mk in CORRECTION_MARKERS):
                 self._sweep_stale_siblings(st, target, summary)
             target.content = content
+            if category:
+                target.category = category
             summary["corrected_in_place"] += 1
             if isinstance(target, MediumItem):
                 self._reinforce_medium_item(st, target, turns, summary)
@@ -730,6 +800,8 @@ class TieredMemory:
             if _is_near_dup(cand_bg, _char_bigrams(m.content)):
                 summary["near_dup_merged"] += 1
                 m.content = content
+                if category:
+                    m.category = category
                 self._reinforce_medium_item(st, m, turns, summary)
                 return
         for s in st.short:
@@ -739,10 +811,14 @@ class TieredMemory:
             if _is_near_dup(cand_bg, _char_bigrams(s.content)):
                 summary["near_dup_merged"] += 1
                 s.content = content
+                if category:
+                    s.category = category
                 self._reinforce_short_item(st, s, turns, summary)
                 return
 
-        st.short.insert(0, ShortItem(id=_new_id(), content=content, count=1))
+        st.short.insert(0, ShortItem(id=_new_id(), content=content, count=1,
+                                     category=category or DEFAULT_CATEGORY,
+                                     last_confirmed_ts=time.time()))
         summary["new_short"] += 1
         while len(st.short) > SHORT_MAX:
             st.short.pop()
@@ -816,6 +892,7 @@ class TieredMemory:
 
     def _reinforce_short_item(self, st: UserTierState, item: ShortItem, turns, summary: dict):
         item.count += 1
+        item.last_confirmed_ts = time.time()   # ③ re-mention = re-confirmation
         summary["reinforced_short"] += 1
         # move toward the front by SHORT_PRIORITY_STEP positions
         try:
@@ -838,6 +915,7 @@ class TieredMemory:
         med = MediumItem(
             id=item.id, content=item.content, count=item.count,
             entry_extraction_index=st.extraction_count,
+            category=item.category, last_confirmed_ts=item.last_confirmed_ts,
         )
         st.medium.append(med)
         summary["promoted_to_medium"] += 1
@@ -846,6 +924,7 @@ class TieredMemory:
     def _reinforce_medium_item(self, st: UserTierState, med: MediumItem, turns, summary: dict):
         med.count += 1
         med.entry_extraction_index = st.extraction_count   # age → 0
+        med.last_confirmed_ts = time.time()                # ③ wall-clock confirmation
         summary["reinforced_medium"] += 1
         self._maybe_create_long(st, med, turns, summary)
 
@@ -870,13 +949,25 @@ class TieredMemory:
         summary["promoted_to_long"] += 1
 
     def _run_demotions(self, st: UserTierState, summary: dict):
-        """Post-ingestion sweep: MEDIUM age-demote + MEDIUM_MAX safety net."""
+        """Post-ingestion sweep: MEDIUM age-demote + MEDIUM_MAX safety net.
+
+        ④ age threshold is per-category (CATEGORY_DEMOTE_AGE): critical facts
+        (allergies/health/taboo topics) survive 3× longer than chat-frequency
+        would suggest — being mentioned rarely is exactly what makes them
+        critical, not what makes them stale. MEDIUM_MAX force-demotion stays
+        category-blind (a hard cap is a hard cap; at cap the oldest goes first).
+        """
         current = st.extraction_count
 
-        # age-based demotion: age > MEDIUM_DOWNGRADE_AGE → back to SHORT (count reset)
-        for m in [m for m in st.medium if (current - m.entry_extraction_index) > MEDIUM_DOWNGRADE_AGE]:
+        # age-based demotion: age > per-category threshold → back to SHORT (count reset)
+        for m in [m for m in st.medium
+                  if (current - m.entry_extraction_index)
+                  > CATEGORY_DEMOTE_AGE.get(m.category, MEDIUM_DOWNGRADE_AGE)]:
             st.medium.remove(m)
-            st.short.insert(0, ShortItem(id=m.id, content=m.content, count=MEDIUM_DOWNGRADE_COUNT_RESET))
+            st.short.insert(0, ShortItem(id=m.id, content=m.content,
+                                         count=MEDIUM_DOWNGRADE_COUNT_RESET,
+                                         category=m.category,
+                                         last_confirmed_ts=m.last_confirmed_ts))
             summary["demoted_to_short"] += 1
 
         # MEDIUM_MAX safety net: force-demote the oldest (highest age) first
@@ -884,7 +975,9 @@ class TieredMemory:
             st.medium.sort(key=lambda m: -(current - m.entry_extraction_index))
             oldest = st.medium.pop(0)
             st.short.insert(0, ShortItem(id=oldest.id, content=oldest.content,
-                                         count=MEDIUM_DOWNGRADE_COUNT_RESET))
+                                         count=MEDIUM_DOWNGRADE_COUNT_RESET,
+                                         category=oldest.category,
+                                         last_confirmed_ts=oldest.last_confirmed_ts))
             summary["demoted_to_short"] += 1
 
         # cap SHORT after demotions
@@ -893,12 +986,37 @@ class TieredMemory:
 
     # ── injection (called by agent._build_messages) ───────────────
 
+    @staticmethod
+    def _staleness_suffix(item: Any, now: Optional[float] = None) -> str:
+        """③ 「截至 X 月」suffix for stale fact-category entries, else "".
+
+        Fires when the entry is in STALE_LABEL_CATEGORIES, carries a known
+        last_confirmed_ts, and hasn't been re-confirmed for STALE_LABEL_AFTER_DAYS.
+        Year is included only when the confirmation predates the current year.
+        Output is write-once-stable: derived from the item's fixed ts + today's
+        date, so an injected line changes at most once (threshold crossing;
+        yearly on Jan 1), never per-turn — L4-tail cache-friendly.
+        """
+        if getattr(item, "category", DEFAULT_CATEGORY) not in STALE_LABEL_CATEGORIES:
+            return ""
+        ts = getattr(item, "last_confirmed_ts", 0.0) or 0.0
+        if ts <= 0:
+            return ""                        # legacy v1 item, unknown age → no label
+        now = now if now is not None else time.time()
+        if now - ts < STALE_LABEL_AFTER_DAYS * 86400.0:
+            return ""
+        when = time.localtime(ts)
+        if when.tm_year == time.localtime(now).tm_year:
+            return f"（截至 {when.tm_mon} 月）"
+        return f"（截至 {when.tm_year} 年 {when.tm_mon} 月）"
+
     def build_medium_injection(self, user_id: str) -> str:
         """Build the MEDIUM injection block. Returns "" if no MEDIUM items.
 
         Selection: top-12 by count + 3 most-recent promotions. Truncated to
         MEDIUM_INJECT_TOKEN_CAP chars, highest-count first (lowest-count dropped).
         count < LOW_CONFIDENCE_THRESHOLD gets a "(低置信)" label (Decision D).
+        ③ stale `fact` entries additionally get a trailing （截至 X 月）label.
         """
         st = self._get_state(user_id)
         if not st.medium:
@@ -920,7 +1038,7 @@ class TieredMemory:
         total = 0
         for m in selected:
             label = "(低置信) " if m.count < LOW_CONFIDENCE_THRESHOLD else ""
-            line = f"- {label}{m.content}"
+            line = f"- {label}{m.content}{self._staleness_suffix(m)}"
             if total + len(line) > MEDIUM_INJECT_TOKEN_CAP:
                 break
             lines.append(line)
@@ -1027,9 +1145,13 @@ class TieredMemory:
             "user_id": st.user_id,
             "extraction_count": st.extraction_count,
             "schema_version": TIER_SCHEMA_VERSION,
-            "short": [{"id": s.id, "content": s.content, "count": s.count} for s in st.short],
+            "short": [{"id": s.id, "content": s.content, "count": s.count,
+                       "category": s.category, "last_confirmed_ts": s.last_confirmed_ts}
+                      for s in st.short],
             "medium": [{"id": m.id, "content": m.content, "count": m.count,
-                        "entry_extraction_index": m.entry_extraction_index} for m in st.medium],
+                        "entry_extraction_index": m.entry_extraction_index,
+                        "category": m.category, "last_confirmed_ts": m.last_confirmed_ts}
+                       for m in st.medium],
             "long": [{"id": lo.id, "title": lo.title, "summary": lo.summary,
                       "snapshot_time": lo.snapshot_time, "query_count": lo.query_count,
                       "query_log": lo.query_log, "linked_medium_id": lo.linked_medium_id}
@@ -1049,13 +1171,17 @@ class TieredMemory:
                 st.extraction_count = int(data.get("extraction_count", 0))
                 st.short = [
                     ShortItem(id=s.get("id") or _new_id(), content=s.get("content", ""),
-                              count=int(s.get("count", 1)))
+                              count=int(s.get("count", 1)),
+                              category=_norm_category(s.get("category")) or DEFAULT_CATEGORY,
+                              last_confirmed_ts=float(s.get("last_confirmed_ts", 0.0) or 0.0))
                     for s in data.get("short", [])
                 ]
                 st.medium = [
                     MediumItem(id=m.get("id") or _new_id(), content=m.get("content", ""),
                                count=int(m.get("count", 0)),
-                               entry_extraction_index=int(m.get("entry_extraction_index", 0)))
+                               entry_extraction_index=int(m.get("entry_extraction_index", 0)),
+                               category=_norm_category(m.get("category")) or DEFAULT_CATEGORY,
+                               last_confirmed_ts=float(m.get("last_confirmed_ts", 0.0) or 0.0))
                     for m in data.get("medium", [])
                 ]
                 st.long = []

@@ -253,6 +253,22 @@ QQBot/benchmarks/memory/
 > junk 泄漏 p1 j3 / p5 j3 转 ABSENT 但 p3 三条照旧——与批次 0 结论一致：重复 junk
 > 晋升不归 ⑨ 管，根治等 Layer1 负面清单加强或 ④ 类型化。
 
+> **L2 批次 2 结果（④③ 后，2026-10-21，engine@2266589+批次2改动，vs post_batch2）**：
+> **112/126 = 89%**（+1，落在 ±4 单跑分辨率内、净正向），canary 16/18 → **17/18**，
+> 泄漏 3 → 4，token ~448k（cache ~72%），每 persona 24 批次不变，6 persona store 全部健康
+> （short+medium 16-19，无批次1.5 那种过度开火塌缩——④ 未改 ⑨ 路由逻辑，符合预期）。
+> **验收命中类别（④ 直接目标）**：critical_lowfreq **17/18 → 18/18（+1，满分）**（p5 cl3
+> MISSING→FOUND）；stable_preference **17/18 → 18/18（+1，满分）**（p2 sp1 MISSING→FOUND）。
+> implanted_false / re_derivable 两类维持 18/18 满分。
+> **evolving_fact 11/18 → 11/18、contradiction 15/18 → 15/18（均净持平）**：内部成员双向
+> 翻动（ef LOST:1→0 但 STALE:0→1；ct CONTRADICTED:3→2/EVOLVED:7→8/MERGED:8→7/STALE:0→1），
+> 与批次 1.5 记录同型的 LLM update 判定波动——非 ④ 机制：类别字段只做打标签，不改 judge 路由。
+> **唯一软肋**：one_shot_junk 15/18 → 14/18（-1，泄漏 +1：p5 j2/j3 转 LEAKED、p3 j3 转 ABSENT）——
+> 重复 junk 晋升是批次 0 起的已知缺口，不归 ④③ 管，仍待 Layer1 负面清单加强。
+> **结论**：给抽取 prompt 加 category 字段对抽取质量**中性偏正**（净 +1 事实、+1 canary，
+> ④ 目标类别 critical/stable_preference 双双满分），无系统性回归；③ 标注与 critical×3 降级
+> 因 L2 逻辑跨度 <30 天挂钟而不被触发（已由单测 + L1 injection_stability churn 不变覆盖）。
+
 - **基线先行**：任何记忆架构改动动手前跑 L1+L2 存基线，改完跑对比——与 Cache-Hit-Rate-Plan 阶段 2 同一套方法论，共享 prefix-hash 与 TokenLedger 基础设施；
   ⚠️ 实际执行偏离（用户 2026-10-20 决定）：批次 1（①②⑦⑧）先于 benchmark 实施，以单测代偿验证；批次 0 建基线时需**额外回补**"优化后 vs 优化前"的对照口径（旧行为可由 git 历史复现）；
 - 不用真实用户聊天记录做 ground truth（隐私 + 标注成本）；如需真实分布基线，仅用 admin 自己的会话且只统计聚合指标（假晋升率、注入尺寸），不做逐条对错判定；
@@ -319,12 +335,20 @@ QQBot/benchmarks/memory/
 
 ### 第二梯队：schema 改动，是 ③⑤ 的地基
 
-#### ④ 写入时类型化（category 字段）
+#### ④ 写入时类型化（category 字段） ✅ 已实施（2026-10-21，批次 2）
 
 - **现状**：抽取产物是扁平"事实"，无类别；Bond §8.2 反正要加 `mem_type: asset/episode`。
 - **做法**：Layer1 JSON schema 加 `category: preference | fact | event | critical`，存入 `ShortItem`/`MediumItem`（`TIER_SCHEMA_VERSION` +1，迁移脚本沿用 `scripts/migrate_memory_p1.py` 模式，缺省回填 `fact`）。
 - **解锁**：critical 类独立降级参数（age 阈值 ×3，配置表）；event 类走 ⑤ 通道；注入渲染按类分组（配合 ⑥）。
 - **时机**：在 Bond P0 动 schema 前做掉，迁移一次完成。
+
+> **实施记录（2026-10-21）**：
+> - **类别口径刻意对齐 Bond §8.2**：`event` ≈ episode，`preference/fact/critical` ≈ asset，schema 只动一次。四类经 `_norm_category` 归一（大小写/空白），非法或幻觉标签 → `None`。
+> - **打/改类型的时机严格受限**：仅在 create（缺省 `fact`）、`update` judge、⑨ M2 纠正替换、⑨ M1 近重复内容替换四处写入；**纯 reinforce/keep 绝不改类型**（防抖动，也防幻觉标签把 critical 降级成 fact）。`_unpack_candidate` 兼容 dict / 4-tuple / 旧 3-tuple（benchmark 与旧调用不受影响）。
+> - **critical 降级 age ×3**：`CATEGORY_DEMOTE_AGE = {preference/fact/event: 30, critical: 90}`（`MEDIUM_DOWNGRADE_AGE × 3`）。理由写进 `_run_demotions` docstring：critical（过敏/健康/禁忌）被提及少恰恰因为它关键而非陈旧。`MEDIUM_MAX` 强制降级仍与类别无关（硬顶就是硬顶）。
+> - **`last_confirmed_ts`（挂钟秒）**随 create/reinforce/update 刷新，晋升/降级双向携带；持久化进 `tiers/*.json`（v2）。`get_judge_list` 每行附带 `category`，让 judge 判定时尊重既有类型。
+> - **迁移脚本** `scripts/migrate_memory_p2_categories.py`：DRY-RUN 默认 + `--apply` + 时间戳备份 `tiers/` + 幂等（`schema_version≥2` 跳过）+ 原子写 + 逐文件错误隔离；回填 `category="fact"`、`last_confirmed_ts=` 文件 mtime（保守：迁移后 30 天内不打任何时效标注）。`load_user` 对 v1 文件容错（缺字段 → `fact`/`0.0`），故**不跑迁移也不会崩**，脚本只是把磁盘状态显式化并给出可用 ts。
+> - **单测**（test_agent.py，TestTieredMemory +10 项）：默认 fact / 四类显式存储（dict+4-tuple）/ 非法标签保留既有 / reinforce 不改类型 / update 改类型 / 晋升+降级携带 / critical vs fact 在 age 31 的降级差异 / 持久化往返 / v1 文件懒加载 / judge_list 附 category。
 
 #### ⑤ Episode"当场写"通道（salience 取代 frequency）
 
@@ -337,12 +361,21 @@ QQBot/benchmarks/memory/
 - **依赖**：④ 的 category 字段；Bond P0 的角色面工具集。
 - **Benchmark 钩子**：L1"episodic canary"转正；L2 `salient_episode` 存活率。
 
-#### ③ 时效标注："截至 X 月"
+#### ③ 时效标注："截至 X 月" ✅ 已实施（2026-10-21，批次 2）
 
 - **现状**：evolving 事实（住址/工作/感情）注入时无时态，模型把旧断言当现在时。
 - **做法**：注入渲染时，`last_confirmed`（或条目创建批次换算的日期）超过阈值 → 渲染为 `用户住在北京（截至 3 月）`。不 pin、不加交互摩擦，只让模型说话自带时态——Claude"记忆 = 写入时刻为真的断言"纪律的最便宜实现。
 - **依赖**：④ 之后按 category 精确控制；之前可先用条目 age 粗做。
 - **可选延伸**（贵，缓做）：critical 类事实临近降级时主动向用户确认一次（"上次你说花生过敏，现在还是吗？"），确认即强化 count——防陈旧效果最好，但加交互摩擦，仅对 critical 类开。
+
+> **实施记录（2026-10-21）**：
+> - **用挂钟 `last_confirmed_ts` 而非逻辑 age**：注入要渲染真实日期（"截至 3 月"），逻辑时钟（抽取批次）换不出日历月。`_staleness_suffix(item, now)` 在 `build_medium_injection` 行尾拼接。
+> - **触发条件**：`category ∈ STALE_LABEL_CATEGORIES`（当前 = `("fact",)`）+ `ts>0`（已知挂钟）+ `now-ts > STALE_LABEL_AFTER_DAYS`（30 天）。同年 → `（截至 X 月）`，跨年 → `（截至 YYYY 年 X 月）`。
+> - **只对 `fact` 打标（关键取舍）**：`critical` 必须保持权威——给"过敏"加"截至"是危险的犹豫化；`preference` 有 ⑩ 修订路径；`event` 本身就是过去时。故 `STALE_LABEL_CATEGORIES` 收窄到 fact 单类。
+> - **字节稳定 / L4 缓存友好**：标注由「条目固定 ts + 今天日期」导出，一行注入至多变一次（跨 30 天阈值那次；此后每年 1 月 1 日月/年字段翻新），**不逐轮变化**。L1 injection_stability churn 前后一致（0.0306→0.0306）实测证实。
+> - **legacy ts=0 不打标**：v1 迁移前条目年龄未知 → 沉默（宁可不标，不可乱标）。迁移用文件 mtime 回填 ts，故迁移后 30 天内不会有存量条目突然被打标。
+> - **单测**（+5 项）：陈旧 fact 出标注 / 新鲜 fact 不出 / critical+preference+event 恒不出（即使 >1 年陈旧）/ ts=0 不出 / 跨年格式 `（截至 YYYY 年 X 月）`。
+> - **L2 覆盖说明**：L2 每 persona 仅 24 批次、逻辑跨度远小于 30 天挂钟，且抽取即时确认，故 L2 **不会触发** ③ 标注，也不触发 critical×3 降级——这两条由单测 + L1 覆盖，L2 只验类别字段接入抽取 prompt 后**不回退**抽取质量。
 
 #### ⑥ 注入排序稳定化
 
@@ -369,7 +402,7 @@ QQBot/benchmarks/memory/
 | **0** ✅ 已完成（2026-10-21） | benchmark L1（含 episodic canary、LONG 可达性、存活曲线）+ L2 persona 与 runner | 无 | 基线快照进 `baselines/`（L1 双基线 + L2 post_batch1: **84%**，canary 17/18 如实记录）；L2 失败画像见 §3.5：纠正残留 ×11 / 偏好槽无纠正 ×4 / 重复 junk 晋升 ×5 → 候选优化点 ⑨⑩ |
 | **1** ✅ 已实施（2026-10-20，先于批次 0，用户决定） | ① LONG 索引+recall；② 负面清单；⑦ 缓冲落盘；⑧ 纠正处理（追加） | ~~批次 0~~ → 单测代偿（test_agent.py 15/15） | ✅ 已回补验证（L2 pre/post 对照，2026-10-21，§3.5）：L1 两场景转正；② 达成（rd 泄漏 2/18→0）；⑧ 部分达成（ef +4，ct 稳定失败核 → 候选 ⑨） |
 | **1.5** ✅ 已完成（2026-10-21） | ⑨ 引擎级纠正替换+近重复合并（M2/M2b/M1+数字守卫，strong-bigram 0.30 门槛）；⑩ preferences 槽位修订路径（updated_preferences 覆盖/null 删除） | 批次 0 基线（L2 稳定失败核 ⑴⑵ 驱动） | ✅ L2 post_batch2 vs post_batch1（§3.5）：84%→**88%**（+5 超分辨率），ct 类 7/18→**16/18** 零回归，泄漏 5→3，canary 16/18；ef 类 -4 列观察项；L1 全绿 churn 不变；test_agent.py 20/20 套件（⑨ 10 项 + ⑩ 1 项新单测） |
-| **2** | ④ category 类型化（含迁移脚本）→ ③ 时效标注 | 批次 1（避免同期多变量） | L2 evolving/critical 类别指标 |
+| **2** ✅ 已完成（2026-10-21） | ④ category 类型化（preference/fact/event/critical，schema v2 + `migrate_memory_p2_categories.py`，critical 降级 age×3）→ ③ 时效标注「截至 X 月」（挂钟 `last_confirmed_ts`，仅 fact 类、>30 天、字节稳定） | 批次 1（避免同期多变量） | ✅ L2 post_batch3 vs post_batch2（§3.5）：111→**112/126**（+1 落 ±4 内、净正向），canary 16→**17**，6 store 全健康无过度开火；**④ 目标类别双满分**：critical_lowfreq 17→**18/18**、stable_preference 17→**18/18**；ef/ct 净持平（成员双向翻动＝judge 波动，④ 不改路由）；泄漏 3→4（one_shot_junk 已知缺口，非本批目标）；L1 全绿 churn 不变；test_agent.py **23/23** 套件（④ 10 项 + ③ 5 项新单测 + judge_list 键集更新）；③/critical×3 因 L2 逻辑跨度 <30 天不触发，由单测 + L1 覆盖 |
 | **3** | ⑤ episode 通道（随 Bond P0/P5 排期） | ④ | episodic canary 转正；`salient_episode` 存活率 |
 | **4** | ⑥ 排序稳定化（视 Q3 数据决定做不做）；多模态扩展位启用（随 Bond P4/P5） | 批次 0 基线 | 搅动率下降且 QA 不降 |
 
