@@ -169,9 +169,13 @@ class UserProfile:
         return overlap > 0.6
 
 
-# Few-shot 反例/正例，嵌入抽取 prompt（§10 Layer 1）。三个反例 → {}，覆盖
-# 三类高频垃圾根因（截图/助手解读当证据、一次性抽卡结果、bot 状态）；一个正例
-# 演示「用户自述持久兴趣」该抽取。反例是主力——模型已证明会无视纯文字禁令。
+# Few-shot 反例/正例，嵌入抽取 prompt（§10 Layer 1）。反例 → {}，覆盖高频垃圾
+# 根因（截图/助手解读当证据、一次性抽卡结果、bot 状态、瞬时决策态、可再推导的
+# 公开信息）；一个正例演示「用户自述持久兴趣」该抽取。反例是主力——模型已证明
+# 会无视纯文字禁令。例6 对应 Memory-Optimization-Plan ②（可再推导测试），
+# 例7 对应 ⑧（用户纠正 → judge="update"，chat-export 冲突消解改进点），
+# 例8 对应 ⑩（画像偏好槽位被推翻 → updated_preferences 覆盖/null 删除——
+# 修规则4「只抽新信息」让陈旧槽位永不修订的死角，L2 两版本稳定复现 ×4）。
 _PROFILE_FEW_SHOT = """例1（截图/助手解读 ≠ 用户事实 → {}）
 输入:
 <conversation>
@@ -205,8 +209,9 @@ _PROFILE_FEW_SHOT = """例1（截图/助手解读 ≠ 用户事实 → {}）
 用户: 我最近迷上原神了，天天肝
 助手(Roxy): 原神挺耐玩的，注意别太肝……
 </conversation>
-输出: {"new_interests": ["原神"], "memory_candidates": [{"content": "用户最近迷上原神，每天都玩", "judge": "new"}]}
-（用户本人陈述的持久兴趣，石蕊测试通过。话题词「原神」进 new_interests；完整事实句进 memory_candidates。）
+输出: {"new_interests": ["原神"], "memory_candidates": [{"content": "用户最近迷上原神，每天都玩", "judge": "new", "category": "fact"}]}
+（用户本人陈述的持久兴趣，石蕊测试通过。话题词「原神」进 new_interests；完整事实句进 memory_candidates。
+「迷上原神每天玩」是持久习惯属性 → category=fact。）
 
 例5（瞬时决策态 / 犹豫中 → {}）
 输入:
@@ -217,7 +222,52 @@ _PROFILE_FEW_SHOT = """例1（截图/助手解读 ≠ 用户事实 → {}）
 输出: {}
 （"在想要不要……"是瞬时决策态，石蕊测试不通过：用户不碰 bot 这条就不成立。
 反之，【现实生活】的持续活动（如"用户正在做力量训练""正在通过饮食调整降血脂"）
-通过石蕊测试，应作为持久信息抽取。）"""
+通过石蕊测试，应作为持久信息抽取。）
+
+例6（工具可查的公开信息，可再推导测试不过 → {}）
+输入:
+<conversation>
+用户: 帮我查一下原神里流浪者突破要什么材料
+助手(Roxy): 流浪者突破需要恒常机关阵列、蕈兽孢子等材料，90级突破共需……
+</conversation>
+输出: {}
+（突破材料是 wiki 公开数据，工具随时可查且随版本变化，写进记忆只会变陈旧。
+"帮我查一次X"也不构成持久兴趣的证据；若用户说"我主玩流浪者"，那才是关于
+用户本人的私有事实，应抽取。）
+
+例7（用户纠正旧记忆 → judge="update"，不可无视；对应 Memory-Optimization-Plan ⑧）
+输入（假设「已有记忆」里有一条 {"id": "m7", "content": "用户每周跑步三次", "tier": "medium"}）:
+<conversation>
+用户: 我现在不跑步了，改游泳了，还是一周三次
+助手(Roxy): 游泳也很好，对膝盖负担小……
+</conversation>
+输出: {"memory_candidates": [{"content": "用户已把每周跑步三次改为每周游泳三次", "judge": "update", "matched_id": "m7", "category": "fact"}]}
+（用户明确纠正/更新旧信息时，必须给 update：content 写纠正后的完整事实句，
+matched_id 指向被纠正的条目——绝不能无视纠正让旧记忆存活，也不要另建一条
+与之矛盾的新记忆。若「已有记忆」里找不到可纠正的条目，则用 judge="new"。
+运动习惯是持久属性 → category=fact；纠正替换时也要给出 category 覆盖旧类型。）
+
+例8（用户推翻 existing 画像里的偏好槽位 → updated_preferences；对应 Memory-Optimization-Plan ⑩）
+输入（假设 existing 画像为 {"preferences": {"设备": "安卓手机", "饮品": "不喝咖啡"}}）:
+<conversation>
+用户: 我上周换 iPhone 了，以后别给我推安卓教程；咖啡也戒了，改喝茶
+助手(Roxy): 好的，之后按 iOS 的来，茶饮推荐也安排……
+</conversation>
+输出: {"updated_preferences": {"设备": "iPhone", "饮品": null}}
+（existing 里已有的偏好槽位被用户推翻或修改时，必须用 updated_preferences 覆盖旧值；
+偏好彻底不成立（戒了/不再/改成别的了）就把值设为 null 删除该槽位。规则4的
+「只抽新信息」绝不意味着让旧槽位永远残留；也不要把修正值塞进 new_preferences
+造成新旧并存。键名必须与 existing 画像里的键完全一致。）
+
+例9（category 分类：critical / preference / event；对应 Memory-Optimization-Plan ④）
+输入:
+<conversation>
+用户: 提醒一下我对青霉素过敏，别推荐含它的药；另外回复尽量简短，我上周刚做完近视手术
+助手(Roxy): 记下了，会避开青霉素类，回复也从简……
+</conversation>
+输出: {"new_preferences": {"回复风格": "简短"}, "memory_candidates": [{"content": "用户对青霉素过敏", "judge": "new", "category": "critical"}, {"content": "用户上周做了近视手术", "judge": "new", "category": "event"}]}
+（过敏禁忌记错代价高 → critical，此类记忆更耐降级；一次性、有明确时间点的经历 → event；
+「回复简短」是互动偏好，走 new_preferences 槽位，不必再进 memory_candidates。）"""
 
 
 class ProfileManager:
@@ -245,7 +295,7 @@ class ProfileManager:
         # external writers (the WebUI panel edits profile.json directly).
         self._cache_mtime: Dict[str, Optional[int]] = {}
 
-        # ── Layer 3 batching state (per-user, in-memory only) ──
+        # ── Layer 3 batching state (per-user) ──
         # _recent: rolling context window (maxlen=EXTRACT_WINDOW_N) of turns,
         #          used to build the <conversation> block (batch + 3 preceding
         #          turns so "该项目"-style references can be resolved).
@@ -254,6 +304,12 @@ class ProfileManager:
         #            (single-flight — never two extractions for one user).
         # _force_flush: users whose pending tail must be flushed at next idle
         #            even if < K (set by delete-flush on a substantive session).
+        # ⑦ (Memory-Optimization-Plan): _recent/_pending_n are mirrored to
+        # {user_dir}/buffer.json on every mutation and lazily restored on the
+        # first observe_turn after a restart, so a crash loses ≤1 turn instead
+        # of up to K-1 un-extracted turns. _inflight/_force_flush stay
+        # process-local (a crash mid-extraction re-buffers, never double-runs:
+        # _flush persists pending_n=0 BEFORE scheduling the task).
         self._recent: Dict[str, "deque[Tuple[str, str]]"] = {}
         self._pending_n: Dict[str, int] = {}
         self._inflight: set = set()
@@ -348,6 +404,10 @@ class ProfileManager:
             # task scheduling on the client-less path.
             return
 
+        if user_id not in self._recent:
+            # ⑦: first observation in this process → try to restore the buffer
+            # persisted before the last shutdown/crash (no-op when absent).
+            self._restore_buffer(user_id)
         dq = self._recent.get(user_id)
         if dq is None:
             dq = deque(maxlen=EXTRACT_WINDOW_N)
@@ -355,6 +415,7 @@ class ProfileManager:
         dq.append((user_message or "", agent_response or ""))
 
         self._pending_n[user_id] = self._pending_n.get(user_id, 0) + 1
+        self._save_buffer(user_id)
         if self._pending_n[user_id] >= PROFILE_BATCH_K and user_id not in self._inflight:
             self._flush(user_id)
 
@@ -372,6 +433,7 @@ class ProfileManager:
         else:
             self._pending_n[user_id] = 0
             self._force_flush.discard(user_id)
+            self._save_buffer(user_id)
             logger.debug(
                 "[profile] delete-flush drop tail user={} turns={}",
                 user_id, session_turn_count,
@@ -382,6 +444,10 @@ class ProfileManager:
         window = list(self._recent.get(user_id, ()))
         self._pending_n[user_id] = 0
         self._force_flush.discard(user_id)
+        # ⑦: persist pending_n=0 BEFORE scheduling — a crash mid-extraction
+        # loses this batch (same as the old in-memory behavior) but can never
+        # double-extract it after a restart.
+        self._save_buffer(user_id)
         if not window:
             return
         try:
@@ -524,6 +590,29 @@ class ProfileManager:
             )
             changed = True
 
+        # updated_preferences (⑩): revise or delete EXISTING slots. Rule 4's
+        # "only extract NEW info" made preferences write-once — L2 showed stale
+        # values (设备:安卓手机 / 从不氪金 / 只看日漫) surviving explicit
+        # contradiction in BOTH engine versions. value None → slot no longer
+        # holds → delete. Keys must match existing ones exactly (the model sees
+        # the full existing profile in the prompt); an unknown key on update
+        # simply creates the slot, on delete is a no-op.
+        upd_prefs = extracted.get("updated_preferences")
+        if upd_prefs and isinstance(upd_prefs, dict):
+            for k, v in upd_prefs.items():
+                key = str(k)[:50]
+                if v is None:
+                    if profile.preferences.pop(key, None) is not None:
+                        changed = True
+                        logger.debug("[profile] pref-delete user={} key={!r}", user_id, key)
+                else:
+                    new_val = str(v)[:100]
+                    if profile.preferences.get(key) != new_val:
+                        profile.preferences[key] = new_val
+                        changed = True
+                        logger.debug("[profile] pref-update user={} key={!r} val={!r}",
+                                     user_id, key, new_val)
+
         # P1: route memory_candidates into the three-tier engine. The Layer-2
         # filter runs on candidate content BEFORE ingestion (§4 principle I).
         if self._memory:
@@ -547,6 +636,7 @@ class ProfileManager:
                     "content": content,
                     "judge": c.get("judge", "new"),
                     "matched_id": c.get("matched_id"),
+                    "category": c.get("category"),   # ④ may be None → engine defaults/keeps
                 })
         dropped = []
         ingest_list = norm
@@ -625,6 +715,9 @@ class ProfileManager:
                 '  - 与某条 tier=medium 重合，且你有更详细/更新的表述 → judge="update"，'
                 'matched_id=该条 id，content 给精炼合并后的完整句\n'
                 '  - 与某条 tier=medium 重合，但无新细节 → judge="keep"，matched_id=该条 id\n'
+                '  - 用户【纠正/推翻】了某条已有记忆（"你记错了""我不再X了，改成Y了"）→ '
+                '必须 judge="update"，matched_id=该条 id，content=纠正后的完整事实句；'
+                '绝不能无视纠正让旧记忆继续存在，也不要另建一条与之矛盾的新记忆\n'
                 f"{json.dumps(judge_list, ensure_ascii=False)}\n\n"
             )
         else:
@@ -641,6 +734,16 @@ class ProfileManager:
             "成立 → 才可能是持久画像；不成立 → 直接丢弃。\n"
             "这一条即可干掉：工作区/磁盘用量、本轮抽卡结果、截图测速、"
             "「正在参与特殊会话」、bot 的口癖或角色扮演称谓。\n\n"
+            "## 次要判据：可再推导测试（负面清单）\n"
+            "通过石蕊测试后，再问一句：\n"
+            "  「这条信息是工具（search_web / character_detail / get_changelog / 天气等）"
+            "随时能查到的公开信息吗？」\n"
+            "是 → 不进记忆。游戏角色数值/养成材料、版本更新内容、攻略数据、天气、新闻、"
+            "汇率等公开信息，用工具现查永远比记忆副本新鲜准确；存进记忆反而会在版本更新后变陈旧错误。\n"
+            "只记【用户本人】的属性、经历、偏好、约定——工具查不到的私有信息。\n"
+            "边界示例：「用户玩原神，主玩钟离」是私有事实（记）；"
+            "「原神角色等级上限是90」是公开信息（不记）。用户让 bot 查一次某公开数据，"
+            "这个查询行为本身也不构成持久兴趣的证据。\n\n"
             "## 硬性规则\n"
             "1. 【助手(Roxy)】说的话只能用于消歧，绝不能当作关于用户的证据。"
             "助手回复可能含角色扮演称谓、假设、对截图/图片的解读——都不是用户的事实。\n"
@@ -649,7 +752,10 @@ class ProfileManager:
             "3. 每条候选必须【自包含】：把指代（该项目/这个/上面说的）解析成明确的命名实体；"
             "无法解析成一句独立成立的话，就丢弃。\n"
             "4. nickname/new_interests/new_preferences 只抽取 existing 画像里没有的【新】信息；"
-            "memory_candidates 则须对照「已有记忆」判定 judge（见下）。\n"
+            "但若用户【推翻或修改】了 existing 画像里已有的偏好（如换了手机、开始喝咖啡了），"
+            "必须用 updated_preferences 覆盖旧值（偏好不再成立则填 null 删除）——"
+            "「只抽新信息」绝不意味着让旧槽位永远残留，也不要把修正值塞进 new_preferences；\n"
+            "   memory_candidates 则须对照「已有记忆」判定 judge（见下）。\n"
             "5. 客观、不臆测：记「玩原神」，不记「可能是开发者」。\n"
             "6. 只抽取关于用户的，不抽取关于助手(Roxy)的。\n"
             "7. 没有新信息就返回 {}。\n\n"
@@ -658,18 +764,31 @@ class ProfileManager:
             '  "nickname": "用户提到的名字或希望被怎样称呼",\n'
             '  "new_interests": ["用户表现出的持久兴趣/话题", ...],\n'
             '  "new_preferences": {"语言/回复风格等偏好键": "偏好值"},\n'
+            '  "updated_preferences": {"existing画像里已有的偏好键": "修正后的新值；该偏好已不成立则为 null"},\n'
             '  "memory_candidates": [\n'
             '    {"content": "关于用户的精炼、自包含事实句（通过石蕊测试）",\n'
             '     "judge": "new | reinforce_short | update | keep",\n'
-            '     "matched_id": "仅 reinforce_short/update/keep 时填，对应已有记忆的 id"}\n'
+            '     "matched_id": "仅 reinforce_short/update/keep 时填，对应已有记忆的 id",\n'
+            '     "category": "preference | fact | event | critical"}\n'
             "  ]\n"
             "}\n\n"
             "## memory_candidates 规则\n"
-            "1. content 必须是关于【用户本人】、通过石蕊测试、自包含的精炼事实句。\n"
+            "1. content 必须是关于【用户本人】、通过石蕊测试与可再推导测试"
+            "（可公开复查的信息不进记忆）、自包含的精炼事实句。\n"
             "2. 判定 judge 只能依据【用户】说的话；助手(Roxy) 的话仅用于消歧。\n"
             "3. 与 new_interests 的区别：兴趣是话题词（如「原神」），memory_candidates 是完整\n"
             "   事实句（如「用户是崩坏：星穹铁道的活跃玩家，每天做日常」）；两者可并存。\n"
-            "4. 没有值得长期记住的事实就省略 memory_candidates。\n\n"
+            "4. 用户纠正旧信息时（\"你记错了\"\"我已经不X了\"）必须输出 memory_candidates：\n"
+            "   已有记忆里有对应条目 → judge=\"update\" + matched_id，content 为纠正后的完整\n"
+            "   事实句；找不到对应条目 → judge=\"new\"。无视纠正是最差的结果。\n"
+            "5. 没有值得长期记住的事实就省略 memory_candidates。\n"
+            "6. category 四选一（不确定就填 fact，它是默认类）：\n"
+            "   - critical：涉及健康安全/过敏禁忌/家庭重大变故/重大财务或法律/绝对不能触碰的话题，\n"
+            "     记错或遗忘代价高（如「用户对青霉素过敏」「用户父亲去年过世」）。此类记忆更耐降级。\n"
+            "   - preference：用户对互动方式或内容消费的偏好（如「用户喜欢简短回复」「用户爱吃辣」）。\n"
+            "   - event：一次性、有明确时间点的经历（如「用户上周去了上海漫展」「用户今年换了工作」）。\n"
+            "   - fact：以上都不是的持久属性/身份/习惯（如「用户住在杭州」「用户是程序员」）——默认类。\n"
+            "   category 只在 new/update/纠正替换时由你给出；纯 reinforce_short/keep 无需重判类型。\n\n"
             "## few-shot\n"
             + _PROFILE_FEW_SHOT + "\n\n"
             f"## existing 画像\n{json.dumps(existing, ensure_ascii=False)}\n\n"
@@ -689,6 +808,71 @@ class ProfileManager:
         """Legacy path used before per-user workspace migration."""
         safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in user_id)
         return os.path.join(self.base_dir, f"{safe_id}.json")
+
+    # ── ⑦ Layer-3 buffer crash recovery ──────────────────────────
+
+    def _buffer_path(self, user_id: str) -> str:
+        """{base_dir}/{safe_id}/buffer.json — sibling of profile.json."""
+        return os.path.join(os.path.dirname(self._path(user_id)), "buffer.json")
+
+    def _save_buffer(self, user_id: str):
+        """Atomically mirror _recent/_pending_n to disk (tmp + os.replace).
+
+        Called on every buffer mutation (observe_turn append, _flush reset,
+        delete-flush drop). Best-effort: a failed write only degrades back to
+        the old behavior (crash loses the in-memory buffer), never breaks the
+        turn itself.
+        """
+        dq = self._recent.get(user_id)
+        payload = {
+            "turns": [[m, r] for m, r in (dq or ())],
+            "pending_n": int(self._pending_n.get(user_id, 0)),
+        }
+        path = self._buffer_path(user_id)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.warning("[profile] buffer save failed user={}: {}", user_id, e)
+
+    def _restore_buffer(self, user_id: str):
+        """Rebuild the Layer-3 buffer from disk (lazy, on first observe).
+
+        After a crash/restart the recovered pending_n lets the tail flush
+        naturally on the next interactions instead of being silently lost.
+        Corrupt/missing files are ignored (fresh buffer). Turns are re-capped
+        to EXTRACT_WINDOW_N and malformed entries skipped.
+        """
+        try:
+            with open(self._buffer_path(user_id), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        turns = data.get("turns")
+        if not isinstance(turns, list):
+            return
+        dq = deque(maxlen=EXTRACT_WINDOW_N)
+        for t in turns[-EXTRACT_WINDOW_N:]:
+            if isinstance(t, (list, tuple)) and len(t) == 2:
+                dq.append((str(t[0]), str(t[1])))
+        try:
+            pending_n = max(0, int(data.get("pending_n") or 0))
+        except (TypeError, ValueError):
+            pending_n = 0
+        if not dq and not pending_n:
+            return
+        self._recent[user_id] = dq
+        # pending can never legitimately exceed the buffered turn count
+        self._pending_n[user_id] = min(pending_n, len(dq))
+        logger.debug(
+            "[profile] buffer restored user={} turns={} pending={}",
+            user_id, len(dq), self._pending_n[user_id],
+        )
 
     def _load(self, user_id: str) -> Optional[UserProfile]:
         path = self._path(user_id)

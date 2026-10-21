@@ -1,0 +1,17 @@
+{
+  "id": "episodic_canary",
+  "title": "Q2 一次性事件存活率（预期当前 CANARY-FAIL：频率驱动晋升救不了单次事件，⑤ 的回归门）",
+  "kind": "canary",
+  "canary_expect": "survive",
+  "user": "bench_canary",
+  "steps": [
+    {"track": "吵架"},
+    {"ingest": [["我们吵架了然后和好了，感觉更了解彼此", "new", null]],
+     "snapshot_turns": [["今天跟你吵架了", "抱歉，我们和好吧"]]},
+    {"loop": {"var": "n", "from": 1, "to": 60, "body": [
+      {"ingest": [["日常闲聊{n}号话题", "new", null]]}
+    ]}},
+    {"checkpoint": {"desc": "期望：一次性重要事件在 60 周期普通流量后仍可达（当前引擎做不到）",
+                    "tier_of": {"find": "吵架", "in": ["short", "medium", "long"]}}}
+  ]
+}

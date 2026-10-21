@@ -1,0 +1,22 @@
+{
+  "id": "persistence_roundtrip",
+  "title": "持久化：三层混合状态 save→reload 后计数、注入字节、LONG 索引与 recall 全部一致",
+  "kind": "gate",
+  "user": "bench_persist",
+  "steps": [
+    {"ingest": [["持久化测试甲事实登山远足", "new", null]], "repeat": 11,
+     "snapshot_turns": [["甲事实", "记住了"]]},
+    {"ingest": [["持久化测试乙事实两只橘猫", "new", null]], "repeat": 3},
+    {"ingest": [["持久化测试丙事实学习吉他", "new", null]]},
+    {"checkpoint": {"desc": "reload 前：LONG 1 / MEDIUM 2（甲 twin+乙）/ SHORT 1（丙）",
+                    "long_count": 1, "medium_count": 2, "short_count": 1}},
+    {"probe": true},
+    {"save": true},
+    {"reload": true},
+    {"checkpoint": {"desc": "reload 后计数一致", "long_count": 1, "medium_count": 2, "short_count": 1}},
+    {"checkpoint": {"desc": "MEDIUM 注入逐字节一致", "injection_same_as_probe": true}},
+    {"checkpoint": {"desc": "LONG 索引逐字节一致（write-once 字段）", "long_index_same_as_probe": true}},
+    {"checkpoint": {"desc": "LONG 索引内容可读", "long_index_contains": "甲事实"}},
+    {"checkpoint": {"desc": "recall 跨 reload 可用", "recall": {"query": "甲事实", "expect_hits": 1, "contains": "持久化测试甲事实登山远足"}}}
+  ]
+}

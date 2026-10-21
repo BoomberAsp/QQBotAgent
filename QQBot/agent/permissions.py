@@ -71,6 +71,7 @@ _PUBLIC_TOOLS: Set[str] = {
     "begin_task",
     "finalize_subtask",
     "recall_search_result",  # Reads own search archives only (user_id-scoped)
+    "recall_memory",         # Reads own LONG-tier memories only (user_id-scoped)
 }
 
 # Additional tools for VIP users (on top of _PUBLIC_TOOLS)
@@ -109,9 +110,12 @@ class PermissionManager:
         }
 
         # execute_code limits per role
+        # max_output capped at 16KB for all roles (Cache-Plan Phase6-B1):
+        # oversized stdout is re-paid at full price every in-run iteration
+        # and the model cannot digest 25K+ tokens of raw output anyway.
         self._code_limits: Dict[UserRole, CodeLimits] = {
-            UserRole.ADMIN: CodeLimits(max_timeout=60, max_output=100 * 1024, max_memory_mb=256),
-            UserRole.VIP: CodeLimits(max_timeout=15, max_output=50 * 1024, max_memory_mb=128),
+            UserRole.ADMIN: CodeLimits(max_timeout=60, max_output=16 * 1024, max_memory_mb=256),
+            UserRole.VIP: CodeLimits(max_timeout=15, max_output=16 * 1024, max_memory_mb=128),
         }
 
         # Resource quotas per role
@@ -123,6 +127,13 @@ class PermissionManager:
 
         # Special session limits per role
         self._max_sessions: Dict[UserRole, int] = {
+            UserRole.ADMIN: 10,
+            UserRole.VIP: 3,
+            UserRole.REGULAR: 1,
+        }
+
+        # UGC character creation quota per role (Bond-System-Design.md §5.2)
+        self._max_characters: Dict[UserRole, int] = {
             UserRole.ADMIN: 10,
             UserRole.VIP: 3,
             UserRole.REGULAR: 1,
@@ -228,3 +239,7 @@ class PermissionManager:
     def get_max_special_sessions(self, role: UserRole) -> int:
         """Return max special sessions for the given role."""
         return self._max_sessions.get(role, 1)
+
+    def get_max_characters(self, role: UserRole) -> int:
+        """Return max UGC characters the role may own."""
+        return self._max_characters.get(role, 1)

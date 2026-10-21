@@ -116,6 +116,7 @@ class TestToolRegistry:
         self.test_execute_sync()
         self.test_execute_async()
         self.test_execute_error()
+        self.test_error_sanitization()
         self.test_unregister()
         self.test_contains()
 
@@ -196,6 +197,56 @@ class TestToolRegistry:
         result = asyncio.run(registry.execute("nonexistent", {}))
         assert "[Error]" in result
         print_pass("Nonexistent tool error handling")
+
+    def test_error_sanitization(self):
+        """P1-2: raw exception text must never reach the model."""
+        from lib.errors import ToolError
+        registry = self.ToolRegistry()
+
+        secret = "RuntimeError at /home/windows11/QQBotAgent/.env DB_PASSWORD=hunter2"
+
+        def leaky():
+            raise RuntimeError(secret)
+
+        registry.register("leaky", leaky, "Leaks internals", {"type": "object", "properties": {}})
+        result = asyncio.run(registry.execute("leaky", {}))
+        assert "[Error]" in result, result
+        assert "hunter2" not in result and "/home/" not in result, \
+            f"Raw exception leaked to model: {result}"
+        assert "诊断编号" in result, f"Expected diagnostic code in: {result}"
+        print_pass("Internal tool errors sanitized (no raw exception text)")
+
+        def classified():
+            raise ToolError("not_found", "未找到角色「阿米娅」，请检查名称后重试。")
+
+        registry.register("classified", classified, "ToolError", {"type": "object", "properties": {}})
+        result = asyncio.run(registry.execute("classified", {}))
+        assert result == "[Error] 未找到角色「阿米娅」，请检查名称后重试。", result
+        print_pass("ToolError safe message passes through verbatim")
+
+        def slow():
+            raise TimeoutError("connect to 10.0.0.1:8080 timed out")
+
+        registry.register("slow", slow, "Times out", {"type": "object", "properties": {}})
+        result = asyncio.run(registry.execute("slow", {}))
+        assert "暂时不可用" in result and "10.0.0.1" not in result, result
+        print_pass("Timeouts classified as unavailable without leaking details")
+
+        def needs(x, y):
+            return x + y
+
+        registry.register("needs", needs, "Two args", {"type": "object", "properties": {}})
+        result = asyncio.run(registry.execute("needs", {"x": 1}))
+        assert result.startswith("[Error] Invalid arguments"), result
+        print_pass("Argument binding errors remain actionable")
+
+        def internal_type_bug(x):
+            return None + x  # TypeError INSIDE the tool → internal, not invalid_args
+
+        registry.register("buggy", internal_type_bug, "Internal bug", {"type": "object", "properties": {}})
+        result = asyncio.run(registry.execute("buggy", {"x": 1}))
+        assert "执行失败" in result and "unsupported operand" not in result, result
+        print_pass("Internal TypeErrors are not misreported as argument errors")
 
     def test_unregister(self):
         registry = self.ToolRegistry()
@@ -938,6 +989,12 @@ class TestAgentCore:
                 id="m1", content="用户正在做力量训练，按酸痛程度分割训练循环",
                 count=6, entry_extraction_index=0,
             ))
+            # ① P2-lite: a LONG entry must also reach the tail via the index.
+            from agent.memory import LongObject
+            st.long.append(LongObject(
+                id="l9", title="用户长期偏好记录", summary="长期偏好摘要",
+                snapshot_turns=[("旧对话", "旧回复")], snapshot_time=time.time(),
+            ))
 
             agent = Agent(
                 deepseek_client=mock_client,
@@ -973,7 +1030,14 @@ class TestAgentCore:
             # rsplit guard is kept merely as belt-and-braces.
             medium_block = tail.rsplit("## 用户记忆（中期）", 1)[1]
             assert "(低置信)" not in medium_block, "count>=5 must NOT be low-confidence"
-            print_pass("P1 MEDIUM-tier memory injected into L4 tail")
+            # LONG index (Memory-Optimization-Plan ①): one-line-per-entry, with
+            # the recall_memory hint; full text/snapshot must NOT leak into the tail.
+            assert "用户长期记忆索引" in tail, f"LONG index missing: {tail[-400:]}"
+            assert "[l9] 用户长期偏好记录" in tail, "LONG index line missing"
+            assert "recall_memory" in tail, "LONG index must hint the recall tool"
+            assert "长期偏好摘要" not in tail, (
+                "index must stay one-line; full text only via recall_memory")
+            print_pass("P1 MEDIUM-tier memory + LONG index injected into L4 tail")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1164,10 +1228,12 @@ class TestProfileExtraction:
         self.test_prompt_no_new_facts()
         self.test_format_conversation_window()
         self.test_apply_extraction_filters_interests()
+        self.test_updated_preferences_revision()
         # Layer 3 — batching / single-flight / delete-flush
         asyncio.run(self.test_observe_turn_flush_at_k())
         asyncio.run(self.test_single_flight())
         asyncio.run(self.test_delete_flush())
+        asyncio.run(self.test_buffer_crash_recovery())
 
     # ── Layer 2 ──────────────────────────────────────────────────
 
@@ -1227,6 +1293,11 @@ class TestProfileExtraction:
             # facts wrongly deleted from user 1114144652 in the 2026-09-14 cleanup).
             "用户正在通过饮食调整降血脂",
             "用户正在做力量训练，按酸痛程度自由分割训练循环",
+            # ⑧: user corrections of old memories must survive L2 — they carry
+            # the highest-value signal (judge="update"), so no pattern may catch
+            # "改为/不再/改X了" phrasing.
+            "用户已把每周跑步三次改为每周游泳三次",
+            "用户不再熬夜了，现在晚上十一点睡觉",
         ]
         for text in legit:
             r = filter_candidate(text)
@@ -1254,7 +1325,15 @@ class TestProfileExtraction:
                       "new_interests", "new_preferences",
                       # P1: the merged extract+judge call always advertises the
                       # memory_candidates schema (§12.1), even with no judge_list.
-                      "memory_candidates", "reinforce_short", "matched_id"]:
+                      "memory_candidates", "reinforce_short", "matched_id",
+                      # ② negative list: re-derivable public info → don't store
+                      # (litmus-style second criterion + few-shot 例6).
+                      "可再推导测试", "例6", "流浪者",
+                      # ⑧ user corrections → judge="update" (few-shot 例7).
+                      "例7", "纠正",
+                      # ⑩ preference-slot revision path (few-shot 例8):
+                      # rule-4 amendment + schema field + null-delete semantics.
+                      "updated_preferences", "例8", "null"]:
             assert token in prompt, f"prompt missing {token!r}"
         # No judge_list → the "暂无已有记忆" branch tells the model to use judge="new".
         assert "暂无已有记忆" in prompt, "empty judge_list must use the no-memory branch"
@@ -1265,7 +1344,10 @@ class TestProfileExtraction:
             judge_list=[{"id": "abc123", "content": "用户喜欢原神", "count": 4, "tier": "medium"}],
         )
         for token in ["abc123", "用户喜欢原神", "已有记忆",
-                      "new", "reinforce_short", "update", "keep"]:
+                      "new", "reinforce_short", "update", "keep",
+                      # ⑧: the judge_list branch must spell out the correction
+                      # → update routing rule.
+                      "纠正"]:
             assert token in jp, f"judge prompt missing {token!r}"
         assert "暂无已有记忆" not in jp, "non-empty judge_list must NOT use the no-memory branch"
         print_pass("Layer1 prompt: litmus + few-shot + memory_candidates schema + judge list")
@@ -1312,6 +1394,35 @@ class TestProfileExtraction:
             # empty extraction → changed False (no writes)
             assert mgr._apply_extraction(mgr.get("u_noop"), "u_noop", {}) is False
             print_pass("Layer1 _apply_extraction: L2-filters interests, sets nickname/prefs, changed flag")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_updated_preferences_revision(self):
+        """⑩: updated_preferences overwrites an existing slot, null deletes it,
+        unknown-key delete is a no-op — the rule-4 "write-once preferences"
+        blind spot the L2 baseline exposed as stable staleness (×4, both versions)."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            from agent.profile import ProfileManager
+            mgr = ProfileManager(base_dir=tmpdir)
+            prof = mgr.get("u_upd")
+            prof.preferences.update({"设备": "安卓手机", "饮品": "不喝咖啡", "语言": "中文"})
+            changed = mgr._apply_extraction(prof, "u_upd", {
+                "updated_preferences": {"设备": "iPhone", "饮品": None, "不存在的键": None},
+            })
+            assert changed is True
+            assert prof.preferences.get("设备") == "iPhone", prof.preferences
+            assert "饮品" not in prof.preferences, "null must delete the slot"
+            assert "不存在的键" not in prof.preferences, "unknown-key delete is a no-op"
+            assert prof.preferences.get("语言") == "中文", "untouched slots stay"
+            # same-value update → changed False (no spurious writes)
+            assert mgr._apply_extraction(prof, "u_upd",
+                                         {"updated_preferences": {"设备": "iPhone"}}) is False
+            # non-dict payload is ignored defensively
+            assert mgr._apply_extraction(prof, "u_upd",
+                                         {"updated_preferences": "iPhone"}) is False
+            assert prof.preferences.get("设备") == "iPhone"
+            print_pass("⑩ updated_preferences: overwrite / null-delete / no-op / idempotent")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1395,6 +1506,56 @@ class TestProfileExtraction:
             assert len(c2.calls) == 0, "transient delete must NOT extract"
             assert m2._pending_n["u3"] == 0, "tail must be dropped"
             print_pass("Layer3 delete-flush: >K forces tail, ≤K drops (Decision J)")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_buffer_crash_recovery(self):
+        """⑦: the Layer-3 buffer mirrors to buffer.json and survives restarts."""
+        tmpdir = tempfile.mkdtemp()
+        buf = os.path.join(tmpdir, "u", "buffer.json")
+        try:
+            from agent.profile import ProfileManager, PROFILE_BATCH_K
+            # "process 1": buffer K-1 turns, then die (object dropped, no flush)
+            c1 = _GatedProfileClient("{}")
+            m1 = ProfileManager(base_dir=tmpdir, llm_client=c1)
+            for i in range(PROFILE_BATCH_K - 1):
+                m1.observe_turn("u", f"m{i}", "r")
+            await asyncio.sleep(0)
+            assert len(c1.calls) == 0
+            with open(buf, encoding="utf-8") as f:
+                blob = json.load(f)
+            assert blob["pending_n"] == PROFILE_BATCH_K - 1, blob
+            assert len(blob["turns"]) == PROFILE_BATCH_K - 1
+
+            # "process 2": restore on first observe; the Kth turn flushes ONCE
+            # with the pre-crash turns included in the extraction window
+            c2 = _GatedProfileClient('{"new_interests": ["原神"]}')
+            m2 = ProfileManager(base_dir=tmpdir, llm_client=c2)
+            m2.observe_turn("u", "mK", "r")
+            await asyncio.sleep(0.05)
+            assert len(c2.calls) == 1, "restored pending must flush at the Kth turn"
+            assert "m0" in c2.calls[0]["prompt"] and "mK" in c2.calls[0]["prompt"], (
+                "pre-crash turns must reach the extraction window")
+            assert "原神" in m2.get("u").interests
+
+            # flush persisted pending_n=0 → "process 3" must NOT double-extract
+            with open(buf, encoding="utf-8") as f:
+                assert json.load(f)["pending_n"] == 0
+            c3 = _GatedProfileClient("{}")
+            m3 = ProfileManager(base_dir=tmpdir, llm_client=c3)
+            m3.observe_turn("u", "after", "r")
+            await asyncio.sleep(0.02)
+            assert len(c3.calls) == 0, "pending=0 must restore (no double extraction)"
+            assert m3._pending_n["u"] == 1
+
+            # corrupt buffer file → ignored, fresh buffer, no crash
+            with open(buf, "w") as f:
+                f.write("{corrupt")
+            c4 = _GatedProfileClient("{}")
+            m4 = ProfileManager(base_dir=tmpdir, llm_client=c4)
+            m4.observe_turn("u", "fresh", "r")
+            assert m4._pending_n["u"] == 1 and len(m4._recent["u"]) == 1
+            print_pass("Layer3 ⑦: buffer survives restarts, flush-once, corrupt-tolerant")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1505,6 +1666,8 @@ class TestBuiltinTools:
         self.test_get_time()
         self.test_execute_code_success()
         self.test_execute_code_error()
+        self.test_execute_code_output_cap()
+        self.test_read_file_segmented()
         self.test_search_web()
 
     def test_get_time(self):
@@ -1534,6 +1697,56 @@ class TestBuiltinTools:
         result = asyncio.run(execute_code("1/0"))
         assert "ZeroDivisionError" in result or "Error" in result
         print_pass("execute_code handles runtime errors")
+
+    def test_execute_code_output_cap(self):
+        """Phase6-B1: 200KB stdout must be capped at 16KB with guidance."""
+        import asyncio
+        from tools.builtin_tools import execute_code, MAX_OUTPUT_SIZE
+
+        assert MAX_OUTPUT_SIZE == 16384, "MAX_OUTPUT_SIZE should be 16KB"
+        result = asyncio.run(execute_code("print('x' * 200000)"))
+        assert "已截断" in result
+        assert "聚合" in result, "truncation notice should guide toward aggregation"
+        assert len(result) < MAX_OUTPUT_SIZE + 2000, (
+            f"result should stay near the 16KB cap, got {len(result)}"
+        )
+        print_pass("execute_code caps output at 16KB with aggregation guidance")
+
+    def test_read_file_segmented(self):
+        """Phase6-B1: large text reads are segmented via offset with exact continuity."""
+        import asyncio
+        import os
+        from tools.builtin_tools import _get_workspace_root
+        from tools.file_tools import read_file
+
+        ws = _get_workspace_root()
+        os.makedirs(ws, exist_ok=True)
+        rel = "_test_segmented.txt"
+        path = os.path.join(ws, rel)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("".join(f"{i:07d}\n" for i in range(20000)))  # 160K chars
+        try:
+            sep = "─" * 40 + "\n\n"
+            raw = open(path, encoding="utf-8").read()
+
+            r1 = asyncio.run(read_file(rel))
+            assert "已截断" in r1 and "offset=50000" in r1, (
+                "first segment should advertise the next offset"
+            )
+            body1 = r1.split(sep, 1)[1]
+            assert body1 == raw[:50000]
+
+            r2 = asyncio.run(read_file(rel, offset=50000))
+            assert "分段读取" in r2 and "offset=100000" in r2
+            body2 = r2.split(sep, 1)[1]
+            assert body2 == raw[50000:100000], "segments must be byte-exact continuous"
+
+            # offset beyond EOF → empty body, no crash
+            r3 = asyncio.run(read_file(rel, offset=len(raw) + 10))
+            assert isinstance(r3, str) and r3
+            print_pass("read_file segmented reading (offset) is exact and continuous")
+        finally:
+            os.remove(path)
 
     def test_search_web(self):
         from tools.builtin_tools import search_web
@@ -2186,9 +2399,37 @@ class TestTieredMemory:
         self.test_injection_low_confidence_label()
         self.test_injection_top_n_plus_recent()
         self.test_injection_token_cap()
+        self.test_long_index_injection()
+        self.test_recall_long_lookup_and_stats()
         self.test_touch_extraction_count()
         self.test_persistence_roundtrip()
         self.test_load_all()
+        self.test_correction_replaces_stale_short()
+        self.test_correction_sweeps_stale_variants_keeps_adjacent()
+        self.test_correction_targets_medium_and_resets_age()
+        self.test_correction_requires_marker()
+        self.test_neardup_merge_recency_wins()
+        self.test_neardup_guard_distinct_facts_coexist()
+        self.test_neardup_digit_guard_enumerations()
+        self.test_correction_spares_fused_episode_entry()
+        self.test_correction_no_topic_word_sweep()
+        # ④ write-time typing (category)
+        self.test_category_defaults_to_fact()
+        self.test_category_explicit_all_four()
+        self.test_category_invalid_or_hallucinated_keeps_existing()
+        self.test_category_reinforce_does_not_retype()
+        self.test_category_update_retypes()
+        self.test_category_survives_promote_and_demote()
+        self.test_critical_demote_age_3x()
+        self.test_category_persistence_roundtrip()
+        self.test_load_v1_file_defaults()
+        self.test_get_judge_list_includes_category()
+        # ③ staleness annotation
+        self.test_staleness_label_stale_fact()
+        self.test_staleness_label_fresh_fact_unlabelled()
+        self.test_staleness_label_scoped_to_fact_only()
+        self.test_staleness_label_legacy_ts0_unlabelled()
+        self.test_staleness_label_cross_year_format()
 
     # ── SHORT ────────────────────────────────────────────────────
 
@@ -2261,12 +2502,17 @@ class TestTieredMemory:
         try:
             from agent.memory import SHORT_MAX
             tm = self._tm(tmp)
-            for i in range(SHORT_MAX + 10):
-                tm.ingest_candidates("u", [(f"独特事实编号{i}", "new", None)])
+            # ⑨ note: "编号{i}" items differ by ONE char — normally the numeric-
+            # correction pattern M1 collapses (三十岁→三十五岁); the ASCII digit
+            # guard keeps distinct enumerations separate, so this stays a valid
+            # 60-distinct-item overflow fixture.
+            contents = [f"独特事实编号{i}" for i in range(SHORT_MAX + 10)]
+            for c in contents:
+                tm.ingest_candidates("u", [(c, "new", None)])
             st = tm._get_state("u")
             assert len(st.short) == SHORT_MAX, f"SHORT must cap at {SHORT_MAX}, got {len(st.short)}"
             # newest survives at front, oldest evicted from tail
-            assert st.short[0].content == f"独特事实编号{SHORT_MAX + 9}"
+            assert st.short[0].content == contents[-1]
             assert all(f"编号0" not in x.content for x in st.short), "oldest should be evicted"
             print_pass("SHORT: overflow evicts oldest from tail (cap SHORT_MAX)")
         finally:
@@ -2411,8 +2657,9 @@ class TestTieredMemory:
             # MEDIUM first, sorted by count desc; then SHORT
             assert [x["id"] for x in jl] == ["m2", "m1", "s1"], [x["id"] for x in jl]
             assert jl[0]["tier"] == "medium" and jl[2]["tier"] == "short"
-            assert all(set(x) == {"id", "content", "count", "tier"} for x in jl)
-            print_pass("judge list: MEDIUM(top by count) + SHORT, each {id,content,count,tier}")
+            assert all(set(x) == {"id", "content", "count", "tier", "category"} for x in jl)
+            assert all(x["category"] == "fact" for x in jl), "④ default category surfaced"
+            print_pass("judge list: MEDIUM(top by count) + SHORT, each {id,content,count,tier,category}")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2482,6 +2729,85 @@ class TestTieredMemory:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    # ── LONG index + recall (P2-lite ①) ─────────────────────────
+
+    def test_long_index_injection(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import LongObject, LONG_INJECT_MAX_LINES
+            tm = self._tm(tmp)
+            assert tm.build_long_index("nobody") == "", "no LONG → empty index"
+            st = tm._get_state("u")
+            now = time.time()
+            for i in range(LONG_INJECT_MAX_LINES + 5):
+                st.long.append(LongObject(
+                    id=f"l{i:02d}", title=f"长期事实{i}", summary="s",
+                    snapshot_turns=[], snapshot_time=now + i,
+                ))
+            block = tm.build_long_index("u")
+            assert "用户长期记忆索引" in block and "recall_memory" in block
+            lines = [ln for ln in block.splitlines() if ln.startswith("- [")]
+            assert len(lines) == LONG_INJECT_MAX_LINES, (
+                f"expected {LONG_INJECT_MAX_LINES} index lines, got {len(lines)}")
+            # newest first; entries beyond the cap are dropped entirely
+            assert "[l24] 长期事实24" in lines[0], lines[0]
+            assert "l00" not in block and "l04" not in block, "oldest beyond cap must be dropped"
+            # one-line format: id + title + （YYYY-MM）
+            assert f"（{time.strftime('%Y-%m', time.localtime(now + 24))}）" in lines[0], lines[0]
+            # byte-stable across calls (write-once fields only)
+            assert block == tm.build_long_index("u"), "index must be byte-stable"
+            print_pass(f"LONG index: '' when empty; {LONG_INJECT_MAX_LINES} lines newest-first; byte-stable")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_recall_long_lookup_and_stats(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import (TieredMemory, LongObject, LONG_RECALL_MAX_MATCHES,
+                                      LONG_RECALL_SNAPSHOT_CAP, LONG_RECALL_QUERY_LOG_CAP)
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            now = time.time()
+            big_turns = [("很长的用户消息" * 40, "很长的回复" * 40) for _ in range(5)]
+            st.long.append(LongObject(id="lab123", title="原神抽卡记录", summary="用户小保底歪了",
+                                      snapshot_turns=big_turns, snapshot_time=now))
+            st.long.append(LongObject(id="lcd456", title="健身计划", summary="用户正在练腿",
+                                      snapshot_turns=[("今天练腿", "加油")], snapshot_time=now - 100))
+            tm.save_user("u")
+
+            # id-prefix match + snapshot rendering capped with truncation marker
+            hits = tm.recall_long("u", "lab")
+            assert len(hits) == 1 and hits[0][0].id == "lab123"
+            assert len(hits[0][1]) <= LONG_RECALL_SNAPSHOT_CAP + 30 and "已截断" in hits[0][1]
+            # keyword match (title/summary, substring)
+            assert [lo.id for lo, _ in tm.recall_long("u", "练腿")] == ["lcd456"]
+            # miss / wrong user / blank query → []
+            assert tm.recall_long("u", "不存在的关键词") == []
+            assert tm.recall_long("other", "lab") == [], "recall must be user-scoped"
+            assert tm.recall_long("u", "   ") == []
+
+            # stats bumped + persisted + query_log capped
+            assert st.long[0].query_count == 1 and st.long[0].query_log
+            for _ in range(LONG_RECALL_QUERY_LOG_CAP + 5):
+                tm.recall_long("u", "lab")
+            assert len(st.long[0].query_log) == LONG_RECALL_QUERY_LOG_CAP
+            tm2 = TieredMemory(base_dir=tmp)
+            tm2.load_all()
+            lo2 = next(lo for lo in tm2._get_state("u").long if lo.id == "lab123")
+            assert lo2.query_count == st.long[0].query_count, "query stats must persist"
+
+            # max-matches cap, newest first; snapshot-less → placeholder text
+            st.long.clear()
+            for i in range(LONG_RECALL_MAX_MATCHES + 2):
+                st.long.append(LongObject(id=f"k{i}", title="共同关键词", summary="x",
+                                          snapshot_turns=[], snapshot_time=now + i))
+            hits = tm.recall_long("u", "共同关键词")
+            assert [lo.id for lo, _ in hits] == ["k4", "k3", "k2"], [lo.id for lo, _ in hits]
+            assert hits[0][1] == "（无对话快照）"
+            print_pass("recall_long: id-prefix/keyword, user-scoped, capped newest-first, stats persisted")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     # ── clock + persistence ──────────────────────────────────────
 
     def test_touch_extraction_count(self):
@@ -2536,6 +2862,604 @@ class TestTieredMemory:
             assert tm2.load_all() == 3
             assert tm2._get_state("bob").short[0].content == "bob 事实"
             print_pass("load_all: reloads every persisted user at startup")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── ⑨ ingest-level deterministic guards (Memory-Optimization-Plan) ──
+
+    def _drive(self, tm, uid, contents):
+        """Ingest each content as judge="new" (the path ⑨ guards), ticking the clock."""
+        summaries = []
+        for c in contents:
+            summaries.append(tm.ingest_candidates(uid, [(c, "new", None)], []))
+            tm.touch_extraction_count(uid)
+        return summaries
+
+    def _all_contents(self, tm, uid):
+        st = tm._get_state(uid)
+        return [s.content for s in st.short] + [m.content for m in st.medium]
+
+    def test_correction_replaces_stale_short(self):
+        """⑨ M2: L2 ct3 pattern — an explicit correction judged "new" must
+        replace the stale value in place, never coexist with it."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            ss = self._drive(tm, "u", [
+                "用户是会计专业的学生",
+                "用户是会计专业的学生",              # exact-dup → count=2
+                "用户是计算机专业的学生，不是会计专业",  # correction, judge="new"
+            ])
+            st = tm._get_state("u")
+            assert ss[2]["corrected_in_place"] == 1, ss[2]
+            assert len(st.short) + len(st.medium) == 1, self._all_contents(tm, "u")
+            assert "不是会计专业" in self._all_contents(tm, "u")[0]
+            # replaced in place: count inherited+1 (=3 → promoted), age anchored
+            assert st.medium and st.medium[0].count == 3, [(m.content, m.count) for m in st.medium]
+            assert st.medium[0].entry_extraction_index == st.extraction_count - 1
+            print_pass("⑨ M2: explicit correction replaces stale SHORT value in place")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_correction_sweeps_stale_variants_keeps_adjacent(self):
+        """⑨ M2b: differently-phrased stale variants (住在杭州/家住杭州) are all
+        swept; a compatible adjacent fact (姐姐是老师) survives both orderings."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            self._drive(tm, "u", [
+                "用户是独生女",
+                "用户的姐姐是老师",                  # compatible adjacent — must survive
+                "用户不是独生女，有一个姐姐",
+                "用户不是独生女，她有一个亲姐姐",
+            ])
+            contents = self._all_contents(tm, "u")
+            assert "用户的姐姐是老师" in contents, contents
+            assert not any(c == "用户是独生女" for c in contents), contents
+            assert sum(1 for c in contents if "独生女" in c) == 1, contents
+            print_pass("⑨ M2b: stale variants swept, topic-adjacent compatible fact kept")
+
+            tm2 = self._tm(tempfile.mkdtemp())
+            self._drive(tm2, "v", [
+                "用户住在杭州",
+                "用户家住杭州",                     # stale variant, Dice-only 0.33 with the above
+                "用户全家去年已从杭州搬到南京居住",
+                "用户全家去年搬到了南京住",
+            ])
+            contents2 = self._all_contents(tm2, "v")
+            assert not any("住在杭州" in c or "家住杭州" in c for c in contents2), contents2
+            assert sum(1 for c in contents2 if "南京" in c) == 1, contents2
+            print_pass("⑨ M2b: phrasing-divergent stale variants (住在/家住) fully cleared")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_correction_targets_medium_and_resets_age(self):
+        """⑨ M2 on the MEDIUM tier: content replaced, count+1, age reset to 0."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            for _ in range(3):                      # promote to MEDIUM at count=3
+                tm.ingest_candidates("u", [("用户是健身教练", "new", None)], [])
+                tm.touch_extraction_count("u")
+            for _ in range(5):                      # let it age
+                tm.ingest_candidates("u", [], [])
+                tm.touch_extraction_count("u")
+            st = tm._get_state("u")
+            assert len(st.medium) == 1 and st.medium[0].count == 3
+            age_before = st.extraction_count - st.medium[0].entry_extraction_index
+            assert age_before >= 5, age_before
+            tm.ingest_candidates("u", [("用户已转行，现在是快递员，不再是健身教练", "new", None)], [])
+            assert len(st.medium) == 1 and not st.short
+            assert st.medium[0].content == "用户已转行，现在是快递员，不再是健身教练"
+            assert st.medium[0].count == 4, "count inherited (+1), not restarted"
+            assert st.extraction_count - st.medium[0].entry_extraction_index == 0, \
+                f"correction resets age (was {age_before})"
+            print_pass("⑨ M2: MEDIUM-tier correction replaces content, count+1, age resets")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_correction_requires_marker(self):
+        """⑨ M2 gate 1: without a narrow correction marker, compatible
+        restatements must NOT clobber existing entries (no 已经/现在/其实 markers)."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            ss = self._drive(tm, "u", [
+                "用户每天肝原神日常",
+                "用户已经在玩原神五年了",            # shares 原神 topic, no narrow marker
+                "用户喜欢喝美式咖啡",
+                "用户不喝咖啡，只喝茶",              # 不 alone is NOT a marker (不是/不再 are)
+            ])
+            assert all(s["corrected_in_place"] == 0 for s in ss), ss
+            contents = self._all_contents(tm, "u")
+            assert len(contents) == 4, contents
+            print_pass("⑨ M2: no marker → no replacement (compatible facts coexist)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_neardup_merge_recency_wins(self):
+        """⑨ M1: unmarked numeric correction (三十岁→三十五岁) merges via the
+        containment rule and keeps the NEWER wording (recency-wins)."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            ss = self._drive(tm, "u", [
+                "用户今年三十岁",
+                "用户今年三十岁，刚过完生日",         # near-dup merge (Dice 0.62)
+                "用户今年三十五岁",                  # overlap 0.60 with embellished variant
+                "用户今年三十五岁了",
+            ])
+            assert ss[1]["near_dup_merged"] == 1 and ss[2]["near_dup_merged"] == 1, ss
+            st = tm._get_state("u")
+            contents = self._all_contents(tm, "u")
+            assert len(contents) == 1, contents
+            assert "三十五" in contents[0] and "三十岁" not in contents[0], contents
+            print_pass("⑨ M1: numeric near-dup chain collapses to one recency-wins item")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_neardup_guard_distinct_facts_coexist(self):
+        """⑨ M1 guards (measured from L2 baseline data): same-template allergy
+        pair, city pair, and evolving-fact pair must all stay separate."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import _char_bigrams, _is_near_dup
+            # unit-level: guard pairs far below both thresholds
+            guards = [
+                ("用户对花生过敏", "用户对海鲜过敏"),                     # Dice 0.25 / ovl 0.25
+                ("用户对花生过敏，吃了会休克", "用户对海鲜过敏，吃虾蟹起疹子"),  # 0.21 / 0.22
+                ("用户住在杭州", "用户住在南京"),                        # 0.25 / 0.33
+                ("用户每天肝原神日常", "用户已经在玩原神五年了"),           # 0.14 / 0.33
+                ("用户有一个上幼儿园的女儿", "用户的女儿今年九月升小学，适应得还不错"),
+            ]
+            for a, b in guards:
+                assert not _is_near_dup(_char_bigrams(a), _char_bigrams(b)), (a, b)
+            # end-to-end: repeated mentions of both allergies stay two items
+            tm = self._tm(tmp)
+            self._drive(tm, "u", [
+                "用户对花生过敏", "用户对海鲜过敏",
+                "用户对花生过敏，吃了会休克", "用户对海鲜过敏，吃虾蟹起疹子",
+            ])
+            contents = self._all_contents(tm, "u")
+            assert sum(1 for c in contents if "花生" in c) == 1, contents
+            assert sum(1 for c in contents if "海鲜" in c) == 1, contents
+            print_pass("⑨ M1: guard pairs (allergy template/city/evolving) never merge")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_neardup_digit_guard_enumerations(self):
+        """⑨ M1 digit guard: differing ASCII digit signatures mark ENUMERATED
+        variants (编号1号/编号10号 share 0.70 bigrams!) — they must coexist,
+        while identifier corrections still ride the M2 marker path."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            self._drive(tm, "u", [
+                "中期事实1号", "中期事实10号", "中期事实100号",
+            ])
+            contents = self._all_contents(tm, "u")
+            assert len(contents) == 3, f"digit variants must not merge: {contents}"
+            # same digits, near-dup template → merges as usual
+            self._drive(tm, "v", ["用户住在3号楼", "用户住在3号楼房子里"])
+            contents_v = self._all_contents(tm, "v")
+            assert len(contents_v) == 1, contents_v
+            # identifier correction with M2 marker still replaces (the corrected
+            # sentence restates the identifier topic → containment 0.5 ≥ 0.33)
+            self._drive(tm, "w", ["用户住在3号楼", "用户不住3号楼了，改成住5号楼"])
+            contents_w = self._all_contents(tm, "w")
+            assert len(contents_w) == 1 and "5号楼" in contents_w[0], contents_w
+            print_pass("⑨ M1: digit guard keeps enumerations, M2 still corrects identifiers")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_correction_spares_fused_episode_entry(self):
+        """⑨ M2 bar (L2 batch-2 p2 se1 regression): extraction often FUSES an
+        episode into a fact entry (有一个上幼儿园的女儿,曾因女儿演出感动落泪).
+        A later 升小学 correction shares 女儿/幼儿/儿园 with it but scores
+        0.18/0.21 — below STALE_VARIANT_OVERLAP → the fused entry (and its
+        canary episode) must survive untouched; the correction lands as new."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            fused = "用户有一个上幼儿园的女儿，曾因女儿演出感动落泪"
+            ss = self._drive(tm, "u", [
+                fused,
+                "用户女儿今年九月升小学了，不再是幼儿园的小朋友",
+            ])
+            assert ss[1]["corrected_in_place"] == 0, ss[1]
+            assert ss[1].get("stale_swept", 0) == 0, ss[1]
+            contents = self._all_contents(tm, "u")
+            assert fused in contents, contents          # episode detail preserved
+            assert any("升小学" in c for c in contents), contents
+            assert len(contents) == 2, contents
+            print_pass("⑨ M2: fused episode entry spared by correction below the variant bar")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_correction_no_topic_word_sweep(self):
+        """⑨ M2b bar (L2 batch-2 p4 regression): a correction sharing only a
+        topic word (游戏, Dice 0.09-0.15) must neither target nor sweep
+        unrelated same-topic facts — the loose first-run bar halved p4's store
+        (cl3 亏损三万块 + all 3 salient episodes lost). The genuine stale entry
+        (从来不用外包…自己做, containment 0.36) IS still replaced."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            stale = "用户从来不用外包，游戏素材全自己做"
+            cl3 = "用户的第一款游戏亏损三万块"
+            ss = self._drive(tm, "u", [
+                stale,
+                cl3,
+                "用户的游戏音乐不再自己做，改为外包",
+            ])
+            assert ss[2]["corrected_in_place"] == 1, ss[2]
+            assert ss[2].get("stale_swept", 0) == 0, ss[2]
+            contents = self._all_contents(tm, "u")
+            assert cl3 in contents, contents            # topic-adjacent fact survives
+            assert not any("从来不用外包" in c for c in contents), contents
+            assert any("改为外包" in c for c in contents), contents
+            assert len(contents) == 2, contents
+            print_pass("⑨ M2b: topic-word-only overlap neither targets nor sweeps")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── ④ write-time typing (category) — Memory-Optimization-Plan batch 2 ──
+
+    def _items(self, tm, uid):
+        st = tm._get_state(uid)
+        return list(st.short) + list(st.medium)
+
+    def _by_content(self, tm, uid, sub):
+        for it in self._items(tm, uid):
+            if sub in it.content:
+                return it
+        return None
+
+    def test_category_defaults_to_fact(self):
+        """④ a candidate with no category (dict w/o key, or legacy 3-tuple)
+        creates a SHORT item typed `fact`."""
+        tmp = tempfile.mkdtemp()
+        try:
+            tm = self._tm(tmp)
+            tm.ingest_candidates("u", [
+                {"content": "用户住在杭州", "judge": "new"},          # dict, no category
+                ("用户是程序员", "new", None),                        # legacy 3-tuple
+            ], [])
+            for sub in ("住在杭州", "程序员"):
+                it = self._by_content(tm, "u", sub)
+                assert it is not None and it.category == "fact", (sub, it and it.category)
+            print_pass("④ category: absent/legacy candidate defaults to 'fact'")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_explicit_all_four(self):
+        """④ all four VALID_CATEGORIES round-trip through a dict candidate,
+        and a 4-tuple carries category too."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import VALID_CATEGORIES
+            tm = self._tm(tmp)
+            tm.ingest_candidates("u", [
+                {"content": "用户对青霉素过敏", "judge": "new", "category": "critical"},
+                {"content": "用户喜欢简短回复", "judge": "new", "category": "preference"},
+                {"content": "用户上周去了漫展", "judge": "new", "category": "event"},
+                ("用户住在杭州", "new", None, "fact"),               # 4-tuple form
+            ], [])
+            got = {self._by_content(tm, "u", s).category: s
+                   for s in ("青霉素过敏", "简短回复", "漫展", "住在杭州")}
+            assert set(got) == set(VALID_CATEGORIES), got
+            assert got["critical"] == "青霉素过敏" and got["preference"] == "简短回复"
+            assert got["event"] == "漫展" and got["fact"] == "住在杭州"
+            print_pass("④ category: preference/fact/event/critical all stored (dict + 4-tuple)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_invalid_or_hallucinated_keeps_existing(self):
+        """④ an invalid tag normalizes to None → existing item KEEPS its category
+        on update; a brand-new item with an invalid tag falls back to `fact`."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import _norm_category
+            assert _norm_category("CRITICAL") == "critical", "case/space normalized"
+            assert _norm_category("  Preference ") == "preference"
+            for bad in ("allergy", "", None, 42, "facts"):
+                assert _norm_category(bad) is None, bad
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            from agent.memory import MediumItem
+            st.medium.append(MediumItem(id="m1", content="用户对青霉素过敏",
+                                        count=4, entry_extraction_index=st.extraction_count,
+                                        category="critical"))
+            # update carrying a hallucinated tag must NOT clobber the critical type
+            tm.ingest_candidates("u", [
+                {"content": "用户对青霉素和头孢都过敏", "judge": "update",
+                 "matched_id": "m1", "category": "allergy"},
+            ], [])
+            assert st.medium[0].category == "critical", st.medium[0].category
+            assert "头孢" in st.medium[0].content, "content still refined"
+            # new item with invalid tag → fact
+            tm.ingest_candidates("u", [
+                {"content": "用户养了一只猫", "judge": "new", "category": "pet"},
+            ], [])
+            assert self._by_content(tm, "u", "养了一只猫").category == "fact"
+            print_pass("④ category: invalid/hallucinated tag → keep existing / default fact")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_reinforce_does_not_retype(self):
+        """④ pure reinforcement (reinforce_short / keep) never re-types: the
+        stored category survives even if the judge supplies a different tag,
+        because reinforce doesn't pass category to the item."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import ShortItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.short.append(ShortItem(id="s1", content="用户住在杭州", count=1,
+                                      category="fact"))
+            # reinforce_short path ignores category entirely
+            tm.ingest_candidates("u", [
+                {"content": "用户住在杭州", "judge": "reinforce_short",
+                 "matched_id": "s1", "category": "critical"},
+            ], [])
+            it = st.short[0]
+            assert it.count == 2 and it.category == "fact", (it.count, it.category)
+            print_pass("④ category: reinforce_short keeps stored type (no silent re-type)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_update_retypes(self):
+        """④ an `update` judge with a valid category DOES re-type (a fact can
+        legitimately be promoted to critical when new detail arrives)."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m1", content="用户吃药要注意",
+                                        count=4, entry_extraction_index=st.extraction_count,
+                                        category="fact"))
+            tm.ingest_candidates("u", [
+                {"content": "用户对青霉素过敏，用错会休克", "judge": "update",
+                 "matched_id": "m1", "category": "critical"},
+            ], [])
+            assert st.medium[0].category == "critical", st.medium[0].category
+            print_pass("④ category: update re-types fact → critical")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_survives_promote_and_demote(self):
+        """④ category + last_confirmed_ts ride along on SHORT→MEDIUM promotion
+        and MEDIUM→SHORT age-demotion (both directions preserve typing)."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MEDIUM_DOWNGRADE_AGE
+            tm = self._tm(tmp)
+            # promote a critical fact to MEDIUM (count reaches 3)
+            for _ in range(3):
+                tm.ingest_candidates("u", [
+                    {"content": "用户对青霉素过敏", "judge": "new", "category": "critical"},
+                ], [])
+                tm.touch_extraction_count("u")
+            st = tm._get_state("u")
+            assert st.medium and st.medium[0].category == "critical", "promote carries category"
+            ts_before = st.medium[0].last_confirmed_ts
+            assert ts_before > 0, "promoted item carries a last_confirmed_ts"
+            # age it past the *fact* threshold but within critical's 3× window
+            st.extraction_count = st.medium[0].entry_extraction_index + MEDIUM_DOWNGRADE_AGE + 1
+            tm.ingest_candidates("u", [], [])
+            assert st.medium and st.medium[0].category == "critical", \
+                "critical must NOT demote at fact-age (3× window)"
+            print_pass("④ category: promote carries type; critical resists fact-age demotion")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_critical_demote_age_3x(self):
+        """④ CATEGORY_DEMOTE_AGE: at age 31 a `fact` demotes but a `critical`
+        of the same age stays in MEDIUM (critical = base × 3)."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import (MediumItem, MEDIUM_DOWNGRADE_AGE,
+                                      CATEGORY_DEMOTE_AGE)
+            assert CATEGORY_DEMOTE_AGE["critical"] == MEDIUM_DOWNGRADE_AGE * 3
+            assert CATEGORY_DEMOTE_AGE["fact"] == MEDIUM_DOWNGRADE_AGE
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            age = MEDIUM_DOWNGRADE_AGE + 1                      # 31
+            st.extraction_count = age
+            st.medium.append(MediumItem(id="f", content="普通事实", count=6,
+                                        entry_extraction_index=0, category="fact"))
+            st.medium.append(MediumItem(id="c", content="用户过敏禁忌", count=6,
+                                        entry_extraction_index=0, category="critical"))
+            tm.ingest_candidates("u", [], [])
+            ids = {m.id for m in st.medium}
+            assert "f" not in ids, "fact demotes at age 31"
+            assert "c" in ids, "critical survives age 31 (3× window)"
+            assert any(s.id == "f" and s.category == "fact" for s in st.short), \
+                "demoted fact lands in SHORT keeping its category"
+            print_pass("④ category: critical demote age = 3× fact; demoted item keeps type")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_category_persistence_roundtrip(self):
+        """④③ save_user/load_user round-trip category + last_confirmed_ts."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory, ShortItem, MediumItem
+            tm = TieredMemory(base_dir=tmp)
+            st = tm._get_state("u")
+            st.short.append(ShortItem(id="s1", content="短期禁忌", count=2,
+                                      category="critical", last_confirmed_ts=12345.0))
+            st.medium.append(MediumItem(id="m1", content="中期偏好", count=6,
+                                        entry_extraction_index=1,
+                                        category="preference", last_confirmed_ts=67890.0))
+            tm.save_user("u")
+            tm2 = TieredMemory(base_dir=tmp)
+            tm2.load_all()
+            st2 = tm2._get_state("u")
+            assert st2.short[0].category == "critical"
+            assert st2.short[0].last_confirmed_ts == 12345.0
+            assert st2.medium[0].category == "preference"
+            assert st2.medium[0].last_confirmed_ts == 67890.0
+            print_pass("④③ persistence: category + last_confirmed_ts round-trip")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_load_v1_file_defaults(self):
+        """④ a legacy schema-v1 tier file (no category/ts keys) loads with
+        category=fact and last_confirmed_ts=0.0 — no crash, no label."""
+        tmp = tempfile.mkdtemp()
+        try:
+            import json as _json
+            from agent.memory import TieredMemory
+            tiers = os.path.join(tmp, "tiers")
+            os.makedirs(tiers, exist_ok=True)
+            v1 = {
+                "user_id": "u", "extraction_count": 5, "schema_version": 1,
+                "short": [{"id": "s1", "content": "老短期事实", "count": 2}],
+                "medium": [{"id": "m1", "content": "老中期事实", "count": 6,
+                            "entry_extraction_index": 1}],
+                "long": [],
+            }
+            with open(os.path.join(tiers, "u.json"), "w", encoding="utf-8") as f:
+                _json.dump(v1, f, ensure_ascii=False)
+            tm = TieredMemory(base_dir=tmp)
+            tm.load_all()
+            st = tm._get_state("u")
+            assert st.short[0].category == "fact" and st.short[0].last_confirmed_ts == 0.0
+            assert st.medium[0].category == "fact" and st.medium[0].last_confirmed_ts == 0.0
+            # ts=0 → never labelled
+            assert tm._staleness_suffix(st.medium[0], now=None) == ""
+            print_pass("④ load: legacy v1 file defaults to fact/ts=0 (unlabelled)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_get_judge_list_includes_category(self):
+        """④ get_judge_list surfaces category so the judge can respect typing."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import MediumItem, ShortItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m1", content="中期禁忌", count=6,
+                                        entry_extraction_index=0, category="critical"))
+            st.short.append(ShortItem(id="s1", content="短期经历", count=1,
+                                      category="event"))
+            rows = {r["id"]: r for r in tm.get_judge_list("u")}
+            assert rows["m1"]["category"] == "critical" and rows["m1"]["tier"] == "medium"
+            assert rows["s1"]["category"] == "event" and rows["s1"]["tier"] == "short"
+            print_pass("④ get_judge_list: category surfaced per row")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── ③ staleness annotation「截至 X 月」— Memory-Optimization-Plan batch 2 ──
+
+    def test_staleness_label_stale_fact(self):
+        """③ a `fact` older than STALE_LABEL_AFTER_DAYS gets a （截至 X 月）label."""
+        tmp = tempfile.mkdtemp()
+        try:
+            import time as _time
+            from agent.memory import TieredMemory, MediumItem, STALE_LABEL_AFTER_DAYS
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            now = _time.time()
+            stale_ts = now - (STALE_LABEL_AFTER_DAYS + 5) * 86400.0
+            st.medium.append(MediumItem(id="m1", content="用户住在杭州", count=6,
+                                        entry_extraction_index=0, category="fact",
+                                        last_confirmed_ts=stale_ts))
+            block = tm.build_medium_injection("u")
+            month = _time.localtime(stale_ts).tm_mon
+            assert f"（截至 {month} 月）" in block, block
+            line = [ln for ln in block.splitlines() if "住在杭州" in ln][0]
+            assert line.endswith(f"（截至 {month} 月）"), line
+            print_pass("③ label: stale fact renders （截至 X 月） in injection")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_staleness_label_fresh_fact_unlabelled(self):
+        """③ a fact confirmed within the window carries NO label."""
+        tmp = tempfile.mkdtemp()
+        try:
+            import time as _time
+            from agent.memory import TieredMemory, MediumItem, STALE_LABEL_AFTER_DAYS
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            fresh_ts = _time.time() - (STALE_LABEL_AFTER_DAYS - 5) * 86400.0
+            st.medium.append(MediumItem(id="m1", content="用户住在杭州", count=6,
+                                        entry_extraction_index=0, category="fact",
+                                        last_confirmed_ts=fresh_ts))
+            block = tm.build_medium_injection("u")
+            assert "截至" not in block, block
+            print_pass("③ label: fresh fact (< window) is unlabelled")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_staleness_label_scoped_to_fact_only(self):
+        """③ critical/preference/event NEVER get the label even when stale —
+        hedging an allergy is dangerous; preference has ⑩; event is past-tense."""
+        tmp = tempfile.mkdtemp()
+        try:
+            import time as _time
+            from agent.memory import (TieredMemory, MediumItem,
+                                      STALE_LABEL_AFTER_DAYS, STALE_LABEL_CATEGORIES)
+            assert STALE_LABEL_CATEGORIES == ("fact",)
+            tm = self._tm(tmp)
+            now = _time.time()
+            stale = now - (STALE_LABEL_AFTER_DAYS + 400) * 86400.0   # >1y stale
+            for i, cat in enumerate(("critical", "preference", "event")):
+                item = MediumItem(id=f"m{i}", content=f"{cat}条目", count=6,
+                                  entry_extraction_index=0, category=cat,
+                                  last_confirmed_ts=stale)
+                assert tm._staleness_suffix(item, now=now) == "", (cat, "must stay unlabelled")
+            fact = MediumItem(id="mf", content="fact条目", count=6,
+                              entry_extraction_index=0, category="fact",
+                              last_confirmed_ts=stale)
+            assert tm._staleness_suffix(fact, now=now) != "", "stale fact IS labelled"
+            print_pass("③ label: scoped to category=fact only (critical/pref/event exempt)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_staleness_label_legacy_ts0_unlabelled(self):
+        """③ last_confirmed_ts == 0.0 (legacy/unknown) → no label regardless of age."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory, MediumItem
+            tm = self._tm(tmp)
+            item = MediumItem(id="m1", content="老事实", count=6,
+                              entry_extraction_index=0, category="fact",
+                              last_confirmed_ts=0.0)
+            assert tm._staleness_suffix(item) == ""
+            print_pass("③ label: ts=0 (unknown age) never labelled")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_staleness_label_cross_year_format(self):
+        """③ a confirmation from a PRIOR year includes the year: （截至 YYYY 年 X 月）;
+        same-year omits it."""
+        tmp = tempfile.mkdtemp()
+        try:
+            import time as _time
+            from agent.memory import TieredMemory, MediumItem
+            tm = self._tm(tmp)
+            now = _time.mktime(_time.localtime())               # ~today
+            cur_year = _time.localtime(now).tm_year
+            # same-year stale: 60 days ago (still this year unless run in Jan/Feb)
+            same = MediumItem(id="a", content="x", count=6, entry_extraction_index=0,
+                              category="fact", last_confirmed_ts=now - 60 * 86400.0)
+            same_lbl = tm._staleness_suffix(same, now=now)
+            same_year = _time.localtime(now - 60 * 86400.0).tm_year
+            if same_year == cur_year:
+                assert "年" not in same_lbl and "月" in same_lbl, same_lbl
+            # prior-year stale: 400 days ago → must include the year
+            prior_ts = now - 400 * 86400.0
+            prior = MediumItem(id="b", content="y", count=6, entry_extraction_index=0,
+                               category="fact", last_confirmed_ts=prior_ts)
+            lbl = tm._staleness_suffix(prior, now=now)
+            py = _time.localtime(prior_ts).tm_year
+            pm = _time.localtime(prior_ts).tm_mon
+            assert lbl == f"（截至 {py} 年 {pm} 月）", lbl
+            assert py != cur_year, "400d ago must be a different year for this assertion"
+            print_pass("③ label: cross-year format （截至 YYYY 年 X 月）, same-year omits year")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2782,6 +3706,693 @@ class TestMemoryMigration:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── P0: Bond system / dual-plane routing tests ────────────────────
+
+class TestBondManager:
+    """Test agent/bond.py — EXP/level/mood settlement + rendering."""
+
+    def run(self):
+        print_header("16. Bond Manager Tests (P0)")
+        self.test_level_curve()
+        self.test_first_turn_settlement()
+        self.test_daily_first_only_once()
+        self.test_long_session_bonus_once()
+        self.test_mood_decay_to_baseline()
+        self.test_daily_soft_cap_diminishing()
+        self.test_format_status_and_prompt()
+        self.test_reset()
+        self.test_persistence_reload()
+
+    def _mgr(self, tmp):
+        from agent.bond import BondManager
+        return BondManager(
+            base_dir=os.path.join(tmp, "bonds"),
+            config_path=os.path.join(tmp, "no_such_config.json"),
+        )
+
+    def test_level_curve(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            assert m.level_for_exp(0) == 1
+            assert m.level_for_exp(99) == 1
+            assert m.level_for_exp(100) == 2
+            assert m.level_for_exp(7999) == 9
+            assert m.level_for_exp(8000) == 10
+            assert m.title_for(1) == "陌生"
+            assert m.title_for(10) == "灵魂伴侣"
+            nxt = m.next_threshold(1)
+            assert nxt["level"] == 2 and nxt["exp"] == 100
+            assert m.next_threshold(10) is None
+            assert m.current_threshold(2) == 100
+            print_pass("level curve / thresholds / titles")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_first_turn_settlement(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            r = m.settle_turn("u1", "rubi")
+            assert r["is_first_today"] is True
+            # first_chat(20) + mood-weighted per-msg(~3)
+            assert r["exp_gained"] >= 21, r
+            assert r["exp"] == r["exp_gained"]
+            assert r["level"] == 1
+            print_pass("first-turn settlement grants daily-first + per-msg EXP")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_daily_first_only_once(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            r1 = m.settle_turn("u1", "rubi")
+            r2 = m.settle_turn("u1", "rubi")
+            assert r1["is_first_today"] is True
+            assert r2["is_first_today"] is False
+            # second turn only earns per-msg (much less than first-turn bundle)
+            assert r2["exp_gained"] < r1["exp_gained"]
+            print_pass("daily-first EXP granted only once per day")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_long_session_bonus_once(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            m.settle_turn("u1", "rubi", turn_count=0)   # consume daily-first
+            r2 = m.settle_turn("u1", "rubi", turn_count=10)  # long-session bonus
+            r3 = m.settle_turn("u1", "rubi", turn_count=10)  # already earned
+            assert r2["exp_gained"] >= 30, r2
+            assert r3["exp_gained"] < 10, r3
+            print_pass("long-session bonus fires once per day")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_mood_decay_to_baseline(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            st = m.get_state("u1", "rubi")
+            now = time.time()
+            st["mood"] = 100.0
+            st["mood_updated"] = now - 3600  # 1h ago → decay 5
+            assert abs(m._decayed_mood(st, now) - 95.0) < 0.1
+            st["mood_updated"] = now - 48 * 3600  # clamps to baseline 60
+            assert abs(m._decayed_mood(st, now) - 60.0) < 0.01
+            st["mood"] = 0.0
+            st["mood_updated"] = now - 48 * 3600  # rises back to baseline
+            assert abs(m._decayed_mood(st, now) - 60.0) < 0.01
+            assert m._mood_label(90) == "极佳"
+            assert m._mood_label(20) == "低落"
+            print_pass("mood decays toward baseline both directions + labels")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_daily_soft_cap_diminishing(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            from datetime import datetime
+            m = self._mgr(tmp)
+            today = datetime.now().strftime("%Y-%m-%d")
+            # at soft cap → halved
+            st = m.get_state("u1", "rubi")
+            m._roll_daily(st, today)
+            st["daily"]["first_done"] = True
+            st["daily"]["chat_exp"] = 150
+            st["mood"] = 60.0
+            st["mood_updated"] = time.time()
+            r_cap = m.settle_turn("u1", "rubi")
+            # beyond 2× cap → quartered
+            st["daily"]["chat_exp"] = 300
+            st["mood"] = 60.0
+            st["mood_updated"] = time.time()
+            r_2cap = m.settle_turn("u1", "rubi")
+            assert r_cap["exp_gained"] <= 2, r_cap
+            assert r_2cap["exp_gained"] < r_cap["exp_gained"], (r_cap, r_2cap)
+            print_pass("daily soft-cap diminishing returns (halve → quarter)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_format_status_and_prompt(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            m.settle_turn("u1", "rubi")
+            status = m.format_status("u1", "rubi", display_name="露比")
+            assert "羁绊" in status and "露比" in status and "Lv" in status
+            prompt = m.build_prompt_context("u1", "rubi", char_short_name="露比")
+            assert "羁绊状态" in prompt
+            # unknown character (create=False) → first-meet copy
+            fresh = m.build_prompt_context("nobody", "nochar")
+            assert "刚刚开始" in fresh
+            print_pass("format_status + build_prompt_context rendering")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_reset(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            m.settle_turn("u1", "rubi")
+            assert m.get_state("u1", "rubi", create=False) is not None
+            m.reset("u1", "rubi")
+            assert m.get_state("u1", "rubi", create=False) is None
+            print_pass("reset clears one character's bond")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_persistence_reload(self):
+        tmp = tempfile.mkdtemp(prefix="bond_")
+        try:
+            m = self._mgr(tmp)
+            m.settle_turn("u1", "rubi")
+            exp1 = m.get_state("u1", "rubi")["exp"]
+            # A fresh manager (cold cache) must read the same value from disk
+            m2 = self._mgr(tmp)
+            exp2 = m2.get_state("u1", "rubi", create=False)["exp"]
+            assert exp1 == exp2 and exp1 > 0
+            print_pass("bond state persists to disk + reloads on cold cache")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestPersonalityMeta:
+    """Test personality card mode/task_voice metadata parsing."""
+
+    def run(self):
+        print_header("17. Personality Mode Metadata Tests (P0)")
+        self.test_mode_and_voice()
+
+    def test_mode_and_voice(self):
+        from agent.personality import PersonalityManager
+        tmp = tempfile.mkdtemp(prefix="pmeta_")
+        try:
+            pdir = os.path.join(tmp, "personalities")
+            os.makedirs(pdir, exist_ok=True)
+            cards = {
+                "assistant": "# 助手 Roxy\n\n没有元数据的普通卡片。",
+                "rubi": "# 露比 (Rubi)\n\n<!-- mode: split | task_voice: character -->\n\n角色内容。",
+                "tpl": "# 模板角色\n\n<!-- mode: split | task_voice: template -->\n\n内容。",
+            }
+            for key, body in cards.items():
+                with open(os.path.join(pdir, f"{key}.md"), "w", encoding="utf-8") as f:
+                    f.write(body)
+            pm = PersonalityManager(personalities_dir=pdir)
+            # defaults for a card without metadata
+            assert pm.get_mode("assistant") == "unified"
+            assert pm.get_task_voice("assistant") == "character"
+            # split + character voice
+            assert pm.get_mode("rubi") == "split"
+            assert pm.get_task_voice("rubi") == "character"
+            # split + template voice
+            assert pm.get_mode("tpl") == "split"
+            assert pm.get_task_voice("tpl") == "template"
+            print_pass("mode/task_voice parsed from card metadata (+ defaults)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestModelRouterClassify:
+    """Test ModelRouter.classify — dual-axis (plane + complexity) parsing."""
+
+    def run(self):
+        print_header("18. ModelRouter.classify Tests (P0)")
+        self.test_parsing_and_fallbacks()
+
+    def _router_with(self, response=None, raises=False):
+        from lib.model_router import ModelRouter
+        router = ModelRouter(config_path="/nonexistent/models.json")
+        client = AsyncMock()
+        if raises:
+            client.chat_completion = AsyncMock(side_effect=RuntimeError("boom"))
+        else:
+            client.chat_completion = AsyncMock(return_value=response)
+        router.get_client = MagicMock(return_value=client)
+        return router
+
+    def test_parsing_and_fallbacks(self):
+        # canonical two-axis
+        r = self._router_with("plane=social complexity=simple")
+        assert asyncio.run(r.classify("你好")) == {"plane": "social", "complexity": "simple"}
+        r = self._router_with("plane=task complexity=complex")
+        assert asyncio.run(r.classify("搜一下")) == {"plane": "task", "complexity": "complex"}
+        # colon + comma separators
+        r = self._router_with("plane: task, complexity: simple")
+        out = asyncio.run(r.classify("x"))
+        assert out["plane"] == "task" and out["complexity"] == "simple"
+        # plane present but complexity missing → default complex
+        r = self._router_with("plane=social")
+        out = asyncio.run(r.classify("x"))
+        assert out == {"plane": "social", "complexity": "complex"}
+        # legacy single-axis: complex → task plane
+        r = self._router_with("complex")
+        assert asyncio.run(r.classify("x")) == {"plane": "task", "complexity": "complex"}
+        # legacy single-axis: "complexity: simple" must NOT match \bcomplex\b
+        r = self._router_with("complexity: simple")
+        out = asyncio.run(r.classify("x"))
+        assert out == {"plane": "social", "complexity": "simple"}, out
+        # unparsable → safe fallback (task/complex)
+        r = self._router_with("hello world")
+        assert asyncio.run(r.classify("x")) == {"plane": "task", "complexity": "complex"}
+        # exception → safe fallback
+        r = self._router_with(raises=True)
+        assert asyncio.run(r.classify("x")) == {"plane": "task", "complexity": "complex"}
+        print_pass("classify parses plane+complexity, legacy & error fallbacks")
+
+
+class TestDelegation:
+    """Test agent/delegation.py — dual-plane task delegation + revoicing."""
+
+    def run(self):
+        print_header("19. Delegation / Dual-Plane Tests (P0)")
+        self.test_guards()
+        self.test_run_delegated_isolation()
+        self.test_revoice()
+        self.test_repatch()
+
+    def test_guards(self):
+        from agent.delegation import run_delegated_task
+        from agent.context import _delegate_depth
+        # missing user
+        r = asyncio.run(run_delegated_task(
+            "x", agent=None, model_router=None, perm_manager=None, user_id=""))
+        assert r.startswith("[Error]")
+        # empty task
+        r = asyncio.run(run_delegated_task(
+            "   ", agent=None, model_router=None, perm_manager=None, user_id="u1"))
+        assert "任务描述为空" in r
+        # nested delegate rejected
+        tok = _delegate_depth.set(1)
+        try:
+            r = asyncio.run(run_delegated_task(
+                "x", agent=None, model_router=None, perm_manager=None, user_id="u1"))
+            assert "嵌套" in r
+        finally:
+            _delegate_depth.reset(tok)
+        print_pass("delegation guards: no user / empty task / nested")
+
+    def test_run_delegated_isolation(self):
+        from agent.delegation import run_delegated_task
+        from agent.context import (
+            _current_personality, _current_bond_context, _delegate_depth,
+        )
+        captured = {}
+
+        class _MockAgent:
+            async def run(self, message, user_id, **kwargs):
+                captured["message"] = message
+                captured["kwargs"] = kwargs
+                captured["personality"] = _current_personality.get()
+                captured["bond"] = _current_bond_context.get()
+                captured["depth"] = _delegate_depth.get()
+                return "任务完成结果"
+
+        class _Role:
+            value = "vip"
+
+        class _MockPerm:
+            def get_role(self, uid):
+                return _Role()
+            def get_allowed_tools(self, role):
+                return {"web_search", "execute_code", "delegate_task"}
+
+        class _MockRouter:
+            flash_client = object()
+            reasoning_client = object()
+            async def classify_complexity(self, task):
+                return "simple"
+
+        p_tok = _current_personality.set("rubi")
+        b_tok = _current_bond_context.set("BONDCTX")
+        try:
+            r = asyncio.run(run_delegated_task(
+                "  do the thing  ",
+                agent=_MockAgent(), model_router=_MockRouter(),
+                perm_manager=_MockPerm(), user_id="u1",
+                disabled_tools={"execute_code"},
+            ))
+            assert r == "任务完成结果"
+            assert captured["message"] == "do the thing"  # stripped
+            kw = captured["kwargs"]
+            assert kw["persist"] is False
+            assert kw["session_type"] == "temporary"
+            assert "delegate_task" not in kw["allowed_tools"]
+            assert "execute_code" not in kw["allowed_tools"]
+            assert "web_search" in kw["allowed_tools"]
+            # task plane runs as neutral assistant, no bond, depth guard set
+            assert captured["personality"] == "assistant"
+            assert captured["bond"] == ""
+            assert captured["depth"] == 1
+            # contextvars restored after the delegated run
+            assert _current_personality.get() == "rubi"
+            assert _current_bond_context.get() == "BONDCTX"
+            assert _delegate_depth.get() == 0
+            print_pass("run_delegated_task isolation + contextvar restore")
+        finally:
+            _current_personality.reset(p_tok)
+            _current_bond_context.reset(b_tok)
+
+    def test_revoice(self):
+        from agent.delegation import revoice_task_result, template_opening
+
+        class _RVClient:
+            def __init__(self, resp):
+                self.resp = resp
+            async def chat_completion(self, message, history=None,
+                                      timeout_set=180.0, purpose="chat"):
+                return self.resp
+
+        # LLM success → opening + verbatim body
+        r = asyncio.run(revoice_task_result(
+            client=_RVClient("锵锵，结果来啦！"), persona_content="PERSONA",
+            short_name="露比", user_request="查天气", response="今天晴天",
+            use_llm=True))
+        assert r == "锵锵，结果来啦！\n\n今天晴天", r
+        # LLM error-prefix → template fallback, body preserved
+        r2 = asyncio.run(revoice_task_result(
+            client=_RVClient("思考超时了"), persona_content="P",
+            short_name="露比", user_request="q", response="BODY", use_llm=True))
+        assert r2.endswith("\n\nBODY")
+        assert "思考超时" not in r2.split("\n\n")[0]
+        # LLM output too long → template fallback
+        r3 = asyncio.run(revoice_task_result(
+            client=_RVClient("x" * 200), persona_content="P",
+            short_name="露比", user_request="q", response="B", use_llm=True))
+        assert r3.endswith("\n\nB") and len(r3.split("\n\n")[0]) <= 120
+        # use_llm=False → template (client ignored)
+        r4 = asyncio.run(revoice_task_result(
+            client=_RVClient("should not be used"), persona_content="P",
+            short_name="露比", user_request="q", response="B", use_llm=False))
+        assert r4.endswith("\n\nB")
+        # empty response → just the opening
+        r5 = asyncio.run(revoice_task_result(
+            client=None, persona_content="", short_name="露比",
+            user_request="q", response="", use_llm=False))
+        assert "露比" in r5
+        assert "露比" in template_opening("露比")
+        print_pass("revoice: LLM opening, template fallbacks, verbatim body")
+
+    def test_repatch(self):
+        from agent.delegation import repatch_last_assistant
+
+        class _Sess:
+            def __init__(self, ctx):
+                self.context = ctx
+
+        class _SM:
+            def __init__(self, sess):
+                self.sess = sess
+                self.updated = False
+            def get(self, uid):
+                return self.sess
+            def update(self, uid, sess):
+                self.updated = True
+
+        # verbatim match → replaced
+        sess = _Sess([{"role": "user", "content": "hi"},
+                      {"role": "assistant", "content": "RAW"}])
+        sm = _SM(sess)
+        assert repatch_last_assistant(sm, "u1", "RAW", "开场白\n\nRAW") is True
+        assert sess.context[-1]["content"] == "开场白\n\nRAW"
+        assert sm.updated is True
+        # non-match (already folded) → untouched
+        sess2 = _Sess([{"role": "assistant", "content": "COMPRESSED"}])
+        sm2 = _SM(sess2)
+        assert repatch_last_assistant(sm2, "u1", "RAW", "NEW") is False
+        assert sess2.context[-1]["content"] == "COMPRESSED"
+        # no session
+        class _SMNone:
+            def get(self, uid):
+                return None
+        assert repatch_last_assistant(_SMNone(), "u1", "a", "b") is False
+        print_pass("repatch_last_assistant verbatim-guard")
+
+
+class TestAgentPersist:
+    """Test Agent.run(persist=False) isolated execution (delegate_task plane)."""
+
+    def run(self):
+        print_header("20. Agent persist=False Isolation Tests (P0)")
+        asyncio.run(self.test_persist_flag())
+
+    async def test_persist_flag(self):
+        from agent.tool_registry import ToolRegistry
+        from agent.agent import Agent
+
+        mock_client = MockDeepSeekClient()
+        mock_client.plain_response = "隔离结果"
+        agent = Agent(
+            deepseek_client=mock_client,
+            tool_registry=ToolRegistry(),
+            config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+        )
+        # persist=False → detached session, nothing registered with the manager
+        resp = await agent.run("task", "iso_user", persist=False)
+        assert resp == "隔离结果"
+        assert agent.sessions.get("iso_user") is None
+        # persist=True (default) → session written back
+        resp2 = await agent.run("hello", "persist_user")
+        assert resp2 == "隔离结果"
+        sess = agent.sessions.get("persist_user")
+        assert sess is not None and len(sess.context) >= 2
+        print_pass("persist=False isolates session; persist=True writes back")
+
+
+class TestCharacterRegistry:
+    """Test agent/character_registry.py — UGC overlay on PersonalityManager."""
+
+    def run(self):
+        print_header("21. CharacterRegistry Tests (P1)")
+        self._setup()
+        try:
+            self.test_discover_builtin_only()
+            self.test_crud_and_scope()
+            self.test_group_and_default()
+            self.test_purge_references()
+        finally:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _setup(self):
+        from agent.character_registry import CharacterRegistry
+        self.tmp = tempfile.mkdtemp(prefix="creg_")
+        pdir = os.path.join(self.tmp, "personalities")
+        os.makedirs(pdir, exist_ok=True)
+        with open(os.path.join(pdir, "assistant.md"), "w", encoding="utf-8") as f:
+            f.write("# 助手 Roxy\n\nbase")
+        with open(os.path.join(pdir, "rubi.md"), "w", encoding="utf-8") as f:
+            f.write("# 露比 (Rubi)\n\n<!-- mode: split | task_voice: character -->\n\nx")
+        self.reg = CharacterRegistry(
+            personalities_dir=pdir,
+            characters_dir=os.path.join(self.tmp, "characters"),
+        )
+
+    def _mk(self, char_id, name, author):
+        card = f"# {name}\n<!-- mode: split | task_voice: character -->\n\n内容"
+        meta = {"char_id": char_id, "display_name": name, "author": author,
+                "created_at": 0, "visibility": "private", "voice_id": None, "source": "ugc"}
+        self.reg.register_character(char_id, card, meta)
+
+    def test_discover_builtin_only(self):
+        # _discover() must never leak UGC (protects get_default fallback)
+        self._mk("星野爱_abc123", "星野爱", "u1")
+        assert set(self.reg._discover()) == {"assistant", "rubi"}
+        assert self.reg.is_ugc("星野爱_abc123")
+        assert self.reg.get_mode("星野爱_abc123") == "split"
+        assert self.reg.get_display_name("星野爱_abc123") == "星野爱"
+        print_pass("_discover() builtin-only; UGC load/mode/display via registry")
+
+    def test_crud_and_scope(self):
+        self._mk("c_aaa111", "爱丽丝", "u1")
+        # owner-scoped resolve: own vs other
+        assert self.reg.resolve_name("爱丽丝", user_id="u1") == "c_aaa111"
+        assert self.reg.resolve_name("爱丽丝", user_id="u2") is None
+        # exact char_id (owner only)
+        assert self.reg.resolve_name("c_aaa111", user_id="u1") == "c_aaa111"
+        assert self.reg.resolve_name("c_aaa111", user_id="u2") is None
+        # builtin still resolves
+        assert self.reg.resolve_name("rubi", user_id="u1") == "rubi"
+        # list: builtins + own UGC only
+        keys_u1 = {e["key"] for e in self.reg.list_personalities(user_id="u1")}
+        keys_u2 = {e["key"] for e in self.reg.list_personalities(user_id="u2")}
+        assert "c_aaa111" in keys_u1 and "c_aaa111" not in keys_u2
+        assert {"assistant", "rubi"} <= keys_u2
+        # set_user_personality is owner-scoped
+        self.reg.set_user_personality("u1", "爱丽丝")
+        assert self.reg.resolve_effective_personality("u1") == "c_aaa111"
+        # u2 cannot resolve u1's char → falls back to default
+        try:
+            self.reg.set_user_personality("u2", "爱丽丝")
+            assert False, "u2 should not resolve u1's UGC"
+        except ValueError:
+            pass
+        # delete
+        assert self.reg.delete("c_aaa111") is True
+        assert self.reg.is_ugc("c_aaa111") is False
+        assert self.reg.delete("c_aaa111") is False
+        print_pass("UGC CRUD + owner-scoped resolve/list/set (privacy)")
+
+    def test_group_and_default(self):
+        self._mk("c_bbb222", "群角色", "admin1")
+        # owner can bind their UGC to a group
+        self.reg.set_group_personality("g1", "群角色", owner_id="admin1")
+        assert self.reg.get_group_personality("g1") == "c_bbb222"
+        # another user in that group resolves it (group layer = any existing key)
+        assert self.reg.resolve_effective_personality("u9", "g1") == "c_bbb222"
+        # non-owner cannot bind someone else's UGC
+        try:
+            self.reg.set_group_personality("g2", "群角色", owner_id="other")
+            assert False
+        except ValueError:
+            pass
+        # get_default unaffected by UGC
+        assert self.reg.get_default() in {"assistant", "rubi"}
+        print_pass("group binding owner-scoped at set; get_default builtin-only")
+
+    def test_purge_references(self):
+        self._mk("c_ccc333", "待删", "u1")
+        self.reg.set_user_personality("u1", "待删")
+        self.reg.set_group_personality("g5", "待删", owner_id="u1")
+        assert self.reg.resolve_effective_personality("u1") == "c_ccc333"
+        removed = self.reg.purge_references("c_ccc333")
+        assert removed == 2, removed
+        # references gone → fall back to default / unset
+        assert self.reg.resolve_effective_personality("u1") != "c_ccc333"
+        assert self.reg.get_group_personality("g5") is None
+        self.reg.delete("c_ccc333")
+        print_pass("purge_references clears user settings + group bindings")
+
+
+class TestCreateCharacterTool:
+    """Test tools/creation_tools.py — create_character validate/review/write."""
+
+    def run(self):
+        print_header("22. create_character Tool Tests (P1)")
+        asyncio.run(self._run_async())
+
+    def _reg(self):
+        from agent.character_registry import CharacterRegistry
+        tmp = tempfile.mkdtemp(prefix="ccreate_")
+        self._tmps.append(tmp)
+        pdir = os.path.join(tmp, "personalities")
+        os.makedirs(pdir, exist_ok=True)
+        with open(os.path.join(pdir, "assistant.md"), "w", encoding="utf-8") as f:
+            f.write("# 助手 Roxy\nbase")
+        return CharacterRegistry(
+            personalities_dir=pdir, characters_dir=os.path.join(tmp, "characters")
+        )
+
+    def _perm(self, max_chars=1):
+        from agent.permissions import UserRole
+        class P:
+            def get_role(self, u): return UserRole.REGULAR
+            def get_max_characters(self, r): return max_chars
+        return P()
+
+    def _client(self, resp):
+        class C:
+            async def chat_completion(self, message, history, timeout_set, purpose):
+                return resp
+        return C()
+
+    async def _run_async(self):
+        from tools.creation_tools import create_character, build_card, validate_fields
+        self._tmps = []
+        try:
+            good = dict(name="星野爱", personality="温柔", speech_style="轻声",
+                        appearance="粉发蓝瞳", gift_loved=["花"])
+            # validation: missing required
+            assert validate_fields(dict(name="A", personality="p")) is not None
+            assert validate_fields(good) is None
+            # card structure carries required metadata + delegate_task wording
+            card = build_card(good)
+            assert card.startswith("# 星野爱")
+            assert "mode: split | task_voice: character" in card
+            assert "delegate_task" in card
+            assert "Appearance Anchor" in card and "Gift Preferences" in card
+
+            # success (no review client → fail-open path)
+            reg = self._reg()
+            res = await create_character(user_id="u1", fields=good, registry=reg,
+                                         perm_manager=self._perm(max_chars=3), review_client=None)
+            assert res.startswith("✅"), res
+            assert len(reg._ugc_ids()) == 1
+
+            # quota block (reg already holds 1 char from the success above)
+            res = await create_character(user_id="u1", fields=dict(good, name="第二个"),
+                                         registry=reg, perm_manager=self._perm(max_chars=1),
+                                         review_client=None)
+            assert res.startswith("[Error]"), res
+
+            # name collision
+            reg2 = self._reg()
+            await create_character(user_id="u1", fields=good, registry=reg2,
+                                   perm_manager=self._perm(max_chars=3), review_client=None)
+            res = await create_character(user_id="u1", fields=good, registry=reg2,
+                                         perm_manager=self._perm(max_chars=3), review_client=None)
+            assert res.startswith("[Error]") and "已拥有" in res
+
+            # review REJECT → fail-closed (nothing written)
+            reg3 = self._reg()
+            res = await create_character(user_id="u1", fields=dict(good, name="坏"),
+                                         registry=reg3, perm_manager=self._perm(max_chars=3),
+                                         review_client=self._client("REJECT: 违规"))
+            assert res.startswith("[Error]") and len(reg3._ugc_ids()) == 0
+
+            # review infra error → fail-open (written)
+            reg4 = self._reg()
+            res = await create_character(user_id="u1", fields=dict(good, name="正常"),
+                                         registry=reg4, perm_manager=self._perm(max_chars=3),
+                                         review_client=self._client("调用DeepSeek API时出错: x"))
+            assert res.startswith("✅") and len(reg4._ugc_ids()) == 1
+
+            print_pass("validate/card/quota/collision/review reject+fail-open/success")
+        finally:
+            for t in self._tmps:
+                shutil.rmtree(t, ignore_errors=True)
+
+
+class TestCharCreationInterview:
+    """Test agent.py L4 interview injection for char_creation sessions."""
+
+    def run(self):
+        print_header("23. Char-Creation Interview Injection (P1)")
+        asyncio.run(self._run_async())
+
+    async def _run_async(self):
+        from agent.tool_registry import ToolRegistry
+        from agent.agent import Agent
+        from agent.session import Session
+        from agent.special_session import SpecialSession
+
+        agent = Agent(
+            deepseek_client=MockDeepSeekClient(),
+            tool_registry=ToolRegistry(),
+            config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+        )
+        sess = Session(user_id="u1")
+
+        def _tail(sp):
+            msgs = agent._build_messages(sess, "你好", sp)
+            # last system message = L4 volatile tail
+            sys_msgs = [m for m in msgs if m["role"] == "system"]
+            return sys_msgs[-1]["content"]
+
+        # creation session → interview instructions present
+        creation = SpecialSession(session_id="c1", user_id="u1", name="角色创作",
+                                  metadata={"kind": "char_creation"})
+        tail = _tail(creation)
+        assert "角色创作访谈" in tail and "create_character" in tail
+
+        # ordinary special session → marker present, interview absent
+        normal = SpecialSession(session_id="s1", user_id="u1", name="普通会话")
+        tail2 = _tail(normal)
+        assert "特殊会话模式" in tail2 and "角色创作访谈" not in tail2
+
+        print_pass("L4 interview injected only for char_creation metadata")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -2805,6 +4416,14 @@ def main():
         ("Personality Manager", TestPersonality()),
         ("TokenLedger", TestTokenLedger()),
         ("Cache Stability (Phase 3/4)", TestCacheStability()),
+        ("Bond Manager (P0)", TestBondManager()),
+        ("Personality Mode Metadata (P0)", TestPersonalityMeta()),
+        ("ModelRouter.classify (P0)", TestModelRouterClassify()),
+        ("Delegation / Dual-Plane (P0)", TestDelegation()),
+        ("Agent persist=False (P0)", TestAgentPersist()),
+        ("CharacterRegistry (P1)", TestCharacterRegistry()),
+        ("create_character Tool (P1)", TestCreateCharacterTool()),
+        ("Char-Creation Interview (P1)", TestCharCreationInterview()),
     ]
 
     passed = 0

@@ -33,6 +33,10 @@ AGENT_EXIT=$?
 python test_workspace.py
 WS_EXIT=$?
 
+# L1 记忆引擎 benchmark（零依赖、确定性场景流；canary 失败如实记录但不算回归）
+python benchmarks/memory/bench_engine.py
+MEMBENCH_EXIT=$?
+
 # 离线测速管线测试（从仓库根目录运行）
 cd "$SCRIPT_DIR"
 python test/test_ag_skill_index.py
@@ -62,6 +66,7 @@ cd "$SCRIPT_DIR/QQBot"
 EXIT_CODE=0
 if [ $AGENT_EXIT -ne 0 ]; then EXIT_CODE=$AGENT_EXIT; fi
 if [ $WS_EXIT -ne 0 ]; then EXIT_CODE=$WS_EXIT; fi
+if [ $MEMBENCH_EXIT -ne 0 ]; then EXIT_CODE=$MEMBENCH_EXIT; fi
 if [ $L1_EXIT -ne 0 ]; then EXIT_CODE=$L1_EXIT; fi
 if [ $ENGINE_EXIT -ne 0 ]; then EXIT_CODE=$ENGINE_EXIT; fi
 if [ $PATH_EXIT -ne 0 ]; then EXIT_CODE=$PATH_EXIT; fi

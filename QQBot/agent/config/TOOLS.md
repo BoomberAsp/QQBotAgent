@@ -218,7 +218,7 @@ Anti-bot handling is a two-tier ladder:
 
 ## Tool: execute_code
 
-**Description**: Execute Python code in a sandboxed environment and return the output. Supports basic Python operations, calculations, and scripts.
+**Description**: Execute Python code in a sandboxed environment and return the output. Supports basic Python operations, calculations, and scripts. Output is capped at 16KB — when dealing with large data, aggregate/filter inside the code and print conclusions, not raw dumps.
 
 **When to use**: When the user asks you to write and run code, perform calculations that require execution, or test a code snippet.
 
@@ -245,7 +245,7 @@ Anti-bot handling is a two-tier ladder:
 
 ## Tool: shell_exec
 
-**Description**: Execute read-only shell commands in the server workspace. Supports pipes (`|`) for chaining. Every command is validated against a whitelist before execution. 40+ commands available.
+**Description**: Execute read-only shell commands in the server workspace. Supports pipes (`|`) for chaining. Every command is validated against a whitelist before execution. 40+ commands available. Output is capped at 16KB (stderr 8KB) — use `head` / `tail` / `grep` / `wc` to narrow results instead of dumping whole files.
 
 **When to use**: When you need quick system info (disk, memory), file metadata, text processing via shell pipes, directory exploration, or git repo inspection. Not for tasks that Python can handle more clearly.
 
@@ -664,7 +664,7 @@ Anti-bot handling is a two-tier ladder:
 
 ## Tool: read_file
 
-**Description**: Read and analyze files that users upload in QQ messages. Supports text files (code, logs, configs, etc. — returns full content), PDF files (returns extracted text), image files (returns metadata + AI analysis if multimodal LLM configured), and audio files (returns metadata + AI transcription/emotion/context analysis if audio model configured).
+**Description**: Read and analyze files that users upload in QQ messages. Supports text files (code, logs, configs, etc. — returns content; large files are segmented via `offset`), PDF files (returns extracted text), image files (returns metadata + AI analysis if multimodal LLM configured), and audio files (returns metadata + AI transcription/emotion/context analysis if audio model configured).
 
 **When to use**: When a user has uploaded a file, image, or voice message in the current message, and you need to read its contents. The file path is auto-generated and provided in the message context (e.g. `[用户上传了文件 report.pdf，已保存至: data/workspace/uploads/xxx-report.pdf]`).
 
@@ -676,6 +676,10 @@ Anti-bot handling is a two-tier ladder:
     "file_path": {
       "type": "string",
       "description": "The saved file path from the message context. Must be within the workspace."
+    },
+    "offset": {
+      "type": "integer",
+      "description": "(Optional) Character offset for segmented reading of large text files. When a read is truncated, the notice gives the offset to pass for the next segment. Text files only; ignored for PDF/image/audio."
     }
   },
   "required": ["file_path"]
@@ -683,7 +687,7 @@ Anti-bot handling is a two-tier ladder:
 ```
 
 **File type support**:
-- Text: `.txt`, `.md`, `.py`, `.json`, `.csv`, `.log`, `.yml`, `.yaml`, `.toml`, `.xml`, `.html`, `.css`, `.js`, `.ts`, `.sh`, `.bat`, `.c`, `.cpp`, `.h`, `.java`, `.go`, `.rs`, `.sql`, and more — returned as plain text (capped at 50KB)
+- Text: `.txt`, `.md`, `.py`, `.json`, `.csv`, `.log`, `.yml`, `.yaml`, `.toml`, `.xml`, `.html`, `.css`, `.js`, `.ts`, `.sh`, `.bat`, `.c`, `.cpp`, `.h`, `.java`, `.go`, `.rs`, `.sql`, and more — returned as plain text (capped at 50K chars per read; pass `offset` from the truncation notice to continue with the next segment)
 - PDF: `.pdf` — text extracted via PyPDF2 (capped at 8KB)
 - Image: `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp` — returns dimensions/format/size metadata, plus AI visual analysis (if multimodal LLM configured in `QQBot/config/models_settings.json` MULTIMODAL_MODEL section)
 - Audio: `.amr`, `.silk`, `.wav`, `.mp3`, `.ogg`, `.m4a`, `.aac`, `.flac`, `.opus` — returns duration/codec/sample-rate metadata, plus AI transcription + emotion + background analysis (if audio model configured in `QQBot/config/models_settings.json` AUDIO_MODEL section; falls back to MULTIMODAL_MODEL if that model supports audio)
@@ -769,6 +773,33 @@ Anti-bot handling is a two-tier ladder:
 ```
 
 **Note**: The output header carries the archive timestamp and age in hours. For time-sensitive topics (news, prices, weather), weigh the age before reusing archived content — when in doubt, run a fresh `search_web`. If the id is invalid, expired, or belongs to another user, the tool says so; fall back to re-searching.
+
+---
+
+## Tool: recall_memory
+
+**Description**: Retrieve the full content of the current user's high-confidence long-term memories (长期记忆) by id or keyword. The system prompt only carries a compact index of these memories (`[id] 标题（时间）`); this tool expands an index entry into its full summary plus the archived conversation snapshot. Strictly per-user — you can only recall the current user's own memories.
+
+**When to use**:
+- The long-term memory index in the system prompt lists an entry relevant to the conversation, and you need its details (full summary or original conversation snapshot)
+- The user references a past event/agreement with "还记得…吗 / 之前说过…" and the index shows a matching title
+- Prefer this over asking the user to repeat themselves when a plausible index entry exists
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "记忆 id（可只写前缀，如 L3f2a）或标题/摘要关键词"
+    }
+  },
+  "required": ["query"]
+}
+```
+
+**Note**: Returns up to 3 matches, newest first, each with a snapshot timestamp — weigh the age before treating the content as current (the user may have changed since). Long snapshots are truncated. If nothing matches, say so honestly and fall back to asking the user; never fabricate memory content.
 
 ---
 

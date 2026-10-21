@@ -79,7 +79,7 @@ def _format_size(size_bytes: int) -> str:
 
 # ── Main Tool ─────────────────────────────────────────────────────────
 
-async def read_file(file_path: str) -> str:
+async def read_file(file_path: str, offset: int = 0) -> str:
     """Read and analyze a file from the workspace.
 
     Supports:
@@ -89,6 +89,9 @@ async def read_file(file_path: str) -> str:
 
     Args:
         file_path: Path to the file (relative to workspace or absolute within workspace).
+        offset: Character offset for segmented reading of large TEXT files
+            (ignored for PDF/image/audio). A truncation notice tells the
+            offset to pass for the next segment.
 
     Returns:
         File contents, analysis, or error message.
@@ -103,7 +106,7 @@ async def read_file(file_path: str) -> str:
 
     # ── Text Files ──────────────────────────────────────────────────
     if ext in _TEXT_EXTENSIONS:
-        return _read_text_file(safe_path)
+        return _read_text_file(safe_path, offset=max(0, int(offset or 0)))
 
     # ── PDF Files ───────────────────────────────────────────────────
     if ext == ".pdf":
@@ -131,10 +134,17 @@ async def read_file(file_path: str) -> str:
 
 # ── Sub-readers ───────────────────────────────────────────────────────
 
-def _read_text_file(path: str, max_chars: int = 50000) -> str:
-    """Read a text file and return its contents."""
+def _read_text_file(path: str, max_chars: int = 50000, offset: int = 0) -> str:
+    """Read a text file and return its contents.
+
+    Args:
+        offset: character offset to start reading from (segmented reading
+            for files larger than ``max_chars``).
+    """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
+            if offset > 0:
+                f.seek(offset)
             content = f.read(max_chars + 1)
 
         truncated = len(content) > max_chars
@@ -160,8 +170,13 @@ def _read_text_file(path: str, max_chars: int = 50000) -> str:
             f"  大小: {_format_size(file_size)} ({file_size:,} bytes)\n"
             f"  行数: {lines}\n"
         )
+        if offset > 0:
+            header += f"  (分段读取：本段起始字符偏移 {offset:,})\n"
         if truncated:
-            header += f"  (内容已截断，仅显示前 {max_chars:,} 字符)\n"
+            header += (
+                f"  (内容已截断，本段显示第 {offset:,}–{offset + max_chars:,} 字符；"
+                f"继续读下一段请再次调用 read_file 并传 offset={offset + max_chars})\n"
+            )
         header += f"\n{'─' * 40}\n\n"
 
         return header + content

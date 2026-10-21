@@ -90,6 +90,38 @@ class PersonalityManager:
                     return line[2:].strip()
         return name
 
+    # ── Card metadata (Bond-System-Design.md §3.4) ────────────────
+    #
+    # 元数据以 HTML 注释形式内嵌在卡片任意位置，例如:
+    #     <!-- mode: split | task_voice: character -->
+    # 注释对 L2 注入的 LLM 语义无干扰；无元数据的卡片一律按默认值处理
+    # （mode=unified，即现有单平面行为，零迁移成本）。
+
+    _MODE_RE = re.compile(r"\bmode\s*[:=]\s*(unified|split)\b", re.IGNORECASE)
+    _TASK_VOICE_RE = re.compile(
+        r"\btask_voice\s*[:=]\s*(character|template)\b", re.IGNORECASE
+    )
+
+    def get_mode(self, name: str) -> str:
+        """Return the personality's operating mode: "unified" or "split".
+
+        split = 双平面角色（Bond-System-Design.md §3）：社交消息走角色面，
+        工具任务路由到任务面（Roxy）。unified = 现有单平面行为。
+        """
+        content = self.load(name) or ""
+        m = self._MODE_RE.search(content)
+        if m and m.group(1).lower() == "split":
+            return "split"
+        return "unified"
+
+    def get_task_voice(self, name: str) -> str:
+        """Return how task results are re-voiced: "character" (LLM) or "template"."""
+        content = self.load(name) or ""
+        m = self._TASK_VOICE_RE.search(content)
+        if m and m.group(1).lower() == "template":
+            return "template"
+        return "character"
+
     def get_short_name(self, name: str) -> str:
         """Extract a short name from the display name for use in messages.
 

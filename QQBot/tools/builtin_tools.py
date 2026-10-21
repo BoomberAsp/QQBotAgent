@@ -99,7 +99,10 @@ _ALLOWED_IMPORTS_HINT = (
     "decimal, fractions, hashlib, base64, textwrap, heapq, bisect, copy"
 )
 
-MAX_OUTPUT_SIZE = 102400  # 100 KB
+# Cache-Plan Phase6-B1: tool results are paid at full price on the next
+# in-run iteration; 100KB (~25-50K tokens) was far beyond what the model can
+# digest. 16KB matches the web_fetch cap (_MAX_FETCH_OUTPUT ~8K chars).
+MAX_OUTPUT_SIZE = 16384  # 16 KB
 MAX_RUNTIME = 60  # seconds
 
 
@@ -892,7 +895,7 @@ async def execute_code(code: str, timeout: int = 30) -> str:
     - Blocks dangerous patterns (shell, network, file write, dynamic exec)
     - Clean environment variables
     - Strict timeout (max 60s)
-    - Output size limit (100KB)
+    - Output size limit (16KB)
 
     Args:
         code: Python source code to execute.
@@ -965,16 +968,21 @@ async def execute_code(code: str, timeout: int = 30) -> str:
             cwd=work_dir,
             env=clean_env,
         )
+        _trunc_hint = (
+            f"\n... (输出过长，已截断至 {max_output // 1024}KB。"
+            "如需处理更多数据，请修改代码：在代码内聚合/统计/筛选后只打印结论，"
+            "不要打印原始大数据；沙箱禁止写文件，无法落盘后分段回读)"
+        )
         output = ""
         if result.stdout:
             stdout = result.stdout[:max_output]
             if len(result.stdout) > max_output:
-                stdout += "\n... (输出过长，已截断)"
+                stdout += _trunc_hint
             output += f"标准输出:\n{stdout}\n"
         if result.stderr:
             stderr = result.stderr[:max_output]
             if len(result.stderr) > max_output:
-                stderr += "\n... (错误输出过长，已截断)"
+                stderr += "\n... (错误输出过长，已截断；请检查报错开头部分定位问题)"
             output += f"标准错误:\n{stderr}\n"
         if not output:
             output = "(代码执行完成，无输出)"
@@ -1257,7 +1265,7 @@ _REDIRECT_RE = re.compile(
 )
 
 # Max output for shell commands
-_MAX_SHELL_OUTPUT = 102400  # 100 KB
+_MAX_SHELL_OUTPUT = 16384  # 16 KB (Cache-Plan Phase6-B1, was 100KB)
 _MAX_SHELL_TIMEOUT = 30  # seconds
 
 
@@ -1442,12 +1450,16 @@ async def shell_exec(command: str, timeout: int = 15) -> str:
         if result.stdout:
             stdout = result.stdout[:_MAX_SHELL_OUTPUT]
             if len(result.stdout) > _MAX_SHELL_OUTPUT:
-                stdout += "\n... (输出过长，已截断)"
+                stdout += (
+                    f"\n... (输出过长，已截断至 {_MAX_SHELL_OUTPUT // 1024}KB。"
+                    "如需查看更多，请用 head / tail / grep / wc 缩小范围后重新执行；"
+                    "本工具禁止重定向，无法落盘回读)"
+                )
             output += stdout
         if result.stderr:
             stderr = result.stderr[:_MAX_SHELL_OUTPUT // 2]
             if len(result.stderr) > _MAX_SHELL_OUTPUT // 2:
-                stderr += "\n... (错误输出过长，已截断)"
+                stderr += "\n... (错误输出过长，已截断；请检查报错开头部分定位问题)"
             if output:
                 output += f"\n--- stderr ---\n{stderr}"
             else:

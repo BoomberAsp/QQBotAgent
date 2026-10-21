@@ -34,6 +34,7 @@ import numpy as np
 from PIL import Image
 
 from lib.buff_alias import extract_skill_buff_labels
+from lib.errors import ToolError
 
 
 # ── Character Skill Index ───────────────────────────────────────────
@@ -439,7 +440,10 @@ async def parse_battle_screenshots(paths: list[str], mode: str = "full") -> str:
             result["_index"] = i
             return i, result, None
         except Exception as e:
-            return i, None, f"截图 {i + 1} 解析失败: {type(e).__name__}: {e}"
+            # warnings flow back into the tool result (model-visible):
+            # only self-authored ToolError text may pass through verbatim.
+            detail = e.safe_message if isinstance(e, ToolError) else type(e).__name__
+            return i, None, f"截图 {i + 1} 解析失败: {detail}"
 
     # OCR is the dominant cost (~60s+ per screenshot), so run the two
     # screenshots concurrently instead of one after the other.  asyncio is
@@ -579,7 +583,7 @@ def _ocr_config() -> dict:
     Prefers the dedicated ``OCR_MODEL`` section of models_settings.json;
     when it is missing/incomplete falls back to the legacy behaviour
     (``MULTIMODAL_MODEL`` credentials + model forced to qwen3.5-ocr).
-    Raises RuntimeError when neither is configured.
+    Raises ToolError('unavailable') when neither is configured.
     """
     from lib.multimodal_client import MultimodalClient
 
@@ -590,8 +594,8 @@ def _ocr_config() -> dict:
         cfg.setdefault("model", _QWEN_OCR_MODEL)
         return cfg
     if not client.is_available():
-        raise RuntimeError(
-            "OCR_MODEL / MULTIMODAL_MODEL 均未配置，OCR 不可用"
+        raise ToolError(
+            "unavailable", "OCR 服务未配置，战报截图解析暂不可用。"
         )
     cfg = dict(client._config)
     cfg["model"] = _QWEN_OCR_MODEL
@@ -700,8 +704,10 @@ async def _qwen_ocr_panel(crop: Image.Image, cfg: dict) -> list[dict]:
             )
         except Exception as e:
             if attempt >= 2:
-                raise RuntimeError(
-                    f"OCR 调用失败（model={cfg.get('model')}）: {e}"
+                # Raw {e} can carry the OCR endpoint URL / HTTP details;
+                # the cause chain is preserved for log_exception upstream.
+                raise ToolError(
+                    "unavailable", "OCR 服务调用失败，请稍后重试。"
                 ) from e
             await asyncio.sleep(2.0 * (attempt + 1))
     return []

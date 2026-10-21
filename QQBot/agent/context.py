@@ -88,6 +88,22 @@ _on_file_created: contextvars.ContextVar[Optional[Callable[[str], None]]] = (
     contextvars.ContextVar("_on_file_created", default=None)
 )
 
+# Character-plane bond state block (Bond-System-Design.md §6): built per-turn
+# by agent_router (level/title, mood, companionship stats), read by
+# agent._build_messages() and injected into the L4 volatile tail — never into
+# the cached L0-L2 prefix. Empty = no injection (unified personality or
+# task-plane run).
+_current_bond_context: contextvars.ContextVar[str] = (
+    contextvars.ContextVar("_current_bond_context", default="")
+)
+
+# delegate_task nesting guard (Bond-System-Design.md §3.3): 0 = not inside a
+# delegation. run_delegated_task sets 1 for the inner task-plane run; a second
+# delegate_task call sees non-zero and hard-rejects (single-level nesting).
+_delegate_depth: contextvars.ContextVar[int] = (
+    contextvars.ContextVar("_delegate_depth", default=0)
+)
+
 # Task-fold directive, set by the ``finalize_subtask`` tool mid-run and read by
 # agent persistence at end of run. A dict {"line": str, "boundary": int|None}:
 #   - "line"     the compact structured record to persist instead of the raw

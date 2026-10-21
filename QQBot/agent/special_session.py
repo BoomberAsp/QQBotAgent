@@ -81,7 +81,10 @@ class SpecialSessionManager:
     # ── CRUD ──────────────────────────────────────────────────────
 
     def create(
-        self, user_id: str, name: Optional[str] = None
+        self,
+        user_id: str,
+        name: Optional[str] = None,
+        metadata: Optional[Dict] = None,
     ) -> SpecialSession:
         """Create a new special session.
 
@@ -89,6 +92,8 @@ class SpecialSessionManager:
             user_id: QQ user ID.
             name: Session name. If None, a rule-based temporary name is generated.
                   The LLM can refine it later via auto_name().
+            metadata: Optional initial metadata (e.g. {"kind": "char_creation"}
+                  for UGC character interview sessions — Bond-System P1).
 
         Returns:
             The newly created SpecialSession.
@@ -115,6 +120,7 @@ class SpecialSessionManager:
             session_id=uuid.uuid4().hex[:12],
             user_id=user_id,
             name=name,
+            metadata=dict(metadata) if metadata else {},
         )
 
         self._save(session)
