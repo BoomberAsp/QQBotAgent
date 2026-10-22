@@ -138,8 +138,9 @@ class QQOfficialSender:
     images, per-code redemption messages). The entry plugin calls
     flush() once the turn completes; consecutive text fragments are
     merged into as few messages as possible, images keep their relative
-    order, progress lines are swallowed outright (plan v2 ③) and quota
-    overflow is dropped with a warning.
+    order, progress lines are swallowed outright (plan v2 ③) except the
+    immediate "正在思考…" indicator which goes out standalone right away,
+    and quota overflow is dropped with a warning.
 
     bot.send(event, ...) resolves the passive-reply semantics for us:
     msg_id=event.id + an auto-incrementing msg_seq per event, and
@@ -162,16 +163,30 @@ class QQOfficialSender:
         # this is belt-and-braces for future intent changes.
         return (not view.is_group) or view.mentioned
 
-    # ── Sender contract (all buffering; nothing hits the API here) ──
+    # ── Sender contract (buffering, except immediate progress) ─────
 
     async def send_text(self, text: str) -> None:
         if text and text.strip():
             self._buffer.append(("text", text))
 
-    async def send_progress(self, text: str) -> None:
-        # Swallowed on purpose: each mid-turn "thinking…" line would eat
-        # one passive reply and cannot be reclaimed by end-of-turn merge.
-        pass
+    async def send_progress(self, text: str, *, immediate: bool = False) -> None:
+        if not immediate:
+            # Swallowed on purpose: mid-turn tool-call progress lines
+            # would each eat one passive reply and cannot be reclaimed
+            # by end-of-turn merge.
+            return
+        # The turn-start "正在思考…" indicator is the one progress line
+        # worth spending quota on: it only helps the user if it arrives
+        # BEFORE the (possibly long) agent turn, so it goes out now as
+        # a standalone message instead of into the merge buffer.
+        if not (text and text.strip()):
+            return
+        if self._sent >= self.max_messages_per_turn:
+            logger.warning(
+                "[qq_official] reply quota exhausted; dropping "
+                f"immediate progress line {text[:30]!r}")
+            return
+        await self._send_once(MessageSegment.text(text))
 
     async def send_markdown(self, text: str) -> None:
         # msg_type=2 markdown requires a platform-approved template;

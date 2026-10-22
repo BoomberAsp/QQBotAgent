@@ -43,8 +43,18 @@ class OutProgress:
     eats the limited quota (group 5/5min, c2c 4/60min) and progress
     lines land mid-turn, where end-of-turn merging cannot reclaim them
     (plan v2 supplement ③).
+
+    ``immediate=True`` marks the one line worth spending quota on even
+    on the official route (the turn-start "正在思考…" indicator):
+    QQOfficialSender sends it right away as a standalone message
+    instead of buffering it into the end-of-turn merge, so the user
+    gets prompt feedback rather than seeing it glued onto the final
+    reply. Tool-call progress lines keep the default (swallowed on
+    official, verbatim on OneBot). OneBot ignores the flag — every
+    send there is already immediate.
     """
     text: str
+    immediate: bool = False
 
 
 class SendFailed(Exception):
@@ -75,4 +85,4 @@ class Sender(Protocol):
     async def send_text(self, text: str) -> None: ...
     async def send_image(self, img: OutImage) -> None: ...
     async def send_markdown(self, text: str) -> None: ...
-    async def send_progress(self, text: str) -> None: ...
+    async def send_progress(self, text: str, *, immediate: bool = False) -> None: ...

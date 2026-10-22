@@ -156,8 +156,9 @@ class _ToolSender:
     async def send_markdown(self, text: str) -> None:
         await _safe_send(text, sender=self._sender)
 
-    async def send_progress(self, text: str) -> None:
-        await _safe_send(OutProgress(text), sender=self._sender)
+    async def send_progress(self, text: str, *, immediate: bool = False) -> None:
+        await _safe_send(OutProgress(text, immediate=immediate),
+                          sender=self._sender)
 
 
 # ── Configuration Paths ───────────────────────────────────────────
@@ -1790,12 +1791,15 @@ async def handle_agent_turn(view: InboundMessage):
         await _handle_special_command(augmented_message, user_id)
         return
 
-    # Send thinking indicator (non-critical, ignore send failures)
+    # Send thinking indicator (non-critical, ignore send failures).
+    # immediate=True: on the official route this is the one progress
+    # line worth spending passive-reply quota on — it must go out as a
+    # standalone message right away, not merged into the final reply.
     try:
         _gid = view.group_id
         _pm = get_character_registry()
         _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, _gid))
-        await _safe_send(f"{_short} 正在思考...")
+        await _safe_send(OutProgress(f"{_short} 正在思考...", immediate=True))
     except Exception:
         pass
 
@@ -2287,7 +2291,7 @@ async def _safe_send(message, max_retries: int = 2, sender=None):
             if isinstance(message, OutImage):
                 await s.send_image(message)
             elif isinstance(message, OutProgress):
-                await s.send_progress(message.text)
+                await s.send_progress(message.text, immediate=message.immediate)
             else:
                 await s.send_text(message)
             return

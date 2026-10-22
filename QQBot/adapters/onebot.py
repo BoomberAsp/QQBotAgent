@@ -86,9 +86,10 @@ class OneBotSender:
     async def send_markdown(self, text: str) -> None:
         await self.send_text(text)
 
-    async def send_progress(self, text: str) -> None:
+    async def send_progress(self, text: str, *, immediate: bool = False) -> None:
         # OneBot has no per-turn reply quota — progress lines go out
-        # verbatim, exactly like pre-stage-4.
+        # verbatim, exactly like pre-stage-4. The immediate flag only
+        # matters on the quota-limited official route; ignored here.
         await self.send_text(text)
 
 
