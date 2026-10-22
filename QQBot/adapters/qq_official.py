@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from pathlib import Path
 
 from nonebot import logger
@@ -56,12 +57,29 @@ from adapters.onebot import _download_and_save_file
 _TEXT_CHUNK_LIMIT = 1500
 
 
+# The official API delivers inline QQ faces inside event.content as raw
+# pseudo-XML tags, e.g.:
+#   <faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">
+# ext is base64 (alphabet A-Za-z0-9+/=) so it can never contain '>',
+# making [^>]* a safe span. Left in, this noise goes verbatim into the
+# LLM prompt; stripped, a face-only message degrades to empty text and
+# hits the kernel's "nothing to process" guard — same net behavior as
+# the OneBot route, where faces arrive as segments the text walk skips.
+_FACE_TAG_RE = re.compile(r"<faceType=[^>]*>")
+
+
+def _clean_content(raw: str | None) -> str:
+    """Official event.content → kernel-ready text (face tags removed)."""
+    return _FACE_TAG_RE.sub("", raw or "").strip()
+
+
 def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
     """QQ official event -> platform-agnostic view (attachments stay lazy).
 
     Group content excludes the @bot mention itself (it lives in
     event.mentions / the GROUP_AT_MESSAGE_CREATE dispatch), so
-    event.content is already the clean user text on both scopes.
+    event.content is already the clean user text on both scopes
+    (modulo inline face tags — see _clean_content).
     """
     is_group = isinstance(event, GroupMessageCreateEvent)
     author = event.author
@@ -70,7 +88,7 @@ def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
         user_id=str(user_id),
         is_group=is_group,
         group_id=str(event.group_openid) if is_group else "",
-        text=(event.content or "").strip(),
+        text=_clean_content(event.content),
         message_id=str(event.id),
         self_id=str(bot.self_id),
         mentioned=True if not is_group else bool(getattr(event, "to_me", True)),
