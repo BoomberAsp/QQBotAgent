@@ -64,14 +64,14 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
     """Play gacha pull animation frames in QQ chat.
 
     Reads animation images and sends them sequentially with configurable intervals.
-    Uses the _send_msg context variable set by agent_router to send images.
+    Uses the _current_sender contextvar (agent.outbound.Sender) to send images.
 
     Args:
         star_level: Highest star level (3=blue, 4=purple, 5=gold, 6=red).
         is_single: True for single pull, False for ten-pull.
         interval: Delay between animation frames in seconds (default 0.75).
     """
-    from agent.context import _current_group_id, _send_msg
+    from agent.context import _current_group_id, _current_sender
     from plugins.pullingMonitor import (
         pull_1, blue_end, blue_middle, blue_or_purple_spaceship_close,
         blue_spaceship_open, gold_spaceship_close, gold_spaceship_open,
@@ -79,10 +79,10 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
         red_end, red_spaceship_close, red_spaceship_open,
         single_pull_start, ten_pull_start,
     )
-    from nonebot.adapters.onebot.v11 import MessageSegment
+    from agent.outbound import OutImage
 
-    send = _send_msg.get()
-    if send is None:
+    sender = _current_sender.get()
+    if sender is None:
         return "[Gacha] 当前环境不支持发送图片（非QQ聊天上下文）。"
 
     # ── Group feature toggle check ────────────────────────────────
@@ -129,7 +129,17 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
         if frame is None:
             continue  # Image file missing, skip silently
         try:
-            await send(frame)
+            # pullingMonitor frames are MessageSegment.image("file://...")
+            # objects; extract the local path so the send goes through
+            # the platform-agnostic OutImage contract (pullingMonitor
+            # itself stays untouched — its legacy pulling_anime path
+            # still consumes the frames as segments).
+            frame_file = frame.data.get("file", "")
+            if frame_file.startswith("file://"):
+                frame_file = frame_file[len("file://"):]
+            if not frame_file:
+                continue
+            await sender.send_image(OutImage(path=frame_file, label="gacha frame"))
             sent_count += 1
             await asyncio.sleep(interval)
         except Exception:

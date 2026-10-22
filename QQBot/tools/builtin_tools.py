@@ -1006,14 +1006,14 @@ async def execute_code(code: str, timeout: int = 30) -> str:
         # ── Send images to QQ chat if context variable is set ─────
         if saved_images:
             try:
-                from agent.context import _send_msg
-                from nonebot.adapters.onebot.v11 import MessageSegment
+                from agent.context import _current_sender
+                from agent.outbound import OutImage
 
-                send = _send_msg.get()
-                if send is not None:
+                sender = _current_sender.get()
+                if sender is not None:
                     for img_path in saved_images:
                         try:
-                            await send(MessageSegment.image(f"file://{img_path}"))
+                            await sender.send_image(OutImage(path=img_path, label="chart"))
                             await asyncio.sleep(0.3)  # Small delay between images
                         except Exception:
                             pass  # Image send failed, continue with other images
