@@ -4821,6 +4821,83 @@ class TestWebuiOfficialStatus:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestWebuiPermissionsEditor:
+    """webui/config_editor permissions — dual identity tables (QQ-official)."""
+
+    def run(self):
+        print_header("29. WebUI Permissions Config Editor (QQ-official)")
+        self.test_validators()
+        self.test_write_roundtrip()
+
+    def _import_module(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from webui import config_editor as ce
+        return ce
+
+    def test_validators(self):
+        ce = self._import_module()
+        # QQ-number tables: digits only (unchanged behavior)
+        assert ce._validate_id_list("123456,789012")
+        assert ce._validate_id_list('["123", "456"]')
+        assert ce._validate_id_list("")            # empty = clear, allowed
+        assert not ce._validate_id_list("5F0E9A3B1C2D")   # openid ≠ QQ number
+        # official tables: opaque alphanumeric openids
+        assert ce._validate_openid_list("5F0E9A3B1C2D2E4F,AB_cd-12")
+        assert ce._validate_openid_list("['ABC123def','XY_zz99']")
+        assert ce._validate_openid_list("")
+        assert not ce._validate_openid_list("ab")           # too short (<4)
+        assert not ce._validate_openid_list("has space,bad")
+        assert not ce._validate_openid_list("中文openid")
+        assert not ce._validate_openid_list("a,b,")         # trailing empty
+        print_pass("validators: QQ-number vs openid tables (format + rejects)")
+
+    def test_write_roundtrip(self):
+        from pathlib import Path as _Path
+        ce = self._import_module()
+        tmp = tempfile.mkdtemp(prefix="wpe_")
+        try:
+            env = _Path(tmp) / ".env"
+            env.write_text(
+                'DRIVER=~fastapi+~httpx+~websockets\n'
+                'QQ_BOTS=[{"id":"102808287","secret":"S3CRET"}]\n'
+                'SUPERUSERS=["111"]\n', encoding="utf-8")
+            with patch.object(ce, "ENV_FILE", env), \
+                    patch.object(ce, "BACKUPS", _Path(tmp) / "backups"):
+                # None = untouched; set official tables + append VIP_USERS
+                r = ce.permissions_write(None, "222,333", "5F0E9A3B1C2D", None)
+                assert r.get("ok"), r
+                text = env.read_text(encoding="utf-8")
+                assert 'SUPERUSERS=["111"]' in text      # untouched
+                assert "VIP_USERS=222,333" in text       # appended
+                assert "QQ_OFFICIAL_SUPERUSERS=5F0E9A3B1C2D" in text
+                assert "QQ_OFFICIAL_VIP_USERS" not in text   # None → not added
+                assert 'QQ_BOTS=[{"id":"102808287","secret":"S3CRET"}]' in text
+                assert "DRIVER=~fastapi+~httpx+~websockets" in text
+                # second write: update in place + clear via ""
+                r = ce.permissions_write('["111","999"]', "", None, "ABCD1234")
+                assert r.get("ok"), r
+                text = env.read_text(encoding="utf-8")
+                assert 'SUPERUSERS=["111","999"]' in text
+                assert any(ln == "VIP_USERS=" for ln in text.splitlines()), text  # cleared
+                assert "QQ_OFFICIAL_SUPERUSERS=5F0E9A3B1C2D" in text  # kept
+                assert "QQ_OFFICIAL_VIP_USERS=ABCD1234" in text
+                assert text.count("QQ_OFFICIAL_VIP_USERS=") == 1      # no dup
+                # read reflects all four tables
+                with patch.object(ce.config, "_BOT_ENV", {}):
+                    got = ce.permissions_read()
+                assert got["QQ_OFFICIAL_VIP_USERS"] == "ABCD1234", got
+                assert got["VIP_USERS"] == "", got
+                # bad openid list rejected, file untouched
+                before = env.read_text(encoding="utf-8")
+                r = ce.permissions_write(None, None, "bad openid!", None)
+                assert "error" in r and env.read_text(encoding="utf-8") == before
+            print_pass("permissions_write: None=keep / ''=clear / other lines intact")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -4857,6 +4934,7 @@ def main():
         ("Bond Events & Dynamic Context (P2)", TestBondEvents()),
         ("Official Status Heartbeat (WebUI IPC)", TestOfficialStatusHeartbeat()),
         ("WebUI Official Status Aggregator", TestWebuiOfficialStatus()),
+        ("WebUI Permissions Editor", TestWebuiPermissionsEditor()),
     ]
 
     passed = 0

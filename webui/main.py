@@ -652,14 +652,20 @@ async def api_config_permissions():
 
 
 class PermissionsPayload(BaseModel):
-    superusers: str = ""
-    vip_users: str = ""
+    # None = key untouched; "" = table cleared (config_editor semantics).
+    # The panel frontend always submits all four fields.
+    superusers: str | None = None
+    vip_users: str | None = None
+    qq_official_superusers: str | None = None
+    qq_official_vip_users: str | None = None
 
 
 @app.put("/api/config/permissions")
 async def api_config_permissions_put(payload: PermissionsPayload, request: Request):
-    result = await asyncio.to_thread(config_editor.permissions_write,
-                                     payload.superusers, payload.vip_users)
+    result = await asyncio.to_thread(
+        config_editor.permissions_write,
+        payload.superusers, payload.vip_users,
+        payload.qq_official_superusers, payload.qq_official_vip_users)
     if "error" in result:
         return JSONResponse(result, status_code=400)
     audit.log_action("config.permissions_write", "修改权限名单", _ip(request))

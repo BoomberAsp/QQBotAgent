@@ -97,12 +97,20 @@
     document.getElementById('prompt-editor').dataset.dirty = '';
   });
 
-  // ── Permissions ────────────────────────────────────────────────
+  // ── Permissions (OneBot QQ-number tables + QQ-official openid tables) ──
+  const PERM_FIELDS = [
+    { el: 'perm-super', key: 'SUPERUSERS', field: 'superusers' },
+    { el: 'perm-vip', key: 'VIP_USERS', field: 'vip_users' },
+    { el: 'perm-official-super', key: 'QQ_OFFICIAL_SUPERUSERS', field: 'qq_official_superusers' },
+    { el: 'perm-official-vip', key: 'QQ_OFFICIAL_VIP_USERS', field: 'qq_official_vip_users' },
+  ];
+
   async function loadPermissions() {
     try {
       const d = await api('/api/config/permissions');
-      document.getElementById('perm-super').value = d.SUPERUSERS || '';
-      document.getElementById('perm-vip').value = d.VIP_USERS || '';
+      for (const f of PERM_FIELDS) {
+        document.getElementById(f.el).value = d[f.key] || '';
+      }
       document.getElementById('perm-note').textContent = d.note || '';
     } catch (e) {
       document.getElementById('perm-note').textContent = '加载失败: ' + e.message;
@@ -111,12 +119,13 @@
 
   document.getElementById('perm-save').addEventListener('click', async () => {
     try {
+      const body = {};
+      for (const f of PERM_FIELDS) {
+        body[f.field] = document.getElementById(f.el).value;
+      }
       const d = await api('/api/config/permissions', {
         method: 'PUT',
-        body: {
-          superusers: document.getElementById('perm-super').value,
-          vip_users: document.getElementById('perm-vip').value,
-        },
+        body,
       });
       toast(d.note || '已保存', 'success');
     } catch (e) {

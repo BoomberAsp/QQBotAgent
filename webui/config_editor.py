@@ -4,8 +4,12 @@ Config hot-management for the panel.
 Editable targets:
   prompts        QQBot/agent/config/**/*.md      → hot-reloaded by the
                                                    bot-side watcher (5 s)
-  permissions    QQBot/.env  SUPERUSERS/VIP_USERS → effective immediately
-                                                   (PermissionManager re-reads)
+  permissions    QQBot/.env identity tables       → effective immediately
+                 OneBot route: SUPERUSERS / VIP_USERS (QQ numbers)
+                 QQ official route: QQ_OFFICIAL_SUPERUSERS /
+                 QQ_OFFICIAL_VIP_USERS (opaque alphanumeric openids)
+                 (PermissionManager re-reads .env on every get_role() call;
+                  it picks the table by the turn's platform contextvar)
   models         QQBot/config/models_settings.json → hot-reloaded by the
                                                    bot-side watcher (~10 s)
   group_features QQBot/data/group_features.json   → effective on next message
@@ -105,23 +109,58 @@ def prompt_write(name: str, content: str) -> dict:
             "note": "bot 侧 watcher 将在 5 秒内热重载"}
 
 
-# ── Permissions (.env) ────────────────────────────────────────────
+# ── Permissions (.env — per-platform identity tables) ────────────
+#
+# Since the QQ official bot route (plugins/qq_official.py), the bot keeps
+# TWO independent identity tables in .env — PermissionManager.get_role()
+# picks one by the turn's platform:
+#   onebot      → SUPERUSERS / VIP_USERS               (QQ numbers, digits)
+#   qq_official → QQ_OFFICIAL_SUPERUSERS / QQ_OFFICIAL_VIP_USERS
+#                                                   (opaque alphanumeric openids)
+# QQ_BOTS (appid+secret) is deliberately NOT editable here: it contains
+# credentials and is only read at bot startup — changes need a restart
+# via the process manager, not a hot edit.
 
 _QQ_ID_LIST = re.compile(r"^\d+(,\d+)*$")
+# openid: opaque token issued by the official API (letters/digits/-/_).
+# Length bounds are generous on purpose — the format is platform-owned.
+_OPENID_TOKEN = r"[A-Za-z0-9_-]{4,64}"
+_OPENID_LIST = re.compile(rf"^{_OPENID_TOKEN}(,{_OPENID_TOKEN})*$")
 
 
-def _validate_id_list(value: str) -> bool:
+def _validate_list(value: str, item_re: str) -> bool:
+    """Comma-separated list, or JSON/python-literal ['a','b'] style.
+    Empty value = empty list = allowed (clears the table)."""
     v = value.strip()
     if not v:
-        return True  # empty list allowed
-    # tolerate the ['a','b'] python-literal style used by nonebot SUPERUSERS
+        return True
     if v.startswith("[") and v.endswith("]"):
         try:
             items = json.loads(v.replace("'", '"'))
-            return all(re.fullmatch(r"\d+", str(i).strip()) for i in items)
         except json.JSONDecodeError:
             return False
-    return bool(_QQ_ID_LIST.fullmatch(v.replace(" ", "")))
+        return isinstance(items, list) and all(
+            re.fullmatch(item_re, str(i).strip()) for i in items)
+    return bool(re.fullmatch(rf"{item_re}(,{item_re})*", v.replace(" ", "")))
+
+
+def _validate_id_list(value: str) -> bool:
+    return _validate_list(value, r"\d+")
+
+
+def _validate_openid_list(value: str) -> bool:
+    return _validate_list(value, _OPENID_TOKEN)
+
+
+# key → (validator, human-readable format hint for error messages)
+_PERMISSION_FIELDS: dict[str, tuple] = {
+    "SUPERUSERS": (_validate_id_list, "逗号分隔的 QQ 号，或 ['123','456'] 形式"),
+    "VIP_USERS": (_validate_id_list, "逗号分隔的 QQ 号，或 ['123','456'] 形式"),
+    "QQ_OFFICIAL_SUPERUSERS": (_validate_openid_list,
+                               "逗号分隔的 openid（字母/数字/-/_），或 ['xx','yy'] 形式"),
+    "QQ_OFFICIAL_VIP_USERS": (_validate_openid_list,
+                              "逗号分隔的 openid（字母/数字/-/_），或 ['xx','yy'] 形式"),
+}
 
 
 def permissions_read() -> dict:
@@ -132,37 +171,52 @@ def permissions_read() -> dict:
         fresh = dotenv_values(ENV_FILE)
     except Exception:
         fresh = env
-    return {
-        "SUPERUSERS": fresh.get("SUPERUSERS", ""),
-        "VIP_USERS": fresh.get("VIP_USERS", ""),
-        "note": "PermissionManager 每次调用都会重读 .env，保存后立即生效",
+    out = {key: (fresh.get(key) or "") for key in _PERMISSION_FIELDS}
+    out["note"] = ("PermissionManager 每次调用都会重读 .env，保存后立即生效。"
+                   "OneBot 路由按 QQ 号匹配 SUPERUSERS/VIP_USERS；"
+                   "QQ 官方路由按 openid 匹配 QQ_OFFICIAL_* —— 两张表相互独立。")
+    return out
+
+
+def permissions_write(superusers=None, vip_users=None,
+                      qq_official_superusers=None, qq_official_vip_users=None) -> dict:
+    """Update identity tables in .env. None = key untouched (kept as-is);
+    "" = table cleared. Line-oriented rewrite: every other .env line
+    (QQ_BOTS, tokens, …) passes through byte-identical."""
+    values = {
+        "SUPERUSERS": superusers,
+        "VIP_USERS": vip_users,
+        "QQ_OFFICIAL_SUPERUSERS": qq_official_superusers,
+        "QQ_OFFICIAL_VIP_USERS": qq_official_vip_users,
     }
-
-
-def permissions_write(superusers: str, vip_users: str) -> dict:
-    for name, val in (("SUPERUSERS", superusers), ("VIP_USERS", vip_users)):
-        if not _validate_id_list(val):
-            return {"error": f"{name} 格式非法：应为逗号分隔的 QQ 号，或 ['123','456'] 形式"}
+    for key, val in values.items():
+        if val is None:
+            continue
+        if not isinstance(val, str):
+            return {"error": f"{key} 必须是字符串"}
+        validator, hint = _PERMISSION_FIELDS[key]
+        if not validator(val):
+            return {"error": f"{key} 格式非法：应为{hint}"}
     if not ENV_FILE.exists():
         return {"error": ".env 不存在"}
     _backup(ENV_FILE)
     try:
         lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
-        updated = {"SUPERUSERS": False, "VIP_USERS": False}
+        updated: set[str] = set()
         for i, ln in enumerate(lines):
-            for key, val in (("SUPERUSERS", superusers), ("VIP_USERS", vip_users)):
-                if ln.startswith(f"{key}="):
+            for key, val in values.items():
+                if val is not None and ln.startswith(f"{key}="):
                     lines[i] = f"{key}={val.strip()}"
-                    updated[key] = True
-        for key, val in (("SUPERUSERS", superusers), ("VIP_USERS", vip_users)):
-            if not updated[key]:
+                    updated.add(key)
+        for key, val in values.items():
+            if val is not None and key not in updated:
                 lines.append(f"{key}={val.strip()}")
         tmp = ENV_FILE.with_suffix(".env.tmp")
         tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
         tmp.replace(ENV_FILE)
     except OSError as e:
         return {"error": str(e)}
-    return {"ok": True, "note": "已保存，权限变更立即生效"}
+    return {"ok": True, "note": "已保存，权限变更立即生效（两条路由各自匹配对应名单）"}
 
 
 # ── Models (models_settings.json — contains live API keys) ───────

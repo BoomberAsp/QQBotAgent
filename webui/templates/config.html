@@ -36,12 +36,28 @@
 <div class="cfg-pane" id="pane-permissions" style="display:none">
   <div class="card" style="max-width:640px">
     <h2 class="card-title">权限名单（.env）</h2>
+    <p class="muted" style="margin:0 0 12px">
+      两条消息路由各自匹配独立名单：OneBot（NapCat）按 QQ 号，QQ 官方机器人按 openid。
+      同一个人走两条路由需要分别录入。
+    </p>
+    <h3 style="margin:0 0 8px;font-size:13px">OneBot 路由（QQ 号）</h3>
     <label class="field"><span>SUPERUSERS（管理员，逗号分隔 QQ 号）</span>
       <input id="perm-super" type="text" placeholder="123456,789012"></label>
     <label class="field"><span>VIP_USERS（VIP 用户）</span>
       <input id="perm-vip" type="text" placeholder="123456,789012"></label>
-    <button class="btn btn-primary" id="perm-save">保存</button>
+    <h3 style="margin:16px 0 8px;font-size:13px">QQ 官方路由（openid）</h3>
+    <label class="field"><span>QQ_OFFICIAL_SUPERUSERS（管理员，逗号分隔 openid）</span>
+      <input id="perm-official-super" type="text" placeholder="5F0E9A3B...,7C11D2..."></label>
+    <label class="field"><span>QQ_OFFICIAL_VIP_USERS（VIP 用户，openid）</span>
+      <input id="perm-official-vip" type="text" placeholder="5F0E9A3B...,7C11D2..."></label>
+    <button class="btn btn-primary" id="perm-save" style="margin-top:12px">保存</button>
     <p class="muted" style="margin:10px 0 0" id="perm-note"></p>
+    <p class="muted" style="margin:10px 0 0;font-size:12px">
+      openid 获取：官方路由每条入站消息都会在 bot 日志打印
+      <code>[qq_official] … openid=…</code>（见「日志查看」），让对方给机器人发一条消息即可采集。
+      官方机器人凭据（QQ_BOTS，含 secret）不在此页维护——它仅在启动时读取，
+      修改 .env 后需到「进程管理」重启 NoneBot。
+    </p>
   </div>
 </div>
 
