@@ -47,6 +47,39 @@
     else qrHint.textContent = '使用手机 QQ 扫码登录';
   }
 
+  // ── QQ 官方路由状态 ────────────────────────────────────
+  const ofCard = document.getElementById('official-status-card');
+  const OF_STATES = {
+    connected: { cls: 'pill badge-ok', text: '已连接' },
+    disconnected: { cls: 'pill badge-err', text: '已断开' },
+    starting: { cls: 'pill badge-warn', text: '启动中' },
+    stale: { cls: 'pill badge-warn', text: '心跳滞后' },
+    unknown: { cls: 'pill', text: '未启用' },
+  };
+
+  async function loadOfficial() {
+    let s;
+    try { s = await api('/api/official/status'); } catch (e) { return; }
+    const appid = s.appid || s.appid_env;
+    // 未启用（无心跳文件且 .env 未配置 QQ_BOTS）时整卡隐藏，不打扰
+    ofCard.hidden = (s.state === 'unknown' && !appid);
+    if (ofCard.hidden) return;
+    const st = OF_STATES[s.state] || OF_STATES.unknown;
+    const pill = document.getElementById('of-state');
+    pill.className = st.cls;
+    pill.textContent = st.text;
+    document.getElementById('of-appid').textContent = appid || '—';
+    const now = Date.now() / 1000;
+    document.getElementById('of-uptime').textContent =
+      (s.state === 'connected' && s.connected_at) ? fmtUptime(now - s.connected_at) : '—';
+    document.getElementById('of-msgs').textContent = s.messages_total ?? 0;
+    document.getElementById('of-last').textContent = s.last_message_at
+      ? fmtUptime(now - s.last_message_at) + '前' : '—';
+    document.getElementById('of-hb').textContent =
+      (s.heartbeat_age !== null && s.heartbeat_age !== undefined)
+        ? s.heartbeat_age + ' 秒前' : '—';
+  }
+
   function statePill(info) {
     const st = info.state;
     const cls = st === 'running' ? 'badge-ok' : st === 'unavailable' ? 'badge-warn' : 'badge-err';
@@ -128,4 +161,7 @@
 
   loadQr();
   setInterval(loadQr, 3000);   // 比进程轮询更密，贴合 NapCat 二维码刷新节奏
+
+  loadOfficial();
+  setInterval(loadOfficial, 5000);   // 与进程轮询对齐；心跳文件 60s 才刷新
 })();

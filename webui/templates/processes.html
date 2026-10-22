@@ -40,6 +40,23 @@
   </div>
   <p class="muted" id="qr-hint" style="margin:0">使用手机 QQ 扫码登录</p>
 </div>
+
+<div class="card" id="official-status-card" hidden>
+  <div class="row">
+    <h2 class="card-title" style="margin:0">QQ 官方路由</h2>
+    <span id="of-state" class="pill">—</span>
+  </div>
+  <table class="data-table" style="margin-top:8px">
+    <tbody>
+      <tr><td class="muted">AppID</td><td class="mono" id="of-appid">—</td></tr>
+      <tr><td class="muted">连接时长</td><td id="of-uptime">—</td></tr>
+      <tr><td class="muted">消息总数</td><td id="of-msgs">—</td></tr>
+      <tr><td class="muted">最近消息</td><td id="of-last">—</td></tr>
+      <tr><td class="muted">最后心跳</td><td id="of-hb">—</td></tr>
+    </tbody>
+  </table>
+  <p class="muted" style="margin:8px 0 0">与 NoneBot 同进程；状态来自 bot 写入的心跳文件（60s 周期）</p>
+</div>
 {% endblock %}
 
 {% block scripts %}

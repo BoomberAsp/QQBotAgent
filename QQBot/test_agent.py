@@ -4697,6 +4697,130 @@ class TestBondEvents:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestOfficialStatusHeartbeat:
+    """Test lib/status_heartbeat — atomic status file for bot→panel IPC."""
+
+    def run(self):
+        print_header("27. Official Status Heartbeat Writer (WebUI IPC)")
+        self.test_write_merge_atomic()
+        self.test_read_corrupt()
+
+    def test_write_merge_atomic(self):
+        from lib.status_heartbeat import read_status, write_status
+        tmp = tempfile.mkdtemp(prefix="hb_")
+        try:
+            path = os.path.join(tmp, "sub", "official_status.json")
+            # first write creates parent dirs, stamps written_at
+            out = write_status(path, state="starting", appid=None)
+            assert out["state"] == "starting" and "written_at" in out
+            assert os.path.isfile(path) and not os.path.exists(path + ".tmp")
+            # second write MERGES (keeps old keys) and re-stamps
+            out2 = write_status(path, state="connected", appid="102808287")
+            assert out2["state"] == "connected"
+            assert out2["appid"] == "102808287"
+            assert out2["written_at"] >= out["written_at"]
+            cur = read_status(path)
+            assert cur["state"] == "connected" and cur["appid"] == "102808287"
+            print_pass("write_status atomic merge + written_at stamp")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_read_corrupt(self):
+        from lib.status_heartbeat import read_status
+        tmp = tempfile.mkdtemp(prefix="hb_")
+        try:
+            # missing file → {}
+            assert read_status(os.path.join(tmp, "nope.json")) == {}
+            # corrupt JSON → {}
+            bad = os.path.join(tmp, "bad.json")
+            with open(bad, "w") as f:
+                f.write("{not json")
+            assert read_status(bad) == {}
+            # valid JSON but not an object → {}
+            arr = os.path.join(tmp, "arr.json")
+            with open(arr, "w") as f:
+                f.write("[1,2]")
+            assert read_status(arr) == {}
+            print_pass("read_status degrades to {} on missing/corrupt/non-object")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestWebuiOfficialStatus:
+    """Test webui/official_status.status() — mtime staleness + appid_env."""
+
+    def run(self):
+        print_header("28. WebUI Official Status Aggregator (P1)")
+        self.test_staleness_ladder()
+        self.test_appid_env()
+
+    def _import_module(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from webui import official_status as wos
+        return wos
+
+    def _write_with_age(self, path, age_seconds, **payload):
+        import json as _json
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(payload, f)
+        old = time.time() - age_seconds
+        os.utime(path, (old, old))
+
+    def test_staleness_ladder(self):
+        from pathlib import Path as _Path
+        wos = self._import_module()
+        tmp = tempfile.mkdtemp(prefix="wos_")
+        try:
+            path = os.path.join(tmp, "official_status.json")
+            with patch.object(wos, "STATUS_FILE", _Path(path)):
+                # missing file → unknown
+                st = asyncio.run(wos.status())
+                assert st["state"] == "unknown" and st["heartbeat_age"] is None
+                # fresh (10s old) → passthrough state
+                self._write_with_age(path, 10, state="connected",
+                                     appid="102808287", messages_total=42,
+                                     connected_at=time.time() - 300,
+                                     last_message_at=time.time() - 60)
+                st = asyncio.run(wos.status())
+                assert st["state"] == "connected" and st["appid"] == "102808287"
+                assert st["messages_total"] == 42 and 0 <= st["heartbeat_age"] < 60
+                # 300s old (>150s, <600s) → stale
+                self._write_with_age(path, 300, state="connected")
+                st = asyncio.run(wos.status())
+                assert st["state"] == "stale", st
+                # 700s old (>600s) → unknown
+                self._write_with_age(path, 700, state="connected")
+                st = asyncio.run(wos.status())
+                assert st["state"] == "unknown"
+            print_pass("status() staleness ladder: fresh/stale/unknown + missing")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_appid_env(self):
+        from pathlib import Path as _Path
+        wos = self._import_module()
+        tmp = tempfile.mkdtemp(prefix="wos_")
+        try:
+            path = os.path.join(tmp, "official_status.json")
+            bots_json = '[{"id":"102808287","secret":"x","use_websocket":true}]'
+            with patch.object(wos, "STATUS_FILE", _Path(path)), \
+                    patch.object(wos.config, "bot_env",
+                                 lambda k, d="": bots_json if k == "QQ_BOTS" else d):
+                st = asyncio.run(wos.status())
+                assert st["appid_env"] == "102808287"
+            # malformed QQ_BOTS → None, never raises
+            with patch.object(wos, "STATUS_FILE", _Path(path)), \
+                    patch.object(wos.config, "bot_env",
+                                 lambda k, d="": "not-json" if k == "QQ_BOTS" else d):
+                st = asyncio.run(wos.status())
+                assert st["appid_env"] is None
+            print_pass("appid_env parsed from QQ_BOTS (malformed → None)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -4731,6 +4855,8 @@ def main():
         ("Bond Content Parsing (P2)", TestBondContent()),
         ("Bond Gift / Poke (P2)", TestBondGiftPoke()),
         ("Bond Events & Dynamic Context (P2)", TestBondEvents()),
+        ("Official Status Heartbeat (WebUI IPC)", TestOfficialStatusHeartbeat()),
+        ("WebUI Official Status Aggregator", TestWebuiOfficialStatus()),
     ]
 
     passed = 0

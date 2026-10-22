@@ -83,7 +83,7 @@ VENV_NB = os.environ.get(
 _NONEBOT_CMD = os.environ.get("WEBUI_NONEBOT_CMD")
 PROCESSES = {
     "nonebot": {
-        "label": "NoneBot (机器人)",
+        "label": "NoneBot (OneBot + QQ官方)",
         "method": "popen",
         "cmd": _NONEBOT_CMD if _NONEBOT_CMD else [VENV_NB, "run"],
         "shell": bool(_NONEBOT_CMD),

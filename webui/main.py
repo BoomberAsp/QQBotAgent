@@ -26,8 +26,8 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from . import (audit, auth, config, config_editor, data_reader,
-               hardware_monitor, log_viewer, napcat_login, playground,
-               process_manager)
+               hardware_monitor, log_viewer, napcat_login, official_status,
+               playground, process_manager)
 from .config import HOST, PORT
 
 
@@ -293,11 +293,15 @@ async def api_dashboard():
     _al_inp = _al.get("input_tokens", 0)
     hit_rate_agent_loop = (_al.get("cached_input_tokens", 0) / _al_inp) if _al_inp else None
     unread = await asyncio.to_thread(data_reader.feedback_unread_count)
+    official = await official_status.status()
     for name, info in procs.items():
         if info.get("state") == "running":
             sub = f"PID {info.get('pid')}"
             if info.get("uptime") is not None:
                 sub += " · " + _fmt_uptime(info["uptime"])
+            # 官方路由与 NapCat 路由同进程；连上时在 NoneBot 卡片追加徽章
+            if name == "nonebot" and official.get("state") == "connected":
+                sub += " · 官方路由✓"
             info["sub"] = sub
         elif info.get("state") == "unavailable":
             info["sub"] = "docker 不可用"
@@ -337,6 +341,7 @@ async def api_dashboard():
             "total": await asyncio.to_thread(data_reader.feedback_total_count),
         },
         "watchdog": {"enabled": process_manager.watchdog_enabled()},
+        "official": official,
     }
 
 
@@ -403,6 +408,14 @@ async def api_napcat_qrcode_png():
         return JSONResponse({"error": "no_qrcode"}, status_code=404)
     return FileResponse(path, media_type="image/png",
                         headers={"Cache-Control": "no-store"})
+
+
+# ── QQ 官方路由状态 API ───────────────────────────────────────────
+
+@app.get("/api/official/status")
+async def api_official_status():
+    """官方路由心跳文件聚合状态（前端每 5s 轮询，见 official_status.py）。"""
+    return await official_status.status()
 
 
 # ── Log viewer API ────────────────────────────────────────────────
