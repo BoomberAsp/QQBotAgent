@@ -240,6 +240,17 @@ def start(name: str) -> dict:
             fh = open(log_file, "ab") if log_file else subprocess.DEVNULL
         except OSError as e:
             return {"ok": False, "error": f"无法打开日志文件: {e}"}
+        # `nb run` (nb_cli) probes bare `python` on PATH to locate the
+        # NoneBot install; a panel process started outside the venv
+        # (screen/systemd/cron) would spawn children that fail with
+        # "NoneBot is not installed". Mirror the qqbot systemd unit's
+        # Environment=PATH fix: always prepend the venv bin dir.
+        child_env = os.environ.copy()
+        # abspath, NOT realpath: venv bin/python is a symlink into the
+        # base interpreter — realpath would yield /usr/bin and defeat
+        # the whole point.
+        _venv_bin = os.path.dirname(os.path.abspath(config.VENV_PYTHON))
+        child_env["PATH"] = _venv_bin + os.pathsep + child_env.get("PATH", "")
         try:
             with open(os.devnull, "rb") as devnull:
                 proc = subprocess.Popen(
@@ -250,6 +261,7 @@ def start(name: str) -> dict:
                     stderr=subprocess.STDOUT,
                     shell=spec.get("shell", False),
                     start_new_session=True,
+                    env=child_env,
                 )
         except Exception as e:
             return {"ok": False, "error": f"启动失败: {e}"}
