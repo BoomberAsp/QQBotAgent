@@ -4,7 +4,8 @@ Platform-agnostic outbound contract — stage 3 of the QQ-official plan.
 The turn kernel (agent/turn.py) and the tool layer never construct
 platform message objects anymore: they hold a ``Sender`` (via argument
 or the ``agent.context._current_sender`` contextvar) and express sends
-semantically — text, local image, markdown. Each entry adapter provides
+semantically — text, progress line, local image, markdown. Each entry
+adapter provides
 the implementation (adapters/onebot.py::OneBotSender now; stage 4 adds
 QQOfficialSender, which turns OutImage.path into base64 + file_image()
 because the official API cannot read local files).
@@ -31,6 +32,19 @@ class OutImage:
     path: str | None = None      # local absolute path
     url: str | None = None       # public URL (or file:// URI)
     label: str = ""              # for logs / fallback text
+
+
+@dataclass
+class OutProgress:
+    """An intermediate progress line ("正在思考…" and friends).
+
+    OneBot: sent verbatim, like any text (pre-stage-4 behavior).
+    QQ official: swallowed by QQOfficialSender — every passive reply
+    eats the limited quota (group 5/5min, c2c 4/60min) and progress
+    lines land mid-turn, where end-of-turn merging cannot reclaim them
+    (plan v2 supplement ③).
+    """
+    text: str
 
 
 class SendFailed(Exception):
@@ -61,3 +75,4 @@ class Sender(Protocol):
     async def send_text(self, text: str) -> None: ...
     async def send_image(self, img: OutImage) -> None: ...
     async def send_markdown(self, text: str) -> None: ...
+    async def send_progress(self, text: str) -> None: ...

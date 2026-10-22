@@ -86,6 +86,11 @@ class OneBotSender:
     async def send_markdown(self, text: str) -> None:
         await self.send_text(text)
 
+    async def send_progress(self, text: str) -> None:
+        # OneBot has no per-turn reply quota — progress lines go out
+        # verbatim, exactly like pre-stage-4.
+        await self.send_text(text)
+
 
 # ── Reply/quote context (OneBot-specific; entry layer computes it) ──
 def build_reply_context(event: MessageEvent) -> str:

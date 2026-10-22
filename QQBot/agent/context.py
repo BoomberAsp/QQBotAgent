@@ -122,3 +122,23 @@ _delegate_depth: contextvars.ContextVar[int] = (
 _pending_task_fold: contextvars.ContextVar[Optional[dict]] = (
     contextvars.ContextVar("_pending_task_fold", default=None)
 )
+
+# Platform of the current turn ("onebot" | "qq_official"). Set by
+# agent.turn.run_agent_turn()/run_continuous_turn() from view.platform.
+# Read by PermissionManager.get_role() to pick the identity table:
+# qq_official consults QQ_OFFICIAL_SUPERUSERS/QQ_OFFICIAL_VIP_USERS
+# (opaque openids), onebot keeps SUPERUSERS/VIP_USERS (QQ numbers) —
+# plan §7.7. Task-scoped: each NoneBot event runs in its own task, so
+# concurrent turns on the two platforms never cross-contaminate.
+_current_platform: contextvars.ContextVar[str] = (
+    contextvars.ContextVar("_current_platform", default="onebot")
+)
+
+# Per-turn sender override (stage 4). The QQ official entry plugin sets
+# this to the QQOfficialSender bound to the current event; _safe_send
+# resolves explicit ``sender`` argument → this contextvar → the
+# default_sender slot. The OneBot entry never sets it (its matcher-slot
+# path is unchanged).
+_turn_sender: contextvars.ContextVar[Optional["Sender"]] = (
+    contextvars.ContextVar("_turn_sender", default=None)
+)
