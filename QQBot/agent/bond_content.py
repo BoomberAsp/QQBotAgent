@@ -163,9 +163,16 @@ def tiers_unlocking_at(card: str, level: int) -> List[Dict[str, object]]:
 
 
 def unlocked_tiers_text(card: str, level: int) -> str:
-    """Dynamic-layer text of all unlocked Bond Tiers (empty if none)."""
+    """Dynamic-layer text of all unlocked Bond Tiers (empty if none).
+
+    Scene tiers are excluded: a scene script is acted out only inside its
+    bond_scene session (or teased via a level-up invitation) — leaking it into
+    the ordinary conversation dynamic layer would spoil it.
+    """
     parts = []
     for t in unlocked_tiers(card, level):
+        if is_scene_tier(t):
+            continue
         body = str(t["body"]).strip()
         title = str(t["title"]).strip()
         if body:
@@ -173,6 +180,66 @@ def unlocked_tiers_text(card: str, level: int) -> str:
         else:
             parts.append(f"【{title}】")
     return "\n\n".join(parts)
+
+
+# ── 剧情场景（Bond-System-Design.md §4.4 形态3 / §5.3，P3）──────────
+# 场景与档案同处 `## Bond Tiers`，靠标题里的「场景」二字区分：
+#   ### Lv3 · 档案Ⅰ        → 档案 tier（解锁后注入动态层）
+#   ### Lv4 · 场景 · 雨夜谈心 → 场景 tier（special_session 承载的分幕脚本）
+
+_SCENE_MARKER = "场景"
+_SCENE_TITLE_RE = re.compile(r"^场景\s*[·:：\-\s]*")
+
+
+def is_scene_tier(tier: Dict[str, object]) -> bool:
+    """A Bond Tier whose title marks it as a 剧情场景 (not an 档案)."""
+    return _SCENE_MARKER in str(tier.get("title", ""))
+
+
+def _clean_scene_title(title: str) -> str:
+    """Strip the leading 「场景 ·」 marker → bare scene name."""
+    t = _SCENE_TITLE_RE.sub("", str(title).strip()).strip()
+    return t or str(title).strip()
+
+
+def parse_scenes(card: str) -> List[Dict[str, object]]:
+    """All 场景 tiers as [{level:int, title:str, body:str, raw_title:str}]."""
+    out: List[Dict[str, object]] = []
+    for t in parse_bond_tiers(card):
+        if is_scene_tier(t):
+            out.append({
+                "level": t["level"],
+                "title": _clean_scene_title(t["title"]),
+                "body": t["body"],
+                "raw_title": str(t["title"]),
+            })
+    return out
+
+
+def scenes_available(card: str, level: int) -> List[Dict[str, object]]:
+    """Scenes whose unlock level ≤ current level."""
+    return [s for s in parse_scenes(card) if int(s["level"]) <= level]
+
+
+def scenes_unlocking_at(card: str, level: int) -> List[Dict[str, object]]:
+    """Scenes that unlock exactly at ``level`` (for level-up invitations)."""
+    return [s for s in parse_scenes(card) if int(s["level"]) == level]
+
+
+def get_scene(card: str, title: str) -> Optional[Dict[str, object]]:
+    """Find a scene by name (exact, then substring either direction)."""
+    key = _clean_scene_title(title).strip().lower()
+    if not key:
+        return None
+    scenes = parse_scenes(card)
+    for s in scenes:
+        if str(s["title"]).strip().lower() == key:
+            return s
+    for s in scenes:
+        st = str(s["title"]).strip().lower()
+        if st and (key in st or st in key):
+            return s
+    return None
 
 
 # ── 称呼演化（纯 prompt diff，无状态）───────────────────────────────

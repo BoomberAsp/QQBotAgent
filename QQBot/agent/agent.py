@@ -71,6 +71,25 @@ _CHAR_CREATION_INTERVIEW_INSTRUCTIONS = (
 )
 
 
+# 剧情场景演绎指令（Bond-System-Design.md §4.4 形态3，P3）。注入在 L4 易变尾部，
+# 仅当特殊会话 metadata.kind == "bond_scene" 时生效；complete_scene 工具由
+# turn.py 在该类会话中通过 allowed_tools 下发。脚本正文另由 metadata["script"]
+# 紧随其后注入。全程 in-character，按分幕推进，结局调 complete_scene 收尾。
+_BOND_SCENE_INSTRUCTIONS = (
+    "## 剧情场景（进行中）\n"
+    "你正与用户共同经历一段专属剧情场景。规则：\n"
+    "1. **全程保持角色**：用你自己的口吻、称呼与性格演绎，不要跳出人设、不要以助手身份说话。\n"
+    "2. 按下方「本场剧情脚本」的分幕自然推进：根据用户的回应即兴发挥，但保持脚本的走向与"
+    "氛围；一幕收束后自然过渡到下一幕，不要生硬报幕。\n"
+    "3. 多描写场景感（环境、动作、神态、语气），让对话有画面感；接住用户在场景中的选择与情绪。\n"
+    "4. 当剧情走到**结局**（脚本最后一幕完成、或你们自然地抵达终点）时，调用 `complete_scene` "
+    "工具收尾，可用 `memento` 参数以你的口吻写一句纪念语（≤40 字）镌刻在纪念卡上；"
+    "调用后请再说一段温柔的收尾白，为这段经历画上句点。\n"
+    "5. 不要主动报好感数值或工具细节；系统会在本轮结束后送出纪念卡片。\n"
+    "6. 若用户想提前退出，提示 /结束会话（提前退出不会获得完成奖励与纪念卡）。"
+)
+
+
 def _display_tool_name(tool_call: dict) -> str:
     """Return a human-facing tool name for the progress message.
 
@@ -592,6 +611,14 @@ class Agent:
             # get create_character in allowed_tools (agent_router).
             if (special_session.metadata or {}).get("kind") == "char_creation":
                 volatile.append(_CHAR_CREATION_INTERVIEW_INSTRUCTIONS)
+            # Bond story-scene session (Bond-System-Design.md §4.4 形态3, P3):
+            # scene sessions carry metadata {"kind": "bond_scene", ...} and get
+            # complete_scene in allowed_tools (turn.py). The script body follows.
+            elif (special_session.metadata or {}).get("kind") == "bond_scene":
+                volatile.append(_BOND_SCENE_INSTRUCTIONS)
+                script = (special_session.metadata or {}).get("script") or ""
+                if script:
+                    volatile.append(f"## 本场剧情脚本\n{script}")
 
         # Workspace quota usage (changes whenever the user writes files)
         if self.workspaces:

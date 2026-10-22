@@ -4424,6 +4424,37 @@ _P2_CARD = """# 测试角色
 第七级解锁的档案内容C。
 """
 
+# P3: 场景 tier（标题含「场景」）与档案 tier 混排，验证区分/解析/防泄漏
+_P3_CARD = """# 测试角色P3
+
+<!-- mode: split | task_voice: character -->
+
+## Core Personality
+
+一个测试用角色。
+
+## Bond Tiers
+
+### Lv3 · 熟悉
+
+第三级档案内容A。
+
+### Lv4 · 场景 · 雨夜谈心
+
+【第一幕 · 骤雨】夜里突降暴雨，你们躲进废弃哨塔。
+【第二幕 · 火光】你们生火烘衣服，聊起往事。
+【终幕 · 雨停之约】雨停了，她把护身符塞进你手里。至此剧情自然收束，调用 complete_scene 收尾。
+
+### Lv5 · 密友
+
+第五级档案内容B。
+
+### Lv6 · 场景 · 星空之约
+
+【第一幕】山顶看星星。
+【终幕】流星划过。调用 complete_scene 收尾。
+"""
+
 
 class TestBondContent:
     """Test agent/bond_content.py — card parsing (gift prefs / tiers / address)."""
@@ -4433,6 +4464,7 @@ class TestBondContent:
         self.test_gift_preferences()
         self.test_match_gift()
         self.test_bond_tiers()
+        self.test_scenes()
         self.test_address_directive()
         self.test_builtin_cards_parse()
 
@@ -4477,6 +4509,35 @@ class TestBondContent:
         assert bc.unlocked_tiers_text(_P2_CARD, 1) == ""
         print_pass("parse/unlocked/unlocking_at/text tiers by level")
 
+    def test_scenes(self):
+        """P3: 场景 tier 解析 / 可用性 / get_scene / 动态层防泄漏。"""
+        from agent import bond_content as bc
+        tiers = bc.parse_bond_tiers(_P3_CARD)
+        assert [bc.is_scene_tier(t) for t in tiers] == [False, True, False, True], tiers
+        scenes = bc.parse_scenes(_P3_CARD)
+        assert [s["level"] for s in scenes] == [4, 6], scenes
+        assert [s["title"] for s in scenes] == ["雨夜谈心", "星空之约"], scenes
+        assert str(scenes[0]["raw_title"]).startswith("场景")
+        assert "第一幕" in scenes[0]["body"] and "complete_scene" in scenes[0]["body"]
+        # availability by level
+        assert [s["title"] for s in bc.scenes_available(_P3_CARD, 5)] == ["雨夜谈心"]
+        assert [s["title"] for s in bc.scenes_available(_P3_CARD, 3)] == []
+        assert [s["title"] for s in bc.scenes_unlocking_at(_P3_CARD, 6)] == ["星空之约"]
+        assert bc.scenes_unlocking_at(_P3_CARD, 5) == []
+        # get_scene: exact / marker prefix / substring both directions / miss
+        assert bc.get_scene(_P3_CARD, "雨夜谈心")["level"] == 4
+        assert bc.get_scene(_P3_CARD, "场景 · 雨夜谈心")["level"] == 4
+        assert bc.get_scene(_P3_CARD, "雨夜")["level"] == 4
+        assert bc.get_scene(_P3_CARD, "雨夜谈心（加长版）")["level"] == 4
+        assert bc.get_scene(_P3_CARD, "不存在的剧情") is None
+        assert bc.get_scene(_P3_CARD, "   ") is None
+        assert bc.get_scene("", "雨夜谈心") is None
+        # leak guard: scene scripts must NOT enter the ordinary dynamic layer
+        txt = bc.unlocked_tiers_text(_P3_CARD, 10)
+        assert "档案内容A" in txt and "档案内容B" in txt
+        assert "第一幕" not in txt and "雨夜谈心" not in txt, txt
+        print_pass("scenes: is_scene/parse/available/get_scene + tier-text leak guard")
+
     def test_address_directive(self):
         from agent import bond_content as bc
         assert "刚认识" in bc.address_directive(1)
@@ -4497,7 +4558,15 @@ class TestBondContent:
             tiers = bc.parse_bond_tiers(card)
             assert len(tiers) >= 3, f"{fname} needs structured Bond Tiers"
             assert all(isinstance(t["level"], int) for t in tiers)
-        print_pass("builtin rubi/roxy_character cards parse (gifts + tiers)")
+            # P3: each builtin card ships at least one playable scene whose
+            # script never leaks into the ordinary conversation dynamic layer
+            scenes = bc.parse_scenes(card)
+            assert scenes, f"{fname} needs at least one 场景 tier"
+            assert all(str(s["body"]).strip() for s in scenes), f"{fname} empty scene"
+            leak = bc.unlocked_tiers_text(card, 99)
+            for s in scenes:
+                assert str(s["title"]) not in leak, f"{fname} scene leaked"
+        print_pass("builtin cards parse (gifts + tiers + scenes, no leak)")
 
 
 class TestBondGiftPoke:
@@ -5050,6 +5119,486 @@ class TestPersonalityMarkerPersistence:
             turn._personality_switch_marker.update(orig_marker)
 
 
+# ── P3a: bond scenes / commemorative card / reunion & anniversary ──
+
+def _import_turn_for_tests():
+    """Import agent.turn with USER_DATA_ROOT kept off the production path."""
+    os.environ.setdefault("USER_DATA_ROOT", "/tmp/qqbot_smoke")
+    import agent.turn as turn
+    return turn
+
+
+def _tmp_bond_manager(tmp):
+    from agent.bond import BondManager
+    return BondManager(
+        base_dir=os.path.join(tmp, "bonds"),
+        config_path=os.path.join(tmp, "no_such_config.json"),
+    )
+
+
+class TestBondScene:
+    """P3a: scene settlement — bond.complete_scene + social_tools + card."""
+
+    def run(self):
+        print_header("31. Bond Scene Settlement (P3a)")
+        self.test_complete_scene_one_shot()
+        self.test_scene_done_records()
+        asyncio.run(self.test_complete_scene_tool())
+        self.test_render_scene_card()
+
+    def test_complete_scene_one_shot(self):
+        tmp = tempfile.mkdtemp(prefix="scene_")
+        try:
+            m = _tmp_bond_manager(tmp)
+            r = m.complete_scene("u1", "rubi", "雨夜谈心")
+            assert r["accepted"] and r["exp_gained"] == 100, r
+            # 0 + 100 EXP → Lv2 (threshold 100)
+            assert r["level"] == 2 and any(u["level"] == 2 for u in r["level_ups"]), r
+            # repeat completion → no reward, EXP untouched
+            r2 = m.complete_scene("u1", "rubi", "雨夜谈心")
+            assert r2["accepted"] is False and r2["reason"] == "already_done", r2
+            assert r2["exp_gained"] == 0 and r2["exp"] == r["exp"], r2
+            assert r2["level_ups"] == []
+            # a different scene still rewards
+            r3 = m.complete_scene("u1", "rubi", "星空之约")
+            assert r3["accepted"] and r3["exp_gained"] == 100, r3
+            # mood got a bump
+            assert m.get_state("u1", "rubi")["mood"] > 0
+            print_pass("complete_scene one-shot +100 EXP → Lv2; dup blocked")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_scene_done_records(self):
+        tmp = tempfile.mkdtemp(prefix="scene_")
+        try:
+            m = _tmp_bond_manager(tmp)
+            assert m.mark_scene_done("u1", "rubi", "雨夜谈心") is True
+            assert m.mark_scene_done("u1", "rubi", "雨夜谈心") is False  # dup
+            assert m.mark_scene_done("u1", "rubi", "  ") is False        # blank
+            assert m.has_done_scene("u1", "rubi", "雨夜谈心") is True
+            assert m.has_done_scene("u1", "rubi", "星空之约") is False
+            done = m.scenes_done("u1", "rubi")
+            assert list(done) == ["雨夜谈心"] and done["雨夜谈心"] > 0
+            # per-character / unknown-user isolation
+            assert m.has_done_scene("u1", "roxy", "雨夜谈心") is False
+            assert m.has_done_scene("ghost", "rubi", "雨夜谈心") is False
+            assert m.scenes_done("ghost", "rubi") == {}
+            print_pass("mark/has/scenes_done records + isolation")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def test_complete_scene_tool(self):
+        from tools.social_tools import complete_scene
+        tmp = tempfile.mkdtemp(prefix="scene_")
+        try:
+            m = _tmp_bond_manager(tmp)
+            out = await complete_scene(
+                user_id="u1", char_id="rubi", scene_title="雨夜谈心",
+                bond_manager=m, memento="雨停之后，心还没停。",
+            )
+            assert out["ok"] and out["result"]["accepted"], out
+            assert out["result"]["memento"] == "雨停之后，心还没停。"
+            assert out["result"]["scene_title"] == "雨夜谈心"
+            obs = out["observation"]
+            assert "雨夜谈心" in obs and "收尾" in obs and "纪念卡" in obs, obs
+            assert "Lv2" in obs, obs  # level-up surfaced to the character
+            # shared-memory events: completion + level-up
+            ev = m.recent_events("u1", "rubi", 5)
+            assert any("完成了剧情场景「雨夜谈心」" in e for e in ev), ev
+            assert any("羁绊提升到了 Lv2" in e for e in ev), ev
+            # duplicate → gentle already-done observation, no new events
+            out2 = await complete_scene(
+                user_id="u1", char_id="rubi", scene_title="雨夜谈心", bond_manager=m,
+            )
+            assert out2["ok"] and out2["result"]["accepted"] is False
+            assert "早已完成" in out2["observation"], out2["observation"]
+            assert len(m.recent_events("u1", "rubi", 10)) == len(ev)
+            # missing scene_title degrades to a generic title, still settles
+            out3 = await complete_scene(
+                user_id="u2", char_id="rubi", scene_title="  ", bond_manager=m,
+            )
+            assert out3["ok"] and out3["result"]["scene_title"] == "这段剧情"
+            # error path
+            err = await complete_scene(
+                user_id="", char_id="rubi", scene_title="x", bond_manager=m,
+            )
+            assert err["ok"] is False and err["observation"].startswith("[Error]")
+            print_pass("social_tools.complete_scene obs/events/dup/generic/error")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_render_scene_card(self):
+        from tools.card_renderer import render_scene_card, scene_card_path
+        tmp = tempfile.mkdtemp(prefix="scene_card_")
+        try:
+            entry = {
+                "char_name": "露比", "scene_title": "雨夜谈心",
+                "level": 4, "level_title": "朋友",
+                "date": "2026-10-23", "memento": "雨停之后，心还没停。",
+            }
+            out = os.path.join(tmp, "card.png")
+            p = render_scene_card(entry, out_path=out)
+            assert p == out and os.path.isfile(p) and os.path.getsize(p) > 1000
+            # degraded entry (all defaults) still renders, never raises
+            p2 = render_scene_card({}, out_path=os.path.join(tmp, "empty.png"))
+            assert p2 and os.path.isfile(p2)
+            # long memento wraps without error
+            p3 = render_scene_card(
+                dict(entry, memento="很长很长的纪念语。" * 12),
+                out_path=os.path.join(tmp, "long.png"))
+            assert p3 and os.path.isfile(p3)
+            # path helper: slug sanitized, per char+scene
+            sp = scene_card_path(entry)
+            assert sp.endswith(".png") and "露比" in sp and "雨夜谈心" in sp
+            assert scene_card_path({}) .endswith(".png")
+            print_pass("render_scene_card renders full/empty/long entries to PNG")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestSceneSession:
+    """P3a: L4 injection, opening seed, level-up routing, command, finish."""
+
+    def run(self):
+        print_header("32. Bond-Scene Session & Commands (P3a)")
+        self.turn = _import_turn_for_tests()
+        self.test_l4_injection()
+        self.test_scene_opening_line()
+        asyncio.run(self.test_emit_level_ups_routing())
+        asyncio.run(self.test_scene_command())
+        asyncio.run(self.test_finish_bond_scene())
+
+    def test_l4_injection(self):
+        from agent.tool_registry import ToolRegistry
+        from agent.agent import Agent
+        from agent.session import Session
+        from agent.special_session import SpecialSession
+
+        agent = Agent(
+            deepseek_client=MockDeepSeekClient(),
+            tool_registry=ToolRegistry(),
+            config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+        )
+        sess = Session(user_id="u1")
+
+        def _tail(sp):
+            msgs = agent._build_messages(sess, "……", sp)
+            sys_msgs = [m for m in msgs if m["role"] == "system"]
+            return sys_msgs[-1]["content"]
+
+        script = "【第一幕 · 骤雨】夜里突降暴雨。\n【终幕 · 雨停之约】雨停了。"
+        scene = SpecialSession(
+            session_id="sc1", user_id="u1", name="剧情·雨夜谈心",
+            metadata={"kind": "bond_scene", "char_id": "rubi",
+                      "scene_title": "雨夜谈心", "script": script,
+                      "completed": False})
+        tail = _tail(scene)
+        assert "剧情场景（进行中）" in tail and "complete_scene" in tail, tail
+        assert "本场剧情脚本" in tail and "骤雨" in tail and "雨停之约" in tail, tail
+
+        # char_creation → interview only, no scene block
+        creation = SpecialSession(session_id="c1", user_id="u1", name="角色创作",
+                                  metadata={"kind": "char_creation"})
+        t2 = _tail(creation)
+        assert "角色创作访谈" in t2 and "剧情场景（进行中）" not in t2
+        # ordinary special session → neither
+        normal = SpecialSession(session_id="s1", user_id="u1", name="普通会话")
+        t3 = _tail(normal)
+        assert "特殊会话模式" in t3 and "剧情场景（进行中）" not in t3
+        print_pass("L4 scene instructions + script only for kind=bond_scene")
+
+    def test_scene_opening_line(self):
+        turn = self.turn
+        orig = turn.get_character_registry
+        try:
+            reg = MagicMock()
+            reg.get_short_name.return_value = "露比"
+            turn.get_character_registry = lambda: reg
+            scene = {"title": "雨夜谈心",
+                     "body": ("# 标题行应被跳过\n> 引用行也应被跳过\n"
+                              "【第一幕 · 骤雨】夜里突降暴雨，你们躲进哨塔。\n"
+                              "【终幕】雨停了。")}
+            line = turn._scene_opening_line("rubi", "雨夜谈心", scene)
+            assert "剧情《雨夜谈心》开始" in line, line
+            assert "第一幕" in line and "终幕" not in line, line  # first act only
+            assert "/结束会话" in line and "露比" in line, line
+            # empty body → generic framed fallback
+            line2 = turn._scene_opening_line(
+                "rubi", "星空之约", {"title": "星空之约", "body": "  "})
+            assert "剧情《星空之约》开始" in line2 and "/结束会话" in line2
+            print_pass("opening seed: first act line, skips #/>; framed fallback")
+        finally:
+            turn.get_character_registry = orig
+
+    async def test_emit_level_ups_routing(self):
+        """档案 tier → 🔓 解锁提示；场景 tier → 私聊邀请（群聊/已完成不邀请）。"""
+        turn = self.turn
+        tmp = tempfile.mkdtemp(prefix="scene_lv_")
+        orig = (turn._bond_manager, turn._safe_send, turn.get_character_registry,
+                turn._send_level_up_notice)
+        sent = []
+        try:
+            m = _tmp_bond_manager(tmp)
+            turn._bond_manager = m
+
+            async def fake_send(payload, sender=None):
+                sent.append(payload)
+
+            async def noop_notice(*a, **k):
+                return None
+
+            reg = MagicMock()
+            reg.load.return_value = _P3_CARD
+            reg.get_short_name.return_value = "露比"
+            turn.get_character_registry = lambda: reg
+            turn._safe_send = fake_send
+            turn._send_level_up_notice = noop_notice
+
+            # Lv3 → archive tier unlock notice, no invite
+            await turn._emit_level_ups("u1", "rubi", [{"level": 3, "title": "熟悉"}])
+            assert any("羁绊档案解锁" in s and "熟悉" in s for s in sent), sent
+            assert not any("剧情" in s for s in sent), sent
+            ev = m.recent_events("u1", "rubi", 5)
+            assert any("解锁了新的羁绊档案「熟悉」" in e for e in ev), ev
+
+            # Lv4 (private) → scene invite, NO archive notice
+            sent.clear()
+            await turn._emit_level_ups("u1", "rubi", [{"level": 4, "title": "朋友"}])
+            assert len(sent) == 1 and "雨夜谈心" in sent[0], sent
+            assert "/剧情 雨夜谈心" in sent[0], sent[0]
+            assert not any("羁绊档案解锁" in s for s in sent), sent
+
+            # group chat → no invite at all
+            sent.clear()
+            await turn._emit_level_ups("u1", "rubi", [{"level": 4, "title": "朋友"}],
+                                       is_group=True)
+            assert not any("雨夜谈心" in s for s in sent), sent
+
+            # already-completed scene → no repeat invite
+            m.mark_scene_done("u1", "rubi", "雨夜谈心")
+            sent.clear()
+            await turn._emit_level_ups("u1", "rubi", [{"level": 4, "title": "朋友"}])
+            assert not any("雨夜谈心" in s for s in sent), sent
+            print_pass("level-up routing: archive→🔓 notice, scene→private invite")
+        finally:
+            (turn._bond_manager, turn._safe_send, turn.get_character_registry,
+             turn._send_level_up_notice) = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def test_scene_command(self):
+        """/剧情 列表 / 启动 / 群聊拒绝 / 未知名 / 非命令。"""
+        turn = self.turn
+        tmp = tempfile.mkdtemp(prefix="scene_cmd_")
+        orig = (turn._bond_manager, turn._safe_send, turn.get_character_registry,
+                turn._start_bond_scene)
+        sent, started = [], []
+        try:
+            m = _tmp_bond_manager(tmp)
+            st = m.get_state("u1", "rubi")
+            st["level"] = 5  # 雨夜谈心(Lv4) 可体验；星空之约(Lv6) 未解锁
+            m._save("u1")
+            turn._bond_manager = m
+
+            async def fake_send(payload, sender=None):
+                sent.append(payload)
+
+            async def fake_start(user_id, char_id, scene):
+                started.append((user_id, char_id, scene["title"]))
+
+            reg = MagicMock()
+            reg.resolve_effective_personality.return_value = "rubi"
+            reg.load.return_value = _P3_CARD
+            reg.get_short_name.return_value = "露比"
+            reg.get_display_name.return_value = "露比 (Rubi)"
+            turn.get_character_registry = lambda: reg
+            turn._safe_send = fake_send
+            turn._start_bond_scene = fake_start
+
+            view = MagicMock()
+            view.group_id = None
+            view.is_group = False
+
+            # list
+            assert await turn._handle_scene_command("/剧情", "u1", view) is True
+            msg = sent[-1]
+            assert "雨夜谈心" in msg and "可体验" in msg, msg
+            assert "星空之约" in msg and "羁绊 Lv6 解锁" in msg, msg
+            # start via substring title
+            assert await turn._handle_scene_command("/剧情 雨夜", "u1", view) is True
+            assert started == [("u1", "rubi", "雨夜谈心")], started
+            # completed scene marked in the list
+            m.mark_scene_done("u1", "rubi", "雨夜谈心")
+            await turn._handle_scene_command("#剧情", "u1", view)
+            assert "已完成" in sent[-1], sent[-1]
+            # group → refuse, no start
+            view.is_group = True
+            view.group_id = "g1"
+            await turn._handle_scene_command("/剧情 星空之约", "u1", view)
+            assert "私聊" in sent[-1] and len(started) == 1, (sent[-1], started)
+            # unknown title (private)
+            view.is_group = False
+            view.group_id = None
+            await turn._handle_scene_command("/剧情 不存在的剧情", "u1", view)
+            assert "没有找到" in sent[-1] and len(started) == 1
+            # non-command → not handled
+            assert await turn._handle_scene_command("/剧情x", "u1", view) is False
+            assert await turn._handle_scene_command("剧情", "u1", view) is False
+            print_pass("/剧情: list(可体验/已完成/门槛) + start + group refuse + miss")
+        finally:
+            (turn._bond_manager, turn._safe_send, turn.get_character_registry,
+             turn._start_bond_scene) = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def test_finish_bond_scene(self):
+        """post-run 收尾：纪念卡 entry 正确 + 图片发送 + 会话关闭；失败静默。"""
+        turn = self.turn
+        tmp = tempfile.mkdtemp(prefix="scene_fin_")
+        orig = (turn._bond_manager, turn._special_sessions, turn._safe_send,
+                turn.get_character_registry, turn.render_scene_card)
+        sent, entries = [], []
+        try:
+            m = _tmp_bond_manager(tmp)
+            turn._bond_manager = m
+            special = MagicMock()
+            turn._special_sessions = special
+
+            async def fake_send(payload, sender=None):
+                sent.append(payload)
+
+            turn._safe_send = fake_send
+            reg = MagicMock()
+            reg.get_display_name.return_value = "露比 (Rubi)"
+            reg.get_short_name.return_value = "露比"
+            turn.get_character_registry = lambda: reg
+
+            def fake_render(entry, out_path=None):
+                entries.append(entry)
+                return os.path.join(tmp, "card.png")
+
+            turn.render_scene_card = fake_render
+            result = {"char_id": "rubi", "scene_title": "雨夜谈心", "level": 4,
+                      "level_ups": [], "memento": "雨停之后，心还没停。"}
+            await turn._finish_bond_scene("u1", result)
+            # card entry assembled from result + bond title
+            assert entries and entries[0]["scene_title"] == "雨夜谈心", entries
+            assert entries[0]["char_name"] == "露比 (Rubi)"
+            assert entries[0]["memento"] == "雨停之后，心还没停。"
+            assert entries[0]["level"] == 4
+            assert entries[0]["level_title"] == m.title_for(4)
+            assert entries[0]["date"] == time.strftime("%Y-%m-%d")
+            # image sent with a label, session closed
+            assert len(sent) == 1
+            assert getattr(sent[0], "path", "").endswith("card.png"), sent[0]
+            assert "羁绊纪念" in getattr(sent[0], "label", ""), sent[0]
+            special.end_active.assert_called_once_with("u1")
+            # render failure (None) → no image, session still closed, no raise
+            sent.clear()
+            special.reset_mock()
+            turn.render_scene_card = lambda entry, out_path=None: None
+            await turn._finish_bond_scene("u1", result)
+            assert sent == [] and special.end_active.called
+            print_pass("finish: card entry/send + end_active; render None degrades")
+        finally:
+            (turn._bond_manager, turn._special_sessions, turn._safe_send,
+             turn.get_character_registry, turn.render_scene_card) = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestBondReunionAnniversary:
+    """P3a: passive reunion + anniversary — prompt injection & once-guards."""
+
+    def run(self):
+        print_header("33. Bond Reunion & Anniversary (P3a)")
+        self.test_reunion_pending_and_context()
+        self.test_note_reunion_guard()
+        self.test_anniversary_pending_and_note()
+        self.test_anniversary_no_trickle()
+
+    def _aged_state(self, m, user, char, *, last_seen_days=0.0, first_met_days=0.0):
+        """Create state via settle_turn, then backdate stats for time-based tests."""
+        m.settle_turn(user, char)
+        st = m.get_state(user, char)
+        now = time.time()
+        if last_seen_days:
+            st["stats"]["last_seen"] = now - last_seen_days * 86400
+        if first_met_days:
+            st["stats"]["first_met"] = now - first_met_days * 86400
+        m._save(user)
+        return st
+
+    def test_reunion_pending_and_context(self):
+        tmp = tempfile.mkdtemp(prefix="reunion_")
+        try:
+            m = _tmp_bond_manager(tmp)
+            self._aged_state(m, "u1", "rubi", last_seen_days=20, first_met_days=25)
+            gap = m.reunion_pending("u1", "rubi")
+            assert gap == 20, gap  # ≥ reunion_days(14) → gap returned
+            ctx = m.build_prompt_context("u1", "rubi", "露比")
+            assert "久别重逢" in ctx and "20 天" in ctx, ctx
+            # fresh gap → no reunion
+            self._aged_state(m, "u2", "rubi", last_seen_days=1)
+            assert m.reunion_pending("u2", "rubi") == 0
+            assert "久别重逢" not in m.build_prompt_context("u2", "rubi", "露比")
+            # boundary: exactly reunion_days counts
+            self._aged_state(m, "u3", "rubi", last_seen_days=14.5)
+            assert m.reunion_pending("u3", "rubi") == 14
+            # no state / disabled config → 0
+            assert m.reunion_pending("ghost", "rubi") == 0
+            m._config["reunion_enabled"] = False
+            assert m.reunion_pending("u1", "rubi") == 0
+            assert "久别重逢" not in m.build_prompt_context("u1", "rubi", "露比")
+            print_pass("reunion_pending + 久别重逢 injection (gap/boundary/off)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_note_reunion_guard(self):
+        tmp = tempfile.mkdtemp(prefix="reunion_")
+        try:
+            m = _tmp_bond_manager(tmp)
+            self._aged_state(m, "u1", "rubi", last_seen_days=20)
+            assert m.note_reunion("u1", "rubi") is True   # first today → log event
+            assert m.note_reunion("u1", "rubi") is False  # once-per-day guard
+            print_pass("note_reunion once-per-day guard")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_anniversary_pending_and_note(self):
+        tmp = tempfile.mkdtemp(prefix="anniv_")
+        try:
+            m = _tmp_bond_manager(tmp)
+            self._aged_state(m, "u1", "rubi", first_met_days=31)  # day 32 ≥ 30
+            assert m.anniversary_pending("u1", "rubi") == 30
+            ctx = m.build_prompt_context("u1", "rubi", "露比")
+            assert "纪念日" in ctx and "第 30 天" in ctx, ctx
+            assert m.note_anniversary("u1", "rubi") == 30
+            assert m.anniversary_pending("u1", "rubi") is None
+            assert m.note_anniversary("u1", "rubi") is None  # idempotent
+            assert "纪念日" not in m.build_prompt_context("u1", "rubi", "露比")
+            # below first milestone → nothing
+            self._aged_state(m, "u2", "rubi", first_met_days=5)
+            assert m.anniversary_pending("u2", "rubi") is None
+            assert m.note_anniversary("u2", "rubi") is None
+            assert m.anniversary_pending("ghost", "rubi") is None
+            print_pass("anniversary pending/note + 纪念日 injection + once-guard")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_anniversary_no_trickle(self):
+        """长期缺席用户跳级：一次标记全部已越过里程碑，不逐回合滴灌。"""
+        tmp = tempfile.mkdtemp(prefix="anniv_")
+        try:
+            m = _tmp_bond_manager(tmp)
+            self._aged_state(m, "u1", "rubi", first_met_days=400)  # day 401
+            assert m.anniversary_pending("u1", "rubi") == 365      # largest hit
+            assert m.note_anniversary("u1", "rubi") == 365
+            st = m.get_state("u1", "rubi")
+            assert set(st["anniversaries_marked"]) == {30, 100, 365}, st
+            assert m.anniversary_pending("u1", "rubi") is None     # no trickle
+            print_pass("absent-user jump marks ALL passed milestones at once")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -5088,6 +5637,9 @@ def main():
         ("WebUI Official Status Aggregator", TestWebuiOfficialStatus()),
         ("WebUI Permissions Editor", TestWebuiPermissionsEditor()),
         ("Personality Marker Persistence (A+B)", TestPersonalityMarkerPersistence()),
+        ("Bond Scene Settlement (P3a)", TestBondScene()),
+        ("Bond-Scene Session & Commands (P3a)", TestSceneSession()),
+        ("Bond Reunion & Anniversary (P3a)", TestBondReunionAnniversary()),
     ]
 
     passed = 0

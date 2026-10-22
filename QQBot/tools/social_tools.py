@@ -77,3 +77,75 @@ GIVE_GIFT_SCHEMA: Dict[str, Any] = {
     },
     "required": ["gift_name"],
 }
+
+
+# ── P3: 剧情场景收尾 ──────────────────────────────────────────────
+
+async def complete_scene(
+    *,
+    user_id: str,
+    char_id: str,
+    scene_title: str,
+    bond_manager,
+    memento: str = "",
+) -> Dict[str, Any]:
+    """Settle a finished bond scene; return {"ok", "result", "observation"}.
+
+    Settlement is one-shot and guarded by ``bond_manager.complete_scene``
+    (+scene_exp, mood bump, mark scenes_done — a repeat completion yields
+    accepted=False and no EXP). The character-plane LLM receives
+    ``observation`` and speaks a closing line in the same turn. The turn.py
+    closure flags ``_pending_bond_scene_done`` and returns ``observation`` as
+    the tool string; the post-run hook consumes ``result`` (level_ups / exp /
+    memento) to send the level-up notice + commemorative card and to close the
+    special session. Mirrors give_gift (settlement + event log live here).
+    """
+    scene_title = (scene_title or "").strip()
+    if not user_id or not char_id:
+        return {"ok": False, "result": {},
+                "observation": "[Error] 缺少用户或角色上下文，无法收尾场景。"}
+    title = scene_title or "这段剧情"
+    memento = (memento or "").strip()
+
+    bond_result = bond_manager.complete_scene(user_id, char_id, title)
+    result = dict(bond_result)
+    result["scene_title"] = title
+    result["char_id"] = char_id
+    result["memento"] = memento
+
+    if not bond_result.get("accepted"):
+        return {
+            "ok": True, "result": result,
+            "observation": (
+                f"剧情「{title}」其实早已完成过、回忆也已珍藏。"
+                f"请以角色口吻温柔地告诉用户这一点，并邀请 TA 去体验别的剧情。"
+            ),
+        }
+
+    bond_manager.append_event(user_id, char_id, f"完成了剧情场景「{title}」")
+    parts = [f"剧情「{title}」已走向结局，你们的羁绊因此更深了。"]
+    for up in bond_result.get("level_ups", []):
+        bond_manager.append_event(
+            user_id, char_id, f"羁绊提升到了 Lv{up['level']}（{up['title']}）"
+        )
+        parts.append(f"你们的好感提升到了 Lv{up['level']}（{up['title']}）！")
+    parts.append(
+        "请以角色口吻说一段收尾的话，为这段共同经历画上温柔的句点"
+        "（可以回望场景中最打动人的一个瞬间，或轻声约定下一次）。"
+        "不要报数值；本轮结束后系统会送出一张纪念卡片。"
+    )
+    return {"ok": True, "result": result, "observation": " ".join(parts)}
+
+
+# complete_scene 工具的 JSON Schema。LLM 无需传场景名（turn.py 闭包从当前
+# bond_scene 会话 metadata 读取）；memento 为可选的卡面纪念语。
+COMPLETE_SCENE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "memento": {
+            "type": "string",
+            "description": "以角色口吻写的一句纪念语（≤40 字），将镌刻在纪念卡片上，概括本场景最难忘的瞬间",
+        },
+    },
+    "required": [],
+}

@@ -25,6 +25,7 @@ never blocks on network state.
 import hashlib
 import json
 import os
+import re
 import threading
 
 from PIL import Image, ImageDraw, ImageFont
@@ -1248,6 +1249,180 @@ def render_changelog_card(entries: list, out_path: str | None = None,
 
     if out_path is None:
         out_path = _CHANGELOG_CARD_PATH
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.convert("RGB").save(out_path, "PNG")
+    return out_path
+
+
+# ── Bond 剧情场景纪念卡（P3）───────────────────────────────────────
+#
+# 一次性纪念卡：完成一个剧情场景后渲染并发送（Bond-System-Design.md §4.4）。
+# 与 wiki 数据卡不同，它不做 hash 缓存（每个场景一生只完成一次，scenes_done
+# 已防重复），直接落盘到 scene_cards/。暖玫瑰金主题，区别于元素色 wiki 卡。
+
+_SCENE_CARD_DIR = os.path.join(_CACHE_DIR, "scene_cards")
+
+_SCENE_ROSE = (236, 100, 130)       # 主玫瑰红
+_SCENE_ROSE_DIM = (150, 62, 88)     # 暗玫瑰（描边/阴影）
+_SCENE_GOLD = (240, 205, 130)       # 暖金（装饰/日期）
+_SCENE_BG = (33, 26, 33)            # 暖调深色背景
+_SCENE_PANEL = (44, 34, 43)         # 内嵌面板
+
+
+def _draw_heart(draw: ImageDraw.ImageDraw, cx: float, cy: float,
+                size: float, color: tuple, outline: tuple | None = None):
+    """Draw a heart centred near (cx, cy) within a ``size``-wide box."""
+    r = size / 4.0
+    draw.ellipse((cx - 2 * r, cy - 1.4 * r, cx, cy + 0.6 * r), fill=color)
+    draw.ellipse((cx, cy - 1.4 * r, cx + 2 * r, cy + 0.6 * r), fill=color)
+    draw.polygon(
+        [(cx - 2 * r + 1, cy - 0.1 * r), (cx + 2 * r - 1, cy - 0.1 * r),
+         (cx, cy + 2.1 * r)],
+        fill=color,
+    )
+    if outline:
+        draw.ellipse((cx - 2 * r, cy - 1.4 * r, cx, cy + 0.6 * r), outline=outline, width=2)
+        draw.ellipse((cx, cy - 1.4 * r, cx + 2 * r, cy + 0.6 * r), outline=outline, width=2)
+
+
+def scene_card_path(entry: dict) -> str:
+    """Stable-ish output path for a scene commemorative card."""
+    char_name = str(entry.get("char_name") or "char").strip()
+    scene_title = str(entry.get("scene_title") or "scene").strip()
+    slug = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", f"{char_name}_{scene_title}")[:80]
+    return os.path.join(_SCENE_CARD_DIR, f"{slug or 'scene'}.png")
+
+
+def render_scene_card(entry: dict, out_path: str | None = None) -> str | None:
+    """Render a bond-scene commemorative card (P3, dark rose-gold theme).
+
+    ``entry`` keys (all optional, degrade gracefully):
+        char_name    角色名（大标题）
+        scene_title  场景标题（如「雨夜谈心」）
+        level        达成时的好感等级（数字）
+        level_title  等级称号（如「朋友」）
+        date         完成日期（如「2026-10-23」）
+        memento      纪念文案（可多行，自动按像素宽换行）
+
+    Returns the PNG path. Never raises on missing fields.
+    """
+    char_name = str(entry.get("char_name") or "TA").strip()
+    scene_title = str(entry.get("scene_title") or "共同的经历").strip()
+    level = entry.get("level")
+    level_title = str(entry.get("level_title") or "").strip()
+    date = str(entry.get("date") or "").strip()
+    memento = str(entry.get("memento") or "").strip()
+
+    probe = ImageDraw.Draw(Image.new("RGBA", (W, 10)))
+
+    # ── font sizes ──
+    title_font = 26
+    name_font = 54
+    sub_font = 22
+    scene_font = 38
+    meta_font = 22
+    body_font = 26
+
+    # ── measure wrapped blocks ──
+    memo_pad = 26
+    inner_w = W - 2 * PAD - 2 * memo_pad
+    memento_lines = _wrap(probe, memento, body_font, inner_w) if memento else []
+    scene_max = W - 2 * PAD - 40
+    scene_lines = _wrap(probe, scene_title, scene_font, scene_max) or [scene_title]
+
+    # level pill text
+    try:
+        lv_txt = f"Lv{int(level)}" if level not in (None, "") else ""
+    except (TypeError, ValueError):
+        lv_txt = str(level).strip()
+    pill_txt = f"{lv_txt} · {level_title}" if lv_txt and level_title else (lv_txt or level_title)
+
+    heart_h = 80
+    title_h = _lh(title_font)
+    name_h = _lh(name_font)
+    sub_h = _lh(sub_font)
+    scene_line_h = _lh(scene_font)
+    pill_h = _lh(meta_font) + 18
+    date_h = _lh(meta_font)
+    memo_line_h = _lh(body_font)
+
+    # ── total height ──
+    total_h = PAD
+    total_h += heart_h + 6
+    total_h += title_h + 14
+    total_h += name_h + 6
+    total_h += sub_h + GAP
+    total_h += len(scene_lines) * scene_line_h + 18
+    if pill_txt:
+        total_h += pill_h + 14
+    if date:
+        total_h += date_h + GAP
+    if memento_lines:
+        total_h += 2 * memo_pad + len(memento_lines) * memo_line_h + GAP
+    total_h += PAD
+
+    canvas = Image.new("RGBA", (W, total_h), _SCENE_BG + (255,))
+    draw = ImageDraw.Draw(canvas)
+
+    # outer decorative border
+    draw.rounded_rectangle((10, 10, W - 11, total_h - 11), radius=26,
+                           outline=_SCENE_ROSE_DIM + (255,), width=3)
+
+    def center_text(y: float, text: str, size: int, fill: tuple) -> float:
+        x = (W - _tw(draw, text, size)) / 2
+        draw.text((x, y), text, font=_font(size), fill=fill + (255,))
+        return y + _lh(size)
+
+    y = PAD + 4
+    # heart ornament (centred)
+    _draw_heart(draw, W / 2, y + heart_h / 2 - 6, 64, _SCENE_ROSE + (255,))
+    y += heart_h + 6
+
+    y = center_text(y, "羁 绊 纪 念 卡", title_font, _SCENE_GOLD)
+    y += 14
+    y = center_text(y, char_name, name_font, _TEXT)
+    y += 6
+    y = center_text(y, "与你共同走过的一段时光", sub_font, _TEXT_FAINT)
+    y += GAP
+
+    # scene title (large, rose; wraps if long)
+    for ln in scene_lines:
+        x = (W - _tw(draw, ln, scene_font)) / 2
+        draw.text((x, y), ln, font=_font(scene_font), fill=_SCENE_ROSE + (255,))
+        y += scene_line_h
+    y += 18
+
+    # level pill
+    if pill_txt:
+        pill_w = _tw(draw, pill_txt, meta_font) + 44
+        px = (W - pill_w) / 2
+        draw.rounded_rectangle((px, y, px + pill_w, y + pill_h), radius=pill_h // 2,
+                               fill=_SCENE_ROSE_DIM + (255,))
+        draw.text((px + 22, y + (pill_h - _lh(meta_font)) // 2),
+                  pill_txt, font=_font(meta_font), fill=_SCENE_GOLD + (255,))
+        y += pill_h + 14
+
+    # date
+    if date:
+        y = center_text(y, f"— {date} —", meta_font, _TEXT_FAINT)
+        y += GAP
+
+    # memento panel
+    if memento_lines:
+        panel_x = PAD
+        panel_w = W - 2 * PAD
+        panel_h = 2 * memo_pad + len(memento_lines) * memo_line_h
+        draw.rounded_rectangle((panel_x, y, panel_x + panel_w, y + panel_h),
+                               radius=16, fill=_SCENE_PANEL + (255,))
+        ty = y + memo_pad
+        for ln in memento_lines:
+            draw.text((panel_x + memo_pad, ty), ln, font=_font(body_font),
+                      fill=_TEXT_DIM + (255,))
+            ty += memo_line_h
+        y += panel_h + GAP
+
+    if out_path is None:
+        out_path = scene_card_path(entry)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     canvas.convert("RGB").save(out_path, "PNG")
     return out_path

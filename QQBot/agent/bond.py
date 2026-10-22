@@ -60,6 +60,11 @@ _DEFAULTS: Dict[str, Any] = {
     "poke_exp": 5,                 # 戳一戳（摸头）
     "daily_poke_limit": 3,
     "poke_mood": 3.0,
+    # ── P3: 剧情场景 / 重逢 / 纪念日 ──
+    "scene_exp": 100,              # 完成一个剧情场景的一次性奖励
+    "scene_mood": 10.0,            # 完成场景的心情增量
+    "reunion_enabled": True,       # 久别重逢语气提示开关
+    "anniversary_days": [30, 100, 365, 730, 1095],  # 相识天数里程碑（可配）
 }
 
 # 角色面动态层固定提示：历史中的任务结果来自任务智能体（中立口吻），
@@ -225,6 +230,9 @@ class BondManager:
             "stats": {"first_met": now, "last_seen": now, "msgs": 0, "gifts": 0},
             "unlocked": [],
             "daily": self._new_daily(),
+            # P3
+            "scenes_done": {},           # {scene_title: ts} 已完成场景（防重复刷 EXP）
+            "anniversaries_marked": [],  # [int] 已庆祝的相识天数里程碑
         }
 
     def _new_daily(self) -> dict:
@@ -474,6 +482,151 @@ class BondManager:
             "level": self.level_for_exp(int(state["exp"])), "exp": state["exp"],
         }
 
+    # ── P3: 剧情场景完成记录（防重复刷 EXP）────────────────────────
+
+    def mark_scene_done(self, user_id: str, char_id: str, title: str) -> bool:
+        """Record a scene as completed. Returns False if it was already done
+        (调用方据此跳过 +scene_exp，防止重复完成刷分)。"""
+        key = str(title or "").strip()
+        if not key:
+            return False
+        state = self.get_state(user_id, char_id)
+        done = state.setdefault("scenes_done", {})
+        if not isinstance(done, dict):
+            done = {}
+            state["scenes_done"] = done
+        if key in done:
+            return False
+        done[key] = time.time()
+        self._save(user_id)
+        return True
+
+    def has_done_scene(self, user_id: str, char_id: str, title: str) -> bool:
+        state = self.get_state(user_id, char_id, create=False)
+        if not state:
+            return False
+        done = state.get("scenes_done")
+        return isinstance(done, dict) and str(title or "").strip() in done
+
+    def scenes_done(self, user_id: str, char_id: str) -> Dict[str, float]:
+        """{scene_title: ts} of completed scenes (empty if none)."""
+        state = self.get_state(user_id, char_id, create=False)
+        if not state:
+            return {}
+        done = state.get("scenes_done")
+        return dict(done) if isinstance(done, dict) else {}
+
+    def complete_scene(self, user_id: str, char_id: str, title: str) -> Dict[str, Any]:
+        """场景完成结算：一次性给 scene_exp + 心情（重复完成不给分）。
+
+        返回 {accepted, exp_gained, level_ups, level, exp}。accepted=False 表示
+        该场景已完成过（不再奖励）。调用方负责 append_event + 纪念卡片。
+        """
+        if not self.mark_scene_done(user_id, char_id, title):
+            state = self.get_state(user_id, char_id)
+            return {
+                "accepted": False, "reason": "already_done", "exp_gained": 0,
+                "level_ups": [], "level": self.level_for_exp(int(state.get("exp", 0))),
+                "exp": int(state.get("exp", 0)),
+            }
+        exp = int(self._config.get("scene_exp", 100))
+        level_ups = self.add_exp(user_id, char_id, exp)
+        state = self.get_state(user_id, char_id)
+        self._apply_mood(state, time.time(), float(self._config.get("scene_mood", 10.0)))
+        self._save(user_id)
+        return {
+            "accepted": True, "exp_gained": exp, "level_ups": level_ups,
+            "level": self.level_for_exp(int(state["exp"])), "exp": int(state["exp"]),
+        }
+
+    # ── P3: 久别重逢 / 纪念日（被动触发，入站回合内）──────────────
+
+    def _reunion_gap_days(self, state: dict, now: float) -> int:
+        last_seen = state.get("stats", {}).get("last_seen")
+        if not last_seen:
+            return 0
+        try:
+            return int((now - float(last_seen)) // 86400)
+        except (TypeError, ValueError):
+            return 0
+
+    def reunion_pending(self, user_id: str, char_id: str) -> int:
+        """Gap-days if this turn is a reunion (≥reunion_days) and enabled, else 0.
+        回合前调用（build_prompt_context 用它注入重逢语气）。"""
+        if not bool(self._config.get("reunion_enabled", True)):
+            return 0
+        state = self.get_state(user_id, char_id, create=False)
+        if not state:
+            return 0
+        gap = self._reunion_gap_days(state, time.time())
+        return gap if gap >= int(self._config["reunion_days"]) else 0
+
+    def note_reunion(self, user_id: str, char_id: str) -> bool:
+        """One-per-day guard for the reunion shared-memory event.
+        settle_turn 已刷新 last_seen，本方法在其后调用；返回 True 表示今天首次
+        记录重逢（应 append_event），False 表示已记过。"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        state = self.get_state(user_id, char_id)
+        if state.get("reunion_marked_date") == today:
+            return False
+        state["reunion_marked_date"] = today
+        self._save(user_id)
+        return True
+
+    def _days_known(self, state: dict, now: float) -> int:
+        first_met = state.get("stats", {}).get("first_met")
+        if not first_met:
+            return 0
+        try:
+            return max(1, int((now - float(first_met)) // 86400) + 1)
+        except (TypeError, ValueError):
+            return 0
+
+    def _pending_anniversary(self, state: dict, now: float) -> Optional[int]:
+        """Largest milestone reached-but-unmarked (day count), or None."""
+        days = self._days_known(state, now)
+        if days <= 0:
+            return None
+        marked = set(int(m) for m in (state.get("anniversaries_marked") or []))
+        hit: Optional[int] = None
+        for m in self._config.get("anniversary_days", []):
+            m = int(m)
+            if days >= m and m not in marked:
+                if hit is None or m > hit:
+                    hit = m
+        return hit
+
+    def anniversary_pending(self, user_id: str, char_id: str) -> Optional[int]:
+        """Milestone day if reached-but-unmarked (回合前注入用), else None."""
+        state = self.get_state(user_id, char_id, create=False)
+        if not state:
+            return None
+        return self._pending_anniversary(state, time.time())
+
+    def note_anniversary(self, user_id: str, char_id: str) -> Optional[int]:
+        """Settle-side: mark ALL passed-but-unmarked milestones and return the
+        largest one (the one to celebrate), or None. Marking every passed
+        milestone at once prevents skipped ones from trickling out on later
+        turns (e.g. an absent user who jumps from day 0 to day 400)."""
+        state = self.get_state(user_id, char_id, create=False)
+        if not state:
+            return None
+        now = time.time()
+        days = self._days_known(state, now)
+        milestone = self._pending_anniversary(state, now)
+        if milestone is None:
+            return None
+        marked = state.setdefault("anniversaries_marked", [])
+        if not isinstance(marked, list):
+            marked = []
+            state["anniversaries_marked"] = marked
+        for m in self._config.get("anniversary_days", []):
+            m = int(m)
+            if days >= m and m not in marked:
+                marked.append(m)
+        self._save(user_id)
+        return milestone
+
     # ── P2: 共同经历日志（bond_events，喂动态层「最近共同经历」）──
 
     def _event_path(self, user_id: str, char_id: str) -> str:
@@ -562,6 +715,20 @@ class BondManager:
         ]
         if address_line:
             parts.append(address_line)
+        # P3: 久别重逢 / 纪念日语气提示（被动，入站回合内触发）
+        gap = self._reunion_gap_days(state, now)
+        if bool(self._config.get("reunion_enabled", True)) and \
+                gap >= int(self._config["reunion_days"]):
+            parts.append(
+                f"久别重逢: 距上次交谈已过去 {gap} 天，你们终于重逢。"
+                f"请自然流露出想念与重逢的喜悦（真挚但不过度煽情）。"
+            )
+        anniv = self._pending_anniversary(state, now)
+        if anniv:
+            parts.append(
+                f"纪念日: 今天是你们相识的第 {anniv} 天，是一个值得纪念的里程碑。"
+                f"可以自然地提及这个特别的日子，表达对这段陪伴的珍惜。"
+            )
         if unlocked_text:
             parts.append(
                 "已解锁的羁绊档案（你可以自然地提及或透露这些背景，"

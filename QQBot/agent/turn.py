@@ -116,9 +116,15 @@ from tools.legacy_tools import (
 from tools.character_detail import character_detail, character_detail_with_card
 from tools.bond_detail import bond_detail, bond_detail_with_card
 from tools.battle_parser import parse_battle_screenshots
-from tools.card_renderer import render_help_card, render_feature_card, render_changelog_card
+from tools.card_renderer import (
+    render_help_card, render_feature_card, render_changelog_card, render_scene_card,
+)
 from tools.creation_tools import create_character as _create_character_impl
-from tools.social_tools import give_gift as _give_gift_impl
+from tools.social_tools import (
+    give_gift as _give_gift_impl,
+    complete_scene as _complete_scene_impl,
+    COMPLETE_SCENE_SCHEMA,
+)
 
 # ── Sender slots (assigned by the entry plugin at import time) ─────
 # _safe_send() and the continuous/poke paths send through
@@ -844,6 +850,45 @@ def _build_tool_registry() -> ToolRegistry:
         },
     )
 
+    # ── 剧情场景收尾（Bond-System-Design.md §4.4 形态3, P3）──
+    # 仅经 bond_scene 特殊会话的 allowed_tools 下发（不在 SOCIAL_TOOLS / 全局
+    # 工具集）。场景名/角色 id 从当前活跃 bond_scene 会话 metadata 读取（LLM 不
+    # 传）；结算（+scene_exp/mark/事件日志）在 social_tools.complete_scene 内完成，
+    # 成功后把 result 记进 _pending_bond_scene_done，post-run 钩子据此发升级通知 +
+    # 纪念卡片并 end_active。
+    async def _complete_scene_tool(memento: str = "") -> str:
+        user_id = _current_user_id.get()
+        persona_key = _current_personality.get()
+        char_id = persona_key
+        scene_title = ""
+        try:
+            active = _special_sessions.get_active(user_id)
+            md = (active.metadata or {}) if active else {}
+            scene_title = str(md.get("scene_title") or "")
+            char_id = str(md.get("char_id") or persona_key)
+        except Exception:
+            pass
+        out = await _complete_scene_impl(
+            user_id=user_id,
+            char_id=char_id,
+            scene_title=scene_title,
+            bond_manager=_bond_manager,
+            memento=memento,
+        )
+        result = out.get("result") or {}
+        if out.get("ok") and result.get("accepted"):
+            _pending_bond_scene_done[user_id] = result
+        return out.get("observation", "")
+
+    registry.register(
+        "complete_scene", _complete_scene_tool,
+        "当你与用户共同经历的剧情场景走到**结局**（脚本最后一幕完成、或你们自然抵达"
+        "终点）时调用此工具收尾。可用 memento 参数以你的口吻写一句纪念语（≤40 字）"
+        "镌刻在纪念卡片上。调用后请再说一段温柔的收尾白。仅在场景结局调用一次，"
+        "场景中途不要调用。",
+        COMPLETE_SCENE_SCHEMA,
+    )
+
     return registry
 
 
@@ -909,6 +954,11 @@ _pending_char_delete_confirm: dict = {}
 # Set by the create_character tool closure on success; the message handler
 # pops it after the run to auto-close the interview special session.
 _pending_char_creation_done: dict = {}
+
+# Set by the complete_scene tool closure on success (value = settlement result
+# dict: level_ups/exp/scene_title/char_id/memento); the post-run hook pops it to
+# send the level-up notice + commemorative card and end_active the scene session.
+_pending_bond_scene_done: dict = {}
 
 # Track pending personality-switch choice: user_id -> (old_display, new_display)
 # Set by /人格切换, resolved on the user's next message: "清空" clears context,
@@ -1744,6 +1794,10 @@ async def handle_agent_turn(view: InboundMessage):
         cmd_handled = await _handle_bond_command(text_content, user_id, view)
         if cmd_handled:
             return
+        # /剧情 #剧情 command (bond story scenes, P3; private-chat only)
+        cmd_handled = await _handle_scene_command(text_content, user_id, view)
+        if cmd_handled:
+            return
         cmd_handled = await _handle_session_command(text_content, user_id)
         if cmd_handled:
             return
@@ -1885,13 +1939,25 @@ async def handle_agent_turn(view: InboundMessage):
         is_creation = bool(active_special) and (
             (active_special.metadata or {}).get("kind") == "char_creation"
         )
+        # Bond story-scene session (Bond-System-Design.md §4.4 形态3, P3).
+        is_scene = bool(active_special) and (
+            (active_special.metadata or {}).get("kind") == "bond_scene"
+        )
+        if is_scene:
+            # The scene belongs to the character it was started with; keep the
+            # turn in that character's voice even if the user switched persona.
+            persona_key = str(
+                (active_special.metadata or {}).get("char_id") or persona_key
+            )
+            persona_mode = pm.get_mode(persona_key)
 
         # ── Triage: classify complexity (and plane, for split personas) ──
         # Creation interviews skip triage entirely: neutral assistant persona,
         # flash model, only create_character exposed (Bond-System-Design.md §5.1).
+        # Scene sessions skip triage too: full-RP as the character on flash.
         is_special = augmented_message in ["/clear", "清除上下文", "新对话", "/status"]
         plane = "task"
-        if is_creation:
+        if is_creation or is_scene:
             client = _model_router.flash_client
         elif not is_special:
             if persona_mode == "split":
@@ -1957,7 +2023,8 @@ async def handle_agent_turn(view: InboundMessage):
         #   "assistant" for split task plane (globally-shared cache prefix),
         #   or the full persona for unified; no bond injection.
         character_plane = (
-            persona_mode == "split" and plane == "social" and not is_creation
+            persona_mode == "split" and plane == "social"
+            and not is_creation and not is_scene
         )
         if is_creation:
             # UGC creation interview: neutral assistant persona (globally-shared
@@ -1965,6 +2032,16 @@ async def handle_agent_turn(view: InboundMessage):
             allowed_tools = {"create_character"}
             _current_bond_context.set("")
             _current_personality.set("assistant")
+        elif is_scene:
+            # Bond story scene (P3): full-RP as the scene's character on flash;
+            # only complete_scene exposed (pure RP — no delegate_task / dangerous
+            # tools); bond context injected so the scene reflects current bond.
+            client = _model_router.flash_client
+            allowed_tools = {"complete_scene"}
+            _current_personality.set(persona_key)
+            _current_bond_context.set(
+                _build_bond_context(user_id, persona_key, pm)
+            )
         elif character_plane:
             client = _model_router.flash_client
             allowed_tools = set(SOCIAL_TOOLS)
@@ -2014,7 +2091,8 @@ async def handle_agent_turn(view: InboundMessage):
         # character's voice (opening line) while passing the body verbatim.
         # The social plane already speaks in character; unified personas are
         # never re-voiced. Creation interviews stay neutral (no revoice).
-        if persona_mode == "split" and not character_plane and not is_creation:
+        if (persona_mode == "split" and not character_plane
+                and not is_creation and not is_scene):
             # Restore persona so _send_response's disclaimer is signed by the
             # character and revoice speaks in the character's voice.
             _current_personality.set(persona_key)
@@ -2048,9 +2126,17 @@ async def handle_agent_turn(view: InboundMessage):
             except Exception:
                 pass
 
+        # ── Scene session completion (P3): complete_scene succeeded this turn
+        # (the tool closure flagged it) → level-up notice + commemorative card,
+        # then leave the scene session. Popped unconditionally so a stale flag
+        # can't survive into a later turn. ──
+        scene_result = _pending_bond_scene_done.pop(user_id, None)
+        if is_scene and scene_result:
+            await _finish_bond_scene(user_id, scene_result)
+
         # ── Bond settlement hook (both planes accrue 好感度) ──
         if persona_mode == "split" and not is_creation:
-            await _settle_bond_turn(user_id, persona_key)
+            await _settle_bond_turn(user_id, persona_key, is_group=bool(view.is_group))
 
         # Auto-name special session after first interaction
         if session_type == "special" and _pending_naming.pop(user_id, False):
@@ -2330,7 +2416,8 @@ async def handle_continuous_turn(view: InboundMessage):
 
         # ── Bond settlement hook ──
         if persona_mode == "split":
-            await _settle_bond_turn(user_id, persona_key, sender=continuous_sender)
+            await _settle_bond_turn(user_id, persona_key, sender=continuous_sender,
+                                     is_group=True)
 
     except asyncio.TimeoutError:
         _pm = get_character_registry()
@@ -2783,11 +2870,13 @@ def _build_bond_context(user_id: str, persona_key: str, pm) -> str:
     )
 
 
-async def _settle_bond_turn(user_id: str, persona_key: str, sender=None):
+async def _settle_bond_turn(user_id: str, persona_key: str, sender=None,
+                            is_group: bool = False):
     """好感结算钩子：split 人格每轮对话结束后累计 EXP/心情，升级时发庆祝。
 
     结算失败必须静默——它是增益功能，绝不能因抛错中断已生成回复的发送。
     turn_count 用于「长聊奖励」（≥long_session_turns 当日一次性加成）。
+    is_group：群聊不发场景邀请（剧情场景仅私聊体验）。
     """
     try:
         try:
@@ -2795,32 +2884,222 @@ async def _settle_bond_turn(user_id: str, persona_key: str, sender=None):
         except Exception:
             turn_count = 0
         result = _bond_manager.settle_turn(user_id, persona_key, turn_count=turn_count)
-        level_ups = result.get("level_ups", [])
-        if level_ups:
-            card = ""
-            try:
-                card = get_character_registry().load(persona_key) or ""
-            except Exception:
-                card = ""
-        for up in level_ups:
-            lv = up.get("level")
+        # P3: 久别重逢 / 纪念日共同经历事件（一次性守卫在 bond.py 内）
+        if result.get("reunion") and _bond_manager.note_reunion(user_id, persona_key):
+            _bond_manager.append_event(user_id, persona_key, "久别重逢")
+        milestone = _bond_manager.note_anniversary(user_id, persona_key)
+        if milestone:
             _bond_manager.append_event(
-                user_id, persona_key,
-                f"羁绊提升到了 Lv{lv}（{up.get('title', '')}）",
+                user_id, persona_key, f"相识第 {milestone} 天纪念日"
             )
-            await _send_level_up_notice(user_id, persona_key, up, sender=sender)
-            # Bond Tier 分段档案解锁（方舟式）：该等级若有新档案，追加事件+提示
-            for tier in bond_content.tiers_unlocking_at(card, int(lv)):
-                title = str(tier.get("title", "")).strip()
-                _bond_manager.append_event(
-                    user_id, persona_key, f"解锁了新的羁绊档案「{title}」"
-                )
-                await _safe_send(
-                    f"🔓 羁绊档案解锁：Lv{lv} ·《{title}》",
-                    sender=sender,
-                )
+        await _emit_level_ups(user_id, persona_key, result.get("level_ups", []),
+                              sender=sender, is_group=is_group)
     except Exception as e:
         log_exception("bond settlement failed", e)
+
+
+async def _emit_level_ups(user_id, persona_key, level_ups, sender=None,
+                          is_group: bool = False):
+    """升级庆祝 + 分段解锁（P3 修正）：档案 tier 发解锁提示，场景 tier 发私聊邀请。"""
+    level_ups = level_ups or []
+    if not level_ups:
+        return
+    card = ""
+    try:
+        card = get_character_registry().load(persona_key) or ""
+    except Exception:
+        card = ""
+    for up in level_ups:
+        lv = up.get("level")
+        _bond_manager.append_event(
+            user_id, persona_key,
+            f"羁绊提升到了 Lv{lv}（{up.get('title', '')}）",
+        )
+        await _send_level_up_notice(user_id, persona_key, up, sender=sender)
+        # 非场景 tier（档案/语气解禁等）：方舟式解锁提示
+        for tier in bond_content.tiers_unlocking_at(card, int(lv)):
+            if bond_content.is_scene_tier(tier):
+                continue  # 场景走下面的邀请
+            title = str(tier.get("title", "")).strip()
+            _bond_manager.append_event(
+                user_id, persona_key, f"解锁了新的羁绊档案「{title}」"
+            )
+            await _safe_send(
+                f"🔓 羁绊档案解锁：Lv{lv} ·《{title}》",
+                sender=sender,
+            )
+        # 场景 tier（P3）：该等级新解锁的场景 → 私聊邀请
+        for sc in bond_content.scenes_unlocking_at(card, int(lv)):
+            await _invite_scene(user_id, persona_key, sc,
+                                is_group=is_group, sender=sender)
+
+
+async def _invite_scene(user_id, persona_key, scene, is_group=False, sender=None):
+    """升级场景邀请（P3）：仅私聊 + 未完成；每级解锁自然一次性。"""
+    if is_group:
+        return
+    title = str(scene.get("title", "")).strip()
+    lv = scene.get("level", "")
+    if not title or _bond_manager.has_done_scene(user_id, persona_key, title):
+        return
+    short = get_character_registry().get_short_name(persona_key)
+    await _safe_send(
+        f"✨ 羁绊到了 Lv{lv}，{short} 好像想和你一起经历新的剧情「{title}」～\n"
+        f"想现在开始的话，私聊发 /剧情 {title} 即可。",
+        sender=sender,
+    )
+
+
+async def _finish_bond_scene(user_id: str, result: dict, sender=None):
+    """场景完成 post-run 收尾（P3）：升级通知 + 纪念卡片 + 关闭会话。
+
+    结算（+scene_exp/mark/事件日志）已在 social_tools.complete_scene 完成；
+    这里只做呈现。失败静默（增益功能不阻断）。
+    """
+    try:
+        char_id = str(result.get("char_id") or "")
+        scene_title = str(result.get("scene_title") or "")
+        pm = get_character_registry()
+        await _emit_level_ups(
+            user_id, char_id, result.get("level_ups") or [],
+            sender=sender, is_group=False,
+        )
+        level = int(result.get("level") or 1)
+        entry = {
+            "char_name": pm.get_display_name(char_id) or pm.get_short_name(char_id),
+            "scene_title": scene_title,
+            "level": level,
+            "level_title": _bond_manager.title_for(level),
+            "date": time.strftime("%Y-%m-%d"),
+            "memento": str(result.get("memento") or ""),
+        }
+        path = render_scene_card(entry)
+        if path:
+            await _safe_send(
+                OutImage(path=path, label=f"羁绊纪念 · {scene_title}"),
+                sender=sender,
+            )
+        try:
+            _special_sessions.end_active(user_id)
+        except Exception:
+            pass
+    except Exception as e:
+        log_exception("bond scene finish failed", e)
+
+
+def _scene_opening_line(char_id: str, title: str, scene: dict) -> str:
+    """零 LLM 的场景开场种子消息：取脚本首个有效行作开场幕。"""
+    body = str(scene.get("body") or "").strip()
+    first = ""
+    for ln in body.splitlines():
+        ln = ln.strip()
+        if ln and not ln.startswith(("#", ">", "-")):
+            first = ln
+            break
+    short = get_character_registry().get_short_name(char_id)
+    head = f"—— 剧情《{title}》开始 ——"
+    if first:
+        return (f"{head}\n{first}\n\n（{short} 看向你，等待你的回应。"
+                f"随时可 /结束会话 退出）")
+    return (f"{head}\n{short} 轻轻拉住你的衣袖，眼里带着期待。"
+            f"「我们出发吧？」\n\n（随时可 /结束会话 退出）")
+
+
+async def _start_bond_scene(user_id: str, char_id: str, scene: dict) -> None:
+    """启动羁绊剧情特殊会话（仅私聊；等级/已完成/会话槽守卫齐全）。"""
+    title = str(scene.get("title") or "")
+    try:
+        lv = int(scene.get("level") or 1)
+    except (TypeError, ValueError):
+        lv = 1
+    state = _bond_manager.get_state(user_id, char_id, create=False)
+    level = int((state or {}).get("level", 1))
+    if level < lv:
+        await _safe_send(
+            f"「{title}」需要羁绊 Lv{lv} 才能体验（当前 Lv{level}），再相处一阵子吧～"
+        )
+        return
+    if _bond_manager.has_done_scene(user_id, char_id, title):
+        await _safe_send(
+            f"「{title}」你们已经经历过了，回忆已珍藏在纪念卡里～ 试试别的剧情吧。"
+        )
+        return
+    active = _special_sessions.get_active(user_id)
+    if active:
+        await _safe_send(
+            "你现在还有一个进行中的特殊会话，先 /结束会话 再开始剧情吧～"
+        )
+        return
+    role = _perm_manager.get_role(user_id)
+    max_sessions = _perm_manager.get_max_special_sessions(role)
+    sessions = _special_sessions.list_sessions(user_id)
+    if len(sessions) >= max_sessions:
+        await _safe_send(
+            f"开始剧情需要占用一个特殊会话槽，但你已达到上限"
+            f"（{len(sessions)}/{max_sessions}）。请先 /删除会话 清理一个。"
+        )
+        return
+    try:
+        session = _special_sessions.create(
+            user_id, f"剧情·{title}",
+            metadata={
+                "kind": "bond_scene", "char_id": char_id,
+                "scene_title": title,
+                "script": str(scene.get("body") or ""),
+                "completed": False,
+            },
+        )
+        _special_sessions.switch_to(user_id, session.name)
+        seed = _scene_opening_line(char_id, title, scene)
+        _special_sessions.add_message(user_id, "assistant", seed)
+        await _safe_send(seed)
+    except Exception as e:
+        code = log_exception("bond scene start failed", e)
+        await _safe_send(f"开始剧情失败（诊断编号 {code}），请稍后重试。")
+
+
+async def _handle_scene_command(text: str, user_id: str, view) -> bool:
+    """/剧情 #剧情 — 列出可用场景或启动一个（P3，仅私聊体验）。"""
+    cmd, _, args = text.partition(" ")
+    args = args.strip()
+    if cmd not in ("/剧情", "#剧情"):
+        return False
+    pm = get_character_registry()
+    persona_key = pm.resolve_effective_personality(user_id, view.group_id)
+    try:
+        card = pm.load(persona_key) or ""
+    except Exception:
+        card = ""
+    scenes = bond_content.parse_scenes(card)
+    short = pm.get_short_name(persona_key)
+    if not scenes:
+        await _safe_send(f"和 {short} 还没有准备好的剧情场景哦～")
+        return True
+    state = _bond_manager.get_state(user_id, persona_key, create=False)
+    level = int((state or {}).get("level", 1))
+    if not args:
+        lines = [f"与 {pm.get_display_name(persona_key)} 的剧情场景："]
+        for s in scenes:
+            lv = int(s["level"])
+            title = str(s["title"])
+            if lv <= level:
+                mark = ("（已完成）" if _bond_manager.has_done_scene(
+                    user_id, persona_key, title) else "（可体验）")
+                lines.append(f"  · Lv{lv} 《{title}》{mark}")
+            else:
+                lines.append(f"  · Lv{lv} 《{title}》（羁绊 Lv{lv} 解锁）")
+        lines.append("\n私聊发 /剧情 <标题> 开始一段剧情。")
+        await _safe_send("\n".join(lines))
+        return True
+    if view.is_group:
+        await _safe_send("剧情场景只能在私聊里体验哦～ 请私聊我再发 /剧情。")
+        return True
+    scene = bond_content.get_scene(card, args)
+    if not scene:
+        await _safe_send(f"没有找到叫「{args}」的剧情，发 /剧情 看看列表吧～")
+        return True
+    await _start_bond_scene(user_id, persona_key, scene)
+    return True
 
 
 async def _send_level_up_notice(user_id: str, persona_key: str, up: dict, sender=None):
