@@ -917,7 +917,69 @@ _pending_personality_switch: dict = {}
 
 # Persistent transition notice per user (injected until context is cleared or
 # personality changes again): user_id -> notice string.
-_personality_switch_marker: dict = {}
+# Persisted to data/personality_markers.json — the notice MUST survive process
+# restarts (panel restart / watchdog). Prod incident 2026-10-22: a restart
+# between the switch and the user's next message wiped this dict, so the L4
+# transition note never reached the model and the persona-styled history of a
+# special session dragged the reply back into the OLD personality's voice.
+_MARKERS_FILE = os.path.join(_DATA_DIR, "personality_markers.json")
+
+
+def _load_personality_markers() -> dict:
+    try:
+        with open(_MARKERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items()
+                    if isinstance(k, str) and isinstance(v, str)}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_personality_markers() -> None:
+    """Atomically persist the marker dict (tmp + os.replace)."""
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        tmp = _MARKERS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_personality_switch_marker, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _MARKERS_FILE)
+    except OSError as e:
+        from loguru import logger
+        logger.warning("[personality] marker 持久化失败: {}", e)
+
+
+_personality_switch_marker: dict = _load_personality_markers()
+
+
+def _inject_personality_transition_into_history(user_id: str) -> None:
+    """Write the transition notice INTO the conversation history (belt to the
+    L4-tail note's braces). The volatile-tail note sits far below a long
+    persona-styled history; an inline system message right next to the
+    offending messages suppresses style drift much more reliably.
+
+    Injected once, when the user confirms 「保留」 (or simply keeps talking
+    after the switch prompt). Targets whichever store is actually in use:
+    the active special session's delta, or the non-empty temp session.
+    """
+    note = _personality_switch_marker.get(user_id)
+    if not note:
+        return
+    msg = (f"[系统提示] {note}"
+           f"请严格遵守：从本条之后的所有回复都使用当前人格的语气、自称与用词，"
+           f"不得模仿上方历史消息中旧人格的说话风格。")
+    try:
+        if _special_sessions.get_active(user_id) is not None:
+            _special_sessions.add_message(user_id, "system", msg)
+        else:
+            session = _session_manager.get_or_create(user_id)
+            if session.context:
+                session.add_message("system", msg)
+                _session_manager.update(user_id, session)
+    except Exception as e:
+        from loguru import logger
+        logger.warning("[personality] 历史注入失败 user={}: {}", user_id, e)
 
 # Active subtask window for multi-turn tool flows (gacha / speed-check):
 #   user_id -> {task_id, goal, boundary, opened_at}
@@ -1617,14 +1679,19 @@ async def handle_agent_turn(view: InboundMessage):
             agent.clear_user_session(user_id)
             _special_sessions.clear_context(user_id)
             _temp_session_files.pop(user_id, None)
-            _personality_switch_marker.pop(user_id, None)
+            if _personality_switch_marker.pop(user_id, None) is not None:
+                _save_personality_markers()
             await _safe_send(f"已清空对话上下文，开始以「{new_display}」人格的新对话~")
             return
         if _reply.lower() in _keep_kw:
+            _inject_personality_transition_into_history(user_id)
             await _safe_send(f"已保留历史对话，后续回复将遵循「{new_display}」人格。")
             return
         # Otherwise: user asked a new question — keep history (marker persists)
         # and fall through so the agent answers with the transition notice.
+        # Inject the notice into the history now, before this turn's messages
+        # are appended, so it sits directly after the old-persona turns.
+        _inject_personality_transition_into_history(user_id)
 
     # ── Handle feedback / bug report (before agent, zero token cost) ─
     if text_content.startswith(("#反馈", "#bug", "#建议")):
@@ -2669,6 +2736,7 @@ async def _handle_personality_command(text: str, user_id: str, view: InboundMess
             f"人格已从「{old_display}」切换为「{new_display}」，"
             f"历史回复风格不代表当前人格。"
         )
+        _save_personality_markers()
         await _safe_send(
             f"已切换至「{new_display}」人格。\n"
             f"是否保留历史对话记录？\n"
@@ -3571,7 +3639,8 @@ async def _handle_special_command(command: str, user_id: str):
         agent.clear_user_session(user_id)
         _special_sessions.clear_context(user_id)
         _temp_session_files.pop(user_id, None)
-        _personality_switch_marker.pop(user_id, None)
+        if _personality_switch_marker.pop(user_id, None) is not None:
+            _save_personality_markers()
         await _safe_send("已清除对话上下文，开始新对话~")
     elif command == "/status":
         status = agent.get_status()

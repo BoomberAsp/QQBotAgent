@@ -4898,6 +4898,158 @@ class TestWebuiPermissionsEditor:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestPersonalityMarkerPersistence:
+    """/人格切换 transition marker — disk persistence (A) + history injection (B).
+
+    Prod incident 2026-10-22: the marker lived only in process memory; a panel
+    restart between the switch and the next message wiped it, so the L4
+    transition note never reached the model and a special session full of
+    old-persona replies dragged the answer back into the old voice.
+    """
+
+    def run(self):
+        print_header("30. Personality Marker Persistence (A+B)")
+        self.turn = self._import_turn()
+        self.test_marker_roundtrip()
+        self.test_marker_load_degrades()
+        self.test_inject_special_session()
+        self.test_inject_temp_session()
+        self.test_inject_noop_without_marker()
+
+    def _import_turn(self):
+        # turn.py reads USER_DATA_ROOT at import time; keep it off the
+        # production path when running on a dev machine.
+        os.environ.setdefault("USER_DATA_ROOT", "/tmp/qqbot_smoke")
+        import agent.turn as turn
+        return turn
+
+    def test_marker_roundtrip(self):
+        turn = self.turn
+        tmp = tempfile.mkdtemp(prefix="pers_marker_")
+        orig_file = turn._MARKERS_FILE
+        orig_dict = dict(turn._personality_switch_marker)
+        try:
+            turn._MARKERS_FILE = os.path.join(tmp, "personality_markers.json")
+            turn._personality_switch_marker.clear()
+            turn._personality_switch_marker["u1"] = "人格已从「露比」切换为「助手」。"
+            turn._save_personality_markers()
+            assert os.path.exists(turn._MARKERS_FILE)
+            # simulate process restart: memory wiped, disk survives
+            turn._personality_switch_marker.clear()
+            loaded = turn._load_personality_markers()
+            assert loaded == {"u1": "人格已从「露比」切换为「助手」。"}, loaded
+            # non-str junk is filtered out on load (JSON keys are always
+            # strings, so junk can only appear on the value side)
+            with open(turn._MARKERS_FILE, "w", encoding="utf-8") as f:
+                json.dump({"u1": "ok", "bad": 123, "worse": ["x"]}, f)
+            assert turn._load_personality_markers() == {"u1": "ok"}
+            print_pass("marker save/load survives restart; junk filtered")
+        finally:
+            turn._MARKERS_FILE = orig_file
+            turn._personality_switch_marker.clear()
+            turn._personality_switch_marker.update(orig_dict)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_marker_load_degrades(self):
+        turn = self.turn
+        tmp = tempfile.mkdtemp(prefix="pers_marker_bad_")
+        orig_file = turn._MARKERS_FILE
+        try:
+            # missing file
+            turn._MARKERS_FILE = os.path.join(tmp, "nope.json")
+            assert turn._load_personality_markers() == {}
+            # corrupt JSON
+            with open(turn._MARKERS_FILE, "w") as f:
+                f.write("{corrupt!!")
+            assert turn._load_personality_markers() == {}
+            print_pass("load degrades to {} on missing/corrupt markers file")
+        finally:
+            turn._MARKERS_FILE = orig_file
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_inject_special_session(self):
+        turn = self.turn
+        orig_marker = dict(turn._personality_switch_marker)
+        orig_special = turn._special_sessions
+        orig_session = turn._session_manager
+        try:
+            turn._personality_switch_marker.clear()
+            turn._personality_switch_marker["u2"] = "人格已切换为「助手」。"
+            special = MagicMock()
+            special.get_active.return_value = object()   # active special session
+            turn._special_sessions = special
+            session_mgr = MagicMock()
+            turn._session_manager = session_mgr
+            turn._inject_personality_transition_into_history("u2")
+            special.add_message.assert_called_once()
+            args = special.add_message.call_args[0]
+            assert args[0] == "u2" and args[1] == "system", args
+            assert "人格已切换为「助手」" in args[2]
+            assert "不得模仿" in args[2]
+            # temp session untouched while a special session is active
+            session_mgr.get_or_create.assert_not_called()
+            print_pass("inject → active special session delta (system role)")
+        finally:
+            turn._special_sessions = orig_special
+            turn._session_manager = orig_session
+            turn._personality_switch_marker.clear()
+            turn._personality_switch_marker.update(orig_marker)
+
+    def test_inject_temp_session(self):
+        from agent.session import SessionManager
+        turn = self.turn
+        tmp = tempfile.mkdtemp(prefix="pers_inject_")
+        orig_marker = dict(turn._personality_switch_marker)
+        orig_special = turn._special_sessions
+        orig_session = turn._session_manager
+        try:
+            turn._personality_switch_marker.clear()
+            turn._personality_switch_marker["u3"] = "人格已切换为「助手」。"
+            special = MagicMock()
+            special.get_active.return_value = None       # no special session
+            turn._special_sessions = special
+            mgr = SessionManager(persistence_dir=tmp)
+            turn._session_manager = mgr
+            # non-empty temp session → injected and persisted
+            s = mgr.get_or_create("u3")
+            s.add_message("user", "旧人格时代的提问")
+            s.add_message("assistant", "露比风格的回答～")
+            mgr.update("u3", s)
+            turn._inject_personality_transition_into_history("u3")
+            with open(os.path.join(tmp, "u3.json"), encoding="utf-8") as f:
+                saved = json.load(f)
+            roles = [m["role"] for m in saved["context"]]
+            assert roles == ["user", "assistant", "system"], roles
+            assert "人格已切换为「助手」" in saved["context"][-1]["content"]
+            # empty temp session → nothing to counteract, no write
+            turn._inject_personality_transition_into_history("u4")
+            assert not os.path.exists(os.path.join(tmp, "u4.json"))
+            print_pass("inject → non-empty temp session persisted; empty skipped")
+        finally:
+            turn._special_sessions = orig_special
+            turn._session_manager = orig_session
+            turn._personality_switch_marker.clear()
+            turn._personality_switch_marker.update(orig_marker)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_inject_noop_without_marker(self):
+        turn = self.turn
+        orig_marker = dict(turn._personality_switch_marker)
+        orig_special = turn._special_sessions
+        try:
+            turn._personality_switch_marker.clear()
+            special = MagicMock()
+            turn._special_sessions = special
+            turn._inject_personality_transition_into_history("ghost")
+            special.get_active.assert_not_called()
+            special.add_message.assert_not_called()
+            print_pass("no marker → inject is a clean no-op")
+        finally:
+            turn._special_sessions = orig_special
+            turn._personality_switch_marker.clear()
+            turn._personality_switch_marker.update(orig_marker)
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -4935,6 +5087,7 @@ def main():
         ("Official Status Heartbeat (WebUI IPC)", TestOfficialStatusHeartbeat()),
         ("WebUI Official Status Aggregator", TestWebuiOfficialStatus()),
         ("WebUI Permissions Editor", TestWebuiPermissionsEditor()),
+        ("Personality Marker Persistence (A+B)", TestPersonalityMarkerPersistence()),
     ]
 
     passed = 0
