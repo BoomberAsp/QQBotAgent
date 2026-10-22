@@ -65,6 +65,16 @@ _DEFAULTS: Dict[str, Any] = {
     "scene_mood": 10.0,            # 完成场景的心情增量
     "reunion_enabled": True,       # 久别重逢语气提示开关
     "anniversary_days": [30, 100, 365, 730, 1095],  # 相识天数里程碑（可配）
+    # ── P3b: 低频主动问候（官方 c2c 主动消息，HEARTBEAT 驱动）──
+    "greet_enabled": True,         # 主动问候总开关
+    "greet_min_level": 5,          # 好感等级门（§7.2 提议 Lv5 密友起）
+    "greet_cooldown_days": 7,      # 距上次问候的冷却天数
+    "greet_probability": 0.25,     # 概率门（每次 HEARTBEAT pass 每候选）
+    "greet_daily_cap": 1,          # 每用户每日主动消息上限（§7.3）
+    "greet_monthly_cap": 4,        # 每用户每月主动消息上限（平台小额配额）
+    "greet_batch_max": 5,          # 单次 pass 最多问候人数
+    "greet_interval_hours": 6.0,   # HEARTBEAT 巡检间隔（小时）
+    "greet_jitter_minutes": 45,    # 巡检间隔随机抖动（分钟），避免整点齐发
 }
 
 # 角色面动态层固定提示：历史中的任务结果来自任务智能体（中立口吻），

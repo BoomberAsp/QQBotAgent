@@ -275,6 +275,48 @@ class QQOfficialSender:
         return None
 
 
+# ── Active (non-passive) c2c messaging ────────────────────────────
+# bot.send_to_c2c WITHOUT msg_id/msg_seq is an *active* message: it does
+# not consume the passive-reply quota but is limited by the platform's
+# small per-user daily/monthly active quota + content audit. Callers
+# (agent/greeting.py bookkeeping in the entry plugin) own the quota
+# gating; this helper only does the send with the route's error policy:
+#   ActionFailed (audit/quota/bad payload) → log, False, no retry;
+#   NetworkError/RateLimitException        → one retry, then False.
+
+
+async def send_active_c2c(bot: QQBot, openid: str, text: str) -> bool:
+    """Send one active c2c message. Returns True only on confirmed send."""
+    openid = str(openid or "").strip()
+    if not openid or not (text and text.strip()):
+        return False
+    for attempt in range(2):
+        try:
+            await bot.send_to_c2c(openid=openid,
+                                  message=MessageSegment.text(text))
+            return True
+        except (NetworkError, RateLimitException) as e:
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+                continue
+            logger.warning(
+                f"[qq_official] active c2c to {openid[:8]}… failed "
+                f"after retry: {e!r}")
+            return False
+        except ActionFailed as e:
+            # platform rejection (active quota exhausted / audit) — the
+            # quota file may lag reality; log for observability, no retry
+            logger.warning(
+                f"[qq_official] active c2c to {openid[:8]}… rejected: {e!r}")
+            return False
+        except Exception as e:
+            logger.warning(
+                f"[qq_official] active c2c to {openid[:8]}… failed: "
+                f"{type(e).__name__}: {e}")
+            return False
+    return False
+
+
 # Event types this route handles — the entry plugin's isinstance guard
 # and the intent config (c2c_group_at_messages) must agree on this set.
 HANDLED_EVENTS = (C2CMessageCreateEvent, GroupAtMessageCreateEvent)

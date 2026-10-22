@@ -5599,6 +5599,188 @@ class TestBondReunionAnniversary:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── P3b: official active messaging + greeting bookkeeping ─────────
+
+class TestActiveGreeting:
+    """P3b: send_active_c2c + agent/greeting.py quota/targets/gates."""
+
+    def run(self):
+        print_header("34. Active Greeting & Quota (P3b)")
+        asyncio.run(self.test_send_active_c2c())
+        self.test_target_index()
+        self.test_quota_daily_monthly()
+        self.test_pick_greet_targets()
+        self.test_bond_config_defaults()
+
+    async def test_send_active_c2c(self):
+        from adapters.qq_official import send_active_c2c
+        from nonebot.adapters.qq.exception import (
+            ActionFailed, NetworkError, RateLimitException,
+        )
+        bot = MagicMock()
+        calls = []
+
+        async def ok_send(**kwargs):
+            calls.append(kwargs)
+            return MagicMock()
+
+        bot.send_to_c2c = ok_send
+        assert await send_active_c2c(bot, "ABC123openid", "好久不见～") is True
+        # ACTIVE semantics: exactly openid + message, NO msg_id/msg_seq
+        assert len(calls) == 1 and set(calls[0]) == {"openid", "message"}, calls
+        assert calls[0]["openid"] == "ABC123openid"
+        assert calls[0]["message"].type == "text"
+        # empty openid / blank text → False, nothing sent
+        assert await send_active_c2c(bot, "", "x") is False
+        assert await send_active_c2c(bot, "oid", "   ") is False
+        assert len(calls) == 1
+
+        # ActionFailed (audit/quota) → False with NO retry
+        calls.clear()
+
+        async def rejected(**kwargs):
+            calls.append(kwargs)
+            raise ActionFailed(MagicMock())
+
+        bot.send_to_c2c = rejected
+        assert await send_active_c2c(bot, "oid", "hi") is False
+        assert len(calls) == 1
+
+        # RateLimitException → one retry, second attempt succeeds
+        calls.clear()
+        attempts = {"n": 0}
+
+        async def flaky(**kwargs):
+            calls.append(kwargs)
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RateLimitException(MagicMock())
+            return MagicMock()
+
+        bot.send_to_c2c = flaky
+        assert await send_active_c2c(bot, "oid", "hi") is True
+        assert len(calls) == 2
+
+        # NetworkError twice → False after exactly one retry
+        calls.clear()
+
+        async def net_fail(**kwargs):
+            calls.append(kwargs)
+            raise NetworkError("timeout")
+
+        bot.send_to_c2c = net_fail
+        assert await send_active_c2c(bot, "oid", "hi") is False
+        assert len(calls) == 2
+        print_pass("send_active_c2c: no msg_id; reject=no-retry; net/rate=1 retry")
+
+    def test_target_index(self):
+        from agent import greeting
+        tmp = tempfile.mkdtemp(prefix="greet_")
+        try:
+            path = os.path.join(tmp, "targets.json")
+            greeting.note_c2c_contact(path, "OID1", now=1000.0)
+            greeting.note_c2c_contact(path, "OID1", now=2000.0)  # refresh
+            greeting.note_c2c_contact(path, "  ", now=1000.0)   # blank ignored
+            targets = greeting.load_targets(path)
+            assert set(targets) == {"OID1"}, targets
+            assert targets["OID1"]["last_seen"] == 2000.0
+            greeting.mark_greeted(path, "OID1", now=5000.0)
+            t = greeting.load_targets(path)["OID1"]
+            assert t["last_greeted"] == 5000.0 and t["greet_count"] == 1
+            assert t["last_seen"] == 2000.0  # mark keeps other fields
+            greeting.mark_greeted(path, "OID1", now=9000.0)
+            assert greeting.load_targets(path)["OID1"]["greet_count"] == 2
+            # corrupt file → {} degrade; junk values filtered
+            with open(path, "w") as f:
+                f.write("{corrupt!!")
+            assert greeting.load_targets(path) == {}
+            with open(path, "w") as f:
+                json.dump({"a": {"last_seen": 1}, "b": 42, "": {}}, f)
+            assert set(greeting.load_targets(path)) == {"a"}
+            # missing file → {}
+            assert greeting.load_targets(os.path.join(tmp, "nope.json")) == {}
+            print_pass("target index: note/mark/load + corrupt & junk degrade")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_quota_daily_monthly(self):
+        from agent import greeting
+        tmp = tempfile.mkdtemp(prefix="quota_")
+        try:
+            path = os.path.join(tmp, "quota.json")
+            base = time.mktime(time.strptime("2026-10-23", "%Y-%m-%d")) + 43200
+            # unknown user → allowed; first send ok, same-day second blocked
+            assert greeting.active_allowed(path, "OID", now=base)
+            greeting.record_active_send(path, "OID", now=base)
+            assert not greeting.active_allowed(path, "OID", now=base + 60)
+            # next days: allowed once per day, until monthly cap (4)
+            for d in (1, 2, 3):
+                t = base + d * 86400
+                assert greeting.active_allowed(path, "OID", now=t), d
+                greeting.record_active_send(path, "OID", now=t)
+            assert not greeting.active_allowed(path, "OID", now=base + 4 * 86400)
+            # still same month, higher daily cap does not bypass monthly cap
+            assert not greeting.active_allowed(path, "OID", now=base + 4 * 86400,
+                                               daily_cap=9, monthly_cap=4)
+            # next month → fresh quota
+            assert greeting.active_allowed(path, "OID", now=base + 40 * 86400)
+            # empty openid record is a no-op
+            greeting.record_active_send(path, "  ", now=base)
+            print_pass("quota: ≤1/day, ≤4/month, day/month rollover resets")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_pick_greet_targets(self):
+        from agent import greeting
+        now = 1_000_000.0
+        entries = {
+            "low":  {"last_seen": now},                                # Lv2 → skip
+            "cool": {"last_seen": now, "last_greeted": now - 3 * 86400},   # cooldown
+            "ok1":  {"last_seen": now, "last_greeted": now - 10 * 86400},  # passes
+            "ok2":  {"last_seen": now},                                # never greeted
+        }
+        states = {"low": {"level": 2}, "cool": {"level": 7},
+                  "ok1": {"level": 5}, "ok2": {"level": 9}}
+        state_for = lambda oid: states.get(oid)  # noqa: E731
+        # probability gate closed → nobody; rng()==probability → excluded
+        assert greeting.pick_greet_targets(entries, state_for=state_for,
+                                           now=now, rng=lambda: 0.99) == []
+        assert greeting.pick_greet_targets({"ok2": entries["ok2"]},
+                                           state_for=state_for, now=now,
+                                           rng=lambda: 0.25,
+                                           probability=0.25) == []
+        # gates open → level + cooldown survivors, in entries order
+        picked = greeting.pick_greet_targets(entries, state_for=state_for,
+                                             now=now, rng=lambda: 0.0)
+        assert [oid for oid, _ in picked] == ["ok1", "ok2"], picked
+        assert picked[0][1] == states["ok1"]
+        # batch cap
+        assert len(greeting.pick_greet_targets(entries, state_for=state_for,
+                                               now=now, rng=lambda: 0.0,
+                                               max_batch=1)) == 1
+        # no bond state / level missing (=Lv1) → skipped
+        assert greeting.pick_greet_targets(entries, state_for=lambda o: None,
+                                           now=now, rng=lambda: 0.0) == []
+        assert greeting.pick_greet_targets({"x": {}}, state_for=lambda o: {},
+                                           now=now, rng=lambda: 0.0) == []
+        # higher min_level raises the bar
+        assert greeting.pick_greet_targets(entries, state_for=state_for,
+                                           now=now, rng=lambda: 0.0,
+                                           min_level=9) == [("ok2", states["ok2"])]
+        print_pass("pick gates: level/cooldown/probability/batch + order")
+
+    def test_bond_config_defaults(self):
+        from agent.bond import _DEFAULTS
+        assert _DEFAULTS["greet_enabled"] is True
+        assert _DEFAULTS["greet_min_level"] == 5
+        assert _DEFAULTS["greet_daily_cap"] == 1
+        assert _DEFAULTS["greet_monthly_cap"] == 4
+        assert _DEFAULTS["greet_cooldown_days"] == 7
+        assert 0 < _DEFAULTS["greet_probability"] <= 1
+        assert _DEFAULTS["greet_interval_hours"] > 0
+        print_pass("bond config exposes greet_* tunables")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -5640,6 +5822,7 @@ def main():
         ("Bond Scene Settlement (P3a)", TestBondScene()),
         ("Bond-Scene Session & Commands (P3a)", TestSceneSession()),
         ("Bond Reunion & Anniversary (P3a)", TestBondReunionAnniversary()),
+        ("Active Greeting & Quota (P3b)", TestActiveGreeting()),
     ]
 
     passed = 0

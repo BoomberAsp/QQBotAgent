@@ -23,6 +23,9 @@ from typing import Any, Callable, Dict, List, Optional, Set
 # delegate_task: 角色面把工具任务委托给任务面（agent-as-tool，需防递归）；
 # give_gift: 送礼互动（P2），任务面 run_delegated_task 只减 delegate_task，
 #   give_gift 本就不在角色工具集里，天然不会泄漏到任务面。
+# complete_scene: 剧情收尾（P3a）——刻意不进 SOCIAL_TOOLS：只在 bond_scene
+#   特殊会话的 allowed_tools={"complete_scene"} 里暴露，普通角色面/任务面
+#   都不应看到它（全局注册仅为路由层可下发，二层硬拒绝兜底）。
 SOCIAL_TOOLS: frozenset = frozenset({"delegate_task", "give_gift"})
 
 DEFAULT_TASK_TIMEOUT = 240.0
