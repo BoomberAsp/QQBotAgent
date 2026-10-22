@@ -2514,12 +2514,20 @@ async def _handle_bond_detail_command(text: str, user_id: str) -> bool:
 _forced_refresh_running = False
 
 
-async def _forced_refresh_wiki_data(user_id: str) -> None:
+async def _forced_refresh_wiki_data(user_id: str, notify_sender=None) -> None:
     """Force a full character + bond cache refresh in the background.
 
     Runs after the triggering handler has returned, so it has no active event
-    context — completion is reported by a direct private message to the admin
-    who requested it (best-effort) rather than ``_safe_send``.
+    context and ``_safe_send`` is NOT usable:
+      - onebot: completion is reported by a direct private message to the
+        requesting admin (get_bots() → send_private_msg, as before);
+      - qq_official: there is no active-message equivalent within quota
+        reason, so the caller passes the triggering turn's bound sender
+        (``_turn_sender`` snapshot). We send into its buffer and flush()
+        explicitly — nobody else will, the turn is long over. Delivery is
+        best-effort by platform semantics: passive replies ride the trigger
+        message's window (group 5min / c2c 60min); a refresh that outlives
+        the window is rejected API-side and _send_once logs + swallows it.
     """
     global _forced_refresh_running
     summary = ""
@@ -2546,18 +2554,27 @@ async def _forced_refresh_wiki_data(user_id: str) -> None:
     finally:
         _forced_refresh_running = False
 
-    # Best-effort completion notice to the requesting admin.
+    # Best-effort completion notice to the requesting admin (see docstring:
+    # platform-forked delivery, never _safe_send — no live event context here).
     if summary:
-        try:
-            import nonebot
-            from nonebot.adapters.onebot.v11 import Bot as _Bot
-            bots = nonebot.get_bots()
-            bot = next((b for b in bots.values() if isinstance(b, _Bot)), None)
-            if bot is not None:
-                await bot.send_private_msg(user_id=int(user_id), message=summary)
-        except Exception as e:
-            print(f"[agent_router] refresh notice send failed: "
-                  f"{type(e).__name__}: {e}", file=sys.stderr)
+        if notify_sender is not None and getattr(notify_sender, "platform", "") == "qq_official":
+            try:
+                await notify_sender.send_text(summary)
+                await notify_sender.flush()
+            except Exception as e:
+                print(f"[agent_router] refresh notice send failed (official): "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+        else:
+            try:
+                import nonebot
+                from nonebot.adapters.onebot.v11 import Bot as _Bot
+                bots = nonebot.get_bots()
+                bot = next((b for b in bots.values() if isinstance(b, _Bot)), None)
+                if bot is not None:
+                    await bot.send_private_msg(user_id=int(user_id), message=summary)
+            except Exception as e:
+                print(f"[agent_router] refresh notice send failed: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
 
 
 async def _handle_refresh_data_command(text: str, user_id: str) -> bool:
@@ -2578,8 +2595,21 @@ async def _handle_refresh_data_command(text: str, user_id: str) -> bool:
         await _safe_send("刷新正在进行中，请稍候~")
         return True
     _forced_refresh_running = True
-    asyncio.create_task(_forced_refresh_wiki_data(user_id))
-    await _safe_send("已开始后台刷新角色/羁绊数据库（抓取+翻译+图片下载），通常需要几分钟，完成后会自动通知。")
+    # Snapshot the triggering turn's bound sender for the completion notice:
+    # on qq_official this is the event-scoped buffering sender (passive-reply
+    # window applies — see _forced_refresh_wiki_data docstring); on onebot it
+    # is None and the notice goes out as a direct private message instead.
+    asyncio.create_task(_forced_refresh_wiki_data(user_id, _turn_sender.get()))
+    _notice_tail = (
+        "完成后会尽力在本会话通知你（群聊里受平台 5 分钟被动回复窗口限制，"
+        "刷新超时则收不到通知，可自行用 /角色详情 验证）。"
+        if _current_platform.get() == "qq_official"
+        else "完成后会自动通知。"
+    )
+    await _safe_send(
+        "已开始后台刷新角色/羁绊数据库（抓取+翻译+图片下载），通常需要几分钟，"
+        + _notice_tail
+    )
     return True
 
 
