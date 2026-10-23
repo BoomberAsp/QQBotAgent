@@ -134,6 +134,7 @@ class Agent:
         hardware_detector: Optional[HardwareDetector] = None,
         workspace_manager: Optional[UserWorkspaceManager] = None,
         special_session_manager: Optional[SpecialSessionManager] = None,
+        asset_memory=None,
         max_tool_iterations: int = 5,
         thinking_timeout: float = 180.0,
     ):
@@ -143,6 +144,7 @@ class Agent:
         self.sessions = session_manager or SessionManager()
         self.memory = memory_system
         self.tiered_memory = tiered_memory  # P1 three-tier engine (MEDIUM injection)
+        self.asset_memory = asset_memory    # P5 multimodal asset cards (L4 injection)
         self.profiles = profile_manager
         self.hardware_detector = hardware_detector
         self.hardware: Optional[HardwareProfile] = None
@@ -595,6 +597,21 @@ class Agent:
         bond_ctx = _current_bond_context.get()
         if bond_ctx:
             volatile.append(bond_ctx)
+
+        # Multimodal asset memories (P5, Bond-System-Design.md §8): recent
+        # images/voices shared with the current character, so the character
+        # can refer back to them ("再发一次那张图" → recall_asset). Lives in
+        # the L4 volatile tail — evictions/rewrites never poison the prefix
+        # cache. Best-effort: any failure just skips the block.
+        if self.asset_memory and persona_name:
+            try:
+                disp = get_character_registry().get_display_name(persona_name)
+                asset_block = self.asset_memory.build_asset_injection(
+                    user_id, persona_name, display_name=disp or persona_name)
+            except Exception:  # noqa: BLE001
+                asset_block = ""
+            if asset_block:
+                volatile.append(asset_block)
 
         # Special session marker (message count changes every turn)
         if special_session:

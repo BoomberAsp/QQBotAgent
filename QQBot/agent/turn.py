@@ -125,11 +125,16 @@ from tools.social_tools import (
     complete_scene as _complete_scene_impl,
     create_image as _create_image_impl,
     send_voice as _send_voice_impl,
+    recall_asset as _recall_asset_impl,
+    enforce_asset_quota as _enforce_asset_quota,
     COMPLETE_SCENE_SCHEMA,
     CREATE_IMAGE_SCHEMA,
     SEND_VOICE_SCHEMA,
+    RECALL_ASSET_SCHEMA,
 )
-from agent.asset_memory import AssetMemory
+from agent.asset_memory import (
+    ASSET_UPLOAD, AssetCard, AssetMemory, make_asset_id,
+)
 
 # ── Sender slots (assigned by the entry plugin at import time) ─────
 # _safe_send() and the continuous/poke paths send through
@@ -938,6 +943,29 @@ def _build_tool_registry() -> ToolRegistry:
         SEND_VOICE_SCHEMA,
     )
 
+    # ── 角色面社交工具：找回影音记忆（Bond-System-Design.md §8.2, P5）──
+    # 检索 asset_memory 的文本卡（关键词 + 歧义时 flash 重排），命中且二进制
+    # 在盘 → 重发；已淘汰 → 角色凭文本卡描述；无命中 → 自然回应。
+    async def _recall_asset_tool(query: str) -> str:
+        user_id = _current_user_id.get()
+        persona_key = _current_personality.get()
+        _progress, _media = _media_callbacks()
+        return await _recall_asset_impl(
+            user_id=user_id, char_id=persona_key, query=query,
+            asset_memory=_asset_memory,
+            rerank_client=_model_router.flash_client,
+            send_media=_media,
+        )
+
+    registry.register(
+        "recall_asset", _recall_asset_tool,
+        "当用户想再看/再听你们之间以前的图片或语音（例如「再发一次那张图」"
+        "「我想再听那段晚安语音」「上次你给我看的照片呢」）时调用。query 填用户"
+        "想找的那段记忆的关键词。找到后系统会替你重新发送，你只需自然地补一句话；"
+        "若原件已不在，工具会把记忆的文字内容给你，由你向用户描述这份回忆。",
+        RECALL_ASSET_SCHEMA,
+    )
+
     # ── 剧情场景收尾（Bond-System-Design.md §4.4 形态3, P3）──
     # 仅经 bond_scene 特殊会话的 allowed_tools 下发（不在 SOCIAL_TOOLS / 全局
     # 工具集）。场景名/角色 id 从当前活跃 bond_scene 会话 metadata 读取（LLM 不
@@ -1128,6 +1156,11 @@ _active_task: dict = {}
 # Task windows older than this are treated as abandoned and ignored on finalize.
 _TASK_WINDOW_TTL = 15 * 60
 
+# 多模态资产记忆层（P4/P5）：文本卡 data/assets/{user}/cards/，二进制
+# data/assets/{user}/{char}/，prompt_hash 去重 + audit.log 计费审计。
+# P5: Agent 持有它做 L4「影音记忆」注入 → 必须先于 Agent 实例化。
+_asset_memory = AssetMemory(base_dir=os.path.join(_DATA_DIR, "assets"))
+
 agent = Agent(
     deepseek_client=_model_router.reasoning_client,
     tool_registry=_tool_registry,
@@ -1139,6 +1172,7 @@ agent = Agent(
     hardware_detector=_hardware_detector,
     workspace_manager=_workspace_manager,
     special_session_manager=_special_sessions,
+    asset_memory=_asset_memory,
     max_tool_iterations=20,
     thinking_timeout=180.0,
 )
@@ -1152,10 +1186,6 @@ _perm_manager = PermissionManager()
 # mtime 校验缓存（外部写入优先，同 ProfileManager 纪律）。
 # 结算钩子在回复成功发送后调用；仅 split 模式人格参与。
 _bond_manager = BondManager(base_dir=os.path.join(_DATA_DIR, "bonds"))
-
-# 多模态资产记忆层（P4）：文本卡 data/assets/{user}/cards/，二进制
-# data/assets/{user}/{char}/，prompt_hash 去重 + audit.log 计费审计。
-_asset_memory = AssetMemory(base_dir=os.path.join(_DATA_DIR, "assets"))
 
 
 # Per-user busy flag — prevents concurrent message processing for the
@@ -1176,6 +1206,73 @@ _temp_session_files: dict[str, set[str]] = {}
 UPGRADE_HINT_THRESHOLD = 15   # message count at which to start suggesting
 UPGRADE_HINT_INTERVAL = 10    # re-suggest at most every N messages
 _upgrade_hint_last: dict[str, int] = {}  # user_id -> message count at last hint
+
+
+# ── P5 (§8.3): 用户上传图/语音的后台文本化（对称通路）────────────────
+# split 人格下附件落盘后起后台任务：多模态 LLM 一句话描述/转录 → 写
+# user_upload 资产卡（文本记忆不褪色；二进制留在工作区，归工作区配额管，
+# 资产 LRU 不碰）→ 小额好感 EXP（每日 upload_exp_daily_cap 次封顶，防刷）。
+# 全程 best-effort 静默失败，不影响当轮回复；现有「路径文本注入 +
+# read_file 懒分析」通路保持不动——这里是额外的记忆入库，不是分析替换。
+_upload_tasks: set = set()
+
+_UPLOAD_IMAGE_PROMPT = "请用一句话客观描述这张图片的内容（不超过60字），不要推测用户意图。"
+_UPLOAD_VOICE_PROMPT = "请转录这段语音的文字内容，并用一句话概括语气与内容（不超过80字）。"
+# multimodal_client 失败时返回错误说明文本（非异常）——识别前缀后放弃入库
+_TEXTUALIZE_ERROR_PREFIXES = ("[多模态]", "[音频", "分析失败", "转录失败")
+
+
+async def _textualize_upload(user_id: str, char_id: str, kind: str, path: str):
+    """图片→一句话描述 / 语音→转录，落 user_upload 资产卡 + 小额好感。"""
+    try:
+        from lib.multimodal_client import multimodal_client
+        if kind == "image":
+            if not multimodal_client.is_available():
+                return
+            desc = await multimodal_client.analyze_image(path, _UPLOAD_IMAGE_PROMPT)
+        elif kind == "voice":
+            if not multimodal_client.is_audio_available():
+                return
+            desc = await multimodal_client.analyze_audio(path, _UPLOAD_VOICE_PROMPT)
+        else:
+            return
+        desc = " ".join((desc or "").split())
+        if not desc or desc.startswith(_TEXTUALIZE_ERROR_PREFIXES):
+            return
+        desc = desc[:200]
+        card = AssetCard(
+            id=make_asset_id(), type=ASSET_UPLOAD, char_id=char_id,
+            user_id=user_id, path=path,
+            prompt=desc, transcript=desc,
+            tags=["uploaded", kind],
+        )
+        _asset_memory.write_card(card)
+        try:
+            role = _perm_manager.get_role(user_id).value
+        except Exception:  # noqa: BLE001
+            role = "regular"
+        _enforce_asset_quota(user_id=user_id, role=role,
+                             bond_manager=_bond_manager,
+                             asset_memory=_asset_memory)
+        granted = _bond_manager.record_upload_exp(user_id, char_id)
+        _asset_memory.append_audit(
+            user_id, char_id, "upload", "", "",
+            "textualized" if granted else "textualized_capped")
+    except Exception as e:  # noqa: BLE001
+        log_exception("upload textualization failed", e)
+
+
+def _spawn_textualize_upload(user_id: str, char_id: str, kind: str, path: str):
+    """Fire-and-forget wrapper（持引用防 GC；无事件循环时静默跳过）。"""
+    if not (user_id and char_id and path):
+        return
+    try:
+        task = asyncio.create_task(
+            _textualize_upload(user_id, char_id, kind, path))
+        _upload_tasks.add(task)
+        task.add_done_callback(_upload_tasks.discard)
+    except RuntimeError:
+        pass
 
 
 def _record_file(message_id: str, name: str, path: str = "", error: str = ""):
@@ -1913,12 +2010,25 @@ async def handle_agent_turn(view: InboundMessage):
     file_context_parts = []
     has_voice = False
     msg_id = view.message_id
+    # P5 (§8.3): split 人格下，上传的图/语音在后台文本化入资产记忆。
+    # 人格解析是纯本地读（无 LLM），放在附件循环前代价可忽略。
+    _upload_persona = ""
+    try:
+        _pm_up = get_character_registry()
+        _p_up = _pm_up.resolve_effective_personality(user_id, view.group_id)
+        if _pm_up.get_mode(_p_up) == "split":
+            _upload_persona = _p_up
+    except Exception:  # noqa: BLE001
+        _upload_persona = ""
     for att in await view.load_attachments():
         if att.kind == "image":
             if att.path:
                 file_context_parts.append(f"[用户上传了图片，已保存至: {att.path}]")
                 _record_file(msg_id, att.name, att.path)
                 _record_session_file(user_id, att.path)
+                if _upload_persona:
+                    _spawn_textualize_upload(
+                        user_id, _upload_persona, "image", att.path)
             elif att.error:
                 file_context_parts.append(f"[用户上传了图片，但下载失败: {att.error}]")
                 _record_file(msg_id, att.name, error=att.error)
@@ -1940,6 +2050,9 @@ async def handle_agent_turn(view: InboundMessage):
                 )
                 _record_file(msg_id, att.name, att.path)
                 _record_session_file(user_id, att.path)
+                if _upload_persona:
+                    _spawn_textualize_upload(
+                        user_id, _upload_persona, "voice", att.path)
             elif att.error:
                 file_context_parts.append(f"[用户发送了语音消息，但下载失败: {att.error}]")
                 _record_file(msg_id, att.name, error=att.error)
@@ -2965,6 +3078,37 @@ def _build_bond_context(user_id: str, persona_key: str, pm) -> str:
     )
 
 
+def _distill_bond_episode(user_id: str, char_id: str, *, title: str,
+                          highlights=None):
+    """P5（§8）：里程碑时刻 → ≤300 字事件文本 → TieredMemory（category=event）。
+
+    素材 = 标题 + highlights + 最近共同经历日志 + 近期影音资产卡（文本化
+    记忆，路径已淘汰的卡也算数）。同步 best-effort——蒸馏失败静默，绝不
+    阻断回合收尾。不改 memory.py：ingest_candidates 本就接受带 category
+    的 4 元组。episode_distill_enabled=False 时整体跳过。
+    """
+    try:
+        if not bool(_bond_manager.get_config("episode_distill_enabled", True)):
+            return
+        recent_cards = _asset_memory.list_cards(user_id, char_id)[:5]
+        hl = [str(h) for h in (highlights or []) if h]
+        try:
+            hl.extend(_bond_manager.recent_events(user_id, char_id, n=2))
+        except Exception:  # noqa: BLE001
+            pass
+        text = _asset_memory.distill_episode(
+            user_id, char_id,
+            asset_ids=[c.id for c in recent_cards],
+            highlights=hl,
+            title=title,
+        )
+        if text:
+            _tiered_memory.ingest_candidates(
+                user_id, [(text, "new", None, "event")])
+    except Exception as e:  # noqa: BLE001
+        log_exception("bond episode distill failed", e)
+
+
 async def _settle_bond_turn(user_id: str, persona_key: str, sender=None,
                             is_group: bool = False):
     """好感结算钩子：split 人格每轮对话结束后累计 EXP/心情，升级时发庆祝。
@@ -2987,8 +3131,18 @@ async def _settle_bond_turn(user_id: str, persona_key: str, sender=None,
             _bond_manager.append_event(
                 user_id, persona_key, f"相识第 {milestone} 天纪念日"
             )
-        await _emit_level_ups(user_id, persona_key, result.get("level_ups", []),
+        ups = result.get("level_ups") or []
+        await _emit_level_ups(user_id, persona_key, ups,
                               sender=sender, is_group=is_group)
+        # P5: 升级是里程碑时刻 → 蒸馏一条事件记忆（长期可召回）
+        if ups:
+            top = ups[-1]
+            _distill_bond_episode(
+                user_id, persona_key,
+                title=f"与用户的羁绊提升到了 Lv{top.get('level')}"
+                      f"（{top.get('title', '')}）",
+                highlights=[f"用户一路陪伴到 Lv{top.get('level')}"],
+            )
     except Exception as e:
         log_exception("bond settlement failed", e)
 
@@ -3074,6 +3228,15 @@ async def _finish_bond_scene(user_id: str, result: dict, sender=None):
                 OutImage(path=path, label=f"羁绊纪念 · {scene_title}"),
                 sender=sender,
             )
+        # P5: 共同走完一段剧情是里程碑 → 蒸馏事件记忆（含纪念语）
+        hl = [f"羁绊 Lv{level}（{entry['level_title']}）"]
+        if entry["memento"]:
+            hl.append(f"纪念语：「{entry['memento']}」")
+        _distill_bond_episode(
+            user_id, char_id,
+            title=f"与用户一起完成了剧情「{scene_title}」",
+            highlights=hl,
+        )
         try:
             _special_sessions.end_active(user_id)
         except Exception:

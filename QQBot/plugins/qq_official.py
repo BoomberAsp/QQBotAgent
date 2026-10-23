@@ -51,11 +51,11 @@ from agent.character_registry import get_character_registry
 from agent.context import _turn_sender
 from agent.delegation import _LLM_ERROR_PREFIXES
 from agent.turn import (
-    _asset_memory, _bond_manager, _model_router, run_agent_turn,
+    _asset_memory, _bond_manager, _model_router, _perm_manager, run_agent_turn,
 )
 from lib import media_gen
 from lib.status_heartbeat import read_status, write_status
-from tools.social_tools import build_image_prompt
+from tools.social_tools import build_image_prompt, enforce_asset_quota
 
 official_router = on_message(priority=1, block=False)
 
@@ -321,6 +321,14 @@ async def _run_media_pass() -> None:
                     _asset_memory.write_card(card)
                     if phash:
                         _asset_memory.record_prompt_hash(phash, card)
+                    # P5 LRU：主动生成也是资产写盘 → 超配额即淘汰低分二进制
+                    try:
+                        _role = _perm_manager.get_role(openid).value
+                    except Exception:
+                        _role = "regular"
+                    enforce_asset_quota(user_id=openid, role=_role,
+                                        bond_manager=_bond_manager,
+                                        asset_memory=_asset_memory)
                 _asset_memory.append_audit(
                     openid, persona, kind,
                     card.model if card else "", phash or "", "proactive_ok")

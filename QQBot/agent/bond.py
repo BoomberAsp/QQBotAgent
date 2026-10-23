@@ -93,6 +93,10 @@ _DEFAULTS: Dict[str, Any] = {
     "media_asset_quota_mb_regular": 100,   # 资产层磁盘配额（P5 LRU 用）
     "media_asset_quota_mb_vip": 300,
     "media_asset_quota_mb_admin": 1000,
+    # ── P5: 多模态记忆闭环（§8）──
+    "upload_exp": 3,               # 用户上传图/语音被文本化入库的小额好感
+    "upload_exp_daily_cap": 3,     # 每日授予次数封顶（防刷图刷好感）
+    "episode_distill_enabled": True,  # 里程碑事件蒸馏进 TieredMemory 开关
 }
 
 # 角色面动态层固定提示：历史中的任务结果来自任务智能体（中立口吻），
@@ -278,6 +282,7 @@ class BondManager:
             "pokes": 0,
             "images": 0,     # P4: 今日已生成图像数
             "voices": 0,     # P4: 今日已合成语音数
+            "uploads": 0,    # P5: 今日已授予 EXP 的上传文本化次数
         }
 
     @staticmethod
@@ -287,7 +292,7 @@ class BondManager:
             state["daily"] = {
                 "date": today, "chat_exp": 0, "first_done": False,
                 "long_done": False, "gifts": 0, "pokes": 0,
-                "images": 0, "voices": 0,
+                "images": 0, "voices": 0, "uploads": 0,
             }
 
     def get_state(self, user_id: str, char_id: str, create: bool = True) -> Optional[dict]:
@@ -592,6 +597,26 @@ class BondManager:
         stats[counter] = int(stats.get(counter, 0)) + 1
         self._save(user_id)
         return used
+
+    def record_upload_exp(self, user_id: str, char_id: str) -> int:
+        """P5（§8.3）：用户上传的图/语音被文本化入库 → 小额好感。
+
+        每日 upload_exp_daily_cap 次封顶（防刷图刷好感）。返回本次授予的
+        EXP（封顶后为 0，调用方据此写审计）。
+        """
+        state = self.get_state(user_id, char_id)
+        self._roll_daily(state, datetime.now().strftime("%Y-%m-%d"))
+        used = int(state["daily"].get("uploads", 0))
+        cap = int(self._config.get("upload_exp_daily_cap", 3))
+        if used >= cap:
+            return 0
+        state["daily"]["uploads"] = used + 1
+        exp = int(self._config.get("upload_exp", 3))
+        if exp > 0:
+            self.add_exp(user_id, char_id, exp)
+        else:
+            self._save(user_id)
+        return exp
 
     # ── P3: 剧情场景完成记录（防重复刷 EXP）────────────────────────
 

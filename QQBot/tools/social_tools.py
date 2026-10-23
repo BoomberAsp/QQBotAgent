@@ -15,11 +15,14 @@ observation 的形式回给角色面 LLM，由角色以自己的口吻自然回�
 所有协作对象经参数注入，可独立单测（与 delegation.py / creation_tools.py 同模式）。
 """
 
+import os
 import random
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent import bond_content
-from agent.asset_memory import AssetCard, make_asset_id, prompt_hash_of
+from agent.asset_memory import (
+    ASSET_VOICE, AssetCard, make_asset_id, prompt_hash_of,
+)
 from agent.outbound import OutAudio, OutImage
 from lib import media_gen
 
@@ -328,6 +331,8 @@ async def create_image(
         asset_memory.record_prompt_hash(phash, card)
         asset_memory.append_audit(user_id, char_id, "image", model, phash, "ok")
         bond_manager.record_media_use(user_id, char_id, "image")
+        enforce_asset_quota(user_id=user_id, role=role,
+                            bond_manager=bond_manager, asset_memory=asset_memory)
         if send_image is not None:
             await send_image(OutImage(path=path, label=description[:30]))
         return (
@@ -426,6 +431,8 @@ async def send_voice(
         asset_memory.record_prompt_hash(phash, card)
         asset_memory.append_audit(user_id, char_id, "voice", model, phash, "ok")
         bond_manager.record_media_use(user_id, char_id, "voice")
+        enforce_asset_quota(user_id=user_id, role=role,
+                            bond_manager=bond_manager, asset_memory=asset_memory)
         if send_audio is not None:
             await send_audio(OutAudio(path=path, label=text[:20]))
         return (
@@ -460,4 +467,90 @@ SEND_VOICE_SCHEMA: Dict[str, Any] = {
         },
     },
     "required": ["text"],
+}
+
+
+# ── P5: 记忆闭环（Bond-System-Design.md §8）───────────────────────────
+
+def enforce_asset_quota(*, user_id: str, role: str, bond_manager,
+                        asset_memory) -> List[str]:
+    """LRU 接线：资产总量超角色配额 → 从低分到高分淘汰二进制（卡保留）。
+
+    每次资产写盘后调用（生成工具 / 主动 pass / 上传文本化）。best-effort，
+    永不抛错（增益功能不阻断生成回合）。返回被淘汰的 asset_id 列表。
+    """
+    try:
+        role_key = role if role in ("regular", "vip", "admin") else "regular"
+        quota_mb = bond_manager.get_config(
+            f"media_asset_quota_mb_{role_key}",
+            bond_manager.get_config("media_asset_quota_mb_regular", 100),
+        )
+        return asset_memory.enforce_quota(user_id, quota_mb)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def recall_asset(
+    *,
+    user_id: str,
+    char_id: str,
+    query: str,
+    asset_memory,
+    rerank_client=None,
+    send_media: Optional[Callable] = None,
+) -> str:
+    """找回一段影音记忆（§8.2）：检索 → 重发 / 描述 / 自然回应。
+
+    命中且二进制在盘 → bump_recall + 重发 + observation；
+    命中但 path=None（已淘汰）→ 文本记忆仍在，observation 让角色凭卡描述；
+    无命中 → observation 引导角色自然回应（不假装记得）。
+    """
+    query = (query or "").strip()
+    if not user_id or not char_id:
+        return "[Error] 缺少用户或角色上下文，无法找回记忆。"
+    if not query:
+        return ("用户想找回以前的图片或语音，但没有说清是哪一段。"
+                "请以角色口吻问问 TA 想找的是哪次回忆。")
+    try:
+        hits = await asset_memory.search_with_rerank(
+            user_id, query, rerank_client, top_k=3, char_id=char_id)
+    except Exception:  # noqa: BLE001
+        hits = []
+    if not hits:
+        return (f"没有找到与「{query[:40]}」相关的影音记忆。请以角色口吻自然地回应"
+                "（可以说记不清有这样的回忆，或请用户描述得再具体一点；如果用户"
+                "其实想要一张新图/一段新语音，可以改用 create_image / send_voice）。")
+
+    card = hits[0]
+    desc = " ".join((card.transcript or card.prompt or "").split())[:60]
+    is_voice = card.type == ASSET_VOICE or "voice" in (card.tags or [])
+    kind = "语音" if is_voice else "图片"
+    if card.path and os.path.isfile(card.path):
+        try:
+            asset_memory.bump_recall(user_id, card.id)
+        except Exception:  # noqa: BLE001
+            pass
+        if send_media is not None:
+            item = (OutAudio(path=card.path, label=desc[:20] or "语音")
+                    if is_voice
+                    else OutImage(path=card.path, label=desc[:20] or "图片"))
+            await send_media(item)
+        return (f"你找回了那段{kind}记忆并已重新发给用户（内容：「{desc}」）。"
+                f"请以角色口吻自然地补一句话，像是翻出珍藏的回忆递给 TA。")
+    return (f"那段{kind}记忆的文字还留在你心里：「{desc}」。但原件已经淡去，"
+            f"无法重新发送。请以角色口吻凭这段文字向用户描述这份回忆"
+            f"（可以带一点歉意或怀念，不要提及系统细节）。")
+
+
+# recall_asset 工具的 JSON Schema（角色面 allowed_tools 下发）
+RECALL_ASSET_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "用户想找回的那段记忆的关键词（从用户的话里提炼，"
+                           "如「海边的图」「晚安语音」；系统会据此检索你们的影音记忆）",
+        },
+    },
+    "required": ["query"],
 }

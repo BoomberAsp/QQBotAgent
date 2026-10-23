@@ -29,8 +29,10 @@ from typing import Any, Callable, Dict, List, Optional, Set
 # create_image / send_voice: 多模态生成（P4，§7）——角色面专属，不进全局
 #   TOOLS.md/permissions（同 give_gift 决策：防污染任务面/unified 前缀，
 #   二层硬拒绝兜底）。复合制作（画集/有声故事等）后续走 delegate_task。
+# recall_asset: 找回影音记忆（P5，§8.2）——检索 asset_memory 文本卡并重发
+#   二进制（或让角色凭文本描述已淡去的原件）。同为角色面专属。
 SOCIAL_TOOLS: frozenset = frozenset(
-    {"delegate_task", "give_gift", "create_image", "send_voice"}
+    {"delegate_task", "give_gift", "create_image", "send_voice", "recall_asset"}
 )
 
 DEFAULT_TASK_TIMEOUT = 240.0

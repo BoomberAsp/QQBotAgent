@@ -11,24 +11,32 @@ markdown+frontmatter 资产卡（与 MemorySystem 同款格式），二进制文
     data/assets/audit.log                              # 生成审计（单行追加）
 
 P4 范围：建卡 / 读卡 / 列表 / prompt_hash 去重 / 审计。
-P5 追加：关键词检索 + 歧义 LLM 重排 / 召回计数 / 注入块 / 事件蒸馏 / LRU 淘汰。
+P5 范围：关键词检索 + 歧义 LLM 重排 / 召回计数 / L4 注入块 / 事件蒸馏 /
+LRU 淘汰（score = recall_count × exp(-age_days/30)，只删二进制、卡保留）。
 
 无 nonebot / 网络依赖，可独立单测。JSON 一律原子写 + 损坏回退空值。
 """
 
 import hashlib
 import json
+import math
 import os
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # 资产类型
 ASSET_IMAGE = "image"
 ASSET_VOICE = "voice"
 ASSET_UPLOAD = "user_upload"
+
+# 注入块/observation 里的中文类型标签
+_TYPE_LABEL = {ASSET_IMAGE: "图片", ASSET_VOICE: "语音", ASSET_UPLOAD: "上传"}
+
+# LRU 半衰期（天）：score = recall_count × exp(-age_days / _LRU_HALF_LIFE_DAYS)
+_LRU_HALF_LIFE_DAYS = 30.0
 
 _DEFAULT_BASE_DIR = os.path.join(
     os.path.dirname(__file__), "..", "data", "assets"
@@ -297,3 +305,246 @@ class AssetMemory:
                 f.write(line)
         except IOError:
             pass
+
+    # ── P5: 关键词检索 + 歧义 LLM 重排（§8.2，不引入向量库）──────────
+
+    def _search_scored(
+        self, user_id: str, query: str, char_id: Optional[str] = None
+    ) -> List[Tuple[AssetCard, float]]:
+        """打分后的命中列表（分数降序、同分新的在前）。"""
+        terms = _search_terms(query)
+        if not terms:
+            return []
+        scored: List[Tuple[AssetCard, float]] = []
+        for card in self.list_cards(user_id, char_id):
+            s = _score_asset(card, terms)
+            if s > 0:
+                scored.append((card, s))
+        scored.sort(key=lambda cs: (-cs[1], -cs[0].created_at))
+        return scored
+
+    def search(
+        self, user_id: str, query: str, top_k: int = 5,
+        char_id: Optional[str] = None,
+    ) -> List[AssetCard]:
+        """关键词检索资产卡（prompt/transcript/tags 子串命中打分）。"""
+        return [c for c, _ in self._search_scored(user_id, query, char_id)[:top_k]]
+
+    async def search_with_rerank(
+        self, user_id: str, query: str, rerank_client=None, top_k: int = 5,
+        char_id: Optional[str] = None,
+    ) -> List[AssetCard]:
+        """关键词 top-N；仅当截断线两侧分差小（歧义）时花一次 flash 重排。
+
+        重排失败/输出不可解析 → 静默回退关键词序（增益功能不阻断）。
+        """
+        scored = self._search_scored(user_id, query, char_id)
+        if not scored:
+            return []
+        top_k = max(1, int(top_k))
+        if len(scored) <= top_k or rerank_client is None:
+            return [c for c, _ in scored[:top_k]]
+        if scored[top_k - 1][1] - scored[top_k][1] >= 1.0:
+            return [c for c, _ in scored[:top_k]]  # 分差足够大，无需重排
+        window = scored[: max(top_k * 2, 6)]
+        try:
+            lines = [
+                f"{i + 1}. [{_TYPE_LABEL.get(c.type, '资产')}] "
+                f"{' '.join((c.transcript or c.prompt or '').split())[:40]}"
+                for i, (c, _) in enumerate(window)
+            ]
+            prompt = (
+                f"用户想找回一段影音记忆，TA 的描述是：「{(query or '')[:80]}」。\n"
+                f"候选列表：\n" + "\n".join(lines) + "\n\n"
+                f"请选出最匹配的至多 {top_k} 项，按相关度从高到低只输出序号，"
+                f"用逗号分隔（例如「3,1」）。不要输出任何其他文字。"
+            )
+            raw = await rerank_client.chat_completion(
+                message=prompt, timeout_set=10.0, purpose="asset_rerank")
+            picked: List[AssetCard] = []
+            seen = set()
+            for n in re.findall(r"\d+", raw or ""):
+                idx = int(n) - 1
+                if 0 <= idx < len(window) and idx not in seen:
+                    seen.add(idx)
+                    picked.append(window[idx][0])
+                if len(picked) >= top_k:
+                    break
+            if picked:
+                return picked
+        except Exception:  # noqa: BLE001
+            pass
+        return [c for c, _ in scored[:top_k]]
+
+    # ── P5: 召回计数 / L4 注入块 / 事件蒸馏 ─────────────────────────
+
+    def bump_recall(self, user_id: str, asset_id: str) -> bool:
+        """召回重发成功后 +1（LRU 权重：常被想起的记忆最后淘汰）。"""
+        card = self.read_card(user_id, asset_id)
+        if card is None:
+            return False
+        card.recall_count = int(card.recall_count or 0) + 1
+        self.write_card(card)
+        return True
+
+    @staticmethod
+    def card_label(card: AssetCard) -> str:
+        if card.type == ASSET_UPLOAD:
+            return ("用户发来的语音" if "voice" in (card.tags or [])
+                    else "用户发来的图片")
+        return _TYPE_LABEL.get(card.type, "资产")
+
+    def build_asset_injection(
+        self, user_id: str, char_id: str, top_k: int = 5,
+        display_name: str = "",
+    ) -> str:
+        """L4 易变尾部的「影音记忆」注入块（无资产 → 空串，零开销）。
+
+        path=None 的已淘汰卡**照样注入**——二进制是缓存，文本记忆不褪色。
+        """
+        cards = self.list_cards(user_id, char_id)[: max(1, int(top_k))]
+        if not cards:
+            return ""
+        name = display_name or char_id
+        lines = []
+        for c in cards:
+            date = time.strftime("%Y-%m-%d", time.localtime(c.created_at))
+            desc = " ".join((c.prompt or c.transcript or "").split())[:40]
+            state = ("" if (c.path and os.path.isfile(c.path))
+                     else "（原件已淡去，只剩文字记忆）")
+            lines.append(f"- [{date} · {self.card_label(c)}] {desc or '（无描述）'}{state}")
+        return (
+            f"## 你与{name}的影音记忆\n"
+            "以下是你们之间最近的图片与语音（新的在前）。可以自然提及这些共同记忆；"
+            "当用户想找回某一张图/某一段语音（如「再发一次那张图」）时，"
+            "调用 recall_asset 工具。\n" + "\n".join(lines)
+        )
+
+    def distill_episode(
+        self, user_id: str, char_id: str,
+        asset_ids: Optional[List[str]], highlights: Optional[List[str]],
+        title: str,
+    ) -> str:
+        """里程碑时刻 → ≤300 字事件文本（TieredMemory category=event 用）。"""
+        parts = [(title or "").strip()]
+        hs = [str(h).strip() for h in (highlights or []) if h and str(h).strip()]
+        if hs:
+            parts.append("；".join(hs))
+        descs = []
+        for aid in (asset_ids or [])[:3]:
+            card = self.read_card(user_id, str(aid))
+            if card is None:
+                continue
+            d = " ".join((card.prompt or card.transcript or "").split())[:30]
+            if d:
+                descs.append(d)
+        if descs:
+            parts.append("相关影音：" + "、".join(descs))
+        return "。".join(p for p in parts if p)[:300]
+
+    # ── P5: LRU 淘汰（二进制 = 可淘汰缓存；卡 = 本体，永不删）────────
+
+    def assets_size(self, user_id: str) -> int:
+        """该用户资产目录总字节数（二进制 + 卡文件；卡极小可忽略）。"""
+        total = 0
+        for dirpath, _dirs, files in os.walk(self._user_dir(user_id)):
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, fn))
+                except OSError:
+                    pass
+        return total
+
+    @staticmethod
+    def eviction_score(card: AssetCard, now: Optional[float] = None) -> float:
+        """recall_count × exp(-age_days/30)——低分先淘汰（平局老的先走）。"""
+        now = now if now is not None else time.time()
+        age_days = max(0.0, (now - float(card.created_at or now)) / 86400.0)
+        return max(0, int(card.recall_count or 0)) * math.exp(
+            -age_days / _LRU_HALF_LIFE_DAYS)
+
+    def eviction_candidates(self, user_id: str) -> List[AssetCard]:
+        """可淘汰二进制（升序：最低分在前）。
+
+        只收资产目录内的文件——data/characters/ 锚点/参考立绘与工作区
+        上传原件（路径在资产目录外）**硬保护**，永不进候选。
+        """
+        root = os.path.abspath(self._user_dir(user_id))
+        out = []
+        for card in self.list_cards(user_id):
+            if not card.path:
+                continue
+            ap = os.path.abspath(card.path)
+            if not ap.startswith(root + os.sep) or not os.path.isfile(ap):
+                continue
+            out.append(card)
+        out.sort(key=lambda c: (self.eviction_score(c), c.created_at))
+        return out
+
+    def evict(self, user_id: str, asset_id: str) -> bool:
+        """只删二进制、卡保留（path=None）；资产目录外的路径拒绝删除。"""
+        card = self.read_card(user_id, asset_id)
+        if card is None or not card.path:
+            return False
+        root = os.path.abspath(self._user_dir(user_id))
+        ap = os.path.abspath(card.path)
+        if not ap.startswith(root + os.sep):
+            return False  # 硬保护：characters/ 锚点、工作区上传原件等
+        try:
+            os.remove(ap)
+        except OSError:
+            return False
+        card.path = None
+        self.write_card(card)
+        return True
+
+    def enforce_quota(self, user_id: str, quota_mb) -> List[str]:
+        """超配额 → 从低分到高分淘汰二进制直到达标。返回被淘汰的 asset_id。"""
+        try:
+            limit = int(quota_mb) * 1024 * 1024
+        except (TypeError, ValueError):
+            return []
+        if limit <= 0:
+            return []
+        size = self.assets_size(user_id)
+        evicted: List[str] = []
+        if size <= limit:
+            return evicted
+        for card in self.eviction_candidates(user_id):
+            if size <= limit:
+                break
+            try:
+                fsize = os.path.getsize(card.path)
+            except OSError:
+                fsize = 0
+            if self.evict(user_id, card.id):
+                size -= fsize
+                evicted.append(card.id)
+        return evicted
+
+
+def _search_terms(query: str) -> List[str]:
+    """检索词：完整 query + 标点/空白切分的 ≥2 字 token（CJK 友好）。"""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    terms = {q}
+    for tok in re.split(r"[\s,，。.!！?？、;；:：\"'「」『』()（）\[\]【】]+", q):
+        if len(tok) >= 2:
+            terms.add(tok)
+    return sorted(terms)
+
+
+def _score_asset(card: AssetCard, terms: List[str]) -> float:
+    prompt = (card.prompt or "").lower()
+    trans = (card.transcript or "").lower()
+    tags = " ".join(card.tags or []).lower()
+    score = 0.0
+    for t in terms:
+        if t in tags:
+            score += 3.0
+        if t in trans:
+            score += 2.0
+        if t in prompt:
+            score += 2.0
+    return score

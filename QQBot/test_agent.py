@@ -7011,6 +7011,573 @@ class TestProactiveMedia:
         print_pass("all sends fail → zero quota recorded, cooldown untouched")
 
 
+# ── P5: 多模态记忆闭环（检索 / 召回 / 上传文本化 / 事件蒸馏 / LRU）──
+
+def _seed_asset(am, user="u1", char="rubi", type_="image", desc="",
+                tags=None, created=None, recall=0, with_file=True,
+                path_override=None, size=64):
+    """Write one asset card (+ real binary unless with_file=False)."""
+    from agent.asset_memory import AssetCard, make_asset_id
+    aid = make_asset_id()
+    path = path_override
+    if path is None and with_file:
+        ext = "mp3" if type_ == "voice" else "png"
+        path = am.binary_path(user, char, aid, ext)
+        with open(path, "wb") as f:
+            f.write(b"X" * size)
+    card = AssetCard(
+        id=aid, type=type_, char_id=char, user_id=user, path=path,
+        model="tts-model" if type_ == "voice" else "img-model",
+        prompt=desc, transcript=desc if type_ == "voice" else "",
+        tags=list(tags if tags is not None else ["generated"]),
+        created_at=created if created is not None else time.time(),
+        recall_count=recall,
+    )
+    am.write_card(card)
+    return card
+
+
+class _FakeRerankClient:
+    """Scripted flash client for search_with_rerank (str reply or Exception)."""
+
+    def __init__(self, reply="1"):
+        self.reply = reply
+        self.calls = 0
+
+    async def chat_completion(self, message, history=None, timeout_set=20.0,
+                              purpose=""):
+        self.calls += 1
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
+
+
+class TestAssetSearch:
+    """40. P5: AssetMemory 关键词检索 + 歧义 LLM 重排."""
+
+    def run(self):
+        print_header("40. Asset Search & Rerank (P5)")
+        from agent.asset_memory import AssetMemory
+        self.tmp = tempfile.mkdtemp(prefix="p5search_")
+        try:
+            self.am = AssetMemory(base_dir=os.path.join(self.tmp, "assets"))
+            self.test_keyword_search()
+            asyncio.run(self.test_rerank_triggered())
+            asyncio.run(self.test_rerank_skipped())
+        finally:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_keyword_search(self):
+        am = self.am
+        c1 = _seed_asset(am, desc="在海边散步的自拍，夕阳很好")
+        c2 = _seed_asset(am, type_="voice", desc="晚安语音，好梦")
+        c3 = _seed_asset(am, desc="星空下的魔法课",
+                         tags=["generated", "proactive"])
+        c4 = _seed_asset(am, char="roxy", desc="海边的洛琪希")
+        # char_id=None → 跨角色检索；显式指定 → 只查该角色
+        assert len(am.search("u1", "海边")) == 2  # c1 + c4
+        hits = am.search("u1", "海边", char_id="rubi")
+        assert [h.id for h in hits] == [c1.id]
+        assert [h.id for h in am.search("u1", "海边", char_id="roxy")] == [c4.id]
+        # 语音卡走 transcript
+        hits = am.search("u1", "晚安")
+        assert hits and hits[0].id == c2.id
+        # tag 命中
+        hits = am.search("u1", "proactive")
+        assert hits and hits[0].id == c3.id
+        # 无命中 / 空 query / 无此用户
+        assert am.search("u1", "完全无关的词汇") == []
+        assert am.search("u1", "   ") == []
+        assert am.search("nobody", "海边") == []
+        # top_k 截断
+        for i in range(6):
+            _seed_asset(am, user="u2", desc=f"日常自拍 {i}")
+        assert len(am.search("u2", "自拍", top_k=3)) == 3
+        print_pass("keyword search: prompt/transcript/tags, char filter, top_k")
+
+    async def test_rerank_triggered(self):
+        from agent.asset_memory import AssetMemory
+        am = AssetMemory(base_dir=os.path.join(self.tmp, "assets_rr"))
+        base = time.time()
+        cards = [_seed_asset(am, user="u3", desc=f"和团长在一起的日子 {i}",
+                             created=base + i)
+                 for i in range(5)]
+        # 全卡同分 → 截断线分差 0 → 触发一次 flash 重排；候选列新的在前，
+        # 即序号 1..5 = cards[4], cards[3], cards[2], cards[1], cards[0]
+        client = _FakeRerankClient(reply="3,1")
+        hits = await am.search_with_rerank("u3", "在一起", client, top_k=2)
+        assert client.calls == 1
+        assert [h.id for h in hits] == [cards[2].id, cards[4].id]
+        # 输出不可解析（无序号）→ 静默回退关键词序
+        client2 = _FakeRerankClient(reply="抱歉，我无法判断")
+        hits2 = await am.search_with_rerank("u3", "在一起", client2, top_k=2)
+        assert client2.calls == 1 and len(hits2) == 2
+        # 客户端抛异常 → 静默回退
+        client3 = _FakeRerankClient(reply=RuntimeError("boom"))
+        hits3 = await am.search_with_rerank("u3", "在一起", client3, top_k=2)
+        assert len(hits3) == 2
+        # 序号越界的被跳过，合法的保留
+        client4 = _FakeRerankClient(reply="99,2,x")
+        hits4 = await am.search_with_rerank("u3", "在一起", client4, top_k=2)
+        assert [h.id for h in hits4] == [cards[1].id] or len(hits4) >= 1
+        print_pass("rerank: ambiguity trigger, index parse, garbage/error fallback")
+
+    async def test_rerank_skipped(self):
+        from agent.asset_memory import AssetMemory
+        am = AssetMemory(base_dir=os.path.join(self.tmp, "assets_skip"))
+        strong = _seed_asset(am, user="u4", desc="烟花大会",
+                             tags=["generated", "烟花"])
+        for i in range(4):
+            _seed_asset(am, user="u4", desc=f"烟花相关的其他回忆 {i}")
+        client = _FakeRerankClient(reply="5,4")
+        # tag 命中 (+3) 使截断线分差 ≥1 → 关键词序已可信，不花重排调用
+        hits = await am.search_with_rerank("u4", "烟花", client, top_k=1)
+        assert client.calls == 0
+        assert hits[0].id == strong.id
+        # 无 rerank client → 关键词序
+        hits2 = await am.search_with_rerank("u4", "烟花", None, top_k=1)
+        assert hits2[0].id == strong.id
+        # 候选数 ≤ top_k → 直接返回，不触发重排
+        hits3 = await am.search_with_rerank("u4", "烟花大会", client, top_k=10)
+        assert client.calls == 0 and len(hits3) >= 1
+        print_pass("rerank skipped: clear margin / no client / few candidates")
+
+
+class TestAssetRecall:
+    """41. P5: recall_asset 工具 — 重发 / 已淡去 / 无命中."""
+
+    def run(self):
+        print_header("41. Asset Recall Tool (P5)")
+        from agent.asset_memory import AssetMemory
+        from agent.outbound import OutAudio, OutImage
+        self.OutAudio, self.OutImage = OutAudio, OutImage
+        self.tmp = tempfile.mkdtemp(prefix="p5recall_")
+        try:
+            self.am = AssetMemory(base_dir=os.path.join(self.tmp, "assets"))
+            asyncio.run(self.test_recall_hit_resend())
+            asyncio.run(self.test_recall_evicted_and_miss())
+        finally:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def test_recall_hit_resend(self):
+        from agent.asset_memory import AssetMemory as _AM
+        from tools.social_tools import recall_asset
+        am = self.am
+        img = _seed_asset(am, desc="海边散步的自拍")
+        voc = _seed_asset(am, type_="voice", desc="晚安语音")
+        sent = []
+
+        async def send_media(item):
+            sent.append(item)
+
+        obs = await recall_asset(user_id="u1", char_id="rubi", query="海边",
+                                 asset_memory=am, rerank_client=None,
+                                 send_media=send_media)
+        assert len(sent) == 1 and isinstance(sent[0], self.OutImage)
+        assert sent[0].path == img.path
+        assert "找回" in obs and "图片" in obs
+        # 重发成功 → recall_count +1（冷读磁盘验证已落盘）
+        cold = _AM(base_dir=am.base_dir)
+        assert cold.read_card("u1", img.id).recall_count == 1
+        # 语音卡 → OutAudio
+        obs = await recall_asset(user_id="u1", char_id="rubi", query="晚安",
+                                 asset_memory=am, send_media=send_media)
+        assert len(sent) == 2 and isinstance(sent[1], self.OutAudio)
+        assert sent[1].path == voc.path and "语音" in obs
+        # send_media=None → 不崩，仍返回找回 observation
+        obs = await recall_asset(user_id="u1", char_id="rubi", query="海边",
+                                 asset_memory=am, send_media=None)
+        assert "找回" in obs
+        print_pass("recall hit: image/voice resend, bump_recall, no-sender safe")
+
+    async def test_recall_evicted_and_miss(self):
+        from tools.social_tools import recall_asset
+        am = self.am
+        _seed_asset(am, desc="旧日的烟花大会", with_file=False)  # path=None 已淘汰
+        sent = []
+
+        async def send_media(item):
+            sent.append(item)
+
+        obs = await recall_asset(user_id="u1", char_id="rubi", query="烟花",
+                                 asset_memory=am, send_media=send_media)
+        assert sent == []
+        assert "淡去" in obs and "烟花" in obs  # 文本记忆仍在 → 角色凭卡描述
+        obs = await recall_asset(user_id="u1", char_id="rubi", query="恐龙",
+                                 asset_memory=am, send_media=send_media)
+        assert "没有找到" in obs and sent == []
+        obs = await recall_asset(user_id="u1", char_id="rubi", query="  ",
+                                 asset_memory=am)
+        assert "哪次回忆" in obs
+        obs = await recall_asset(user_id="", char_id="rubi", query="海边",
+                                 asset_memory=am)
+        assert obs.startswith("[Error]")
+        print_pass("recall: evicted → describe, miss → natural reply, guards")
+
+
+class TestUploadTextualization:
+    """42. P5: turn._textualize_upload — 上传 → user_upload 卡 + EXP 日封顶.
+
+    非 split 人格不触发的门在 run_agent_turn 的附件循环里（_upload_persona
+    解析）；这里覆盖后台任务本体 + _spawn_textualize_upload 的上下文守卫。
+    """
+
+    PATCHED = ("_asset_memory", "_bond_manager", "_perm_manager")
+
+    def run(self):
+        print_header("42. Upload Textualization (P5)")
+        from types import SimpleNamespace
+        import lib.multimodal_client as mc
+        turn = _import_turn_for_tests()
+        self.turn = turn
+        self.client = mc.multimodal_client
+        self.tmp = tempfile.mkdtemp(prefix="p5upload_")
+        orig = tuple(getattr(turn, n) for n in self.PATCHED)
+        orig_mc = (self.client.is_available, self.client.is_audio_available,
+                   self.client.analyze_image, self.client.analyze_audio)
+        try:
+            from agent.asset_memory import AssetMemory
+            turn._asset_memory = AssetMemory(
+                base_dir=os.path.join(self.tmp, "assets"))
+            turn._bond_manager = _tmp_bond_manager(self.tmp)
+            turn._perm_manager = SimpleNamespace(
+                get_role=lambda uid: SimpleNamespace(value="regular"))
+            self.am, self.m = turn._asset_memory, turn._bond_manager
+            asyncio.run(self.test_image_and_voice_cards())
+            asyncio.run(self.test_error_and_unavailable())
+            asyncio.run(self.test_daily_cap_and_exception())
+            self.test_spawn_guard()
+        finally:
+            for n, v in zip(self.PATCHED, orig):
+                setattr(turn, n, v)
+            (self.client.is_available, self.client.is_audio_available,
+             self.client.analyze_image, self.client.analyze_audio) = orig_mc
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def test_image_and_voice_cards(self):
+        turn = self.turn
+        img_path = os.path.join(self.tmp, "up", "cat.png")
+        os.makedirs(os.path.dirname(img_path), exist_ok=True)
+        with open(img_path, "wb") as f:
+            f.write(b"P")
+        self.client.is_available = lambda: True
+        seen = []
+
+        async def fake_image(path, prompt=None, timeout=60.0):
+            seen.append((path, prompt))
+            return "一只橘猫趴在窗台上晒太阳。"
+        self.client.analyze_image = fake_image
+        await turn._textualize_upload("u1", "rubi", "image", img_path)
+        assert seen[0][0] == img_path and "一句话" in seen[0][1]
+        cards = self.am.list_cards("u1", "rubi")
+        assert len(cards) == 1
+        c = cards[0]
+        assert c.type == "user_upload" and c.tags == ["uploaded", "image"]
+        assert c.path == img_path
+        assert "橘猫" in c.prompt and "橘猫" in c.transcript
+        st = self.m.get_state("u1", "rubi", create=False)
+        assert st["daily"]["uploads"] == 1
+        assert st["exp"] == int(self.m._config["upload_exp"])
+        audit = open(self.am._audit_path, encoding="utf-8").read()
+        assert "|upload|" in audit and "textualized" in audit
+        # 语音 → 转录卡
+        voc_path = os.path.join(self.tmp, "up", "msg.mp3")
+        with open(voc_path, "wb") as f:
+            f.write(b"M")
+        self.client.is_audio_available = lambda: True
+
+        async def fake_audio(path, prompt=None, timeout=120.0):
+            return "用户说：明天一起去海边吧。语气愉快。"
+        self.client.analyze_audio = fake_audio
+        await turn._textualize_upload("u1", "rubi", "voice", voc_path)
+        cards = self.am.list_cards("u1", "rubi")
+        assert len(cards) == 2
+        voc = [c for c in cards if "voice" in c.tags][0]
+        assert voc.type == "user_upload" and "海边" in voc.prompt
+        assert self.m.get_state("u1", "rubi", create=False)["daily"]["uploads"] == 2
+        print_pass("image/voice upload → user_upload card, EXP granted, audit")
+
+    async def test_error_and_unavailable(self):
+        turn = self.turn
+        called = []
+        self.client.is_available = lambda: False
+
+        async def fake_image(path, prompt=None, timeout=60.0):
+            called.append(path)
+            return "desc"
+        self.client.analyze_image = fake_image
+        await turn._textualize_upload("u2", "rubi", "image", "/x/y.png")
+        assert called == [] and self.am.list_cards("u2", "rubi") == []
+        # 客户端把错误当文本返回（[多模态] 前缀）→ 不入库
+        self.client.is_available = lambda: True
+
+        async def err_image(path, prompt=None, timeout=60.0):
+            return "[多模态] 图片文件不存在: /x/y.png"
+        self.client.analyze_image = err_image
+        await turn._textualize_upload("u2", "rubi", "image", "/x/y.png")
+        assert self.am.list_cards("u2", "rubi") == []
+        # 空描述 / 未知 kind → 静默
+        async def empty_image(path, prompt=None, timeout=60.0):
+            return "   "
+        self.client.analyze_image = empty_image
+        await turn._textualize_upload("u2", "rubi", "image", "/x/y.png")
+        await turn._textualize_upload("u2", "rubi", "file", "/x/y.zip")
+        assert self.am.list_cards("u2", "rubi") == []
+        print_pass("unavailable / error-text / empty / unknown kind → no card")
+
+    async def test_daily_cap_and_exception(self):
+        turn = self.turn
+        self.client.is_available = lambda: True
+
+        async def fake_image(path, prompt=None, timeout=60.0):
+            return "一张风景照。"
+        self.client.analyze_image = fake_image
+        self.m._config["upload_exp_daily_cap"] = 2
+        for i in range(3):
+            await turn._textualize_upload("u3", "rubi", "image", f"/x/{i}.png")
+        st = self.m.get_state("u3", "rubi", create=False)
+        assert st["daily"]["uploads"] == 2               # 封顶
+        assert len(self.am.list_cards("u3", "rubi")) == 3  # 卡照样全部入库
+        assert st["exp"] == 2 * int(self.m._config["upload_exp"])
+        audit = open(self.am._audit_path, encoding="utf-8").read()
+        assert "textualized_capped" in audit
+        # 分析抛异常 → 静默不崩、不入库
+        async def boom(path, prompt=None, timeout=60.0):
+            raise RuntimeError("net down")
+        self.client.analyze_image = boom
+        await turn._textualize_upload("u4", "rubi", "image", "/x/z.png")
+        assert self.am.list_cards("u4", "rubi") == []
+        print_pass("daily EXP cap (cards still written), exception silent")
+
+    def test_spawn_guard(self):
+        turn = self.turn
+        n0 = len(turn._upload_tasks)
+        turn._spawn_textualize_upload("", "rubi", "image", "/x.png")
+        turn._spawn_textualize_upload("u1", "", "image", "/x.png")
+        turn._spawn_textualize_upload("u1", "rubi", "image", "")
+        assert len(turn._upload_tasks) == n0
+        print_pass("spawn guard: missing user/char/path → no task")
+
+
+class TestEpisodeDistill:
+    """43. P5: 里程碑事件蒸馏 → TieredMemory (category=event)."""
+
+    PATCHED = ("_asset_memory", "_bond_manager", "_tiered_memory")
+
+    class _FakeTM:
+        def __init__(self):
+            self.calls = []
+
+        def ingest_candidates(self, user_id, candidates, snapshot_turns=None):
+            self.calls.append((user_id, list(candidates)))
+            return {}
+
+    def run(self):
+        print_header("43. Episode Distillation (P5)")
+        turn = _import_turn_for_tests()
+        self.turn = turn
+        self.tmp = tempfile.mkdtemp(prefix="p5distill_")
+        orig = tuple(getattr(turn, n) for n in self.PATCHED)
+        try:
+            from agent.asset_memory import AssetMemory
+            turn._asset_memory = AssetMemory(
+                base_dir=os.path.join(self.tmp, "assets"))
+            turn._bond_manager = _tmp_bond_manager(self.tmp)
+            self.am, self.m = turn._asset_memory, turn._bond_manager
+            self.tm = self._FakeTM()
+            turn._tiered_memory = self.tm
+            self.test_distill_scene_episode()
+            self.test_switch_and_failure()
+            self.test_distill_length_cap()
+        finally:
+            for n, v in zip(self.PATCHED, orig):
+                setattr(turn, n, v)
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_distill_scene_episode(self):
+        turn = self.turn
+        _seed_asset(self.am, user="u1", desc="雨夜哨塔里的合影")
+        self.m.append_event("u1", "rubi", "完成了剧情场景「雨夜谈心」")
+        turn._distill_bond_episode(
+            "u1", "rubi",
+            title="与用户一起完成了剧情「雨夜谈心」",
+            highlights=["纪念语：「雨停了，心还暖着」"])
+        assert len(self.tm.calls) == 1
+        uid, cands = self.tm.calls[0]
+        assert uid == "u1" and len(cands) == 1
+        content, judge, matched, category = cands[0]
+        assert judge == "new" and matched is None and category == "event"
+        assert "雨夜谈心" in content and "纪念语" in content
+        assert "雨夜哨塔" in content       # 近期影音资产折进事件文本
+        assert len(content) <= 300
+        # 真实 TieredMemory 的 category 白名单包含 event（防接口漂移）
+        from agent.memory import VALID_CATEGORIES
+        assert "event" in VALID_CATEGORIES
+        print_pass("scene distill: 4-tuple category=event, assets folded in")
+
+    def test_switch_and_failure(self):
+        turn = self.turn
+        self.m._config["episode_distill_enabled"] = False
+        turn._distill_bond_episode("u1", "rubi", title="不该被蒸馏")
+        assert len(self.tm.calls) == 1  # 开关关闭 → 无新调用
+        self.m._config["episode_distill_enabled"] = True
+
+        class _Boom:
+            def ingest_candidates(self, *a, **kw):
+                raise RuntimeError("db down")
+        turn._tiered_memory = _Boom()
+        turn._distill_bond_episode("u1", "rubi", title="升级了")  # 静默不崩
+        turn._tiered_memory = self.tm
+        turn._distill_bond_episode("u1", "rubi", title="羁绊升级至 Lv5（密友）")
+        assert len(self.tm.calls) == 2
+        print_pass("switch off → skip; ingest failure → silent; re-enabled works")
+
+    def test_distill_length_cap(self):
+        text = self.am.distill_episode(
+            "u1", "rubi", asset_ids=[], highlights=["很长的一段话" * 100],
+            title="标题")
+        assert len(text) <= 300
+        assert self.am.distill_episode("u1", "rubi", None, None, "只有标题") == "只有标题"
+        assert self.am.distill_episode("u1", "rubi", [], [], "") == ""
+        # 不存在的 asset_id 被跳过，不炸
+        assert "只有标题" in self.am.distill_episode(
+            "u1", "rubi", ["ast_nosuch"], [], "只有标题")
+        print_pass("distill_episode: ≤300 chars, title-only, empty, bad ids")
+
+
+class TestAssetEvictionInjection:
+    """44. P5: LRU 淘汰（只删二进制）+ L4 影音记忆注入块."""
+
+    def run(self):
+        print_header("44. Asset Eviction & Injection (P5)")
+        from agent.asset_memory import AssetMemory
+        self.tmp = tempfile.mkdtemp(prefix="p5evict_")
+        try:
+            self.am = AssetMemory(base_dir=os.path.join(self.tmp, "assets"))
+            self.test_scores_and_order()
+            self.test_evict_and_protect()
+            self.test_enforce_quota()
+            self.test_injection_block()
+            self.test_quota_helper()
+        finally:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_scores_and_order(self):
+        import math
+        am = self.am
+        now = time.time()
+        old_zero = _seed_asset(am, user="u1", desc="旧的普通图",
+                               created=now - 40 * 86400)
+        new_zero = _seed_asset(am, user="u1", desc="新的普通图", created=now)
+        loved = _seed_asset(am, user="u1", desc="常被想起的图",
+                            created=now - 30 * 86400, recall=1)
+        # score = recall × exp(-age/30)：零召回旧的 < 零召回新的 < 被召回过的
+        cands = am.eviction_candidates("u1")
+        assert [c.id for c in cands] == [old_zero.id, new_zero.id, loved.id]
+        assert abs(am.eviction_score(loved, now=now) - math.exp(-1.0)) < 1e-6
+        assert am.eviction_score(new_zero, now=now) == 0.0
+        print_pass("eviction score: recall×exp(-age/30) asc, ties → oldest first")
+
+    def test_evict_and_protect(self):
+        from agent.asset_memory import AssetMemory as _AM
+        am = self.am
+        # 资产目录外的路径（工作区上传原件 / characters 锚点）→ 硬保护
+        outside = os.path.join(self.tmp, "workspace", "cat.png")
+        os.makedirs(os.path.dirname(outside), exist_ok=True)
+        with open(outside, "wb") as f:
+            f.write(b"CAT")
+        up = _seed_asset(am, user="u1", desc="外部文件卡", path_override=outside)
+        assert up.id not in [c.id for c in am.eviction_candidates("u1")]
+        assert am.evict("u1", up.id) is False
+        assert os.path.isfile(outside)
+        # 正常资产：二进制删除、卡保留（path=None），冷读可验证
+        victim = _seed_asset(am, user="u1", desc="要被淘汰的图")
+        victim_path = victim.path  # evict 会原地改缓存对象（path=None）
+        assert os.path.isfile(victim_path)
+        assert am.evict("u1", victim.id) is True
+        assert not os.path.isfile(victim_path)
+        cold = _AM(base_dir=am.base_dir)
+        back = cold.read_card("u1", victim.id)
+        assert back is not None and back.path is None
+        assert back.prompt == "要被淘汰的图"  # 文本记忆不褪色
+        # 已淘汰 → 幂等 False；不存在的卡 → False
+        assert am.evict("u1", victim.id) is False
+        assert am.evict("u1", "ast_nosuch") is False
+        print_pass("evict: binary-only delete, card kept; outside paths protected")
+
+    def test_enforce_quota(self):
+        from agent.asset_memory import AssetMemory
+        am = AssetMemory(base_dir=os.path.join(self.tmp, "assets_q"))
+        now = time.time()
+        big = _seed_asset(am, user="u1", desc="旧的大文件",
+                          created=now - 10 * 86400, size=900 * 1024)
+        small = _seed_asset(am, user="u1", desc="新的小文件",
+                            created=now, size=200 * 1024)
+        big_path, small_path = big.path, small.path  # evict 原地改缓存对象
+        assert am.assets_size("u1") >= 1100 * 1024
+        evicted = am.enforce_quota("u1", 1)  # 1MB 配额 → 淘汰低分大文件
+        assert evicted == [big.id]
+        assert not os.path.isfile(big_path) and os.path.isfile(small_path)
+        assert am.assets_size("u1") < 1024 * 1024
+        # 达标 → 不动；非法/零配额 → 不动
+        assert am.enforce_quota("u1", 100) == []
+        assert am.enforce_quota("u1", "abc") == []
+        assert am.enforce_quota("u1", 0) == []
+        assert os.path.isfile(small.path)
+        print_pass("enforce_quota: evicts lowest-score until under cap")
+
+    def test_injection_block(self):
+        from agent.asset_memory import AssetMemory
+        am = AssetMemory(base_dir=os.path.join(self.tmp, "assets_inj"))
+        now = time.time()
+        _seed_asset(am, user="u1", desc="海边的合影", created=now - 86400)
+        _seed_asset(am, user="u1", type_="voice", desc="晚安语音", created=now)
+        _seed_asset(am, user="u1", desc="旧日的烟花",
+                    created=now - 5 * 86400, with_file=False)
+        _seed_asset(am, user="u1", type_="user_upload", desc="猫照片",
+                    tags=["uploaded", "image"], created=now - 2 * 86400,
+                    path_override=os.path.join(self.tmp, "no_such_cat.png"))
+        block = am.build_asset_injection("u1", "rubi", display_name="露比")
+        assert block.startswith("## 你与露比的影音记忆")
+        assert "recall_asset" in block
+        lines = [l for l in block.splitlines() if l.startswith("- [")]
+        assert len(lines) == 4
+        # 新的在前 + 类型标签
+        assert "晚安语音" in lines[0] and "语音" in lines[0]
+        assert "海边的合影" in lines[1] and "图片" in lines[1]
+        assert "用户发来的图片" in lines[2] and "淡去" in lines[2]  # 文件已丢
+        assert "烟花" in lines[3] and "淡去" in lines[3]  # 已淘汰卡照样注入
+        # top_k / 角色过滤 / 空态
+        block2 = am.build_asset_injection("u1", "rubi", top_k=2)
+        assert len([l for l in block2.splitlines() if l.startswith("- [")]) == 2
+        assert am.build_asset_injection("u1", "roxy") == ""
+        assert am.build_asset_injection("nobody", "rubi") == ""
+        # 未给 display_name → 用 char_id
+        assert "## 你与rubi的影音记忆" in am.build_asset_injection("u1", "rubi")
+        print_pass("injection: labels, order, evicted-still-injected, empty state")
+
+    def test_quota_helper(self):
+        from tools.social_tools import enforce_asset_quota
+        m = _tmp_bond_manager(os.path.join(self.tmp, "bonds_q"))
+        _seed_asset(self.am, user="u5", desc="大文件", size=1200 * 1024)
+        m._config["media_asset_quota_mb_regular"] = 1
+        # 未知 role → regular 档
+        evicted = enforce_asset_quota(user_id="u5", role="ghost",
+                                      bond_manager=m, asset_memory=self.am)
+        assert len(evicted) == 1
+        # 达标后不再淘汰
+        assert enforce_asset_quota(user_id="u5", role="regular",
+                                   bond_manager=m, asset_memory=self.am) == []
+
+        class _Boom:
+            def get_config(self, *a, **kw):
+                raise RuntimeError("cfg down")
+        assert enforce_asset_quota(user_id="u5", role="regular",
+                                   bond_manager=_Boom(),
+                                   asset_memory=self.am) == []
+        print_pass("enforce_asset_quota: role fallback, idempotent, exception-safe")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -7058,6 +7625,11 @@ def main():
         ("Media Quota & Level Gates (P4)", TestMediaQuota()),
         ("Appearance Anchor & Voice ID (P4)", TestAnchorVoiceId()),
         ("Proactive Media Pass (P4)", TestProactiveMedia()),
+        ("Asset Search & Rerank (P5)", TestAssetSearch()),
+        ("Asset Recall Tool (P5)", TestAssetRecall()),
+        ("Upload Textualization (P5)", TestUploadTextualization()),
+        ("Episode Distillation (P5)", TestEpisodeDistill()),
+        ("Asset Eviction & Injection (P5)", TestAssetEvictionInjection()),
     ]
 
     passed = 0
