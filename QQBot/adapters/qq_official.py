@@ -43,7 +43,7 @@ from nonebot.adapters.qq.exception import (
 )
 
 from agent.inbound import Attachment, InboundMessage
-from agent.outbound import OutImage
+from agent.outbound import OutAudio, OutImage
 
 # Reuse the neutral URL→disk download helper (stage 2 parked it in the
 # OneBot adapter; its bot=None path is pure httpx and platform-neutral).
@@ -55,6 +55,28 @@ from adapters.onebot import _download_and_save_file
 # _send_response already chunks at 300 chars; this only guards the
 # merged result against the official content length limit.
 _TEXT_CHUNK_LIMIT = 1500
+
+# 官方富媒体「二进制直传」上限 5MB（超过须走分片上传；URL 上传软限制
+# 20MB）。见 docs/qqbot-api-v2-full-docs.md 单聊富媒体上传节。
+_BINARY_UPLOAD_LIMIT = 5 * 1024 * 1024
+
+
+def _audio_as_file_fallback(seg: MessageSegment) -> MessageSegment | None:
+    """file_audio 被平台拒收 → 同字节降级为文件卡（file_type=4）。
+
+    官方文档两处口径冲突：单聊富媒体上传页写「语音支持 silk」，富媒体
+    概述页写「语音支持 silk/mp3/wav/ogg，发送后展示语音条」。策略：先按
+    语音条发（file_type=3），若被拒（如 850019 不支持的文件格式）改用
+    file_type=4（任意格式，展示为可下载文件卡）——用户仍拿到 mp3。
+    """
+    if seg is None or getattr(seg, "type", "") != "file_audio":
+        return None
+    data = seg.data.get("content")
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    return MessageSegment.file_file(
+        bytes(data), file_name=seg.data.get("file_name")
+    )
 
 
 # The official API delivers inline QQ faces inside event.content as raw
@@ -196,6 +218,9 @@ class QQOfficialSender:
     async def send_image(self, img: OutImage) -> None:
         self._buffer.append(("image", img))
 
+    async def send_audio(self, audio: OutAudio) -> None:
+        self._buffer.append(("audio", audio))
+
     # ── Flush: merged payloads under the quota cap ─────────────────
 
     async def flush(self) -> None:
@@ -228,6 +253,14 @@ class QQOfficialSender:
                     continue
                 logger.warning(f"[qq_official] send failed after retry: {e!r}")
             except ActionFailed as e:
+                # 语音条被拒 → 换文件卡再试一次（格式口径冲突的降级梯）
+                fallback = _audio_as_file_fallback(seg)
+                if fallback is not None and attempt == 0:
+                    logger.warning(
+                        f"[qq_official] audio rejected ({e!r}); "
+                        f"retrying as file card")
+                    seg = fallback
+                    continue
                 # API rejection (audit, quota, bad payload) — not retryable
                 logger.warning(f"[qq_official] send rejected: {e!r}")
                 return
@@ -256,7 +289,8 @@ class QQOfficialSender:
                 text_run.append(item)  # type: ignore[arg-type]
             else:
                 flush_text()
-                seg = self._image_segment(item)  # type: ignore[arg-type]
+                seg = (self._image_segment(item) if kind == "image"  # type: ignore[arg-type]
+                       else self._audio_segment(item))               # type: ignore[arg-type]
                 if seg is not None:
                     out.append(seg)
         flush_text()
@@ -266,12 +300,28 @@ class QQOfficialSender:
         if img.path and os.path.isfile(img.path):
             # file_image(): bytes upload — the official API cannot read
             # local paths, and image(url) only accepts public URLs.
+            # 二进制直传上限 5MB：超限且有公网 URL 时改走平台侧下载
+            # （URL 上传软限制 20MB）。
+            if os.path.getsize(img.path) > _BINARY_UPLOAD_LIMIT and img.url:
+                return MessageSegment.image(img.url)
             return MessageSegment.file_image(Path(img.path))
         if img.url:
             return MessageSegment.image(img.url)
         logger.warning(
             f"[qq_official] image dropped (label={img.label!r}): "
             f"{'local path missing: ' + img.path if img.path else 'no path or url'}")
+        return None
+
+    def _audio_segment(self, audio: OutAudio) -> MessageSegment | None:
+        if audio.path and os.path.isfile(audio.path):
+            # file_audio(): bytes upload as msg_type=3 rich media — the
+            # official API cannot read local paths (same as file_image).
+            return MessageSegment.file_audio(Path(audio.path))
+        if audio.url:
+            return MessageSegment.audio(audio.url)
+        logger.warning(
+            f"[qq_official] audio dropped (label={audio.label!r}): "
+            f"{'local path missing: ' + audio.path if audio.path else 'no path or url'}")
         return None
 
 
@@ -312,6 +362,52 @@ async def send_active_c2c(bot: QQBot, openid: str, text: str) -> bool:
         except Exception as e:
             logger.warning(
                 f"[qq_official] active c2c to {openid[:8]}… failed: "
+                f"{type(e).__name__}: {e}")
+            return False
+    return False
+
+
+async def send_active_c2c_media(bot: QQBot, openid: str,
+                                seg: MessageSegment) -> bool:
+    """Send one ACTIVE c2c rich-media message (P4 proactive image/voice).
+
+    Same active-message semantics as send_active_c2c (no msg_id) but with
+    a media segment: the adapter uploads the bytes (msg_type=7 payload /
+    file_type 1|3) and posts in one call. Platform audit + the small
+    active quota apply — error policy mirrors send_active_c2c exactly:
+    ActionFailed → False, no retry; Network/RateLimit → one retry.
+    """
+    openid = str(openid or "").strip()
+    if not openid or seg is None:
+        return False
+    for attempt in range(2):
+        try:
+            await bot.send_to_c2c(openid=openid, message=seg)
+            return True
+        except (NetworkError, RateLimitException) as e:
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+                continue
+            logger.warning(
+                f"[qq_official] active c2c media to {openid[:8]}… failed "
+                f"after retry: {e!r}")
+            return False
+        except ActionFailed as e:
+            # 语音条被拒 → 文件卡降级再试一次（同 _send_once 策略）
+            fallback = _audio_as_file_fallback(seg)
+            if fallback is not None and attempt == 0:
+                logger.warning(
+                    f"[qq_official] active c2c audio to {openid[:8]}… "
+                    f"rejected ({e!r}); retrying as file card")
+                seg = fallback
+                continue
+            logger.warning(
+                f"[qq_official] active c2c media to {openid[:8]}… "
+                f"rejected: {e!r}")
+            return False
+        except Exception as e:
+            logger.warning(
+                f"[qq_official] active c2c media to {openid[:8]}… failed: "
                 f"{type(e).__name__}: {e}")
             return False
     return False

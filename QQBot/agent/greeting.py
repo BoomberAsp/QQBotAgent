@@ -109,63 +109,110 @@ def _day_key(now: float) -> str:
     return datetime.fromtimestamp(now).strftime("%Y-%m-%d")
 
 
+def _kind_prefix(kind: str) -> str:
+    """Counter key prefix per active-message kind.
+
+    ``"text"`` 保持无前缀 —— 与 P3b 生产文件（data/official_active_quota.json
+    的 month/day/… 平铺键）向后兼容；``"media"``（P4 主动图/语音）用
+    ``media_`` 前缀，日/月计数与文本互相独立。
+    """
+    return "" if kind == "text" else f"{kind}_"
+
+
 def quota_allows(data: dict, openid: str, *, now: float,
-                 daily_cap: int = 1, monthly_cap: int = 4) -> bool:
-    """Pure check: is one more active message allowed for ``openid``?"""
+                 daily_cap: int = 1, monthly_cap: int = 4,
+                 kind: str = "text") -> bool:
+    """Pure check: is one more active message allowed for ``openid``?
+
+    月度上限是**平台级共享**的（文本+媒体都吃同一个主动推送小配额），
+    所以 media 判定按两种 kind 的当月计数**总和**对 monthly_cap 卡；
+    每日上限则按 kind 各自独立（文本 1/天、媒体 1/天互不占用）。
+    """
     rec = data.get(openid)
     if not isinstance(rec, dict):
         return True
+    p = _kind_prefix(kind)
     try:
-        if rec.get("month") == _month_key(now) and \
-                int(rec.get("month_count", 0)) >= int(monthly_cap):
+        if kind == "media":
+            total_month = 0
+            for prefix in ("", "media_"):
+                if rec.get(prefix + "month") == _month_key(now):
+                    total_month += int(rec.get(prefix + "month_count", 0))
+            if total_month >= int(monthly_cap):
+                return False
+        elif rec.get(p + "month") == _month_key(now) and \
+                int(rec.get(p + "month_count", 0)) >= int(monthly_cap):
             return False
-        if rec.get("day") == _day_key(now) and \
-                int(rec.get("day_count", 0)) >= int(daily_cap):
+        if rec.get(p + "day") == _day_key(now) and \
+                int(rec.get(p + "day_count", 0)) >= int(daily_cap):
             return False
     except (TypeError, ValueError):
         return True  # 脏数据 → 放行由平台侧兜底，不阻断
     return True
 
 
-def quota_record(data: dict, openid: str, *, now: float) -> None:
+def quota_record(data: dict, openid: str, *, now: float,
+                 kind: str = "text") -> None:
     """Pure mutation: count one active send (rolls day/month windows)."""
     rec = data.get(openid)
     if not isinstance(rec, dict):
         rec = {}
         data[openid] = rec
-    if rec.get("month") != _month_key(now):
-        rec["month"] = _month_key(now)
-        rec["month_count"] = 0
-    if rec.get("day") != _day_key(now):
-        rec["day"] = _day_key(now)
-        rec["day_count"] = 0
+    p = _kind_prefix(kind)
+    if rec.get(p + "month") != _month_key(now):
+        rec[p + "month"] = _month_key(now)
+        rec[p + "month_count"] = 0
+    if rec.get(p + "day") != _day_key(now):
+        rec[p + "day"] = _day_key(now)
+        rec[p + "day_count"] = 0
     try:
-        rec["month_count"] = int(rec.get("month_count", 0)) + 1
-        rec["day_count"] = int(rec.get("day_count", 0)) + 1
+        rec[p + "month_count"] = int(rec.get(p + "month_count", 0)) + 1
+        rec[p + "day_count"] = int(rec.get(p + "day_count", 0)) + 1
     except (TypeError, ValueError):
-        rec["month_count"] = 1
-        rec["day_count"] = 1
-    rec["last_active"] = now
+        rec[p + "month_count"] = 1
+        rec[p + "day_count"] = 1
+    rec[p + "last_active"] = now
+    if kind == "text":
+        rec["last_active"] = now  # 兼容 P3b 旧读取方
 
 
 def active_allowed(path: str, openid: str, *, now: Optional[float] = None,
-                   daily_cap: int = 1, monthly_cap: int = 4) -> bool:
+                   daily_cap: int = 1, monthly_cap: int = 4,
+                   kind: str = "text") -> bool:
     """File-backed :func:`quota_allows`."""
     now = time.time() if now is None else float(now)
     return quota_allows(_read_json(path), openid, now=now,
-                        daily_cap=daily_cap, monthly_cap=monthly_cap)
+                        daily_cap=daily_cap, monthly_cap=monthly_cap,
+                        kind=kind)
 
 
 def record_active_send(path: str, openid: str, *,
-                       now: Optional[float] = None) -> None:
+                       now: Optional[float] = None,
+                       kind: str = "text") -> None:
     """File-backed :func:`quota_record` — call only AFTER a successful send."""
     openid = str(openid or "").strip()
     if not openid:
         return
     now = time.time() if now is None else float(now)
     data = _read_json(path)
-    quota_record(data, openid, now=now)
+    quota_record(data, openid, now=now, kind=kind)
     _atomic_write_json(path, data)
+
+
+def active_sent_today(path: str, openid: str, *, kind: str = "text",
+                      now: Optional[float] = None) -> bool:
+    """今天是否已经给 ``openid`` 发过某类主动消息（P4 media pass 防同日
+    文本+媒体双发打扰；脏数据 → False 放行由后续门控兜底）。"""
+    now = time.time() if now is None else float(now)
+    rec = _read_json(path).get(openid)
+    if not isinstance(rec, dict):
+        return False
+    p = _kind_prefix(kind)
+    try:
+        return (rec.get(p + "day") == _day_key(now)
+                and int(rec.get(p + "day_count", 0) or 0) > 0)
+    except (TypeError, ValueError):
+        return False
 
 
 # ── 选靶门控（纯函数，rng/now 可注入）──────────────────────────────

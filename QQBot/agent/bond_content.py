@@ -242,6 +242,18 @@ def get_scene(card: str, title: str) -> Optional[Dict[str, object]]:
     return None
 
 
+# ── 外观锚点（P4 视觉一致性，Bond-System-Design.md §7.4）────────────
+
+def parse_appearance_anchor(card: str) -> str:
+    """Return the body of ``## Appearance Anchor`` ("" when absent).
+
+    图像生成时**强制前缀**到 prompt——同一角色跨时间的面部/服饰一致性
+    锚点。UGC 卡由 creation_tools.build_card 保证存在；内置卡手工维护；
+    缺失时优雅降级（仅角色名+用户描述，一致性弱化但不报错）。
+    """
+    return _section(card, "Appearance Anchor")
+
+
 # ── 称呼演化（纯 prompt diff，无状态）───────────────────────────────
 
 def address_directive(level: int) -> str:

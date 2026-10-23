@@ -46,7 +46,7 @@ import httpx
 
 from agent.agent import Agent
 from agent.inbound import InboundMessage
-from agent.outbound import OutImage, OutProgress, SendFailed
+from agent.outbound import OutAudio, OutImage, OutProgress, SendFailed
 from agent.continuous_session import ContinuousSessionManager
 from agent.context import (
     _current_sender, _turn_sender, _current_platform,
@@ -123,8 +123,13 @@ from tools.creation_tools import create_character as _create_character_impl
 from tools.social_tools import (
     give_gift as _give_gift_impl,
     complete_scene as _complete_scene_impl,
+    create_image as _create_image_impl,
+    send_voice as _send_voice_impl,
     COMPLETE_SCENE_SCHEMA,
+    CREATE_IMAGE_SCHEMA,
+    SEND_VOICE_SCHEMA,
 )
+from agent.asset_memory import AssetMemory
 
 # ── Sender slots (assigned by the entry plugin at import time) ─────
 # _safe_send() and the continuous/poke paths send through
@@ -158,6 +163,9 @@ class _ToolSender:
 
     async def send_image(self, img: OutImage) -> None:
         await _safe_send(img, sender=self._sender)
+
+    async def send_audio(self, audio: OutAudio) -> None:
+        await _safe_send(audio, sender=self._sender)
 
     async def send_markdown(self, text: str) -> None:
         await _safe_send(text, sender=self._sender)
@@ -850,6 +858,86 @@ def _build_tool_registry() -> ToolRegistry:
         },
     )
 
+    # ── 角色面社交工具：画图 / 语音（Bond-System-Design.md §7, P4）──
+    # 门控/生成/资产记账全在 social_tools.create_image / send_voice（依赖
+    # 注入、可独立单测）；闭包只取 contextvar 上下文并桥接出站通道：
+    # 桥接语走 send_progress(immediate=True)（官方途径绕缓冲秒达），媒体
+    # 本体走 Sender 缓冲、回合末随正文 flush。经 SOCIAL_TOOLS 下发，不进
+    # 全局 TOOLS.md / permissions——同 give_gift 隔离决策。
+    def _media_callbacks():
+        """(send_progress, send_media) 桥到当前回合的 sender 通道。"""
+        s = _current_sender.get()
+
+        async def _progress(text: str):
+            if s is not None:
+                await s.send_progress(text, immediate=True)
+            else:
+                await _safe_send(OutProgress(text, immediate=True))
+
+        async def _media(item):
+            if s is not None:
+                if isinstance(item, OutAudio):
+                    await s.send_audio(item)
+                else:
+                    await s.send_image(item)
+            else:
+                await _safe_send(item)
+
+        return _progress, _media
+
+    async def _create_image_tool(description: str) -> str:
+        user_id = _current_user_id.get()
+        persona_key = _current_personality.get()
+        role = _current_user_role.get() or "regular"
+        registry = get_character_registry()
+        try:
+            card = registry.load(persona_key) or ""
+        except Exception:
+            card = ""
+        display = registry.get_display_name(persona_key)
+        _progress, _media = _media_callbacks()
+        return await _create_image_impl(
+            user_id=user_id, char_id=persona_key, role=role,
+            description=description, card_content=card, display_name=display,
+            bond_manager=_bond_manager, registry=registry,
+            asset_memory=_asset_memory,
+            review_client=_model_router.flash_client,
+            send_progress=_progress, send_image=_media,
+        )
+
+    registry.register(
+        "create_image", _create_image_tool,
+        "当用户向你要一张图（例如「画张自拍给我」「画一下我们在海边的样子」）时调用，"
+        "生成并发送一张你（角色本人形象）的图片。description 填用户想要的画面内容"
+        "（场景/动作/表情/服装；无需描述你自己的长相——系统会自动保持你的外观一致）。"
+        "好感等级、每日次数与内容安全校验由工具自动完成；未通过时会返回中立原因，"
+        "你需以角色口吻婉拒。生成需要一点时间，工具会先替你发一句等待提示；"
+        "图片发送成功后你只需以角色口吻自然地配一句话。",
+        CREATE_IMAGE_SCHEMA,
+    )
+
+    async def _send_voice_tool(text: str) -> str:
+        user_id = _current_user_id.get()
+        persona_key = _current_personality.get()
+        role = _current_user_role.get() or "regular"
+        _progress, _media = _media_callbacks()
+        return await _send_voice_impl(
+            user_id=user_id, char_id=persona_key, role=role, text=text,
+            bond_manager=_bond_manager, registry=get_character_registry(),
+            asset_memory=_asset_memory,
+            review_client=_model_router.flash_client,
+            send_progress=_progress, send_audio=_media,
+        )
+
+    registry.register(
+        "send_voice", _send_voice_tool,
+        "当用户想听你的声音（例如「用语音跟我说晚安」「发条语音来听听」）时调用。"
+        "text 填你要说出的完整台词（用你自己的口吻写好，≤300字），系统会以你固定的"
+        "音色合成语音发给用户。等级/次数/安全校验自动完成；语音发送成功后你只需"
+        "自然地补一句话，不要整段重复语音内容。",
+        SEND_VOICE_SCHEMA,
+    )
+
     # ── 剧情场景收尾（Bond-System-Design.md §4.4 形态3, P3）──
     # 仅经 bond_scene 特殊会话的 allowed_tools 下发（不在 SOCIAL_TOOLS / 全局
     # 工具集）。场景名/角色 id 从当前活跃 bond_scene 会话 metadata 读取（LLM 不
@@ -1064,6 +1152,10 @@ _perm_manager = PermissionManager()
 # mtime 校验缓存（外部写入优先，同 ProfileManager 纪律）。
 # 结算钩子在回复成功发送后调用；仅 split 模式人格参与。
 _bond_manager = BondManager(base_dir=os.path.join(_DATA_DIR, "bonds"))
+
+# 多模态资产记忆层（P4）：文本卡 data/assets/{user}/cards/，二进制
+# data/assets/{user}/{char}/，prompt_hash 去重 + audit.log 计费审计。
+_asset_memory = AssetMemory(base_dir=os.path.join(_DATA_DIR, "assets"))
 
 
 # Per-user busy flag — prevents concurrent message processing for the
@@ -2429,10 +2521,11 @@ async def handle_continuous_turn(view: InboundMessage):
 
 
 async def _safe_send(message, max_retries: int = 2, sender=None):
-    """Send a message (str, OutImage or OutProgress) with retry on SendFailed.
+    """Send a message (str, OutImage, OutAudio or OutProgress) with retry.
 
     Args:
-        message: Message text (str), agent.outbound.OutImage or OutProgress.
+        message: Message text (str), agent.outbound.OutImage, OutAudio or
+            OutProgress.
         max_retries: Number of retry attempts on SendFailed.
         sender: Optional Sender to use. Falls back to the _turn_sender
             contextvar (QQ official entry binds a per-event sender there)
@@ -2444,6 +2537,8 @@ async def _safe_send(message, max_retries: int = 2, sender=None):
         try:
             if isinstance(message, OutImage):
                 await s.send_image(message)
+            elif isinstance(message, OutAudio):
+                await s.send_audio(message)
             elif isinstance(message, OutProgress):
                 await s.send_progress(message.text, immediate=message.immediate)
             else:
@@ -3238,8 +3333,11 @@ async def _handle_bond_command(
             sender=sender,
         )
         return True
+    role_str = _perm_manager.get_role(user_id).value
     await _safe_send(
-        _bond_manager.format_status(user_id, persona_key, display_name=display),
+        _bond_manager.format_status(
+            user_id, persona_key, display_name=display, role=role_str
+        ),
         sender=sender,
     )
     return True

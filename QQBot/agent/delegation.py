@@ -26,7 +26,12 @@ from typing import Any, Callable, Dict, List, Optional, Set
 # complete_scene: 剧情收尾（P3a）——刻意不进 SOCIAL_TOOLS：只在 bond_scene
 #   特殊会话的 allowed_tools={"complete_scene"} 里暴露，普通角色面/任务面
 #   都不应看到它（全局注册仅为路由层可下发，二层硬拒绝兜底）。
-SOCIAL_TOOLS: frozenset = frozenset({"delegate_task", "give_gift"})
+# create_image / send_voice: 多模态生成（P4，§7）——角色面专属，不进全局
+#   TOOLS.md/permissions（同 give_gift 决策：防污染任务面/unified 前缀，
+#   二层硬拒绝兜底）。复合制作（画集/有声故事等）后续走 delegate_task。
+SOCIAL_TOOLS: frozenset = frozenset(
+    {"delegate_task", "give_gift", "create_image", "send_voice"}
+)
 
 DEFAULT_TASK_TIMEOUT = 240.0
 

@@ -5781,6 +5781,1236 @@ class TestActiveGreeting:
         print_pass("bond config exposes greet_* tunables")
 
 
+# ── P4: 多模态生成（media_gen / asset_memory / 配额 / 锚点 / 主动媒体）──
+
+class _FakeResp:
+    """Minimal httpx.Response stand-in (json + streaming download)."""
+
+    def __init__(self, status=200, payload=None, text="", body=b""):
+        self.status_code = status
+        self._payload = payload if payload is not None else {}
+        self.text = text
+        self._body = body
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    async def aiter_bytes(self, chunk=65536):
+        yield self._body
+
+
+class _StreamCM:
+    def __init__(self, resp):
+        self.resp = resp
+
+    async def __aenter__(self):
+        return self.resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeHttpx:
+    """Scripted replacement for media_gen.httpx (queue of responses/exceptions)."""
+
+    class TimeoutException(Exception):
+        pass
+
+    class NetworkError(Exception):
+        pass
+
+    def __init__(self, queue):
+        self.queue = list(queue)
+        self.calls = []  # [(kind, url, kwargs)]
+
+    def AsyncClient(self, **kwargs):
+        outer = self
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, **kw):
+                outer.calls.append(("post", url, kw))
+                item = outer.queue.pop(0)
+                if isinstance(item, Exception):
+                    raise item
+                return item
+
+            def stream(self, method, url, **kw):
+                outer.calls.append(("stream", url, kw))
+                item = outer.queue.pop(0)
+                if isinstance(item, Exception):
+                    raise item
+                return _StreamCM(item)
+
+        return _Client()
+
+
+def _image_payload(url="http://cdn.test/img.png"):
+    return {"output": {"choices": [{"message": {"content": [{"image": url}]}}]},
+            "usage": {"input_tokens": 10}}
+
+
+def _tts_payload(url="http://cdn.test/a.mp3"):
+    return {"output": {"audio": {"url": url}}, "usage": {"characters": 12}}
+
+
+class TestMediaGen:
+    """35. P4: lib/media_gen.py runner + social_tools create_image/send_voice."""
+
+    CARD = ("# 露比 (Rubi)\n\n## Appearance Anchor\n\n"
+            "淡金色长发、海蓝色瞳孔的娇小少女。\n\n## Other\n\nx")
+
+    def run(self):
+        print_header("35. Media Generation Runner & Tools (P4)")
+        from lib import media_gen
+        self.mg = media_gen
+        self.tmp = tempfile.mkdtemp(prefix="mediagen_")
+        self._orig_settings = media_gen._SETTINGS_PATH
+        self._orig_httpx = media_gen.httpx
+        try:
+            media_gen._SETTINGS_PATH = self._write_settings()
+            self._reset_sems()
+            asyncio.run(self.test_image_success())
+            asyncio.run(self.test_image_reference_edit())
+            asyncio.run(self.test_image_retry_and_reject())
+            asyncio.run(self.test_tts_success_and_truncation())
+            asyncio.run(self.test_not_configured())
+            asyncio.run(self.test_review_prompt())
+            self.test_config_helpers()
+            asyncio.run(self.test_create_image_tool_chain())
+            asyncio.run(self.test_send_voice_tool_chain())
+        finally:
+            media_gen._SETTINGS_PATH = self._orig_settings
+            media_gen.httpx = self._orig_httpx
+            self._reset_sems()
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _reset_sems(self):
+        self.mg._IMAGE_SEM = None
+        self.mg._TTS_SEM = None
+
+    def _write_settings(self, image=True, tts=True):
+        cfg = {}
+        if image:
+            cfg["IMAGE_GEN_MODEL"] = {
+                "api_key": "k", "api_base": "http://api.test/gen",
+                "model": "img-model", "timeout": 5, "max_retries": 1,
+                "max_concurrency": 2,
+            }
+        if tts:
+            cfg["TTS_MODEL"] = {
+                "api_key": "k", "api_base": "http://api.test/tts",
+                "model": "tts-model", "format": "mp3", "sample_rate": 22050,
+                "timeout": 5, "max_retries": 1, "max_concurrency": 2,
+                "default_voice": "dv", "voice_pool": ["v1", "v2", "v3"],
+            }
+        path = os.path.join(self.tmp, f"settings_{len(os.listdir(self.tmp))}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        return path
+
+    def _use_httpx(self, queue):
+        fake = _FakeHttpx(queue)
+        self.mg.httpx = fake
+        return fake
+
+    async def test_image_success(self):
+        out = os.path.join(self.tmp, "gen", "img.png")
+        fake = self._use_httpx([
+            _FakeResp(200, _image_payload()),
+            _FakeResp(200, body=b"PNGDATA"),
+        ])
+        got = await self.mg.generate_image(
+            "a cat", out_path=out, negative_prompt="blurry")
+        assert got == out and os.path.isfile(out), got
+        with open(out, "rb") as f:
+            assert f.read() == b"PNGDATA"
+        kind, url, kw = fake.calls[0]
+        assert kind == "post" and url == "http://api.test/gen"
+        assert kw["headers"]["Authorization"] == "Bearer k"
+        body = kw["json"]
+        assert body["model"] == "img-model"
+        content = body["input"]["messages"][0]["content"]
+        assert content == [{"text": "a cat"}], content  # no reference → pure T2I
+        assert body["parameters"]["watermark"] is False
+        assert body["parameters"]["negative_prompt"] == "blurry"
+        # download went through the stream call
+        assert fake.calls[1][0] == "stream"
+        # empty prompt → None, no HTTP
+        fake.queue.clear()
+        assert await self.mg.generate_image("  ", out_path=out) is None
+        assert fake.calls[1][0] == "stream" and len(fake.calls) == 2
+        print_pass("generate_image: T2I body/headers, download to out_path")
+
+    async def test_image_reference_edit(self):
+        ref = os.path.join(self.tmp, "ref.png")
+        with open(ref, "wb") as f:
+            f.write(b"REF")
+        out = os.path.join(self.tmp, "i2i.png")
+        fake = self._use_httpx([
+            _FakeResp(200, _image_payload()),
+            _FakeResp(200, body=b"IMG2"),
+        ])
+        got = await self.mg.generate_image(
+            "same face, new scene", out_path=out, reference_image_path=ref)
+        assert got == out
+        content = fake.calls[0][2]["json"]["input"]["messages"][0]["content"]
+        assert len(content) == 2 and content[1] == {"text": "same face, new scene"}
+        assert content[0]["image"].startswith("data:image/png;base64,"), content[0]
+        # missing reference file degrades to pure T2I (no crash)
+        fake.queue.extend([_FakeResp(200, _image_payload()),
+                           _FakeResp(200, body=b"IMG3")])
+        got2 = await self.mg.generate_image(
+            "x", out_path=os.path.join(self.tmp, "i2i2.png"),
+            reference_image_path=os.path.join(self.tmp, "no_such.png"))
+        assert got2 and len(fake.calls[2][2]["json"]["input"]["messages"][0]["content"]) == 1
+        print_pass("generate_image: reference → base64 I2I edit; missing ref → T2I")
+
+    async def test_image_retry_and_reject(self):
+        out = os.path.join(self.tmp, "retry.png")
+        # 500 → one retry → success
+        fake = self._use_httpx([
+            _FakeResp(500, text="boom"),
+            _FakeResp(200, _image_payload()),
+            _FakeResp(200, body=b"OK"),
+        ])
+        with patch.object(asyncio, "sleep", new=AsyncMock(return_value=None)):
+            got = await self.mg.generate_image("x", out_path=out)
+        assert got == out
+        assert sum(1 for c in fake.calls if c[0] == "post") == 2
+        # 4xx (审核/参数) → NO retry, None
+        fake2 = self._use_httpx([_FakeResp(400, text="rejected")])
+        assert await self.mg.generate_image("x", out_path=out) is None
+        assert len(fake2.calls) == 1
+        # timeout twice → None after exactly one retry
+        fake3 = self._use_httpx([
+            _FakeHttpx.TimeoutException(), _FakeHttpx.TimeoutException()])
+        with patch.object(asyncio, "sleep", new=AsyncMock(return_value=None)):
+            assert await self.mg.generate_image("x", out_path=out) is None
+        assert len(fake3.calls) == 2
+        # 200 but no url in payload → None
+        self._use_httpx([_FakeResp(200, {"output": {"choices": []}})])
+        assert await self.mg.generate_image("x", out_path=out) is None
+        # download fails (network) → None even though generation succeeded
+        self._use_httpx([_FakeResp(200, _image_payload()),
+                         _FakeHttpx.NetworkError()])
+        assert await self.mg.generate_image("x", out_path=out) is None
+        print_pass("generate_image: 5xx retry-once, 4xx no-retry, timeout/download → None")
+
+    async def test_tts_success_and_truncation(self):
+        out = os.path.join(self.tmp, "voice", "a.mp3")
+        fake = self._use_httpx([
+            _FakeResp(200, _tts_payload()),
+            _FakeResp(200, body=b"MP3DATA"),
+        ])
+        long_text = "晚安呀" * 100  # 300 chars
+        got = await self.mg.generate_speech(long_text, "v1", out_path=out,
+                                            max_chars=10)
+        assert got == out and os.path.isfile(out)
+        with open(out, "rb") as f:
+            assert f.read() == b"MP3DATA"
+        _, url, kw = fake.calls[0]
+        assert url == "http://api.test/tts"
+        inp = kw["json"]["input"]
+        assert inp["text"] == long_text[:10]  # 按字符计费 → 硬截断
+        assert inp["voice"] == "v1"
+        assert inp["format"] == "mp3" and inp["sample_rate"] == 22050
+        # empty voice → default_voice; hard cap respected
+        fake.queue.extend([_FakeResp(200, _tts_payload()),
+                           _FakeResp(200, body=b"M2")])
+        got2 = await self.mg.generate_speech(
+            "x" * 5000, "", out_path=os.path.join(self.tmp, "b.mp3"),
+            max_chars=99999)
+        assert got2
+        inp2 = fake.calls[2][2]["json"]["input"]
+        assert inp2["voice"] == "dv" and len(inp2["text"]) == 600
+        # no audio url → None; empty text → None without HTTP
+        self._use_httpx([_FakeResp(200, {"output": {}})])
+        assert await self.mg.generate_speech("hi", "v1", out_path=out) is None
+        assert await self.mg.generate_speech("  ", "v1", out_path=out) is None
+        print_pass("generate_speech: body/truncation/default_voice, no-url → None")
+
+    async def test_not_configured(self):
+        self.mg._SETTINGS_PATH = self._write_settings(image=False, tts=False)
+        try:
+            fake = self._use_httpx([])
+            assert await self.mg.generate_image("x", out_path="y") is None
+            assert await self.mg.generate_speech("x", "v", out_path="y") is None
+            assert fake.calls == []  # never touches the network
+            assert self.mg.is_image_available() is False
+            assert self.mg.is_tts_available() is False
+            print_pass("unconfigured sections → None, zero HTTP")
+        finally:
+            self.mg._SETTINGS_PATH = self._write_settings()
+
+    async def test_review_prompt(self):
+        class _Client:
+            def __init__(self, reply):
+                self.reply = reply
+                self.calls = 0
+
+            async def chat_completion(self, message, history=None,
+                                      timeout_set=20.0, purpose=""):
+                self.calls += 1
+                if isinstance(self.reply, Exception):
+                    raise self.reply
+                return self.reply
+
+        ok, reason = await self.mg.review_prompt("正常的画", _Client("APPROVE"))
+        assert ok and reason == ""
+        ok, reason = await self.mg.review_prompt("色情内容", _Client("REJECT: 色情描写"))
+        assert not ok and reason == "色情描写"
+        ok, _ = await self.mg.review_prompt("x", _Client("REJECT"))
+        assert not ok  # bare REJECT still fail-closed with default reason
+        # infra errors → fail-open
+        ok, _ = await self.mg.review_prompt("x", _Client("调用DeepSeek API时出错: 500"))
+        assert ok
+        ok, _ = await self.mg.review_prompt("x", _Client(RuntimeError("net")))
+        assert ok
+        ok, _ = await self.mg.review_prompt("x", _Client(""))
+        assert ok
+        # no client → fail-open; empty text → rejected without any call
+        assert await self.mg.review_prompt("x", None) == (True, "")
+        ok, reason = await self.mg.review_prompt("   ", _Client("APPROVE"))
+        assert not ok and reason == "内容为空"
+        print_pass("review_prompt: REJECT fail-closed, infra fail-open, empty reject")
+
+    def test_config_helpers(self):
+        pool, default = self.mg.get_voice_pool()
+        assert pool == ["v1", "v2", "v3"] and default == "dv"
+        assert self.mg.get_model_name("image") == "img-model"
+        assert self.mg.get_model_name("voice") == "tts-model"
+        print_pass("get_voice_pool/get_model_name read fresh config")
+
+    # ── social_tools 全链路（三重门 + 去重 + 资产卡 + observation）──
+
+    def _tool_env(self):
+        from agent.asset_memory import AssetMemory
+        from types import SimpleNamespace
+        env_dir = tempfile.mkdtemp(prefix="env_", dir=self.tmp)
+        m = _tmp_bond_manager(env_dir)
+        am = AssetMemory(base_dir=os.path.join(env_dir, "assets_tools"))
+        reg = SimpleNamespace(reference_image_path=lambda cid: None,
+                              get_voice_id=lambda cid: "vid1")
+        prog, imgs, auds = [], [], []
+
+        async def send_progress(text):
+            prog.append(text)
+
+        async def send_image(item):
+            imgs.append(item)
+
+        async def send_audio(item):
+            auds.append(item)
+
+        return m, am, reg, prog, imgs, auds, send_progress, send_image, send_audio
+
+    async def test_create_image_tool_chain(self):
+        from tools.social_tools import create_image
+        m, am, reg, prog, imgs, _auds, sp, si, _sa = self._tool_env()
+        m.add_exp("u1", "rubi", 1200)  # Lv5 — image gate (Lv4) passes
+
+        async def fake_gen(prompt, *, out_path, reference_image_path=None,
+                           negative_prompt="", **kw):
+            fake_gen.calls.append({"prompt": prompt, "ref": reference_image_path,
+                                   "neg": negative_prompt})
+            if fake_gen.fail:
+                return None
+            with open(out_path, "wb") as f:
+                f.write(b"PNG")
+            return out_path
+        fake_gen.calls = []
+        fake_gen.fail = False
+
+        common = dict(char_id="rubi", role="regular", card_content=self.CARD,
+                      display_name="露比", bond_manager=m, registry=reg,
+                      asset_memory=am, send_progress=sp, send_image=si)
+        with patch.object(self.mg, "is_image_available", lambda: True), \
+                patch.object(self.mg, "get_model_name", lambda kind: "img-model"), \
+                patch.object(self.mg, "review_prompt", AsyncMock(return_value=(True, ""))), \
+                patch.object(self.mg, "generate_image", new=fake_gen):
+            # 等级门：Lv1 用户被婉拒，且不发桥接语、不生成
+            obs = await create_image(user_id="u_low", description="海边", **common)
+            assert "羁绊还不够深" in obs and fake_gen.calls == [] and prog == []
+            # 无效入参
+            obs = await create_image(user_id="", description="x", **common)
+            assert obs.startswith("[Error]")
+            obs = await create_image(user_id="u1", description="  ", **common)
+            assert "想画什么" in obs
+            # 配额门（u_q 等级达标，只卡配额）
+            m.add_exp("u_q", "rubi", 1200)
+            m._config["daily_image_regular"] = 1
+            m.record_media_use("u_q", "rubi", "image")
+            obs = await create_image(user_id="u_q", description="x", **common)
+            assert "今天的画图次数已经用完了" in obs
+            m._config["daily_image_regular"] = 3
+            # 生成失败 → 道歉 observation + gen_failed 审计，无卡无发送
+            fake_gen.fail = True
+            obs = await create_image(user_id="u1", description="失败图", **common)
+            assert "画图生成失败" in obs and imgs == []
+            assert am.list_cards("u1") == []
+            fake_gen.fail = False
+            # 成功：锚点前缀 prompt + 桥接语 + 资产卡 + 记账 + 发送
+            n_gen, n_prog = len(fake_gen.calls), len(prog)
+            obs = await create_image(user_id="u1", description="在海边散步", **common)
+            assert "画好了" in obs
+            call = fake_gen.calls[-1]
+            assert call["prompt"].startswith("角色外观（必须严格保持一致）: 淡金色长发")
+            assert "角色: 露比" in call["prompt"] and "画面: 在海边散步" in call["prompt"]
+            assert call["neg"] and call["ref"] is None
+            assert len(fake_gen.calls) == n_gen + 1
+            assert len(prog) == n_prog + 1 and prog[-1]  # 桥接语先于生成
+            assert len(imgs) == 1 and imgs[0].label == "在海边散步"
+            cards = am.list_cards("u1", "rubi")
+            assert len(cards) == 1 and cards[0].tags == ["generated"]
+            assert cards[0].prompt == call["prompt"] and cards[0].model == "img-model"
+            assert os.path.isfile(cards[0].path)
+            st = m.get_state("u1", "rubi", create=False)
+            assert st["daily"]["images"] == 1 and st["stats"]["images"] == 1
+            # 去重：同 description 再来一次 → 复用旧文件，不再计费
+            obs = await create_image(user_id="u1", description="在海边散步", **common)
+            assert "旧作" in obs
+            assert len(fake_gen.calls) == n_gen + 1  # 去重命中不再生成
+            assert len(imgs) == 2  # 旧作也重发了
+            assert m.get_state("u1", "rubi", create=False)["daily"]["images"] == 2
+            assert len(am.list_cards("u1", "rubi")) == 1  # 去重不建新卡
+            # 审查拒绝 → 婉拒 + review_reject 审计，审查前置不生成
+            n_gen = len(fake_gen.calls)
+            with patch.object(self.mg, "review_prompt",
+                              AsyncMock(return_value=(False, "违规"))):
+                obs = await create_image(user_id="u1", description="违规内容", **common)
+            assert "内容安全审查" in obs
+            assert len(fake_gen.calls) == n_gen
+        audit = open(am._audit_path, encoding="utf-8").read()
+        assert "gen_failed" in audit and "review_reject" in audit
+        assert "dedupe" in audit
+        assert any(l.endswith("|ok") for l in audit.splitlines())
+        print_pass("create_image chain: gates/dedupe/anchor prompt/card/audit/obs")
+
+    async def test_send_voice_tool_chain(self):
+        from tools.social_tools import send_voice
+        m, am, reg, prog, _imgs, auds, sp, _si, sa = self._tool_env()
+        m.add_exp("u1", "rubi", 1200)  # Lv5 — voice gate passes
+
+        async def fake_tts(text, voice, *, out_path, max_chars=300, **kw):
+            fake_tts.calls.append({"text": text, "voice": voice})
+            if fake_tts.fail:
+                return None
+            with open(out_path, "wb") as f:
+                f.write(b"MP3")
+            return out_path
+        fake_tts.calls = []
+        fake_tts.fail = False
+
+        common = dict(char_id="rubi", role="regular", bond_manager=m,
+                      registry=reg, asset_memory=am,
+                      send_progress=sp, send_audio=sa)
+        with patch.object(self.mg, "is_tts_available", lambda: True), \
+                patch.object(self.mg, "get_model_name", lambda kind: "tts-model"), \
+                patch.object(self.mg, "review_prompt", AsyncMock(return_value=(True, ""))), \
+                patch.object(self.mg, "generate_speech", new=fake_tts):
+            # 等级门（voice 需 Lv5；u_low 是 Lv1）
+            obs = await send_voice(user_id="u_low", text="晚安", **common)
+            assert "羁绊还不够深" in obs and fake_tts.calls == []
+            # 空文本 → 引导 observation
+            obs = await send_voice(user_id="u1", text="  ", **common)
+            assert "想听你说什么" in obs
+            # 合成失败 → 道歉
+            fake_tts.fail = True
+            obs = await send_voice(user_id="u1", text="晚安", **common)
+            assert "语音合成失败" in obs and auds == []
+            fake_tts.fail = False
+            # 成功：固定 voice_id + 资产卡(transcript) + 记账 + OutAudio
+            n_prog = len(prog)
+            obs = await send_voice(user_id="u1", text="晚安呀，团长～", **common)
+            assert "录了一段语音" in obs and "晚安呀，团长～" in obs
+            assert fake_tts.calls[-1]["voice"] == "vid1"  # 声纹一致性
+            assert len(prog) == n_prog + 1 and prog[-1]  # 桥接语先于合成
+            assert len(auds) == 1 and auds[0].label == "晚安呀，团长～"[:20]
+            cards = am.list_cards("u1", "rubi")
+            assert len(cards) == 1 and cards[0].type == "voice"
+            assert cards[0].transcript == "晚安呀，团长～"
+            st = m.get_state("u1", "rubi", create=False)
+            assert st["daily"]["voices"] == 1 and st["daily"]["images"] == 0
+            # media_tts_max_chars 截断
+            m._config["media_tts_max_chars"] = 10
+            obs = await send_voice(user_id="u1", text="一二三四五六七八九十超出部分", **common)
+            assert fake_tts.calls[-1]["text"] == "一二三四五六七八九十"
+            assert am.list_cards("u1", "rubi")[0].transcript == "一二三四五六七八九十"
+            m._config["media_tts_max_chars"] = 300
+            # 配额门：voice 独立于 image 计数
+            m._config["daily_voice_regular"] = 2
+            obs = await send_voice(user_id="u1", text="再来一句", **common)
+            assert "今天的语音次数已经用完了" in obs
+        print_pass("send_voice chain: gate/voice_id/transcript card/truncation/quota")
+
+
+class TestAssetCardsP4:
+    """36. P4: agent/asset_memory.py — 卡读写/列表/去重/审计/缓存."""
+
+    def run(self):
+        print_header("36. Asset Cards & Dedupe (P4)")
+        from agent.asset_memory import AssetMemory
+        self.tmp = tempfile.mkdtemp(prefix="assets_")
+        try:
+            self.am = AssetMemory(base_dir=self.tmp)
+            self.test_ids_and_hashes()
+            self.test_card_roundtrip()
+            self.test_list_cards()
+            self.test_dedupe()
+            self.test_audit()
+            self.test_cache_mtime()
+        finally:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_ids_and_hashes(self):
+        from agent.asset_memory import make_asset_id, prompt_hash_of
+        ids = {make_asset_id() for _ in range(100)}
+        assert len(ids) == 100
+        assert all(i.startswith("ast_") and len(i) == 12 for i in ids)
+        assert prompt_hash_of(" x ") == prompt_hash_of("x")  # strip-stable
+        assert len(prompt_hash_of("x")) == 32
+        assert prompt_hash_of("a") != prompt_hash_of("b")
+        assert prompt_hash_of("") == prompt_hash_of("   ")
+        print_pass("make_asset_id unique; prompt_hash_of stable/stripped")
+
+    def test_card_roundtrip(self):
+        from agent.asset_memory import AssetCard
+        am = self.am
+        card = AssetCard(
+            id="ast_00000001", type="image", char_id="rubi", user_id="u1",
+            path="/tmp/x/ast_00000001.png", model="img-model",
+            prompt="海边散步", tags=["generated"], created_at=1000,
+            recall_count=2, prompt_hash="ph1", proactive=False)
+        p = am.write_card(card)
+        assert os.path.isfile(p) and p.endswith("ast_00000001.md")
+        raw = open(p, encoding="utf-8").read()
+        assert raw.startswith("---\n") and "海边散步" in raw
+        # 冷读（新实例，绕过写缓存）验证磁盘格式可解析
+        from agent.asset_memory import AssetMemory as _AM
+        cold = _AM(base_dir=am.base_dir).read_card("u1", "ast_00000001")
+        back = am.read_card("u1", "ast_00000001")
+        for c in (cold, back):
+            assert c.id == card.id and c.type == "image"
+            assert c.prompt == "海边散步" and c.transcript == ""
+            assert c.path == card.path and c.model == "img-model"
+            assert c.tags == ["generated"] and c.created_at == 1000
+            assert c.recall_count == 2 and c.prompt_hash == "ph1"
+            assert c.proactive is False
+        # voice card: body 存 transcript
+        v = AssetCard(id="ast_00000002", type="voice", char_id="rubi",
+                      user_id="u1", transcript="晚安", prompt="晚安",
+                      tags=["generated", "proactive"], proactive=True)
+        am.write_card(v)
+        v2 = am.read_card("u1", "ast_00000002")
+        assert v2.transcript == "晚安" and v2.proactive is True
+        # path=None（已淘汰语义）roundtrip
+        n = AssetCard(id="ast_00000003", type="image", char_id="c",
+                      user_id="u1", path=None)
+        am.write_card(n)
+        assert am.read_card("u1", "ast_00000003").path is None
+        # malformed content → None
+        assert AssetCard.from_markdown("no frontmatter") is None
+        assert AssetCard.from_markdown("---\nid: x\n") is None
+        assert am.read_card("u1", "ast_nope") is None
+        print_pass("card write/read roundtrip (image/voice/evicted) + malformed → None")
+
+    def test_list_cards(self):
+        from agent.asset_memory import AssetCard
+        am = self.am
+        for aid, char, ts in (("ast_l0000001", "rubi", 300),
+                              ("ast_l0000002", "rubi", 100),
+                              ("ast_l0000003", "roxy", 200)):
+            am.write_card(AssetCard(id=aid, type="image", char_id=char,
+                                    user_id="u2", created_at=ts))
+        allc = am.list_cards("u2")
+        assert [c.id for c in allc] == ["ast_l0000001", "ast_l0000003",
+                                        "ast_l0000002"]  # newest first
+        rubi = am.list_cards("u2", "rubi")
+        assert [c.id for c in rubi] == ["ast_l0000001", "ast_l0000002"]
+        assert am.list_cards("ghost") == []
+        print_pass("list_cards: newest-first ordering + char filter + isolation")
+
+    def test_dedupe(self):
+        from agent.asset_memory import AssetCard, prompt_hash_of
+        am = self.am
+        path = am.binary_path("u3", "rubi", "ast_d0000001", "png")
+        assert path.endswith("ast_d0000001.png")
+        with open(path, "wb") as f:
+            f.write(b"PNG")
+        card = AssetCard(id="ast_d0000001", type="image", char_id="rubi",
+                         user_id="u3", path=path, prompt="p1")
+        am.write_card(card)
+        ph = prompt_hash_of("p1")
+        assert am.find_by_prompt_hash(ph) is None  # 未登记
+        am.record_prompt_hash(ph, card)
+        hit = am.find_by_prompt_hash(ph)
+        assert hit is not None and hit.id == "ast_d0000001"
+        assert am.find_by_prompt_hash("") is None
+        assert am.find_by_prompt_hash("unknown") is None
+        # TTL 过期 → miss；ttl_hours=0 → 不检查过期
+        idx = json.load(open(am._dedupe_path, encoding="utf-8"))
+        idx[ph]["ts"] = time.time() - 200 * 3600
+        json.dump(idx, open(am._dedupe_path, "w", encoding="utf-8"))
+        assert am.find_by_prompt_hash(ph, ttl_hours=168) is None
+        assert am.find_by_prompt_hash(ph, ttl_hours=0) is not None
+        # 二进制丢失 → miss（防止发不存在的文件）
+        idx[ph]["ts"] = time.time()
+        json.dump(idx, open(am._dedupe_path, "w", encoding="utf-8"))
+        os.remove(path)
+        assert am.find_by_prompt_hash(ph) is None
+        # 无 path 的卡不登记
+        am.record_prompt_hash("ph_nopath", AssetCard(
+            id="ast_d0000002", type="image", char_id="rubi", user_id="u3"))
+        assert "ph_nopath" not in json.load(
+            open(am._dedupe_path, encoding="utf-8"))
+        # 损坏索引 → {} 降级，且可继续登记
+        with open(am._dedupe_path, "w", encoding="utf-8") as f:
+            f.write("{corrupt!!")
+        assert am.find_by_prompt_hash(ph) is None
+        with open(path, "wb") as f:
+            f.write(b"PNG2")
+        am.record_prompt_hash(ph, card)
+        assert am.find_by_prompt_hash(ph) is not None
+        print_pass("dedupe: hit/TTL expiry/missing file/no-path skip/corrupt → {}")
+
+    def test_audit(self):
+        am = self.am
+        am.append_audit("u4", "rubi", "image", "img-model", "ph9", "ok")
+        am.append_audit("u4", "rubi", "voice", "tts-model", "ph8", "gen_failed")
+        lines = open(am._audit_path, encoding="utf-8").read().strip().splitlines()
+        assert len(lines) == 2
+        f1 = lines[0].split("|")
+        assert len(f1) == 7
+        assert f1[1:] == ["u4", "rubi", "image", "img-model", "ph9", "ok"]
+        assert f1[0].isdigit()  # ts
+        assert lines[1].endswith("|gen_failed")
+        print_pass("append_audit: ts|user|char|type|model|phash|result lines")
+
+    def test_cache_mtime(self):
+        from agent.asset_memory import AssetCard
+        am = self.am
+        card = AssetCard(id="ast_c0000001", type="image", char_id="rubi",
+                         user_id="u5", model="m1")
+        p = am.write_card(card)
+        assert am.read_card("u5", "ast_c0000001").model == "m1"
+        # 外部改写（panel/其他进程）→ mtime 变化 → 缓存失效重读
+        card.model = "m2-external"
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(card.to_markdown())
+        st = os.stat(p)
+        os.utime(p, (st.st_atime, st.st_mtime + 5))
+        assert am.read_card("u5", "ast_c0000001").model == "m2-external"
+        # 文件消失 → None（缓存弹出，不抛异常）
+        os.remove(p)
+        assert am.read_card("u5", "ast_c0000001") is None
+        assert am.read_card("u5", "ast_c0000001") is None  # 二次读也安全
+        print_pass("read_card cache: mtime invalidation + vanished file → None")
+
+
+class TestMediaQuota:
+    """37. P4: bond.py media 配额/等级门/日滚动/format_status."""
+
+    def run(self):
+        print_header("37. Media Quota & Level Gates (P4)")
+        self.tmp = tempfile.mkdtemp(prefix="mediaquota_")
+        try:
+            self.test_defaults()
+            self.test_level_gates()
+            self.test_quota_roles()
+            self.test_daily_roll_and_status()
+        finally:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_defaults(self):
+        from agent.bond import _DEFAULTS
+        assert _DEFAULTS["media_enabled"] is True
+        assert _DEFAULTS["media_image_min_level"] == 4
+        assert _DEFAULTS["media_voice_min_level"] == 5
+        assert _DEFAULTS["media_proactive_voice_min_level"] == 7
+        assert (_DEFAULTS["daily_image_regular"], _DEFAULTS["daily_image_vip"],
+                _DEFAULTS["daily_image_admin"]) == (3, 10, 50)
+        assert (_DEFAULTS["daily_voice_regular"], _DEFAULTS["daily_voice_vip"],
+                _DEFAULTS["daily_voice_admin"]) == (3, 10, 50)
+        assert _DEFAULTS["proactive_media_probability"] == 0.15
+        assert _DEFAULTS["proactive_media_daily_cap"] == 1
+        assert _DEFAULTS["media_dedupe_ttl_hours"] == 168
+        assert _DEFAULTS["media_tts_max_chars"] == 300
+        assert _DEFAULTS["media_asset_quota_mb_regular"] == 100
+        print_pass("bond _DEFAULTS expose all P4 media tunables")
+
+    def test_level_gates(self):
+        m = _tmp_bond_manager(self.tmp)
+        assert m.get_level("nobody", "rubi") == 1  # 无状态 → Lv1
+        assert m.get_level("u", "rubi") == 1
+        m.add_exp("u", "rubi", 300)  # Lv3
+        assert m.get_level("u", "rubi") == 3
+        assert m.media_level_gate("u", "rubi", "image") == (False, 3, 4)
+        m.add_exp("u", "rubi", 350)  # 650 → Lv4
+        assert m.media_level_gate("u", "rubi", "image") == (True, 4, 4)
+        assert m.media_level_gate("u", "rubi", "voice") == (False, 4, 5)
+        m.add_exp("u", "rubi", 550)  # 1200 → Lv5
+        assert m.media_level_gate("u", "rubi", "voice") == (True, 5, 5)
+        assert m.media_level_gate("u", "rubi", "voice", proactive=True) == (False, 5, 7)
+        m.add_exp("u", "rubi", 1800)  # 3000 → Lv7
+        assert m.media_level_gate("u", "rubi", "voice", proactive=True) == (True, 7, 7)
+        assert m.media_level_gate("u", "rubi", "video") == (False, 0, 0)  # fail-closed
+        print_pass("level gates: image Lv4 / voice Lv5 / proactive Lv7 boundaries")
+
+    def test_quota_roles(self):
+        m = _tmp_bond_manager(self.tmp)
+        ok, msg = m.check_media_quota("u", "rubi", "image", "regular")
+        assert ok and msg == ""
+        for i in (1, 2, 3):
+            assert m.record_media_use("u", "rubi", "image") == i
+        ok, msg = m.check_media_quota("u", "rubi", "image", "regular")
+        assert not ok and msg == "daily_limit:3/3"
+        # vip 上限更高（同一用户同一计数，角色决定 limit）
+        assert m.check_media_quota("u", "rubi", "image", "vip") == (True, "")
+        for i in range(4, 11):
+            m.record_media_use("u", "rubi", "image")
+        assert m.check_media_quota("u", "rubi", "image", "vip")[0] is False
+        assert m.check_media_quota("u", "rubi", "image", "admin") == (True, "")
+        # 未知角色 → 按 regular 处理
+        m.record_media_use("u2", "rubi", "voice")
+        m.record_media_use("u2", "rubi", "voice")
+        m.record_media_use("u2", "rubi", "voice")
+        assert m.check_media_quota("u2", "rubi", "voice", "ghost")[0] is False
+        # voice 与 image 计数独立
+        assert m.check_media_quota("u2", "rubi", "image", "regular") == (True, "")
+        st = m.get_state("u2", "rubi", create=False)
+        assert st["daily"]["voices"] == 3 and st["daily"]["images"] == 0
+        assert st["stats"]["voices"] == 3
+        # 未知类型 / 全局开关
+        assert m.check_media_quota("u", "rubi", "video", "regular") == \
+            (False, "unknown_media_type")
+        assert m.record_media_use("u", "rubi", "video") == 0
+        m._config["media_enabled"] = False
+        assert m.check_media_quota("u3", "rubi", "image", "regular") == \
+            (False, "media_disabled")
+        m._config["media_enabled"] = True
+        assert m.check_media_quota("u3", "rubi", "image", "regular")[0]
+        print_pass("quota: per-role caps 3/10/50, counters isolated, fail-closed")
+
+    def test_daily_roll_and_status(self):
+        # 全新目录：避免与 test_quota_roles 的同日计数互相污染
+        m = _tmp_bond_manager(tempfile.mkdtemp(prefix="roll_", dir=self.tmp))
+        for _ in range(3):
+            m.record_media_use("u", "rubi", "image")
+        assert m.check_media_quota("u", "rubi", "image", "regular")[0] is False
+        # 跨日：daily.date 过期 → 计数清零
+        st = m.get_state("u", "rubi")
+        st["daily"]["date"] = "2000-01-01"
+        m._save("u")
+        assert m.check_media_quota("u", "rubi", "image", "regular") == (True, "")
+        assert m.get_state("u", "rubi", create=False)["daily"]["images"] == 0
+        assert m.get_state("u", "rubi", create=False)["stats"]["images"] == 3  # 累计保留
+        # format_status 带媒体行（按角色上限）
+        m.record_media_use("u", "rubi", "image")
+        m.record_media_use("u", "rubi", "voice")
+        m.record_media_use("u", "rubi", "voice")
+        out = m.format_status("u", "rubi", display_name="露比", role="regular")
+        assert "今日生成: 画图 1/3 · 语音 2/3" in out, out
+        out_vip = m.format_status("u", "rubi", display_name="露比", role="vip")
+        assert "画图 1/10 · 语音 2/10" in out_vip, out_vip
+        # media_enabled=False → 不显示媒体行
+        m._config["media_enabled"] = False
+        assert "今日生成" not in m.format_status("u", "rubi", role="regular")
+        print_pass("daily roll resets counters; format_status media line per role")
+
+
+class TestAnchorVoiceId:
+    """38. P4: Appearance Anchor 解析 + voice_id 解析链（声纹一致性）."""
+
+    def run(self):
+        print_header("38. Appearance Anchor & Voice ID (P4)")
+        self.tmp = tempfile.mkdtemp(prefix="anchor_")
+        try:
+            self.test_parse_anchor()
+            self.test_builtin_cards()
+            self.test_ugc_resolution_chain()
+            self.test_build_card_and_assign()
+        finally:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_parse_anchor(self):
+        from agent.bond_content import parse_appearance_anchor
+        card = ("# X\n\n## Appearance Anchor\n\n银发红瞳。\n\n## Other\n\ny")
+        assert parse_appearance_anchor(card) == "银发红瞳。"
+        assert parse_appearance_anchor("# X\n\n## Other\n\ny") == ""
+        assert parse_appearance_anchor("") == ""
+        assert parse_appearance_anchor(None) == ""
+        print_pass("parse_appearance_anchor: section body / absent → ''")
+
+    def test_builtin_cards(self):
+        # 内置卡真文件回归：rubi/roxy 的 voice_id 注释 + Appearance Anchor 段
+        from agent.personality import PersonalityManager
+        from agent.bond_content import parse_appearance_anchor
+        pm = PersonalityManager()
+        assert pm.get_voice_id("rubi") == "longxiaochun_v3.6"
+        assert pm.get_voice_id("roxy_character") == "longanrou_v3.6"
+        anchor = parse_appearance_anchor(pm.load("rubi"))
+        assert "淡金色长发" in anchor and "海蓝色" in anchor, anchor
+        anchor2 = parse_appearance_anchor(pm.load("roxy_character"))
+        assert "蓝色" in anchor2 and "三股辫" in anchor2, anchor2
+        print_pass("builtin rubi/roxy cards carry voice_id + Appearance Anchor")
+
+    def test_ugc_resolution_chain(self):
+        import hashlib
+        from agent.character_registry import CharacterRegistry
+        pool = ["v1", "v2", "v3"]
+
+        def fake_pool():
+            return pool, "dv"
+
+        pdir = os.path.join(self.tmp, "personalities")
+        os.makedirs(pdir, exist_ok=True)
+        with open(os.path.join(pdir, "plain.md"), "w", encoding="utf-8") as f:
+            f.write("# 素卡\n\n<!-- mode: split -->\n\nx")
+        with patch("agent.character_registry.get_voice_pool", fake_pool):
+            reg = CharacterRegistry(personalities_dir=pdir,
+                                    characters_dir=os.path.join(self.tmp, "chars"))
+            # 1) UGC meta.json.voice_id 最优先（即使卡片注释另有值）
+            reg.register_character(
+                "c_meta1", "# A\n<!-- mode: split | voice_id: cardvoice -->\n\nx",
+                {"display_name": "A", "author": "u1", "voice_id": "metavoice"})
+            assert reg.get_voice_id("c_meta1") == "metavoice"
+            # 2) meta 无 voice_id → 卡片注释
+            reg.register_character(
+                "c_card1", "# B\n<!-- mode: split | voice_id: cardvoice -->\n\nx",
+                {"display_name": "B", "author": "u1", "voice_id": None})
+            assert reg.get_voice_id("c_card1") == "cardvoice"
+            # 3) 两者皆无 → voice_pool blake2b 确定性分配（跨调用/跨进程稳定）
+            reg.register_character(
+                "c_pool1", "# C\n<!-- mode: split -->\n\nx",
+                {"display_name": "C", "author": "u1"})
+            v1 = reg.get_voice_id("c_pool1")
+            assert v1 == reg.get_voice_id("c_pool1") and v1 in pool
+            digest = hashlib.blake2b(b"c_pool1", digest_size=8).hexdigest()
+            assert v1 == pool[int(digest, 16) % len(pool)]
+            # 内置卡无 voice_id 注释 → 同款 pool 分配
+            pv = reg.get_voice_id("plain")
+            d2 = hashlib.blake2b(b"plain", digest_size=8).hexdigest()
+            assert pv == pool[int(d2, 16) % len(pool)]
+            # 4) 池空 → default_voice → None
+            with patch("agent.character_registry.get_voice_pool", lambda: ([], "dv")):
+                assert reg.get_voice_id("c_pool1") == "dv"
+            with patch("agent.character_registry.get_voice_pool", lambda: ([], "")):
+                assert reg.get_voice_id("c_pool1") is None
+            # reference_image_path：缺失 → None；存在 → 路径
+            assert reg.reference_image_path("c_pool1") is None
+            adir = os.path.join(self.tmp, "chars", "c_pool1", "assets")
+            os.makedirs(adir, exist_ok=True)
+            ref = os.path.join(adir, "reference.png")
+            with open(ref, "wb") as f:
+                f.write(b"PNG")
+            assert reg.reference_image_path("c_pool1") == ref
+        print_pass("voice_id chain: meta → card comment → pool(blake2b) → default")
+
+    def test_build_card_and_assign(self):
+        import hashlib
+        from tools.creation_tools import assign_voice_id, build_card
+        from agent.bond_content import parse_appearance_anchor
+        from agent.personality import PersonalityManager
+        pool = ["v1", "v2", "v3"]
+        with patch("tools.creation_tools.get_voice_pool", lambda: (pool, "dv")):
+            a = assign_voice_id("xyz_123")
+            assert a == assign_voice_id("xyz_123") and a in pool
+            digest = hashlib.blake2b(b"xyz_123", digest_size=8).hexdigest()
+            assert a == pool[int(digest, 16) % len(pool)]
+        with patch("tools.creation_tools.get_voice_pool", lambda: ([], "dv")):
+            assert assign_voice_id("q") == "dv"
+        with patch("tools.creation_tools.get_voice_pool", lambda: ([], "")):
+            assert assign_voice_id("q") is None
+        fields = {"name": "小雪", "gender": "女", "personality": "冷静沉着",
+                  "speech_style": "语速平缓", "appearance": "银发红瞳的少女"}
+        card = build_card(fields, voice_id="v123")
+        assert "<!-- mode: split | task_voice: character | voice_id: v123 -->" in card
+        m = PersonalityManager._VOICE_ID_RE.search(card)
+        assert m and m.group(1) == "v123"
+        assert parse_appearance_anchor(card) == "银发红瞳的少女"
+        card2 = build_card(fields)
+        assert "voice_id" not in card2.split("-->")[0]
+        assert parse_appearance_anchor(card2) == "银发红瞳的少女"
+        print_pass("build_card voice slot + anchor section; assign_voice_id stable")
+
+
+class _FakeRandom:
+    """Deterministic stand-in for the random module inside the plugin."""
+
+    def __init__(self, values=None):
+        self.values = list(values or [])
+
+    def random(self):
+        return self.values.pop(0) if self.values else 0.0
+
+    def uniform(self, a, b):
+        return 0.0
+
+    def choice(self, seq):
+        return seq[0]
+
+
+class _FakeMediaGenModule:
+    """Stand-in for lib.media_gen inside plugins.qq_official."""
+
+    def __init__(self):
+        self.image_ok = True
+        self.tts_ok = True
+        self.image_result_ok = True
+        self.voice_result_ok = True
+        self.review_ok = True
+        self.image_calls = []
+        self.voice_calls = []
+
+    def is_image_available(self):
+        return self.image_ok
+
+    def is_tts_available(self):
+        return self.tts_ok
+
+    def get_model_name(self, kind):
+        return f"{kind}-model"
+
+    async def generate_image(self, prompt, *, out_path, **kw):
+        self.image_calls.append({"prompt": prompt, "out": out_path})
+        if not self.image_result_ok:
+            return None
+        with open(out_path, "wb") as f:
+            f.write(b"PNG")
+        return out_path
+
+    async def generate_speech(self, text, voice, *, out_path, **kw):
+        self.voice_calls.append({"text": text, "voice": voice})
+        if not self.voice_result_ok:
+            return None
+        with open(out_path, "wb") as f:
+            f.write(b"MP3")
+        return out_path
+
+    async def review_prompt(self, text, client, **kw):
+        return (self.review_ok, "" if self.review_ok else "违规")
+
+
+class _FakePersonaMgr:
+    CARD = ("# 露比 (Rubi)\n\n<!-- mode: split | task_voice: character | "
+            "voice_id: voice-rubi -->\n\n## Appearance Anchor\n\n"
+            "淡金色长发。\n")
+
+    def __init__(self):
+        self.mode = "split"
+
+    def resolve_effective_personality(self, user_id, group_id=None):
+        return "rubi"
+
+    def get_mode(self, persona):
+        return self.mode
+
+    def load(self, persona):
+        return self.CARD
+
+    def get_display_name(self, persona):
+        return "露比"
+
+    def get_short_name(self, persona):
+        return "露比"
+
+    def get_voice_id(self, persona):
+        return "voice-rubi"
+
+    def reference_image_path(self, persona):
+        return None
+
+
+class TestProactiveMedia:
+    """39. P4: plugins/qq_official.py _run_media_pass 门控链 + 降级 + 记账."""
+
+    PATCHED = ("_bond_manager", "_asset_memory", "media_gen", "random",
+               "get_character_registry", "_get_qq_bot", "_GREET_TARGETS_FILE",
+               "_GREET_QUOTA_FILE", "send_active_c2c_media", "send_active_c2c",
+               "_compose_greeting")
+
+    def run(self):
+        print_header("39. Proactive Media Pass (P4)")
+        _import_turn_for_tests()  # USER_DATA_ROOT off production paths
+        import nonebot
+        try:
+            nonebot.init()
+        except ValueError:
+            pass  # already initialized in this process
+        import plugins.qq_official as po
+        self.po = po
+        self.tmp = tempfile.mkdtemp(prefix="media_pass_")
+        self._setup()
+        try:
+            self.test_quota_kind_semantics()
+            asyncio.run(self.test_gate_chain())
+            asyncio.run(self.test_success_voice_and_daily_cap())
+            asyncio.run(self.test_success_image_anchor())
+            asyncio.run(self.test_send_failure_falls_back_to_text())
+            asyncio.run(self.test_generation_failure_falls_back())
+            asyncio.run(self.test_no_record_when_everything_fails())
+        finally:
+            self._teardown()
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _setup(self):
+        from agent import greeting
+        from agent.asset_memory import AssetMemory
+        po = self.po
+        self.greeting = greeting
+        self.m = _tmp_bond_manager(self.tmp)
+        self.am = AssetMemory(base_dir=os.path.join(self.tmp, "assets"))
+        self.mg = _FakeMediaGenModule()
+        self.pm = _FakePersonaMgr()
+        self.rng = _FakeRandom()
+        self.targets = os.path.join(self.tmp, "targets.json")
+        self.quota = os.path.join(self.tmp, "quota.json")
+        self.media_sends = []
+        self.text_sends = []
+        self.media_send_ok = True
+        self.text_send_ok = True
+        self._orig = {k: getattr(po, k) for k in self.PATCHED}
+
+        async def fake_media_send(bot, openid, seg):
+            self.media_sends.append((openid, seg))
+            return self.media_send_ok
+
+        async def fake_text_send(bot, openid, text):
+            self.text_sends.append((openid, text))
+            return self.text_send_ok
+
+        async def fake_compose(persona, state):
+            return "露比：「好久不见呀，最近好吗？」"
+
+        po._bond_manager = self.m
+        po._asset_memory = self.am
+        po.media_gen = self.mg
+        po.random = self.rng
+        po.get_character_registry = lambda: self.pm
+        po._get_qq_bot = lambda: MagicMock()
+        po._GREET_TARGETS_FILE = self.targets
+        po._GREET_QUOTA_FILE = self.quota
+        po.send_active_c2c_media = fake_media_send
+        po.send_active_c2c = fake_text_send
+        po._compose_greeting = fake_compose
+
+    def _teardown(self):
+        for k, v in self._orig.items():
+            setattr(self.po, k, v)
+
+    def _reset_files(self):
+        # 去重索引也要清：fake rng.choice 恒选场景池第一项，跨用例同
+        # prompt 会命中上一个用例登记的资产（去重机制本身另有专测）
+        for p in (self.targets, self.quota, self.am._audit_path,
+                  self.am._dedupe_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        self.media_sends.clear()
+        self.text_sends.clear()
+        self.media_send_ok = True
+        self.text_send_ok = True
+        self.mg.image_result_ok = True
+        self.mg.voice_result_ok = True
+        self.mg.image_calls.clear()
+        self.mg.voice_calls.clear()
+        self.rng.values.clear()
+
+    def _seed(self, openid, exp):
+        self.greeting.note_c2c_contact(self.targets, openid)
+        if exp:
+            self.m.add_exp(openid, "rubi", exp)
+
+    def test_quota_kind_semantics(self):
+        g = self.greeting
+        base = time.mktime(time.strptime("2026-10-10", "%Y-%m-%d")) + 43200
+        data = {}
+        g.quota_record(data, "O", now=base, kind="text")
+        # 每日按 kind 独立：文本已发 1 条，媒体当日仍可发
+        assert g.quota_allows(data, "O", now=base + 60, daily_cap=1,
+                              monthly_cap=4, kind="media")
+        g.quota_record(data, "O", now=base + 60, kind="media")
+        assert not g.quota_allows(data, "O", now=base + 120, daily_cap=1,
+                                  monthly_cap=4, kind="media")
+        # 月度是平台共享配额：媒体判定按 text+media 总和
+        d2 = {}
+        for i in range(3):
+            g.quota_record(d2, "O", now=base + i * 86400, kind="text")
+        g.quota_record(d2, "O", now=base + 3 * 86400, kind="media")
+        day4 = base + 4 * 86400
+        assert not g.quota_allows(d2, "O", now=day4, daily_cap=1,
+                                  monthly_cap=4, kind="media")   # 3+1 ≥ 4
+        assert g.quota_allows(d2, "O", now=day4, daily_cap=1,
+                              monthly_cap=4, kind="text")        # text 自身 3 < 4
+        # 前缀隔离：media 计数不污染 text 平铺键（P3b 生产文件兼容）
+        rec = data["O"]
+        assert rec["day_count"] == 1 and rec["media_day_count"] == 1
+        assert "last_active" in rec and "media_last_active" in rec
+        # active_sent_today（file-backed + 脏数据 → False）
+        path = os.path.join(self.tmp, "q2.json")
+        assert g.active_sent_today(path, "O", kind="text") is False  # 无文件
+        g.record_active_send(path, "O", kind="text")
+        assert g.active_sent_today(path, "O", kind="text") is True
+        assert g.active_sent_today(path, "O", kind="media") is False
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{corrupt!!")
+        assert g.active_sent_today(path, "O", kind="text") is False
+        print_pass("quota kinds: daily per-kind, monthly shared total, sent_today")
+
+    async def test_gate_chain(self):
+        po = self.po
+        # (a) media_enabled=False → 整个 pass 直接返回
+        self._reset_files()
+        self._seed("OID1", 4300)
+        self.m._config["media_enabled"] = False
+        await po._run_media_pass()
+        assert self.media_sends == [] and self.text_sends == []
+        self.m._config["media_enabled"] = True
+        # (b) 无 bot → 返回
+        po._get_qq_bot = lambda: None
+        await po._run_media_pass()
+        assert self.media_sends == []
+        po._get_qq_bot = lambda: MagicMock()
+        # (c) 等级门：Lv3 (<4) → 跳过
+        self._reset_files()
+        self._seed("OID_low", 300)
+        await po._run_media_pass()
+        assert self.media_sends == [] and self.text_sends == []
+        # (d) 概率门：rng ≥ 0.15 → 跳过
+        self._reset_files()
+        self._seed("OID_prob", 4300)
+        self.rng.values.append(0.99)
+        await po._run_media_pass()
+        assert self.media_sends == []
+        # (e) 今天已收到主动文本 → 不叠加媒体（防同日双发）
+        self._reset_files()
+        self._seed("OID_dup", 4300)
+        self.greeting.record_active_send(self.quota, "OID_dup", kind="text")
+        await po._run_media_pass()
+        assert self.media_sends == []
+        # (f) 非 split 人格 → 跳过
+        self._reset_files()
+        self._seed("OID_mode", 4300)
+        self.pm.mode = "unified"
+        await po._run_media_pass()
+        assert self.media_sends == []
+        self.pm.mode = "split"
+        # (g) 无羁绊状态（未 seed exp → get_state create=False → None）→ 跳过
+        self._reset_files()
+        self.greeting.note_c2c_contact(self.targets, "OID_nostate")
+        await po._run_media_pass()
+        assert self.media_sends == []
+        print_pass("media pass gates: enabled/bot/level/prob/same-day-text/mode/state")
+
+    async def test_success_voice_and_daily_cap(self):
+        po = self.po
+        self._reset_files()
+        self._seed("OID1", 4300)  # Lv8：图+语音都可
+        self.rng.values.extend([0.0, 0.0])  # 概率过；kind 选择 <0.5 → voice
+        await po._run_media_pass()
+        assert len(self.media_sends) == 1
+        openid, seg = self.media_sends[0]
+        assert openid == "OID1" and seg.type == "file_audio"
+        # TTS 用固定 voice_id；台词从「」包装中提取
+        assert len(self.mg.voice_calls) == 1
+        assert self.mg.voice_calls[0]["voice"] == "voice-rubi"
+        assert self.mg.voice_calls[0]["text"] == "好久不见呀，最近好吗？"
+        # 记账：media 已发、text 未发；冷却已重置
+        assert self.greeting.active_sent_today(self.quota, "OID1", kind="media")
+        assert not self.greeting.active_sent_today(self.quota, "OID1", kind="text")
+        t = self.greeting.load_targets(self.targets)["OID1"]
+        assert t.get("last_greeted") and t.get("greet_count") == 1
+        # 资产卡：proactive voice，transcript 保留
+        cards = self.am.list_cards("OID1", "rubi")
+        assert len(cards) == 1 and cards[0].proactive is True
+        assert cards[0].type == "voice" and cards[0].transcript == "好久不见呀，最近好吗？"
+        assert os.path.isfile(cards[0].path)
+        audit = open(self.am._audit_path, encoding="utf-8").read()
+        assert "proactive_ok" in audit
+        # 同日第二次 pass：media 日配额（1/天）→ 跳过，不重复生成
+        self.rng.values.clear()
+        await po._run_media_pass()
+        assert len(self.media_sends) == 1 and len(self.mg.voice_calls) == 1
+        print_pass("proactive voice: fixed voice_id, record-after-success, ≤1/day")
+
+    async def test_success_image_anchor(self):
+        po = self.po
+        self._reset_files()
+        self._seed("OID2", 1200)  # Lv5：只够图（语音要 Lv7）
+        self.rng.values.append(0.0)
+        await po._run_media_pass()
+        assert len(self.media_sends) == 1
+        assert self.media_sends[0][1].type == "file_image"
+        assert self.mg.voice_calls == []  # can_voice=False → kind 必为 image
+        prompt = self.mg.image_calls[0]["prompt"]
+        assert prompt.startswith("角色外观（必须严格保持一致）: 淡金色长发。")
+        assert "给用户发一张日常自拍" in prompt  # 场景池第一项
+        cards = self.am.list_cards("OID2", "rubi")
+        assert len(cards) == 1 and cards[0].type == "image"
+        assert cards[0].proactive is True and "proactive" in cards[0].tags
+        print_pass("proactive image: Lv5 image-only, anchor-prefixed prompt, card")
+
+    async def test_send_failure_falls_back_to_text(self):
+        po = self.po
+        self._reset_files()
+        self._seed("OID3", 4300)
+        self.media_send_ok = False  # 平台拒收（审核/配额）
+        self.rng.values.extend([0.0, 0.0])
+        await po._run_media_pass()
+        assert len(self.media_sends) == 1  # 尝试过
+        assert len(self.text_sends) == 1   # 降级纯文本问候
+        # 只在成功一侧记账：media 未记，text 已记 + 冷却重置
+        assert not self.greeting.active_sent_today(self.quota, "OID3", kind="media")
+        assert self.greeting.active_sent_today(self.quota, "OID3", kind="text")
+        t = self.greeting.load_targets(self.targets)["OID3"]
+        assert t.get("last_greeted")
+        # 发送失败不写资产卡；审计留痕
+        assert self.am.list_cards("OID3", "rubi") == []
+        audit = open(self.am._audit_path, encoding="utf-8").read()
+        assert "proactive_failed" in audit and "proactive_ok" not in audit
+        print_pass("send failure → text fallback; record only after success")
+
+    async def test_generation_failure_falls_back(self):
+        po = self.po
+        self._reset_files()
+        self._seed("OID4", 1200)  # Lv5 → image
+        self.mg.image_result_ok = False  # 生成失败 → seg None
+        self.rng.values.append(0.0)
+        await po._run_media_pass()
+        assert self.media_sends == []  # seg=None → 短路，不浪费主动配额尝试
+        assert len(self.text_sends) == 1
+        assert not self.greeting.active_sent_today(self.quota, "OID4", kind="media")
+        assert self.greeting.active_sent_today(self.quota, "OID4", kind="text")
+        assert self.am.list_cards("OID4", "rubi") == []
+        print_pass("generation failure → no media attempt, text fallback recorded")
+
+    async def test_no_record_when_everything_fails(self):
+        po = self.po
+        self._reset_files()
+        self._seed("OID5", 4300)
+        self.media_send_ok = False
+        self.text_send_ok = False
+        self.rng.values.extend([0.0, 0.0])
+        await po._run_media_pass()
+        assert len(self.media_sends) == 1 and len(self.text_sends) == 1
+        assert not self.greeting.active_sent_today(self.quota, "OID5", kind="media")
+        assert not self.greeting.active_sent_today(self.quota, "OID5", kind="text")
+        t = self.greeting.load_targets(self.targets)["OID5"]
+        assert not t.get("last_greeted")  # 冷却不被失败消耗
+        print_pass("all sends fail → zero quota recorded, cooldown untouched")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -5823,6 +7053,11 @@ def main():
         ("Bond-Scene Session & Commands (P3a)", TestSceneSession()),
         ("Bond Reunion & Anniversary (P3a)", TestBondReunionAnniversary()),
         ("Active Greeting & Quota (P3b)", TestActiveGreeting()),
+        ("Media Generation Runner & Tools (P4)", TestMediaGen()),
+        ("Asset Cards & Dedupe (P4)", TestAssetCardsP4()),
+        ("Media Quota & Level Gates (P4)", TestMediaQuota()),
+        ("Appearance Anchor & Voice ID (P4)", TestAnchorVoiceId()),
+        ("Proactive Media Pass (P4)", TestProactiveMedia()),
     ]
 
     passed = 0

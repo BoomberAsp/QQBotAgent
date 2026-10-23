@@ -35,6 +35,21 @@ class OutImage:
 
 
 @dataclass
+class OutAudio:
+    """An audio/voice message to send, described platform-agnostically (P4).
+
+    OneBot: ``path`` → MessageSegment.record(Path(path)); ``url`` used
+    as-is when there is no local path. Official: ``path`` → bytes upload
+    via MessageSegment.file_audio() (msg_type=3 rich media); ``url`` →
+    MessageSegment.audio(url). Generated TTS always carries a local path
+    (media_gen downloads the 24h-expiring provider URL immediately).
+    """
+    path: str | None = None      # local absolute path (mp3/wav/silk…)
+    url: str | None = None       # public URL
+    label: str = ""              # for logs / fallback text
+
+
+@dataclass
 class OutProgress:
     """An intermediate progress line ("正在思考…" and friends).
 
@@ -84,5 +99,6 @@ class Sender(Protocol):
 
     async def send_text(self, text: str) -> None: ...
     async def send_image(self, img: OutImage) -> None: ...
+    async def send_audio(self, audio: OutAudio) -> None: ...
     async def send_markdown(self, text: str) -> None: ...
     async def send_progress(self, text: str, *, immediate: bool = False) -> None: ...

@@ -13,12 +13,14 @@ fail-open + log，避免 API 抖动把正常创作卡死）→ 落盘注册。
 （与 agent/delegation.py 同一模式）。
 """
 
+import hashlib
 import logging
 import time
 from typing import Any, Dict, List, Optional
 
 from agent.delegation import _LLM_ERROR_PREFIXES
 from agent.character_registry import make_char_id
+from lib.media_gen import get_voice_pool
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +58,29 @@ def _clean_list(value: Any) -> List[str]:
     return items
 
 
-def build_card(fields: Dict[str, Any]) -> str:
-    """Assemble card.md content from interview fields (§5.3 structure)."""
+def assign_voice_id(char_id: str) -> Optional[str]:
+    """从 voice_pool 按 char_id 确定性分配固定音色（P4 声纹一致性锚点）。
+
+    与 character_registry.get_voice_id 同款 blake2b 取模（不用内建
+    hash()——PYTHONHASHSEED 随机化会跨进程漂移声纹）。注册时写进
+    meta.json.voice_id 把音色**钉死**：后续 voice_pool 增删不影响已有
+    角色。池空 → default_voice → None（registry 解析链继续兜底）。
+    """
+    pool, default = get_voice_pool()
+    if not pool:
+        return default or None
+    digest = hashlib.blake2b(
+        str(char_id).encode("utf-8"), digest_size=8
+    ).hexdigest()
+    return pool[int(digest, 16) % len(pool)]
+
+
+def build_card(fields: Dict[str, Any], voice_id: str = "") -> str:
+    """Assemble card.md content from interview fields (§5.3 structure).
+
+    ``voice_id`` 非空时写进元数据注释（与内置卡同款 ``voice_id: X`` 槽位；
+    UGC 主通路是 meta.json.voice_id，卡片注释是第二优先级冗余）。
+    """
     name = _clean_str(fields.get("name"), _MAX_NAME_LEN)
     gender = _clean_str(fields.get("gender"), 40)
     personality = _clean_str(fields.get("personality"))
@@ -71,9 +94,13 @@ def build_card(fields: Dict[str, Any]) -> str:
     disliked = _clean_list(fields.get("gift_disliked"))
     bond_levels = _clean_str(fields.get("bond_levels"))
 
+    meta_comment = "<!-- mode: split | task_voice: character"
+    if voice_id:
+        meta_comment += f" | voice_id: {voice_id}"
+    meta_comment += " -->"
     lines = [
         f"# {name}",
-        "<!-- mode: split | task_voice: character -->",
+        meta_comment,
         "",
         f"你是「{name}」，一个由用户创作的虚拟角色。始终以第一人称扮演该角色，"
         "不要提及自己是 AI、语言模型或角色卡。",
@@ -193,20 +220,22 @@ async def create_character(
     if registry.name_taken(name, user_id):
         return f"[Error] 你已拥有名为「{name}」的角色，请让用户换个名字或先删除旧角色。"
 
-    card = build_card(fields)
+    # char_id 先行：voice_id 按其确定性分配并钉进卡注释 + meta（P4 声纹一致性）
+    char_id = make_char_id(name)
+    voice_id = assign_voice_id(char_id)
+    card = build_card(fields, voice_id=voice_id or "")
 
     rejection = await review_card(card, review_client)
     if rejection is not None:
         return f"[Error] 角色设定未通过安全审查：{rejection}。请让用户调整设定后重试。"
 
-    char_id = make_char_id(name)
     meta = {
         "char_id": char_id,
         "display_name": name,
         "author": user_id,
         "created_at": int(time.time()),
         "visibility": "private",
-        "voice_id": None,
+        "voice_id": voice_id,
         "source": "ugc",
     }
     try:

@@ -17,6 +17,7 @@ Character Registry — UGC 角色叠加层（Bond-System-Design.md §5 / P1）�
   很小、每次直读保证新鲜。
 """
 
+import hashlib
 import json
 import os
 import re
@@ -25,6 +26,7 @@ import uuid
 from typing import Dict, List, Optional, Tuple
 
 from agent.personality import PersonalityManager
+from lib.media_gen import get_voice_pool
 
 
 _DEFAULT_CHARACTERS_DIR = os.path.join(
@@ -86,6 +88,21 @@ class CharacterRegistry(PersonalityManager):
     def _card_path(self, char_id: str) -> str:
         return os.path.join(self._char_dir, char_id, "card.md")
 
+    def reference_image_path(self, char_id: str) -> Optional[str]:
+        """角色参考立绘（P4 视觉一致性 I2I 通路）——存在才返回。
+
+        ``data/characters/{char_id}/assets/reference.png``。缺失时调用方
+        优雅降级纯文生图（机制先就位，立绘后补）。此目录受资产 LRU
+        **永不淘汰**保护（asset_memory 硬保护路径）。
+        """
+        for ext in ("png", "jpg", "jpeg", "webp"):
+            path = os.path.join(
+                self._char_dir, char_id, "assets", f"reference.{ext}"
+            )
+            if os.path.isfile(path):
+                return path
+        return None
+
     def _meta_path(self, char_id: str) -> str:
         return os.path.join(self._char_dir, char_id, "meta.json")
 
@@ -121,6 +138,30 @@ class CharacterRegistry(PersonalityManager):
             return None
         self._ugc_cache[name] = (mtime, content)
         return content
+
+    def get_voice_id(self, name: str) -> Optional[str]:
+        """The character's fixed TTS voice (P4 声纹一致性锚点).
+
+        解析链：UGC meta.json.voice_id → 卡片元数据注释 voice_id（内置卡
+        主通路）→ voice_pool 确定性分配（blake2b 摘要取模，**不用内建
+        hash()** —— 后者受 PYTHONHASHSEED 随机化，跨进程会漂移声纹）→
+        TTS default_voice → None。同一角色永远解析到同一音色 ID。
+        """
+        if self.is_ugc(name):
+            meta = self.get_meta(name) or {}
+            vid = str(meta.get("voice_id") or "").strip()
+            if vid:
+                return vid
+        vid = super().get_voice_id(name)
+        if vid:
+            return vid
+        pool, default = get_voice_pool()
+        if pool:
+            digest = hashlib.blake2b(
+                str(name).encode("utf-8"), digest_size=8
+            ).hexdigest()
+            return pool[int(digest, 16) % len(pool)]
+        return default or None
 
     def get_display_name(self, name: str) -> str:
         """UGC: meta.json display_name, fallback to card heading, then id."""

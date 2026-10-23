@@ -101,6 +101,12 @@ class PersonalityManager:
     _TASK_VOICE_RE = re.compile(
         r"\btask_voice\s*[:=]\s*(character|template)\b", re.IGNORECASE
     )
+    # P4 声纹一致性：卡片元数据注释里的固定音色 ID，例如
+    #     <!-- mode: split | task_voice: character | voice_id: longxiaochun_v3.6 -->
+    # 取值允许字母/数字/下划线/点/连字符（系统音色与复刻 voice_id 均兼容）。
+    _VOICE_ID_RE = re.compile(
+        r"\bvoice_id\s*[:=]\s*([A-Za-z0-9_.\-]+)", re.IGNORECASE
+    )
 
     def get_mode(self, name: str) -> str:
         """Return the personality's operating mode: "unified" or "split".
@@ -121,6 +127,18 @@ class PersonalityManager:
         if m and m.group(1).lower() == "template":
             return "template"
         return "character"
+
+    def get_voice_id(self, name: str) -> Optional[str]:
+        """Return the card's fixed TTS voice ID (P4 声纹一致性), or None.
+
+        内置卡走这里的元数据注释；UGC 卡由 CharacterRegistry 覆写为
+        meta.json.voice_id 优先（注册时确定性分配，见 registry）。
+        """
+        content = self.load(name) or ""
+        m = self._VOICE_ID_RE.search(content)
+        if m:
+            return m.group(1)
+        return None
 
     def get_short_name(self, name: str) -> str:
         """Extract a short name from the display name for use in messages.

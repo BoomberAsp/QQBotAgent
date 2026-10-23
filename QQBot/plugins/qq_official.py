@@ -30,11 +30,12 @@ let a quiet evening degrade the panel card to "stale" falsely.
 """
 import asyncio
 import random
+import re
 import time
 from pathlib import Path
 
 from nonebot import get_bots, get_driver, logger, on_message
-from nonebot.adapters.qq import Bot as QQBot
+from nonebot.adapters.qq import Bot as QQBot, MessageSegment
 from nonebot.adapters.qq.event import QQMessageEvent
 
 from adapters.qq_official import (
@@ -42,13 +43,19 @@ from adapters.qq_official import (
     QQOfficialSender,
     build_view,
     send_active_c2c,
+    send_active_c2c_media,
 )
-from agent import greeting
+from agent import bond_content, greeting
+from agent.asset_memory import AssetCard, make_asset_id, prompt_hash_of
 from agent.character_registry import get_character_registry
 from agent.context import _turn_sender
 from agent.delegation import _LLM_ERROR_PREFIXES
-from agent.turn import _bond_manager, _model_router, run_agent_turn
+from agent.turn import (
+    _asset_memory, _bond_manager, _model_router, run_agent_turn,
+)
+from lib import media_gen
 from lib.status_heartbeat import read_status, write_status
+from tools.social_tools import build_image_prompt
 
 official_router = on_message(priority=1, block=False)
 
@@ -166,6 +173,10 @@ async def _greeting_loop():
             await _run_greeting_pass()
         except Exception as e:
             logger.warning(f"[qq_official] greeting pass failed: {e!r}")
+        try:
+            await _run_media_pass()
+        except Exception as e:
+            logger.warning(f"[qq_official] media pass failed: {e!r}")
 
 
 def _get_qq_bot() -> QQBot | None:
@@ -225,6 +236,199 @@ async def _run_greeting_pass() -> None:
         await asyncio.sleep(random.uniform(2.0, 6.0))  # 错峰，避免齐发
     if greeted:
         logger.info(f"[qq_official] greeting pass: {greeted} sent")
+
+
+# ── P4: 主动发图/语音（greeting pass 之后，共享候选索引）─────────────
+#
+# 门控链：split 人格 + 羁绊状态 → 等级门（图 ≥ media_image_min_level，
+# 语音 ≥ media_proactive_voice_min_level）→ 概率门 proactive_media_probability
+# → 今天没收到过任何主动消息（防文本+媒体同日双发）→ active_allowed
+# (kind="media")（日 ≤ proactive_media_daily_cap；月与文本共享平台配额）。
+# 命中后生成一条媒体主动发送；任何环节失败 → 降级纯文本主动问候（不浪费
+# 候选）。成功才记配额 + 写资产卡（proactive=True）+ mark_greeted 重置冷却。
+# 全程 best-effort：任何异常只记日志，绝不影响入站消息处理。
+
+_MEDIA_IMAGE_SCENES = (
+    "给用户发一张日常自拍，对镜头温柔地笑",
+    "穿常服在街头散步的日常画面，姿态自然放松",
+    "在温馨的房间里做自己的事情，充满生活气息",
+    "在户外柔和的光线下回头一笑",
+)
+
+# 台词审查被拒时的 TTS 安全兜底（_GREET_FALLBACKS 带「{name}：」前缀不适合朗读）
+_MEDIA_VOICE_FALLBACKS = (
+    "好久不见呀，最近过得怎么样？",
+    "突然有点想你，忙也要记得休息哦。",
+    "记得按时吃饭，好好睡觉哦。",
+)
+
+
+async def _run_media_pass() -> None:
+    cfg = _bond_manager._config
+    if not bool(cfg.get("media_enabled", True)):
+        return
+    bot = _get_qq_bot()
+    if bot is None:
+        return
+    entries = greeting.load_targets(str(_GREET_TARGETS_FILE))
+    if not entries:
+        return
+    pm = get_character_registry()
+    img_min = int(cfg.get("media_image_min_level", 4))
+    voice_min = int(cfg.get("media_proactive_voice_min_level", 7))
+    prob = float(cfg.get("proactive_media_probability", 0.15))
+    media_daily_cap = int(cfg.get("proactive_media_daily_cap", 1))
+    monthly_cap = int(cfg.get("greet_monthly_cap", 4))
+    max_batch = int(cfg.get("greet_batch_max", 5))
+    ttl = float(cfg.get("media_dedupe_ttl_hours", 168))
+
+    sent = 0
+    for openid, _entry in entries.items():
+        if sent >= max_batch:
+            break
+        try:
+            persona = pm.resolve_effective_personality(openid, None)
+            if pm.get_mode(persona) != "split":
+                continue
+            state = _bond_manager.get_state(openid, persona, create=False)
+            if not isinstance(state, dict):
+                continue
+            level = int(state.get("level", 1))
+            can_image = level >= img_min and media_gen.is_image_available()
+            can_voice = level >= voice_min and media_gen.is_tts_available()
+            if not (can_image or can_voice):
+                continue
+            if random.random() >= prob:
+                continue
+            # 今天已收到主动文本 → 不再叠加媒体（防同日双发打扰）
+            if greeting.active_sent_today(str(_GREET_QUOTA_FILE), openid,
+                                          kind="text"):
+                continue
+            if not greeting.active_allowed(
+                    str(_GREET_QUOTA_FILE), openid,
+                    daily_cap=media_daily_cap, monthly_cap=monthly_cap,
+                    kind="media"):
+                continue
+            kind = "voice" if (can_voice and random.random() < 0.5) else (
+                "image" if can_image else "voice")
+            seg, card, phash = await _prepare_proactive_media(
+                openid, persona, kind, state, pm, ttl)
+            if seg is not None and await send_active_c2c_media(bot, openid, seg):
+                greeting.record_active_send(str(_GREET_QUOTA_FILE), openid,
+                                            kind="media")
+                greeting.mark_greeted(str(_GREET_TARGETS_FILE), openid)
+                if card is not None:
+                    _asset_memory.write_card(card)
+                    if phash:
+                        _asset_memory.record_prompt_hash(phash, card)
+                _asset_memory.append_audit(
+                    openid, persona, kind,
+                    card.model if card else "", phash or "", "proactive_ok")
+                sent += 1
+                logger.info(
+                    f"[qq_official] proactive {kind} → {openid[:8]}… "
+                    f"as {persona}")
+            else:
+                if phash:
+                    _asset_memory.append_audit(
+                        openid, persona, kind, "", phash, "proactive_failed")
+                # 降级：纯文本主动问候（text 配额与冷却独立结算）
+                await _fallback_text_greeting(bot, openid, persona, state)
+            await asyncio.sleep(random.uniform(2.0, 6.0))  # 错峰，避免齐发
+        except Exception as e:
+            logger.warning(
+                f"[qq_official] media pass: {openid[:8]}… failed: {e!r}")
+    if sent:
+        logger.info(f"[qq_official] media pass: {sent} sent")
+
+
+async def _prepare_proactive_media(openid: str, persona: str, kind: str,
+                                   state: dict, pm, ttl: float):
+    """Generate one proactive media payload.
+
+    Returns ``(seg|None, card|None, phash)``。card=None 表示复用旧资产
+    （去重命中，不建新卡）或生成失败（seg 也为 None）。图像 = Appearance
+    Anchor 强制前缀 + 日常场景池（prompt_hash 去重防重复计费/重复画面）；
+    语音 = flash in-character 台词 → TTS（与被动工具同一 voice_id 解析链
+    = 声纹一致）。台词未过审查 → 换安全兜底句。
+    """
+    card_content = pm.load(persona) or ""
+    display = pm.get_display_name(persona)
+    if kind == "image":
+        anchor = bond_content.parse_appearance_anchor(card_content)
+        prompt = build_image_prompt(random.choice(_MEDIA_IMAGE_SCENES),
+                                    anchor, display)
+        phash = prompt_hash_of(prompt)
+        hit = _asset_memory.find_by_prompt_hash(phash, ttl_hours=ttl)
+        if hit is not None and hit.path:
+            return MessageSegment.file_image(Path(hit.path)), None, phash
+        asset_id = make_asset_id()
+        out_path = _asset_memory.binary_path(openid, persona, asset_id, "png")
+        try:
+            reference = pm.reference_image_path(persona)
+        except Exception:
+            reference = None
+        path = await media_gen.generate_image(
+            prompt, out_path=out_path, reference_image_path=reference)
+        if not path:
+            return None, None, phash
+        card = AssetCard(
+            id=asset_id, type="image", char_id=persona, user_id=openid,
+            path=path, model=media_gen.get_model_name("image"),
+            prompt=prompt, tags=["generated", "proactive"],
+            prompt_hash=phash, proactive=True,
+        )
+        return MessageSegment.file_image(Path(path)), card, phash
+
+    # ── voice ──
+    line = await _compose_greeting(persona, state)
+    m = re.search(r"「(.+?)」", line or "")
+    if m:  # 模板降级带「{name}：「…」」包装 → 取台词本体
+        line = m.group(1)
+    line = (line or "").strip()[:120] or random.choice(_MEDIA_VOICE_FALLBACKS)
+    review_ok, _reason = await media_gen.review_prompt(
+        line, _model_router.flash_client)
+    if not review_ok:
+        line = random.choice(_MEDIA_VOICE_FALLBACKS)
+    phash = prompt_hash_of("proactive_voice:" + line)
+    voice_id = ""
+    try:
+        voice_id = pm.get_voice_id(persona) or ""
+    except Exception:
+        voice_id = ""
+    asset_id = make_asset_id()
+    out_path = _asset_memory.binary_path(openid, persona, asset_id, "mp3")
+    path = await media_gen.generate_speech(
+        line, voice_id, out_path=out_path,
+        max_chars=int(_bond_manager.get_config("media_tts_max_chars", 300)))
+    if not path:
+        return None, None, phash
+    card = AssetCard(
+        id=asset_id, type="voice", char_id=persona, user_id=openid,
+        path=path, model=media_gen.get_model_name("voice"),
+        transcript=line, prompt=line, tags=["generated", "proactive"],
+        prompt_hash=phash, proactive=True,
+    )
+    return MessageSegment.file_audio(Path(path)), card, phash
+
+
+async def _fallback_text_greeting(bot, openid: str, persona: str,
+                                  state: dict) -> None:
+    """媒体生成/发送失败 → 纯文本主动问候（text 配额独立，成功才记账）。"""
+    cfg = _bond_manager._config
+    if not bool(cfg.get("greet_enabled", True)):
+        return
+    if not greeting.active_allowed(
+            str(_GREET_QUOTA_FILE), openid,
+            daily_cap=int(cfg.get("greet_daily_cap", 1)),
+            monthly_cap=int(cfg.get("greet_monthly_cap", 4)),
+            kind="text"):
+        return
+    text = await _compose_greeting(persona, state)
+    if text and await send_active_c2c(bot, openid, text):
+        greeting.record_active_send(str(_GREET_QUOTA_FILE), openid,
+                                    kind="text")
+        greeting.mark_greeted(str(_GREET_TARGETS_FILE), openid)
 
 
 async def _compose_greeting(persona_key: str, state: dict) -> str:

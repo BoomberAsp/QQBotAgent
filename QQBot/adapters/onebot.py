@@ -38,7 +38,7 @@ from nonebot.adapters.onebot.v11 import (
 
 from agent.context import _current_user_workspace
 from agent.inbound import Attachment, InboundMessage
-from agent.outbound import OutImage, SendFailed
+from agent.outbound import OutAudio, OutImage, SendFailed
 from agent.turn import _AGENT_DIR, _recent_files
 from tools.builtin_tools import _ensure_workspace_dirs
 
@@ -78,6 +78,19 @@ class OneBotSender:
             seg = MessageSegment.image(img.url)
         else:
             raise ValueError(f"OutImage has neither path nor url (label={img.label!r})")
+        try:
+            await self._matcher.send(seg)
+        except ActionFailed as e:
+            raise SendFailed(str(e), info=getattr(e, "info", None)) from e
+
+    async def send_audio(self, audio: OutAudio) -> None:
+        # NapCat transcodes common formats (mp3/wav) to silk itself.
+        if audio.path:
+            seg = MessageSegment.record(Path(audio.path))
+        elif audio.url:
+            seg = MessageSegment.record(audio.url)
+        else:
+            raise ValueError(f"OutAudio has neither path nor url (label={audio.label!r})")
         try:
             await self._matcher.send(seg)
         except ActionFailed as e:

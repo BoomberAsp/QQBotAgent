@@ -19,7 +19,7 @@ import os
 import re
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # ── 默认配置（Bond-System-Design.md §4.2 / §4.3，全部可被 JSON 覆盖）──
@@ -75,6 +75,24 @@ _DEFAULTS: Dict[str, Any] = {
     "greet_batch_max": 5,          # 单次 pass 最多问候人数
     "greet_interval_hours": 6.0,   # HEARTBEAT 巡检间隔（小时）
     "greet_jitter_minutes": 45,    # 巡检间隔随机抖动（分钟），避免整点齐发
+    # ── P4: 多模态生成（§7.2 三重门控的可配数值）──
+    "media_enabled": True,             # 生成玩法总开关
+    "media_image_min_level": 4,        # create_image 好感等级门（§7.2 图 Lv4）
+    "media_voice_min_level": 5,        # send_voice 好感等级门（§7.2 语音 Lv5）
+    "media_proactive_voice_min_level": 7,  # 主动语音等级门（§7.2 主动语音 Lv7）
+    "daily_image_regular": 3,          # 每日生成配额（按用户角色分档）
+    "daily_image_vip": 10,
+    "daily_image_admin": 50,
+    "daily_voice_regular": 3,
+    "daily_voice_vip": 10,
+    "daily_voice_admin": 50,
+    "proactive_media_probability": 0.15,  # 主动媒体概率门（每候选每 pass）
+    "proactive_media_daily_cap": 1,    # 主动媒体 ≤1 次/天/用户（§7.3）
+    "media_dedupe_ttl_hours": 168,     # prompt_hash 去重窗口（7 天）
+    "media_tts_max_chars": 300,        # TTS 文本上限（plus 按字符计费）
+    "media_asset_quota_mb_regular": 100,   # 资产层磁盘配额（P5 LRU 用）
+    "media_asset_quota_mb_vip": 300,
+    "media_asset_quota_mb_admin": 1000,
 }
 
 # 角色面动态层固定提示：历史中的任务结果来自任务智能体（中立口吻），
@@ -151,6 +169,11 @@ class BondManager:
                 key=lambda e: e[2],
             )
         self._config = cfg
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        """Public read-only access to a config value (social_tools 等外部
+        模块不直接摸 _config)。"""
+        return self._config.get(key, default)
 
     # ── Level curve ───────────────────────────────────────────────
 
@@ -253,6 +276,8 @@ class BondManager:
             "long_done": False,
             "gifts": 0,
             "pokes": 0,
+            "images": 0,     # P4: 今日已生成图像数
+            "voices": 0,     # P4: 今日已合成语音数
         }
 
     @staticmethod
@@ -262,6 +287,7 @@ class BondManager:
             state["daily"] = {
                 "date": today, "chat_exp": 0, "first_done": False,
                 "long_done": False, "gifts": 0, "pokes": 0,
+                "images": 0, "voices": 0,
             }
 
     def get_state(self, user_id: str, char_id: str, create: bool = True) -> Optional[dict]:
@@ -491,6 +517,81 @@ class BondManager:
             "pokes_today": daily["pokes"], "daily_poke_limit": limit,
             "level": self.level_for_exp(int(state["exp"])), "exp": state["exp"],
         }
+
+    # ── P4: 多模态生成门控与配额（§7.2 等级门 + 配额门）──────────────
+
+    # media_type → daily 计数键（与 _new_daily/_roll_daily 对应）
+    _MEDIA_COUNTERS = {"image": "images", "voice": "voices"}
+
+    def get_level(self, user_id: str, char_id: str) -> int:
+        """当前好感等级（无状态 → Lv1）。"""
+        state = self.get_state(user_id, char_id, create=False)
+        if not state:
+            return 1
+        return self.level_for_exp(int(state.get("exp", 0)))
+
+    def media_level_gate(
+        self,
+        user_id: str,
+        char_id: str,
+        media_type: str,
+        proactive: bool = False,
+    ) -> Tuple[bool, int, int]:
+        """等级门：返回 (通过?, 当前等级, 要求等级)。
+
+        - image → media_image_min_level
+        - voice（被动）→ media_voice_min_level
+        - voice（主动，proactive=True）→ media_proactive_voice_min_level
+        未知 media_type 视为不通过（fail-closed）。
+        """
+        if media_type == "image":
+            required = int(self._config.get("media_image_min_level", 4))
+        elif media_type == "voice":
+            key = (
+                "media_proactive_voice_min_level" if proactive
+                else "media_voice_min_level"
+            )
+            required = int(self._config.get(key, 7 if proactive else 5))
+        else:
+            return False, 0, 0
+        level = self.get_level(user_id, char_id)
+        return level >= required, level, required
+
+    def check_media_quota(
+        self, user_id: str, char_id: str, media_type: str, role: str
+    ) -> Tuple[bool, str]:
+        """配额门：返回 (可生成?, 拒绝原因)。只读判定，不写盘。
+
+        原因串机器可读（调用方转 observation）：
+        ``media_disabled`` / ``daily_limit:{used}/{limit}`` / ``""``（通过）。
+        """
+        counter = self._MEDIA_COUNTERS.get(media_type)
+        if counter is None:
+            return False, "unknown_media_type"
+        if not bool(self._config.get("media_enabled", True)):
+            return False, "media_disabled"
+        state = self.get_state(user_id, char_id)
+        self._roll_daily(state, datetime.now().strftime("%Y-%m-%d"))
+        used = int(state["daily"].get(counter, 0))
+        role_key = role if role in ("regular", "vip", "admin") else "regular"
+        limit = int(self._config.get(f"daily_{media_type}_{role_key}", 3))
+        if used >= limit:
+            return False, f"daily_limit:{used}/{limit}"
+        return True, ""
+
+    def record_media_use(self, user_id: str, char_id: str, media_type: str) -> int:
+        """生成**成功后**记账（同 give_gift 模式）。返回今日已用次数。"""
+        counter = self._MEDIA_COUNTERS.get(media_type)
+        if counter is None:
+            return 0
+        state = self.get_state(user_id, char_id)
+        self._roll_daily(state, datetime.now().strftime("%Y-%m-%d"))
+        used = int(state["daily"].get(counter, 0)) + 1
+        state["daily"][counter] = used
+        stats = state.setdefault("stats", {})
+        stats[counter] = int(stats.get(counter, 0)) + 1
+        self._save(user_id)
+        return used
 
     # ── P3: 剧情场景完成记录（防重复刷 EXP）────────────────────────
 
@@ -754,7 +855,7 @@ class BondManager:
     # ── User-facing status (/好感度 指令) ─────────────────────────
 
     def format_status(
-        self, user_id: str, char_id: str, display_name: str = ""
+        self, user_id: str, char_id: str, display_name: str = "", role: str = "regular"
     ) -> str:
         state = self.get_state(user_id, char_id, create=False)
         name = display_name or char_id
@@ -791,6 +892,15 @@ class BondManager:
             f"\n今日互动: 送礼 {gifts_today}/{int(self._config['daily_gift_limit'])}"
             f" · 戳一戳 {pokes_today}/{int(self._config['daily_poke_limit'])}"
         )
+        media_line = ""
+        if bool(self._config.get("media_enabled", True)):
+            role_key = role if role in ("vip", "admin") else "regular"
+            img_cap = int(self._config.get(f"daily_image_{role_key}", 3))
+            voc_cap = int(self._config.get(f"daily_voice_{role_key}", 3))
+            media_line = (
+                f"\n今日生成: 画图 {int(daily.get('images', 0))}/{img_cap}"
+                f" · 语音 {int(daily.get('voices', 0))}/{voc_cap}"
+            )
         return (
             f"💗 与「{name}」的羁绊\n"
             f"等级: Lv{level} {self.title_for(level)}\n"
@@ -800,6 +910,7 @@ class BondManager:
             + (f" · 累计收礼 {gifts_total} 次" if gifts_total else "")
             + f"\n今日聊天好感: {chat_today}/{cap}（超出后收益递减）"
             + gift_line
+            + media_line
         )
 
     # ── Admin ─────────────────────────────────────────────────────
