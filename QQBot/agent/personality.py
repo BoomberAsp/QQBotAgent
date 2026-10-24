@@ -40,7 +40,8 @@ class PersonalityManager:
 
     def __init__(self, personalities_dir: str = None):
         self._dir = personalities_dir or _PERSONALITIES_DIR
-        self._cache: Dict[str, str] = {}  # name → raw markdown content
+        # name → (mtime, raw markdown content)
+        self._cache: Dict[str, tuple] = {}
 
     # ── Discovery ─────────────────────────────────────────────────
 
@@ -59,14 +60,21 @@ class PersonalityManager:
     def load(self, name: str) -> Optional[str]:
         """Load a personality's raw markdown content.
 
-        Caches in memory after first load. Returns None if not found.
+        Cached by file mtime (same rule CharacterRegistry already uses for UGC
+        cards), so editing a card takes effect on the next turn instead of
+        requiring a bot restart. Returns None if not found.
         """
-        if name in self._cache:
-            return self._cache[name]
-
         path = os.path.join(self._dir, f"{name}.md")
         if not os.path.isfile(path):
             return None
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+
+        cached = self._cache.get(name)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == mtime:
+            return cached[1]
 
         with open(path, "r", encoding="utf-8") as f:
             content = f.read().strip()
@@ -74,7 +82,7 @@ class PersonalityManager:
         if not content:
             return None
 
-        self._cache[name] = content
+        self._cache[name] = (mtime, content)
         return content
 
     def get_display_name(self, name: str) -> str:

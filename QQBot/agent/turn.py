@@ -1852,6 +1852,24 @@ def _story_query_from(text: str, limit: int = 400) -> str:
     return text[:limit]
 
 
+def _story_log(message: str) -> None:
+    """Emit one line of story-KB diagnostics.
+
+    Goes through loguru so it lands in logs/bot_*.log (the file sink installed by
+    _setup_file_logging); falls back to stderr when loguru is unavailable.
+    """
+    try:
+        from loguru import logger as _logger
+        _logger.info(message)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _story_char_id_for(persona_key: str, pm) -> str:
     """Resolve the active persona to a story character id (cached lookup)."""
     try:
@@ -1882,6 +1900,9 @@ def _build_story_context(persona_key: str, query: str, pm) -> tuple:
             max_chars=_STORY_INJECT_CHARS,
             min_score=_STORY_MIN_SCORE,
         )
+        if block:
+            _story_log(f"[story-kb] inject {len(block)}c persona={persona_key} "
+                       f"char={char_id or '-'} q={q[:40]!r}")
         return block or "", char_id
     except Exception:  # noqa: BLE001 — never break a reply
         return "", ""
@@ -1894,8 +1915,8 @@ def _story_search(query: str = "", limit: int = 4) -> str:
 
         kb = get_story_kb()
         if not kb.available:
-            return ("[story_search] 剧情知识库尚未构建（data/story_kb/story.db 不存在）。"
-                    "管理员可运行 python scripts/build_story_kb.py --all 生成。")
+            return (f"[story_search] 剧情知识库尚未构建（{kb.db_path} 不存在）。"
+                    f"管理员可运行 python scripts/build_story_kb.py --all 生成。")
         q = (query or "").strip()
         if not q:
             return "[story_search] 请提供要查询的关键词（角色名、事件名、章节等）。"
@@ -1903,9 +1924,12 @@ def _story_search(query: str = "", limit: int = 4) -> str:
             limit = max(1, min(int(limit), 8))
         except (TypeError, ValueError):
             limit = 4
-        return kb.format_tool_result(
+        out = kb.format_tool_result(
             q, limit=limit, persona_char_id=_current_story_char_id.get(),
         )
+        _story_log(f"[story-kb] tool q={q[:40]!r} limit={limit} "
+                   f"-> {len(out)}c{' (miss)' if '没有找到' in out else ''}")
+        return out
     except Exception as exc:  # noqa: BLE001
         return f"[story_search] 检索失败：{type(exc).__name__}: {exc}"
 

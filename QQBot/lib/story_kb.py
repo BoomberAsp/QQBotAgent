@@ -48,15 +48,106 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 # ── Constants ──────────────────────────────────────────────────────
 
-_DEFAULT_DB = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "data", "story_kb", "story.db"
-)
+# ── Paths / data root ──────────────────────────────────────────────
+#
+# The database is a *build artifact*, not source: on a real deployment it lives
+# on the data disk next to the per-user memories and workspaces
+# (USER_DATA_ROOT=/mnt/datadisk0/QQBotUserData → …/story_kb/story.db), so it
+# survives `git pull` / redeploys and is picked up by whatever backs up
+# USER_DATA_ROOT.
+#
+# Resolution order (first hit wins):
+#   1. $STORY_KB_DIR                 explicit override, build + read
+#   2. $USER_DATA_ROOT/story_kb      the deployment data disk
+#   3. <QQBot>/data/story_kb         a plain dev checkout
+_QQBOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _clean(path: str) -> str:
+    return (path or "").strip().rstrip("/\\")
+
+
+_DOTENV_LOADED = False
+
+
+def _load_dotenv_once() -> None:
+    """Populate os.environ from ``QQBot/.env`` the first time a path resolves.
+
+    The bot loads .env when agent/turn.py is imported, but scripts, the webui
+    process and tests can reach this module first. Without this, USER_DATA_ROOT
+    would be absent and the KB would silently resolve to the git checkout
+    instead of the data disk. Existing environment variables always win, which
+    matches python-dotenv's default behaviour.
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+    try:
+        with open(os.path.join(_QQBOT_DIR, ".env"), "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if not key or key in os.environ:
+                    continue
+                os.environ[key] = value.split(" #")[0].strip().strip('"').strip("'")
+    except OSError:
+        pass
+
+
+def data_root() -> str:
+    """The configured data root (``USER_DATA_ROOT``), or "" when unset."""
+    _load_dotenv_once()
+    return _clean(os.environ.get("USER_DATA_ROOT", ""))
+
+
+def story_kb_candidates() -> List[str]:
+    """Every directory the KB may live in, most authoritative first."""
+    _load_dotenv_once()
+    out: List[str] = []
+    explicit = _clean(os.environ.get("STORY_KB_DIR", ""))
+    if explicit:
+        out.append(explicit)
+    root = data_root()
+    if root:
+        out.append(os.path.join(root, "story_kb"))
+    out.append(os.path.join(_QQBOT_DIR, "data", "story_kb"))
+    return out
+
+
+def preferred_story_kb_dir() -> str:
+    """Where the KB *should* live on this host (created on demand by the builder)."""
+    _load_dotenv_once()
+    explicit = _clean(os.environ.get("STORY_KB_DIR", ""))
+    if explicit:
+        return explicit
+    root = data_root()
+    if root and os.path.isdir(root):
+        return os.path.join(root, "story_kb")
+    return os.path.join(_QQBOT_DIR, "data", "story_kb")
+
+
+def default_db_path() -> str:
+    """Absolute path of the database to read.
+
+    Deliberately *not* a cross-candidate search: in a configured deployment the
+    KB location must be deterministic, otherwise the bot could silently serve a
+    stale copy left inside the git checkout while the data disk holds the real
+    one. When USER_DATA_ROOT is unset (or points at a path that does not exist
+    yet, e.g. a dev box), ``preferred_story_kb_dir()`` already resolves to
+    ``<QQBot>/data/story_kb`` — so a bare checkout keeps working.
+    """
+    return os.path.join(preferred_story_kb_dir(), "story.db")
 
 # Schema version written by the builder; the reader refuses newer DBs
 # (forward-compatibility guard) and tolerates older ones.
 #   1 — initial (unit / scene / chunk + two FTS indexes)
 #   2 — scene.zh_kw (per-scene Chinese keywords, used by ranking + entity gate)
-SCHEMA_VERSION = 2
+#   3 — scene.cast_line (English speaker → official Chinese name)
+SCHEMA_VERSION = 3
 
 # RRF constant (standard value from the TREC RRF literature).
 _RRF_K = 60
@@ -148,6 +239,7 @@ class StoryHit:
     scene_title_zh: str = ""
     zh_gist: str = ""
     zh_kw: str = ""
+    cast: str = ""
     char_ids: str = ""
     speakers: str = ""
     # chunk body
@@ -262,17 +354,43 @@ class StoryKB:
     """Read-only reader over the story knowledge base."""
 
     def __init__(self, db_path: Optional[str] = None):
-        self.db_path = os.path.abspath(db_path or _DEFAULT_DB)
+        # Resolved per instance (not at import time): USER_DATA_ROOT is read
+        # from .env which the bot loads after this module may first be imported.
+        self.db_path = os.path.abspath(db_path or default_db_path())
         self._lock = threading.Lock()
         self._ok: Optional[bool] = None
         self._stats: Dict[str, object] = {}
         self._entities: Optional[List[str]] = None
+        # Filled by available(): schema version (informational) and whether this
+        # DB carries the optional scene.cast_line column.
+        self._schema = 0
+        self._has_cast = False
 
     # ── Availability ─────────────────────────────────────────────
 
+    # Columns this reader depends on. Checked instead of the schema version so
+    # that an *additive* schema bump never disables the feature: the builder can
+    # rewrite the DB before the process is restarted without any downtime, and a
+    # reader newer than the DB still works as long as the required columns exist.
+    _REQUIRED_COLUMNS = {
+        "unit": {"id", "page_title", "work", "zh_summary", "zh_keywords"},
+        "scene": {"id", "unit_id", "ord", "zh_gist", "zh_kw", "char_ids", "speakers"},
+        "chunk": {"id", "scene_id", "text_en"},
+    }
+
     @property
     def available(self) -> bool:
-        """True when a readable, schema-compatible database exists."""
+        """True when a readable, schema-compatible database exists.
+
+        A negative result is re-checked whenever the DB file appears, so building
+        the knowledge base while the bot is running becomes visible without a
+        restart (the deploy order is: ship code → build/migrate DB → chat).
+        """
+        if self._ok:
+            return True
+        if self._ok is False and os.path.isfile(self.db_path):
+            self._ok = None
+            self._stats = {}
         if self._ok is not None:
             return self._ok
         self._ok = False
@@ -284,8 +402,17 @@ class StoryKB:
                 row = conn.execute(
                     "SELECT value FROM meta WHERE key='schema_version'"
                 ).fetchone()
-                ver = int(row[0]) if row else 0
-                self._ok = 0 < ver <= SCHEMA_VERSION
+                self._schema = int(row[0]) if row else 0
+                if self._schema <= 0:
+                    return False
+                tables = {}
+                for table, required in self._REQUIRED_COLUMNS.items():
+                    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+                    tables[table] = cols
+                    if not required <= cols:
+                        return False
+                self._has_cast = "cast_line" in tables.get("scene", set())
+                self._ok = True
             finally:
                 conn.close()
         except Exception:  # noqa: BLE001 — never break a chat turn
@@ -315,6 +442,9 @@ class StoryKB:
                 meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
                 self._stats = {
                     "available": True,
+                    "db_path": self.db_path,
+                    "schema_version": self._schema,
+                    "has_cast_line": self._has_cast,
                     "units": one("SELECT COUNT(*) FROM unit"),
                     "scenes": one("SELECT COUNT(*) FROM scene"),
                     "chunks": one("SELECT COUNT(*) FROM chunk"),
@@ -491,11 +621,14 @@ class StoryKB:
         if not ids:
             return []
         marks = ",".join("?" for _ in ids)
+        cast_expr = "s.cast_line" if self._has_cast else "''"
         sql = f"""
             SELECT c.id AS chunk_id, c.scene_id, c.ord AS chunk_ord, c.text_en,
                    c.n_lines,
                    s.ord AS scene_ord, s.scene_title, s.scene_title_zh, s.zh_gist,
-                   s.zh_kw, s.char_ids, s.speakers, s.unit_id,
+                   s.zh_kw,
+                   {cast_expr} AS cast_line,
+                   s.char_ids, s.speakers, s.unit_id,
                    u.work, u.episode, u.chapter_no, u.chapter_title_en,
                    u.chapter_title_zh, u.event_name, u.event_name_zh,
                    u.page_title, u.url, u.zh_summary
@@ -527,6 +660,7 @@ class StoryKB:
                 scene_title_zh=r["scene_title_zh"] or "",
                 zh_gist=r["zh_gist"] or "",
                 zh_kw=r["zh_kw"] or "",
+                cast=r["cast_line"] or "",
                 char_ids=r["char_ids"] or "",
                 speakers=r["speakers"] or "",
                 ord=int(r["chunk_ord"] or 0),
@@ -648,6 +782,8 @@ class StoryKB:
                 "- 只在与当前话题相关时自然提及，不要朗读原文，"
                 "不要提「知识库/检索/资料」之类的系统用词。\n"
                 f"- 台词原文是英文；对团长复述时用中文口语转述，并保持{who}的语气。\n"
+                "- 人名的中文写法**一律**按每段的「本段人物」一行（官方译名），"
+                "不要自己音译。\n"
                 "- 标注「你（本角色）在场」的段落你是当事人，用第一人称；"
                 "标注「你不在场」的按「后来听说」处理。\n"
                 "- 检索可能不完整：把握不大时就用模糊的说法，不要编造细节。"
@@ -662,6 +798,8 @@ class StoryKB:
                 body.append(f"梗概：{hit.zh_gist}")
             elif hit.zh_summary:
                 body.append(f"单元梗概：{hit.zh_summary}")
+            if hit.cast:
+                body.append(f"本段人物：{hit.cast}")
             dialogue = self._trim_dialogue(hit.text_en, dialogue_chars)
             if dialogue:
                 body.append("片段：\n" + dialogue)
@@ -696,6 +834,8 @@ class StoryKB:
                 lines.append(f"单元梗概：{hit.zh_summary}")
             if hit.zh_gist:
                 lines.append(f"本段梗概：{hit.zh_gist}")
+            if hit.cast:
+                lines.append(f"本段人物（官方译名）：{hit.cast}")
             lines.append("对白：\n" + self._trim_dialogue(hit.text_en, detail))
             if hit.url:
                 lines.append(f"来源：{hit.url}")
