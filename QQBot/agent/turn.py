@@ -2139,7 +2139,7 @@ async def handle_agent_turn(view: InboundMessage):
         cmd_handled = await _handle_bond_command(text_content, user_id, view)
         if cmd_handled:
             return
-        # /设好感 <等级> (admin GM tool, direct, zero token)
+        # /设好感 <等级> (self bond level override, direct, zero token)
         cmd_handled = await _handle_set_bond_command(text_content, user_id, view)
         if cmd_handled:
             return
@@ -2580,7 +2580,7 @@ async def handle_continuous_turn(view: InboundMessage):
     if await _handle_bond_command(text_content, user_id, view, sender=continuous_sender):
         return
 
-    # /设好感 <等级> (admin GM tool, direct, zero token)
+    # /设好感 <等级> (self bond level override, direct, zero token)
     if await _handle_set_bond_command(
         text_content, user_id, view, sender=continuous_sender
     ):
@@ -3700,18 +3700,15 @@ async def _handle_bond_command(
 async def _handle_set_bond_command(
     text: str, user_id: str, view: InboundMessage, sender=None
 ) -> bool:
-    """Handle /设好感 <等级> — 管理员把自己与当前角色的羁绊直接设到目标等级。
+    """Handle /设好感 <等级> — 把自己与当前角色的羁绊直接设到目标等级。
 
-    GM 工具（零 token）：允许下调，用于活动补偿与生产测试（如自设 Lv7
-    验证主动媒体 pass）。跨用户调整不做成聊天命令——官方途径的用户身份
-    是不透明 openid，管理员拿不到别人的 id；需要时走 WebUI/服务器侧。
+    所有人可用（零 token）：只作用于本人的羁绊状态，允许上调/下调——
+    「只涨不掉」是自然积累的纪律，本人显式重设视为自由存档。
+    跨用户调整不存在：命令永远作用于发送者自己。
     """
     parts = text.strip().split()
     if not parts or parts[0] not in ("/设好感", "#设好感"):
         return False
-    if _perm_manager.get_role(user_id) != UserRole.ADMIN:
-        await _safe_send("此命令仅限管理员使用。", sender=sender)
-        return True
     if len(parts) < 2 or not parts[1].isdigit() or not (1 <= int(parts[1]) <= 10):
         await _safe_send(
             "用法：/设好感 <等级1-10>（作用于你与当前角色人格的羁绊）",

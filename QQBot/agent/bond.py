@@ -488,11 +488,13 @@ class BondManager:
         ]
 
     def set_level(self, user_id: str, char_id: str, level: int) -> List[Dict[str, Any]]:
-        """GM/管理员专用：把羁绊直接设到目标等级（EXP=该级阈值）。
+        """把羁绊直接设到目标等级（EXP=该级阈值）——本人显式重设，所有人可用。
 
-        「只涨不掉」是玩家侧纪律，本方法是管理员豁免——**允许下调**
-        （活动补偿/生产测试用）。等级 clamp 到等级表范围；上调时返回
-        跨越的 level_ups（复用 add_exp 的返回形态），下调返回 []。
+        「只涨不掉」是自然积累的纪律；用户显式重设视为自由存档，**允许下调**
+        （回调起点/活动补偿/测试皆宜）。调用方须自行保证作用于本人
+        （聊天命令 /设好感 永远以发送者 user_id 调用）。等级 clamp 到
+        等级表范围；上调时返回跨越的 level_ups（复用 add_exp 的返回形态），
+        下调返回 []。
         """
         levels = self._config["levels"]
         try:
