@@ -30,6 +30,10 @@ _MAX_NAME_LEN = 24
 _MAX_LIST_ITEMS = 10
 _MAX_ITEM_LEN = 60
 
+# 初始羁绊封顶 Lv5（密友）：Lv4/Lv5 的画图/语音门槛可以作为创作预设送出，
+# Lv6+（知己/暧昧/恋人…）必须相处挣得，保住养成感。
+_MAX_INITIAL_BOND = 5
+
 _REQUIRED_FIELDS = ("name", "personality", "speech_style", "appearance")
 
 _REVIEW_SYSTEM = (
@@ -45,6 +49,15 @@ def _clean_str(value: Any, max_len: int = _MAX_FIELD_LEN) -> str:
     if value is None:
         return ""
     return str(value).strip()[:max_len]
+
+
+def _coerce_initial_bond(value: Any) -> int:
+    """Clamp the interview's initial_bond_level into [1, _MAX_INITIAL_BOND]."""
+    try:
+        level = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(level, _MAX_INITIAL_BOND))
 
 
 def _clean_list(value: Any) -> List[str]:
@@ -237,6 +250,8 @@ async def create_character(
         "visibility": "private",
         "voice_id": voice_id,
         "source": "ugc",
+        # 初始羁绊（1-5）：bond 状态首次创建时对作者本人生效（bond._seed_initial_bond）
+        "initial_bond_level": _coerce_initial_bond(fields.get("initial_bond_level")),
     }
     try:
         registry.register_character(char_id, card, meta)
@@ -268,6 +283,13 @@ CREATE_CHARACTER_SCHEMA: Dict[str, Any] = {
         "gift_normal": {"type": "array", "items": {"type": "string"}, "description": "普通的礼物（可选）"},
         "gift_disliked": {"type": "array", "items": {"type": "string"}, "description": "讨厌的礼物（可选）"},
         "bond_levels": {"type": "string", "description": "各羁绊等级的态度变化/解锁档案描述（可选）"},
+        "initial_bond_level": {
+            "type": "integer",
+            "description": (
+                "初始羁绊等级 1-5（可选，默认1=陌生；5=密友）。"
+                "用户与角色初次建立羁绊时按此等级起步，之后照常相处升级。"
+            ),
+        },
     },
     "required": ["name", "personality", "speech_style", "appearance"],
 }

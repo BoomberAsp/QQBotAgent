@@ -1186,7 +1186,12 @@ _perm_manager = PermissionManager()
 # 好感/心情/陪伴统计核心。data/bonds/{user_id}.json 持久化，
 # mtime 校验缓存（外部写入优先，同 ProfileManager 纪律）。
 # 结算钩子在回复成功发送后调用；仅 split 模式人格参与。
-_bond_manager = BondManager(base_dir=os.path.join(_DATA_DIR, "bonds"))
+# characters_dir：UGC 卡 meta.json 的 initial_bond_level 在 bond 状态
+# 首次创建时播种初始羁绊（仅作者本人，与 CharacterRegistry 默认目录同源）。
+_bond_manager = BondManager(
+    base_dir=os.path.join(_DATA_DIR, "bonds"),
+    characters_dir=os.path.join(_DATA_DIR, "characters"),
+)
 
 
 # Per-user busy flag — prevents concurrent message processing for the
@@ -2134,6 +2139,10 @@ async def handle_agent_turn(view: InboundMessage):
         cmd_handled = await _handle_bond_command(text_content, user_id, view)
         if cmd_handled:
             return
+        # /设好感 <等级> (admin GM tool, direct, zero token)
+        cmd_handled = await _handle_set_bond_command(text_content, user_id, view)
+        if cmd_handled:
+            return
         # /剧情 #剧情 command (bond story scenes, P3; private-chat only)
         cmd_handled = await _handle_scene_command(text_content, user_id, view)
         if cmd_handled:
@@ -2569,6 +2578,12 @@ async def handle_continuous_turn(view: InboundMessage):
 
     # /好感度 #好感度 /bond (direct, no agent, zero token)
     if await _handle_bond_command(text_content, user_id, view, sender=continuous_sender):
+        return
+
+    # /设好感 <等级> (admin GM tool, direct, zero token)
+    if await _handle_set_bond_command(
+        text_content, user_id, view, sender=continuous_sender
+    ):
         return
 
     # ── Handle pending delete confirmation (intercept before agent) ──
@@ -3675,6 +3690,49 @@ async def _handle_bond_command(
     role_str = _perm_manager.get_role(user_id).value
     await _safe_send(
         _bond_manager.format_status(
+            user_id, persona_key, display_name=display, role=role_str
+        ),
+        sender=sender,
+    )
+    return True
+
+
+async def _handle_set_bond_command(
+    text: str, user_id: str, view: InboundMessage, sender=None
+) -> bool:
+    """Handle /设好感 <等级> — 管理员把自己与当前角色的羁绊直接设到目标等级。
+
+    GM 工具（零 token）：允许下调，用于活动补偿与生产测试（如自设 Lv7
+    验证主动媒体 pass）。跨用户调整不做成聊天命令——官方途径的用户身份
+    是不透明 openid，管理员拿不到别人的 id；需要时走 WebUI/服务器侧。
+    """
+    parts = text.strip().split()
+    if not parts or parts[0] not in ("/设好感", "#设好感"):
+        return False
+    if _perm_manager.get_role(user_id) != UserRole.ADMIN:
+        await _safe_send("此命令仅限管理员使用。", sender=sender)
+        return True
+    if len(parts) < 2 or not parts[1].isdigit() or not (1 <= int(parts[1]) <= 10):
+        await _safe_send(
+            "用法：/设好感 <等级1-10>（作用于你与当前角色人格的羁绊）",
+            sender=sender,
+        )
+        return True
+    pm = get_character_registry()
+    persona_key = pm.resolve_effective_personality(user_id, view.group_id)
+    display = pm.get_display_name(persona_key)
+    if pm.get_mode(persona_key) != "split":
+        await _safe_send(
+            f"当前人格「{display}」未启用羁绊养成，先用 /人格切换 切换到角色。",
+            sender=sender,
+        )
+        return True
+    _bond_manager.set_level(user_id, persona_key, int(parts[1]))
+    state = _bond_manager.get_state(user_id, persona_key)
+    role_str = _perm_manager.get_role(user_id).value
+    await _safe_send(
+        f"✅ 已把你与「{display}」的羁绊设为 Lv{state.get('level')}。\n"
+        + _bond_manager.format_status(
             user_id, persona_key, display_name=display, role=role_str
         ),
         sender=sender,
