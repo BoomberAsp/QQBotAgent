@@ -803,6 +803,37 @@ Anti-bot handling is a two-tier ladder:
 
 ---
 
+## Tool: story_search
+
+**Description**: Search the 《星陨计划 (Ark Re:Code)》 original-story knowledge base — every dialogue line of the main story (序章 / Part I–III, including the S-rank stages) and all limited-time event stories. Returns, for each hit: the scene's source label (chapter/event + scene title), the unit-level Chinese synopsis, the scene-level Chinese gist, and an excerpt of the **original English dialogue** with speaker names.
+
+**When to use**:
+- The user asks about game plot, character backstory or world events: 剧情, 故事, 主线, 活动剧情, 谁是谁, 发生了什么, 后来怎么样了, 第一次方舟战争, 使徒, 三大方舟, 露比/伊娥丝/挪亚的过去…
+- A `## 剧情记忆（原作剧情检索命中）` block already appeared but you need more scenes than the two it carries
+- You are about to state something canon about Ark Re:Code and want to verify it instead of guessing
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "检索关键词：角色名、事件名、章节号或情节描述（中文优先）"
+    },
+    "limit": {
+      "type": "integer",
+      "description": "返回片段数，1-8，默认 4"
+    }
+  },
+  "required": ["query"]
+}
+```
+
+**Note**: The corpus is English; always translate quoted dialogue into Chinese when answering. If a search returns nothing, retry once with a different phrasing (character name instead of a plot description) and then admit you don't have that part of the story — never invent plot details. The database is built offline by `python scripts/build_story_kb.py --all`; if the tool reports it is missing, tell the user to rebuild it.
+
+---
+
 ## Tool: get_changelog
 
 **Description**: Query the bot's own update records / changelog (更新记录 / 更新日志). Returns the most recent `count` entries (default 3, max 20) as structured plain text — each entry has a version, a date, and a list of typed change items (新增/修复/优化/调整/移除). The data is maintained by the admin through the WebUI 更新日志 page and read fresh from disk on every call, so it is always current. This is the bot's OWN changelog — not a game's or any third-party software's release notes.

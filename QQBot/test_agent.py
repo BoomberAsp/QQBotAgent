@@ -7578,6 +7578,158 @@ class TestAssetEvictionInjection:
         print_pass("enforce_asset_quota: role fallback, idempotent, exception-safe")
 
 
+class TestWebuiModelSections:
+    """webui model config — IMAGE_GEN/TTS media sections (Bond P4).
+
+    Covers config_editor.models_section_prepare (per-section field schema,
+    unmask merge, comma voice_pool) and model_probe dispatch (media sections
+    POST to api_base verbatim with an empty-input body — never
+    /chat/completions, never a billable generation call).
+    """
+
+    def run(self):
+        print_header("40. WebUI Model Sections (IMAGE_GEN / TTS)")
+        self.test_prepare_media_sections()
+        self.test_probe_dispatch()
+
+    def _import_ce(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from webui import config_editor as ce
+        return ce
+
+    def test_prepare_media_sections(self):
+        from pathlib import Path as _Path
+        ce = self._import_ce()
+        tmp = tempfile.mkdtemp(prefix="wms_")
+        try:
+            settings = _Path(tmp) / "models_settings.json"
+            settings.write_text(json.dumps({
+                "TTS_MODEL": {
+                    "api_key": "sk-real-key-123456789",
+                    "api_base": "https://dash/api/v1/services/audio/tts/SpeechSynthesizer",
+                    "model": "qwen-audio-3.1-tts-plus",
+                    "voice_pool": ["old_voice_1"],
+                    "max_concurrency": 2,
+                },
+            }), encoding="utf-8")
+            with patch.object(ce, "MODELS_FILE", settings):
+                # masked api_key round-trips; stringy numbers cast;
+                # comma-separated voice_pool accepted from the panel input
+                r = ce.models_section_prepare("TTS_MODEL", {
+                    "api_key": "sk-rea***6789",
+                    "api_base": "https://dash/api/v1/services/audio/tts/SpeechSynthesizer",
+                    "model": "qwen-audio-3.1-tts-plus",
+                    "timeout": "45", "sample_rate": "24000",
+                    "format": "wav", "default_voice": " v1 ",
+                    "voice_pool": "vb_1, vc_2 ,",
+                })
+                assert r.get("ok"), r
+                sec = r["section_data"]
+                assert sec["api_key"] == "sk-real-key-123456789"   # unmasked
+                assert sec["timeout"] == 45 and isinstance(sec["timeout"], int)
+                assert sec["sample_rate"] == 24000
+                assert sec["format"] == "wav" and sec["default_voice"] == "v1"
+                assert sec["voice_pool"] == ["vb_1", "vc_2"]
+                assert sec["max_concurrency"] == 2      # kept from old section
+                assert r["needs_probe"] is False        # credentials unchanged
+                # invalid extras rejected with field-level error
+                assert "error" in ce.models_section_prepare(
+                    "TTS_MODEL", {"voice_pool": 42})
+                assert "error" in ce.models_section_prepare(
+                    "TTS_MODEL", {"sample_rate": "abc"})
+                assert "error" in ce.models_section_prepare(
+                    "TTS_MODEL", {"voice_pool": " , "})
+                # IMAGE_GEN: media extras only — text fields not injected,
+                # unknown section still rejected
+                r = ce.models_section_prepare("IMAGE_GEN_MODEL", {
+                    "api_key": "k", "api_base": "https://dash/gen",
+                    "model": "qwen-image-3.0", "max_retries": "2",
+                })
+                assert r.get("ok"), r
+                assert r["section_data"]["max_retries"] == 2
+                assert "max_tokens" not in r["section_data"]
+                assert r["needs_probe"] is True         # new credentials
+                assert "error" in ce.models_section_prepare("NOPE_MODEL", {})
+                # text sections keep the old max_tokens/temperature behavior
+                r = ce.models_section_prepare("FLASH_MODEL", {
+                    "api_key": "k", "api_base": "b", "model": "m",
+                    "max_tokens": "4096", "temperature": "0.3",
+                })
+                assert r.get("ok") and r["section_data"]["max_tokens"] == 4096
+                assert r["section_data"]["temperature"] == 0.3
+            print_pass("models_section_prepare: media schemas, unmask, voice_pool")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_probe_dispatch(self):
+        import types
+        import httpx as real_httpx
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from webui import model_probe as mp
+        captured = {"code": 400}
+
+        class _FakeResp:
+            def __init__(self, code):
+                self.status_code = code
+                self.text = '{"message":"invalid parameter"}'
+
+        class _FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, headers=None, json=None, timeout=None):
+                captured["url"] = url
+                captured["body"] = json
+                return _FakeResp(captured["code"])
+
+        fake_httpx = types.SimpleNamespace(
+            AsyncClient=lambda: _FakeClient(),
+            ConnectError=real_httpx.ConnectError,
+            ConnectTimeout=real_httpx.ConnectTimeout,
+            TimeoutException=real_httpx.TimeoutException,
+        )
+        tts_url = "https://dash/api/v1/services/audio/tts/SpeechSynthesizer"
+        with patch.object(mp, "httpx", fake_httpx):
+            # media section → POSTs to api_base VERBATIM, empty input body;
+            # the deliberate 400 proves credentials without billing anything
+            r = asyncio.run(mp.probe_model("sk-k", tts_url, "m",
+                                           section="TTS_MODEL"))
+            assert captured["url"] == tts_url, captured["url"]
+            assert captured["body"]["input"] == {"text": ""}
+            assert r["ok"] and r["status"] == "ok_with_warning", r
+            # 401 on media probe → auth_failed (blocks save)
+            captured["code"] = 401
+            r = asyncio.run(mp.probe_model("sk-k", "https://dash/gen", "m",
+                                           section="IMAGE_GEN_MODEL"))
+            assert not r["ok"] and r["status"] == "auth_failed", r
+            assert captured["body"]["input"] == {"messages": []}
+            # 404 on media probe → bad_path (endpoint URL wrong)
+            captured["code"] = 404
+            r = asyncio.run(mp.probe_model("sk-k", "https://dash/gen", "m",
+                                           section="IMAGE_GEN_MODEL"))
+            assert not r["ok"] and r["status"] == "bad_path", r
+            # chat section → unchanged /chat/completions join; a plain 400
+            # there is still a hard reject (not lenient)
+            captured["code"] = 400
+            r = asyncio.run(mp.probe_model("sk-k", "https://api.deepseek.com",
+                                           "m", section="FLASH_MODEL"))
+            assert captured["url"] == "https://api.deepseek.com/chat/completions"
+            assert not r["ok"] and r["status"] == "rejected", r
+            # masked key never reaches the transport
+            captured.pop("url", None)
+            r = asyncio.run(mp.probe_model("sk-***", tts_url, "m",
+                                           section="TTS_MODEL"))
+            assert r["status"] == "missing_config" and "url" not in captured
+        print_pass("probe dispatch: media=verbatim url + empty input, chat unchanged")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -7630,6 +7782,7 @@ def main():
         ("Upload Textualization (P5)", TestUploadTextualization()),
         ("Episode Distillation (P5)", TestEpisodeDistill()),
         ("Asset Eviction & Injection (P5)", TestAssetEvictionInjection()),
+        ("WebUI Model Sections (IMAGE_GEN/TTS)", TestWebuiModelSections()),
     ]
 
     passed = 0

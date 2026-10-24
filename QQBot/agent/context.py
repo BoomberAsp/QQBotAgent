@@ -142,3 +142,20 @@ _current_platform: contextvars.ContextVar[str] = (
 _turn_sender: contextvars.ContextVar[Optional["Sender"]] = (
     contextvars.ContextVar("_turn_sender", default=None)
 )
+
+# ── Story knowledge base (Ark Re:Code 原作剧情) ────────────────────
+# Per-turn retrieved original-story block. Built by agent/turn.py from the
+# local FTS index when a character persona is about to speak, then injected by
+# agent._build_messages() into the L4 volatile tail — never into the cached
+# L0-L2 prefix, so retrieval churn cannot break provider prefix caching.
+# Empty string = nothing relevant was found (or the persona has no mapping).
+_current_story_context: contextvars.ContextVar[str] = (
+    contextvars.ContextVar("_current_story_context", default="")
+)
+
+# Character id of the active persona inside the story corpus (e.g. "H076" for
+# rubi/露比). Read by the story_search tool to label "you were there" and to
+# boost scenes featuring that character. Empty = unmapped persona.
+_current_story_char_id: contextvars.ContextVar[str] = (
+    contextvars.ContextVar("_current_story_char_id", default="")
+)

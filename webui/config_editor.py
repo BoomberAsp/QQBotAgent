@@ -11,7 +11,10 @@ Editable targets:
                  (PermissionManager re-reads .env on every get_role() call;
                   it picks the table by the turn's platform contextvar)
   models         QQBot/config/models_settings.json → hot-reloaded by the
-                                                   bot-side watcher (~10 s)
+                 chat sections: bot-side watcher (~10 s)
+                 media sections (IMAGE_GEN_MODEL/TTS_MODEL): fresh-read
+                 per call by lib/media_gen.py (max_concurrency latches
+                 at first use → needs bot restart)
   group_features QQBot/data/group_features.json   → effective on next message
                                                    (GroupFeatures.refresh)
   personality    QQBot/data/personality_config.json + group_personality.json
@@ -290,7 +293,52 @@ def models_write(raw: str) -> dict:
 # ── Models: structured per-section edit (probe before write) ──────
 
 MODEL_SECTIONS = ("REASONING_MODEL", "FLASH_MODEL", "MULTIMODAL_MODEL",
-                  "AUDIO_MODEL", "OCR_MODEL")
+                  "AUDIO_MODEL", "OCR_MODEL", "IMAGE_GEN_MODEL", "TTS_MODEL")
+
+# Per-section editable extras beyond api_key/api_base/model.
+# Kinds: "int" | "float" | "num" (int when whole) | "str" | "str_list".
+# IMAGE_GEN/TTS are the Bond-P4 media sections consumed by lib/media_gen.py
+# (fresh-read per call → hot; only max_concurrency latches at first use and
+# needs a bot restart). voice_pool also accepts a comma-separated string
+# for the panel input's convenience.
+_TEXT_EXTRAS = {"max_tokens": "int", "temperature": "float"}
+_MEDIA_EXTRAS = {"timeout": "num", "max_retries": "int",
+                 "max_concurrency": "int"}
+_SECTION_EXTRAS = {
+    "REASONING_MODEL": _TEXT_EXTRAS,
+    "FLASH_MODEL": _TEXT_EXTRAS,
+    "MULTIMODAL_MODEL": _TEXT_EXTRAS,
+    "AUDIO_MODEL": _TEXT_EXTRAS,
+    "OCR_MODEL": _TEXT_EXTRAS,
+    "IMAGE_GEN_MODEL": _MEDIA_EXTRAS,
+    "TTS_MODEL": {**_MEDIA_EXTRAS, "format": "str", "sample_rate": "int",
+                  "default_voice": "str", "voice_pool": "str_list"},
+}
+
+
+def _cast_extra(kind: str, v):
+    """Cast one extra field; raises ValueError with a Chinese message."""
+    if kind == "str":
+        return str(v).strip()
+    if kind == "str_list":
+        if isinstance(v, str):
+            v = v.split(",")
+        if not isinstance(v, list) or not all(isinstance(i, str) for i in v):
+            raise ValueError("必须是字符串数组（或逗号分隔字符串）")
+        out = [i.strip() for i in v if i.strip()]
+        if not out:
+            raise ValueError("不能为空数组")
+        return out
+    if isinstance(v, bool):
+        raise ValueError("必须是数字")
+    num = float(v)
+    if kind == "int":
+        if not num.is_integer():
+            raise ValueError("必须是整数")
+        return int(num)
+    if kind == "float":
+        return num
+    return int(num) if num.is_integer() else num   # "num"
 
 
 def models_section_prepare(section: str, data: dict) -> dict:
@@ -317,14 +365,14 @@ def models_section_prepare(section: str, data: dict) -> dict:
         if not isinstance(v, str):
             return {"error": f"{f} 必须是字符串"}
         cleaned[f] = v.strip()
-    for f, cast in (("max_tokens", int), ("temperature", float)):
+    for f, kind in _SECTION_EXTRAS.get(section, {}).items():
         v = data.get(f)
         if isinstance(v, bool) or v in (None, ""):
             continue  # keep whatever the old section had
         try:
-            cleaned[f] = cast(v)
-        except (TypeError, ValueError):
-            return {"error": f"{f} 必须是数字"}
+            cleaned[f] = _cast_extra(kind, v)
+        except (TypeError, ValueError) as e:
+            return {"error": f"{f} {e}"}
 
     if not MODELS_FILE.exists():
         return {"error": "models_settings.json 不存在"}

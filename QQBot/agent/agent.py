@@ -520,7 +520,7 @@ class Agent:
         """
         from agent.context import (
             _current_personality, _personality_transition, _current_group_context,
-            _current_bond_context,
+            _current_bond_context, _current_story_context,
         )
         from agent.character_registry import get_character_registry
 
@@ -597,6 +597,14 @@ class Agent:
         bond_ctx = _current_bond_context.get()
         if bond_ctx:
             volatile.append(bond_ctx)
+
+        # Original-story memory (Story KB): retrieved per turn by
+        # agent/turn.py when a character persona is on stage — the character
+        # recalls "her own" canon scenes without calling a tool. Volatile:
+        # rebuilt every turn, never touches the cached prefix.
+        story_ctx = _current_story_context.get()
+        if story_ctx:
+            volatile.append(story_ctx)
 
         # Multimodal asset memories (P5, Bond-System-Design.md §8): recent
         # images/voices shared with the current character, so the character
