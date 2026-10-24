@@ -69,8 +69,10 @@
     <button class="btn btn-sm" id="models-reload">重新加载</button>
   </div>
   <p class="muted" style="margin:0 0 14px">
-    保存前自动验证 API 可用性（最小真实调用），仅写入验证通过的配置；
-    api_key 留空表示维持原值。保存后约 10 秒 bot 自动热重载，无需重启。
+    保存前自动验证 API 可用性，仅写入验证通过的配置；api_key 留空表示维持原值。
+    对话类模型做最小 chat 调用；图像生成 / 语音合成段（DashScope 原生端点，按量计费）
+    用空参数探测验证凭据，不产生生成费用。保存后约 10 秒 bot 自动热重载
+    （媒体段为每次调用即时读取；仅 max_concurrency 改动需重启 NoneBot）。
   </p>
   <div id="model-cards" style="display:flex;flex-direction:column;gap:14px">
     <p class="muted">加载中…</p>

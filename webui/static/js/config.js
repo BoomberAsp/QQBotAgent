@@ -134,19 +134,72 @@
   });
 
   // ── Models: structured section cards + raw JSON fallback ───────
-  const MODEL_SECTIONS = [
-    { key: 'REASONING_MODEL', label: '推理模型 REASONING', desc: '复杂任务主推理' },
-    { key: 'FLASH_MODEL', label: '轻量模型 FLASH', desc: '复杂度分类与简单任务' },
-    { key: 'MULTIMODAL_MODEL', label: '多模态模型 MULTIMODAL', desc: '图片理解' },
-    { key: 'AUDIO_MODEL', label: '音频模型 AUDIO', desc: '语音/音频分析' },
-    { key: 'OCR_MODEL', label: 'OCR 模型', desc: '截图文字识别' },
+  // extras kinds mirror webui/config_editor._SECTION_EXTRAS:
+  //   number → int/float, text → str, list → str_list (comma-separated input)
+  const TEXT_EXTRAS = [
+    { name: 'max_tokens', label: 'max_tokens', type: 'number', min: 1, step: 'any' },
+    { name: 'temperature', label: 'temperature', type: 'number', min: 0, max: 2, step: 'any' },
   ];
+  const MEDIA_EXTRAS = [
+    { name: 'timeout', label: 'timeout（秒）', type: 'number', min: 1, step: 'any' },
+    { name: 'max_retries', label: 'max_retries', type: 'number', min: 0, step: 1 },
+    { name: 'max_concurrency', label: 'max_concurrency ※', type: 'number', min: 1, step: 1 },
+  ];
+  const MODEL_SECTIONS = [
+    { key: 'REASONING_MODEL', label: '推理模型 REASONING', desc: '复杂任务主推理', extras: TEXT_EXTRAS },
+    { key: 'FLASH_MODEL', label: '轻量模型 FLASH', desc: '复杂度分类与简单任务', extras: TEXT_EXTRAS },
+    { key: 'MULTIMODAL_MODEL', label: '多模态模型 MULTIMODAL', desc: '图片理解', extras: TEXT_EXTRAS },
+    { key: 'AUDIO_MODEL', label: '音频模型 AUDIO', desc: '语音/音频分析', extras: TEXT_EXTRAS },
+    { key: 'OCR_MODEL', label: 'OCR 模型', desc: '截图文字识别', extras: TEXT_EXTRAS },
+    {
+      key: 'IMAGE_GEN_MODEL', label: '图像生成 IMAGE_GEN', desc: '角色立绘/场景图（按张计费）',
+      extras: MEDIA_EXTRAS, isMedia: true,
+      apiBasePlaceholder: 'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+      note: 'api_base 是完整端点 URL（DashScope 原生，不是 /chat/completions 基址）。'
+          + '测试连接为空参数探测，不产生生成调用与费用。',
+    },
+    {
+      key: 'TTS_MODEL', label: '语音合成 TTS', desc: '角色语音（按字符计费）',
+      isMedia: true,
+      extras: [
+        ...MEDIA_EXTRAS,
+        { name: 'format', label: 'format（mp3/wav/pcm）', type: 'text' },
+        { name: 'sample_rate', label: 'sample_rate', type: 'number', min: 8000, step: 1 },
+        { name: 'default_voice', label: 'default_voice（音色 ID）', type: 'text' },
+        { name: 'voice_pool', label: 'voice_pool（逗号分隔音色 ID）', type: 'list' },
+      ],
+      apiBasePlaceholder: 'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer',
+      note: 'voice 音色不能跨模型混用；音色 ID 见百炼「Qwen-Audio-TTS 音色列表」。'
+          + '测试连接为空参数探测，不产生合成费用。',
+    },
+  ];
+  const MEDIA_RESTART_NOTE = '※ max_concurrency 在 bot 进程首次调用时锁定，修改后需重启 NoneBot；其余字段每次调用即时读取。';
 
   function attr(s) { return esc(s).replace(/"/g, '&quot;'); }
+
+  function extraFieldHtml(f, s) {
+    const v = s[f.name];
+    const val = f.type === 'list'
+      ? (Array.isArray(v) ? v.join(', ') : (v || ''))
+      : (v != null ? v : '');
+    const numAttrs = ['min', 'max', 'step']
+      .filter(a => f[a] != null).map(a => `${a}="${f[a]}"`).join(' ');
+    return `<label class="field" style="flex:1"><span>${esc(f.label)}</span>
+      <input data-field="${f.name}" type="${f.type === 'number' ? 'number' : 'text'}"
+             ${numAttrs} value="${attr(String(val))}"></label>`;
+  }
 
   function modelCardHtml(sec, cfg) {
     const s = cfg || {};
     const maskedKey = s.api_key || '';   // already masked by backend
+    const extras = sec.extras || TEXT_EXTRAS;
+    // lay extras out in rows of two, like the original max_tokens/temperature row
+    const rows = [];
+    for (let i = 0; i < extras.length; i += 2) {
+      rows.push(`<div class="row" style="gap:14px">${extras.slice(i, i + 2).map(f => extraFieldHtml(f, s)).join('')}</div>`);
+    }
+    const notes = [sec.note, sec.isMedia ? MEDIA_RESTART_NOTE : '']
+      .filter(Boolean).map(t => `<p class="muted" style="font-size:12px;margin:6px 0 0">${esc(t)}</p>`).join('');
     return `<div class="card" data-section="${attr(sec.key)}" style="max-width:640px;margin:0">
       <div class="row" style="margin-bottom:8px">
         <h2 class="card-title" style="margin:0">${esc(sec.label)}</h2>
@@ -155,21 +208,15 @@
       </div>
       <label class="field"><span>api_base</span>
         <input data-field="api_base" type="text" value="${attr(s.api_base || '')}"
-               placeholder="https://api.deepseek.com"></label>
+               placeholder="${attr(sec.apiBasePlaceholder || 'https://api.deepseek.com')}"></label>
       <label class="field"><span>api_key（留空 = 维持原值）</span>
         <input data-field="api_key" type="password" value=""
                placeholder="${attr(maskedKey)}" autocomplete="new-password"></label>
       <label class="field"><span>model</span>
         <input data-field="model" type="text" value="${attr(s.model || '')}"></label>
-      <div class="row" style="gap:14px">
-        <label class="field" style="flex:1"><span>max_tokens</span>
-          <input data-field="max_tokens" type="number" min="1" step="any"
-                 value="${attr(s.max_tokens != null ? s.max_tokens : '')}"></label>
-        <label class="field" style="flex:1"><span>temperature</span>
-          <input data-field="temperature" type="number" min="0" max="2" step="any"
-                 value="${attr(s.temperature != null ? s.temperature : '')}"></label>
-      </div>
-      <div class="row" style="gap:10px;margin-top:2px">
+      ${rows.join('')}
+      ${notes}
+      <div class="row" style="gap:10px;margin-top:8px">
         <button class="btn btn-sm btn-test">测试连接</button>
         <button class="btn btn-sm btn-primary btn-save">验证并保存本段</button>
         <span class="probe-status muted" style="font-size:12.5px"></span>
@@ -183,6 +230,7 @@
   }
 
   function readCardFields(card) {
+    const sec = MODEL_SECTIONS.find(x => x.key === card.dataset.section);
     const get = (name) => {
       const el = card.querySelector(`[data-field="${name}"]`);
       return el ? el.value.trim() : '';
@@ -195,9 +243,14 @@
       api_key: (keyEl && keyEl.value) ? keyEl.value.trim() : (keyEl ? keyEl.placeholder : ''),
       model: get('model'),
     };
-    const mt = get('max_tokens'), tp = get('temperature');
-    if (mt !== '') out.max_tokens = Number(mt);
-    if (tp !== '') out.temperature = Number(tp);
+    // extras: empty input = omit (backend keeps the stored value)
+    for (const f of (sec && sec.extras) || TEXT_EXTRAS) {
+      const raw = get(f.name);
+      if (raw === '') continue;
+      if (f.type === 'number') out[f.name] = Number(raw);
+      else if (f.type === 'list') out[f.name] = raw.split(',').map(x => x.trim()).filter(Boolean);
+      else out[f.name] = raw;
+    }
     return out;
   }
 
@@ -257,6 +310,10 @@
     if (ev.target.closest('.btn-save')) {
       btns.forEach(b => { b.disabled = true; });
       setCardStatus(card, '验证并保存中…', 'muted');
+      const secDef = MODEL_SECTIONS.find(x => x.key === section);
+      const hotNote = secDef && secDef.isMedia
+        ? '媒体段每次调用即时生效（max_concurrency 需重启）'
+        : 'bot 约 10 秒内热重载';
       try {
         const d = await api('/api/config/models/section', {
           method: 'PUT',
@@ -264,13 +321,13 @@
         });
         if (d.skipped) {
           setCardStatus(card, '✓ 已保存（凭据未变，跳过验证）', 'ok');
-          toast('已保存，bot 约 10 秒内热重载', 'success', 5000);
+          toast('已保存，' + hotNote, 'success', 5000);
         } else {
           const p = d.probe || {};
           const mark = p.status === 'ok_with_warning' ? '⚠' : '✓';
           setCardStatus(card, `${mark} 验证通过 (${p.elapsed_ms}ms)，已保存`,
                         p.status === 'ok_with_warning' ? 'warn' : 'ok');
-          toast('验证通过并已保存，bot 约 10 秒内热重载', 'success', 5000);
+          toast('验证通过并已保存，' + hotNote, 'success', 5000);
         }
         setTimeout(loadModels, 1500);   // refresh masks + raw editor
       } catch (e) {

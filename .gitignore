@@ -23,6 +23,9 @@ QQBot/data/wiki_cache/status_icons/
 !QQBot/data/redeem_code/
 !QQBot/data/personality_config.json
 !QQBot/data/group_personality.json
+# 原作剧情知识库（wiki 快照 + LLM 中文增强 + SQLite，全部为可再生产物）
+# 重建：cd QQBot && python scripts/build_story_kb.py --all
+QQBot/data/story_kb/
 QQBot/logs
 QQBot/.env
 QQBot/.env.prod

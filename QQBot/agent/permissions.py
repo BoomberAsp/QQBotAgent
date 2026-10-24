@@ -72,6 +72,7 @@ _PUBLIC_TOOLS: Set[str] = {
     "finalize_subtask",
     "recall_search_result",  # Reads own search archives only (user_id-scoped)
     "recall_memory",         # Reads own LONG-tier memories only (user_id-scoped)
+    "story_search",          # Original-story KB (read-only, no user data)
 }
 
 # Additional tools for VIP users (on top of _PUBLIC_TOOLS)
