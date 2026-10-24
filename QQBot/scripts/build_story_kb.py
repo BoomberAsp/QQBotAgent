@@ -64,11 +64,48 @@ sys.path.insert(0, _QROOT)
 from lib.story_kb import (                            # noqa: E402
     SCHEMA_VERSION,
     cjk_bigrams,
+    preferred_story_kb_dir,
 )
+
+
+def _resolve_data_dir() -> str:
+    """Directory that holds raw/ , zh/ and story.db on this host."""
+    override = (os.environ.get("STORY_KB_DATA_DIR") or "").strip()
+    if override:
+        return override
+    return preferred_story_kb_dir()
 
 # ── Paths & constants ──────────────────────────────────────────────
 
-DATA_DIR = os.path.join(_QROOT, "data", "story_kb")
+def _load_dotenv_early() -> None:
+    """Read QQBot/.env without overriding what is already in the environment.
+
+    The bot does this via python-dotenv at turn.py import; the build script must
+    do the same *before* resolving paths, otherwise a build on the server would
+    ignore USER_DATA_ROOT and write onto the system disk.
+    """
+    env_path = os.path.join(_QROOT, ".env")
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.split(" #")[0].strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
+_load_dotenv_early()
+
+# Where the artifacts live. The DB (and its raw/ + zh/ inputs) belong on the
+# deployment data disk, not in the git checkout — same resolution rule as
+# lib/story_kb.py so the bot and the builder never disagree.
+DATA_DIR = _resolve_data_dir()
 RAW_DIR = os.path.join(DATA_DIR, "raw")
 RAW_PAGES = os.path.join(RAW_DIR, "pages")
 INDEX_DIR = os.path.join(RAW_DIR, "index")
@@ -90,7 +127,7 @@ BATCH = 50                      # MediaWiki max titles per revisions query
 REQUEST_PAUSE = 0.4             # polite delay between revisions batches
 
 DEFAULT_MODEL = "deepseek-chat"
-ZH_PROMPT_VERSION = 2
+ZH_PROMPT_VERSION = 4
 ZH_MAX_SCENE_CHARS = 900        # per-scene cap fed to the LLM
 ZH_MAX_TOTAL_CHARS = 24000      # per-page cap fed to the LLM
 
@@ -896,11 +933,30 @@ ZH_PROMPT = """下面是一段《星陨计划》(Ark Re:Code) 的剧情页面，
   ]
 }}
 
-要求：
-1. 全部使用简体中文。人名使用游戏中文译名：露比(Rubi)、团长(player)、伊娥丝(Eos)、挪亚(Noah)、
-   阿帕西(Aponia)、璐西玛(Lucia)、伊卡弥勒(Esther 等三大方舟领袖)、萝莎莱(Rosalie) 等；不确定的人名保留英文。
-2. 只做概括，不要逐句翻译台词。
-3. scenes 数组必须恰好 {n} 个元素，i 依次为 1..{n}，与下面场景一一对应。
+### 人名必须用「官方中文包译名」
+下表是**官方译名**（English → 官方中文）。写作时**必须**严格使用表中的中文名，
+不要用其它音译（例如不要写 阿帕西/崔斯特/玛莎/普瑞玛/盖塔/璐西玛/诺亚/米凯尔）。
+
+【本页出场角色】
+{cast}
+
+【常用角色】（全库高频）
+{glossary}
+
+【世界观固定译名】（一律照此写，不要自创音译）
+方舟(Ark)、方舟α/β/γ(Ark-α/β/γ)、方舟Ω(Ark-Ω)、使徒(Apostle)、星源(Astrogen)、
+星源碎片(astrogen shards)、星源力(Astrogen power)、真理教团(The Order of Truth)、
+团长(player)、佣兵团(Mercenary Union)、佣兵联盟、总理(Premier)、复制体(Clone)、
+无国界医疗组织、变异体(mutant)、共鸣(Resonance)、特工(Agent)。
+（注：使徒有时指那位具体存在，有时指整个族群，按上下文理解，都用「使徒」。）
+
+规则：
+1. 表里没有的角色：直接保留英文原名，**不要自己音译**，也不要猜。
+   地名/组织名一律用上面的「世界观固定译名」，例如写 方舟α 而不是 阿卡-α。
+2. 注意区分姐妹二人：Lucia=璐茜娅、Lucima=璐茜玛。两者常同场出现，**不要混用**；
+   各场景标题下方标注了「本场出场」，请据此判断该场说的是谁。
+3. 全部使用简体中文（人名按上表）。只做概括，不要逐句翻译台词。
+4. scenes 数组必须恰好 {n} 个元素，i 依次为 1..{n}，与下面场景一一对应。
 
 ===== 页面：{title}（{meta_line}）=====
 
@@ -936,12 +992,60 @@ def _meta_line(meta: dict) -> str:
     return f"{ep} 第{ch}章" if ch is not None else ep
 
 
-def _build_zh_body(unit: Unit) -> str:
+def _official_cast(unit: Unit, id_to_zh: Dict[str, str]) -> Tuple[List[str], List[str]]:
+    """Return (page cast lines, per-scene cast lines) using official names.
+
+    ``page cast``  — "Trist=翠丝特" for every named speaker on the page.
+    ``scene cast`` — same, per scene, so scenes where two similar characters
+                     (Lucia / Lucima) co-occur can be told apart by context.
+    """
+    id_to_en: Dict[str, str] = {}
+    page_pairs: List[str] = []
+    seen: set = set()
+    for scene in unit.scenes:
+        for ln in scene.lines:
+            if ln.kind == "say" and ln.char_id and ln.char_id in id_to_zh:
+                pair = f"{ln.speaker}={id_to_zh[ln.char_id]}"
+                id_to_en.setdefault(ln.char_id, ln.speaker)
+                if pair not in seen:
+                    seen.add(pair)
+                    page_pairs.append(pair)
+
+    scene_lines: List[str] = []
+    for scene in unit.scenes:
+        pairs: List[str] = []
+        for ln in scene.lines:
+            if ln.kind == "say" and ln.char_id and ln.char_id in id_to_zh:
+                pair = f"{ln.speaker}={id_to_zh[ln.char_id]}"
+                if pair not in pairs:
+                    pairs.append(pair)
+        scene_lines.append("、".join(pairs[:8]))
+    return page_pairs, scene_lines
+
+
+def _global_glossary(units: Sequence[Unit], id_to_zh: Dict[str, str],
+                     limit: int = 40) -> List[str]:
+    """Top-N characters by scene count, as "English=官方中文名"."""
+    counts: Dict[str, int] = {}
+    en_of: Dict[str, str] = {}
+    for unit in units:
+        for scene in unit.scenes:
+            for ln in scene.lines:
+                if ln.kind == "say" and ln.char_id and ln.char_id in id_to_zh:
+                    counts[ln.char_id] = counts.get(ln.char_id, 0) + 1
+                    en_of.setdefault(ln.char_id, ln.speaker)
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])[:limit]
+    return [f"{en_of[cid]}={id_to_zh[cid]}" for cid, _n in ranked if cid in en_of]
+
+
+def _build_zh_body(unit: Unit, scene_cast: Sequence[str] = ()) -> str:
     """Compact per-scene dialogue digest for the enrichment prompt."""
     parts: List[str] = []
     total = 0
     for i, scene in enumerate(unit.scenes, 1):
         head = f"### 场景 {i}｜{scene.title or '(无标题)'}"
+        if i - 1 < len(scene_cast) and scene_cast[i - 1]:
+            head += f"\n（本场出场：{scene_cast[i - 1]}）"
         text = scene.render()
         if len(text) > ZH_MAX_SCENE_CHARS:
             text = text[:ZH_MAX_SCENE_CHARS] + "\n…（后续省略）"
@@ -1025,13 +1129,19 @@ def enrich(units: Sequence[Unit], model: str, concurrency: int,
     sem = asyncio.Semaphore(max(1, concurrency))
     done = {"n": 0, "fail": 0}
 
+    id_to_zh = _char_id_to_zh()
+    glossary = "、".join(_global_glossary(units, id_to_zh))
+
     async def one(client, unit: Unit):
         async with sem:
+            page_cast, scene_cast = _official_cast(unit, id_to_zh)
             prompt = ZH_PROMPT.format(
                 n=len(unit.scenes),
                 title=unit.page_title,
                 meta_line=_meta_line(unit.meta),
-                body=_build_zh_body(unit),
+                cast="、".join(page_cast) or "（本页无名册角色）",
+                glossary=glossary or "（无）",
+                body=_build_zh_body(unit, scene_cast),
             )
             data = await _llm_json(client, model, prompt)
             done["n"] += 1
@@ -1112,6 +1222,7 @@ CREATE TABLE scene (
     speakers TEXT DEFAULT '',
     zh_gist TEXT DEFAULT '',
     zh_kw TEXT DEFAULT '',
+    cast_line TEXT DEFAULT '',
     content_hash TEXT DEFAULT ''
 );
 CREATE INDEX idx_scene_unit ON scene(unit_id, ord);
@@ -1150,11 +1261,118 @@ def chunk_scene(scene: Scene) -> List[List[Line]]:
     return out
 
 
+# ── Official name normalisation ────────────────────────────────────
+#
+# The zh enrichment was written by an LLM reading *English* dialogue, so it
+# transliterated names its own way (阿帕西/玛莎/崔斯特…). The official Chinese
+# client package uses different spellings (埃帕蒂/玛夏/翠丝特…), which live in
+# config/characters/members_info.json `name`. Gists/keywords are rewritten to
+# the official spelling at index time; the fan spellings are kept as extra FTS
+# aliases so a query with either form still retrieves.
+
+_NAME_VARIANT_FILE = os.path.join(
+    _QROOT, "config", "characters", "story_name_variants.json")
+
+
+_EXCLUSIVE_RULES: List[Tuple[List[str], Dict[str, str]]] = []
+
+
+def _load_name_variants() -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
+    """(unambiguous, ambiguous) name tables, longest key first.
+
+    ``ambiguous`` maps a fan spelling to {character id: official name} — the
+    corpus uses some spellings for two different people (姐妹 璐西玛), so those
+    are resolved per scene from ``char_ids`` instead of globally.
+    """
+    try:
+        with open(_NAME_VARIANT_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}, {}
+    pairs = {}
+    for k, v in (raw.get("variants") or {}).items():
+        if isinstance(k, str) and isinstance(v, str) and k and k != v:
+            pairs[k] = v
+    amb = {}
+    for k, m in (raw.get("ambiguous") or {}).items():
+        if isinstance(k, str) and isinstance(m, dict) and m:
+            amb[k] = {str(c): str(v) for c, v in m.items() if v}
+    exclusive = []
+    for rule in (raw.get("cast_exclusive") or []):
+        ids = [str(i) for i in (rule.get("ids") or []) if i]
+        names = {str(k): str(v) for k, v in (rule.get("names") or {}).items() if v}
+        if len(ids) >= 2 and all(i in names for i in ids):
+            exclusive.append((ids, names))
+    _EXCLUSIVE_RULES.clear()
+    _EXCLUSIVE_RULES.extend(exclusive)
+    return (dict(sorted(pairs.items(), key=lambda kv: -len(kv[0]))),
+            dict(sorted(amb.items(), key=lambda kv: -len(kv[0]))))
+
+
+NAME_VARIANTS, AMBIGUOUS_VARIANTS = _load_name_variants()
+
+
+def normalize_names(text: str, char_ids: Sequence[str] = ()) -> str:
+    """Rewrite fan-transliterated names to the official package spelling.
+
+    ``char_ids`` (the scene's cast) resolves genuinely ambiguous spellings; when
+    it cannot, the text is left alone rather than guessed.
+    """
+    if not text:
+        return text
+    for src, dst in NAME_VARIANTS.items():
+        if src in text:
+            text = text.replace(src, dst)
+    if AMBIGUOUS_VARIANTS:
+        present = set(char_ids or ())
+        for src, by_char in AMBIGUOUS_VARIANTS.items():
+            if src not in text:
+                continue
+            hits = {by_char[c] for c in present if c in by_char}
+            if len(hits) == 1:
+                text = text.replace(src, hits.pop())
+    # Look-alike pairs (sisters): correct the wrong name only when a single one
+    # of them is on stage AND the text does not already name both (a scene can
+    # legitimately mention the absent sister).
+    if _EXCLUSIVE_RULES and char_ids:
+        present = set(char_ids)
+        for ids, names in _EXCLUSIVE_RULES:
+            on_stage = [i for i in ids if i in present]
+            if len(on_stage) != 1:
+                continue
+            pair_names = [names[i] for i in ids]
+            if all(n in text for n in pair_names):
+                continue          # both mentioned on purpose → leave it alone
+            keep = names[on_stage[0]]
+            for other in ids:
+                if other != on_stage[0]:
+                    wrong = names[other]
+                    if wrong != keep and wrong in text:
+                        text = text.replace(wrong, keep)
+
+    # Self-duplication safety net, after the correction above.
+    if _EXCLUSIVE_RULES:
+        for _ids, _names in _EXCLUSIVE_RULES:
+            vals = list(dict.fromkeys(_names.values()))
+            for a in vals:
+                other = next((v for v in vals if v != a), None)
+                if not other:
+                    continue
+                for conj in ("与", "和", "跟", "同"):
+                    text = text.replace(f"{a}{conj}{a}", f"{a}{conj}{other}")
+    return text
+
+
 def _zh_blob(title_zh: str, gist: str, keywords: Sequence[str],
-             chars_zh: Sequence[str], unit_zh: str) -> str:
-    """Bigram-indexed Chinese text for one chunk."""
+             chars_zh: Sequence[str], unit_zh: str,
+             aliases: Sequence[str] = ()) -> str:
+    """Bigram-indexed Chinese text for one chunk.
+
+    ``aliases`` carries the fan-transliterated spellings of the characters in
+    this scene, so both naming systems stay searchable after normalisation.
+    """
     parts = [title_zh or "", gist or "", " ".join(keywords or []),
-             " ".join(chars_zh or []), unit_zh or ""]
+             " ".join(chars_zh or []), " ".join(aliases or []), unit_zh or ""]
     raw = " 。".join(p for p in parts if p)
     return " ".join(cjk_bigrams(raw))
 
@@ -1167,8 +1385,15 @@ def build_index(units: Sequence[Unit], zh: dict, db_path: str,
     if os.path.exists(tmp_path):
         os.remove(tmp_path)
 
-    # Chinese name lookup: char_id → 中文名 (for the Chinese index).
+    # Chinese name lookup: char_id → 官方中文名 (for the Chinese index).
     id_to_zh = _char_id_to_zh()
+    # official → [fan spellings], so they can be added to the searchable blob.
+    official_to_alias: Dict[str, List[str]] = {}
+    for _fan, _official in NAME_VARIANTS.items():
+        official_to_alias.setdefault(_official, []).append(_fan)
+    for _fan, _by_char in AMBIGUOUS_VARIANTS.items():
+        for _official in _by_char.values():
+            official_to_alias.setdefault(_official, []).append(_fan)
 
     # A chapter spans several pages; the LLM may phrase its Chinese name
     # slightly differently on each. Pick the most frequent non-empty variant
@@ -1199,8 +1424,9 @@ def build_index(units: Sequence[Unit], zh: dict, db_path: str,
             scenes_zh = zinfo.get("scenes") or []
             zh_ver = int(zinfo.get("version", 0) or 0)
             ch_key = f"{meta.get('episode', '')}|{meta.get('chapter_no')}"
-            acct_ch_title_zh = chapter_zh_best.get(ch_key, "") or str(
-                zinfo.get("chapter_title_zh", "")).strip()
+            acct_ch_title_zh = normalize_names(
+                chapter_zh_best.get(ch_key, "") or str(
+                    zinfo.get("chapter_title_zh", "")).strip())
             # The wiki index only carries Chinese titles for a couple of
             # events, so the LLM's chapter_title_zh doubles as the event's
             # Chinese name when nothing authoritative exists.
@@ -1225,8 +1451,9 @@ def build_index(units: Sequence[Unit], zh: dict, db_path: str,
                     meta.get("member", "") or "",
                     unit.url,
                     len(unit.scenes),
-                    zinfo.get("unit_summary", "") or "",
-                    "、".join(zinfo.get("unit_keywords") or []),
+                    normalize_names(zinfo.get("unit_summary", "") or ""),
+                    "、".join(normalize_names(str(k))
+                              for k in (zinfo.get("unit_keywords") or [])),
                     zh_ver,
                 ),
             )
@@ -1243,21 +1470,35 @@ def build_index(units: Sequence[Unit], zh: dict, db_path: str,
 
             for scene in unit.scenes:
                 sz = scenes_zh[scene.ord] if scene.ord < len(scenes_zh) else {}
-                title_zh = (sz.get("title_zh") or "") if isinstance(sz, dict) else ""
-                gist = (sz.get("gist") or "") if isinstance(sz, dict) else ""
-                kw = (sz.get("keywords") or []) if isinstance(sz, dict) else []
+                raw_title_zh = (sz.get("title_zh") or "") if isinstance(sz, dict) else ""
+                raw_gist = (sz.get("gist") or "") if isinstance(sz, dict) else ""
+                raw_kw = (sz.get("keywords") or []) if isinstance(sz, dict) else []
                 char_ids = scene.char_ids
+                title_zh = normalize_names(raw_title_zh, char_ids)
+                gist = normalize_names(raw_gist, char_ids)
+                kw = [normalize_names(str(k), char_ids) for k in raw_kw]
                 chars_zh = [id_to_zh.get(c, "") for c in char_ids]
                 chars_zh = [c for c in chars_zh if c]
+                # Fan spellings of the same characters, kept searchable only.
+                alias_zh = [a for c in chars_zh for a in official_to_alias.get(c, [])]
+
+                # English speaker → official Chinese name, for the cast line.
+                cast_pairs: List[str] = []
+                for ln in scene.lines:
+                    if ln.kind == "say" and ln.char_id and ln.char_id in id_to_zh:
+                        pair = f"{ln.speaker}={id_to_zh[ln.char_id]}"
+                        if pair not in cast_pairs:
+                            cast_pairs.append(pair)
+                scene_cast = "、".join(cast_pairs[:6])
 
                 cur = conn.execute(
                     "INSERT INTO scene (unit_id, ord, scene_title, scene_title_zh,"
-                    " n_lines, char_ids, speakers, zh_gist, zh_kw, content_hash)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    " n_lines, char_ids, speakers, zh_gist, zh_kw, cast_line, content_hash)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         unit_id, scene.ord, scene.title, title_zh,
                         len(scene.lines), ",".join(char_ids),
-                        ",".join(scene.speakers), gist, "、".join(kw),
+                        ",".join(scene.speakers), gist, "、".join(kw), scene_cast,
                         scene.content_hash,
                     ),
                 )
@@ -1285,6 +1526,7 @@ def build_index(units: Sequence[Unit], zh: dict, db_path: str,
                     )
                     zh_blob = _zh_blob(
                         title_zh if ci == 0 else "", gist, kw, chars_zh, unit_zh,
+                        aliases=alias_zh,
                     )
                     if zh_blob:
                         conn.execute(
@@ -1377,6 +1619,54 @@ def export_markdown(units: Sequence[Unit], zh: dict, out_path: str) -> None:
                 f.write("```\n" + scene.render() + "\n```\n\n")
 
 
+def migrate() -> dict:
+    """Copy the KB artifacts from the repo checkout to the resolved data dir.
+
+    Idempotent: existing files at the destination are kept (the destination is
+    authoritative once it has a database), so re-running after a partial copy
+    only fills the gaps. Prints the before/after paths so an operator can see
+    where the KB actually ends up.
+    """
+    import shutil
+
+    src_dir = os.path.join(_QROOT, "data", "story_kb")
+    dst_dir = DATA_DIR
+    print(f"[migrate] source     : {src_dir}")
+    print(f"[migrate] destination: {dst_dir}")
+    if os.path.abspath(src_dir) == os.path.abspath(dst_dir):
+        print("[migrate] 源与目标相同（本机即数据目录），无需迁移")
+        return {"moved": 0, "dest": dst_dir}
+
+    moved = 0
+    os.makedirs(dst_dir, exist_ok=True)
+    for name in ("raw", "zh"):
+        src = os.path.join(src_dir, name)
+        if not os.path.isdir(src):
+            continue
+        for root, _dirs, files in os.walk(src):
+            rel = os.path.relpath(root, src_dir)
+            target_dir = os.path.join(dst_dir, rel)
+            os.makedirs(target_dir, exist_ok=True)
+            for fname in files:
+                s = os.path.join(root, fname)
+                d = os.path.join(target_dir, fname)
+                if os.path.exists(d):
+                    continue
+                shutil.copy2(s, d)
+                moved += 1
+    db_src = os.path.join(src_dir, "story.db")
+    db_dst = os.path.join(dst_dir, "story.db")
+    if os.path.isfile(db_src) and not os.path.exists(db_dst):
+        shutil.copy2(db_src, db_dst)
+        moved += 1
+    print(f"[migrate] copied {moved} file(s); DB now at {db_dst} "
+          f"(exists={os.path.isfile(db_dst)})")
+    if moved == 0 and not os.path.isfile(db_dst):
+        print("[migrate] 没有可迁移的数据，请先运行 --crawl / --enrich / --index")
+    return {"moved": moved, "dest": dst_dir}
+
+
+
 # ── CLI ────────────────────────────────────────────────────────────
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1390,6 +1680,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--index", action="store_true", help="stage 3: build SQLite")
     ap.add_argument("--enrich", action="store_true", help="stage 2: LLM Chinese summaries")
     ap.add_argument("--stats", action="store_true", help="print DB stats")
+    ap.add_argument("--migrate", action="store_true",
+                    help="copy raw/ + zh/ + story.db from the repo checkout "
+                         "to the resolved data directory (e.g. the data disk)")
     ap.add_argument("--export-md", metavar="PATH", help="dump parsed units to markdown")
     ap.add_argument("--limit", type=int, default=0, help="cap pages (smoke test)")
     ap.add_argument("--enrich-limit", type=int, default=0, help="cap enrichment calls")
@@ -1402,8 +1695,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     do_all = args.all or not any((args.crawl, args.index, args.enrich, args.stats,
-                                  args.export_md))
+                                  args.export_md, args.migrate))
     rc = 0
+
+    if args.migrate:
+        migrate()
 
     if args.crawl or do_all:
         try:
