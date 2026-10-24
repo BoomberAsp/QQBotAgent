@@ -4507,7 +4507,19 @@ class TestBondContent:
         txt = bc.unlocked_tiers_text(_P2_CARD, 5)
         assert "【熟悉】" in txt and "【密友】" in txt and "【暧昧】" not in txt
         assert bc.unlocked_tiers_text(_P2_CARD, 1) == ""
-        print_pass("parse/unlocked/unlocking_at/text tiers by level")
+        # UGC alias: build_card() writes `## Bond Levels` — must parse identically
+        ugc_card = _P2_CARD.replace("## Bond Tiers", "## Bond Levels")
+        ugc_tiers = bc.parse_bond_tiers(ugc_card)
+        assert [t["level"] for t in ugc_tiers] == [3, 5, 7], ugc_tiers
+        assert [t["title"] for t in ugc_tiers] == ["熟悉", "密友", "暧昧"], ugc_tiers
+        assert [t["level"] for t in bc.unlocked_tiers(ugc_card, 5)] == [3, 5]
+        # `Bond Tiers` wins when both sections somehow coexist
+        both = _P2_CARD + "\n## Bond Levels\n\n### Lv9 · 别名\n\n不该被读到。\n"
+        assert [t["level"] for t in bc.parse_bond_tiers(both)] == [3, 5, 7]
+        # free-text Bond Levels (no ### Lv subsections) degrades to []
+        freeform = "# x\n\n## Bond Levels\n\n好感越高越亲近。Lv3 之后更随意。\n"
+        assert bc.parse_bond_tiers(freeform) == []
+        print_pass("parse/unlocked/unlocking_at/text tiers by level (+Bond Levels alias)")
 
     def test_scenes(self):
         """P3: 场景 tier 解析 / 可用性 / get_scene / 动态层防泄漏。"""

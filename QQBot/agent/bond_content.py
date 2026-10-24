@@ -8,6 +8,7 @@ nonebot 依赖，可独立单测：
   按礼物名做子串匹配决定档位与 EXP。
 - **Bond Tiers**（分段解锁档案）：``### Lv{N} · {标题}`` 子段，等级到达后
   注入角色面动态层，让角色「自然地透露」背景故事（方舟式档案解锁）。
+  UGC 卡的等价标题 ``## Bond Levels``（build_card 产物）作为别名兼容。
 - **称呼演化**：按好感等级给出一句 prompt 指令（纯 prompt diff，无状态）。
 
 约定：本模块只读角色卡文本，不关心它是内置人格还是 UGC；调用方（agent_router）
@@ -118,8 +119,11 @@ def parse_bond_tiers(card: str) -> List[Dict[str, object]]:
 
     Each subsection header looks like ``### Lv3 · 档案Ⅰ`` (separators ·/：/:/-
     all accepted). Body is the text under that subsection.
+
+    别名兼容：内置卡用 ``## Bond Tiers``，UGC 卡由 creation_tools.build_card()
+    写成 ``## Bond Levels``——两者都进同一解析器（Bond Tiers 优先）。
     """
-    body = _section(card, "Bond Tiers")
+    body = _section(card, "Bond Tiers") or _section(card, "Bond Levels")
     if not body:
         return []
     tiers: List[Dict[str, object]] = []
