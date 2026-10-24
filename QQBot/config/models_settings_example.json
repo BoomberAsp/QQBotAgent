@@ -47,6 +47,30 @@
     "temperature": 0.0
   },
 
+  "IMAGE_GEN_MODEL": {
+    "_comment": "Image generation (Bond P4, lib/media_gen.py). DashScope-native synchronous endpoint — api_base is the FULL endpoint URL, NOT a /chat/completions base. Billed per image; the section is fresh-read on every call (hot), except max_concurrency which latches at first use and needs a bot restart. Text-to-image and reference-image editing share this endpoint. Leave api_key/api_base/model empty to disable image generation.",
+    "api_key": "",
+    "api_base": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+    "model": "qwen-image-3.0",
+    "timeout": 60,
+    "max_retries": 1,
+    "max_concurrency": 2
+  },
+
+  "TTS_MODEL": {
+    "_comment": "Speech synthesis (Bond P4, lib/media_gen.py). DashScope-native non-realtime endpoint — api_base is the FULL endpoint URL. Billed per character. Voices cannot be mixed across TTS models; pick voice IDs from the Bailian 'Qwen-Audio-TTS voice list' (the placeholders below are examples). output.audio.url expires after 24h — media_gen downloads it immediately. default_voice is used when a character has no assigned voice; voice_pool feeds deterministic per-character voice assignment. Same hot-reload semantics as IMAGE_GEN_MODEL.",
+    "api_key": "",
+    "api_base": "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer",
+    "model": "qwen-audio-3.1-tts-plus",
+    "format": "mp3",
+    "sample_rate": 22050,
+    "timeout": 30,
+    "max_retries": 1,
+    "max_concurrency": 2,
+    "default_voice": "longanhuan_v3.6",
+    "voice_pool": ["longanhuan_v3.6", "longxiaochun_v3.6", "longxiaoxia_v3.6", "longanrou_v3.6"]
+  },
+
   "task_routing": {
     "_comment": "Task routing rules — which model handles which task type. triage = model used for complexity classification. simple_task = model for simple conversations. complex_task = model for complex reasoning. image_analysis = model for multimodal image understanding. audio_analysis = model for audio/voice understanding.",
     "triage": "FLASH_MODEL",
