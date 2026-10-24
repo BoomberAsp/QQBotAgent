@@ -120,8 +120,13 @@ class BondManager:
         base_dir: str,
         config_path: Optional[str] = None,
         events_dir: Optional[str] = None,
+        characters_dir: Optional[str] = None,
     ):
         self.base_dir = base_dir
+        # UGC 角色目录（data/characters/）：提供时，bond 状态首次创建会按
+        # meta.json 的 initial_bond_level 播种初始羁绊（仅对作者本人生效）。
+        # 默认 None = 播种关闭（内置卡无 meta.json，天然不受影响）。
+        self.characters_dir = characters_dir
         os.makedirs(base_dir, exist_ok=True)
         # 共同经历日志根目录（默认与 bonds/ 同级的 bond_events/）
         self.events_dir = events_dir or os.path.join(
@@ -299,6 +304,7 @@ class BondManager:
         """Return the mutable state dict for (user, char), creating on demand.
 
         create=False 用于只读路径（查询/注入），避免把未落盘的空状态挂进缓存。
+        新建状态时按 UGC 卡的 initial_bond_level 播种初始羁绊（仅作者本人）。
         """
         data = self._get_user_data(user_id)
         state = data.get(char_id)
@@ -306,8 +312,38 @@ class BondManager:
             if not create:
                 return None
             state = self._new_state(time.time())
+            self._seed_initial_bond(state, user_id, char_id)
             data[char_id] = state
         return state
+
+    def _seed_initial_bond(self, state: dict, user_id: str, char_id: str):
+        """Apply the UGC card's initial_bond_level to a brand-new state.
+
+        只对作者本人生效（meta.author == user_id）：初始羁绊是创作者对
+        「自己与 TA」关系起点的预设，群里其他成员仍从 Lv1 开始。
+        任何读取/解析失败都静默降级为默认 Lv1——播种绝不炸 get_state。
+        """
+        if not self.characters_dir:
+            return
+        # 与 CharacterRegistry 同款布局：characters_dir/{char_id}/meta.json
+        # （char_id 原样作目录名，不走 _safe_id）；挡掉路径穿越形态的 id。
+        if not char_id or char_id in (".", "..") or re.split(r"[/\\]", char_id) != [char_id]:
+            return
+        try:
+            meta_path = os.path.join(self.characters_dir, char_id, "meta.json")
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if not isinstance(meta, dict) or meta.get("author") != user_id:
+                return
+            level = int(meta.get("initial_bond_level", 1))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return
+        levels = self._config["levels"]
+        level = max(levels[0][0], min(level, levels[-1][0]))
+        if level <= levels[0][0]:
+            return
+        state["exp"] = self.current_threshold(level)
+        state["level"] = level
 
     # ── Mood ──────────────────────────────────────────────────────
 
@@ -449,6 +485,33 @@ class BondManager:
         return [
             {"level": lv, "title": self.title_for(lv)}
             for lv in range(level_before + 1, level_after + 1)
+        ]
+
+    def set_level(self, user_id: str, char_id: str, level: int) -> List[Dict[str, Any]]:
+        """GM/管理员专用：把羁绊直接设到目标等级（EXP=该级阈值）。
+
+        「只涨不掉」是玩家侧纪律，本方法是管理员豁免——**允许下调**
+        （活动补偿/生产测试用）。等级 clamp 到等级表范围；上调时返回
+        跨越的 level_ups（复用 add_exp 的返回形态），下调返回 []。
+        """
+        levels = self._config["levels"]
+        try:
+            level = int(level)
+        except (TypeError, ValueError):
+            return []
+        level = max(levels[0][0], min(level, levels[-1][0]))
+        state = self.get_state(user_id, char_id)
+        level_before = int(state.get("level", levels[0][0]))
+        state["exp"] = self.current_threshold(level)
+        state["level"] = level
+        self.append_event(
+            user_id, char_id,
+            f"羁绊等级被调整为 Lv{level}（{self.title_for(level)}）",
+        )
+        self._save(user_id)
+        return [
+            {"level": lv, "title": self.title_for(lv)}
+            for lv in range(level_before + 1, level + 1)
         ]
 
     # ── P2: 互动动作（礼物 / 戳一戳）───────────────────────────────

@@ -4507,7 +4507,19 @@ class TestBondContent:
         txt = bc.unlocked_tiers_text(_P2_CARD, 5)
         assert "【熟悉】" in txt and "【密友】" in txt and "【暧昧】" not in txt
         assert bc.unlocked_tiers_text(_P2_CARD, 1) == ""
-        print_pass("parse/unlocked/unlocking_at/text tiers by level")
+        # UGC alias: build_card() writes `## Bond Levels` — must parse identically
+        ugc_card = _P2_CARD.replace("## Bond Tiers", "## Bond Levels")
+        ugc_tiers = bc.parse_bond_tiers(ugc_card)
+        assert [t["level"] for t in ugc_tiers] == [3, 5, 7], ugc_tiers
+        assert [t["title"] for t in ugc_tiers] == ["熟悉", "密友", "暧昧"], ugc_tiers
+        assert [t["level"] for t in bc.unlocked_tiers(ugc_card, 5)] == [3, 5]
+        # `Bond Tiers` wins when both sections somehow coexist
+        both = _P2_CARD + "\n## Bond Levels\n\n### Lv9 · 别名\n\n不该被读到。\n"
+        assert [t["level"] for t in bc.parse_bond_tiers(both)] == [3, 5, 7]
+        # free-text Bond Levels (no ### Lv subsections) degrades to []
+        freeform = "# x\n\n## Bond Levels\n\n好感越高越亲近。Lv3 之后更随意。\n"
+        assert bc.parse_bond_tiers(freeform) == []
+        print_pass("parse/unlocked/unlocking_at/text tiers by level (+Bond Levels alias)")
 
     def test_scenes(self):
         """P3: 场景 tier 解析 / 可用性 / get_scene / 动态层防泄漏。"""
@@ -7730,6 +7742,213 @@ class TestWebuiModelSections:
         print_pass("probe dispatch: media=verbatim url + empty input, chat unchanged")
 
 
+# ── 初始好感度：UGC initial_bond_level 播种 + set_level GM 工具 ──
+
+class TestInitialBond:
+    """45. 初始好感度：创角预设 Lv1-5，bond 首建时播种（仅作者本人）."""
+
+    def run(self):
+        print_header("45. Initial Bond Seeding (UGC)")
+        self._tmps = []
+        try:
+            self.test_seed_initial_bond()
+            self.test_seed_edge_cases()
+            self.test_set_level()
+            asyncio.run(self.test_create_character_meta())
+        finally:
+            for t in self._tmps:
+                shutil.rmtree(t, ignore_errors=True)
+
+    def _env(self, prefix="inibond_"):
+        from agent.bond import BondManager
+        tmp = tempfile.mkdtemp(prefix=prefix)
+        self._tmps.append(tmp)
+        chars = os.path.join(tmp, "characters")
+        os.makedirs(chars, exist_ok=True)
+        m = BondManager(
+            base_dir=os.path.join(tmp, "bonds"),
+            config_path=os.path.join(tmp, "no_such_config.json"),
+            characters_dir=chars,
+        )
+        return m, chars
+
+    @staticmethod
+    def _write_meta(chars, char_id, author="u1", level=3, extra=None):
+        d = os.path.join(chars, char_id)
+        os.makedirs(d, exist_ok=True)
+        meta = {"char_id": char_id, "author": author,
+                "initial_bond_level": level}
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+
+    def test_seed_initial_bond(self):
+        m, chars = self._env()
+        self._write_meta(chars, "星野爱_a1b2c3", author="u1", level=3)
+        st = m.get_state("u1", "星野爱_a1b2c3")
+        assert st["exp"] == 300 and st["level"] == 3, st
+        # 非作者不播种（群里其他成员从 Lv1 开始）
+        st2 = m.get_state("u2", "星野爱_a1b2c3")
+        assert st2["exp"] == 0 and st2["level"] == 1
+        # Lv5 上限档
+        self._write_meta(chars, "c5", author="u1", level=5)
+        st3 = m.get_state("u1", "c5")
+        assert st3["exp"] == 1200 and st3["level"] == 5
+        # level=1 → 与默认无差别
+        self._write_meta(chars, "c1", author="u1", level=1)
+        st4 = m.get_state("u1", "c1")
+        assert st4["exp"] == 0 and st4["level"] == 1
+        # 播种结果随首次 _save 落盘，冷读一致（现实流程：聊天结算 add_exp）
+        m.add_exp("u1", "星野爱_a1b2c3", 1)
+        from agent.bond import BondManager
+        cold = BondManager(base_dir=m.base_dir,
+                           config_path=os.path.join(m.base_dir, "nope.json"),
+                           characters_dir=chars)
+        st5 = cold.get_state("u1", "星野爱_a1b2c3")
+        assert st5["exp"] == 301 and st5["level"] == 3
+        print_pass("seed: author-only, level→threshold exp, persists on first save")
+
+    def test_seed_edge_cases(self):
+        m, chars = self._env(prefix="inibond_edge_")
+        # meta 损坏 / 缺失 / level 非法 → 静默降级 Lv1
+        bad_dir = os.path.join(chars, "bad")
+        os.makedirs(bad_dir, exist_ok=True)
+        with open(os.path.join(bad_dir, "meta.json"), "w") as f:
+            f.write("{corrupt!!")
+        assert m.get_state("u1", "bad")["exp"] == 0
+        assert m.get_state("u1", "no_meta_at_all")["exp"] == 0
+        self._write_meta(chars, "nan", author="u1", level="abc")
+        assert m.get_state("u1", "nan")["exp"] == 0
+        # 越界 clamp 到等级表上限 Lv10
+        self._write_meta(chars, "hi", author="u1", level=99)
+        assert m.get_state("u1", "hi")["exp"] == 8000
+        # 路径穿越形态的 char_id → 不炸、默认状态
+        assert m.get_state("u1", "../evil")["exp"] == 0
+        # characters_dir=None → 播种整体关闭（向后兼容）
+        from agent.bond import BondManager
+        m2 = BondManager(base_dir=os.path.join(m.base_dir, "x"),
+                         config_path=os.path.join(m.base_dir, "nope.json"))
+        assert m2.get_state("u1", "hi")["exp"] == 0
+        # 已存在的状态永不被回改（只涨不掉）：先攒 50 EXP，再补 meta
+        m3, chars3 = self._env(prefix="inibond_late_")
+        m3.add_exp("u1", "late", 50)
+        self._write_meta(chars3, "late", author="u1", level=4)
+        from agent.bond import BondManager as _BM
+        cold = _BM(base_dir=m3.base_dir,
+                   config_path=os.path.join(m3.base_dir, "nope.json"),
+                   characters_dir=chars3)
+        assert cold.get_state("u1", "late")["exp"] == 50
+        print_pass("seed edges: corrupt/missing/invalid meta, clamp, traversal, no-retro")
+
+    def test_set_level(self):
+        m, chars = self._env(prefix="inibond_set_")
+        # 上调：exp=阈值、level_ups 覆盖跨越等级
+        ups = m.set_level("u1", "rubi", 5)
+        st = m.get_state("u1", "rubi")
+        assert st["exp"] == 1200 and st["level"] == 5
+        assert [u["level"] for u in ups] == [2, 3, 4, 5]
+        assert ups[-1]["title"] == "密友"
+        # 下调：GM 豁免「只涨不掉」，无 level_ups
+        assert m.set_level("u1", "rubi", 2) == []
+        st = m.get_state("u1", "rubi")
+        assert st["exp"] == 100 and st["level"] == 2
+        # 越界 clamp / 非法输入不动状态
+        m.set_level("u1", "rubi", 99)
+        assert m.get_state("u1", "rubi")["level"] == 10
+        m.set_level("u1", "rubi", 0)
+        assert m.get_state("u1", "rubi")["level"] == 1
+        assert m.set_level("u1", "rubi", "abc") == []
+        assert m.get_state("u1", "rubi")["level"] == 1
+        # 事件留痕 + 冷读持久化
+        assert any("调整" in e for e in m.recent_events("u1", "rubi", n=5))
+        from agent.bond import BondManager
+        cold = BondManager(base_dir=m.base_dir,
+                           config_path=os.path.join(m.base_dir, "nope.json"),
+                           characters_dir=chars)
+        assert cold.get_state("u1", "rubi")["level"] == 1
+        # reset 后回到「故事起点」：重新按 meta 播种
+        self._write_meta(chars, "rubi", author="u1", level=3)
+        m.reset("u1", "rubi")
+        st = m.get_state("u1", "rubi")
+        assert st["exp"] == 300 and st["level"] == 3
+        print_pass("set_level: up/down, clamp, invalid, event, persist, reset re-seeds")
+
+    async def test_create_character_meta(self):
+        from tools.creation_tools import (
+            create_character, _coerce_initial_bond, CREATE_CHARACTER_SCHEMA,
+        )
+        from agent.character_registry import CharacterRegistry
+
+        # coerce：None/垃圾/越界 → clamp [1,5]
+        assert _coerce_initial_bond(None) == 1
+        assert _coerce_initial_bond("abc") == 1
+        assert _coerce_initial_bond(0) == 1
+        assert _coerce_initial_bond(9) == 5
+        assert _coerce_initial_bond(3) == 3
+        assert _coerce_initial_bond("4") == 4
+        # schema 有字段且非必填
+        assert "initial_bond_level" in CREATE_CHARACTER_SCHEMA["properties"]
+        assert "initial_bond_level" not in CREATE_CHARACTER_SCHEMA["required"]
+
+        from agent.permissions import UserRole
+
+        class P:
+            def get_role(self, u): return UserRole.REGULAR
+            def get_max_characters(self, r): return 3
+
+        class C:
+            def __init__(self, resp): self.resp = resp
+            async def chat_completion(self, message, history, timeout_set, purpose):
+                return self.resp
+
+        good = dict(name="爱酱", personality="温柔", speech_style="轻声",
+                    appearance="粉发蓝瞳")
+
+        async def _create(fields, tag):
+            tmp = tempfile.mkdtemp(prefix="inibond_cc_")
+            self._tmps.append(tmp)
+            pdir = os.path.join(tmp, "personalities")
+            os.makedirs(pdir, exist_ok=True)
+            with open(os.path.join(pdir, "assistant.md"), "w", encoding="utf-8") as f:
+                f.write("# 助手\nbase")
+            reg = CharacterRegistry(
+                personalities_dir=pdir,
+                characters_dir=os.path.join(tmp, "characters"),
+            )
+            res = await create_character(
+                user_id="u1", fields=dict(fields, name=fields.get("name", "") + tag),
+                registry=reg, perm_manager=P(), review_client=C("APPROVE"),
+            )
+            assert res.startswith("✅"), res
+            (cid,) = reg._ugc_ids()
+            with open(os.path.join(tmp, "characters", cid, "meta.json"),
+                      encoding="utf-8") as f:
+                return json.load(f)
+
+        meta = await _create(dict(good, initial_bond_level=4), "四")
+        assert meta["initial_bond_level"] == 4
+        meta = await _create(dict(good, initial_bond_level=99), "溢")
+        assert meta["initial_bond_level"] == 5
+        meta = await _create(good, "缺")
+        assert meta["initial_bond_level"] == 1
+        # REJECT 分支不受新字段影响（fail-closed 照旧）
+        tmp = tempfile.mkdtemp(prefix="inibond_rj_")
+        self._tmps.append(tmp)
+        pdir = os.path.join(tmp, "personalities")
+        os.makedirs(pdir, exist_ok=True)
+        with open(os.path.join(pdir, "assistant.md"), "w", encoding="utf-8") as f:
+            f.write("# 助手\nbase")
+        reg = CharacterRegistry(personalities_dir=pdir,
+                                characters_dir=os.path.join(tmp, "characters"))
+        res = await create_character(
+            user_id="u1", fields=dict(good, initial_bond_level=3),
+            registry=reg, perm_manager=P(), review_client=C("REJECT: 违规"),
+        )
+        assert res.startswith("[Error]") and len(reg._ugc_ids()) == 0
+        print_pass("create_character: meta field clamp/default, schema, review intact")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -7783,6 +8002,7 @@ def main():
         ("Episode Distillation (P5)", TestEpisodeDistill()),
         ("Asset Eviction & Injection (P5)", TestAssetEvictionInjection()),
         ("WebUI Model Sections (IMAGE_GEN/TTS)", TestWebuiModelSections()),
+        ("Initial Bond Seeding (UGC)", TestInitialBond()),
     ]
 
     passed = 0
