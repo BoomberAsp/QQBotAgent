@@ -187,6 +187,15 @@ _AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CONFIG_DIR = os.path.join(_AGENT_DIR, "agent", "config")
 _DATA_DIR = os.path.join(_AGENT_DIR, "data")
 _USER_DATA_ROOT = os.environ.get("USER_DATA_ROOT", os.path.join(_AGENT_DIR, "data", "users_store"))
+# 用户产生的不可替代状态（UGC 角色 / 好感 / 长期记忆 / 多模态资产）支持
+# env 单独指定——生产部署指向数据盘，与 USER_DATA_ROOT（画像/特殊会话/
+# 工作区）同盘，备份单树化；开发机不设 env 时回落 QQBot/data/*，行为不变。
+# 缓存类（wiki_cache/search_cache）、临时会话（sessions/）与全局配置
+# JSON 留在 QQBot/data/ 系统盘，可丢可重建。
+_CHARACTERS_DIR = os.environ.get("CHARACTERS_DIR") or os.path.join(_DATA_DIR, "characters")
+_BONDS_DIR = os.environ.get("BONDS_DIR") or os.path.join(_DATA_DIR, "bonds")
+_MEMORY_DIR = os.environ.get("MEMORY_DIR") or os.path.join(_DATA_DIR, "memory")
+_ASSETS_DIR = os.environ.get("ASSETS_DIR") or os.path.join(_DATA_DIR, "assets")
 _HELP_MD_PATH = os.path.join(_CONFIG_DIR, "HELP.md")
 # 公开使用站点（bot.oneweblog.cn）短链，随更新公告文本/卡片指路。可经 .env 覆盖。
 _PUBLIC_SITE_URL = os.environ.get("BOT_PUBLIC_SITE_URL", "https://bot.oneweblog.cn")
@@ -1020,7 +1029,7 @@ _session_manager = SessionManager(
 )
 
 _memory_system = MemorySystem(
-    base_dir=os.path.join(_DATA_DIR, "memory"),
+    base_dir=_MEMORY_DIR,
 )
 
 # Model router is built first so downstream components use the JSON-configured
@@ -1040,7 +1049,7 @@ _profile_manager.set_client(_model_router.flash_client)
 # subdir → no collision, trivial rollback (delete tiers/). load_all() pre-warms
 # the per-user cache at startup; set_memory wires it into the merged extract+judge
 # call so ProfileManager routes memory_candidates into SHORT/MEDIUM/LONG.
-_tiered_memory = TieredMemory(base_dir=os.path.join(_DATA_DIR, "memory"))
+_tiered_memory = TieredMemory(base_dir=_MEMORY_DIR)
 _tiered_memory.load_all()
 _profile_manager.set_memory(_tiered_memory)
 
@@ -1160,7 +1169,7 @@ _TASK_WINDOW_TTL = 15 * 60
 # 多模态资产记忆层（P4/P5）：文本卡 data/assets/{user}/cards/，二进制
 # data/assets/{user}/{char}/，prompt_hash 去重 + audit.log 计费审计。
 # P5: Agent 持有它做 L4「影音记忆」注入 → 必须先于 Agent 实例化。
-_asset_memory = AssetMemory(base_dir=os.path.join(_DATA_DIR, "assets"))
+_asset_memory = AssetMemory(base_dir=_ASSETS_DIR)
 
 agent = Agent(
     deepseek_client=_model_router.reasoning_client,
@@ -1188,9 +1197,11 @@ _perm_manager = PermissionManager()
 # 结算钩子在回复成功发送后调用；仅 split 模式人格参与。
 # characters_dir：UGC 卡 meta.json 的 initial_bond_level 在 bond 状态
 # 首次创建时播种初始羁绊（仅作者本人，与 CharacterRegistry 默认目录同源）。
+# events_dir 未显式传入 → BondManager 自动取 bonds 同级的 bond_events/，
+# 随 BONDS_DIR 一起落数据盘。
 _bond_manager = BondManager(
-    base_dir=os.path.join(_DATA_DIR, "bonds"),
-    characters_dir=os.path.join(_DATA_DIR, "characters"),
+    base_dir=_BONDS_DIR,
+    characters_dir=_CHARACTERS_DIR,
 )
 
 

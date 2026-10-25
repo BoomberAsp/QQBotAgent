@@ -19,6 +19,7 @@ Character Registry — UGC 角色叠加层（Bond-System-Design.md §5 / P1）�
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,6 +29,8 @@ from typing import Dict, List, Optional, Tuple
 from agent.personality import PersonalityManager
 from lib.media_gen import get_voice_pool
 
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_CHARACTERS_DIR = os.path.join(
     os.path.dirname(__file__), "..", "data", "characters"
@@ -57,7 +60,14 @@ class CharacterRegistry(PersonalityManager):
         characters_dir: str = None,
     ):
         super().__init__(personalities_dir=personalities_dir)
-        self._char_dir = characters_dir or _DEFAULT_CHARACTERS_DIR
+        # env 在 __init__ 惰性读取（而非模块级常量）：单例可能在 dotenv
+        # 加载前被 import，且生产部署用 CHARACTERS_DIR 把 UGC 角色指向
+        # 数据盘（与 turn.py 的 _CHARACTERS_DIR 同源约定）。
+        self._char_dir = (
+            characters_dir
+            or os.environ.get("CHARACTERS_DIR")
+            or _DEFAULT_CHARACTERS_DIR
+        )
         # char_id → (card.md mtime, content)
         self._ugc_cache: Dict[str, Tuple[float, str]] = {}
 
@@ -107,12 +117,23 @@ class CharacterRegistry(PersonalityManager):
         return os.path.join(self._char_dir, char_id, "meta.json")
 
     def get_meta(self, char_id: str) -> Optional[dict]:
-        """Read meta.json fresh (small file; no cache)."""
+        """Read meta.json fresh (small file; no cache).
+
+        损坏/非 UTF-8 编码的 meta.json（如 Windows 中转产生的 GBK）返回
+        None 并 log 警告——一个坏文件既不应炸掉所有用户的
+        list_personalities（_ugc_ids_for 遍历全量 id），也不应无声消失。
+        """
         try:
             with open(self._meta_path(char_id), "r", encoding="utf-8") as f:
                 meta = json.load(f)
             return meta if isinstance(meta, dict) else None
-        except (FileNotFoundError, json.JSONDecodeError, IOError):
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, IOError, UnicodeError) as e:
+            logger.warning(
+                "UGC meta unreadable for %s (%s: %s) — character hidden",
+                char_id, type(e).__name__, e,
+            )
             return None
 
     # ── Load / display overrides ──────────────────────────────────
@@ -132,7 +153,16 @@ class CharacterRegistry(PersonalityManager):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
-        except (IOError, OSError):
+        except (IOError, OSError) as e:
+            logger.warning(
+                "UGC card unreadable for %s (%s: %s)", name, type(e).__name__, e,
+            )
+            return None
+        except UnicodeError as e:
+            logger.warning(
+                "UGC card %s is not valid UTF-8 (%s) — check file encoding",
+                name, e,
+            )
             return None
         if not content:
             return None

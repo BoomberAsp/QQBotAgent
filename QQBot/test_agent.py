@@ -4171,6 +4171,8 @@ class TestCharacterRegistry:
             self.test_crud_and_scope()
             self.test_group_and_default()
             self.test_purge_references()
+            self.test_env_chars_dir()
+            self.test_bad_encoding_meta()
         finally:
             shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -4262,6 +4264,56 @@ class TestCharacterRegistry:
         assert self.reg.get_group_personality("g5") is None
         self.reg.delete("c_ccc333")
         print_pass("purge_references clears user settings + group bindings")
+
+    def test_env_chars_dir(self):
+        """CHARACTERS_DIR env redirects UGC root when no explicit arg given."""
+        from agent.character_registry import CharacterRegistry, _DEFAULT_CHARACTERS_DIR
+        pdir = os.path.join(self.tmp, "personalities")
+        env_dir = os.path.join(self.tmp, "env_characters")
+        old = os.environ.get("CHARACTERS_DIR")
+        try:
+            os.environ["CHARACTERS_DIR"] = env_dir
+            reg = CharacterRegistry(personalities_dir=pdir)
+            assert reg._char_dir == env_dir, reg._char_dir
+            reg.register_character("c_env001", "# env\n内容",
+                                   {"display_name": "env", "author": "u1"})
+            assert os.path.isfile(os.path.join(env_dir, "c_env001", "card.md"))
+            # explicit arg still wins over env
+            reg2 = CharacterRegistry(personalities_dir=pdir, characters_dir=self.tmp)
+            assert reg2._char_dir == self.tmp
+        finally:
+            if old is None:
+                os.environ.pop("CHARACTERS_DIR", None)
+            else:
+                os.environ["CHARACTERS_DIR"] = old
+        # no env → module default
+        assert CharacterRegistry(personalities_dir=pdir)._char_dir == _DEFAULT_CHARACTERS_DIR
+        print_pass("CHARACTERS_DIR env override + explicit-arg precedence")
+
+    def test_bad_encoding_meta(self):
+        """GBK/corrupt meta.json: get_meta → None (logged), never raises;
+        one bad character must not break listing for everyone else."""
+        self._mk("c_good11", "好角色", "u1")
+        bad_dir = os.path.join(self.tmp, "characters", "c_bad222")
+        os.makedirs(bad_dir, exist_ok=True)
+        with open(os.path.join(bad_dir, "card.md"), "w", encoding="utf-8") as f:
+            f.write("# 坏元数据\n内容")
+        with open(os.path.join(bad_dir, "meta.json"), "wb") as f:
+            f.write('{"display_name": "坏角色"}'.encode("gbk"))  # 非 UTF-8
+        assert self.reg.get_meta("c_bad222") is None       # no raise
+        assert self.reg.get_meta("c_good11")["author"] == "u1"
+        own = self.reg.list_personalities(user_id="u1")
+        keys = [e["key"] for e in own]
+        assert "c_good11" in keys and "c_bad222" not in keys, keys
+        # 非 UTF-8 card.md 同样优雅降级
+        with open(os.path.join(bad_dir, "meta.json"), "w", encoding="utf-8") as f:
+            f.write('{"display_name": "坏角色", "author": "u1"}')
+        with open(os.path.join(bad_dir, "card.md"), "wb") as f:
+            f.write("# 坏卡片".encode("gbk"))
+        assert self.reg.load("c_bad222") is None           # no raise
+        self.reg.delete("c_good11")
+        self.reg.delete("c_bad222")
+        print_pass("bad-encoding meta/card degrade gracefully, listing survives")
 
 
 class TestCreateCharacterTool:

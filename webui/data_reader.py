@@ -31,7 +31,9 @@ AUDIT_DIR = DATA / "audit"
 FEEDBACK_DIR = DATA / "feedback"
 SESSION_DIR = DATA / "sessions"
 TASKLOG_DIR = DATA / "task_log"
-MEMORY_DIR = DATA / "memory"
+# 与 bot 侧 turn.py 同源：MEMORY_DIR env（生产指数据盘）经 QQBot/.env 透传，
+# 缺省回落 data/memory。tiers/ 子目录随 base_dir 一起走。
+MEMORY_DIR = Path(config.bot_env("MEMORY_DIR", str(DATA / "memory")))
 WIKI_CACHE_DIR = DATA / "wiki_cache"
 REDEEM_DIR = DATA / "redeem_code"
 CHANGELOG_DIR = DATA / "changelog"
