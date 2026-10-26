@@ -33,6 +33,10 @@ AGENT_EXIT=$?
 python test_workspace.py
 WS_EXIT=$?
 
+# 剧情知识库（合成语料 + 人格白名单；无网络依赖，生产库缺失时自动 skip）
+python test_story_kb.py
+STORYKB_EXIT=$?
+
 # L1 记忆引擎 benchmark（零依赖、确定性场景流；canary 失败如实记录但不算回归）
 python benchmarks/memory/bench_engine.py
 MEMBENCH_EXIT=$?
@@ -66,6 +70,7 @@ cd "$SCRIPT_DIR/QQBot"
 EXIT_CODE=0
 if [ $AGENT_EXIT -ne 0 ]; then EXIT_CODE=$AGENT_EXIT; fi
 if [ $WS_EXIT -ne 0 ]; then EXIT_CODE=$WS_EXIT; fi
+if [ $STORYKB_EXIT -ne 0 ]; then EXIT_CODE=$STORYKB_EXIT; fi
 if [ $MEMBENCH_EXIT -ne 0 ]; then EXIT_CODE=$MEMBENCH_EXIT; fi
 if [ $L1_EXIT -ne 0 ]; then EXIT_CODE=$L1_EXIT; fi
 if [ $ENGINE_EXIT -ne 0 ]; then EXIT_CODE=$ENGINE_EXIT; fi

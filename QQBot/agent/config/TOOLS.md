@@ -830,6 +830,8 @@ Anti-bot handling is a two-tier ladder:
 }
 ```
 
+**Availability**: Gated by persona — only the personas listed in `config/story_personas.json` (default `rubi` + `assistant`) see this tool and receive the per-turn `## 剧情记忆` injection. Other personas (user-created characters, 角色 Roxy) get neither; edit that JSON to change it (takes effect on the next turn).
+
 **Note**: The corpus is English; always translate quoted dialogue into Chinese when answering. If a search returns nothing, retry once with a different phrasing (character name instead of a plot description) and then admit you don't have that part of the story — never invent plot details. The database is built offline by `python scripts/build_story_kb.py --all`; if the tool reports it is missing, tell the user to rebuild it.
 
 ---

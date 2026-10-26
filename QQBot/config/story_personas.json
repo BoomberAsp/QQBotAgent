@@ -1,0 +1,10 @@
+{
+  "_comment": "personas: 允许使用原作剧情记忆的人格（自动注入 + story_search 工具）。neutral: 其中允许『没有剧情角色映射』也注入的人格——它们用中性资料口径（第三人称/说书），而不是角色的第一人称记忆。改完按 mtime 即时生效。",
+  "personas": [
+    "rubi",
+    "assistant"
+  ],
+  "neutral": [
+    "assistant"
+  ]
+}

@@ -8002,7 +8002,7 @@ class TestInitialBond:
 
 
 class TestStoryKbInjectionGate:
-    """46. Story-KB 自动注入门控：解析不出 char_id 就不注入。
+    """46. Story-KB 注入门控：人格白名单（story_personas.json）+ 空 char_id 双层闸门。
 
     Prod incident 2026-10-26（UGC「夏以昼」）: retrieve() 的 persona_char_id
     只做加权/标注、**不做过滤**——UGC 角色解析不到剧情角色 id 时退化成
@@ -8016,25 +8016,34 @@ class TestStoryKbInjectionGate:
         os.environ.setdefault("USER_DATA_ROOT", "/tmp/qqbot_smoke")
         import agent.turn as turn
         self.turn = turn
-        self.test_gate_blocks_unknown_persona()
+        self.test_allowlist_gate_blocks_outsider()
+        self.test_char_id_gate_blocks_unmapped_persona()
+        self.test_neutral_persona_injects_without_char_id()
         self.test_gate_passes_known_persona()
         self.test_gate_degrades_when_kb_unavailable()
 
-    def _patched(self, char_id, kb):
-        """Context-style patch of turn._story_char_id_for + get_story_kb."""
+    def _patched(self, char_id, kb, allowed=True, neutral=False):
+        """Patch turn._story_char_id_for / _story_persona_allowed /
+        _story_neutral_persona + lib.story_kb.get_story_kb."""
         turn = self.turn
         import lib.story_kb as story_kb_mod
-        orig_cid = turn._story_char_id_for
-        orig_get = story_kb_mod.get_story_kb
+        orig = (
+            turn._story_char_id_for,
+            turn._story_persona_allowed,
+            turn._story_neutral_persona,
+            story_kb_mod.get_story_kb,
+        )
         turn._story_char_id_for = lambda persona_key, pm: char_id
+        turn._story_persona_allowed = lambda persona_key: allowed
+        turn._story_neutral_persona = lambda persona_key: neutral
         story_kb_mod.get_story_kb = lambda: kb
-        return orig_cid, orig_get
+        return orig
 
     def _restore(self, orig):
         import lib.story_kb as story_kb_mod
-        orig_cid, orig_get = orig
-        self.turn._story_char_id_for = orig_cid
-        story_kb_mod.get_story_kb = orig_get
+        turn = self.turn
+        (turn._story_char_id_for, turn._story_persona_allowed,
+         turn._story_neutral_persona, story_kb_mod.get_story_kb) = orig
 
     @staticmethod
     def _mock_kb(available=True, block="【剧情记忆】露比在教堂经历了婚礼。"):
@@ -8043,16 +8052,46 @@ class TestStoryKbInjectionGate:
         kb.format_injection.return_value = block
         return kb
 
-    def test_gate_blocks_unknown_persona(self):
+    def test_allowlist_gate_blocks_outsider(self):
+        """① 白名单外人格（UGC）→ 连 KB 都不碰。"""
         turn = self.turn
         kb = self._mock_kb()
-        orig = self._patched("", kb)
+        orig = self._patched("", kb, allowed=False)
         try:
             block, char_id = turn._build_story_context(
                 "夏以昼_aff51a", "夏以昼的哥哥是谁", None)
             assert (block, char_id) == ("", ""), (block, char_id)
             kb.format_injection.assert_not_called()
-            print_pass("empty char_id → no injection, format_injection never called")
+            print_pass("persona not allowlisted → no injection, kb never queried")
+        finally:
+            self._restore(orig)
+
+    def test_char_id_gate_blocks_unmapped_persona(self):
+        """② 白名单内、非 neutral、解析不到 char_id → 不注入（原事故路径）。"""
+        turn = self.turn
+        kb = self._mock_kb()
+        orig = self._patched("", kb, allowed=True, neutral=False)
+        try:
+            block, char_id = turn._build_story_context(
+                "rubi", "露比的哥哥是谁", None)
+            assert (block, char_id) == ("", ""), (block, char_id)
+            kb.format_injection.assert_not_called()
+            print_pass("allowlisted, empty char_id & not neutral → no injection")
+        finally:
+            self._restore(orig)
+
+    def test_neutral_persona_injects_without_char_id(self):
+        """②' neutral 人格（assistant）无 char_id 也注入，走中性口径。"""
+        turn = self.turn
+        kb = self._mock_kb(block="【剧情记忆·中性】参考片段。")
+        orig = self._patched("", kb, allowed=True, neutral=True)
+        try:
+            block, char_id = turn._build_story_context(
+                "assistant", "露比小时候发生过什么", None)
+            assert char_id == "" and "中性" in block, (block, char_id)
+            kwargs = kb.format_injection.call_args.kwargs
+            assert kwargs["persona_char_id"] == "", kwargs
+            print_pass("neutral persona → injection proceeds with empty char_id")
         finally:
             self._restore(orig)
 
