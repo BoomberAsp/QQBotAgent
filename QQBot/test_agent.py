@@ -8001,6 +8001,87 @@ class TestInitialBond:
         print_pass("create_character: meta field clamp/default, schema, review intact")
 
 
+class TestStoryKbInjectionGate:
+    """46. Story-KB 自动注入门控：解析不出 char_id 就不注入。
+
+    Prod incident 2026-10-26（UGC「夏以昼」）: retrieve() 的 persona_char_id
+    只做加权/标注、**不做过滤**——UGC 角色解析不到剧情角色 id 时退化成
+    全库检索，把别的角色的剧情（婚礼/亲密场景）注进 L4，模型推理痕迹
+    显示被无关剧情带偏（"剧情记忆那段完全不相关，忽略不用"）。
+    """
+
+    def run(self):
+        print_header("46. Story-KB Injection Gate")
+        # turn.py reads USER_DATA_ROOT at import time; keep it off prod paths
+        os.environ.setdefault("USER_DATA_ROOT", "/tmp/qqbot_smoke")
+        import agent.turn as turn
+        self.turn = turn
+        self.test_gate_blocks_unknown_persona()
+        self.test_gate_passes_known_persona()
+        self.test_gate_degrades_when_kb_unavailable()
+
+    def _patched(self, char_id, kb):
+        """Context-style patch of turn._story_char_id_for + get_story_kb."""
+        turn = self.turn
+        import lib.story_kb as story_kb_mod
+        orig_cid = turn._story_char_id_for
+        orig_get = story_kb_mod.get_story_kb
+        turn._story_char_id_for = lambda persona_key, pm: char_id
+        story_kb_mod.get_story_kb = lambda: kb
+        return orig_cid, orig_get
+
+    def _restore(self, orig):
+        import lib.story_kb as story_kb_mod
+        orig_cid, orig_get = orig
+        self.turn._story_char_id_for = orig_cid
+        story_kb_mod.get_story_kb = orig_get
+
+    @staticmethod
+    def _mock_kb(available=True, block="【剧情记忆】露比在教堂经历了婚礼。"):
+        kb = MagicMock()
+        kb.available = available
+        kb.format_injection.return_value = block
+        return kb
+
+    def test_gate_blocks_unknown_persona(self):
+        turn = self.turn
+        kb = self._mock_kb()
+        orig = self._patched("", kb)
+        try:
+            block, char_id = turn._build_story_context(
+                "夏以昼_aff51a", "夏以昼的哥哥是谁", None)
+            assert (block, char_id) == ("", ""), (block, char_id)
+            kb.format_injection.assert_not_called()
+            print_pass("empty char_id → no injection, format_injection never called")
+        finally:
+            self._restore(orig)
+
+    def test_gate_passes_known_persona(self):
+        turn = self.turn
+        kb = self._mock_kb()
+        orig = self._patched("rubi", kb)
+        try:
+            block, char_id = turn._build_story_context(
+                "rubi", "露比小时候发生过什么", None)
+            assert char_id == "rubi" and "剧情记忆" in block, (block, char_id)
+            kwargs = kb.format_injection.call_args.kwargs
+            assert kwargs["persona_char_id"] == "rubi", kwargs
+            print_pass("resolved char_id → injection proceeds, persona passed through")
+        finally:
+            self._restore(orig)
+
+    def test_gate_degrades_when_kb_unavailable(self):
+        turn = self.turn
+        kb = self._mock_kb(available=False)
+        orig = self._patched("rubi", kb)
+        try:
+            assert turn._build_story_context("rubi", "露比的过往", None) == ("", "")
+            kb.format_injection.assert_not_called()
+            print_pass("kb unavailable → silent ('', ''), unchanged behavior")
+        finally:
+            self._restore(orig)
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -8055,6 +8136,7 @@ def main():
         ("Asset Eviction & Injection (P5)", TestAssetEvictionInjection()),
         ("WebUI Model Sections (IMAGE_GEN/TTS)", TestWebuiModelSections()),
         ("Initial Bond Seeding (UGC)", TestInitialBond()),
+        ("Story-KB Injection Gate", TestStoryKbInjectionGate()),
     ]
 
     passed = 0

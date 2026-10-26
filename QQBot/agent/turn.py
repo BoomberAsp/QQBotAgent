@@ -1908,6 +1908,13 @@ def _build_story_context(persona_key: str, query: str, pm) -> tuple:
         if not q:
             return "", ""
         char_id = _story_char_id_for(persona_key, pm)
+        if not char_id:
+            # 无法把当前人格解析到剧情角色（UGC 自创角色、assistant 等）。
+            # retrieve() 的 persona_char_id 只做加权/标注、不做过滤——
+            # 空 id 会退化成全库检索，把其他角色的剧情（婚礼/亲密场景）
+            # 注进当前角色的对话，造成跨角色污染。宁可不注入；
+            # 主动查询走 story_search 工具，不受此限。
+            return "", ""
         block = kb.format_injection(
             q,
             persona_char_id=char_id,
