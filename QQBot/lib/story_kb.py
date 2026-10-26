@@ -38,6 +38,7 @@ Public API
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -61,6 +62,78 @@ from typing import Dict, List, Optional, Sequence, Tuple
 #   2. $USER_DATA_ROOT/story_kb      the deployment data disk
 #   3. <QQBot>/data/story_kb         a plain dev checkout
 _QQBOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# ── Persona allowlist ──────────────────────────────────────────────
+#
+# Story memory is opt-in per persona: only the personas listed in
+# config/story_personas.json get the per-turn injection and may call the
+# `story_search` tool. Everyone else (UGC characters, 角色 Roxy …) sees neither,
+# so a user-created character never starts reciting Ark Re:Code canon.
+_STORY_PERSONAS_FILE = os.path.join(_QQBOT_DIR, "config", "story_personas.json")
+_DEFAULT_STORY_PERSONAS = frozenset({"rubi", "assistant"})
+_personas_cache: Dict[str, object] = {"mtime": None, "path": "", "value": _DEFAULT_STORY_PERSONAS}
+
+
+def story_personas(path: Optional[str] = None) -> set:
+    """Persona keys allowed to use story memory (mtime-cached, default rubi+assistant).
+
+    A malformed/missing config falls back to the default instead of disabling the
+    feature silently.
+    """
+    target = path or _STORY_PERSONAS_FILE
+    try:
+        mtime = os.path.getmtime(target)
+    except OSError:
+        return set(_DEFAULT_STORY_PERSONAS)
+    if (_personas_cache["mtime"] == mtime
+            and _personas_cache["path"] == target):
+        return set(_personas_cache["value"])
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        names = raw.get("personas") if isinstance(raw, dict) else raw
+        value = frozenset(
+            str(n).strip() for n in (names or [])
+            if isinstance(n, (str, int)) and str(n).strip()
+        )
+    except Exception:  # noqa: BLE001
+        return set(_DEFAULT_STORY_PERSONAS)
+    if not value:
+        value = _DEFAULT_STORY_PERSONAS
+    _personas_cache.update({"mtime": mtime, "path": target, "value": value})
+    return set(value)
+
+
+_NEUTRAL_CACHE: Dict[str, object] = {"mtime": None, "path": "", "value": frozenset({"assistant"})}
+
+
+def story_neutral_personas(path: Optional[str] = None) -> set:
+    """Personas allowed to inject story memory *without* a character mapping.
+
+    These get the neutral (third-person reference) framing instead of the
+    in-character "your own memory" framing. Defaults to ``{"assistant"}``.
+    """
+    target = path or _STORY_PERSONAS_FILE
+    try:
+        mtime = os.path.getmtime(target)
+    except OSError:
+        return set(_NEUTRAL_CACHE["value"])
+    if _NEUTRAL_CACHE["mtime"] == mtime and _NEUTRAL_CACHE["path"] == target:
+        return set(_NEUTRAL_CACHE["value"])
+    value = frozenset({"assistant"})
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict) and raw.get("neutral") is not None:
+            value = frozenset(
+                str(n).strip() for n in (raw.get("neutral") or [])
+                if isinstance(n, (str, int)) and str(n).strip()
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    _NEUTRAL_CACHE.update({"mtime": mtime, "path": target, "value": value})
+    return set(value)
 
 
 def _clean(path: str) -> str:
@@ -275,10 +348,11 @@ class StoryHit:
         if scene:
             bits.append(scene)
         label = " · ".join(b for b in bits if b)
-        if persona_char_id and persona_char_id in self.char_id_set:
-            label += " ｜ 你（本角色）在场"
-        else:
-            label += " ｜ 你不在场"
+        # The "you were there" marker only makes sense for a mapped character;
+        # for a neutral persona (assistant) the label carries no suffix.
+        if persona_char_id:
+            label += (" ｜ 你（本角色）在场" if persona_char_id in self.char_id_set
+                      else " ｜ 你不在场")
         return label
 
 
@@ -777,17 +851,32 @@ class StoryKB:
         parts: List[str] = []
         if with_preamble:
             parts.append("## 剧情记忆（原作剧情检索命中）")
-            parts.append(
-                "以下片段检索自《星陨计划》原作剧情，请当作**你自己的亲身记忆**使用：\n"
-                "- 只在与当前话题相关时自然提及，不要朗读原文，"
-                "不要提「知识库/检索/资料」之类的系统用词。\n"
-                f"- 台词原文是英文；对团长复述时用中文口语转述，并保持{who}的语气。\n"
-                "- 人名的中文写法**一律**按每段的「本段人物」一行（官方译名），"
-                "不要自己音译。\n"
-                "- 标注「你（本角色）在场」的段落你是当事人，用第一人称；"
-                "标注「你不在场」的按「后来听说」处理。\n"
-                "- 检索可能不完整：把握不大时就用模糊的说法，不要编造细节。"
-            )
+            if persona_char_id:
+                # In-character framing: these scenes are "her own" memories.
+                parts.append(
+                    "以下片段检索自《星陨计划》原作剧情，请当作**你自己的亲身记忆**使用：\n"
+                    "- 只在与当前话题相关时自然提及，不要朗读原文，"
+                    "不要提「知识库/检索/资料」之类的系统用词。\n"
+                    f"- 台词原文是英文；对团长复述时用中文口语转述，并保持{who}的语气。\n"
+                    "- 人名的中文写法**一律**按每段的「本段人物」一行（官方译名），"
+                    "不要自己音译。\n"
+                    "- 标注「你（本角色）在场」的段落你是当事人，用第一人称；"
+                    "标注「你不在场」的按「后来听说」处理。\n"
+                    "- 检索可能不完整：把握不大时就用模糊的说法，不要编造细节。"
+                )
+            else:
+                # Neutral framing (assistant): reference material, not memories.
+                parts.append(
+                    "以下片段检索自《星陨计划》原作剧情库，是这款游戏的设定与剧情原文，"
+                    "供你回答玩家问题时引用：\n"
+                    "- 只在与当前话题相关时引用，不要大段朗读原文，"
+                    "不要提「知识库/检索/资料」之类的系统用词。\n"
+                    "- 台词原文是英文；向玩家讲述时用中文转述。\n"
+                    "- 人名的中文写法**一律**按每段的「本段人物」一行（官方译名）。\n"
+                    "- 你是助手而不是剧中角色：描述这些内容时用第三人称/说书口吻，"
+                    "不要用「我亲身经历」的语气。\n"
+                    "- 检索可能不完整：把握不大时就说「这段剧情我不太确定」，不要编造细节。"
+                )
 
         budget = max(400, int(max_chars))
         used = 0
@@ -885,8 +974,6 @@ _members_lock = threading.Lock()
 
 def _load_member_aliases() -> Dict[str, str]:
     """Return {alias_lower: character_id} from the vendored members_info.json."""
-    import json
-
     path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "..", "config", "characters", "members_info.json",

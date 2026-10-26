@@ -94,6 +94,15 @@ async def run_delegated_task(
     allowed: Set[str] = set(perm_manager.get_allowed_tools(role)) - {"delegate_task"}
     if disabled_tools:
         allowed -= set(disabled_tools)
+    # Story KB tools follow the *originating* persona, not the task plane's
+    # neutral one: a character that is not allowlisted must not gain canon
+    # access just by delegating.
+    try:
+        from lib.story_kb import story_personas
+        if _current_personality.get() not in story_personas():
+            allowed.discard("story_search")
+    except Exception:  # noqa: BLE001
+        pass
 
     tokens = (
         _delegate_depth.set(1),

@@ -1886,6 +1886,28 @@ def _story_log(message: str) -> None:
         pass
 
 
+def _story_persona_allowed(persona_key: str) -> bool:
+    """True when this persona may use story memory (config/story_personas.json)."""
+    if not persona_key:
+        return False
+    try:
+        from lib.story_kb import story_personas
+        return persona_key in story_personas()
+    except Exception:  # noqa: BLE001 — never block a turn on config issues
+        return persona_key in ("rubi", "assistant")
+
+
+def _story_neutral_persona(persona_key: str) -> bool:
+    """True when this persona may inject without a story character mapping."""
+    if not persona_key:
+        return False
+    try:
+        from lib.story_kb import story_neutral_personas
+        return persona_key in story_neutral_personas()
+    except Exception:  # noqa: BLE001
+        return persona_key == "assistant"
+
+
 def _story_char_id_for(persona_key: str, pm) -> str:
     """Resolve the active persona to a story character id (cached lookup)."""
     try:
@@ -1901,6 +1923,9 @@ def _build_story_context(persona_key: str, query: str, pm) -> tuple:
     try:
         from lib.story_kb import get_story_kb
 
+        # 逐人格白名单：不在 config/story_personas.json 里的人格完全不注入。
+        if not _story_persona_allowed(persona_key):
+            return "", ""
         kb = get_story_kb()
         if not kb.available:
             return "", ""
@@ -1908,12 +1933,13 @@ def _build_story_context(persona_key: str, query: str, pm) -> tuple:
         if not q:
             return "", ""
         char_id = _story_char_id_for(persona_key, pm)
-        if not char_id:
-            # 无法把当前人格解析到剧情角色（UGC 自创角色、assistant 等）。
+        if not char_id and not _story_neutral_persona(persona_key):
+            # 既解析不到剧情角色、又不是中立人格（UGC 自创角色等）。
             # retrieve() 的 persona_char_id 只做加权/标注、不做过滤——
             # 空 id 会退化成全库检索，把其他角色的剧情（婚礼/亲密场景）
             # 注进当前角色的对话，造成跨角色污染。宁可不注入；
             # 主动查询走 story_search 工具，不受此限。
+            # assistant 例外：它没有角色身份，走中性「资料引用」口径。
             return "", ""
         block = kb.format_injection(
             q,
@@ -2409,6 +2435,11 @@ async def handle_agent_turn(view: InboundMessage):
             persona_mode == "split" and plane == "social"
             and not is_creation and not is_scene
         )
+
+        # ── Story memory is opt-in per persona (config/story_personas.json) ──
+        # Personas not on the list get neither the L4 injection nor the
+        # story_search tool, so UGC characters never recite the game's canon.
+        _story_persona_ok = _story_persona_allowed(persona_key)
         if is_creation:
             # UGC creation interview: neutral assistant persona (globally-shared
             # cache prefix), only the create_character tool exposed, no bond.
@@ -2437,20 +2468,24 @@ async def handle_agent_turn(view: InboundMessage):
             _current_personality.set(
                 "assistant" if persona_mode == "split" else persona_key
             )
+        # story_search only for allowlisted personas (schema filtering; the
+        # executor additionally refuses tools outside allowed_tools).
+        if not _story_persona_ok:
+            allowed_tools = set(allowed_tools) - {"story_search"}
+
         _delegate_depth.set(0)
         _personality_transition.set(_personality_switch_marker.get(user_id, ""))
 
         # ── Original-story memory injection (Story KB) ──
-        # Only where the character herself answers: the character plane (split
-        # personas) or a unified character persona. The task plane runs as
-        # neutral Roxy and reaches the KB through the story_search tool
-        # instead, so its answers never borrow the character's first person.
+        # Allowlisted personas only. Where the character herself answers (the
+        # character plane of a split persona, or a unified persona such as
+        # rubi/assistant) the block goes in first-person; the task plane runs as
+        # neutral Roxy and reaches the KB through story_search instead.
         _story_block, _story_char = "", ""
-        if not is_creation and not is_scene:
+        if _story_persona_ok and not is_creation and not is_scene:
             if character_plane or persona_mode != "split":
-                if persona_key and persona_key != "assistant":
-                    _story_block, _story_char = _build_story_context(
-                        persona_key, text_content or augmented_message, pm)
+                _story_block, _story_char = _build_story_context(
+                    persona_key, text_content or augmented_message, pm)
         _current_story_context.set(_story_block)
         _current_story_char_id.set(_story_char)
 
@@ -2775,6 +2810,7 @@ async def handle_continuous_turn(view: InboundMessage):
 
             # ── Plane context ──
             character_plane = (persona_mode == "split" and plane == "social")
+            _story_persona_ok = _story_persona_allowed(persona_key)
             if character_plane:
                 client = _model_router.flash_client
                 # Social plane keeps only delegate_task (+ window control).
@@ -2792,13 +2828,13 @@ async def handle_continuous_turn(view: InboundMessage):
             _personality_transition.set(_personality_switch_marker.get(user_id, ""))
 
             # ── 原作剧情记忆注入（与 handle_agent_turn 同一策略）──
-            # 群聊连续模式下角色面同样可见剧情记忆；任务面不注入，
-            # 改由 story_search 工具深挖。
+            # 仅白名单人格；任务面不注入，改由 story_search 工具深挖。
+            if not _story_persona_ok:
+                allowed_tools = set(allowed_tools) - {"story_search"}
             _story_block, _story_char = "", ""
-            if character_plane or persona_mode != "split":
-                if persona_key and persona_key != "assistant":
-                    _story_block, _story_char = _build_story_context(
-                        persona_key, text_content or augmented_message, pm)
+            if _story_persona_ok and (character_plane or persona_mode != "split"):
+                _story_block, _story_char = _build_story_context(
+                    persona_key, text_content or augmented_message, pm)
             _current_story_context.set(_story_block)
             _current_story_char_id.set(_story_char)
 

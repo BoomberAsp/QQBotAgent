@@ -295,6 +295,23 @@ class BuilderAndRetrievalTests(unittest.TestCase):
                                      persona_char_id="H076", min_score=0.0165))
 
 
+    def test_neutral_injection_framing(self):
+        """无 char_id（assistant）走中性口径，不出现「你在场」标记。"""
+        neutral = self.kb.format_injection("露比 雨夜", persona_char_id="",
+                                           persona_name="Roxy")
+        self.assertTrue(neutral)
+        self.assertIn("你是助手而不是剧中角色", neutral)
+        self.assertNotIn("你（本角色）在场", neutral)
+        self.assertNotIn("亲身记忆", neutral)
+
+    def test_character_injection_framing(self):
+        """有 char_id（rubi）走第一人称口径，带「你在场」标记。"""
+        char = self.kb.format_injection("露比 雨夜", persona_char_id="H076",
+                                        persona_name="露比")
+        self.assertTrue(char)
+        self.assertIn("亲身记忆", char)
+        self.assertIn("你（本角色）在场", char)
+
     def test_tool_result_has_source_and_dialogue(self):
         out = self.kb.format_tool_result("unconscious ass", limit=1)
         self.assertIn("[story_search]", out)
@@ -342,6 +359,50 @@ class ProductionDatabaseSmokeTest(unittest.TestCase):
         self.assertTrue(hits, "expected at least one hit in the production DB")
         self.assertGreater(kb.stats()["chunks"], 100)
 
+
+
+class PersonaAllowlistTests(unittest.TestCase):
+    """config/story_personas.json decides who gets story memory."""
+
+    def _write(self, payload):
+        import json as _json
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            _json.dump(payload, f, ensure_ascii=False)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_default_is_rubi_and_assistant(self):
+        from lib.story_kb import story_personas
+        self.assertEqual(story_personas("/nonexistent/story_personas.json"),
+                         {"rubi", "assistant"})
+
+    def test_custom_list_is_honoured(self):
+        from lib.story_kb import story_personas
+        path = self._write({"personas": ["rubi", "roxy_character"]})
+        self.assertEqual(story_personas(path), {"rubi", "roxy_character"})
+
+    def test_empty_or_broken_falls_back_to_default(self):
+        from lib.story_kb import story_personas
+        self.assertEqual(story_personas(self._write({"personas": []})),
+                         {"rubi", "assistant"})
+        self.assertEqual(story_personas(self._write({"nope": 1})),
+                         {"rubi", "assistant"})
+
+    def test_repo_config_lists_rubi_and_assistant(self):
+        from lib.story_kb import story_personas
+        self.assertIn("rubi", story_personas())
+        self.assertIn("assistant", story_personas())
+
+    def test_membership_semantics_used_by_the_gate(self):
+        from lib.story_kb import story_personas
+        allowed = story_personas()
+        self.assertTrue("rubi" in allowed)
+        self.assertTrue("assistant" in allowed)
+        self.assertFalse("roxy_character" in allowed)
+        self.assertFalse("" in allowed)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
