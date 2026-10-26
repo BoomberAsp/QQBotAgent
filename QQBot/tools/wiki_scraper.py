@@ -12,6 +12,7 @@ Data sources:
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -83,6 +84,19 @@ _POT_DETAIL_FIELDS = (
     "team_pot_rate", "team_pot_base", "team_pot_add",
     "self_pot_rate", "self_pot_base", "self_pot_add",
 )
+
+# Whitelist of panel-editable field paths (WebUI 人工修正). Must stay in sync
+# with webui/data_reader.py (_DETAIL_TOP_FIELDS / _DETAIL_SKILL_FIELDS): the
+# panel records edited dotted paths in entry["_manual_fields"] (e.g. "desc",
+# "skills.1.des"), and the refresh pipeline treats those fields as
+# authoritative human text — restored onto rebuilt entries after
+# re-translation, skipped by name healing and by the LLM merge guard.
+_MANUAL_TOP_FIELDS = {
+    "char": ("name_cn", "desc", "discs"),
+    "bond": ("name_cn", "desc", "effect", "notes", "obtain"),
+}
+_MANUAL_SKILL_FIELDS = ("name", "des", "des2", "burst")
+_MANUAL_SKILL_PATH = re.compile(r"skills\.(\d+)\.(\w+)")
 
 
 # ── WikiScraper ──────────────────────────────────────────────────
@@ -894,6 +908,7 @@ class WikiScraper:
 
         to_translate = []
         result = {}
+        manual_old = {}  # title → cached entry with panel corrections
         unchanged = seeded = changed = healed = 0
 
         for entry in scraped:
@@ -940,6 +955,8 @@ class WikiScraper:
                 to_translate.append(entry)
                 result[title] = entry
                 changed += 1
+                if old is not None and old.get("_manual_fields"):
+                    manual_old[title] = old
 
         print(f"[WikiScraper] {unchanged} unchanged ({healed} names healed), "
               f"{seeded} seeded from openrubi, "
@@ -948,6 +965,19 @@ class WikiScraper:
 
         if to_translate:
             await self._translate_character_details(to_translate)
+
+        # Panel corrections (_manual_fields) are authoritative human text: the
+        # rebuild above re-translated changed entries from English, so copy the
+        # manually-edited whitelisted fields back from the cached entry. Done
+        # BEFORE _card_hash stamping so cards render the restored text.
+        restored = 0
+        for title, old in manual_old.items():
+            entry = result.get(title)
+            if entry is not None and entry is not old:
+                restored += self._restore_manual_fields(entry, old, "char")
+        if restored:
+            print(f"[WikiScraper] restored {restored} manually-edited field(s) "
+                  f"across {len(manual_old)} changed entries", file=sys.stderr)
 
         # Stamp each entry with its content hash so the card renderer can skip
         # re-drawing unchanged cards.
@@ -1093,15 +1123,61 @@ class WikiScraper:
         Alias resolution depends on ``name_cn`` matching the canonical name in
         ``character_dic.json``; caches built before that alignment drift and
         make alias lookups fail. Returns True when the entry was changed.
+
+        A panel-corrected name (``name_cn`` listed in ``_manual_fields``) is
+        authoritative human text and is never healed back to the canonical.
         """
         title = str(entry.get("title", "")).strip()
         canonical = canonical_names.get(title.strip().lower()) if title else None
         if not canonical:
             return False
+        if "name_cn" in (entry.get("_manual_fields") or []):
+            return False
         if entry.get("name_cn") == canonical:
             return False
         entry["name_cn"] = canonical
         return True
+
+    @staticmethod
+    def _restore_manual_fields(entry: dict, old: dict, kind: str) -> int:
+        """Backfill manually-edited whitelisted fields from ``old`` onto ``entry``.
+
+        A wiki change (or a parser fix invalidating ``_src_hash``) rebuilds the
+        entry from English and re-runs LLM translation, which would silently
+        discard panel corrections recorded in ``old["_manual_fields"]``. This
+        restores them afterwards so human text stays authoritative. The marker
+        is carried over onto ``entry``, narrowed to the paths actually restored
+        (e.g. a ``skills.{i}.*`` path whose index no longer exists is dropped).
+        Returns the number of restored field paths.
+        """
+        manual = old.get("_manual_fields")
+        if not isinstance(manual, list) or not manual:
+            return 0
+        top = _MANUAL_TOP_FIELDS.get(kind, ())
+        restored = []
+        for path in manual:
+            path = str(path).strip()
+            if path in top:
+                if path in old:
+                    entry[path] = copy.deepcopy(old[path])
+                    restored.append(path)
+                continue
+            m = _MANUAL_SKILL_PATH.fullmatch(path)
+            if not m:
+                continue
+            idx, key = int(m.group(1)), m.group(2)
+            old_skills = old.get("skills") or []
+            new_skills = entry.get("skills") or []
+            if (key in _MANUAL_SKILL_FIELDS
+                    and idx < len(old_skills) and idx < len(new_skills)
+                    and isinstance(old_skills[idx], dict)
+                    and isinstance(new_skills[idx], dict)
+                    and key in old_skills[idx]):
+                new_skills[idx][key] = old_skills[idx][key]
+                restored.append(path)
+        if restored:
+            entry["_manual_fields"] = sorted(set(restored))
+        return len(restored)
 
     def _load_character_cache(self) -> dict:
         """Load existing {title: entry} from character_details.json."""
@@ -1237,6 +1313,9 @@ class WikiScraper:
             return {"error": "未配置 LLM 客户端，无法重翻译"}
         if kind == "char":
             for c in entries:
+                # Intentional overwrite: drop the manual-edit marker so the
+                # merge guard does not protect fields the panel asked to redo.
+                c.pop("_manual_fields", None)
                 c["name_cn"] = c.get("title", "")
                 c["desc"] = c.get("desc_en", "")
                 c["discs"] = list(c.get("discs_en", []))
@@ -1246,6 +1325,7 @@ class WikiScraper:
             await self._translate_character_details(entries)
         else:
             for b in entries:
+                b.pop("_manual_fields", None)
                 b["name_cn"] = b.get("title", "")
             await self._translate_bond_details(entries)
         return {"entries": len(entries)}
@@ -1435,18 +1515,27 @@ class WikiScraper:
                 # source (i.e. untranslated). Authoritative Chinese values
                 # (openrubi-seeded names/descriptions) are never overwritten —
                 # this is what lets seeded entries be gap-filled safely.
-                if t.get("name_cn") and c.get("name_cn") == c.get("title"):
+                # Panel-corrected fields (_manual_fields) are skipped too: a
+                # human edit that happens to equal the English source (or is
+                # deliberately left English) must not be re-translated.
+                manual = c.get("_manual_fields") or []
+                if (t.get("name_cn") and c.get("name_cn") == c.get("title")
+                        and "name_cn" not in manual):
                     c["name_cn"] = t["name_cn"]
-                if t.get("desc") and (c.get("desc") or "") == c.get("desc_en"):
+                if (t.get("desc") and (c.get("desc") or "") == c.get("desc_en")
+                        and "desc" not in manual):
                     c["desc"] = t["desc"]
                 for idx, sk in enumerate(c.get("skills", [])):
                     ts = t.get("skills", [])
                     if isinstance(ts, list) and idx < len(ts) and isinstance(ts[idx], dict):
                         for key in ("name", "des", "des2", "burst"):
                             val = ts[idx].get(key)
-                            if val and (sk.get(key) or "") == sk.get(key + "_en"):
+                            if (val and (sk.get(key) or "") == sk.get(key + "_en")
+                                    and f"skills.{idx}.{key}" not in manual):
                                 sk[key] = val
-                if isinstance(t.get("discs"), list) and c.get("discs") == c.get("discs_en"):
+                if (isinstance(t.get("discs"), list)
+                        and c.get("discs") == c.get("discs_en")
+                        and "discs" not in manual):
                     c["discs"] = t["discs"]
 
     @staticmethod
@@ -1591,6 +1680,7 @@ class WikiScraper:
 
         to_translate = []
         result = {}
+        manual_old = {}  # title → cached entry with panel corrections
         unchanged = seeded = changed = 0
 
         for entry in scraped:
@@ -1615,12 +1705,28 @@ class WikiScraper:
                 to_translate.append(entry)
                 result[title] = entry
                 changed += 1
+                if old is not None and old.get("_manual_fields"):
+                    manual_old[title] = old
 
         print(f"[WikiScraper] bonds: {unchanged} unchanged, {seeded} seeded, "
               f"{changed} to translate", file=sys.stderr)
 
         if to_translate:
             await self._translate_bond_details(to_translate)
+
+        # Panel corrections (_manual_fields) are authoritative human text.
+        # Bond LLM translation overwrites desc/effect/notes/obtain with no
+        # merge guard, so restore them from the cached entry afterwards —
+        # BEFORE _card_hash stamping so cards render the restored text.
+        restored = 0
+        for title, old in manual_old.items():
+            entry = result.get(title)
+            if entry is not None and entry is not old:
+                restored += self._restore_manual_fields(entry, old, "bond")
+        if restored:
+            print(f"[WikiScraper] bonds: restored {restored} manually-edited "
+                  f"field(s) across {len(manual_old)} changed entries",
+                  file=sys.stderr)
 
         # Stamp each entry with its content hash for card-render dedup.
         for entry in result.values():

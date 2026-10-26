@@ -853,10 +853,15 @@ def wiki_glossary_default() -> dict:
 # ── Wiki 详情缓存编辑（人工修正 / 重翻译写回）────────────────────
 # 字段级人工修正：白名单路径（char: name_cn/desc/discs/skills.{i}.子字段；
 # bond: name_cn/desc/effect/notes/obtain），被改字段记入 entry 的
-# ``_manual_fields``（UI 徽标 + 重翻译 confirm 提示）。整条 LLM 重翻译由
-# main.py 的后台任务执行（force_retranslate），写回走 wiki_details_replace_entry。
+# ``_manual_fields``（UI 徽标 + 重翻译 confirm 提示）。bot 侧刷新管线读同一
+# 名单（wiki_scraper._MANUAL_TOP_FIELDS/_MANUAL_SKILL_FIELDS）：/刷新角色数据
+# 或每周自动刷新重建条目后，人工字段从旧缓存回填，不被 LLM 翻译覆盖。
+# 整条 LLM 重翻译由 main.py 的后台任务执行（force_retranslate），写回走
+# wiki_details_replace_entry。
 
 # 可人工修正的字段白名单（skills 子字段单独校验）
+# ⚠ 与 QQBot/tools/wiki_scraper.py 的 _MANUAL_TOP_FIELDS/_MANUAL_SKILL_FIELDS
+#   保持同步（test/test_character_lookup_and_heal.py 第 8 节做一致性校验）。
 _DETAIL_TOP_FIELDS = {
     "char": ("name_cn", "desc", "discs"),
     "bond": ("name_cn", "desc", "effect", "notes", "obtain"),
