@@ -1051,9 +1051,9 @@ def _parse_features_md(md_path: str) -> list:
                 continue  # separator row (|---|)
             if cells[0] in ("功能", "命令", "级别", "类别"):
                 continue  # header row
-            name = cells[0]
-            desc = cells[1] if len(cells) > 1 else ""
-            tag = cells[2] if len(cells) > 2 else ""
+            name = cells[0].replace("**", "")
+            desc = (cells[1] if len(cells) > 1 else "").replace("**", "")
+            tag = (cells[2] if len(cells) > 2 else "").replace("**", "")
             if name:
                 current[1].append((name, desc, tag))
     return sections
