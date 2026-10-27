@@ -4521,17 +4521,22 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         await _safe_send(msg)
         return True
 
-    # ── /帮助 — 命令列表 + 帮助卡片 ─────────────────────────────
+    # ── /帮助 — 命令速查卡片（文本只在渲染失败时兜底）────────────
+    # 2026-10 改版：HELP.md 精简为「一条命令一行」后，卡片与文本内容完全重合；
+    # 而官方途经每轮只有 4 条被动回复（群 5 条/5 分钟），同一份内容发两遍会挤掉
+    # 真正的解释。故默认只发卡片；卡片渲染/发送失败时才回退发文本，保证命令
+    # 始终查得到（文字兜底也顺带覆盖了图片加载不出来的客户端）。
     if cmd in ("/帮助", "#帮助", "/help", "#help", "/命令", "#命令"):
-        # 1. Send the HELP.md text (segmented)
-        await _send_markdown_doc(_HELP_MD_PATH, label="帮助文档")
-        # 2. Render and send the help card (best-effort; text already sent)
+        card_path = None
         try:
             card_path = await asyncio.to_thread(render_help_card, _HELP_MD_PATH)
-            if card_path:
-                await _safe_send(OutImage(path=card_path, label="help card"))
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 — 卡片是增强，不能让它拖垮命令
+            from nonebot import logger as _lg
+            _lg.warning(f"[help] card render failed: {e!r}")
+        if card_path:
+            await _safe_send(OutImage(path=card_path, label="help card"))
+        else:
+            await _send_markdown_doc(_HELP_MD_PATH, label="帮助文档")
         return True
 
     # ── /管理工作区 ─────────────────────────────────────────────
