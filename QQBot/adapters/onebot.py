@@ -209,6 +209,31 @@ def build_reply_context(event: MessageEvent) -> str:
 
     return ""
 
+def quoted_file_paths(event: MessageEvent) -> list[str]:
+    """Local paths of the files carried by the message this event quotes.
+
+    OneBot never inlines quoted content into the reply segment (it only
+    carries the quoted message id), so quoted attachments are resolved
+    through turn.py's recent-file registry — populated whenever this bot
+    downloaded that file. Used by /设形象 to accept "引用一张图 + 发命令".
+    """
+    reply_id = ""
+    for seg in event.message:
+        if seg.type == "reply":
+            reply_id = str(seg.data.get("id", ""))
+            break
+    if not reply_id:
+        reply = getattr(event, "reply", None)
+        if isinstance(reply, dict):
+            reply_id = str(reply.get("message_id") or reply.get("id") or "")
+        elif reply is not None:
+            reply_id = str(
+                getattr(reply, "message_id", "") or getattr(reply, "id", "") or "")
+    if not reply_id:
+        return []
+    return [f["path"] for f in _recent_files.get(reply_id, []) if f.get("path")]
+
+
 # ── View construction ──────────────────────────────────────────────
 
 def _is_mentioned(event: MessageEvent) -> bool:
