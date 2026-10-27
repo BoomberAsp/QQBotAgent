@@ -136,6 +136,7 @@ from tools.social_tools import (
 from agent.asset_memory import (
     ASSET_UPLOAD, AssetCard, AssetMemory, make_asset_id,
 )
+from agent.portrait import describe_size, normalize_reference_image
 
 # ── Sender slots (assigned by the entry plugin at import time) ─────
 # _safe_send() and the continuous/poke paths send through
@@ -1306,6 +1307,35 @@ def _record_file(message_id: str, name: str, path: str = "", error: str = ""):
         del _recent_files[oldest]
 
 
+def _attachment_label(att) -> str:
+    """Human label for an attachment inside a prompt line."""
+    if att.kind == "file":
+        return f"文件 {att.name}"
+    return {"image": "图片", "voice": "语音消息"}.get(att.kind, "文件")
+
+
+def _attachment_saved_line(att) -> str:
+    """Prompt line for a downloaded attachment (quoted vs uploaded now)."""
+    if att.quoted:
+        return f"[用户引用了{_attachment_label(att)}，已保存至: {att.path}]"
+    if att.kind == "image":
+        return f"[用户上传了图片，已保存至: {att.path}]"
+    if att.kind == "file":
+        return f"[用户上传了文件 {att.name}，已保存至: {att.path}]"
+    return f"[用户发送了语音消息，已保存至: {att.path}]"
+
+
+def _attachment_error_line(att) -> str:
+    """Prompt line for an attachment whose download failed."""
+    if att.quoted:
+        return f"[用户引用的{_attachment_label(att)}下载失败: {att.error}]"
+    if att.kind == "image":
+        return f"[用户上传了图片，但下载失败: {att.error}]"
+    if att.kind == "file":
+        return f"[用户上传了文件 {att.name}，但下载失败: {att.error}]"
+    return f"[用户发送了语音消息，但下载失败: {att.error}]"
+
+
 def _record_session_file(user_id: str, abs_path: str) -> None:
     """Attribute a newly written workspace file to the active special session.
 
@@ -2194,6 +2224,10 @@ async def handle_agent_turn(view: InboundMessage):
         cmd_handled = await _handle_session_command(text_content, user_id)
         if cmd_handled:
             return
+        # /设形象 /形象 /清除形象 — 自创角色的参考立绘（直连，零 token）
+        cmd_handled = await _handle_portrait_command(text_content, user_id, view)
+        if cmd_handled:
+            return
 
     # ── Quota cleanup protocol intercept ───────────────────────────
     # Runs before file download / agent so that, when the user is over quota,
@@ -2224,41 +2258,41 @@ async def handle_agent_turn(view: InboundMessage):
             _upload_persona = _p_up
     except Exception:  # noqa: BLE001
         _upload_persona = ""
+    has_quoted_attachment = False
     for att in await view.load_attachments():
+        has_quoted_attachment = has_quoted_attachment or att.quoted
         if att.kind == "image":
             if att.path:
-                file_context_parts.append(f"[用户上传了图片，已保存至: {att.path}]")
+                file_context_parts.append(_attachment_saved_line(att))
                 _record_file(msg_id, att.name, att.path)
                 _record_session_file(user_id, att.path)
                 if _upload_persona:
                     _spawn_textualize_upload(
                         user_id, _upload_persona, "image", att.path)
             elif att.error:
-                file_context_parts.append(f"[用户上传了图片，但下载失败: {att.error}]")
+                file_context_parts.append(_attachment_error_line(att))
                 _record_file(msg_id, att.name, error=att.error)
 
         elif att.kind == "file":
             if att.path:
-                file_context_parts.append(f"[用户上传了文件 {att.name}，已保存至: {att.path}]")
+                file_context_parts.append(_attachment_saved_line(att))
                 _record_file(msg_id, att.name, att.path)
                 _record_session_file(user_id, att.path)
             elif att.error:
-                file_context_parts.append(f"[用户上传了文件 {att.name}，但下载失败: {att.error}]")
+                file_context_parts.append(_attachment_error_line(att))
                 _record_file(msg_id, att.name, error=att.error)
 
         elif att.kind == "voice":
             has_voice = True
             if att.path:
-                file_context_parts.append(
-                    f"[用户发送了语音消息，已保存至: {att.path}]"
-                )
+                file_context_parts.append(_attachment_saved_line(att))
                 _record_file(msg_id, att.name, att.path)
                 _record_session_file(user_id, att.path)
                 if _upload_persona:
                     _spawn_textualize_upload(
                         user_id, _upload_persona, "voice", att.path)
             elif att.error:
-                file_context_parts.append(f"[用户发送了语音消息，但下载失败: {att.error}]")
+                file_context_parts.append(_attachment_error_line(att))
                 _record_file(msg_id, att.name, error=att.error)
 
     # ── Quota warning after any upload ─────────────────────────────
@@ -2270,7 +2304,10 @@ async def handle_agent_turn(view: InboundMessage):
     # upload awaiting later analysis. Skipping the agent for voice broke
     # the pre-existing "语音直达 LLM" behavior (regression from f7e5f4e).
     has_files = bool(file_context_parts)
-    if has_files and not has_voice and not text_content and not reply_context:
+    # A quoted attachment means "look at this", not "here is a new upload":
+    # never swallow that turn behind the file-received acknowledgement.
+    if (has_files and not has_voice and not has_quoted_attachment
+            and not text_content and not reply_context):
         names = []
         for part in file_context_parts:
             m = re.search(r"文件 (.+?)，", part) or re.search(r"上传了(\w+)，", part)
@@ -2697,27 +2734,25 @@ async def handle_continuous_turn(view: InboundMessage):
                 _record_file(msg_id, att.name, att.path)
                 _record_session_file(user_id, att.path)
             elif att.error:
-                file_context_parts.append(f"[用户上传了图片，但下载失败: {att.error}]")
+                file_context_parts.append(_attachment_error_line(att))
                 _record_file(msg_id, att.name, error=att.error)
 
         elif att.kind == "file":
             if att.path:
-                file_context_parts.append(f"[用户上传了文件 {att.name}，已保存至: {att.path}]")
+                file_context_parts.append(_attachment_saved_line(att))
                 _record_file(msg_id, att.name, att.path)
                 _record_session_file(user_id, att.path)
             elif att.error:
-                file_context_parts.append(f"[用户上传了文件 {att.name}，但下载失败: {att.error}]")
+                file_context_parts.append(_attachment_error_line(att))
                 _record_file(msg_id, att.name, error=att.error)
 
         elif att.kind == "voice":
             if att.path:
-                file_context_parts.append(
-                    f"[用户发送了语音消息，已保存至: {att.path}]"
-                )
+                file_context_parts.append(_attachment_saved_line(att))
                 _record_file(msg_id, att.name, att.path)
                 _record_session_file(user_id, att.path)
             elif att.error:
-                file_context_parts.append(f"[用户发送了语音消息，但下载失败: {att.error}]")
+                file_context_parts.append(_attachment_error_line(att))
                 _record_file(msg_id, att.name, error=att.error)
 
     # ── Quota warning after any upload this turn ───────────────────
@@ -4004,6 +4039,130 @@ async def _handle_toggle_command(text: str, user_id: str, view: InboundMessage) 
     except ValueError as e:
         await _safe_send(str(e))
 
+    return True
+
+
+# ── 参考立绘：/设形象 · /形象 · /清除形象（UGC 角色，零 token）──────
+# 参考立绘是角色卡之外的第二条视觉锚：文字锚是卡里的 ## Appearance Anchor，
+# 图片锚是 CHARACTERS_DIR/<char_id>/assets/reference.*（I2I 用）。只在自创
+# 角色上开放——内置角色是公共设定，改了会影响所有用户。
+_PORTRAIT_SET_CMDS = ("/设形象", "#设形象")
+_PORTRAIT_SHOW_CMDS = ("/形象", "#形象", "/查看形象")
+_PORTRAIT_CLEAR_CMDS = ("/清除形象", "#清除形象", "/删形象")
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+
+
+def _owned_ugc(registry, char_id: str, user_id: str) -> bool:
+    """True if ``char_id`` is a UGC character authored by ``user_id``."""
+    return bool(
+        char_id
+        and registry.is_ugc(char_id)
+        and (registry.get_meta(char_id) or {}).get("author") == user_id
+    )
+
+
+def _portrait_target(registry, text: str, user_id: str, view):
+    """Resolve (char_id, display_name, error_msg) for a portrait command."""
+    _, _, args = text.partition(" ")
+    args = args.strip()
+    if args:
+        char_id = registry.resolve_name(args, user_id=user_id)
+        if not _owned_ugc(registry, char_id, user_id):
+            return "", "", (
+                f"没找到你的自创角色「{args}」。参考立绘只能设在自己的自创角色上："
+                "用 /人格切换 查看可用角色，或 /创建角色 新建一个。")
+        return char_id, registry.get_display_name(char_id), ""
+
+    char_id = registry.resolve_effective_personality(user_id, view.group_id)
+    if not _owned_ugc(registry, char_id, user_id):
+        name = registry.get_display_name(char_id) if char_id else "当前人格"
+        return "", "", (
+            f"当前人格「{name}」不是你的自创角色，设不了参考立绘。\n"
+            "可以先用 /人格切换 切到自己的角色，或直接写 `/设形象 <角色名>`。")
+    return char_id, registry.get_display_name(char_id), ""
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+async def _portrait_source(view):
+    """Find the image for /设形象 → (path, source_label, error_msg)."""
+    atts = await view.load_attachments()
+    images = [a for a in atts if a.kind == "image"]
+    for att in images:                      # 本条消息新发的优先，其次引用图
+        if att.path:
+            return att.path, ("引用的图" if att.quoted else "这张图"), ""
+    if images:
+        return "", "", (
+            f"图片下载失败了（{images[0].error or '未知原因'}），重新发一次试试")
+    if getattr(view, "platform", "") == "onebot":
+        # OneBot 的引用图不在 segments 里，靠 recent-file 注册表反查
+        try:
+            from adapters.onebot import quoted_file_paths
+            for path in quoted_file_paths(view.raw):
+                if path.lower().endswith(_IMAGE_EXTS) and os.path.isfile(path):
+                    return path, "引用的图", ""
+        except Exception:  # noqa: BLE001 — 反查失败按“没图”处理
+            pass
+    return "", "", (
+        "没看到图片。把图片和命令一起发（图片 + `/设形象`），"
+        "或引用你之前发的那张图再发 `/设形象`。")
+
+
+async def _handle_portrait_command(text: str, user_id: str, view) -> bool:
+    """`/设形象` / `/形象` / `/清除形象` —— 自创角色的参考立绘（零 token）。"""
+    cmd = text.partition(" ")[0]
+    if cmd not in (_PORTRAIT_SET_CMDS + _PORTRAIT_SHOW_CMDS + _PORTRAIT_CLEAR_CMDS):
+        return False
+    registry = get_character_registry()
+    char_id, display, err = _portrait_target(registry, text, user_id, view)
+    if err:
+        await _safe_send(err)
+        return True
+
+    if cmd in _PORTRAIT_SET_CMDS:
+        path, source, err = await _portrait_source(view)
+        if err:
+            await _safe_send(err)
+            return True
+        try:
+            raw = await asyncio.to_thread(_read_bytes, path)
+            data, width, height = await asyncio.to_thread(
+                normalize_reference_image, raw)
+            await asyncio.to_thread(
+                registry.set_reference_image, char_id, data, "png")
+        except ValueError as e:              # 校验失败：文案可直接回给用户
+            await _safe_send(str(e))
+            return True
+        except Exception as e:               # noqa: BLE001
+            code = log_exception("set reference portrait failed", e)
+            await _safe_send(f"保存参考立绘失败（诊断编号 {code}），稍后再试。")
+            return True
+        await _safe_send(
+            f"✅ 已把{source}设为「{display}」的参考立绘"
+            f"（{describe_size(width, height, len(data))}）。\n"
+            "之后向 TA 要画图、以及 TA 主动发图，都会以这张图作为外观基准"
+            "（文字外观设定 + 图片双重锚定），脸更稳。\n"
+            "随时可发 /形象 查看，或 /清除形象 撤掉。")
+        return True
+
+    if cmd in _PORTRAIT_SHOW_CMDS:
+        current = registry.reference_image_path(char_id)
+        if not current:
+            await _safe_send(
+                f"「{display}」还没有参考立绘。\n"
+                "把一张图发给 TA 并附上 `/设形象`（或引用那张图再发 `/设形象`）即可设置。")
+            return True
+        await _safe_send(f"「{display}」当前的参考立绘：")
+        await _safe_send(OutImage(path=current, label=f"{display} 参考立绘"))
+        return True
+
+    if not registry.clear_reference_image(char_id):      # /清除形象
+        await _safe_send(f"「{display}」本来就没有参考立绘。")
+        return True
+    await _safe_send(f"已清除「{display}」的参考立绘，之后按文字外观设定作画。")
     return True
 
 

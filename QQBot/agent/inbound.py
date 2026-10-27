@@ -34,6 +34,8 @@ class Attachment:
     name: str = ""                # semantic name used in prompts/_recent_files
     content_type: str = ""
     error: str = ""               # download failure reason ("" on success)
+    quoted: bool = False          # came from the *quoted* message rather than
+                                  # this turn's upload (official: msg_elements)
 
     def __post_init__(self) -> None:
         if not self.name and self.path:

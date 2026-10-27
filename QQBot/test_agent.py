@@ -8121,6 +8121,306 @@ class TestStoryKbInjectionGate:
             self._restore(orig)
 
 
+class TestQQOfficialQuoteParsing:
+    """47. 官方途经：引用消息（message_type=103）的文本与附件解析.
+
+    引用消息在 API 里是「当前事件 + msg_elements 里的被引用内容」：被引用
+    的图片/文件挂在 msg_elements[].attachments 上，而不是事件顶层
+    attachments。构建视图时若只读顶层字段，整条引用消息会退化成空消息，
+    内核直接 return，智能体什么也看不到（迁移后线上现象）。
+    """
+
+    BASE = {
+        "id": "M1",
+        "content": "",
+        "timestamp": "2026-10-27T10:00:00+08:00",
+        "author": {"id": "U1", "user_openid": "U1", "username": "小明", "bot": False},
+    }
+
+    def __init__(self):
+        self.qo = None
+        self.C2C = None
+
+    def run(self):
+        print_header("47. QQ Official Quote Parsing")
+        # The adapter chain imports agent.turn, which builds its managers from
+        # USER_DATA_ROOT at import time — same smoke root the later suites use.
+        os.environ.setdefault("USER_DATA_ROOT", "/tmp/qqbot_smoke")
+        import adapters.qq_official as qo
+        from nonebot.adapters.qq.event import C2CMessageCreateEvent
+        self.qo = qo
+        self.C2C = C2CMessageCreateEvent
+        self.test_quote_only_image_is_resolved()
+        self.test_quote_plus_fresh_upload_keeps_both()
+        self.test_voice_content_type_maps_to_voice()
+        self.test_plain_upload_unchanged()
+
+    # ── helpers ──────────────────────────────────────────────────
+    def _view(self, payload):
+        event = self.C2C.model_validate(payload)
+        return self.qo.build_view(MagicMock(self_id="APPID123"), event)
+
+    def _resolve(self, view):
+        """Run load_attachments with the disk downloader stubbed out."""
+        async def fake_download(url, name, bot=None, file_id=""):
+            return f"/tmp/uploads/{name}", ""
+
+        orig = self.qo._download_and_save_file
+        self.qo._download_and_save_file = fake_download
+        try:
+            return asyncio.run(view.load_attachments())
+        finally:
+            self.qo._download_and_save_file = orig
+
+    def _quote_payload(self, **over):
+        payload = {
+            **self.BASE,
+            "content": " ",
+            "message_type": 103,
+            "message_scene": {"source": "default", "ext": ["ref_msg_idx=OLD"]},
+            "msg_elements": [{
+                "msg_idx": "OLD",
+                "message_type": 0,
+                "content": "上次的截图",
+                "author": {"id": "U1", "user_openid": "U1", "username": "小明"},
+                "attachments": [{
+                    "content_type": "image/png",
+                    "filename": "old.png",
+                    "url": "https://cdn.example/old.png",
+                }],
+            }],
+        }
+        payload.update(over)
+        return payload
+
+    # ── cases ────────────────────────────────────────────────────
+    def test_quote_only_image_is_resolved(self):
+        """纯引用（本条无文字、无附件）也要拿到被引用的图。"""
+        view = self._view(self._quote_payload())
+        assert "上次的截图" in view.reply_context, view.reply_context
+        atts = self._resolve(view)
+        assert len(atts) == 1, atts
+        assert atts[0].kind == "image" and atts[0].quoted, atts[0]
+        print_pass("引用消息：引用文本 + 被引用图片均已解析")
+
+    def test_quote_plus_fresh_upload_keeps_both(self):
+        """「引用旧图 + 上传新图」：两张都要，且新旧标记正确。"""
+        payload = self._quote_payload(
+            content="和这张比一下",
+            attachments=[{
+                "content_type": "image/jpeg",
+                "filename": "new.jpg",
+                "url": "https://cdn.example/new.jpg",
+            }],
+        )
+        atts = self._resolve(self._view(payload))
+        assert len(atts) == 2, atts
+        fresh = [a for a in atts if not a.quoted]
+        quoted = [a for a in atts if a.quoted]
+        assert len(fresh) == 1 and fresh[0].name == "new.jpg", fresh
+        assert len(quoted) == 1 and quoted[0].name == "old.png", quoted
+        print_pass("引用 + 新上传：顺序与新/引用标记都正确")
+
+    def test_voice_content_type_maps_to_voice(self):
+        """官方语音的 content_type 是裸 'voice'，不能落成文件。"""
+        payload = {
+            **self.BASE,
+            "content": "",
+            "message_type": 0,
+            "attachments": [{
+                "content_type": "voice",
+                "filename": "v.silk",
+                "url": "https://cdn.example/v.silk",
+            }],
+        }
+        atts = self._resolve(self._view(payload))
+        assert len(atts) == 1 and atts[0].kind == "voice", atts
+        print_pass("content_type=voice → voice（不再降级成文件）")
+
+    def test_plain_upload_unchanged(self):
+        """普通上传保持原语义：非引用、无 reply_context。"""
+        payload = {
+            **self.BASE,
+            "content": "看这张",
+            "message_type": 0,
+            "attachments": [{
+                "content_type": "image/png",
+                "filename": "a.png",
+                "url": "https://cdn.example/a.png",
+            }],
+        }
+        view = self._view(payload)
+        assert view.reply_context == "", view.reply_context
+        atts = self._resolve(view)
+        assert len(atts) == 1 and not atts[0].quoted and atts[0].kind == "image", atts
+        print_pass("普通上传：语义不变（quoted=False）")
+
+
+class TestReferencePortrait:
+    """48. /设形象 —— 自创角色参考立绘（校验/落盘/命令链路）."""
+
+    def __init__(self):
+        self.turn = None
+
+    def run(self):
+        print_header("48. Reference Portrait (/设形象)")
+        os.environ.setdefault("USER_DATA_ROOT", "/tmp/qqbot_smoke")
+        import agent.turn as turn
+        self.turn = turn
+        self.test_normalize()
+        self.test_registry_roundtrip()
+        self.test_command_chain()
+        self.test_guardrails()
+
+    # ── helpers ──────────────────────────────────────────────────
+    @staticmethod
+    def _png(size=(900, 1200), mode="RGB"):
+        import io as _io
+        from PIL import Image
+        color = (200, 120, 90) if mode == "RGB" else (200, 120, 90, 128)
+        buf = _io.BytesIO()
+        Image.new(mode, size, color).save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _registry(self, tmp):
+        from agent.character_registry import CharacterRegistry
+        reg = CharacterRegistry(characters_dir=tmp)
+        char_id = "测试角色_abc123"
+        reg.register_character(char_id, "# 测试角色\n", {
+            "char_id": char_id, "display_name": "测试角色", "author": "u1"})
+        return reg, char_id
+
+    def _view(self, path=None, user_id="u1"):
+        from agent.inbound import Attachment, InboundMessage
+        view = InboundMessage(user_id=user_id, platform="onebot")
+        view.attachments = ([Attachment(kind="image", path=path, name="up.png")]
+                            if path else [])
+        view.attachments_loaded = True
+        return view
+
+    # ── cases ────────────────────────────────────────────────────
+    def test_normalize(self):
+        from agent.portrait import normalize_reference_image
+        data, w, h = normalize_reference_image(self._png())
+        assert (w, h) == (900, 1200) and data[:8] == b"\x89PNG\r\n\x1a\n", (w, h)
+        _, w2, h2 = normalize_reference_image(self._png((3000, 2000)))
+        assert max(w2, h2) == 1536, (w2, h2)
+        # alpha 铺白底 → 仍出 PNG，尺寸不变
+        _, w3, h3 = normalize_reference_image(self._png((400, 500), "RGBA"))
+        assert (w3, h3) == (400, 500), (w3, h3)
+        for bad in (b"", b"definitely not an image", self._png((64, 64))):
+            try:
+                normalize_reference_image(bad)
+            except ValueError:
+                continue
+            raise AssertionError("normalize 应拒绝非法输入")
+        print_pass("normalize: 保留尺寸/限边 1536/alpha 铺白底/拒空·非图·过小")
+
+    def test_registry_roundtrip(self):
+        tmp = tempfile.mkdtemp(prefix="portrait_reg_")
+        reg, char_id = self._registry(tmp)
+        try:
+            assert reg.reference_image_path(char_id) is None
+            path = reg.set_reference_image(char_id, self._png(), "png")
+            assert os.path.isfile(path) and path.endswith("assets/reference.png"), path
+            assert reg.reference_image_path(char_id) == path
+            # 旧扩展名要被清掉，永远只有一张参考图
+            stale = os.path.join(reg.reference_image_dir(char_id), "reference.jpg")
+            with open(stale, "wb") as f:
+                f.write(b"x")
+            reg.set_reference_image(char_id, self._png(), "png")
+            assert not os.path.isfile(stale), "stale reference.jpg should be removed"
+            assert reg.clear_reference_image(char_id) is True
+            assert reg.reference_image_path(char_id) is None
+            assert reg.clear_reference_image(char_id) is False
+            print_pass("registry: 原子落盘 / 旧扩展名清理 / 读回 / 清除幂等")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_command_chain(self):
+        turn = self.turn
+        tmp = tempfile.mkdtemp(prefix="portrait_cmd_")
+        reg, char_id = self._registry(tmp)
+        sent = []
+
+        async def fake_send(payload, sender=None):
+            sent.append(payload)
+
+        orig = (turn.get_character_registry, turn._safe_send)
+        try:
+            turn.get_character_registry = lambda: reg
+            turn._safe_send = fake_send
+            reg.resolve_effective_personality = lambda uid, gid=None: char_id
+
+            with open(os.path.join(tmp, "up.png"), "wb") as f:
+                f.write(self._png((700, 900)))
+            view = self._view(os.path.join(tmp, "up.png"))
+
+            assert asyncio.run(turn._handle_portrait_command("/设形象", "u1", view))
+            assert "参考立绘" in sent[-1] and "700×900" in sent[-1], sent[-1]
+            assert reg.reference_image_path(char_id), "portrait file missing"
+
+            sent.clear()
+            assert asyncio.run(turn._handle_portrait_command("/形象", "u1", view))
+            assert isinstance(sent[0], str)
+            from agent.outbound import OutImage
+            assert isinstance(sent[1], OutImage), sent
+            assert sent[1].path == reg.reference_image_path(char_id)
+
+            sent.clear()
+            assert asyncio.run(turn._handle_portrait_command("/清除形象", "u1", view))
+            assert reg.reference_image_path(char_id) is None
+            print_pass("command: 设形象→落盘 / 形象→文本+OutImage / 清除形象→删文件")
+        finally:
+            turn.get_character_registry, turn._safe_send = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_guardrails(self):
+        turn = self.turn
+        tmp = tempfile.mkdtemp(prefix="portrait_guard_")
+        reg, char_id = self._registry(tmp)
+        sent = []
+
+        async def fake_send(payload, sender=None):
+            sent.append(payload)
+
+        orig = (turn.get_character_registry, turn._safe_send)
+        try:
+            turn.get_character_registry = lambda: reg
+            turn._safe_send = fake_send
+            with open(os.path.join(tmp, "up.png"), "wb") as f:
+                f.write(self._png((300, 300)))
+            img = os.path.join(tmp, "up.png")
+
+            # ① 没图 → 提示怎么发
+            reg.resolve_effective_personality = lambda uid, gid=None: char_id
+            asyncio.run(turn._handle_portrait_command("/设形象", "u1", self._view()))
+            assert "没看到图片" in sent[-1], sent[-1]
+
+            # ② 别人的角色 → 拒绝
+            sent.clear()
+            asyncio.run(turn._handle_portrait_command(
+                "/设形象 测试角色", "u2", self._view(img, user_id="u2")))
+            assert "没找到你的自创角色" in sent[-1], sent[-1]
+            assert reg.reference_image_path(char_id) is None
+
+            # ③ 内置人格 → 拒绝（不能改公共设定）
+            sent.clear()
+            reg.resolve_effective_personality = lambda uid, gid=None: "rubi"
+            asyncio.run(turn._handle_portrait_command(
+                "/设形象", "u1", self._view(img)))
+            assert "不是你的自创角色" in sent[-1], sent[-1]
+
+            # ④ 非本命令文本 → 不拦截
+            assert asyncio.run(turn._handle_portrait_command(
+                "/人格切换", "u1", self._view(img))) is False
+            print_pass("guard: 无图提示 / 他人角色拒 / 内置人格拒 / 非本命令放行")
+        finally:
+            turn.get_character_registry, turn._safe_send = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -8176,6 +8476,8 @@ def main():
         ("WebUI Model Sections (IMAGE_GEN/TTS)", TestWebuiModelSections()),
         ("Initial Bond Seeding (UGC)", TestInitialBond()),
         ("Story-KB Injection Gate", TestStoryKbInjectionGate()),
+        ("QQ Official Quote Parsing", TestQQOfficialQuoteParsing()),
+        ("Reference Portrait (/设形象)", TestReferencePortrait()),
     ]
 
     passed = 0

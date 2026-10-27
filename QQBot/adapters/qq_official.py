@@ -15,17 +15,25 @@ Official-route realities that shape this module (plan §7.5 / analysis):
     quota overflow with a warning;
   - the API cannot read local files: OutImage.path → base64 upload via
     MessageSegment.file_image(); OutImage.url → platform-side fetch;
-  - inbound attachments arrive as public https URLs (event.attachments)
-    and are downloaded with the same neutral URL→disk helper the OneBot
-    resolver uses (uuid-prefixed naming, size cap, magic-byte extension
-    detection, per-user workspace uploads dir), so the kernel sees
-    identical Attachment semantics on both routes.
+  - inbound attachments arrive as public https URLs and are downloaded
+    with the same neutral URL→disk helper the OneBot resolver uses
+    (uuid-prefixed naming, size cap, magic-byte extension detection,
+    per-user workspace uploads dir), so the kernel sees identical
+    Attachment semantics on both routes;
+  - a *quoted* message (message_type=103) carries the referenced content
+    and its attachments inside msg_elements[] (indexed by
+    message_scene.ext ref_msg_idx); the adapter's _check_reply() also
+    resolves that element into event.reply. Both are read here: the quoted
+    text becomes reply_context and the quoted attachments are downloaded
+    with quoted=True, so the kernel can tell "the user just sent this"
+    from "the user is pointing at this".
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from nonebot import logger
@@ -95,6 +103,94 @@ def _clean_content(raw: str | None) -> str:
     return _FACE_TAG_RE.sub("", raw or "").strip()
 
 
+# A quote can carry a whole merged chat history; truncate so one long quote
+# cannot eat the prompt budget (the full text is still on the platform).
+_QUOTE_TEXT_LIMIT = 400
+
+
+@dataclass
+class _Quoted:
+    """The quoted message: its text plus every attachment it carried."""
+    text: str = ""
+    attachments: list = field(default_factory=list)
+    author_name: str = ""
+
+
+def _scene_ext(event: QQMessageEvent) -> dict[str, str]:
+    """message_scene.ext (["msg_idx=…", "ref_msg_idx=…"]) → dict."""
+    scene = getattr(event, "message_scene", None)
+    out: dict[str, str] = {}
+    for item in (getattr(scene, "ext", None) or []):
+        if isinstance(item, str) and "=" in item:
+            key, value = item.split("=", 1)
+            out[key.strip()] = value.strip()
+    return out
+
+
+def _quoted_message(event: QQMessageEvent) -> _Quoted:
+    """Extract the quoted message (text + attachments) from an inbound event.
+
+    Official API: replying to a message delivers message_type=103 with the
+    referenced content in msg_elements[] and its index in
+    message_scene.ext.ref_msg_idx; nonebot-adapter-qq >= 1.7 also resolves
+    the referenced element into event.reply. Prefer event.reply (that is the
+    element the platform says was quoted) and fall back to msg_elements.
+
+    Attachments are gathered from every element, not just the referenced
+    one: nested/merged quotes (message_type 101/102) put their payload one
+    level deeper, and deduping by URL below keeps that harmless.
+    """
+    elements = list(getattr(event, "msg_elements", None) or [])
+    reply = getattr(event, "reply", None)
+    if reply is not None and all(reply is not element for element in elements):
+        elements.insert(0, reply)
+    if not elements:
+        if getattr(event, "message_type", None) == 103:
+            # 103 means "this is a quote" but nothing came with it — log it so a
+            # future payload shape does not silently degrade to an empty turn.
+            logger.warning(
+                "[qq_official] message_type=103 without msg_elements: "
+                "quoted content unavailable")
+        return _Quoted()
+
+    ref_idx = _scene_ext(event).get("ref_msg_idx", "")
+    target = next(
+        (element for element in elements
+         if getattr(element, "msg_idx", None) == ref_idx), None)
+    if target is None:
+        target = elements[0]
+
+    attachments: list = []
+    seen: set[str] = set()
+    for element in elements:
+        for att in (getattr(element, "attachments", None) or []):
+            url = getattr(att, "url", "") or ""
+            if url and url not in seen:
+                seen.add(url)
+                attachments.append(att)
+
+    author = getattr(target, "author", None)
+    return _Quoted(
+        text=_clean_content(getattr(target, "content", "") or ""),
+        attachments=attachments,
+        author_name=(getattr(author, "username", "") or "").strip(),
+    )
+
+
+def _quote_context(quoted: _Quoted) -> str:
+    """Quoted message → prompt line (OneBot parity: [用户引用了消息: "…"]).
+
+    Only the text belongs here: attachment paths are produced by the
+    resolver so a failed download degrades exactly like a failed upload.
+    """
+    text = quoted.text
+    if not text:
+        return ""
+    if len(text) > _QUOTE_TEXT_LIMIT:
+        text = text[:_QUOTE_TEXT_LIMIT].rstrip() + "…"
+    return f'[用户引用了消息: "{text}"]'
+
+
 def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
     """QQ official event -> platform-agnostic view (attachments stay lazy).
 
@@ -106,6 +202,7 @@ def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
     is_group = isinstance(event, GroupMessageCreateEvent)
     author = event.author
     user_id = author.member_openid if is_group else author.user_openid
+    quoted = _quoted_message(event)
     return InboundMessage(
         user_id=str(user_id),
         is_group=is_group,
@@ -114,42 +211,67 @@ def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
         message_id=str(event.id),
         self_id=str(bot.self_id),
         mentioned=True if not is_group else bool(getattr(event, "to_me", True)),
-        reply_context="",  # official API has no inbound quote passthrough
-        resolver=QQOfficialAttachmentResolver(event),
+        reply_context=_quote_context(quoted),
+        resolver=QQOfficialAttachmentResolver(event, quoted),
         platform="qq_official",
         raw=event,
     )
 
 
 class QQOfficialAttachmentResolver:
-    """Downloads event.attachments (public https URLs) to the uploads dir.
+    """Downloads this turn's attachments *and* the quoted message's ones.
 
     Kind mapping mirrors the OneBot resolver: image/* → image,
-    audio/* → voice ("语音消息"), everything else (video/file) → file.
+    audio/*|voice → voice ("语音消息"), everything else (video/file) → file.
+    Quoted attachments carry quoted=True so the kernel words them as
+    "[用户引用了…]" rather than "[用户上传了…]" (they were sent earlier).
     Failures become Attachment.error entries so the kernel records them
     in _recent_files and the prompt exactly like failed NapCat downloads.
     """
 
-    def __init__(self, event: QQMessageEvent):
+    def __init__(self, event: QQMessageEvent, quoted: _Quoted | None = None):
         self._event = event
+        self._quoted = quoted if quoted is not None else _quoted_message(event)
 
     async def resolve(self, view: InboundMessage) -> list[Attachment]:
         out: list[Attachment] = []
-        for att in (self._event.attachments or []):
+        seen: set[str] = set()
+        # This turn's uploads first (they are "now"), then the quoted ones;
+        # dedupe by URL because some payloads repeat the attachment in both.
+        pending = [(att, False) for att in (self._event.attachments or [])]
+        pending += [(att, True) for att in self._quoted.attachments]
+        for att, quoted in pending:
             url = att.url or ""
-            if not url:
+            if not url or url in seen:
                 continue
-            ct = (att.content_type or "").split("/", 1)[0]
-            if ct == "image":
-                kind, name = "image", att.filename or f"image-{abs(hash(url)) % 10**8}"
-            elif ct == "audio":
-                kind, name = "voice", "语音消息"
-            else:
-                kind, name = "file", att.filename or f"file-{abs(hash(url)) % 10**8}"
+            seen.add(url)
+            kind, name = _classify_attachment(att, url)
             saved_path, error = await _download_and_save_file(url, name, bot=None)
+            if error:
+                logger.warning(
+                    f"[qq_official] attachment download failed "
+                    f"({'quoted ' if quoted else ''}{kind} {name!r}): {error}")
             out.append(Attachment(kind=kind, path=saved_path or "",
-                                  name=name, error=error or ""))
+                                  name=name, error=error or "", quoted=quoted))
         return out
+
+
+def _classify_attachment(att, url: str) -> tuple[str, str]:
+    """MessageAttachment → (kernel kind, filename used on disk / in prompts).
+
+    The official API reports 语音消息 with the bare content_type "voice"
+    (not audio/*), and group files as "file" — mapping both here keeps voice
+    turns on the voice path instead of silently degrading to a file card.
+    """
+    ct = (att.content_type or "").strip().lower()
+    filename = (att.filename or "").strip()
+    if ct.startswith("image"):
+        return "image", filename or f"image-{abs(hash(url)) % 10 ** 8}"
+    if ct.startswith("audio") or ct in ("voice", "silk", "amr"):
+        return "voice", "语音消息"
+    if ct.startswith("video"):
+        return "file", filename or f"video-{abs(hash(url)) % 10 ** 8}"
+    return "file", filename or f"file-{abs(hash(url)) % 10 ** 8}"
 
 
 class QQOfficialSender:
