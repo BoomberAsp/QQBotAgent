@@ -3525,20 +3525,54 @@ async def _finish_bond_scene(user_id: str, result: dict, sender=None):
         log_exception("bond scene finish failed", e)
 
 
+async def _scene_opening_performance(char_id: str, title: str, scene: dict):
+    """LLM（flash）以角色口吻演绎剧情开场。None → 调用方降级到零 LLM 固定文案。
+
+    脚本正文是给模型的舞台指示（分幕梗概），绝不能原文发给用户；这里让模型
+    按第一幕即兴演绎出有画面感的开场白（环境+动作+台词），并留出回应空间。
+    """
+    try:
+        persona_content = get_character_registry().load(char_id) or ""
+        body = str(scene.get("body") or "").strip()
+        if not persona_content or not body:
+            return None
+        system = (
+            persona_content
+            + "\n\n---\n你正在扮演上述角色，即将与用户（对你最重要的人）一对一"
+              "共同演绎下方剧情脚本。现在是剧情开场：请按脚本**第一幕**的设定，"
+              "以角色口吻演绎开场——描写环境与你的动作、神态、语气，说出台词，"
+              "结尾自然留出等待用户回应的空间。\n"
+              "要求：全程保持角色，不要以助手身份说话；舞台指示（【第X幕】等）"
+              "是给你的设定，**不要照搬或复述**；不要提前演绎后续幕的内容；"
+              "不使用 markdown；不报任何数值；只输出剧情正文本身；不超过 180 字。"
+        )
+        prompt = (
+            f"剧情《{title}》脚本如下：\n{body}\n\n"
+            f"请演绎这段剧情第一幕的开场。"
+        )
+        raw = await _model_router.flash_client.chat_completion(
+            message=prompt,
+            history=[{"role": "system", "content": system}],
+            timeout_set=20.0,
+            purpose="bond_scene_opening",
+        )
+        candidate = (raw or "").strip()
+        if (
+            candidate
+            and not candidate.startswith(_LLM_ERROR_PREFIXES)
+            and len(candidate) <= 400
+            and "【" not in candidate
+        ):
+            return candidate
+    except Exception:
+        pass
+    return None
+
+
 def _scene_opening_line(char_id: str, title: str, scene: dict) -> str:
-    """零 LLM 的场景开场种子消息：取脚本首个有效行作开场幕。"""
-    body = str(scene.get("body") or "").strip()
-    first = ""
-    for ln in body.splitlines():
-        ln = ln.strip()
-        if ln and not ln.startswith(("#", ">", "-")):
-            first = ln
-            break
+    """零 LLM 降级开场：通用引导文案。绝不回显脚本原文（那是给模型的舞台指示）。"""
     short = get_character_registry().get_short_name(char_id)
     head = f"—— 剧情《{title}》开始 ——"
-    if first:
-        return (f"{head}\n{first}\n\n（{short} 看向你，等待你的回应。"
-                f"随时可 /结束会话 退出）")
     return (f"{head}\n{short} 轻轻拉住你的衣袖，眼里带着期待。"
             f"「我们出发吧？」\n\n（随时可 /结束会话 退出）")
 
@@ -3588,7 +3622,12 @@ async def _start_bond_scene(user_id: str, char_id: str, scene: dict) -> None:
             },
         )
         _special_sessions.switch_to(user_id, session.name)
-        seed = _scene_opening_line(char_id, title, scene)
+        opening = await _scene_opening_performance(char_id, title, scene)
+        if opening:
+            seed = (f"—— 剧情《{title}》开始 ——\n{opening}\n\n"
+                    f"（随时可 /结束会话 退出）")
+        else:
+            seed = _scene_opening_line(char_id, title, scene)
         _special_sessions.add_message(user_id, "assistant", seed)
         await _safe_send(seed)
     except Exception as e:
