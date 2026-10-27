@@ -46,7 +46,7 @@ import httpx
 
 from agent.agent import Agent
 from agent.inbound import InboundMessage
-from agent.outbound import OutAudio, OutImage, OutProgress, SendFailed
+from agent.outbound import OutAudio, OutImage, OutMarkdown, OutProgress, SendFailed
 from agent.continuous_session import ContinuousSessionManager
 from agent.context import (
     _current_sender, _turn_sender, _current_platform,
@@ -56,7 +56,7 @@ from agent.context import (
     _current_group_context, _current_personality,
     _personality_transition, _on_file_created, _current_quota_bytes,
     _pending_task_fold, _current_bond_context, _delegate_depth,
-    _current_story_context, _current_story_char_id,
+    _current_story_context, _current_story_char_id, _current_render_context,
 )
 from agent.bond import BondManager
 from agent import bond_content
@@ -165,6 +165,14 @@ class _ToolSender:
     def __init__(self, sender=None):
         self._sender = sender
 
+    @property
+    def supports_markdown(self) -> bool:
+        # Delegate to the platform sender this bridge resolves to (same
+        # chain as _safe_send): tools/render layer querying the contextvar
+        # sender see the real channel capability, never a kernel default.
+        s = self._sender or _turn_sender.get() or default_sender
+        return bool(getattr(s, "supports_markdown", False))
+
     async def send_text(self, text: str) -> None:
         await _safe_send(text, sender=self._sender)
 
@@ -175,7 +183,7 @@ class _ToolSender:
         await _safe_send(audio, sender=self._sender)
 
     async def send_markdown(self, text: str) -> None:
-        await _safe_send(text, sender=self._sender)
+        await _safe_send(OutMarkdown(text), sender=self._sender)
 
     async def send_progress(self, text: str, *, immediate: bool = False) -> None:
         await _safe_send(OutProgress(text, immediate=immediate),
@@ -641,8 +649,12 @@ def _build_tool_registry() -> ToolRegistry:
 
         # Send each active time-limited code as a standalone message so users
         # can copy it directly. Skipped for long_term/all — those lists can be
-        # huge; the user gets them as copyable list text instead.
-        if scope == "time_limited" and active[:MAX_TOOL_CODES]:
+        # huge; the user gets them as copyable list text instead. Also skipped
+        # on markdown-capable channels (official route): sends there are
+        # buffered+merged anyway, and the agent's markdown reply lists every
+        # code in one message (§6.10.8 rule 4 — per-code flood is OneBot-only).
+        if (scope == "time_limited" and active[:MAX_TOOL_CODES]
+                and not _channel_supports_markdown()):
             try:
                 from agent.context import _current_sender
                 sender = _current_sender.get()
@@ -1069,6 +1081,14 @@ _special_sessions = SpecialSessionManager(
     llm_client=_model_router.reasoning_client,
 )
 
+# 会话人格绑定：把活跃特殊会话查询入口注入 CharacterRegistry，使
+# resolve_effective_personality 自动获得「剧情钉住 > 会话绑定」两层
+# （单点解析——turn.py 15+ 调用点与连续会话路径零改动保持一致）。
+# 注释掉本行即整体回滚到旧解析链（provider=None → 会话层跳过）。
+# lambda 间接寻址模块全局：测试替换 turn._special_sessions 后自动跟随。
+get_character_registry().set_session_provider(
+    lambda uid: _special_sessions.get_active(uid))
+
 # Track sessions pending LLM auto-naming: user_id -> True
 _pending_naming: dict = {}
 
@@ -1240,6 +1260,33 @@ _UPLOAD_VOICE_PROMPT = "请转录这段语音的文字内容，并用一句话�
 _TEXTUALIZE_ERROR_PREFIXES = ("[多模态]", "[音频", "分析失败", "转录失败")
 
 
+def _clean_textualization(desc: str, limit: int = 200) -> str:
+    """把多模态返回的原始文本清洗成适合入库的一句话摘要。
+
+    防御性处理（即便 multimodal_client 已默认不内联思考，也兜住旧行为/
+    其它模型的意外输出）：
+    1) 若含 `[回复]` 脚手架，只取其后正文（丢弃 `[思考]` 段）；
+    2) 仍以 `[思考]`/`[DEBUG]` 开头的串视为无有效正文 → 返回空（放弃入库）；
+    3) 压平空白；
+    4) 截到 limit 字，但优先在最后一个句末标点处收口，避免出现半句话。
+    """
+    text = desc or ""
+    if "[回复]" in text:
+        text = text.split("[回复]", 1)[1]
+    text = text.strip()
+    if not text or text.startswith(("[思考]", "[DEBUG]")):
+        return ""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    # 在窗口内找最后一个句末标点，从句尾收口（保留标点）
+    cut = max(window.rfind(p) for p in "。！？!?.；;")
+    if cut >= limit // 2:  # 句末标点太靠前就不强收，直接按长度截
+        return window[: cut + 1]
+    return window.rstrip() + "…"
+
+
 async def _textualize_upload(user_id: str, char_id: str, kind: str, path: str):
     """图片→一句话描述 / 语音→转录，落 user_upload 资产卡 + 小额好感。"""
     try:
@@ -1254,10 +1301,9 @@ async def _textualize_upload(user_id: str, char_id: str, kind: str, path: str):
             desc = await multimodal_client.analyze_audio(path, _UPLOAD_VOICE_PROMPT)
         else:
             return
-        desc = " ".join((desc or "").split())
+        desc = _clean_textualization(desc)
         if not desc or desc.startswith(_TEXTUALIZE_ERROR_PREFIXES):
             return
-        desc = desc[:200]
         card = AssetCard(
             id=make_asset_id(), type=ASSET_UPLOAD, char_id=char_id,
             user_id=user_id, path=path,
@@ -2159,7 +2205,10 @@ async def handle_agent_turn(view: InboundMessage):
     # ── Handle pending personality-switch choice (keep vs clear) ────
     pending_switch = _pending_personality_switch.pop(user_id, None)
     if pending_switch:
-        _old_display, new_display = pending_switch
+        # 3 元组 (old, new, session_scoped)；兼容旧 2 元组
+        _old_display, new_display, *_rest = pending_switch
+        _scoped = bool(_rest[0]) if _rest else False
+        _scope_note = "本会话" if _scoped else ""
         _reply = text_content.strip()
         _clear_kw = ("清空", "清除", "清空上下文", "清除上下文", "不保留", "清")
         _keep_kw = ("保留", "保留历史", "保留记录", "是", "好的", "嗯", "行", "可以", "yes", "keep")
@@ -2173,7 +2222,7 @@ async def handle_agent_turn(view: InboundMessage):
             return
         if _reply.lower() in _keep_kw:
             _inject_personality_transition_into_history(user_id)
-            await _safe_send(f"已保留历史对话，后续回复将遵循「{new_display}」人格。")
+            await _safe_send(f"已保留历史对话，后续{_scope_note}回复将遵循「{new_display}」人格。")
             return
         # Otherwise: user asked a new question — keep history (marker persists)
         # and fall through so the agent answers with the transition notice.
@@ -2240,7 +2289,8 @@ async def handle_agent_turn(view: InboundMessage):
         cmd_handled = await _handle_scene_command(text_content, user_id, view)
         if cmd_handled:
             return
-        cmd_handled = await _handle_session_command(text_content, user_id)
+        cmd_handled = await _handle_session_command(
+            text_content, user_id, group_id=view.group_id)
         if cmd_handled:
             return
         # /设形象 /形象 /清除形象 — 自创角色的参考立绘（直连，零 token）
@@ -2418,6 +2468,12 @@ async def handle_agent_turn(view: InboundMessage):
         persona_key = pm.resolve_effective_personality(user_id, group_id)
         persona_mode = pm.get_mode(persona_key)
 
+        # Render-capability declaration for this turn (L4 volatile tail;
+        # buttons-design §6.10.6). Resolved per turn — session persona
+        # binding makes "一会 markdown、一会纯文本" a legal combination.
+        # Always set ("" clears any inherited value).
+        _current_render_context.set(_build_render_context(persona_mode))
+
         # Detect session type (also gates the UGC creation interview below)
         active_special = _special_sessions.get_active(user_id)
         session_type = "special" if active_special else "temporary"
@@ -2429,12 +2485,18 @@ async def handle_agent_turn(view: InboundMessage):
             (active_special.metadata or {}).get("kind") == "bond_scene"
         )
         if is_scene:
-            # The scene belongs to the character it was started with; keep the
-            # turn in that character's voice even if the user switched persona.
-            persona_key = str(
-                (active_special.metadata or {}).get("char_id") or persona_key
-            )
-            persona_mode = pm.get_mode(persona_key)
+            # 场景钉住已由 CharacterRegistry 会话层统一处理（scene 创建时写
+            # metadata.persona_key=char_id，resolve 单点解析，2418 行的
+            # persona_key 已含钉住结果）。这里只做一致性断言：char_id 与解析
+            # 结果不一致（如 UGC 角色被删后懒校验穿透）时记日志便于排查。
+            _scene_char = str((active_special.metadata or {}).get("char_id") or "")
+            if _scene_char and _scene_char != persona_key:
+                from loguru import logger as _logger
+                _logger.warning(
+                    "[scene] char_id {} 与解析人格 {} 不一致 (user={})，"
+                    "可能角色已删除、已懒校验穿透",
+                    _scene_char, persona_key, user_id,
+                )
 
         # ── Triage: classify complexity (and plane, for split personas) ──
         # Creation interviews skip triage entirely: neutral assistant persona,
@@ -2851,6 +2913,11 @@ async def handle_continuous_turn(view: InboundMessage):
         persona_key = pm.resolve_effective_personality(user_id, group_id)
         persona_mode = pm.get_mode(persona_key)
 
+        # Same per-turn render declaration as the main path (the
+        # continuous sender slot resolves the channel capability).
+        _current_render_context.set(
+            _build_render_context(persona_mode, continuous_sender))
+
         plane = "task"
         if persona_mode == "split":
             _cls = await _model_router.classify(augmented_message)
@@ -2994,6 +3061,8 @@ async def _safe_send(message, max_retries: int = 2, sender=None):
                 await s.send_image(message)
             elif isinstance(message, OutAudio):
                 await s.send_audio(message)
+            elif isinstance(message, OutMarkdown):
+                await s.send_markdown(message.text)
             elif isinstance(message, OutProgress):
                 await s.send_progress(message.text, immediate=message.immediate)
             else:
@@ -3044,6 +3113,68 @@ async def _send_codes_individually(codes: list):
         await _safe_send(entry["code"])
 
 
+def _channel_supports_markdown(sender=None) -> bool:
+    """True when the current turn's channel renders native markdown
+    (QQ official, env on, breaker closed). Commands consult this to pick
+    their msg_type=2 form; OneBot is always False (buttons-design §6.10.7)."""
+    s = sender or _turn_sender.get() or default_sender
+    return bool(getattr(s, "supports_markdown", False))
+
+
+def _code_line_md(entry: dict, expiry_disp: str = "", expired: bool = False) -> str:
+    """One code as a markdown list item (§6.10.8: one per line, no bold,
+    no inline code — backticks are not in the official md whitelist and
+    paired decorators around codes with _/* would corrupt them)."""
+    code = entry.get("code", "")
+    parts = [code]
+    if entry.get("content"):
+        parts.append(entry["content"])
+    if expired:
+        parts.append(f"已于 {expiry_disp or '?'} 过期")
+    elif expiry_disp:
+        parts.append(f"有效期至 {expiry_disp}")
+    else:
+        parts.append("过期时间未知（新收录，建议尽快兑换）")
+    return "- " + " · ".join(parts)
+
+
+def _redeem_time_md(active: list, recent_expired: list, hidden: int,
+                    stale_note: str, format_expiry_display) -> str:
+    """/兑换码 as a single markdown body (design §6.10.8: N codes ≈ 9 plain
+    messages blow the 4/5-reply quota; one md message fits them all)."""
+    lines = [f"## 限时兑换码（{len(active)} 条）", ""]
+    for entry in active:
+        lines.append(_code_line_md(
+            entry, format_expiry_display(entry.get("valid", ""))
+            if entry.get("valid") else ""))
+    if recent_expired:
+        lines += ["", f"**已于 7 天内过期（{len(recent_expired)} 条）**", ""]
+        for entry in recent_expired:
+            lines.append(_code_line_md(
+                entry, format_expiry_display(entry.get("valid", "")),
+                expired=True))
+    if hidden > 0:
+        lines += ["", f"另有 {hidden} 条较早的码未显示"]
+    lines += ["", "长期有效的兑换码请发送 /长期兑换码"]
+    if stale_note:
+        lines.append(stale_note)
+    return "\n".join(lines)
+
+
+def _redeem_long_md(lt_codes: list, stale_note: str) -> str:
+    """/长期兑换码 as a single markdown body."""
+    lines = [f"## 长期有效兑换码（{len(lt_codes)} 条）", ""]
+    for entry in lt_codes:
+        line = f"- {entry.get('code', '')}"
+        if entry.get("content"):
+            line += f" · {entry['content']}"
+        lines.append(line)
+    lines += ["", "（长按消息可复制）"]
+    if stale_note:
+        lines.append(stale_note)
+    return "\n".join(lines)
+
+
 async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
     """Handle /兑换码 (time-limited) and /长期兑换码 commands — direct, no agent.
 
@@ -3091,6 +3222,11 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
             await _safe_send(msg)
             return True
 
+        # 官方渠道 markdown 单条（§6.10.8）；OneBot 保持纯文本分块
+        if _channel_supports_markdown():
+            await _safe_send(OutMarkdown(_redeem_long_md(lt_codes, stale_note)))
+            return True
+
         lines = [f"长期有效兑换码（无过期时间，共 {len(lt_codes)} 条）:", ""]
         for entry in lt_codes:
             line = f"  {entry.get('code', '')}"
@@ -3135,6 +3271,14 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
     MAX_DISPLAY = 30
     shown_active = active[:MAX_DISPLAY]
     hidden = len(active) - len(shown_active)
+
+    # 官方渠道：全部码合并为一条 markdown（现状 N+2 条纯文本必爆 4/5 条
+    # 被动回复配额），并跳过逐条单发（§6.10.8 规则 4：逐条保留给 OneBot）
+    if _channel_supports_markdown():
+        await _safe_send(OutMarkdown(_redeem_time_md(
+            shown_active, recent_expired, hidden, stale_note,
+            format_expiry_display)))
+        return True
 
     lines = [f"当前有效限时兑换码（{len(active)} 条）:", ""]
     for entry in shown_active:
@@ -3335,16 +3479,18 @@ async def _handle_personality_command(text: str, user_id: str, view: InboundMess
     args = args.strip()
     group_id = view.group_id
 
+    # --全局 逃生门：在特殊会话内修改用户级默认人格（会话绑定不动）
+    global_flag = args.endswith("--全局")
+    if global_flag:
+        args = args[: -len("--全局")].strip()
+
     # /personality — show current and available
     if not args:
         current_key = pm.resolve_effective_personality(user_id, group_id)
         current_display = pm.get_display_name(current_key)
         # Annotate where the effective personality comes from
-        source = "全局默认"
-        if pm.get_personal_personality(user_id) == current_key:
-            source = "个人设置"
-        elif pm.get_group_personality(group_id) == current_key:
-            source = "群默认"
+        # (剧情钉住/会话绑定/个人设置/群默认/全局默认 — registry 同链路判定)
+        source = pm.resolve_effective_source(user_id, group_id)
         lines = [f"当前人格: {current_display} ({current_key}，{source})", "", "可用人格:"]
         for p in personalities:
             marker = " ← 当前" if p["key"] == current_key else ""
@@ -3354,32 +3500,84 @@ async def _handle_personality_command(text: str, user_id: str, view: InboundMess
             "\n使用 /人格切换 <名称> 切换，例如: /人格切换 "
             f"{personalities[0]['display_name']}"
         )
+        _active_for_hint = _special_sessions.get_active(user_id)
+        if _active_for_hint is not None:
+            lines.append("当前在特殊会话中：切换仅作用于本会话；加 --全局 修改默认人格。")
         lines.append("用 /创建角色 访谈式创建你自己的角色。")
         await _safe_send("\n".join(lines))
         return True
 
     # /personality <name> — switch
+    # 会话绑定语义：特殊会话内切换只写 metadata.persona_key（用户默认不变）；
+    # 临时会话内切换仍写用户默认；bond_scene/char_creation 会话拒绝切换。
+    active = _special_sessions.get_active(user_id)
+    kind = (active.metadata or {}).get("kind") if active else None
+    if active and not global_flag and kind in ("bond_scene", "char_creation"):
+        label = "剧情场景" if kind == "bond_scene" else "角色创作"
+        await _safe_send(
+            f"{label}会话的人格是固定的，无法在会话内切换。\n"
+            f"结束会话后可正常切换；加 --全局 可修改你的默认人格（不影响本会话）。"
+        )
+        return True
+    session_scoped = bool(active) and not global_flag
+
     try:
         old_key = pm.resolve_effective_personality(user_id, group_id)
         old_display = pm.get_display_name(old_key)
-        resolved = pm.set_user_personality(user_id, args)
-        new_display = pm.get_display_name(resolved)
-        if resolved == old_key:
-            # Already this personality — no transition prompt/marker needed.
-            await _safe_send(f"当前已是「{new_display}」人格，无需切换~")
+
+        if global_flag and active is not None:
+            # --全局 在特殊会话内：只改用户默认，会话绑定与本轮人格都不动，
+            # 因此没有「保留/清空」追问，也不写 marker。
+            prev_personal = pm.get_personal_personality(user_id)
+            resolved = pm.set_user_personality(user_id, args)
+            new_display = pm.get_display_name(resolved)
+            same_note = "（原本已是该默认）" if resolved == prev_personal else ""
+            await _safe_send(
+                f"已将默认人格设为「{new_display}」{same_note}。\n"
+                f"当前会话人格不变（仍为「{old_display}」），退出本会话后生效。"
+            )
             return True
-        _pending_personality_switch[user_id] = (old_display, new_display)
+
+        if session_scoped:
+            resolved = pm._resolve_or_raise(args, user_id=user_id)
+            if resolved == old_key:
+                await _safe_send(f"本会话已是「{pm.get_display_name(resolved)}」人格，无需切换~")
+                return True
+            if not _special_sessions.update_metadata(
+                    user_id, active.name, {"persona_key": resolved}):
+                raise RuntimeError(f"update_metadata failed for session {active.name}")
+        else:
+            # 临时会话（含 --全局）：现有行为，写用户默认
+            resolved = pm.set_user_personality(user_id, args)
+            if resolved == old_key:
+                # Already this personality — no transition prompt/marker needed.
+                await _safe_send(f"当前已是「{pm.get_display_name(resolved)}」人格，无需切换~")
+                return True
+
+        new_display = pm.get_display_name(resolved)
+        _pending_personality_switch[user_id] = (old_display, new_display, session_scoped)
+        _scope_prefix = "本会话" if session_scoped else ""
         _personality_switch_marker[user_id] = (
-            f"人格已从「{old_display}」切换为「{new_display}」，"
+            f"{_scope_prefix}人格已从「{old_display}」切换为「{new_display}」，"
             f"历史回复风格不代表当前人格。"
         )
         _save_personality_markers()
-        await _safe_send(
-            f"已切换至「{new_display}」人格。\n"
-            f"是否保留历史对话记录？\n"
-            f"回复「保留」保留历史并注入切换提示词；\n"
-            f"回复「清空」清除当前上下文。"
-        )
+        if session_scoped:
+            await _safe_send(
+                f"已将本会话切换至「{new_display}」人格"
+                f"（仅当前会话，你的默认人格不变；"
+                f"用 /人格切换 <名称> --全局 可修改默认人格）。\n"
+                f"是否保留历史对话记录？\n"
+                f"回复「保留」保留历史并注入切换提示词；\n"
+                f"回复「清空」清除当前上下文。"
+            )
+        else:
+            await _safe_send(
+                f"已切换至「{new_display}」人格。\n"
+                f"是否保留历史对话记录？\n"
+                f"回复「保留」保留历史并注入切换提示词；\n"
+                f"回复「清空」清除当前上下文。"
+            )
     except ValueError as e:
         await _safe_send(str(e))
     except Exception as e:
@@ -3673,11 +3871,21 @@ async def _start_bond_scene(user_id: str, char_id: str, scene: dict) -> None:
             f"（{len(sessions)}/{max_sessions}）。请先 /删除会话 清理一个。"
         )
         return
+    # 钉住人格合法性前置校验：会话层对失效 char_id 是懒穿透的，
+    # 启动时就拦住，避免建出一个「钉不住」的剧情会话。
+    _pm_scene = get_character_registry()
+    if not _pm_scene._exists(char_id, user_id=user_id):
+        await _safe_send("该剧情对应的角色已不存在，无法开始。")
+        return
     try:
         session = _special_sessions.create(
             user_id, f"剧情·{title}",
             metadata={
                 "kind": "bond_scene", "char_id": char_id,
+                # 会话人格绑定统一入口：scene 的钉住人格 = char_id，
+                # CharacterRegistry._session_persona 优先按 kind 读 char_id，
+                # 这里冗余写入便于 /会话列表 等展示逻辑统一读 persona_key。
+                "persona_key": char_id,
                 "scene_title": title,
                 "script": str(scene.get("body") or ""),
                 "completed": False,
@@ -3925,6 +4133,28 @@ async def _handle_set_bond_command(
         sender=sender,
     )
     return True
+
+
+def _help_markdown() -> str:
+    """HELP.md → official-md-safe body (design §6.10.3: /帮助 as one
+    msg_type=2 message instead of a card image — saves 1 reply quota and
+    stays copyable/searchable).
+
+    Transform keeps whitelisted syntax (#/## headings, - lists, **bold**)
+    and fixes the two violations HELP.md contains: inline-code backticks
+    (not in the official whitelist — would render verbatim) are stripped,
+    and `---` horizontal rules become `***` (the whitelisted hr form).
+    "" on read failure → caller falls back to the card image path.
+    """
+    try:
+        with open(_HELP_MD_PATH, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except Exception:  # noqa: BLE001 — help must never crash the turn
+        return ""
+    if not content:
+        return ""
+    content = content.replace("`", "")
+    return re.sub(r"^\s*-{3,}\s*$", "***", content, flags=re.MULTILINE)
 
 
 async def _send_markdown_doc(path: str, label: str = "文档") -> bool:
@@ -4322,8 +4552,12 @@ async def _handle_portrait_command(text: str, user_id: str, view) -> bool:
     return True
 
 
-async def _handle_session_command(text: str, user_id: str) -> bool:
+async def _handle_session_command(
+    text: str, user_id: str, group_id: str = None
+) -> bool:
     """Handle special session management commands.
+
+    ``group_id`` 供会话人格快照/回落解析使用（群默认人格层）。
 
     Returns True if the command was handled (should skip agent processing).
     """
@@ -4454,7 +4688,14 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             return True
         try:
             name = args if args else None
-            session = _special_sessions.create(user_id, name)
+            # 会话人格绑定：创建时快照当前生效人格。必须在 create/switch_to
+            # 之前 resolve——切换后 provider 会看到新会话自己（未绑定→穿透），
+            # 快照就丢了当前上下文里的人格。
+            _pm_new = get_character_registry()
+            _snapshot = _pm_new.resolve_effective_personality(user_id, group_id)
+            _snapshot_display = _pm_new.get_display_name(_snapshot)
+            session = _special_sessions.create(
+                user_id, name, metadata={"persona_key": _snapshot})
             # Activate the session — create() only persists it, doesn't set active_session
             _special_sessions.switch_to(user_id, session.name)
             # Starting a fresh special session; drop any pending temp-session file
@@ -4464,6 +4705,7 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             if args:
                 msg = (
                     f"已创建特殊会话「{session.name}」。\n"
+                    f"会话人格: {_snapshot_display}（会话内 /人格切换 仅作用于本会话）。\n"
                     f"当前处于特殊会话模式，上下文将持续保存。\n"
                     f"使用 /结束会话 退出，/会话列表 查看所有会话。\n"
                     f"当前特殊会话: {len(sessions)+1}/{max_sessions}"
@@ -4472,6 +4714,7 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
                 _pending_naming[user_id] = True
                 msg = (
                     f"已创建特殊会话「{session.name}」（名称待精炼）。\n"
+                    f"会话人格: {_snapshot_display}（会话内 /人格切换 仅作用于本会话）。\n"
                     f"首次交互后会自动生成更贴切的名称。\n"
                     f"当前处于特殊会话模式，上下文将持续保存。\n"
                     f"当前特殊会话: {len(sessions)+1}/{max_sessions}"
@@ -4496,13 +4739,29 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             return True
 
         active_name = _special_sessions._load_index(user_id).get("active_session")
+        _pm_list = get_character_registry()
         lines = ["你的特殊会话:"]
         for s in sessions:
             marker = " ← 当前" if s["name"] == active_name else ""
             created = time.strftime("%m/%d %H:%M", time.localtime(s["created_at"]))
+            # 会话人格绑定标注（scene 显示钉住角色；创作会话固定中性；
+            # key 失效/未绑定的存量会话显示跟随默认）
+            meta = s.get("metadata") or {}
+            _kind = meta.get("kind")
+            if _kind == "char_creation":
+                p_note = "人格: 固定（角色创作）"
+            else:
+                pkey = meta.get("persona_key") or (
+                    meta.get("char_id") if _kind == "bond_scene" else None)
+                if pkey and _pm_list._exists(str(pkey), user_id=user_id):
+                    p_note = f"人格: {_pm_list.get_display_name(str(pkey))}"
+                elif pkey:
+                    p_note = "人格: 已失效→跟随默认"
+                else:
+                    p_note = "人格: 跟随默认"
             lines.append(
                 f"  {s['name']}{marker}\n"
-                f"    创建: {created} | 消息数: {s['total_messages']}"
+                f"    创建: {created} | 消息数: {s['total_messages']} | {p_note}"
             )
         lines.append(f"\n共 {len(sessions)}/{max_sessions} 个会话")
         await _safe_send("\n".join(lines))
@@ -4515,9 +4774,16 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             return True
         try:
             session = _special_sessions.switch_to(user_id, args)
+            # 人格提示：switch_to 后 provider 已看到新会话，resolve 结果即
+            # 该会话的绑定人格（未绑定则回落到 用户>群>全局 链）。
+            # 切会话不注入 personality marker——各会话历史本属于自己的人格。
+            _pm_sw = get_character_registry()
+            _p_key = _pm_sw.resolve_effective_personality(user_id, group_id)
+            _p_disp = _pm_sw.get_display_name(_p_key)
             await _safe_send(
                 f"已切换到特殊会话「{session.name}」"
-                f"（{session.total_messages} 条消息）。"
+                f"（{session.total_messages} 条消息）。\n"
+                f"当前人格: {_p_disp}"
             )
         except ValueError as e:
             await _safe_send(str(e))
@@ -4603,8 +4869,14 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         active = _special_sessions.get_active(user_id)
         if active:
             _special_sessions.end_active(user_id)
+            # 回落后的人格提示：end_active 后 provider 返回 None，
+            # resolve 走 用户>群>全局 链，即临时会话生效的人格。
+            _pm_end = get_character_registry()
+            _p_disp = _pm_end.get_display_name(
+                _pm_end.resolve_effective_personality(user_id, group_id))
             await _safe_send(
                 f"已退出特殊会话「{active.name}」，回到临时会话模式。\n"
+                f"当前人格: {_p_disp}\n"
                 f"特殊会话内容已保存，随时可以用 /切换会话 {active.name} 恢复。"
             )
         else:
@@ -4635,8 +4907,13 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
             return True
 
         name = args if args else None
+        # 会话人格绑定：快照当前生效人格（临时会话语境 = 用户>群>全局 链），
+        # 必须在 create/switch_to 之前 resolve。
+        _pm_save = get_character_registry()
+        _snapshot = _pm_save.resolve_effective_personality(user_id, group_id)
         try:
-            session = _special_sessions.create(user_id, name)
+            session = _special_sessions.create(
+                user_id, name, metadata={"persona_key": _snapshot})
             # Activate the session so add_message() calls below actually work
             _special_sessions.switch_to(user_id, session.name)
         except ValueError as e:
@@ -4669,6 +4946,8 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
         msg = (
             f"已将当前临时会话（最近 {min(len(temp_session.context), 20)} 条消息）"
             f"保存为特殊会话「{session.name}」。\n"
+            f"会话人格: {_pm_save.get_display_name(_snapshot)}"
+            f"（会话内 /人格切换 仅作用于本会话）。\n"
             f"现在处于特殊会话模式，后续对话将持续保存。\n"
             f"当前特殊会话: {len(sessions)}/{max_sess}"
         )
@@ -4683,6 +4962,13 @@ async def _handle_session_command(text: str, user_id: str) -> bool:
     # 真正的解释。故默认只发卡片；卡片渲染/发送失败时才回退发文本，保证命令
     # 始终查得到（文字兜底也顺带覆盖了图片加载不出来的客户端）。
     if cmd in ("/帮助", "#帮助", "/help", "#help", "/命令", "#命令"):
+        # 官方渠道：HELP.md 直接作为一条 markdown 发送（省掉卡片图的 1 条
+        # 配额，文本可选中复制）；读取/转换失败再走卡片兜底。
+        if _channel_supports_markdown():
+            _help_md = _help_markdown()
+            if _help_md:
+                await _safe_send(OutMarkdown(_help_md))
+                return True
         card_path = None
         try:
             card_path = await asyncio.to_thread(render_help_card, _HELP_MD_PATH)
@@ -4800,12 +5086,95 @@ async def _handle_special_command(command: str, user_id: str):
         )
 
 
+# ── Markdown render layer (buttons-design §6.10) ──────────────────
+# Per-turn decision, never user-cached: session persona binding means the
+# same user can be unified in one session and split in another (§6.10.6).
+
+# L4 volatile-tail declaration injected when this turn renders markdown.
+# The subset mirrors SOUL #8's "declared subset" wording; images are
+# explicitly forbidden here (the model has no public URLs to reference —
+# card/asset images go out as separate msg_type=7 messages).
+_RENDER_MD_DECLARATION = (
+    "## 本轮渲染能力\n"
+    "本回合最终回复将经 QQ 官方 markdown（msg_type=2）渲染。\n"
+    "可用语法：# / ## 标题、**加粗**、_斜体_、~~删除线~~、- 无序列表、"
+    "1. 有序列表、> 引用、*** 分割线、[文字](https://链接)。\n"
+    "禁止：表格、代码块、行内代码（反引号）、HTML 标签、![]() 图片语法"
+    "（图片由系统单独发送，不要编造图片 URL）。\n"
+    "按完整区块结构输出正文，不必压缩到 300 字以内；段落之间空一行。"
+)
+
+# 免责声明 auto 策略（§6.10.5）：正文 ≤200 字内联；长正文独立成条，
+# 紧跟正文之后（先于图片），配额紧张时免责优先于媒体。
+_MD_INLINE_DISCLAIMER_LIMIT = 200
+
+_MD_FENCE_RE = re.compile(r"^\s*(```|~~~)", re.MULTILINE)
+_MD_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|", re.MULTILINE)
+
+
+def _build_render_context(persona_mode: str, sender=None) -> str:
+    """Build this turn's L4 render declaration ("" = plain-text turn).
+
+    Markdown requires BOTH: a markdown-capable channel sender (QQ
+    official with env switch on and breaker closed) AND the unified
+    persona mode. Split personas stay plain text (人设表达 + revoice
+    转述 + 防 markdown 记号泄漏, §6.10.6).
+    """
+    s = sender or _turn_sender.get() or default_sender
+    if persona_mode == "unified" and getattr(s, "supports_markdown", False):
+        return _RENDER_MD_DECLARATION
+    return ""
+
+
+def _md_violates_whitelist(text: str) -> bool:
+    """True when the body uses syntax outside the official md whitelist
+    (code fences / tables / any backtick). Such a body must not go out
+    as msg_type=2 — degrade to sanitized plain text instead (§6.10.10)."""
+    return bool(_MD_FENCE_RE.search(text)
+                or _MD_TABLE_ROW_RE.search(text)
+                or "`" in text)
+
+
+def _clean_md_markers(text: str) -> str:
+    """Strip markdown decoration for plain-text sending (bottom guard,
+    §6.10.6 #6 — never rely on the prompt alone).
+
+    Conservative + idempotent: only unambiguous decoration is removed
+    (fence lines, heading hashes, paired **/__/~~/***, backticks);
+    content itself — including code inside former fences and list
+    bullets, which read fine as plain text — is preserved.
+    """
+    out = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            continue  # drop the fence, keep the code inside
+        line = re.sub(r"^(\s{0,3})#{1,6}\s+", r"\1", line)   # headings
+        line = re.sub(r"\*\*\*(.+?)\*\*\*", r"\1", line)     # bold-italic
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)         # bold
+        line = re.sub(r"__(.+?)__", r"\1", line)
+        line = re.sub(r"~~(.+?)~~", r"\1", line)             # strikethrough
+        line = line.replace("`", "")                         # inline code
+        out.append(line)
+    return "\n".join(out)
+
+
 async def _send_response(response: str, sender=None):
     """Send response, splitting long messages into chunks with rate limiting.
 
     Args:
         response: The response text to send.
         sender: Optional Sender to use. Defaults to default_sender.
+
+    Format routing (buttons-design §6.10): on the QQ official route with
+    this turn's markdown declaration set (unified persona + capable
+    channel), the body goes out as one msg_type=2 markdown message — no
+    300-char chunking (the adapter block-splits over-long bodies) — with
+    the disclaimer inline (short body) or as a separate plain message
+    right after it (auto strategy). Illegal syntax (tables/code fences)
+    degrades to the sanitized plain path; on every official-route plain
+    send leaked markdown markers are stripped. OneBot behavior is
+    byte-identical to before.
     """
     if not response:
         return
@@ -4815,6 +5184,25 @@ async def _send_response(response: str, sender=None):
     _persona = _current_personality.get() or _pm.get_default()
     _short = _pm.get_short_name(_persona)
     disclaimer = f"\n\n{_short} 的回答并非总是准确无误，请理性判断。"
+
+    on_official = _current_platform.get() == "qq_official"
+    if on_official:
+        s = sender or _turn_sender.get() or default_sender
+        if (_current_render_context.get()
+                and getattr(s, "supports_markdown", False)):
+            if not _md_violates_whitelist(response):
+                if len(response) <= _MD_INLINE_DISCLAIMER_LIMIT:
+                    await _safe_send(OutMarkdown(response + disclaimer),
+                                     sender=sender)
+                else:
+                    await _safe_send(OutMarkdown(response), sender=sender)
+                    await _safe_send(disclaimer.strip(), sender=sender)
+                return
+            # whitelist violation → sanitize, fall through to plain path
+        # plain send on the official channel: never show raw md markers
+        # (split persona output / degraded unified / breaker open)
+        response = _clean_md_markers(response)
+
     response += disclaimer
 
     # Shorter chunks + longer delays to avoid QQ rate limiting

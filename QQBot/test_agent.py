@@ -16,6 +16,7 @@ Usage:
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -4173,6 +4174,7 @@ class TestCharacterRegistry:
             self.test_purge_references()
             self.test_env_chars_dir()
             self.test_bad_encoding_meta()
+            self.test_session_persona_layer()
         finally:
             shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -4314,6 +4316,72 @@ class TestCharacterRegistry:
         self.reg.delete("c_good11")
         self.reg.delete("c_bad222")
         print_pass("bad-encoding meta/card degrade gracefully, listing survives")
+
+    def test_session_persona_layer(self):
+        """会话人格绑定：provider 注入 + 优先级 + 懒校验穿透 + 来源标签。"""
+        from types import SimpleNamespace
+        self._mk("c_sess01", "会话角色", "u1")
+        orig_settings = self.reg._load_settings()
+        orig_groups = self.reg._load_group_settings()
+        try:
+            # 无 provider → 原三层链（全局默认）
+            self.reg.set_session_provider(None)
+            assert self.reg.resolve_effective_personality("u1") == self.reg.get_default()
+
+            # 会话绑定 > 用户设置
+            self.reg.set_user_personality("u1", "assistant")
+            sess = SimpleNamespace(metadata={"persona_key": "c_sess01"})
+            self.reg.set_session_provider(
+                lambda uid: sess if uid == "u1" else None)
+            assert self.reg.resolve_effective_personality("u1") == "c_sess01"
+            assert self.reg.resolve_effective_source("u1") == "会话绑定"
+            # 其他用户不受影响
+            assert self.reg.resolve_effective_personality("u2") == self.reg.get_default()
+
+            # 绑定 key 失效（UGC 被删）→ 懒校验穿透到用户层
+            sess.metadata["persona_key"] = "deleted_char"
+            assert self.reg.resolve_effective_personality("u1") == "assistant"
+            assert self.reg.resolve_effective_source("u1") == "个人设置"
+
+            # bond_scene：char_id 钉住优先于一切（persona_key 冗余字段被忽略）
+            scene = SimpleNamespace(metadata={
+                "kind": "bond_scene", "char_id": "rubi",
+                "persona_key": "c_sess01"})
+            self.reg.set_session_provider(lambda uid: scene)
+            assert self.reg.resolve_effective_personality("u1") == "rubi"
+            assert self.reg.resolve_effective_source("u1") == "剧情钉住"
+            # scene char_id 失效 → 穿透（不回退到 persona_key）
+            scene.metadata["char_id"] = "deleted_too"
+            assert self.reg.resolve_effective_personality("u1") == "assistant"
+
+            # char_creation → 固定中性，穿透
+            creation = SimpleNamespace(
+                metadata={"kind": "char_creation", "persona_key": "rubi"})
+            self.reg.set_session_provider(lambda uid: creation)
+            assert self.reg.resolve_effective_personality("u1") == "assistant"
+
+            # provider 抛异常 → 安全穿透，不阻断解析
+            def boom(uid):
+                raise RuntimeError("provider down")
+            self.reg.set_session_provider(boom)
+            assert self.reg.resolve_effective_personality("u1") == "assistant"
+
+            # 无 metadata 属性的会话对象（如裸 object()）→ getattr 防御穿透
+            self.reg.set_session_provider(lambda uid: object())
+            assert self.reg.resolve_effective_personality("u1") == "assistant"
+
+            # source 标签：个人设置 / 群默认 / 全局默认
+            self.reg.set_session_provider(lambda uid: None)
+            assert self.reg.resolve_effective_source("u1") == "个人设置"
+            self.reg.set_group_personality("g9", "rubi")
+            assert self.reg.resolve_effective_source("ux", "g9") == "群默认"
+            assert self.reg.resolve_effective_source("ux", "") == "全局默认"
+            print_pass("session persona layer: priority/lazy-validation/scene-pin/source")
+        finally:
+            self.reg.set_session_provider(None)
+            self.reg._save_settings(orig_settings)
+            self.reg._save_group_settings(orig_groups)
+            self.reg.delete("c_sess01")
 
 
 class TestCreateCharacterTool:
@@ -5181,6 +5249,287 @@ class TestPersonalityMarkerPersistence:
             turn._special_sessions = orig_special
             turn._personality_switch_marker.clear()
             turn._personality_switch_marker.update(orig_marker)
+
+
+class TestSessionPersonaBinding:
+    """会话人格绑定端到端：创建快照 / 会话内切换 / --全局 / scene 拒绝 / 提示消息。
+
+    全部走真实 SpecialSessionManager + 真实 CharacterRegistry（临时目录），
+    仅替换 turn 模块级单例与发送回调（沿用 TestSceneSession 的手法）。
+    """
+
+    def run(self):
+        print_header("51. Session-Persona Binding")
+        self.turn = _import_turn_for_tests()
+        asyncio.run(self.test_new_session_snapshot())
+        asyncio.run(self.test_switch_in_session_and_global())
+        asyncio.run(self.test_scene_creation_reject())
+        asyncio.run(self.test_switch_end_list_messages())
+        self.test_clear_context_keeps_binding()
+
+    # ── 隔离环境 ──────────────────────────────────────────────────
+
+    def _env(self):
+        """搭建隔离环境并替换 turn 模块属性；返回 ctx dict。"""
+        import agent.personality as pmod
+        from agent.character_registry import CharacterRegistry
+        from agent.special_session import SpecialSessionManager
+        turn = self.turn
+        tmp = tempfile.mkdtemp(prefix="sess_persona_")
+        pdir = os.path.join(tmp, "personalities")
+        os.makedirs(pdir, exist_ok=True)
+        for name, title in [("assistant", "助手 Roxy"), ("rubi", "露比 (Rubi)")]:
+            with open(os.path.join(pdir, f"{name}.md"), "w", encoding="utf-8") as f:
+                f.write(f"# {title}\n\nTest personality.")
+        with open(os.path.join(tmp, "personality_config.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"default": "assistant"}, f)
+        patcher = patch.multiple(
+            pmod,
+            _SETTINGS_FILE=os.path.join(tmp, "personality_settings.json"),
+            _DEFAULT_CONFIG_FILE=os.path.join(tmp, "personality_config.json"),
+            _GROUP_CONFIG_FILE=os.path.join(tmp, "group_personality.json"),
+        )
+        patcher.start()
+        reg = CharacterRegistry(
+            personalities_dir=pdir,
+            characters_dir=os.path.join(tmp, "characters"),
+        )
+        mgr = SpecialSessionManager(
+            user_data_root=os.path.join(tmp, "users"), max_per_user=10)
+        reg.set_session_provider(lambda uid: mgr.get_active(uid))
+
+        sent = []
+
+        async def fake_send(payload, sender=None):
+            sent.append(payload)
+
+        from agent.session import SessionManager
+        tmp_sm = SessionManager(persistence_dir=os.path.join(tmp, "sessions"))
+        ctx = {
+            "tmp": tmp, "reg": reg, "mgr": mgr, "sent": sent,
+            "patcher": patcher,
+            "orig": (
+                turn._special_sessions, turn.get_character_registry,
+                turn._safe_send, turn._perm_manager, turn._quota_warning,
+                turn._MARKERS_FILE, turn._session_manager,
+                dict(turn._pending_personality_switch),
+                dict(turn._personality_switch_marker),
+            ),
+        }
+        turn._special_sessions = mgr
+        turn._session_manager = tmp_sm
+        turn.get_character_registry = lambda: reg
+        turn._safe_send = fake_send
+        perm = MagicMock()
+        perm.get_role.return_value = "admin"
+        perm.get_max_special_sessions.return_value = 10
+        turn._perm_manager = perm
+        turn._quota_warning = lambda uid: ""
+        turn._MARKERS_FILE = os.path.join(tmp, "personality_markers.json")
+        turn._pending_personality_switch.clear()
+        turn._personality_switch_marker.clear()
+        return ctx
+
+    def _restore(self, ctx):
+        turn = self.turn
+        (turn._special_sessions, turn.get_character_registry, turn._safe_send,
+         turn._perm_manager, turn._quota_warning, turn._MARKERS_FILE,
+         turn._session_manager, _pend, _mark) = ctx["orig"]
+        turn._pending_personality_switch.clear()
+        turn._pending_personality_switch.update(_pend)
+        turn._personality_switch_marker.clear()
+        turn._personality_switch_marker.update(_mark)
+        ctx["reg"].set_session_provider(None)
+        ctx["patcher"].stop()
+        shutil.rmtree(ctx["tmp"], ignore_errors=True)
+
+    @staticmethod
+    def _view(group_id=None):
+        from types import SimpleNamespace
+        return SimpleNamespace(group_id=group_id)
+
+    # ── 用例 ──────────────────────────────────────────────────────
+
+    async def test_new_session_snapshot(self):
+        """/新会话 与 /保存为会话 创建时快照当前生效人格。"""
+        ctx = self._env()
+        turn, mgr, reg, sent = self.turn, ctx["mgr"], ctx["reg"], ctx["sent"]
+        try:
+            # 无用户设置 → 快照全局默认 assistant
+            await turn._handle_session_command("/新会话 研究", "u1")
+            entry = [s for s in mgr.list_sessions("u1") if s["name"] == "研究"][0]
+            assert entry["metadata"]["persona_key"] == "assistant", entry
+            assert any("会话人格: 助手 Roxy" in s for s in sent), sent
+            # 快照后切换生效：resolve 走会话绑定
+            assert reg.resolve_effective_personality("u1") == "assistant"
+            assert reg.resolve_effective_source("u1") == "会话绑定"
+
+            # 用户默认改为 rubi → 新会话快照 rubi（而非旧会话的绑定）
+            reg.set_user_personality("u1", "rubi")
+            mgr.update_metadata("u1", "研究", {"persona_key": "rubi"})
+            await turn._handle_session_command("/新会话 二", "u1")
+            entry2 = [s for s in mgr.list_sessions("u1") if s["name"] == "二"][0]
+            # 注意：创建时仍处于「研究」会话（快照=研究的绑定 rubi）
+            assert entry2["metadata"]["persona_key"] == "rubi", entry2
+
+            # /保存为会话：先退到临时会话，塞上下文，再保存
+            mgr.end_active("u1")
+            reg.set_user_personality("u1", "assistant")
+            sess = turn._session_manager.get_or_create("u1x")
+            sess.add_message("user", "旧对话")
+            turn._session_manager.update("u1x", sess)
+            sent.clear()
+            await turn._handle_session_command("/保存为会话 存档", "u1x")
+            entry3 = [s for s in mgr.list_sessions("u1x") if s["name"] == "存档"][0]
+            assert entry3["metadata"]["persona_key"] == "assistant", entry3
+            assert any("会话人格: 助手 Roxy" in s for s in sent), sent
+            print_pass("/新会话 + /保存为会话 snapshot effective persona at creation")
+        finally:
+            self._restore(ctx)
+
+    async def test_switch_in_session_and_global(self):
+        """会话内 /人格切换 只写绑定；--全局 只写用户默认。"""
+        ctx = self._env()
+        turn, mgr, reg, sent = self.turn, ctx["mgr"], ctx["reg"], ctx["sent"]
+        try:
+            reg.set_user_personality("u1", "rubi")
+            s = mgr.create("u1", "聊天", metadata={"persona_key": "rubi"})
+            mgr.switch_to("u1", s.name)
+            view = self._view()
+
+            # 会话内切换 → 只写 metadata，用户默认不动
+            await turn._handle_personality_command("/人格切换 assistant", "u1", view)
+            entry = [x for x in mgr.list_sessions("u1") if x["name"] == "聊天"][0]
+            assert entry["metadata"]["persona_key"] == "assistant", entry
+            assert reg.get_personal_personality("u1") == "rubi"
+            assert reg.resolve_effective_personality("u1") == "assistant"
+            # pending 3 元组 + marker 带「本会话」+ 提示含「仅当前会话」
+            old, new, scoped = turn._pending_personality_switch["u1"]
+            assert scoped is True and new == "助手 Roxy", (old, new, scoped)
+            assert "本会话" in turn._personality_switch_marker["u1"]
+            assert any("仅当前会话" in x for x in sent), sent
+
+            # 同名再切 → 「无需切换」短路，不产生 pending
+            turn._pending_personality_switch.clear()
+            sent.clear()
+            await turn._handle_personality_command("/人格切换 assistant", "u1", view)
+            assert any("无需切换" in x for x in sent), sent
+            assert "u1" not in turn._pending_personality_switch
+
+            # --全局 → 写用户默认，会话绑定与 pending/marker 均不动
+            turn._pending_personality_switch.clear()
+            turn._personality_switch_marker.clear()
+            sent.clear()
+            await turn._handle_personality_command(
+                "/人格切换 assistant --全局", "u1", view)
+            assert reg.get_personal_personality("u1") == "assistant"
+            entry = [x for x in mgr.list_sessions("u1") if x["name"] == "聊天"][0]
+            assert entry["metadata"]["persona_key"] == "assistant", entry
+            assert "u1" not in turn._pending_personality_switch
+            assert any("默认人格" in x and "当前会话人格不变" in x for x in sent), sent
+
+            # 临时会话（无活跃特殊会话）→ 原行为：写用户默认
+            mgr.end_active("u1")
+            sent.clear()
+            await turn._handle_personality_command("/人格切换 露比", "u1", view)
+            assert reg.get_personal_personality("u1") == "rubi"
+            pend = turn._pending_personality_switch["u1"]
+            assert len(pend) == 3 and pend[2] is False, pend
+            print_pass("in-session switch binds session only; --全局 writes user default")
+        finally:
+            self._restore(ctx)
+
+    async def test_scene_creation_reject(self):
+        """bond_scene / char_creation 会话拒绝切换；--全局 在 scene 内放行。"""
+        ctx = self._env()
+        turn, mgr, reg, sent = self.turn, ctx["mgr"], ctx["reg"], ctx["sent"]
+        try:
+            view = self._view()
+            scene = mgr.create("u2", "剧情·雨夜", metadata={
+                "kind": "bond_scene", "char_id": "rubi", "persona_key": "rubi"})
+            mgr.switch_to("u2", scene.name)
+            await turn._handle_personality_command("/人格切换 assistant", "u2", view)
+            assert any("固定" in x for x in sent), sent
+            assert reg.get_personal_personality("u2") is None
+            entry = [x for x in mgr.list_sessions("u2") if x["name"] == "剧情·雨夜"][0]
+            assert entry["metadata"]["persona_key"] == "rubi", entry
+
+            # --全局 在 scene 内放行：改默认、不动钉住
+            sent.clear()
+            await turn._handle_personality_command(
+                "/人格切换 assistant --全局", "u2", view)
+            assert reg.get_personal_personality("u2") == "assistant"
+            assert reg.resolve_effective_personality("u2") == "rubi"  # 仍钉住
+            assert any("当前会话人格不变" in x for x in sent), sent
+
+            # char_creation 同样拒绝
+            creation = mgr.create(
+                "u3", "角色创作", metadata={"kind": "char_creation"})
+            mgr.switch_to("u3", creation.name)
+            sent.clear()
+            await turn._handle_personality_command("/人格切换 assistant", "u3", view)
+            assert any("角色创作" in x and "固定" in x for x in sent), sent
+            print_pass("scene/creation sessions reject switch; --全局 bypasses")
+        finally:
+            self._restore(ctx)
+
+    async def test_switch_end_list_messages(self):
+        """/切换会话、/结束会话、/会话列表 的人格提示与标注。"""
+        ctx = self._env()
+        turn, mgr, reg, sent = self.turn, ctx["mgr"], ctx["reg"], ctx["sent"]
+        try:
+            mgr.create("u4", "会话A", metadata={"persona_key": "rubi"})
+            mgr.create("u4", "会话B", metadata={"persona_key": "assistant"})
+            mgr.create("u4", "旧会话")  # 存量会话：无绑定
+            mgr.switch_to("u4", "会话A")
+
+            sent.clear()
+            await turn._handle_session_command("/切换会话 会话B", "u4")
+            assert "当前人格: 助手 Roxy" in sent[-1], sent
+            await turn._handle_session_command("/切换会话 会话A", "u4")
+            assert "当前人格: 露比 (Rubi)" in sent[-1], sent
+            # 切到未绑定的存量会话 → 穿透到全局默认
+            await turn._handle_session_command("/切换会话 旧会话", "u4")
+            assert "当前人格: 助手 Roxy" in sent[-1], sent
+
+            sent.clear()
+            await turn._handle_session_command("/结束会话", "u4")
+            assert "当前人格: 助手 Roxy" in sent[-1], sent  # 回落到全局默认
+
+            sent.clear()
+            await turn._handle_session_command("/会话列表", "u4")
+            out = sent[-1]
+            assert "人格: 露比 (Rubi)" in out, out
+            assert "人格: 助手 Roxy" in out, out
+            assert "人格: 跟随默认" in out, out  # 存量未绑定会话
+            print_pass("switch/end/list commands surface session persona")
+        finally:
+            self._restore(ctx)
+
+    def test_clear_context_keeps_binding(self):
+        """clear_context 清历史但保留 persona_key；update_metadata 往返。"""
+        ctx = self._env()
+        mgr = ctx["mgr"]
+        try:
+            s = mgr.create("u5", "保留绑定", metadata={"persona_key": "rubi"})
+            mgr.switch_to("u5", s.name)
+            mgr.add_message("u5", "user", "hello")
+            mgr.clear_context("u5")
+            entry = [x for x in mgr.list_sessions("u5")
+                     if x["name"] == "保留绑定"][0]
+            assert entry["metadata"]["persona_key"] == "rubi", entry
+            assert entry["total_messages"] == 0, entry
+            # update_metadata 合并语义 + 不存在的会话返回 False
+            assert mgr.update_metadata("u5", "保留绑定",
+                                       {"persona_key": "assistant"}) is True
+            entry = [x for x in mgr.list_sessions("u5")
+                     if x["name"] == "保留绑定"][0]
+            assert entry["metadata"]["persona_key"] == "assistant", entry
+            assert mgr.update_metadata("u5", "不存在", {"x": 1}) is False
+            print_pass("clear_context keeps binding; update_metadata roundtrip")
+        finally:
+            self._restore(ctx)
 
 
 # ── P3a: bond scenes / commemorative card / reunion & anniversary ──
@@ -7392,6 +7741,7 @@ class TestUploadTextualization:
             self.am, self.m = turn._asset_memory, turn._bond_manager
             asyncio.run(self.test_image_and_voice_cards())
             asyncio.run(self.test_error_and_unavailable())
+            asyncio.run(self.test_reasoning_scaffold_and_truncation())
             asyncio.run(self.test_daily_cap_and_exception())
             self.test_spawn_guard()
         finally:
@@ -7471,6 +7821,50 @@ class TestUploadTextualization:
         await turn._textualize_upload("u2", "rubi", "file", "/x/y.zip")
         assert self.am.list_cards("u2", "rubi") == []
         print_pass("unavailable / error-text / empty / unknown kind → no card")
+
+    async def test_reasoning_scaffold_and_truncation(self):
+        """防御层②：思考脚手架剥离 + 句边界截断（根修回归护栏）。"""
+        turn = self.turn
+        self.client.is_available = lambda: True
+
+        # [思考]…[回复]… 脚手架 → 只取回复段正文入库
+        async def scaffold_image(path, prompt=None, timeout=60.0):
+            return ("[思考]\n用户想要客观描述，先看主体再看环境……（很长的推理）"
+                    "\n\n[回复]\n一只橘猫趴在窗台上晒太阳，神情慵懒。")
+        self.client.analyze_image = scaffold_image
+        await turn._textualize_upload("u5", "rubi", "image", "/x/s.png")
+        cards = self.am.list_cards("u5", "rubi")
+        assert len(cards) == 1
+        body = cards[0].prompt
+        assert "[思考]" not in body and "[回复]" not in body
+        assert body == "一只橘猫趴在窗台上晒太阳，神情慵懒。"
+
+        # 只有 [思考] 无 [回复]（旧 bug 现场：思考吃光预算被切断）→ 放弃入库
+        async def reasoning_only(path, prompt=None, timeout=60.0):
+            return "[思考] 主体是动漫少女，姿态趴在床上，穿着白色"
+        self.client.analyze_image = reasoning_only
+        await turn._textualize_upload("u5", "rubi", "image", "/x/t.png")
+        assert len(self.am.list_cards("u5", "rubi")) == 1  # 没多写卡
+
+        # [DEBUG] 前缀（旧 analyze_audio 调试残留）→ 放弃入库
+        async def debug_image(path, prompt=None, timeout=60.0):
+            return "[DEBUG] 源文件: 123B, WAV: 456B\n\n一段语音转录。"
+        self.client.analyze_image = debug_image
+        await turn._textualize_upload("u5", "rubi", "image", "/x/d.png")
+        assert len(self.am.list_cards("u5", "rubi")) == 1
+
+        # 超长正文 → 句边界收口，不再是硬切的半句
+        long_text = "".join(f"第{i}句话描述了一些细节内容。" for i in range(30))
+        async def long_image(path, prompt=None, timeout=60.0):
+            return long_text
+        self.client.analyze_image = long_image
+        await turn._textualize_upload("u5", "rubi", "image", "/x/l.png")
+        cards = self.am.list_cards("u5", "rubi")
+        assert len(cards) == 2
+        long_body = [c for c in cards if "第0句" in c.prompt][0].prompt
+        assert len(long_body) <= 200
+        assert long_body.endswith("。")  # 收在句末标点，不是断裂的半句
+        print_pass("reasoning scaffold stripped / dropped, sentence-boundary cut")
 
     async def test_daily_cap_and_exception(self):
         turn = self.turn
@@ -8873,6 +9267,315 @@ class TestDirectVision:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class _MdFakeBot:
+    """Minimal QQBot stand-in: records sends, raises ActionFailed by code."""
+
+    def __init__(self, fail_codes=()):
+        self.sent = []
+        self._fail = list(fail_codes)
+
+    async def send(self, event, msg):
+        if self._fail:
+            code = self._fail.pop(0)
+            from nonebot.drivers import Response
+            from nonebot.adapters.qq.exception import ActionFailed
+            raise ActionFailed(Response(
+                status_code=400, headers={},
+                content=json.dumps({"code": code, "message": "rejected"}).encode()))
+        self.sent.append(msg)
+
+
+class TestOfficialMarkdown:
+    """51. QQ 官方渠道 markdown（msg_type=2）发送能力.
+
+    buttons-design §6.10/§12.7 落地：渠道能力位、md/text 分组合并与区块
+    切分、拒绝码纯文本降级 + 熔断、配额丢弃优先级、_send_response 格式
+    路由（unified→md / split→纯文本+清洗 / OneBot 零改动）、L4 渲染能力
+    声明注入（缓存前缀不动）、/帮助 与 /兑换码 markdown 化。
+    """
+
+    def run(self):
+        print_header("51. QQ Official Markdown (msg_type=2)")
+        os.environ.setdefault("USER_DATA_ROOT", "/tmp/qqbot_smoke")
+        asyncio.run(self.test_capability_flags())
+        asyncio.run(self.test_env_kill_switch())
+        asyncio.run(self.test_merge_rules())
+        asyncio.run(self.test_md_block_split())
+        asyncio.run(self.test_reject_code_degrades_to_text())
+        asyncio.run(self.test_breaker_disables_markdown())
+        asyncio.run(self.test_drop_by_priority())
+        asyncio.run(self.test_build_render_context())
+        asyncio.run(self.test_send_response_format_routing())
+        asyncio.run(self.test_l4_injection_keeps_prefix())
+        asyncio.run(self.test_help_markdown_transform())
+        asyncio.run(self.test_redeem_markdown_bodies())
+
+    # ── helpers ──────────────────────────────────────────────────
+    @staticmethod
+    def _qo():
+        import adapters.qq_official as qo
+        return qo
+
+    @staticmethod
+    def _sender(bot=None, is_group=False):
+        qo = TestOfficialMarkdown._qo()
+        return qo.QQOfficialSender(bot or _MdFakeBot(), MagicMock(), is_group)
+
+    @staticmethod
+    def _breaker_guard(qo):
+        """Snapshot/restore module-level breaker + env (tests mutate both)."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def guard():
+            rejects, disabled = qo._md_breaker.rejects, qo._md_breaker.disabled_until
+            env = os.environ.pop("QQ_OFFICIAL_MARKDOWN", None)
+            try:
+                qo._md_breaker.rejects = 0
+                qo._md_breaker.disabled_until = 0.0
+                yield
+            finally:
+                qo._md_breaker.rejects = rejects
+                qo._md_breaker.disabled_until = disabled
+                if env is not None:
+                    os.environ["QQ_OFFICIAL_MARKDOWN"] = env
+                else:
+                    os.environ.pop("QQ_OFFICIAL_MARKDOWN", None)
+        return guard()
+
+    # ── cases ────────────────────────────────────────────────────
+    async def test_capability_flags(self):
+        """能力位：官方 True / OneBot False（渠道隔离 §6.10.7）。"""
+        qo = self._qo()
+        with self._breaker_guard(qo):
+            assert self._sender().supports_markdown is True
+        from adapters.onebot import OneBotSender
+        assert OneBotSender(MagicMock()).supports_markdown is False
+        print_pass("supports_markdown: official=True / onebot=False")
+
+    async def test_env_kill_switch(self):
+        """QQ_OFFICIAL_MARKDOWN=off → 能力位立即变 False（热读逃生门）。"""
+        qo = self._qo()
+        with self._breaker_guard(qo):
+            os.environ["QQ_OFFICIAL_MARKDOWN"] = "off"
+            assert self._sender().supports_markdown is False
+            os.environ["QQ_OFFICIAL_MARKDOWN"] = "on"
+            assert self._sender().supports_markdown is True
+        print_pass("env kill-switch 热读生效")
+
+    async def test_merge_rules(self):
+        """合并规则：md 只与 md 合并，text 只与 text 合并，顺序保持。"""
+        qo = self._qo()
+        with self._breaker_guard(qo):
+            s = self._sender()
+            await s.send_text("a")
+            await s.send_text("b")
+            await s.send_markdown("## c")
+            await s.send_markdown("## d")
+            await s.send_text("e")
+            payloads = s._merged_payloads()
+            kinds = [(seg.type, k) for seg, k in payloads]
+            assert kinds == [("text", "text"), ("markdown", "markdown"),
+                             ("text", "text")], kinds
+            assert payloads[0][0].data["text"] == "a\nb"
+            assert payloads[1][0].data["markdown"].content == "## c\n\n## d"
+            assert payloads[2][0].data["text"] == "e"
+        print_pass("md/text 分组互不混入，相对顺序保持")
+
+    async def test_md_block_split(self):
+        """超长 md 按区块边界切分，每块 ≤1500，不切行中。"""
+        qo = self._qo()
+        body = "\n\n".join(f"## 段落{i}\n内容行A\n内容行B" for i in range(150))
+        chunks = qo._split_markdown(body)
+        assert len(chunks) > 1
+        assert all(len(c) <= qo._MD_CHUNK_LIMIT for c in chunks)
+        assert not any(c.endswith("内容行") for c in chunks), "不得切在行中"
+        assert qo._split_markdown("短文本") == ["短文本"]
+        print_pass(f"区块切分：{len(body)}字 → {len(chunks)} 块，均 ≤1500")
+
+    async def test_reject_code_degrades_to_text(self):
+        """md 被拒（40034011）→ 同内容纯文本重发一次，内容不丢。"""
+        qo = self._qo()
+        with self._breaker_guard(qo):
+            bot = _MdFakeBot(fail_codes=[40034011])
+            s = self._sender(bot)
+            await s.send_markdown("**正文**")
+            await s.flush()
+            assert len(bot.sent) == 1, bot.sent
+            seg = bot.sent[0]
+            assert seg.type == "text" and seg.data["text"] == "**正文**"
+            assert qo._md_breaker.rejects == 1
+        print_pass("拒绝码降级：md → 纯文本重发（内容保留）+ 熔断计数")
+
+    async def test_breaker_disables_markdown(self):
+        """连续 3 次被拒 → 熔断打开：能力位 False，send_markdown 落 text 缓冲。"""
+        qo = self._qo()
+        with self._breaker_guard(qo):
+            for _ in range(3):
+                qo._md_record_reject()
+            assert self._sender().supports_markdown is False
+            s = self._sender()
+            await s.send_markdown("## 熔断期正文")
+            assert s._buffer == [("text", "## 熔断期正文")], s._buffer
+            # 冷却期满 → 半开恢复
+            qo._md_breaker.disabled_until = time.monotonic() - 1
+            assert qo._md_available() is True
+            assert qo._md_breaker.rejects == 0
+        print_pass("熔断：3 拒 → 降级纯文本；冷却后半开恢复")
+
+    async def test_drop_by_priority(self):
+        """配额不足丢弃优先级：先媒体（尾部起），再文本（免责在正文后）。"""
+        qo = self._qo()
+        payloads = [("md", "markdown"), ("img", "media"), ("dis", "text")]
+        kept = qo._drop_by_priority(payloads, 1)
+        assert [k for _, k in kept] == ["markdown", "text"], kept
+        kept = qo._drop_by_priority(payloads, 2)
+        assert [k for _, k in kept] == ["markdown"], kept
+        # 顺序保持：幸存者相对顺序不变
+        assert kept[0][0] == "md"
+        print_pass("丢弃优先级：media 先丢、尾部先丢、正文最后")
+
+    async def test_build_render_context(self):
+        """渲染声明：unified×官方 → 注入文本；split 或无能力渠道 → 空。"""
+        turn = _import_turn_for_tests()
+        qo = self._qo()
+        with self._breaker_guard(qo):
+            md_sender = self._sender()
+
+            class _NoMd:
+                supports_markdown = False
+            assert turn._build_render_context("unified", md_sender) \
+                == turn._RENDER_MD_DECLARATION
+            assert turn._build_render_context("split", md_sender) == ""
+            assert turn._build_render_context("unified", _NoMd()) == ""
+        print_pass("声明矩阵：仅 unified + md 渠道非空")
+
+    async def test_send_response_format_routing(self):
+        """_send_response 五路由：短md内联免责 / 长md免责独立 / 违规降纯 /
+        官方纯文本清洗记号 / OneBot 行为零改动。"""
+        turn = _import_turn_for_tests()
+        from agent.outbound import OutMarkdown
+
+        class _RecSender:
+            platform = "qq_official"
+            max_messages_per_turn = 10
+            supports_markdown = True
+
+            def __init__(self):
+                self.out = []
+
+            async def send_text(self, x): self.out.append(("text", x))
+            async def send_markdown(self, x): self.out.append(("md", x))
+            async def send_image(self, x): pass
+            async def send_audio(self, x): pass
+            async def send_progress(self, x, *, immediate=False): pass
+
+        old_sender = turn.default_sender
+        p_tok = turn._current_platform.set("qq_official")
+        r_tok = turn._current_render_context.set(turn._RENDER_MD_DECLARATION)
+        try:
+            # 1) 短正文 → 单条 md，免责内联
+            s = _RecSender(); turn.default_sender = s
+            await turn._send_response("## 短答复\n**要点**")
+            assert len(s.out) == 1 and s.out[0][0] == "md", s.out
+            assert "理性判断" in s.out[0][1]
+            # 2) 长正文 → md + 独立纯文本免责
+            s = _RecSender(); turn.default_sender = s
+            await turn._send_response("## 长答复\n" + "内" * 250)
+            assert [k for k, _ in s.out] == ["md", "text"], s.out
+            assert "理性判断" in s.out[1][1]
+            # 3) 白名单违规（表格）→ 纯文本路径
+            s = _RecSender(); turn.default_sender = s
+            await turn._send_response("| a | b |\n| 1 | 2 |")
+            assert all(k == "text" for k, _ in s.out), s.out
+            # 4) split（无声明）→ 纯文本且 ** 记号被清洗
+            s = _RecSender(); turn.default_sender = s
+            turn._current_render_context.set("")
+            await turn._send_response("**加粗**正文")
+            assert s.out[0][0] == "text" and "**" not in s.out[0][1], s.out
+            # 5) OneBot → 原样纯文本，不清洗（行为零改动 §13.3）
+            s = _RecSender(); s.platform = "onebot"; s.supports_markdown = False
+            turn.default_sender = s
+            turn._current_platform.set("onebot")
+            turn._current_render_context.set(turn._RENDER_MD_DECLARATION)
+            await turn._send_response("**keep** markers")
+            assert s.out[0][0] == "text" and "**keep**" in s.out[0][1], s.out
+        finally:
+            turn.default_sender = old_sender
+            turn._current_platform.reset(p_tok)
+            turn._current_render_context.reset(r_tok)
+        print_pass("_send_response 五条格式路由全部符合预期")
+
+    async def test_l4_injection_keeps_prefix(self):
+        """声明只进 L4 易变尾部；L1-L3 缓存前缀不受影响。"""
+        from agent.tool_registry import ToolRegistry
+        from agent.agent import Agent
+        from agent.context import _current_personality, _current_group_context
+        turn = _import_turn_for_tests()
+        agent = Agent(
+            deepseek_client=MockDeepSeekClient(),
+            tool_registry=ToolRegistry(),
+            config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+        )
+        p_tok = _current_personality.set("")
+        g_tok = _current_group_context.set("")
+        r_tok = turn._current_render_context.set(turn._RENDER_MD_DECLARATION)
+        try:
+            msgs = agent._build_messages(
+                agent.sessions.get_or_create("user_md"), "问题")
+            systems = [m for m in msgs if m["role"] == "system"]
+            head, tail = systems[0]["content"], systems[-1]["content"]
+            assert "本轮渲染能力" in tail, "声明必须在 L4 尾部"
+            assert "本轮渲染能力" not in head, "缓存前缀不得含易变声明"
+            # 关闭声明 → 尾部无该块，头部逐字节不变
+            head_before = head
+            turn._current_render_context.set("")
+            msgs2 = agent._build_messages(
+                agent.sessions.get_or_create("user_md"), "问题2")
+            systems2 = [m for m in msgs2 if m["role"] == "system"]
+            assert "本轮渲染能力" not in systems2[-1]["content"]
+            assert systems2[0]["content"] == head_before, "头部必须逐字节稳定"
+        finally:
+            _current_personality.reset(p_tok)
+            _current_group_context.reset(g_tok)
+            turn._current_render_context.reset(r_tok)
+        print_pass("L4 注入：声明进尾部，缓存前缀逐字节稳定")
+
+    async def test_help_markdown_transform(self):
+        """/帮助 md 化：反引号剥除、--- → ***、标题/列表保留、单条长度。"""
+        turn = _import_turn_for_tests()
+        md = turn._help_markdown()
+        assert md, "HELP.md 读取失败"
+        assert "`" not in md, "行内代码不在官方白名单"
+        assert not re.search(r"^\s*-{3,}\s*$", md, re.MULTILINE), "--- 需换成 ***"
+        assert "## 特殊会话管理" in md and "- /新会话" in md
+        assert len(md) <= 1500, f"帮助应单条发出，实际 {len(md)} 字"
+        print_pass(f"/帮助 → 单条 md（{len(md)} 字，白名单安全）")
+
+    async def test_redeem_markdown_bodies(self):
+        """/兑换码 md：每码一行、无加粗/反引号、过期分段、页脚保留。"""
+        turn = _import_turn_for_tests()
+        fmt = lambda v: v  # noqa: E731 — 有效期展示不参与本测试断言
+        active = [
+            {"code": "ABC_123", "content": "钻石×100", "valid": "11-05"},
+            {"code": "DEF456", "content": "", "valid": ""},
+        ]
+        expired = [{"code": "OLD-1", "content": "抽卡券×3", "valid": "10-20"}]
+        md = turn._redeem_time_md(active, expired, hidden=2,
+                                  stale_note="⚠ 数据截至 x", format_expiry_display=fmt)
+        assert "- ABC_123 · 钻石×100 · 有效期至 11-05" in md, md
+        assert "- DEF456 · 过期时间未知" in md, md
+        assert "**已于 7 天内过期（1 条）**" in md
+        assert "- OLD-1 · 抽卡券×3 · 已于 10-20 过期" in md
+        assert "另有 2 条较早的码未显示" in md
+        assert "/长期兑换码" in md and "⚠ 数据截至 x" in md
+        for bad in ("`", "**ABC", "| "):
+            assert bad not in md.replace("**已于", ""), f"码行不得含 {bad!r}"
+        lt = turn._redeem_long_md([{"code": "LT_1", "content": "金币×999"}], "")
+        assert "## 长期有效兑换码（1 条）" in lt and "- LT_1 · 金币×999" in lt
+        print_pass("/兑换码 与 /长期兑换码 md 正文格式符合 §6.10.8")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -8911,6 +9614,7 @@ def main():
         ("WebUI Official Status Aggregator", TestWebuiOfficialStatus()),
         ("WebUI Permissions Editor", TestWebuiPermissionsEditor()),
         ("Personality Marker Persistence (A+B)", TestPersonalityMarkerPersistence()),
+        ("Session-Persona Binding", TestSessionPersonaBinding()),
         ("Bond Scene Settlement (P3a)", TestBondScene()),
         ("Bond-Scene Session & Commands (P3a)", TestSceneSession()),
         ("Bond Reunion & Anniversary (P3a)", TestBondReunionAnniversary()),
@@ -8931,6 +9635,7 @@ def main():
         ("QQ Official Quote Parsing", TestQQOfficialQuoteParsing()),
         ("Reference Portrait (/设形象)", TestReferencePortrait()),
         ("Direct Vision (主模型直连识图)", TestDirectVision()),
+        ("QQ Official Markdown (msg_type=2)", TestOfficialMarkdown()),
     ]
 
     passed = 0

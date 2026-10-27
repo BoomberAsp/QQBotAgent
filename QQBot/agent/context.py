@@ -104,6 +104,17 @@ _current_bond_context: contextvars.ContextVar[str] = (
     contextvars.ContextVar("_current_bond_context", default="")
 )
 
+# Per-turn render-capability declaration (buttons-design §6.10.6): built by
+# agent/turn.py when the effective persona is unified AND the turn's Sender
+# reports supports_markdown (QQ official route, msg_type=2). Injected by
+# agent._build_messages() into the L4 volatile tail — never the cached
+# prefix — and doubles as the render-layer flag: _send_response() reads it
+# back to pick the markdown branch. Empty = plain-text turn (split persona,
+# OneBot channel, or markdown disabled/breaker-open).
+_current_render_context: contextvars.ContextVar[str] = (
+    contextvars.ContextVar("_current_render_context", default="")
+)
+
 # delegate_task nesting guard (Bond-System-Design.md §3.3): 0 = not inside a
 # delegation. run_delegated_task sets 1 for the inner task-plane run; a second
 # delegate_task call sees non-zero and hard-rejects (single-level nesting).

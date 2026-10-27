@@ -78,6 +78,19 @@ class CharacterRegistry(PersonalityManager):
         )
         # char_id → (card.md mtime, content)
         self._ugc_cache: Dict[str, Tuple[float, str]] = {}
+        # 会话人格绑定（Session-Persona-Binding）：turn.py 初始化时注入
+        # user_id -> Optional[SpecialSession] 的查询入口（_special_sessions.get_active）。
+        # None 时会话层整体跳过（旧解析链），也是回滚开关。
+        self._session_provider = None
+
+    def set_session_provider(self, provider) -> None:
+        """注入活跃特殊会话查询入口（模仿 SpecialSessionManager.set_client）。
+
+        provider: callable(user_id) -> session | None，session 需带
+        ``metadata`` dict。注入后 resolve_effective_personality 自动感知
+        会话绑定人格，turn.py 的 15+ 调用点无需逐个改动。
+        """
+        self._session_provider = provider
 
     # ── UGC discovery ─────────────────────────────────────────────
 
@@ -463,9 +476,54 @@ class CharacterRegistry(PersonalityManager):
         self._save_group_settings(settings)
         return resolved
 
+    # ── Session-bound persona (会话人格绑定) ──────────────────────
+
+    def _session_persona(self, user_id: str) -> Tuple[Optional[str], Optional[str]]:
+        """Inspect the active special session for a persona binding.
+
+        Returns ``(kind, persona_key)``:
+        - provider 未注入 / 无活跃会话 / 查询异常 → (None, None)
+        - kind="char_creation" → (kind, None)：创作访谈固定中性助手，穿透
+        - kind="bond_scene" → char_id 钉住（经 _exists 懒校验；失效则穿透，
+          取代旧 turn.py 无校验的每轮覆写）
+        - 其他 → metadata.persona_key（str 且 _exists 才生效；失效静默穿透，
+          覆盖 UGC 角色被删的场景，无需迁移存量数据）
+        """
+        if self._session_provider is None:
+            return None, None
+        try:
+            session = self._session_provider(user_id)
+        except Exception:  # noqa: BLE001 — 会话查询故障不阻断人格解析
+            logger.warning("session provider failed for %s", user_id, exc_info=True)
+            return None, None
+        if session is None:
+            return None, None
+        meta = getattr(session, "metadata", None) or {}
+        kind = meta.get("kind")
+        if kind == "char_creation":
+            return kind, None
+        if kind == "bond_scene":
+            char_id = str(meta.get("char_id") or "")
+            if char_id and self._exists(char_id, user_id=user_id):
+                return kind, char_id
+            if char_id:
+                logger.warning(
+                    "bond_scene char_id %r no longer resolvable; falling through",
+                    char_id,
+                )
+            return kind, None
+        key = meta.get("persona_key")
+        if isinstance(key, str) and key and self._exists(key, user_id=user_id):
+            return kind, key
+        return kind, None
+
     def resolve_effective_personality(
         self, user_id: str, group_id: str = None
     ) -> str:
+        # 0. Session layer: bond_scene 钉住 / 会话绑定人格（懒校验穿透）
+        _kind, session_key = self._session_persona(user_id)
+        if session_key:
+            return session_key
         # 1. User override (builtin or own UGC)
         settings = self._load_settings()
         name = settings.get(user_id)
@@ -477,6 +535,32 @@ class CharacterRegistry(PersonalityManager):
             return group_name
         # 3. Global default (builtin-only, unaffected by UGC)
         return self.get_default()
+
+    #: resolve_effective_source 的标签（/personality 无参列表用）
+    _SOURCE_LABELS = {
+        "scene_pin": "剧情钉住",
+        "session_bind": "会话绑定",
+        "user": "个人设置",
+        "group": "群默认",
+        "global": "全局默认",
+    }
+
+    def resolve_effective_source(
+        self, user_id: str, group_id: str = None
+    ) -> str:
+        """与 resolve_effective_personality 同链路，返回生效来源的中文标签。"""
+        kind, session_key = self._session_persona(user_id)
+        if session_key:
+            return self._SOURCE_LABELS[
+                "scene_pin" if kind == "bond_scene" else "session_bind"
+            ]
+        settings = self._load_settings()
+        name = settings.get(user_id)
+        if name and self._exists(name, user_id=user_id):
+            return self._SOURCE_LABELS["user"]
+        if self.get_group_personality(group_id or ""):
+            return self._SOURCE_LABELS["group"]
+        return self._SOURCE_LABELS["global"]
 
     # ── UGC lifecycle (write side; used by tools/creation_tools.py) ──
 

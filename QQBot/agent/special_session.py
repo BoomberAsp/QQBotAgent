@@ -148,6 +148,28 @@ class SpecialSessionManager:
         index = self._load_index(user_id)
         return index.get("sessions", [])
 
+    def update_metadata(self, user_id: str, name: str, updates: Dict) -> bool:
+        """Merge ``updates`` into a session's metadata and persist the index.
+
+        metadata 的唯一真源是 _index.json 的 entry（_load 也从那里读回），
+        所以直接改 index entry 即可，无需触碰 snapshot/delta。
+        会话人格绑定（persona_key）走这里写入。
+
+        Returns:
+            True if the session was found and updated, False otherwise.
+        """
+        index = self._load_index(user_id)
+        for entry in index.get("sessions", []):
+            if entry.get("name") == name:
+                meta = entry.get("metadata")
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta.update(updates)
+                entry["metadata"] = meta
+                self._save_index(user_id, index)
+                return True
+        return False
+
     def switch_to(self, user_id: str, name: str) -> SpecialSession:
         """Switch the active session to the named one.
 

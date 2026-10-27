@@ -562,7 +562,7 @@ class Agent:
         """
         from agent.context import (
             _current_personality, _personality_transition, _current_group_context,
-            _current_bond_context, _current_story_context,
+            _current_bond_context, _current_story_context, _current_render_context,
         )
         from agent.character_registry import get_character_registry
 
@@ -631,6 +631,15 @@ class Agent:
         transition_note = _personality_transition.get()
         if transition_note:
             volatile.append(transition_note)
+
+        # Render-capability declaration (buttons-design §6.10.6): present
+        # only when this turn renders as QQ official markdown (unified
+        # persona + supports_markdown channel). SOUL #8 defaults to plain
+        # text unless this declaration says otherwise — volatile tail, so
+        # the cached prefix is untouched either way.
+        render_ctx = _current_render_context.get()
+        if render_ctx:
+            volatile.append(render_ctx)
 
         # Character-plane bond state (level/title/mood/companionship stats).
         # Split personalities only, rebuilt per turn by agent_router — lives
