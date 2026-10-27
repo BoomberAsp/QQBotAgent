@@ -5328,6 +5328,7 @@ class TestSceneSession:
         self.turn = _import_turn_for_tests()
         self.test_l4_injection()
         self.test_scene_opening_line()
+        asyncio.run(self.test_scene_start_opening())
         asyncio.run(self.test_emit_level_ups_routing())
         asyncio.run(self.test_scene_command())
         asyncio.run(self.test_finish_bond_scene())
@@ -5372,6 +5373,7 @@ class TestSceneSession:
         print_pass("L4 scene instructions + script only for kind=bond_scene")
 
     def test_scene_opening_line(self):
+        """降级开场：通用引导文案，绝不回显脚本舞台指示原文。"""
         turn = self.turn
         orig = turn.get_character_registry
         try:
@@ -5384,15 +5386,96 @@ class TestSceneSession:
                               "【终幕】雨停了。")}
             line = turn._scene_opening_line("rubi", "雨夜谈心", scene)
             assert "剧情《雨夜谈心》开始" in line, line
-            assert "第一幕" in line and "终幕" not in line, line  # first act only
             assert "/结束会话" in line and "露比" in line, line
-            # empty body → generic framed fallback
+            # 脚本是给模型的提示词，降级文案也不得泄漏给用户
+            assert "第一幕" not in line and "哨塔" not in line, line
+            # empty body → same generic framed fallback
             line2 = turn._scene_opening_line(
                 "rubi", "星空之约", {"title": "星空之约", "body": "  "})
             assert "剧情《星空之约》开始" in line2 and "/结束会话" in line2
-            print_pass("opening seed: first act line, skips #/>; framed fallback")
+            print_pass("opening fallback: framed generic line, never echoes script")
         finally:
             turn.get_character_registry = orig
+
+    async def test_scene_start_opening(self):
+        """_start_bond_scene：LLM 演绎开场（不回显脚本）；LLM 失败降级固定文案。"""
+        turn = self.turn
+        tmp = tempfile.mkdtemp(prefix="scene_open_")
+        orig = (turn._bond_manager, turn._perm_manager, turn._special_sessions,
+                turn._safe_send, turn.get_character_registry, turn._model_router)
+        sent = []
+        try:
+            m = _tmp_bond_manager(tmp)
+            st = m.get_state("u1", "rubi")
+            st["level"] = 5
+            m._save("u1")
+            turn._bond_manager = m
+            perm = MagicMock()
+            perm.get_role.return_value = "admin"
+            perm.get_max_special_sessions.return_value = 10
+            turn._perm_manager = perm
+            special = MagicMock()
+            special.get_active.return_value = None
+            special.list_sessions.return_value = []
+            _created = MagicMock()
+            _created.name = "剧情·雨夜谈心"  # MagicMock(name=…) 不设属性，须显式赋值
+            special.create.return_value = _created
+            turn._special_sessions = special
+
+            async def fake_send(payload, sender=None):
+                sent.append(payload)
+
+            turn._safe_send = fake_send
+            reg = MagicMock()
+            reg.get_short_name.return_value = "露比"
+            reg.load.return_value = _P3_CARD
+            turn.get_character_registry = lambda: reg
+            scene = {"title": "雨夜谈心", "level": 4,
+                     "body": ("【第一幕 · 骤雨】夜里突降暴雨，你们躲进哨塔。\n"
+                              "【终幕】雨停了。")}
+
+            # LLM 成功 → 发送演绎文本 + 框架头尾；脚本原文不外泄
+            async def fake_ok(message, history=None, timeout_set=None, purpose=None):
+                assert "哨塔" in message  # 脚本作为提示词给模型
+                return "暴雨砸在哨塔的铁皮顶上，你被我拉着钻进塔里……「发什么呆？」"
+
+            router = MagicMock()
+            router.flash_client.chat_completion = fake_ok
+            turn._model_router = router
+            await turn._start_bond_scene("u1", "rubi", scene)
+            assert len(sent) == 1, sent
+            seed = sent[0]
+            assert seed.startswith("—— 剧情《雨夜谈心》开始 ——"), seed
+            assert "暴雨砸在哨塔的铁皮顶上" in seed, seed
+            assert "/结束会话" in seed, seed
+            assert "【第一幕" not in seed, seed  # 舞台指示不回显
+            special.add_message.assert_called_once_with("u1", "assistant", seed)
+            special.switch_to.assert_called_once()
+
+            # LLM 失败 → 降级通用文案，同样不泄漏脚本
+            sent.clear()
+            special.add_message.reset_mock()
+            special.switch_to.reset_mock()
+            m2 = _tmp_bond_manager(tempfile.mkdtemp(prefix="scene_open2_"))
+            st2 = m2.get_state("u2", "rubi")
+            st2["level"] = 5
+            m2._save("u2")
+            turn._bond_manager = m2
+
+            async def fake_err(message, history=None, timeout_set=None, purpose=None):
+                return "调用DeepSeek API时出错: timeout"
+
+            router.flash_client.chat_completion = fake_err
+            await turn._start_bond_scene("u2", "rubi", scene)
+            assert len(sent) == 1, sent
+            assert "剧情《雨夜谈心》开始" in sent[0], sent[0]
+            assert "轻轻拉住你的衣袖" in sent[0], sent[0]
+            assert "哨塔" not in sent[0], sent[0]
+            print_pass("scene start: LLM opening (no script leak) + degrade fallback")
+        finally:
+            (turn._bond_manager, turn._perm_manager, turn._special_sessions,
+             turn._safe_send, turn.get_character_registry, turn._model_router) = orig
+            shutil.rmtree(tmp, ignore_errors=True)
 
     async def test_emit_level_ups_routing(self):
         """档案 tier → 🔓 解锁提示；场景 tier → 私聊邀请（群聊/已完成不邀请）。"""
