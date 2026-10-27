@@ -507,6 +507,7 @@ async def handle_official_message(bot: QQBot, event: QQMessageEvent):
         f"[qq_official] {scope} message: openid={view.user_id} "
         f"group={view.group_id or '-'} msg_id={view.message_id} "
         f"attachments={len(event.attachments or [])} "
+        f"quoted={'yes' if getattr(event, 'reply', None) else 'no'} "
         f"text={view.text[:60]!r}"
     )
 

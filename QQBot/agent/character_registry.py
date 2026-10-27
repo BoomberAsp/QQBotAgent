@@ -113,6 +113,62 @@ class CharacterRegistry(PersonalityManager):
                 return path
         return None
 
+    # ── 参考立绘写端（/设形象 命令；读端见 reference_image_path）────
+
+    def reference_image_dir(self, char_id: str) -> str:
+        """Directory that holds the character's reference portrait."""
+        return os.path.join(self._char_dir, char_id, "assets")
+
+    def set_reference_image(
+        self, char_id: str, data: bytes, ext: str = "png"
+    ) -> str:
+        """Atomically store the reference portrait; return its path.
+
+        Writes ``assets/reference.<ext>`` via tmp + ``os.replace`` (same
+        directory, so the rename stays atomic even when CHARACTERS_DIR sits
+        on another disk than the upload it came from), then removes stale
+        ``reference.*`` with other extensions so exactly one portrait wins
+        the probe order used by :meth:`reference_image_path`.
+        """
+        if not self.is_ugc(char_id):
+            raise FileNotFoundError(f"不是自创角色: {char_id}")
+        adir = self.reference_image_dir(char_id)
+        os.makedirs(adir, exist_ok=True)
+        target = os.path.join(adir, f"reference.{ext}")
+        tmp = target + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+        for other in ("png", "jpg", "jpeg", "webp"):
+            stale = os.path.join(adir, f"reference.{other}")
+            if stale != target and os.path.isfile(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+        return target
+
+    def clear_reference_image(self, char_id: str) -> bool:
+        """Remove every reference portrait variant; True if anything went."""
+        adir = self.reference_image_dir(char_id)
+        removed = False
+        for ext in ("png", "jpg", "jpeg", "webp"):
+            path = os.path.join(adir, f"reference.{ext}")
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                    removed = True
+                except OSError:
+                    pass
+        try:
+            if os.path.isdir(adir) and not os.listdir(adir):
+                os.rmdir(adir)
+        except OSError:
+            pass
+        return removed
+
     def _meta_path(self, char_id: str) -> str:
         return os.path.join(self._char_dir, char_id, "meta.json")
 

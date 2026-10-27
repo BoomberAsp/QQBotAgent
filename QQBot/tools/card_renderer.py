@@ -895,38 +895,76 @@ def _parse_help_md(md_path: str) -> list:
             body = line[2:].strip().replace("`", "")
             if "—" in body:
                 cmd, _, desc = body.partition("—")
-                current[1].append((cmd.strip(), desc.strip()))
+                # 卡片是纯图：去掉 ** 记号，否则会原样画出星号
+                current[1].append((cmd.strip().replace("**", ""),
+                                   desc.strip().replace("**", "")))
             else:
-                current[1].append((body, ""))
+                current[1].append((body.replace("**", ""), ""))
     return sections
 
 
 def render_help_card(md_path: str, out_path: str | None = None) -> str | None:
     """Render HELP.md as a dark-theme help/command cheat-sheet card.
 
-    The card is derived from the markdown (``## `` sections + ``- `` command
-    rows), so it stays in sync with the doc ``/帮助`` sends as text. Returns
-    the PNG path, or ``None`` when the doc has no parseable sections.
+    The card is derived from the markdown (``## `` sections + ``- `` rows), so
+    it stays in sync with the doc ``/帮助`` sends as text. Long descriptions
+    are wrapped to the canvas: the previous one-line-per-command layout drew
+    straight past 1080px and silently clipped everything after it.
     """
     sections = _parse_help_md(md_path)
     if not sections:
         return None
 
     probe = ImageDraw.Draw(Image.new("RGBA", (W, 10)))
-
     title = "帮助 · 命令速查"
     subtitle = "以下命令直接由系统处理 · 发送 /功能 查看完整功能一览"
 
     title_h = _lh(52)
     sub_h = _lh(22)
     pill_h = _lh(24) + 20
-    cmd_h = _lh(24)
+    line_h = _lh(24)
     row_gap = 8
+    indent = 24                       # 续行缩进（相对命令起始列）
+
+    def _layout_rows(commands):
+        """Each row → [(x, line_offset, text)], wrapped to the canvas width."""
+        rows = []
+        for cmd, desc in commands:
+            if not desc:
+                # 没有「—」的说明行：整段按画布宽度折行（首行顶格）
+                wrapped = _wrap(probe, cmd, 24, W - PAD - indent * 2) or [""]
+                rows.append(
+                    [(PAD + 10, 0, wrapped[0])]
+                    + [(PAD + 10 + indent, k, ln)
+                       for k, ln in enumerate(wrapped[1:], 1)])
+                continue
+
+            cmd_w = _tw(probe, cmd, 24)
+            desc_x = PAD + 10 + cmd_w + 18
+            avail = W - PAD - desc_x
+            if _tw(probe, desc, 24) <= avail:
+                rows.append([(PAD + 10, 0, cmd), (desc_x, 0, desc)])
+                continue
+
+            cells = [(PAD + 10, 0, cmd)]
+            if avail < 260:            # 命令本身太长：说明另起一行
+                desc_x = PAD + 10 + indent
+                avail = W - PAD - desc_x
+                offset = 1
+            else:
+                offset = 0
+            for k, ln in enumerate(_wrap(probe, desc, 24, avail)):
+                cells.append((desc_x, offset + k, ln))
+            rows.append(cells)
+        return rows
+
+    layout = [(name, _layout_rows(commands)) for name, commands in sections]
 
     total_h = PAD + title_h + sub_h + GAP
-    for _name, commands in sections:
+    for _name, rows in layout:
         total_h += pill_h + GAP // 2
-        total_h += len(commands) * (cmd_h + row_gap)
+        for cells in rows:
+            total_h += line_h * (max(o for _x, o, _t in cells) + 1) + row_gap
         total_h += GAP
     total_h += PAD
 
@@ -939,7 +977,7 @@ def render_help_card(md_path: str, out_path: str | None = None) -> str | None:
     draw.text((PAD, y), subtitle, font=_font(22), fill=_TEXT_FAINT)
     y += sub_h + GAP
 
-    for idx, (name, commands) in enumerate(sections):
+    for idx, (name, rows) in enumerate(layout):
         color = _HELP_SECTION_COLORS[idx % len(_HELP_SECTION_COLORS)]
 
         # section pill header
@@ -950,14 +988,12 @@ def render_help_card(md_path: str, out_path: str | None = None) -> str | None:
                   name, font=_font(24), fill=(255, 255, 255, 255))
         y += pill_h + GAP // 2
 
-        # command rows
-        for cmd, desc in commands:
-            draw.text((PAD + 10, y), cmd, font=_font(24), fill=_TEXT)
-            cmd_w = _tw(draw, cmd, 24)
-            if desc:
-                draw.text((PAD + 10 + cmd_w + 18, y), desc,
-                          font=_font(24), fill=_TEXT_DIM)
-            y += cmd_h + row_gap
+        for cells in rows:
+            for x, offset, txt in cells:
+                primary = (offset == 0 and x == PAD + 10)
+                draw.text((x, y + offset * line_h), txt,
+                          font=_font(24), fill=_TEXT if primary else _TEXT_DIM)
+            y += line_h * (max(o for _x, o, _t in cells) + 1) + row_gap
 
         y += GAP
 
