@@ -9542,15 +9542,24 @@ class TestOfficialMarkdown:
         print_pass("L4 注入：声明进尾部，缓存前缀逐字节稳定")
 
     async def test_help_markdown_transform(self):
-        """/帮助 md 化：反引号剥除、--- → ***、标题/列表保留、单条长度。"""
+        """/帮助 md 化：反引号剥除、--- → ***、标题/列表保留、# 命令转义、单条长度。"""
         turn = _import_turn_for_tests()
         md = turn._help_markdown()
         assert md, "HELP.md 读取失败"
         assert "`" not in md, "行内代码不在官方白名单"
         assert not re.search(r"^\s*-{3,}\s*$", md, re.MULTILINE), "--- 需换成 ***"
         assert "## 特殊会话管理" in md and "- /新会话" in md
+        # 真标题（# 后带空格）保留、H1 不被误伤
+        assert md.startswith("# 帮助"), f"H1 标题应原样保留，实际开头 {md[:12]!r}"
+        assert "## 特殊会话管理" in md
+        # 反馈命令前缀 # 必须转义，避免被 QQ 渲染成节
+        for cmd in ("反馈", "bug", "建议"):
+            assert f"\\#{cmd}" in md, f"命令 #{cmd} 未加转义符"
+        # 不得残留裸 #命令：# 紧跟非空白「非 #」字符且前面不是反斜杠
+        # （排除 ## 真标题——其首 # 后是 #，属 [^\s#] 之外，不会被误判）
+        assert not re.search(r"(?<!\\)#(?=[^\s#])", md), "存在未转义的 # 命令前缀"
         assert len(md) <= 1500, f"帮助应单条发出，实际 {len(md)} 字"
-        print_pass(f"/帮助 → 单条 md（{len(md)} 字，白名单安全）")
+        print_pass(f"/帮助 → 单条 md（{len(md)} 字，白名单安全，# 命令已转义）")
 
     async def test_redeem_markdown_bodies(self):
         """/兑换码 md：每码一行、无加粗/反引号、过期分段、页脚保留。"""

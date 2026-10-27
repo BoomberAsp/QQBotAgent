@@ -4135,15 +4135,32 @@ async def _handle_set_bond_command(
     return True
 
 
+def _escape_md_command_hashes(content: str) -> str:
+    """Escape ``#`` that belongs to command text, not to a real heading.
+
+    QQ 官方 markdown（msg_type=2）把行首/列表项内的 ``#`` 一律当标题渲染，
+    于是 HELP.md 的反馈命令 ``#反馈``/``#bug``/``#建议`` 会被误识别成节。
+    判别依据：真标题的 ``#{1,6}`` 之后**必带空格**（``# 一号标题``、``## 反馈``），
+    而命令前缀的 ``#`` 紧跟一个非空白、非 ``#`` 字符（``#反馈``）。故只匹配
+    「``#`` 串的首个 ``#``、其后紧跟 ``[^\\s#]``」并加反斜杠转义（CommonMark 标准
+    转义符）：``(?<![#\\])`` 保证只命中串首且跳过已转义者（幂等），``[^\\s#]``
+    保证 ``## 反馈`` 这类真标题（首 ``#`` 后是 ``#``）不被误伤。设计文档 §line442
+    预期其余 md 命令复用本 helper。
+    """
+    return re.sub(r"(?<![#\\])#(?=[^\s#])", r"\#", content)
+
+
 def _help_markdown() -> str:
     """HELP.md → official-md-safe body (design §6.10.3: /帮助 as one
     msg_type=2 message instead of a card image — saves 1 reply quota and
     stays copyable/searchable).
 
     Transform keeps whitelisted syntax (#/## headings, - lists, **bold**)
-    and fixes the two violations HELP.md contains: inline-code backticks
-    (not in the official whitelist — would render verbatim) are stripped,
-    and `---` horizontal rules become `***` (the whitelisted hr form).
+    and fixes the violations HELP.md contains: inline-code backticks (not in
+    the official whitelist — would render verbatim) are stripped; `---`
+    horizontal rules become `***` (the whitelisted hr form); and the ``#``
+    feedback-command prefixes get backslash-escaped so QQ's renderer doesn't
+    treat them as headings (see _escape_md_command_hashes).
     "" on read failure → caller falls back to the card image path.
     """
     try:
@@ -4154,7 +4171,8 @@ def _help_markdown() -> str:
     if not content:
         return ""
     content = content.replace("`", "")
-    return re.sub(r"^\s*-{3,}\s*$", "***", content, flags=re.MULTILINE)
+    content = re.sub(r"^\s*-{3,}\s*$", "***", content, flags=re.MULTILINE)
+    return _escape_md_command_hashes(content)
 
 
 async def _send_markdown_doc(path: str, label: str = "文档") -> bool:
