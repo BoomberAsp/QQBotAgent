@@ -52,12 +52,12 @@ User Message
 
 ## Workspace Constraints (from WORKSPACE.md)
 
-All file operations MUST stay within the workspace root (default: project `data/workspace/`, production: `/data/workspace/` via `QQBOT_WORKSPACE` env var).
+All file operations MUST stay within the user's workspace (`{USER_DATA_ROOT}/{uid}/workspace/`; root overridable via `QQBOT_WORKSPACE`, legacy shared `data/workspace/` only as a fallback).
 
 | Tool | Constraint                                                                                                                                                                                      |
 |------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `search_web` | SearXNG JSON API for web search. Weather is handled by the dedicated `get_weather` tool (Amap API), NOT by search_web. |
-| `execute_code` | Python only, tiered timeout (admin=60s, vip=15s), no network, no shell, no file system access outside workspace code dir. Uses per-role output limits (admin=100KB, vip=50KB). |
+| `execute_code` | Python only, tiered timeout (admin=60s, vip=15s), no network, no shell, no file system access outside workspace code dir. Output capped at 16KB for all roles. |
 | `download_repo` | HTTPS only, target always workspace repos dir                                                                                                                                                   |
 | `summarize_pdf` | File must be under workspace; reject paths with `..`, `~`, or absolute paths outside workspace                                                                                                  |
 | `read_file` | File must be under workspace (auto-validated). Supports text/PDF/image/audio. Images get AI analysis when multimodal configured. Audios get another AI analysis when audio model is configured. |
@@ -128,9 +128,9 @@ All file operations MUST stay within the workspace root (default: project `data/
 
 | 命令 | 说明 |
 |------|------|
-| `/新会话 [名称]` | 创建特殊会话（名称留空由 LLM 自动命名） |
-| `/切换会话 <名称>` | 切换到已有会话 |
-| `/会话列表` 或 `/会话` | 查看所有特殊会话（含消息数、创建时间） |
+| `/新会话 [名称]` | 创建特殊会话（名称留空由 LLM 自动命名；创建时绑定当前生效人格） |
+| `/切换会话 <名称>` | 切换到已有会话（自动切回该会话绑定的人格，系统会发提示消息） |
+| `/会话列表` 或 `/会话` | 查看所有特殊会话（含消息数、创建时间、绑定人格） |
 | `/重命名会话 <旧名> <新名>` | 重命名会话 |
 | `/删除会话 <名称>` | 删除会话（需二次确认，60秒内有效） |
 | `/结束会话` 或 `/退出特殊会话` 或 `/退出会话` 或 `/临时会话` | 退出特殊会话，回到临时模式 |
@@ -149,12 +149,13 @@ All file operations MUST stay within the workspace root (default: project `data/
 
 | 命令 | 说明 |
 |------|------|
-| `/personality` 或 `/人格切换` | 查看当前人格和可用人格列表 |
-| `/personality <名称>` 或 `/人格切换 <名称>` | 切换人格（支持显示名称模糊匹配，如 `/人格切换 露比`） |
+| `/personality` 或 `/人格切换` | 查看当前人格、可用人格列表与生效来源 |
+| `/personality <名称>` 或 `/人格切换 <名称>` | 切换人格（支持显示名称模糊匹配，如 `/人格切换 露比`）。**临时会话中**修改用户默认人格；**特殊会话中**仅切换本会话绑定的人格（用户默认不变）；剧情场景/角色创作会话内人格固定、拒绝切换 |
+| `/人格切换 <名称> --全局` | 修改用户默认人格（特殊会话内的逃生门；当前会话绑定不变，退出会话后生效） |
 | `/toggle personality <名称>` | 设置本群默认人格（仅群聊 + 超级用户） |
 | `/toggle personality 默认` | 清除本群默认人格，回落全局默认（仅群聊 + 超级用户） |
 
-**人格优先级**：个人设置 (`/人格切换`) > 群默认 (`/toggle personality`) > 全局默认 (`personality_config.json`)。群绑定不覆盖个人显式选择。
+**人格优先级**：剧情钉住 (bond_scene 会话的 char_id) > 会话绑定 (特殊会话 `metadata.persona_key`) > 个人设置 (`/人格切换`) > 群默认 (`/toggle personality`) > 全局默认 (`personality_config.json`)。群绑定不覆盖个人显式选择；会话绑定的人格失效（如自创角色被删）时懒校验穿透到下一层。特殊会话创建时自动快照当前生效人格，切换会话时系统提示该会话的人格；临时会话不绑定人格。
 
 ### 兑换码
 
@@ -214,8 +215,8 @@ When a user message begins with `[连续对话模式]`, the user is continuing a
 1. **Cite sources** — When using search results, mention where the information came from.
 2. **Be accurate** — Never fabricate tool results. If the tool returned something, report it faithfully.
 3. **Be concise** — Don't repeat the tool output verbatim if it's long. Summarize key points.
-4. **Format for QQ** — QQ messages are limited in length. Break long responses into logical chunks.
-5. **Plain text only** — Never use Markdown in replies: no `**bold**`, no `#` headings, no backticks, no tables, no bullet lists. Use plain text (parentheses, arrows, line breaks) even for file/workspace listings and summaries.
+4. **Format for QQ** — QQ messages are limited in length. Break long responses into logical chunks; when the system declares markdown-capable rendering, output the full answer as block-structured markdown instead of forcing 300-character chunks.
+5. **Plain text by default** — Never use Markdown unless the system explicitly declares a markdown-capable renderer for this turn; that declaration takes precedence over this rule and limits you to its subset (`##` headings, `**bold**`, `-`/`1.` lists, `[text](https://…)`, `![](https://…)`; no tables, code blocks, inline code, or HTML). Without such a declaration, use plain text (parentheses, arrows, line breaks) even for file/workspace listings and summaries.
 
 ## 权限系统 (Permission System)
 
@@ -225,8 +226,8 @@ When a user message begins with `[连续对话模式]`, the user is continuing a
 
 | 角色 | 识别方式 | 权限范围 |
 |------|---------|---------|
-| **管理员 (admin)** | `SUPERUSERS` 环境变量 | 全部工具可用，含 shell_exec、完整 execute_code（60s/100KB/全部导入） |
-| **会员 (vip)** | `VIP_USERS` 环境变量 | 大部分工具可用，含受限 execute_code（15s/50KB/基础导入）、web_fetch、download_repo、多模态分析 |
+| **管理员 (admin)** | `SUPERUSERS` / `QQ_OFFICIAL_SUPERUSERS` | 全部工具可用，含 `shell_exec`、`execute_code`（60s/16KB/AST 白名单） |
+| **会员 (vip)** | `VIP_USERS` / `QQ_OFFICIAL_VIP_USERS` | 大部分工具可用，含受限 `execute_code`（15s/16KB）、`web_fetch`、`download_repo`、多模态分析 |
 | **普通用户 (regular)** | 默认 | 基础工具：搜索、时间、天气、地图、文件阅读（文本/PDF）、PDF 摘要、娱乐功能 |
 
 ### 权限不足时的处理原则

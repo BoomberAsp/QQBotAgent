@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -67,6 +68,158 @@ _TEXT_CHUNK_LIMIT = 1500
 # 官方富媒体「二进制直传」上限 5MB（超过须走分片上传；URL 上传软限制
 # 20MB）。见 docs/qqbot-api-v2-full-docs.md 单聊富媒体上传节。
 _BINARY_UPLOAD_LIMIT = 5 * 1024 * 1024
+
+
+# ── Markdown (msg_type=2) 能力层 ───────────────────────────────────
+# 2026/04/23 起单聊/群聊自定义 markdown 对所有机器人开放（无需模板），
+# 见 docs/qqbot-api-v2-full-docs.md §36。单条长度上限官方未公布（通用
+# 40054007 消息长度超限），按设计稿 §6.10.10 保守取 1500 字，切分只落
+# 在区块边界（空行 / 标题行），绝不切在行中。
+_MD_CHUNK_LIMIT = 1500
+
+# markdown 被拒的平台错误码 → 同内容纯文本降级重发一次（内容不丢）。
+# 来源：docs/qqbot-api-v2-full-docs.md 错误码表（50037/50041/50054-57、
+# 304036、40034006-40034011、40034124、40034127）与群聊 40054010
+# （不允许发送 URL）。
+_MD_REJECT_CODES = frozenset({
+    50037, 50041, 50054, 50055, 50056, 50057,
+    304036,
+    40034006, 40034008, 40034009, 40034010, 40034011,
+    40034124, 40034127,
+    40054010,
+})
+
+# 熔断器：连续 _MD_BREAKER_THRESHOLD 次被拒 → 进程内禁用 markdown
+# _MD_BREAKER_COOLDOWN 秒（期间 send_markdown 直接降级纯文本），防止
+# 权限/政策意外时每条回复都白付一次失败请求。冷却期满自动半开重试。
+_MD_BREAKER_THRESHOLD = 3
+_MD_BREAKER_COOLDOWN = 600.0
+
+
+@dataclass
+class _MdBreaker:
+    """Module-level markdown circuit breaker state (design §8.3 pattern)."""
+    rejects: int = 0
+    disabled_until: float = 0.0
+
+
+_md_breaker = _MdBreaker()
+
+
+def _md_env_enabled() -> bool:
+    """QQ_OFFICIAL_MARKDOWN=off/0/false/no → 全渠道禁用（热读，逃生门）。"""
+    return os.environ.get("QQ_OFFICIAL_MARKDOWN", "on").strip().lower() \
+        not in ("off", "0", "false", "no")
+
+
+def _md_available() -> bool:
+    """markdown 当前是否可发：env 开关 && 熔断器未打开。"""
+    if not _md_env_enabled():
+        return False
+    if _md_breaker.disabled_until:
+        if time.monotonic() < _md_breaker.disabled_until:
+            return False
+        # 冷却期满：半开 —— 清零计数，下一条 md 即试探
+        _md_breaker.disabled_until = 0.0
+        _md_breaker.rejects = 0
+        logger.info("[qq_official] markdown breaker half-open; retrying")
+    return True
+
+
+def _md_record_reject() -> None:
+    _md_breaker.rejects += 1
+    if (_md_breaker.rejects >= _MD_BREAKER_THRESHOLD
+            and not _md_breaker.disabled_until):
+        _md_breaker.disabled_until = time.monotonic() + _MD_BREAKER_COOLDOWN
+        logger.warning(
+            f"[qq_official] markdown rejected {_md_breaker.rejects}× "
+            f"consecutively; degrading to plain text for "
+            f"{_MD_BREAKER_COOLDOWN:.0f}s")
+
+
+def _md_record_success() -> None:
+    _md_breaker.rejects = 0
+
+
+def _drop_by_priority(payloads: list[tuple[MessageSegment, str]],
+                      n_drop: int) -> list[tuple[MessageSegment, str]]:
+    """Choose which payloads to drop when the passive-reply quota is short.
+
+    Order (§6.10.4): media (image/audio) first, then text — in both
+    passes from the TAIL, because the disclaimer trails the body and a
+    multi-chunk body's last chunk matters less than its first. Survivor
+    order is preserved. 正文永不丢 unless nothing else can be sacrificed.
+    """
+    if n_drop <= 0:
+        return payloads
+    dropped: set[int] = set()
+    for pass_kinds in (("media",), ("media", "markdown", "text")):
+        for i in range(len(payloads) - 1, -1, -1):
+            if n_drop <= 0:
+                break
+            if i not in dropped and payloads[i][1] in pass_kinds:
+                dropped.add(i)
+                n_drop -= 1
+        if n_drop <= 0:
+            break
+    if dropped:
+        logger.warning(
+            f"[qq_official] reply quota short: dropped {len(dropped)} "
+            f"payload(s) (media first, tail-first)")
+    return [p for i, p in enumerate(payloads) if i not in dropped]
+
+
+_MD_BLOCK_RE = re.compile(r"\n\n+|\n(?=#{1,6} )")
+
+
+def _split_markdown(text: str, limit: int = _MD_CHUNK_LIMIT) -> list[str]:
+    """Split over-long markdown at block boundaries (blank line / heading).
+
+    Greedy packing keeps each chunk ≤ limit; a single oversized block is
+    hard-cut (rare — the kernel already caps model output). Chunks rejoin
+    paragraphs with a blank line so md paragraph semantics survive.
+    """
+    if len(text) <= limit:
+        return [text]
+    blocks = [b.strip("\n") for b in _MD_BLOCK_RE.split(text) if b.strip()]
+    out: list[str] = []
+    buf = ""
+    for block in blocks:
+        while len(block) > limit:
+            if buf:
+                out.append(buf)
+                buf = ""
+            out.append(block[:limit])
+            block = block[limit:]
+        if not block:
+            continue
+        if buf and len(buf) + 2 + len(block) > limit:
+            out.append(buf)
+            buf = block
+        else:
+            buf = f"{buf}\n\n{block}" if buf else block
+    if buf:
+        out.append(buf)
+    return out or [text[:limit]]
+
+
+def _markdown_text_fallback(seg: MessageSegment,
+                            err: ActionFailed) -> MessageSegment | None:
+    """markdown 段被平台拒收 → 同内容纯文本段（msg_type=0）降级。
+
+    只对 _MD_REJECT_CODES 里的 markdown 专属错误码降级并计入熔断；
+    其它拒绝（审核/配额）原样返回 None 走既有 log-and-drop 路径。
+    """
+    if getattr(seg, "type", "") != "markdown":
+        return None
+    code = getattr(err, "code", None)
+    if code not in _MD_REJECT_CODES:
+        return None
+    _md_record_reject()
+    md = seg.data.get("markdown")
+    content = getattr(md, "content", None) or (
+        md.get("content") if isinstance(md, dict) else None) or ""
+    return MessageSegment.text(str(content))
 
 
 def _audio_as_file_fallback(seg: MessageSegment) -> MessageSegment | None:
@@ -289,6 +442,14 @@ class QQOfficialSender:
     bot.send(event, ...) resolves the passive-reply semantics for us:
     msg_id=event.id + an auto-incrementing msg_seq per event, and
     msg_type 7 media upload for file_image segments.
+
+    Markdown (msg_type=2) is sent natively — custom md is open to all
+    bots since 2026/04 (docs §36), the adapter derives msg_type from the
+    MessageSegment.markdown() type. Guard rails: env kill-switch
+    QQ_OFFICIAL_MARKDOWN=off, a reject-code-triggered plain-text resend,
+    and a module-level circuit breaker (3 consecutive rejects → 10 min
+    plain-text degradation). supports_markdown reflects all of it, so
+    the kernel's per-turn format decision degrades automatically.
     """
 
     platform = "qq_official"
@@ -300,6 +461,12 @@ class QQOfficialSender:
         self.max_messages_per_turn = 5 if is_group else 4
         self._buffer: list[tuple[str, object]] = []
         self._sent = 0
+
+    @property
+    def supports_markdown(self) -> bool:
+        # Dynamic: env kill-switch (hot-read) + circuit breaker. The
+        # kernel queries this per turn to pick the render format.
+        return _md_available()
 
     def wants_reply(self, view: InboundMessage) -> bool:
         # c2c: always answer. Group: only when @-mentioned — the
@@ -333,9 +500,16 @@ class QQOfficialSender:
         await self._send_once(MessageSegment.text(text))
 
     async def send_markdown(self, text: str) -> None:
-        # msg_type=2 markdown requires a platform-approved template;
-        # unapproved md is rejected, so degrade to plain text like OneBot.
-        await self.send_text(text)
+        """Buffer a markdown payload (msg_type=2, custom md — open to all
+        bots since 2026/04, no template needed). Degrades to the plain
+        text buffer when markdown is unavailable (env kill-switch or
+        breaker open), so content is never lost."""
+        if not (text and text.strip()):
+            return
+        if _md_available():
+            self._buffer.append(("markdown", text))
+        else:
+            await self.send_text(text)
 
     async def send_image(self, img: OutImage) -> None:
         self._buffer.append(("image", img))
@@ -349,18 +523,26 @@ class QQOfficialSender:
         """Send the buffered turn output. Best-effort: a failing payload
         is logged and skipped, never raised — mirrors _safe_send's
         "log but don't crash" policy (kernel retry does not reach here
-        because buffering makes every send_* succeed)."""
+        because buffering makes every send_* succeed).
+
+        Quota overflow drops by priority (§6.10.4/§12.7 #9): media
+        (image/audio) first, then tail-most text (the disclaimer sits
+        after the body, so it goes before body chunks) — 正文永不丢
+        unless literally nothing else fits."""
         if not self._buffer:
             return
         payloads = self._merged_payloads()
         self._buffer.clear()
-        for i, seg in enumerate(payloads):
-            if self._sent >= self.max_messages_per_turn:
-                logger.warning(
-                    f"[qq_official] reply quota exhausted "
-                    f"({self.max_messages_per_turn}/turn); dropping "
-                    f"{len(payloads) - i} remaining payload(s)")
-                break
+        remaining = self.max_messages_per_turn - self._sent
+        if remaining <= 0:
+            logger.warning(
+                f"[qq_official] reply quota exhausted "
+                f"({self.max_messages_per_turn}/turn); dropping "
+                f"{len(payloads)} buffered payload(s)")
+            return
+        if len(payloads) > remaining:
+            payloads = _drop_by_priority(payloads, len(payloads) - remaining)
+        for seg, _kind in payloads:
             await self._send_once(seg)
 
     async def _send_once(self, seg: MessageSegment) -> None:
@@ -368,6 +550,8 @@ class QQOfficialSender:
             try:
                 await self._bot.send(self._event, seg)
                 self._sent += 1
+                if getattr(seg, "type", "") == "markdown":
+                    _md_record_success()
                 return
             except (NetworkError, RateLimitException) as e:
                 if attempt == 0:
@@ -377,10 +561,14 @@ class QQOfficialSender:
             except ActionFailed as e:
                 # 语音条被拒 → 换文件卡再试一次（格式口径冲突的降级梯）
                 fallback = _audio_as_file_fallback(seg)
+                if fallback is None:
+                    # markdown 被拒（模板/语法/URL 类错误码）→ 同内容
+                    # 纯文本再试一次 + 熔断计数（设计稿 §6.10.10 / §8.1 L2）
+                    fallback = _markdown_text_fallback(seg, e)
                 if fallback is not None and attempt == 0:
                     logger.warning(
-                        f"[qq_official] audio rejected ({e!r}); "
-                        f"retrying as file card")
+                        f"[qq_official] {seg.type} rejected ({e!r}); "
+                        f"retrying as {fallback.type}")
                     seg = fallback
                     continue
                 # API rejection (audit, quota, bad payload) — not retryable
@@ -391,12 +579,20 @@ class QQOfficialSender:
                     f"[qq_official] send failed: {type(e).__name__}: {e}")
                 return
 
-    def _merged_payloads(self) -> list[MessageSegment]:
-        """Merge the buffer: consecutive text fragments join into one
-        message (the kernel's 1s-apart 300-char chunks collapse), images
-        keep their position relative to the surrounding text."""
-        out: list[MessageSegment] = []
+    def _merged_payloads(self) -> list[tuple[MessageSegment, str]]:
+        """Merge the buffer into (segment, priority-kind) payloads.
+
+        Consecutive text fragments join into one message (the kernel's
+        1s-apart 300-char chunks collapse); images keep their position
+        relative to the surrounding text. Markdown runs merge *only with
+        markdown* (joined by a blank line, then block-split at
+        _MD_CHUNK_LIMIT): mixing plain text into a msg_type=2 payload
+        would render its markers verbatim, and splitting mid-line would
+        break md syntax. Kind is "text"/"markdown"/"media" for the
+        quota-drop priority in _drop_by_priority."""
+        out: list[tuple[MessageSegment, str]] = []
         text_run: list[str] = []
+        md_run: list[str] = []
 
         def flush_text() -> None:
             if not text_run:
@@ -404,18 +600,33 @@ class QQOfficialSender:
             merged = "\n".join(text_run)
             text_run.clear()
             for i in range(0, len(merged), _TEXT_CHUNK_LIMIT):
-                out.append(MessageSegment.text(merged[i:i + _TEXT_CHUNK_LIMIT]))
+                out.append((MessageSegment.text(merged[i:i + _TEXT_CHUNK_LIMIT]),
+                            "text"))
+
+        def flush_md() -> None:
+            if not md_run:
+                return
+            merged = "\n\n".join(md_run)
+            md_run.clear()
+            for chunk in _split_markdown(merged):
+                out.append((MessageSegment.markdown(chunk), "markdown"))
 
         for kind, item in self._buffer:
             if kind == "text":
+                flush_md()
                 text_run.append(item)  # type: ignore[arg-type]
+            elif kind == "markdown":
+                flush_text()
+                md_run.append(item)    # type: ignore[arg-type]
             else:
                 flush_text()
+                flush_md()
                 seg = (self._image_segment(item) if kind == "image"  # type: ignore[arg-type]
                        else self._audio_segment(item))               # type: ignore[arg-type]
                 if seg is not None:
-                    out.append(seg)
+                    out.append((seg, "media"))
         flush_text()
+        flush_md()
         return out
 
     def _image_segment(self, img: OutImage) -> MessageSegment | None:

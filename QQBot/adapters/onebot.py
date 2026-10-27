@@ -61,6 +61,9 @@ class OneBotSender:
     platform = "onebot"
     # OneBot has no per-turn reply quota; part of the Sender contract.
     max_messages_per_turn = 100
+    # NapCat/QQ has no native markdown rendering; the render layer must
+    # never emit markdown on this route (buttons-design §6.10.7).
+    supports_markdown = False
 
     def __init__(self, matcher):
         self._matcher = matcher

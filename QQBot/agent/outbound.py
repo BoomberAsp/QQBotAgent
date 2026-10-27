@@ -50,6 +50,19 @@ class OutAudio:
 
 
 @dataclass
+class OutMarkdown:
+    """A markdown-formatted body (buttons-design §6.10).
+
+    OneBot: rendered as plain text (channel has no markdown; the render
+    layer normally never emits this there — supports_markdown=False).
+    QQ official: msg_type=2 custom markdown (open to all bots since
+    2026/04), buffered and block-merged by QQOfficialSender with a
+    plain-text degradation chain on reject codes.
+    """
+    text: str
+
+
+@dataclass
 class OutProgress:
     """An intermediate progress line ("正在思考…" and friends).
 
@@ -96,6 +109,13 @@ class Sender(Protocol):
     # Optional: the official route's passive-reply quota is limited, so
     # an implementation may declare how many messages one turn may emit.
     max_messages_per_turn: int
+    # Channel capability flag (buttons-design §6.10.7): True only when the
+    # platform renders native markdown (QQ official msg_type=2, open to
+    # all bots since 2026-04). The kernel's render layer reads this to
+    # decide the per-turn format; OneBot stays False — never build
+    # markdown on that route. send_markdown() must still accept text on
+    # every implementation (degrading to plain text when False).
+    supports_markdown: bool
 
     async def send_text(self, text: str) -> None: ...
     async def send_image(self, img: OutImage) -> None: ...

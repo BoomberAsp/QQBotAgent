@@ -2,19 +2,24 @@
 
 ## 项目概述
 
-**QQBot** 是基于 [NapCat](https://github.com/NapNeko/NapCatQQ) + [NoneBot2](https://nonebot.dev/) 构建的 **LLM Agent 智能体**，采用 Markdown 驱动的现代智能体架构，支持工具调用（Tool Calling）、用户画像、长期记忆、特殊会话（百万 token 上下文）与用户工作区隔离。AI 后端使用 DeepSeek API。
+**QQBot** 是基于 [NoneBot2](https://nonebot.dev/) 构建的 **LLM Agent 智能体**，支持工具调用（Tool Calling）、用户画像、三层长期记忆、特殊会话（百万 token 上下文）与用户工作区隔离。当前同时接入 **两条 QQ 协议渠道**：NapCat / OneBot V11（QQ 号身份）与 **QQ 官方机器人 API**（openid 身份，单聊与群 @）。
 
-- **智能体架构**: Think→Act→Observe→Respond 循环，Markdown 配置文件驱动
+- **智能体架构**: Think→Act→Observe→Respond 循环，Markdown 配置文件驱动；平台无关内核（`agent/turn.py`）+ 入口适配器（`adapters/`）
 - **运行框架**: NoneBot2 (Python)
-- **QQ 协议适配**: NapCat (OneBot V11 反向 WebSocket)
-- **AI 后端**: DeepSeek API (OpenAI 兼容 Function Calling) + 多模型路由 (REASONING/FLASH/MULTIMODAL/AUDIO/OCR)，模型配置可经 Web 面板结构化编辑（保存前真实探测 API 可用性）并热重载
-- **搜索引擎**: SearXNG (Docker 自托管，聚合 Bing/DDG) + `web_fetch` 直接抓取网页
-- **特殊会话**: 每用户持久化会话（按角色：管理员 10 / 会员 3 / 普通 1），百万 token 上下文，快照+增量存储
-- **用户工作区**: 每用户独立文件空间，配额管理，跨会话隔离
-- **三层记忆引擎**: `TieredMemory`（SHORT/MEDIUM/LONG），LLM judge 归类 + 频次晋升/年龄降级状态机
-- **Web 管理面板**: FastAPI 独立服务（`webui/`），进程管理、配置热编辑、记忆/画像/别名管理、Token 看板、反馈处理、更新记录编辑与群发、Playground
+- **QQ 协议适配**: NapCat (OneBot V11 反向 WebSocket) / QQ 官方机器人 API（`nonebot-adapter-qq`，WebSocket 网关）
+- **AI 后端**: OpenAI 兼容接口 + 多模型路由（REASONING / FLASH / MULTIMODAL / AUDIO / OCR）；图像生成与 TTS 走 DashScope 原生接口（IMAGE_GEN / TTS 段），模型配置可经 Web 面板结构化编辑（保存前真实探测）并热重载
+- **双平面路由**: `split` 人格下，社交面（角色本人）与任务面（中立 Roxy，agent-as-tool）分离，任务结果回角色口吻转述
+- **角色养成**: 好感度 10 级（只涨不掉）+ 心情值 + 陪伴统计；礼物 / 戳一戳 / 称呼演化 / 档案解锁 / 剧情场景 / 纪念日 / 久别重逢；UGC 自创角色（含参考立绘与声纹）
+- **影音生成与记忆**: 角色画图（Lv4）与语音（Lv5）、主动发媒体（Lv7+）；资产卡（文本化本体）+ 二进制 LRU + 按 id 召回 + 事件蒸馏
+- **原作剧情知识库**: 本地 SQLite FTS5 检索（约 5 万句对白），按人格白名单注入 L4；`story_search` 工具主动检索
+- **直连识图（Direct Vision）**: 模型段开启 `supports_vision` 时，本轮图片以 `image_url` content part 直接进主模型
+- **搜索引擎**: SearXNG (Docker 自托管，聚合 Bing 等) + `web_fetch` 直接抓取网页（TLS 指纹伪装 + 可选无头浏览器兜底）
+- **特殊会话**: 每用户持久化会话（按角色：管理员 10 / 会员 3 / 普通 1），百万 token 上下文，快照+增量存储；**人格绑定在会话上**（`metadata.persona_key`），切换会话自动切换人格（解析链：剧情钉住 > 会话绑定 > 个人设置 > 群默认 > 全局默认）
+- **用户工作区**: 每用户独立文件空间，配额管理（2GB/500MB/100MB），跨会话隔离，80% 预警 + 超限清理协议
+- **三层记忆引擎**: `TieredMemory`（SHORT/MEDIUM/LONG），LLM judge 归类 + 频次晋升/年龄降级状态机；LONG 支持索引注入与 `recall_memory` 召回
+- **Web 管理面板**: FastAPI 独立服务（`webui/`，74 个 API + 16 个页面），进程管理、配置热编辑、记忆/画像/别名管理、Token 看板、反馈处理、更新记录编辑与群发、Playground、官方路由状态卡
 - **更新记录**: 结构化更新日志（版本/日期/分类变更条目），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询，管理员在面板编辑并群发更新公告；QQ 端以图片卡片呈现，并同步脱敏快照到公开站点 `bot.oneweblog.cn`
-- **部署方式**: Docker Compose（含 NVIDIA GPU 支持）或手动部署
+- **部署方式**: Docker Compose（searxng + qqbot；vLLM 由 `vllm-start.sh` 可选单独拉起）或手动部署
 
 ---
 
@@ -22,139 +27,142 @@
 
 ```
 QQBotAgent/
-├── bot.py                   # NoneBot 启动入口（备用；生产用 `cd QQBot && nb run`）
-├── main.py                  # PyCharm 占位入口（非实际入口）
-├── setup.sh / start.sh / stop.sh / start_bot.sh  # 安装与启动脚本
-├── start_webui.sh           # Web 管理面板 启动/停止/重启/状态
-├── test.sh                  # 测试脚本（10 个脚本，其中 8 个在被 gitignore 的 test/ 下）
-├── Dockerfile               # Docker 镜像构建文件
-├── docker-compose.yml       # Docker Compose 编排 (含 SearXNG + QQBot + vLLM)
-├── docker-entrypoint.sh     # Docker 容器入口脚本
-├── vllm-start.sh            # vLLM 推理服务启动脚本
-├── napcat.sh                # Napcat 安装脚本 (Rootless)
-├── searxng/                 # SearXNG 配置
-│   └── settings.yml         #   搜索引擎配置 (Bing, 国内优化)
+├── setup.sh / start.sh / stop.sh / start_bot.sh   # 安装 / 启动 / 停止 / 仅启动 NoneBot
+├── start_webui.sh              # Web 管理面板 启动|停止|重启|状态（127.0.0.1:8090）
+├── test.sh                     # 测试调度：3 个主测试 + 记忆 benchmark + 11 个离线脚本
+├── bot.py                      # NoneBot 备用入口（仅注册 OneBot 适配器；生产用 `cd QQBot && nb run`）
+├── main.py                     # PyCharm 占位入口（非实际入口）
+├── docker-compose.yml          # Docker 编排（searxng + qqbot 两服务）
+├── Dockerfile / docker-entrypoint.sh / vllm-start.sh
+├── napcat.sh                   # NapCat 安装脚本（Rootless / Docker）
+├── deploy_public_site.sh       # 公开站点发布脚本
+├── searxng/settings.yml        # SearXNG 搜索引擎配置（国内可用引擎）
 │
-├── webui/                   # ★ Web 管理面板（FastAPI 独立服务，绑定 127.0.0.1:8090）
-│   ├── main.py              #   面板入口（71 个 /api/ 端点 + 16 个页面路由 + 2 个 WebSocket）
-│   ├── auth.py              #   登录鉴权（scrypt 口令哈希 + 内存会话）
-│   ├── process_manager.py   #   进程管理（启动/停止 bot，看门狗状态持久化）
-│   ├── config_editor.py     #   配置热编辑（密钥脱敏；模型配置分段 prepare/commit + 原子写）
-│   ├── model_probe.py       #   模型 API 可用性探测（最小真实调用 + 分级判定）
-│   ├── data_reader.py       #   记忆/画像/会话/Wiki 别名/更新记录等数据读写（写前备份）
-│   ├── log_viewer.py / audit.py / hardware_monitor.py / playground.py
-│   ├── config.py            #   面板配置（从 QQBot/.env 读 USER_DATA_ROOT 等）
-│   ├── templates/ static/   #   前端页面（19 个模板）与静态资源
-│   └── data/                #   面板运行时数据（webui.pid / logs / watchdog_state.json）
+├── webui/                      # ★ Web 管理面板（FastAPI 独立进程）
+│   ├── main.py                 #   入口（74 个 /api/ 端点 + 16 个页面路由 + 2 个 WebSocket）
+│   ├── auth.py                 #   登录鉴权（scrypt 口令哈希 + 内存会话）
+│   ├── process_manager.py      #   启停 bot / 看门狗状态持久化
+│   ├── config_editor.py        #   提示词 / 人格 / .env / JSON 配置热编辑（密钥脱敏 + 原子写）
+│   ├── model_probe.py          #   模型 API 可用性探测（最小真实调用 + 分级判定）
+│   ├── data_reader.py          #   记忆/画像/会话/Wiki 别名/兑换码/更新记录 数据读写
+│   ├── log_viewer.py / audit.py / hardware_monitor.py / playground.py / napcat_login.py
+│   ├── official_status.py      #   QQ 官方路由状态（只读 official_status.json，mtime 判新鲜度）
+│   ├── config.py               #   面板配置（从 QQBot/.env 读 USER_DATA_ROOT 等）
+│   ├── templates/ static/      #   19 个页面模板与静态资源
+│   └── data/                   #   面板运行时数据（webui.pid / logs / watchdog_state.json / backups）
 │
-├── public_site/             # ★ 公开使用站点（bot.oneweblog.cn，纯静态只读，无登录/无后端）
-│   ├── index.html / style.css / app.js   # 单页：场景 / 怎么用 / 演示 / 更新记录
-│   ├── changelog.json       #   ← 自动生成（WebUI 保存时脱敏导出），勿手改
-│   └── assets/              #   演示截图/GIF（缺失时占位降级）
+├── public_site/                # ★ 公开使用站点（bot.oneweblog.cn，纯静态只读）
+├── docs/                       # 开发文档
+│   ├── qqbot-api-v2-full-docs.md          #   官方 API v2 离线全量文档（192 章）
+│   ├── qqbot-official-buttons-design.md   #   官方渠道按钮交互设计（功能盘点 + 接入方案）
+│   ├── 更新日志.md / aliyun_models_api.md / COMPARISON-QQBOTAGENT.md
+│   └── QQBOTAGENT-IMPROVEMENT-PLAN.md / openrubi_migration_plan.md / bot-site-nginx.md
+├── test/                       # 离线测试与实验脚本（gitignore，仅开发机；test.sh 调用其中 11 个）
+├── evidence/                   # 验证证据 / 截图
+├── *.md                        # 设计与计划文档（Bond / Story-KB / Voice / Cache-Hit-Rate / Memory 等）
 │
-├── docs/                    # 开发者向文档（更新日志.md、bot-site-nginx.md 等）
-│
-└── QQBot/                   # NoneBot 机器人主体
-    ├── .env                 # NoneBot 环境配置 (含 DeepSeek/OneBot 密钥) ⚠ git-ignored
-    ├── .env.example         #   .env 说明文档 + 模板 (逐行注释每个变量)
-    ├── requirements.txt     # Python 依赖
-    ├── pyproject.toml       # NoneBot 项目配置
-    ├── config.yml           # NoneBot 配置
-    ├── test_agent.py        # Agent 系统测试套件 (14 套件)
-    ├── test_workspace.py    # 工作区/会话文件测试 (11 类)
+└── QQBot/                      # NoneBot 机器人主体
+    ├── .env / .env.example     # 环境配置（密钥）与逐行注释模板
+    ├── requirements.txt / pyproject.toml / config.yml
+    ├── test_agent.py           # 主测试套件（51 个 Test 类 / 282 个用例）
+    ├── test_workspace.py       # 工作区 / 会话文件测试（11 个类）
+    ├── test_story_kb.py        # 剧情知识库检索测试（37 个用例，无网络）
+    ├── DOCUMENTATION.md / PLAN.md / README.md
     │
-    ├── agent/               # 智能体核心
-    │   ├── agent.py         #   主循环: Think→Act→Observe→Respond
-    │   ├── tool_registry.py #   工具注册表 (OpenAI JSON Schema 生成)
-    │   ├── session.py       #   会话管理 (per-user, timeout, trim 迟滞, 持久化, mtime 重校验)
-    │   ├── special_session.py #  特殊会话管理 (百万 token, 快照+增量存储, 按角色限制数量)
-    │   ├── continuous_session.py # 群聊连续对话窗口管理 (90秒免@)
-    │   ├── hardware.py      #   硬件自动检测 & 动态任务拒绝
-    │   ├── workspace.py     #   用户工作区隔离 & 配额管理
-    │   ├── workspace_snapshot.py # 工作区目录树快照 (get_user_info 用)
-    │   ├── quota_cleanup.py #   配额清理协议
-    │   ├── context.py       #   执行上下文传递 (contextvars, 工具→QQ图片)
-    │   ├── permissions.py   #   三层权限系统 (PermissionManager, UserRole)
-    │   ├── memory.py        #   长期记忆: MemorySystem (Markdown) + TieredMemory (三层引擎)
-    │   ├── fact_filter.py   #   确定性事实过滤 (画像/记忆抽取前置)
-    │   ├── profile.py       #   用户画像 (LLM 批量提取, mtime 重校验)
-    │   ├── task_record.py   #   子任务结构化记录 (begin_task/finalize_subtask 配套)
-    │   ├── search_archive.py #  搜索结果存档 (search_web/web_fetch 全文落盘, recall_search_result 配套)
-    │   ├── group_features.py #  群聊功能开关 (按群控制抽卡/图片/语音)
-    │   ├── personality.py   #   人格管理 (多套人格切换)
-    │   └── config/          #   智能体配置 (Markdown 文件)
-    │       ├── SOUL.md / IDENTITY.md / AGENTS.md / MEMORY.md  # 注入系统提示词 (4 个)
-    │       ├── TOOLS.md / BOOTSTRAP.md / SESSION.md           # 加载但不注入 (3 个)
-    │       ├── HELP.md / FEATURES.md       # /帮助、/功能 命令读取
-    │       ├── WORKSPACE.md / USER.md / HEARTBEAT.md          # 未加载 (文档遗留/失效)
-    │       └── personalities/  # 人格定义 (assistant / roxy_character / rubi)
+    ├── agent/                  # 智能体核心
+    │   ├── turn.py             #   ★ 平台无关内核：命令分发、回合编排、发送/进度、权限上下文
+    │   ├── agent.py            #   Think→Act→Observe→Respond 主循环
+    │   ├── inbound.py / outbound.py        # 入站视图 / 出站契约（Sender、OutImage/OutAudio/OutProgress）
+    │   ├── tool_registry.py    #   工具注册（OpenAI JSON Schema）
+    │   ├── context.py          #   contextvars：用户/角色/工作区/平台/Sender/人格/记忆注入 …
+    │   ├── permissions.py      #   三层角色 + 按平台身份表 + 工具过滤 + 配额
+    │   ├── session.py / special_session.py / continuous_session.py
+    │   ├── memory.py           #   MemorySystem（Markdown）+ TieredMemory（SHORT/MEDIUM/LONG）
+    │   ├── fact_filter.py / profile.py     # 画像提取流水线（LLM + 确定性过滤 + 批量调度）
+    │   ├── personality.py / character_registry.py   # 内置人格 + UGC 角色叠加层
+    │   ├── bond.py / bond_content.py       # 好感度 / 心情 / 送礼 / 戳一戳 / 剧情场景 / 重逢 / 纪念日
+    │   ├── asset_memory.py     #   多模态资产卡（文本化本体 + 去重 + 检索 + LRU）
+    │   ├── delegation.py       #   双平面路由：任务面委派 + 角色口吻转述
+    │   ├── greeting.py         #   主动问候候选索引 + 主动消息配额（官方渠道）
+    │   ├── portrait.py         #   参考立绘校验 / 规整 / 描述
+    │   ├── hardware.py / workspace.py / workspace_snapshot.py / quota_cleanup.py
+    │   ├── task_record.py / search_archive.py / group_features.py
+    │   └── config/             #   SOUL/IDENTITY/AGENTS/MEMORY（注入）+ TOOLS/BOOTSTRAP/SESSION（加载）
+    │                           #   + HELP/FEATURES（命令时读取）+ personalities/ + portraits/
     │
-    ├── plugins/             # NoneBot 插件目录
-    │   ├── agent_router.py  #   ★ 统一消息入口 (唯一活跃的消息处理插件; 含配置看门狗)
-    │   ├── pullingMonitor.py#   抽卡监控 & 卡池数据加载
-    │   ├── check_redeem_code.py # 兑换码爬取 & 缓存管理
-    │   ├── test.py          #   启动配置检查 (env 验证 + 客户端连通性)
-    │   └── chat.py / deepseek_*.py / group.py / speed.py / photos.py / character.py / utils.py
-    │                        #   [已废弃] 仅保留个别工具函数或全部注释
+    ├── adapters/               # 平台入口适配器
+    │   ├── onebot.py           #   OneBot V11：事件→InboundMessage、附件下载、OneBotSender
+    │   └── qq_official.py      #   QQ 官方：build_view、附件解析、QQOfficialSender（缓冲+合并+配额）、主动消息
     │
-    ├── tools/               # Agent 工具实现
-    │   ├── builtin_tools.py #   内置工具 (搜索/抓取/代码/Shell/PDF/Git/时间/系统负载/删除文件)
-    │   ├── file_tools.py    #   文件读取工具 (文本/PDF/图片/音频分析)
-    │   ├── map_tools.py     #   地图工具 (地理编码/逆编码/天气/POI/路径)
-    │   ├── legacy_tools.py  #   游戏/娱乐工具 (抽卡/动画/测速/乱速/解释/翻译)
-    │   ├── character_detail.py # 角色详情查询 (面板/技能/倍率/属性/天赋/潜能)
-    │   ├── bond_detail.py   #   羁绊详情查询 (类别/星级/攻击/生命/技能/获取/售价)
-    │   ├── card_renderer.py #   角色/羁绊卡片图片渲染
-    │   ├── battle_parser.py #   团战截图 OCR 解析 (行动值修正模块)
-    │   ├── ocr_name_matcher.py # OCR 角色名模糊匹配
-    │   ├── ag_skill_index.py   # 技能分类索引 (Skill 类 + 阵营触发方式分类)
-    │   ├── ag_trigger_engine.py # 行动值效果触发链推断
-    │   ├── ag_llm_resolver.py  # 拉/推条技能 LLM 解析
-    │   ├── buff_vocab_dump.py  # buff 词表导出 (模板采集辅助)
-    │   ├── wiki_scraper.py  #   Wiki 爬虫 (角色/羁绊数据 + buff 图标)
-    │   ├── name_resolver.py #   角色别名解析 (模糊匹配; 别名字典支持面板编辑+热重载)
-    │   └── changelog.py     #   更新记录读写/格式化 (纯 IO; 命令+工具+群发轮询共用)
+    ├── plugins/                # NoneBot 插件
+    │   ├── agent_router.py     #   OneBot 入口 + 配置看门狗 + 更新公告群发/群列表导出
+    │   ├── qq_official.py      #   官方入口 + 主动问候 / 主动发媒体 + 状态心跳
+    │   ├── pullingMonitor.py / check_redeem_code.py / ruyipage_fetch.py / offline_logger.py
+    │   └── group.py / speed.py / photos.py / test.py / utils.py（旧插件，仅保留个别工具函数）
     │
-    ├── scripts/             # 运维脚本
-    │   ├── migrate_memory_p1.py     # 旧记忆 → 三层结构迁移
-    │   └── cleanup_profile_facts.py # 画像事实存量清理
+    ├── tools/                  # Agent 工具实现
+    │   ├── builtin_tools.py    #   搜索/抓取/代码/Shell/Git/PDF/时间/系统负载/删除文件/搜索存档召回
+    │   ├── file_tools.py       #   文本 / PDF / 图片 / 音频读取与分析
+    │   ├── map_tools.py        #   地理编码 / 天气 / POI / 路径规划
+    │   ├── legacy_tools.py     #   抽卡 / 抽卡动画 / 测速 / 乱速 / 代码解释 / 翻译
+    │   ├── social_tools.py     #   画图 / 语音 / 资产召回 / 送礼（养成工具）
+    │   ├── creation_tools.py   #   自创角色
+    │   ├── character_detail.py / bond_detail.py / card_renderer.py
+    │   ├── battle_parser.py / ocr_name_matcher.py
+    │   ├── ag_skill_index.py / ag_trigger_engine.py / ag_llm_resolver.py / buff_vocab_dump.py
+    │   ├── wiki_scraper.py / wiki_glossary.py / name_resolver.py
+    │   └── changelog.py        #   更新记录读写/格式化/群发队列（纯 IO）
     │
-    ├── config/              # 配置文件
-    │   ├── multimodal.json  #   多模态 LLM 配置 (已被 models_settings.json 取代)
-    │   ├── models_settings.json  #   多模型配置 (REASONING/FLASH/MULTIMODAL/AUDIO/OCR) ⚠ 含密钥
-    │   ├── models_settings_example.json  #   多模型配置示例模板
-    │   ├── characters/      #   角色别名字典 (character_dic.json / bonds_search_dic.json, 面板可编辑)
-    │   ├── font/            #   卡片渲染字体
-    │   ├── ocr_digit_templates/ # OCR 数字模板
-    │   └── gacha_data.json  #   抽卡数据 (角色/羁绊/概率, 由 pullingMonitor 加载)
+    ├── lib/                    # 自定义库
+    │   ├── deepseek_client.py / model_router.py / multimodal_client.py
+    │   ├── token_ledger.py     #   Token 用量记账（面板看板数据源）
+    │   ├── media_gen.py        #   DashScope 图像生成 + TTS（并发闸 / 硬超时 / 优雅失败）
+    │   ├── image_parts.py      #   Direct Vision：图片 → OpenAI image_url part 编码
+    │   ├── story_kb.py         #   原作剧情检索（SQLite FTS5 + BM25/RRF）
+    │   ├── ocr_engine.py / buff_alias.py / status_icons.py
+    │   ├── browser_fetch.py    #   ruyiPage 无头浏览器抓取共享运行器
+    │   ├── status_heartbeat.py #   状态文件原子读写（面板↔bot 文件 IPC）
+    │   ├── errors.py           #   错误分类 + 诊断编号
+    │   └── amap_client.py
     │
-    ├── lib/                 # 自定义库
-    │   ├── deepseek_client.py  # DeepSeek API 客户端 (OpenAI 兼容 Function Calling)
-    │   ├── multimodal_client.py # 多模态 LLM 客户端 (图片+音频理解; reload() 热重载)
-    │   ├── model_router.py  #   多模型路由器 (复杂度分类 + 模型调度; reload() 热重载)
-    │   ├── token_ledger.py  #   Token 用量记账 (WebUI 看板数据源)
-    │   ├── amap_client.py   #   高德地图 API 客户端
-    │   ├── ocr_engine.py    #   OCR 引擎 (BuffDetector 模板匹配 + 技能冷却检测)
-    │   ├── buff_alias.py    #   buff 名称 → 图标标签别名映射 (提取/归一化)
-    │   └── status_icons.py  #   状态图标文件名 → 中文标签 (STATUS_ICON_CN)
+    ├── scripts/                # 运维脚本
+    │   ├── build_story_kb.py           # 离线构建剧情知识库（story.db）
+    │   ├── migrate_memory_p1.py        # 旧记忆 → 三层结构
+    │   ├── migrate_memory_p2_categories.py  # 记忆条目类型化（schema v2）
+    │   └── cleanup_profile_facts.py    # 画像事实存量清理
     │
-    ├── data/                # Agent 运行时数据 (生产环境位于 USER_DATA_ROOT)
-    │   ├── sessions/        #   会话持久化 (JSON)
-    │   ├── memory/          #   长期记忆 (tiers/{uid}.json 三层结构 + tiers/long/ 快照 + 旧版 Markdown)
-    │   ├── users/           #   用户画像 (JSON 文件)
-    │   ├── token_usage/     #   Token 用量记录
-    │   ├── task_log/        #   子任务结构化日志 ({uid}.jsonl)
-    │   ├── search_cache/    #   搜索结果存档 ({uid}/{id}.json, 7天TTL+50条上限, 不占工作区配额)
-    │   ├── audit/           #   审计日志 (JSONL)
-    │   ├── feedback/        #   用户反馈/Bug 报告
-    │   ├── name_index/      #   角色名索引缓存
-    │   ├── wiki_cache/      #   Wiki 爬取缓存 (角色/羁绊/兑换码)
-    │   ├── redeem_code/     #   兑换码缓存
-    │   ├── changelog/       #   更新记录 (changelog.json 主数据 + known_groups/pending_broadcast/broadcast_status 面板↔bot 通信)
-    │   ├── personality_config.json # 人格选择持久化
-    │   └── workspace/       #   工作区 (代码执行/仓库/上传/输出, 按 QQ 号隔离)
+    ├── benchmarks/memory/      # 记忆引擎 benchmark（场景流 / 端到端 / personas / 基线报告）
+    ├── images/                 # 抽卡动画、测速样本、buff 图标
+    ├── logs/                   # 运行日志（loguru）
+    ├── docs/                   # 机器人侧开发文档
     │
-    └── images/              # 图像资源 (抽卡动画 / 测速样本数据)
+    ├── config/                 # 配置（部分 git-ignored）
+    │   ├── models_settings.json / models_settings_example.json  # 7 段模型 + task_routing
+    │   ├── multimodal.json     # 旧版多模态配置（已被 models_settings 取代）
+    │   ├── gacha_data.json     # 抽卡数据
+    │   ├── story_personas.json # 剧情 KB 人格白名单 / 角色映射
+    │   ├── translation_glossary.json  # 翻译对照表
+    │   ├── characters/         # 角色/羁绊别名字典（面板可编辑）
+    │   ├── font/               # 卡片渲染字体
+    │   └── ocr_digit_templates/
+    │
+    └── data/                   # 运行时数据（生产环境由 USER_DATA_ROOT 等 env 指向数据盘）
+        ├── sessions/           #   临时会话持久化
+        ├── memory/             #   三层记忆（tiers/{uid}.json + long/ 快照 + 旧版 Markdown）
+        ├── users/              #   用户画像
+        ├── workspace/          #   用户工作区（代码/仓库/上传/输出）
+        ├── bonds/              #   好感度/心情/陪伴（按用户 × 角色）
+        ├── characters/         #   UGC 角色卡（card.md + meta.json）
+        ├── assets/             #   影音资产卡 + 二进制（可 LRU 淘汰）+ 去重索引 + 审计
+        ├── story_kb/           #   剧情知识库（story.db + 构建报告 + 原始语料）
+        ├── token_usage/        #   Token 用量
+        ├── audit/              #   工具调用审计（JSONL）
+        ├── feedback/           #   用户反馈 / Bug 报告
+        ├── name_index/         #   角色名索引缓存
+        ├── wiki_cache/         #   Wiki 爬取缓存与卡片图
+        ├── redeem_code/        #   兑换码缓存
+        ├── personality_config.json / personality_settings.json / group_personality.json
+        └── official_status.json #  官方路由状态（面板仪表盘读取；按需生成）
 ```
 
 ---
@@ -164,61 +172,106 @@ QQBotAgent/
 ### 1.1 核心循环
 
 ```
-User Message (@Bot)
-       │
-       ▼
-┌─────────────────────────────────────────────────────────┐
-│  agent_router.py (on_message, priority=1, rule=to_me())  │
-│                                                         │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │  Agent.run(user_message, user_id)               │    │
-│  │                                                 │    │
-│  │  1. Build Messages (四层分级, 见 §1.2):          │    │
-│  │     ├── L1-L3 System Prompt (静态→用户级稳定)    │    │
-│  │     ├── Conversation History (Session)          │    │
-│  │     ├── L4 易变尾部 (时间/画像/MEDIUM 记忆注入)  │    │
-│  │     └── Current User Message                    │    │
-│  │                                                 │    │
-│  │  2. THINK → LLM (chat_completion_with_tools)    │    │
-│  │                                                 │    │
-│  │  3. Has tool_calls?                             │    │
-│  │     YES → ACT (Execute Tool) → OBSERVE → goto 2 │    │
-│  │     NO  → RESPOND (return final answer)         │    │
-│  │                                                 │    │
-│  │  4. Post-processing:                           │    │
-│  │     ├── Session.update() + trim (迟滞修剪)      │    │
-│  │     └── _schedule_profile_update()              │    │
-│  │         → ProfileManager.observe_turn() 缓冲,   │    │
-│  │           每 5 轮后台批量 extract+judge          │    │
-│  └─────────────────────────────────────────────────┘    │
-│                                                         │
-│  5. Send response (_safe_send with retry, _split_text 智能分行, 300字符/块, 1s间隔)           │
-└─────────────────────────────────────────────────────────┘
+QQ 消息
+  ├─ OneBot 渠道（QQ 号）      adapters/onebot.py      ─┐
+  └─ 官方渠道（openid）        adapters/qq_official.py  ─┤
+                                                         ▼
+                          agent/turn.py（平台无关内核）
+   │  run_agent_turn(view) / run_continuous_turn(view)
+   │
+   ├─ 平台化身份：_current_platform → PermissionManager（QQ 号表 / openid 表）
+   ├─ 直连命令层（零 token，命中即 return）：会话 / 人格 / 养成 / 游戏 / 群管理 / 反馈 …
+   │
+   └─ 自然语言 → Agent.run(user_message, user_id, client=…)
+         │
+         ├─ 1. Build Messages（四层分级，见 §1.2）
+         │      L1–L3 system + 会话历史 + L4 易变尾 + 当前用户消息
+         │
+         ├─ 2. THINK → LLM（chat_completion_with_tools）
+         │
+         ├─ 3. Has tool_calls?
+         │      YES → ACT（ToolRegistry.execute）→ OBSERVE → 回到 2
+         │      NO  → RESPOND（最终回复）
+         │
+         ├─ 4. 收尾：
+         │      Session.update() + trim（迟滞修剪）
+         │      ProfileManager.observe_turn()（每 5 轮批量 extract+judge）
+         │      羁绊结算 / 剧情收尾 / 记忆注入准备
+         │
+         └─ 5. Sender 出站（_safe_send + _split_text，300 字符/块、1s 间隔）
+                官方渠道：缓冲合并 → 被动回复配额控制 → 失败降级
 ```
 
-**关键参数**:
-- `max_tool_iterations=20` — 最多 20 轮工具调用，防止死循环
-- `thinking_timeout=180.0s` — LLM 思考超时
-- `max_context_messages=20` — 每会话保留最近 20 条上下文
-- `session_timeout=1800.0s` — 会话 30 分钟无活动自动过期
-- `message_handler_timeout=300.0s` — 单次消息处理总超时
+**关键参数**：
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `max_tool_iterations` | 20（生产实例） | 最多 20 轮工具调用；默认构造值为 5 |
+| `thinking_timeout` | 180.0s | 单次 LLM 调用超时 |
+| 外层总超时 | 300.0s | 单条消息处理（`asyncio.wait_for`） |
+| `max_context_messages` | 20 | 临时会话保留条数（+ `TRIM_HYSTERESIS=4` 迟滞） |
+| `session_timeout` | 1800.0s | 临时会话 30 分钟无活动过期 |
+| 连续对话窗口 | 90s | 群聊 @ 一次后免 @ 窗口 |
+| 重复工具熔断 | 同工具同参数失败 ≥2 次 | 中断循环并给出说明 |
+| 上下文压缩 | `COMPRESS_STEP=4` / 尾部全文 20 条 | 特殊会话阶梯压缩，保前缀稳定 |
+| 自动折叠 | 结果 >600 字（抽卡/测速/截图解析） | 折叠为 `TaskRecord` 摘要 |
 
 ### 1.2 系统提示词结构（四层分级，前缀缓存友好）
 
-v2.26 起消息序列按**变化频率**分四层构建（`agent.py:_build_messages`），越靠前越稳定，最大化提供商侧前缀缓存命中率：
+v2.26 起消息序列按**变化频率**分四层构建（`agent.py::_build_messages`），越靠前越稳定，最大化提供商侧前缀缓存命中率：
 
 ```
-L1 全局静态 (system)   → SOUL.md + IDENTITY.md + AGENTS.md + MEMORY.md + 硬件信息
+L1 全局静态 (system)   → SOUL.md + IDENTITY.md + AGENTS.md + MEMORY.md
+                          (+ 硬件上下文，仅 bootstrap() 后存在)
                           所有用户共享同一前缀，字节级稳定（无时间戳）
-L2 人格/群 (system)    → personality 块 + 群功能限制（同人格/同群共享）
+L2 人格/群 (system)    → 角色卡正文（内置/UGC，CharacterRegistry）
+                          + 群功能限制块（同人格/同群共享）
 L3 用户级稳定 (system) → 工作区路径 + 权限角色说明（同用户跨轮稳定）
-   Conversation History → 会话上下文（迟滞修剪，头部每几轮才变一次）
-L4 易变尾部 (system)   → 真实当前时间、特殊会话标记、quota 用量、
-                          用户画像 (ProfileManager)、MEDIUM 记忆注入
-                          (TieredMemory.build_medium_injection, top 15 条 ≤600 字符)
+   Conversation History → 会话上下文（迟滞修剪；特殊会话走阶梯压缩）
+L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊状态（等级/进度/心情/
+                          陪伴/重逢/纪念日/已解锁档案）、原作剧情记忆块、
+                          影音资产注入（top 5）、特殊会话标记 + 创作/剧情指令、
+                          工作区配额用量、用户画像、MEDIUM 记忆 + LONG 索引行
 ```
 
-L4 置于历史**之后**：时间/画像/记忆每轮变化只影响尾部，不破坏 L1-L3 共享前缀。`build_system_prompt()` 只负责 L1（拼接 SOUL/IDENTITY/AGENTS/MEMORY 并缓存），`reload_configs()` 清空缓存重读。
+关键约束（均为代码注释中明确的设计决策）：
+
+- **时间不进 L1**：早期实现把时间块拼进缓存的系统提示词，导致时间冻结；现改为每轮重建的 L4。
+- **L4 位于历史之后**：所有易变内容（时间/羁绊/剧情/资产/画像/记忆）都在 append-only 历史之后，不打断 L1–L3 共享前缀。
+- **人格块在 L1 之后**：避免按人格切分约 10k token 的共享前缀。
+- **硬件段有门控**：只有 `Agent.bootstrap()` 检测过硬件才拼接；当前入口未调用 `bootstrap()`，故该段默认缺席（需要时在启动处调用一次）。
+
+### 1.3 双协议入口与出站契约
+
+| 层 | 实现 | 说明 |
+|---|---|---|
+| 入站视图 | `agent/inbound.py::InboundMessage` | 统一字段：`user_id / is_group / group_id / text / message_id / self_id / mentioned / reply_context / resolver / platform`；附件惰性下载，失败也记录为 `Attachment.error` |
+| OneBot 入口 | `plugins/agent_router.py` + `adapters/onebot.py` | 群消息手工判 `@`（不依赖 NapCat `to_me`）；附件经 NapCat `get_file`/`get_record` 或 HTTP 兜底 |
+| 官方入口 | `plugins/qq_official.py` + `adapters/qq_official.py` | 只处理 `C2CMessageCreateEvent` / `GroupAtMessageCreateEvent`；附件是公网 URL，直接下载；引用消息按 `msg_elements` + `ref_msg_idx` 解析 |
+| 出站契约 | `agent/outbound.py::Sender` | `send_text / send_markdown / send_image / send_audio / send_progress`；`OutImage` / `OutAudio` / `OutMarkdown` / `OutProgress` 描述语义，平台细节在适配器；`supports_markdown` 能力位是渠道隔离唯一判据（官方 True / OneBot False） |
+| OneBot 出站 | `OneBotSender` | 文本原样发、300 字符分块由内核负责；图片 `MessageSegment.image(Path)`；`send_markdown` 降级纯文本 |
+| 官方出站 | `QQOfficialSender` | 缓冲 + 合并 + 配额（单聊 4 次/60min、群 5 次/5min）；图片/语音 base64 上传（本地文件不可直读）；语音被拒降级文件卡；markdown（msg_type=2）单独成组、按区块 ≤1500 字切分，被拒（40034011 等）同内容纯文本重发 + 连续 3 拒熔断 10 分钟，`QQ_OFFICIAL_MARKDOWN=off` 一键禁用（热读）；配额不足丢弃优先级 正文 > 免责 > 图片；进度行默认吞掉，仅「正在思考…」即时发送 |
+| 失败语义 | `SendFailed` | 只有它是可重试错误；其它异常记日志后丢弃 |
+
+### 1.4 双平面路由（`split` 人格）
+
+```
+用户消息（角色人格 rubi / UGC 角色）
+  │
+  ├─ 角色面（social）   allowed_tools = SOCIAL_TOOLS
+  │     ├─ delegate_task  —— 把工具任务委托给任务面（agent-as-tool）
+  │     ├─ give_gift / create_image / send_voice / recall_asset
+  │     └─ 以角色人设直接答复闲聊、情绪与剧情
+  │
+  └─ 任务面（task）     run_delegated_task(persist=False)
+        ├─ 以中立 Roxy 人格运行，隔离上下文（不写会话历史）
+        ├─ 按用户角色过滤工具（与权限系统同一套 schema 过滤）
+        └─ 结果 → revoice_task_result：角色口吻开场白 + 正文原样透传
+```
+
+- 角色卡可通过 HTML 注释声明 `mode: split\|unified`（默认 unified）；`task_voice: character|template` 控制任务结果是否用 LLM 转述。
+- `_delegate_depth` 守卫单层嵌套，禁止递归委派。
+- UGC 角色同样走双平面；内置助手 Roxy 不拆分，直接走任务面。
 
 ---
 
@@ -240,7 +293,8 @@ L4 置于历史**之后**：时间/画像/记忆每轮变化只影响尾部，�
 | `hardware_detector` | `HardwareDetector` | None | 硬件检测器 (可选) |
 | `workspace_manager` | `UserWorkspaceManager` | None | 用户工作区管理 (可选) |
 | `special_session_manager` | `SpecialSessionManager` | None | 特殊会话管理 (可选) |
-| `max_tool_iterations` | `int` | 5 | 最大工具调用轮数（`agent_router.py:985` 实例化为 20） |
+| `asset_memory` | `AssetMemory` | None | 影音资产卡（P5 起 L4 注入来源） |
+| `max_tool_iterations` | `int` | 5 | 最大工具调用轮数（`turn.py` 生产实例为 20） |
 | `thinking_timeout` | `float` | 180.0 | LLM 思考超时秒数 |
 
 | 方法 | 说明 |
@@ -323,10 +377,11 @@ L4 置于历史**之后**：时间/画像/记忆每轮变化只影响尾部，�
 
 | 方法 | 说明 |
 |------|------|
-| `create(user_id, name=None)` | 创建特殊会话。name 为 None 时生成规则临时名 `{MMDD}_{HHMM}`，首次交互后 LLM 异步命名；重名自动追加 `_N` 后缀。按角色的数量上限（10/3/1）由 `agent_router._handle_session_command()` 在上游强制，`create()` 本身不检查 |
+| `create(user_id, name=None, metadata=None)` | 创建特殊会话。name 为 None 时生成规则临时名 `{MMDD}_{HHMM}`，首次交互后 LLM 异步命名；重名自动追加 `_N` 后缀。metadata 写入 `_index.json` entry（如 `persona_key` 会话人格绑定、`kind`/`char_id` 剧情会话标记）。按角色的数量上限（10/3/1）由 `agent_router._handle_session_command()` 在上游强制，`create()` 本身不检查 |
 | `get_active(user_id)` | 获取用户当前激活的特殊会话 (同一时间仅一个激活，读 `_index.json`) |
 | `get_by_name(user_id, name)` | 按名称获取会话 |
 | `list_sessions(user_id)` | 列出用户所有特殊会话 (索引条目: 名称/创建时间/消息数) |
+| `update_metadata(user_id, name, updates)` | 合并 updates 进指定会话的 metadata 并持久化 `_index.json`（`/人格切换` 会话内写绑定用）；会话不存在返回 False |
 | `switch_to(user_id, name)` | 切换到指定名称的会话；不存在时抛 `ValueError`（附可用会话列表） |
 | `rename(user_id, old_name, new_name)` | 重命名会话（新名已存在则抛 `ValueError`） |
 | `delete(user_id, name)` | 删除会话及其名下工作区文件（`repos/` 记录但保留；文件删除幂等），返回 `{"deleted", "freed_bytes", "kept_repos"}` 摘要 |
@@ -374,7 +429,7 @@ Markdown 文件 + frontmatter 存储，`MEMORY.md` 索引。**无内存缓存**�
 
 #### 类: `TieredMemory` — 三层记忆引擎 (P1)
 
-频次驱动的用户事实记忆状态机：**SHORT**（近期原文候选）→ **MEDIUM**（按频次强化的要点，唯一注入提示词的层）→ **LONG**（长期对象快照；P1 仅创建+持久化，查询/RAG 留待 P2）。所有方法为同步实现（asyncio 单线程下无需锁），与 `MemorySystem` 并存。
+频次驱动的用户事实记忆状态机：**SHORT**（近期原文候选）→ **MEDIUM**（按频次强化的要点，唯一注入提示词的层）→ **LONG**（长期对象快照 + 一行索引注入 + `recall_memory` 按 id 召回；快照 write-once，超过 critical 阈值 90 天降级）。所有方法为同步实现（asyncio 单线程下无需锁），与 `MemorySystem` 并存。
 
 **数据结构**（`dataclass`）：
 
@@ -400,7 +455,10 @@ Markdown 文件 + frontmatter 存储，`MEMORY.md` 索引。**无内存缓存**�
 | `MEDIUM_INJECT_TOKEN_CAP` | 600 | 注入文本字符上限 |
 | `LOW_CONFIDENCE_THRESHOLD` | 5 | count<5 的条目注入时标注「(低置信)」 |
 | `JUDGE_MEDIUM_LIST_CAP` | 40 | judge 提示词中嵌入的 MEDIUM 列表上限（SHORT 全量嵌入） |
-| `TIER_SCHEMA_VERSION` | 1 | 存储 schema 版本 |
+| `TIER_SCHEMA_VERSION` | 2 | 存储 schema 版本（v2 增加 `category` + `last_confirmed_ts`） |
+| `LONG_INJECT_MAX_LINES` / `LONG_RECALL_MAX_MATCHES` / `LONG_RECALL_SNAPSHOT_CAP` | 20 / 3 / 1200 | LONG 索引注入行数 / 单次召回条数 / 单条快照字符上限 |
+| 
+EARDUP_MERGE_DICE` | 0.6 | 近重复合并阈值（引擎级去重） |
 
 **方法**：
 
@@ -510,26 +568,30 @@ class UserRole(Enum):
 
 | 工具 | 管理员 | 会员 | 普通用户 |
 |------|:---:|:---:|:---:|
-| `search_web`, `get_time`, `get_weather` | ✅ | ✅ | ✅ |
-| `recall_search_result` (仅本人存档) | ✅ | ✅ | ✅ |
-| `read_file` (文本/PDF) | ✅ | ✅ | ✅ |
-| `summarize_pdf` | ✅ | ✅ | ✅ |
-| `geocode`, `reverse_geocode`, `search_poi`, `plan_route` | ✅ | ✅ | ✅ |
-| 游戏/娱乐工具 (抽卡/测速/翻译等) | ✅ | ✅ | ✅ |
+| 搜索 / 时间 / 地图 / 天气 / PDF / 文件读取 | ✅ | ✅ | ✅ |
+| 游戏工具（抽卡 / 测速 / 角色 / 羁绊 / 兑换码 / 截图解析） | ✅ | ✅ | ✅ |
+| 记忆与编排（`begin_task` / `finalize_subtask` / `recall_memory` / `recall_search_result` / `get_changelog` / `get_user_info`） | ✅ | ✅ | ✅ |
+| `story_search` | ✅ | ✅ | ✅（仅剧情白名单人格出现在 schema） |
 | `get_system_load` | ✅ | ✅ | ❌ |
 | `web_fetch` | ✅ | ✅ | ❌ |
 | `download_repo` | ✅ | ✅ | ❌ |
-| `read_file` (图片/音频 AI 分析) | ✅ | ✅ | ❌ |
-| `execute_code` | ✅ 完整 | ✅ 受限 | ❌ |
+| `execute_code` | ✅ 完整 | ✅ 受限 | ❌（`get_code_limits()` 返回 None） |
 | `shell_exec` | ✅ | ❌ | ❌ |
+| 角色面工具（`delegate_task` / `give_gift` / `create_image` / `send_voice` / `recall_asset`） | 动态 | 动态 | 动态 |
+| `create_character` / `complete_scene` / `end_continuous_mode` | 场景动态 | 场景动态 | 场景动态 |
+
+> 📌 **实现细节**：静态集合共 32 项（public 27 / vip 4 / admin 1），角色可用数为 admin 32、vip 31、regular 27；另外 8 个工具不在静态集合中，只经 `allowed_tools` 按场景下发（角色面 / 创作会话 / 剧情会话 / 连续对话），执行层硬拒绝越权调用。
+> `read_file` 的图片/音频 AI 分析**没有角色门**（只要对应模型段配置可用即可），权限表只限制文本/PDF 之外工具本身的可见性——文档与注释里"仅 VIP"的说法以实现为准。
 
 #### execute_code 分级限制
 
 | 参数 | 管理员 | 会员 |
 |------|:---:|:---:|
 | 最大超时 | 60s | 15s |
-| 输出上限 | 100KB | 50KB |
-| 内存上限 | 256MB | 128MB |
+| 输出上限 | 16KB | 16KB |
+| 内存提示 | 256MB | 128MB |
+
+> 输出上限自缓存优化 Phase 6-B1 起统一压到 16KB（超长 stdout 会在每轮工具循环里重复计费，模型也消化不了）；`max_memory_mb` 目前仅用于展示（`get_user_info`），未落 rlimit。
 
 #### 资源配额
 
@@ -537,34 +599,43 @@ class UserRole(Enum):
 |------|:---:|:---:|:---:|
 | 工作区磁盘配额 | 2 GB | 500 MB | 100 MB |
 | 最大特殊会话数 | 10 | 3 | 1 |
+| 自创角色数 | 10 | 3 | 1 |
+| 每日画图 / 语音配额 | 50 / 50 | 10 / 10 | 3 / 3 |
+| 影音资产磁盘配额 | 1000 MB | 300 MB | 100 MB |
 
-#### 身份识别
+工作区另有 80% 预警与超限清理协议（10 分钟未响应则按最旧文件自动清理到 80% 以下）。
 
-- **管理员**: `SUPERUSERS` 环境变量 (QQ 号逗号分隔列表)
-- **会员**: `VIP_USERS` 环境变量 (QQ 号逗号分隔列表)
-- **普通用户**: 不在以上两列表中的所有用户
+#### 身份识别（按平台切换）
+
+| 平台 | 管理员 | 会员 | 解析方式 |
+|---|---|---|---|
+| OneBot（QQ 号） | `SUPERUSERS` | `VIP_USERS` | 逗号分隔，逐项 `isdigit()` 过滤 |
+| QQ 官方（openid） | `QQ_OFFICIAL_SUPERUSERS` | `QQ_OFFICIAL_VIP_USERS` | 逗号分隔，**不过滤数字**（openid 是字母数字串） |
+
+- 平台由回合开始时设置的 `_current_platform` contextvar 决定（`run_agent_turn` / `run_continuous_turn` 各设一次，默认 `"onebot"`）；
+- `.env` 由 `PermissionManager` **每次调用直接读文件**（NoneBot 不一定把 `.env` 灌进 `os.environ`），所以面板改权限名单无需重启；
+- 管理员优先于会员；其余为普通用户。
 
 #### 权限传递机制
 
-权限信息通过 `contextvars` 在请求处理链路中传递：
-
 ```
-agent_router.py
-  ├── PermissionManager.get_role(user_id) → UserRole
-  ├── _current_user_role.set(role.value)          ← contextvar
-  ├── _current_code_limits.set(limits_dict)        ← contextvar
+turn.py / 入口插件
+  ├── PermissionManager.get_role(user_id) → UserRole        （按 _current_platform 选表）
+  ├── _current_user_role.set(role.value)                    ← contextvar
+  ├── _current_code_limits.set(limits_dict)                 ← 仅 admin/vip 有值
   └── agent.run(message, user_id, allowed_tools=..., user_role=...)
-        ├── get_schemas_for(allowed_tools)         ← LLM 只看到允许的工具
-        └── _execute_tool_calls()                  ← 硬拦截二次校验
-              └── execute_code() → _get_code_limits() ← 读取 contextvar 应用分级限制
+        ├── get_schemas_for(allowed_tools)                  ← LLM 只看到允许的工具
+        └── _execute_tool_calls()                           ← 硬拦截二次校验
+              └── execute_code() → _get_code_limits()       ← 读取 contextvar 应用分级限制
 ```
 
 #### 设计原则
 
-1. **Schema 过滤为主**: LLM 看不到越权工具就不会调用，从根源避免权限违规
-2. **硬拦截为纵深防御**: `_execute_tool_calls()` 中检查 `allowed_tools`，即使 schema 过滤出现 bug 也能兜底
-3. **环境变量认证**: 仅通过 `SUPERUSERS` / `VIP_USERS` 环境变量识别身份，无 QQ 命令提权路径，防止社会工程攻击
-4. **权限不足不暴露系统能力**: Agent 被告知权限受限时应说明"当前账户权限不支持"，而非"系统没有此功能"
+1. **Schema 过滤为主**：LLM 看不到越权工具就不会调用，从根源避免权限违规；
+2. **硬拦截为纵深防御**：`_execute_tool_calls()` 检查 `allowed_tools`，即使 schema 过滤出现 bug 也能兜底；
+3. **身份只来自环境变量**：没有任何 QQ 命令可以提权，防止社会工程；
+4. **双渠道不串号**：openid 与 QQ 号各自使用独立名单，官方渠道用户不会意外匹配到 OneBot 管理员；
+5. **权限不足不暴露系统能力**：Agent 被告知权限受限时应说"当前账户权限不支持"，而非"系统没有此功能"。
 
 ### 2.7 `lib/deepseek_client.py` — DeepSeek API 客户端
 
@@ -584,155 +655,77 @@ agent_router.py
 
 **全局实例**: `deepseek_client` — 模块级单例，try/except 创建，兼容测试环境。通过可选构造参数支持多模型实例化。
 
-### 2.8 `plugins/agent_router.py` — 统一消息入口
+### 2.8 `plugins/agent_router.py` — OneBot 入口与后台任务
 
-**这是当前唯一活跃的 QQ 消息处理插件**。所有旧的 `on_command` / `on_message` 处理程序已禁用。
+> 说明：v2.31 起**回合内核**已迁移到 `agent/turn.py`（见 §2.10），本插件只保留 OneBot 平台胶水与后台任务；QQ 官方入口见 `plugins/qq_official.py`。
+
+#### 职责
+
+| 职责 | 说明 |
+|---|---|
+| OneBot 匹配器 | `agent_router`（priority=1，手工判群 @，不依赖 NapCat `to_me`）、`continuous_router`（priority=2，连续对话窗口）、`poke_router`（priority=5，戳一戳通知） |
+| 事件转换 | `adapters/onebot.py::build_view` → `agent.inbound.InboundMessage` → `run_agent_turn()` |
+| 后台任务 | 配置看门狗（三组 mtime）、更新公告群发轮询器、群列表导出（`known_groups.json`） |
+| Sender 槽位 | 导入时把 `OneBotSender` 写入 `turn.default_sender / continuous_sender / poke_sender`，内核据此发送 |
 
 #### 消息处理
 
 | 处理程序 | 触发条件 | 说明 |
-|----------|----------|------|
-| `agent_router` | `on_message(priority=1, block=False, rule=to_me())` | 捕获所有 @机器人 的消息 |
+|---|---|---|
+| `agent_router` | `on_message(priority=1, block=False)` | 捕获所有消息；群消息要求 @ 机器人（或 `is_tome`） |
+| `continuous_router` | `on_message(priority=2)` | 仅群聊、仅连续窗口内、且未 @ 机器人；续期 90 秒窗口 |
+| `poke_router` | `on_notice(priority=5)` | 仅"戳了机器人自己"；`split` 人格下结算好感并回角色口吻反应 |
 
-#### 特殊命令 (绕过 Agent 直接处理)
+#### 直连命令一览（实现位于 `agent/turn.py`）
 
-| 命令 | 操作 |
-|------|------|
-| `/clear`, `清除上下文`, `新对话` | 清除当前用户会话上下文 (临时会话) |
-| `/status` | 显示 Agent 状态 (活跃会话数、已注册工具列表) |
-| `/新会话 [名称]` | 创建特殊会话。可选名称，留空由 LLM 自动命名 |
-| `/切换会话 <名称>` | 切换到指定特殊会话 |
-| `/会话列表` | 列出所有特殊会话及状态 (名称/消息数/创建时间) |
-| `/重命名会话 <旧名> <新名>` | 重命名指定特殊会话 |
-| `/删除会话 <名称>` | 删除指定特殊会话 (输出 6 位确认码, 60s 有效期) |
-| `/保存为会话 [名称]` | 将当前临时对话保存为特殊会话 |
-| `/结束会话` 或 `/退出特殊会话` 或 `/退出会话` 或 `/临时会话` | 退出特殊会话模式，回到临时会话 |
-| `/帮助` 或 `/help` 或 `/命令` | 显示完整系统命令列表（读取 `HELP.md`） |
-| `/personality [名称]` 或 `/人格切换 [名称]` | 查看/切换人格（assistant / roxy_character / rubi） |
-| `/toggle [功能] [on/off]` | 群聊功能开关（仅超级用户，仅群聊；gacha / image / voice） |
-| `/兑换码` 或 `/redeem-code` | 查询当前有效游戏兑换码（零 token，不经智能体） |
-| `/角色详情 <名称>` | 查询角色详情并渲染卡片图片（零 token） |
-| `/羁绊详情 <名称>` | 查询羁绊详情并渲染卡片图片（零 token） |
-| `/刷新角色数据` | 仅管理员：强制后台刷新角色/羁绊数据库 |
-| `/功能` 或 `/features` | 渲染 `FEATURES.md` 为功能卡片图片（零 token） |
-| `/更新日志 [d]` 或 `/update record [d]`（亦支持 `#更新日志`、`/更新记录`、`/update log`、`/changelog`） | 查询机器人最近 d 条更新记录（默认 3，最多 20；零 token，读 `data/changelog/changelog.json`） |
-| `/管理工作区` | 引导智能体调用 `get_user_info` 展示工作区快照（落入 Agent 处理，非拦截命令） |
-| `/取消` 或 `#取消` 或 `/结束` 或 `#结束` | 退出群聊连续对话模式（四个写法等价） |
-| `#反馈 <内容>` | 提交使用反馈，自动附带用户上下文（零 token 消耗） |
-| `#bug <描述>` | 提交 Bug 报告，自动附带用户上下文（零 token 消耗） |
-| `#建议 <内容>` | 提交改进建议，自动附带用户上下文（零 token 消耗） |
+| 类别 | 命令（含别名） |
+|---|---|
+| 会话 | `/新会话`、`/会话列表`（`/会话`）、`/切换会话`、`/重命名会话`、`/删除会话`（回复「确认删除 <名称>」）、`/结束会话`（`/临时会话`/`/退出会话`/`/退出特殊会话`）、`/保存为会话`、`/clear`（`清除上下文`/`新对话`）、`/帮助`（`/help`/`/命令`）、`/status` |
+| 人格 | `/personality`、`/人格切换`（均支持带名称；无 `#` 变体；特殊会话内只写会话绑定，`--全局` 后缀改写用户默认） |
+| 养成 | `/好感度`（`#好感度`/`/bond`）、`/剧情`、`/设好感 <1-10>`、`/创建角色`、`/删除角色`（回复「确认删除角色 <名称>」）、`/设形象`、`/形象`（`/查看形象`）、`/清除形象`（`/删形象`） |
+| 游戏 | `/兑换码`（`/redeem-code`）、`/长期兑换码`、`/角色详情 <名>`、`/羁绊详情 <名>`、`/刷新角色数据`（仅 admin） |
+| 群管理 | `/toggle`、`/toggle <gacha\|image\|voice> <on\|off>`、`/toggle personality [名称\|默认]`（仅群聊 + admin） |
+| 其他 | `/功能`（`/features`）、`/更新日志 [d]`（多个别名）、`/管理工作区`（落入 agent）、`/取消`（`#取消`/`/结束`/`#结束`，连续对话窗口内） |
+| 反馈 | `#反馈 <内容>`、`#bug <描述>`、`#建议 <内容>`（**必须用空格分隔**，且三者都零 token 直达开发者） |
 
-#### 消息发送辅助函数
+> 分发顺序（命中即 return）：反馈 → `/取消` → `/toggle` → `/兑换码` → `/角色详情` → `/羁绊详情` → `/刷新角色数据` → `/功能` → `/更新日志` → `/人格切换` → `/好感度` → `/设好感` → `/剧情` → 会话族 → 形象族 → 元命令（`/clear`、`/status` 等）→ Agent。
+> 特例：`/帮助` 由会话族处理（渲染 HELP.md 卡片）；`/管理工作区` 与私聊 `/取消` 会落入 Agent。
 
-| 函数 | 说明 |
-|------|------|
-| `_safe_send(message, max_retries=2, matcher=None)` | 带重试的安全发送。`ActionFailed` 时自动重试（递增退避 1s/2s），非重试错误静默丢弃。可选 `matcher` 参数用于连续对话路由。 |
-| `_send_response(response, matcher=None)` | 发送 Agent 回复。自动检测长度，短消息直接发送，长消息调用 `_split_text` 拆分后逐块发送（300 字符/块, 1s 间隔）。可选 `matcher` 参数。 |
-| `_split_text(text, max_len=300)` | 智能文本拆分。优先在句子边界（`。！？\n\n`）处断开，避免截断语义。 |
-| `_download_and_save_file(url, filename, max_size_mb=50)` | 从 QQ 消息下载文件到工作区 `uploads/`。UUID 防碰撞文件名，120s 超时。 |
-| `_continuous_sessions` | `ContinuousSessionManager` 实例。管理群聊连续对话窗口 (90秒免@)。 |
+#### 已注册工具（40 个）
 
-#### 连续对话模式 (Continuous Mode)
+静态工具 32 个（注册于 `agent/turn.py::_build_tool_registry()`，权限集合在 `agent/permissions.py`）：
 
-群聊中，用户首次 @机器人 后自动开启 90 秒「免 @」窗口。窗口内用户的所有消息都会被 Agent 处理，无需反复 @mention。
+| 分组 | 工具 |
+|---|---|
+| 信息与通用 | `search_web`、`get_time`、`read_file`、`summarize_pdf`、`delete_workspace_file`、`get_user_info`、`recall_search_result`、`get_changelog` |
+| 地图天气 | `geocode`、`reverse_geocode`、`get_weather`、`search_poi`、`plan_route` |
+| 游戏 | `gacha_pull`、`play_gacha_animation`、`calculate_speed`、`compare_speed_probability`、`parse_battle_screenshots`、`character_detail`、`bond_detail`、`redeem_code` |
+| 文本 | `explain_code`、`translate_text` |
+| 记忆编排 | `begin_task`、`finalize_subtask`、`recall_memory`、`story_search` |
+| 会员（vip） | `web_fetch`、`download_repo`、`get_system_load`、`execute_code` |
+| 管理员（admin） | `shell_exec` |
 
-| 处理器 | 优先级 | 触发条件 | 说明 |
-|--------|--------|----------|------|
-| `agent_router` | 1 | `to_me()` | 正常的 @机器人 入口，处理后自动开启连续窗口 |
-| `continuous_router` | 2 | 无规则 | 仅处理 `GroupMessageEvent` + 连续窗口内的用户消息 |
+动态工具 8 个（不在静态集合中，按场景经 `allowed_tools` 下发）：
 
-**窗口生命周期**:
-1. **开启**: `agent_router` 处理完 @消息 后自动调用 `_continuous_sessions.start(group_id, user_id)`
-2. **续期**: `continuous_router` 每条消息调用 `touch()` → 重置为完整 90 秒
-3. **取消**: 用户发送 `/取消` / `#取消` / `/结束` / `#结束` → 窗口关闭
-4. **超时**: 90 秒无消息 → `is_active()` 自动清理过期窗口
+| 工具 | 下发场景 |
+|---|---|
+| `delegate_task`、`give_gift`、`create_image`、`send_voice`、`recall_asset` | 角色面（`SOCIAL_TOOLS`） |
+| `create_character` | 仅在 `char_creation` 创作会话 |
+| `complete_scene` | 仅在 `bond_scene` 剧情会话 |
+| `end_continuous_mode` | 仅在连续对话窗口 |
 
-**Agent 感知**: 连续模式消息注入 `[连续对话模式]` 前缀，Agent 应保持简洁、不重复问候、适时建议用户 `/取消` 退出。
-
-#### 消息处理流程更新
-
-```
-收到 @消息
-  ├── 特殊命令 → /clear, /status (直接处理)
-  └── 自然语言
-       ├── _safe_send("Roxy 正在思考...")  ← 非阻塞，失败不影响后续
-       ├── Agent.run(message, user_id)    ← 最多 300s 超时
-       └── _send_response(response)       ← 重试 + 智能拆分
-            ├── ≤300 字符 → _safe_send() 直接发送
-            └── >300 字符 → _split_text() 句子边界拆分 → 逐块 _safe_send() (1s 间隔)
-```
-
-#### 已注册工具 (31 个)
-
-**内置工具 (13 个)**:
-
-| 工具名 | 来源 | 说明 |
-|--------|------|------|
-| `get_time` | builtin_tools | 获取当前日期和时间 (含中文星期) |
-| `search_web` | builtin_tools | SearXNG 聚合搜索 — 新闻/百科/知识查询 |
-| `web_fetch` | builtin_tools | 直接抓取 HTTPS 网页内容并提取纯文本 |
-| `execute_code` | builtin_tools | 执行 Python 代码，自动捕获并发送生成的图表 |
-| `shell_exec` | builtin_tools | 执行只读 shell 命令（白名单+管道，40+命令） |
-| `download_repo` | builtin_tools | Git clone 代码仓库 (HTTPS only, 命令注入防护) |
-| `summarize_pdf` | builtin_tools | 提取并总结 PDF 内容 (PyPDF2, 路径验证) |
-| `get_system_load` | builtin_tools | 获取服务器实时系统负载 (CPU/内存/磁盘, 用于任务预检) |
-| `get_user_info` | agent_router | 获取当前用户系统信息快照 (权限/会话/工作区/工具范围, 零 token 消耗) |
-| `delete_workspace_file` | builtin_tools | 删除工作区文件/空目录 (释放磁盘配额) |
-| `read_file` | file_tools | 读取用户上传的文件 (文本/PDF/图片/音频, 图片和音频可 AI 分析) |
-| `recall_search_result` | agent_router → search_archive | 按存档 id 取回 search_web/web_fetch 的完整结果 (7天保留, per-user 隔离) |
-| `get_changelog` | agent_router → changelog | 查询机器人自身的更新记录 (自然语言通道, 与 `/更新日志` 命令共用 `tools/changelog.py`) |
-
-**地图工具 (5 个)**:
-
-| 工具名 | 来源 | 说明 |
-|--------|------|------|
-| `geocode` | map_tools | 地址 → 经纬度坐标 |
-| `reverse_geocode` | map_tools | 经纬度 → 详细地址 + 周边 |
-| `get_weather` | map_tools | 实时天气 / 4天预报 (替代搜索方式) |
-| `search_poi` | map_tools | POI搜索 (餐厅/地铁/银行等) |
-| `plan_route` | map_tools | 路径规划 (驾车/步行/公交) |
-
-**娱乐工具 (6 个)**:
-
-| 工具名 | 来源 | 说明 |
-|--------|------|------|
-| `gacha_pull` | legacy_tools | 模拟游戏抽卡 (4 种卡池, 单抽/十连) |
-| `play_gacha_animation` | legacy_tools | 播放抽卡动画 (根据星级发送图片序列) |
-| `calculate_speed` | legacy_tools | 根据战斗行动值数据计算敌方速度 |
-| `compare_speed_probability` | legacy_tools | 计算两个速度值的乱速概率 |
-| `explain_code` | legacy_tools | LLM 中文解释代码功能和原理 |
-| `translate_text` | legacy_tools | LLM 多语言翻译 |
-
-**游戏工具 (4 个)**:
-
-| 工具名 | 来源 | 说明 |
-|--------|------|------|
-| `redeem_code` | agent_router → check_redeem_code | 游戏兑换码查询 (自动爬取+缓存) |
-| `character_detail` | character_detail | 角色详情查询 (面板/技能/倍率/属性/天赋) |
-| `bond_detail` | bond_detail | 羁绊详情查询 (类别/星级/技能/获取方式) |
-| `parse_battle_screenshots` | battle_parser | 团战截图 OCR 解析 (轻量/全量两种模式) |
-
-**会话编排 (3 个)**:
-
-| 工具名 | 来源 | 说明 |
-|--------|------|------|
-| `begin_task` | agent_router | 标记多轮工具型子任务起点 (抽卡/测速)，折叠问答避免污染上下文 |
-| `finalize_subtask` | agent_router | 结束子任务并提交结构化结果 (详情归档到 `data/task_log/{uid}.jsonl`) |
-| `end_continuous_mode` | agent_router | 智能体主动结束群聊连续对话窗口 (用户表达告别意图时) |
-
-**注**: `check_weather` 已移除。天气查询通过专用的 `get_weather` 工具（高德地图 API）实现。`web_fetch` 用于直接抓取搜索结果中无法索引的网页。`search_web` / `web_fetch` 的完整结果会存档到 `data/search_cache/{uid}/{id}.json`（`agent/search_archive.py`，7 天 TTL + 每用户 50 条上限，save 时惰性清扫），返回文本末尾附 `[存档] id: xxx` 行；上下文折叠/压缩后模型可经 `recall_search_result` 按 id 取回全文而无需重搜。存档 id 只随 append-only 的工具消息流转、不进系统提示词，与 v2.26 的前缀缓存优化不冲突。
-
-**权限分布**: 31 个工具中 24 个为公共工具（`_PUBLIC_TOOLS`），4 个为会员工具（`web_fetch` / `download_repo` / `get_system_load` / `execute_code`），1 个为管理员工具（`shell_exec`）；`end_continuous_mode` 不固定归属，由连续对话上下文动态并入。注册分布：26 个在 `_build_tool_registry()`，其余 5 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask` / `recall_search_result`）在模块级单独注册。
+> 📌 `story_search` 虽在 `_PUBLIC_TOOLS`，但 schema 会按人格白名单裁剪（非白名单人格看不到该工具）。
+> 注册位置：`_build_tool_registry()` 33 个 + 模块级 7 个（`get_user_info` / `end_continuous_mode` / `begin_task` / `finalize_subtask` / `recall_search_result` / `recall_memory` / `story_search`）。
 
 #### 配置看门狗（热重载）
 
-`_start_config_watcher()`（`agent_router.py:1007`）后台任务每 5 秒轮询三组文件的 mtime（各组独立 5 秒冷却），配合 WebUI 面板实现保存即生效、无需重启：
+`_start_config_watcher()`（`plugins/agent_router.py` 的 `@get_driver().on_startup`）每 5 秒轮询三组文件的 mtime（各组独立 5 秒冷却），配合 WebUI 面板实现保存即生效、无需重启：
 
 | 监听对象 | 变化时的动作 |
 |---|---|
-| `agent/config/*.md`（含 `personalities/`） | `reload_configs()` 重建系统提示词（只有 SOUL/IDENTITY/AGENTS/MEMORY 四个注入文件会即时改变行为；HELP/FEATURES 在下次命令触发时生效） |
+| `agent/config/**/*.md`（含 `personalities/`） | `agent.reload_configs()` 重建系统提示词（只有 SOUL/IDENTITY/AGENTS/MEMORY 四个注入文件会即时改变行为；HELP/FEATURES 在下次命令触发时生效） |
 | `config/characters/character_dic.json` / `bonds_search_dic.json` | `NameResolver.reload()` + 角色/羁绊详情缓存失效（面板「Wiki 缓存」页可编辑别名） |
-| `config/models_settings.json` | `model_router.reload()`（含模块级单例与 `MultimodalClient`）+ 重挂 3 处固化 client 引用（`agent.client` / `_profile_manager.set_client` / `_special_sessions.set_client`），约 10 秒生效 |
+| `config/models_settings.json` | `model_router.reload()`（含模块级单例与 `MultimodalClient`）+ 重挂固化 client 引用（`agent.client` / `_profile_manager.set_client` / `_special_sessions.set_client`），约 10 秒生效 |
 
 ### 2.9 `lib/model_router.py` — 多模型路由器
 
@@ -768,6 +761,96 @@ agent_router.py
   │
   └── 返回路由后的 client → Agent.run(message, user_id, client=client)
 ```
+
+
+### 2.10 `agent/turn.py` — 平台无关内核
+
+v2.31 起，原本集中在 `plugins/agent_router.py` 的回合逻辑被整体搬迁到这里，使 OneBot 与 QQ 官方两条入口共用同一内核（入口插件只保留平台胶水）。
+
+| 职责 | 说明 |
+|---|---|
+| 回合编排 | `run_agent_turn(view)` / `run_continuous_turn(view)`：平台上下文、权限、工作区、群功能限制、双平面选面、Agent 调用、收尾结算 |
+| 命令直连层 | 反馈 → `/取消` → `/toggle` → `/兑换码` → `/角色详情` → `/羁绊详情` → `/刷新角色数据` → `/功能` → `/更新日志` → `/人格切换` → `/好感度` → `/设好感` → `/剧情` → 会话族 → 形象族；随后元命令 `/clear`、`/status` 等 |
+| 发送语义 | `_safe_send()` / `_send_response()` / `_send_text_chunks()`：文本、图片、语音、进度统一走 `Sender`；300 字符分块 + 1s 间隔 |
+| 上下文 | 用户/角色/工作区/平台/群/Sender/人格/羁绊/剧情/委派深度等 contextvars 在回合开始时统一设置 |
+| 单例装配 | `Agent`、`SessionManager`、`SpecialSessionManager`、`TieredMemory`、`ProfileManager`、`BondManager`、`AssetMemory`、`CharacterRegistry`、`ToolRegistry` 在此构造并互相注入 |
+
+**关键常量**：任务开窗 TTL 900s、近期文件表 200 条、配额清理超时 600s、临时会话升级提示阈值 15 条（每 10 条复提）。
+
+### 2.11 `adapters/` + `agent/inbound.py` + `agent/outbound.py` — 平台适配层
+
+| 模块 | 职责 |
+|---|---|
+| `agent/inbound.py` | `InboundMessage`（平台无关视图）+ `Attachment`（kind/path/name/error/quoted）+ `AttachmentResolver` 协议 |
+| `agent/outbound.py` | `Sender` 协议 + `OutImage` / `OutAudio` / `OutProgress` + `SendFailed`（唯一可重试错误） |
+| `adapters/onebot.py` | OneBot 事件 → 视图；附件下载（`get_file`/`get_record` + HTTP 兜底）；引用消息解析；`OneBotSender` |
+| `adapters/qq_official.py` | 官方事件 → 视图（剥离内联表情伪 XML）；公网 URL 附件下载；引用消息（`message_type=103` + `msg_elements`）；`QQOfficialSender`；主动消息 `send_active_c2c` / `send_active_c2c_media` |
+
+**官方渠道的现实约束**（代码注释与实现）：
+
+- 无法读本地文件：图片/语音必须 base64 上传（`MessageSegment.file_image/file_audio`，单文件 >5MB 且有公网 URL 时改走 URL 上传，URL 软限 20MB）；
+- 被动回复配额极小：单聊 4 次/60min、群 5 次/5min，所以 Sender 采用「缓冲 → 合并 → 超配额丢弃 + WARNING」；
+- 语音条被平台拒收（如 850019）时降级为文件卡（`file_type=4`），用户仍能拿到 mp3；
+- 「正在思考…」是唯一值得即时占用配额的进度行（`OutProgress.immediate=True`），其余进度行默认吞掉。
+
+### 2.12 `agent/bond.py` + `agent/bond_content.py` — 角色养成核心
+
+三值模型：
+
+| 维度 | 范围 | 规则 |
+|---|---|---|
+| Bond（长期） | Lv1–Lv10（陌生→相识→熟悉→朋友→密友→知己→暧昧→恋人→誓约→灵魂伴侣） | 只涨不掉，永不衰减；阈值见 `_DEFAULT_LEVELS` |
+| Mood（短期） | 0–100 | 围绕基线 60 回归（5/h），影响加经验系数 0.8–1.2 与提示词语气行 |
+| Stats（陪伴） | 相识天数 / 累计消息 / 礼物数 | 驱动重逢与纪念日判定 |
+
+**加经验**：每日首聊 20、每消息 3（心情系数后 2–4）、每日聊天软上限 150（超出减半、2 倍后 1/4）、≥10 轮长会话 +30（每日一次）。
+**互动**：送礼三档（喜爱 30 / 普通 15 / 讨厌 5 经验，每日 3 次）、戳一戳（+5 经验、+3 心情，每日 3 次）、称呼演化、按级解锁档案。
+**剧情**：`complete_scene(title)` 结算（+100 经验、+10 心情），记录完成状态，供 `/剧情` 与纪念卡使用。
+**重逢 / 纪念日**：≥14 天未见触发重逢标记；相识 30/100/365/730/1095 天里程碑。
+**媒体门槛与配额**：画图 Lv4、语音 Lv5、主动语音 Lv7；每日配额 admin 50 / vip 10 / regular 3；影音资产磁盘配额 1000/300/100MB。
+**持久化**：`data/bonds/{user_id}.json`（按角色分区），进程内缓存 + `st_mtime_ns` 校验；数值可被 `config/bond_settings.json` 覆盖（该文件当前不存在，走默认值）。
+
+### 2.13 `agent/character_registry.py` + `agent/personality.py` + `agent/portrait.py` — 人格与 UGC 角色
+
+| 模块 | 职责 |
+|---|---|
+| `PersonalityManager` | 内置人格目录（`agent/config/personalities/*.md`）、卡片 HTML 注释元数据（`mode: split\|unified`、`task_voice`、`voice_id`）、用户级/群级绑定、模糊匹配与歧义拒绝（`CharacterRegistry` 基类） |
+| `CharacterRegistry` | 在人格之上叠加 UGC：`data/characters/{char_id}/card.md + meta.json`；按作者可见性隔离；解析显示名/模式/参考立绘/声纹；`_discover()` 仍只列内置，避免影响默认回退链。**人格解析单点**：`resolve_effective_personality` 五层链（见下）+ `resolve_effective_source` 来源标签 |
+| `portrait.py` | 参考立绘规整纯函数：解码校验、EXIF 旋转、alpha 铺白、长边 ≤1536（兜底 1024）、最小边 128、输出 ≤4MB |
+
+**参考立绘双层路径**：出厂层 `agent/config/portraits/`（内置人格随仓库分发）+ 覆盖层 `CHARACTERS_DIR/_builtin/<key>/assets`（管理员上传）。
+**声纹解析链**：UGC meta → 角色卡注释 → `voice_pool` 按 `blake2b(char_id)` 取模 → 默认音色，保证同一角色声线稳定。
+
+**会话人格绑定**（2026-10-27）：人格注册在特殊会话上（`_index.json` entry 的 `metadata.persona_key`），不再只是用户级默认。
+- **解析优先级**：`剧情钉住（bond_scene char_id）> 会话绑定（persona_key）> 个人设置 > 群默认 > 全局默认`；绑定 key 失效（UGC 角色被删）时懒校验穿透到下一层，存量无绑定的旧会话零迁移。
+- **provider 注入 = 单点解析**：`turn.py` 初始化时 `set_session_provider(lambda uid: _special_sessions.get_active(uid))`，15+ 个 resolve 调用点与连续会话路径零改动自动一致；注释掉注入行即整体回滚（provider=None → 会话层跳过）。
+- **切换规则**：特殊会话内 `/人格切换` 只写本会话绑定（经 `update_metadata`），`--全局` 逃生门改写用户默认；临时会话不绑定人格，其中切换仍写用户默认；剧情/角色创作会话拒绝切换（`--全局` 放行）。
+- **删除角色联动**：`CharacterRegistry.purge_references(char_id)` 清理**用户默认人格**与**群默认人格**中指向该角色的条目（`/删除角色` 回复「已解除 N 处人格设置引用」）；会话级 `metadata.persona_key` 不批量清理，由 `_exists` 懒校验自动穿透；好感数据（`data/bonds/`）保留，重逢时仍在。
+- **创建快照**：`/新会话`、`/保存为会话` 在 create/switch_to **之前** resolve 当前生效人格写入 `persona_key`；bond_scene 冗余写 `persona_key=char_id`（展示统一读 persona_key，解析按 kind 优先 char_id）。
+- 切会话/结束会话发人格提示消息但不注入 personality marker；`/clear` 清历史保留绑定。
+
+### 2.14 `agent/asset_memory.py` + `lib/media_gen.py` + `lib/image_parts.py` — 影音资产与生成
+
+| 模块 | 职责 |
+|---|---|
+| `asset_memory.py` | 资产卡（markdown + frontmatter）为**本体**，二进制是可淘汰缓存：建卡 / 读卡 / 列表 / `prompt_hash` 去重（168h 窗 + 4096 索引护栏）/ 关键词检索 / LRU 淘汰 / 事件蒸馏（≤300 字）/ 审计单行追加 / L4 注入（top 5） |
+| `media_gen.py` | DashScope 生成运行器：qwen-image（文生图与参考图 I2I 共用端点，同步返回图片 URL）+ qwen-audio-tts（`SpeechSynthesizer`，音频 URL 仅 24h → 必须立即落盘）；进程级并发闸 2、硬超时（图 60s/TTS 30s）、一次重试、TTS 硬顶 600 字、生成前 LLM 内容审查、失败统一返 None |
+| `image_parts.py` | Direct Vision 编码：本地图 → base64 `image_url` part（最长边 1568、≤20MB 原始、≤5MB 编码后、≤4 张/轮、GIF 取首帧、魔数嗅探 MIME、损坏静默跳过） |
+
+**存储布局**：`data/assets/{uid}/cards/{asset_id}.md`（卡，永不淘汰）、`data/assets/{uid}/{char_id}/{asset_id}.png|mp3`（二进制）、`data/assets/_dedupe_index.json`、`data/assets/audit.log`。
+
+### 2.15 `lib/story_kb.py` — 原作剧情知识库
+
+- **构建**：`scripts/build_story_kb.py` 四阶段（crawl → parse → index → enrich）产出 `data/story_kb/story.db`（当前约 11.7 MB）。
+- **检索**：SQLite FTS5 双索引 —— 中文按重叠 bigram（`unicode61` 无 CJK 分词器），英文 `unicode61` + BM25 权重；两路排序经 RRF（k=60）融合，再按「角色出现在场景 / 主线优先」等加分重排；候选召回放大 `max(limit*6, 24)`，查询词上限 24。
+- **注入**：`format_injection(limit=2, max_chars=2200)`，仅在人格白名单（默认 `{rubi, assistant}`，见 `config/story_personas.json`）且有匹配时进入 L4；UGC 等解析不到剧情角色的情况**不做检索**，避免跨角色污染。
+- **工具**：`story_search`（public，但 schema 按人格裁剪），返回带出处的检索结果。
+- **测试**：`test_story_kb.py` 6 个类 / 37 个用例，离线合成语料建临时 SQLite。
+
+### 2.16 `agent/delegation.py` + `agent/greeting.py` — 双平面与主动消息
+
+- `delegation.py`：`SOCIAL_TOOLS` 白名单、`run_delegated_task`（中立 Roxy、`persist=False`、权限过滤、单层嵌套、默认 240s 超时）、`revoice_task_result`（角色开场白 + 正文透传，群聊用固定模板）、`repatch_last_assistant`（把持久化历史改写成角色口吻）。
+- `greeting.py`：官方 c2c 主动消息簿记（纯函数、可注入 rng/now）。候选索引 `data/bond_greet_targets.json` 只由 **c2c 入站**写入（群 member_openid 不能用于 c2c 主动消息）；配额 `data/official_active_quota.json` 按自然日/月滚动，文本与媒体**分账**（月配额共享、日配额各自独立）。选靶四门：羁绊等级 ≥5、冷却 7 天、概率 0.25、批量 ≤5。
 
 ---
 
@@ -845,7 +928,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 
 ## 四、配置文件详解
 
-所有 Markdown 配置文件位于 `agent/config/`，共 12 个 + `personalities/` 人格目录。另外 `config/` 目录下有 JSON 配置文件，运行时敏感配置（密钥 / 服务地址）在 `.env`。
+所有 Markdown 配置文件位于 `agent/config/`，共 12 个 + `personalities/`（人格定义）与 `portraits/`（内置人格出厂立绘）。另外 `config/` 目录下有 JSON 配置文件，运行时敏感配置（密钥 / 服务地址）在 `.env`。
 
 ### Markdown 配置文件 (12 个)
 
@@ -877,6 +960,8 @@ Agent 必须在以下情况拒绝 (礼貌):
 | `multimodal.json` | 忽略 | [已废弃] 旧版多模态配置，已被 models_settings.json 取代 |
 | `gacha_data.json` | 跟踪 | 抽卡数据（角色/羁绊/概率，由 pullingMonitor 加载） |
 | `characters/character_dic.json` / `characters/bonds_search_dic.json` | 跟踪 | 角色/羁绊别名字典（NameResolver 数据源）；面板「Wiki 缓存」页可编辑，watcher 热重载 |
+| `story_personas.json` | 跟踪 | 剧情知识库的人格白名单与角色映射（默认 `rubi` / `assistant`） |
+| `translation_glossary.json` | 跟踪 | 角色/羁绊数据翻译对照表（抓取更新时使用） |
 
 ### 环境变量（`.env`）
 
@@ -888,7 +973,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 
 ## 五、工具实现
 
-### 5.1 `tools/builtin_tools.py` — 内置工具 (9 个)
+### 5.1 `tools/builtin_tools.py` — 内置工具 (9 个) + 搜索存档召回
 
 | 函数 | 说明 | 实现方式 |
 |------|------|----------|
@@ -986,6 +1071,22 @@ Agent 必须在以下情况拒绝 (礼貌):
 - **原子写** `_atomic_write_json`（tmp + `os.replace`）贯穿所有写操作。
 - 详细的面板/后台任务/文件队列设计见 §十二「更新记录 / 群发」。
 
+
+### 5.9 `tools/social_tools.py` / `tools/creation_tools.py` — 养成与创作工具
+
+这两个模块实现的工具由 `turn.py` 以闭包方式注册（需要注入 `BondManager` / `AssetMemory` / `CharacterRegistry` / LLM 客户端），**只在对应场景经 `allowed_tools` 下发**：
+
+| 工具 | 模块 | 职责 |
+|---|---|---|
+| `give_gift` | social_tools | 送礼结算：按角色卡礼物偏好分三档加经验与心情，受每日上限约束 |
+| `create_image` | social_tools | 角色画图：等级门（Lv4）+ 每日配额 + `prompt_hash` 去重 + 参考立绘图生图 + 资产卡落盘 + 磁盘配额淘汰 |
+| `send_voice` | social_tools | 角色语音：等级门（Lv5）+ 声纹解析 + 台词内容审查 + TTS + 资产卡落盘 |
+| `recall_asset` | social_tools | 按记忆召回旧图/旧语音（含"二进制已淘汰但资产卡仍在"的文本回忆） |
+| `complete_scene` | social_tools | 剧情场景收尾：结算经验/心情、标记完成、生成纪念卡素材 |
+| `create_character` | creation_tools | 创作访谈落库：字段清洗与校验（`validate_fields`）、角色卡构建（`build_card`）、LLM 审核（`review_card`）、声纹分配（`assign_voice_id`）、注册到 `CharacterRegistry` |
+
+辅助函数（非工具）：`build_image_prompt`（外观锚 + 场景 + 显示名拼装）、`enforce_asset_quota`（按角色判定资产磁盘配额并触发 LRU 淘汰）。
+
 ---
 
 ## 六、数据流
@@ -1006,7 +1107,7 @@ web_fetch (HTTPS 直接抓取)    ←── web_fetch 工具调用
 NoneBot2 (FastAPI, 端口 8081)
        │
        ▼
-agent_router.py: on_message(priority=1, rule=to_me())
+turn.py / agent_router（OneBot 入口）: on_message(priority=1)
        │
        ├── 特殊命令 → 会话管理 / 反馈 / 元命令 (直接处理，不经过 Agent)
        │
@@ -1189,7 +1290,7 @@ Agent synthesizes response
 
 **无配置时的降级行为**: 图片分析仅返回元数据 (尺寸/格式/大小) + 配置指引信息，不会出错。
 
-**Thinking Mode 兼容**: 若多模态模型返回 `reasoning_content`（如 Qwen thinking mode），客户端会在回复中保留并以 `[思考]...[回复]...` 格式呈现。由于多模态调用为单轮请求（无对话历史），reasoning_content 无需回传，不会触发 API 400 错误。
+**Thinking Mode 处理**: 多模态调用为单轮请求（无对话历史），`reasoning_content` 无需回传，不会触发 API 400。`analyze_image`/`analyze_audio` 默认**丢弃** `reasoning_content`，只返回正文——因为下游程序性消费方（资产卡文本化 `_textualize_upload`、OCR 名称匹配、read_file 懒分析）会对返回文本做定长截断/关键词解析，思考前缀会把它们全部带偏（曾导致 user_upload 卡在 `[思考]` 中间被切断、正文丢失）。仅当显式传 `include_reasoning=True`（人工调试）时，才以 `[思考]...[回复]...` 格式拼接返回。作为纵深防御，`turn._clean_textualization` 仍会剥离 `[思考]/[回复]` 脚手架、丢弃残留 `[思考]`/`[DEBUG]` 前缀串，并在句末标点处收口截断。
 
 ### 8.3 音频分析
 
@@ -1237,11 +1338,52 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 
 **无配置时的降级行为**: 音频分析仅返回元数据 (格式/时长/采样率/声道/文件大小) + 配置指引信息。
 
+
+### 8.4 Direct Vision（主模型直连识图）
+
+除"图片 → 视觉模型 → 文本"的老链路外，主对话模型可直接看到当轮图片：
+
+```
+用户上传/引用图片
+   └─ turn.py 落盘（uploads/）+ 生成占位文本行（历史里只存文本，base64 不落盘）
+        └─ 若本轮选中的模型段 supports_vision=true
+             └─ lib/image_parts.build_image_parts()
+                  ├─ 魔数嗅探 MIME（QQ 下载常无扩展名）
+                  ├─ 最长边 1568px LANCZOS 缩放；GIF 取首帧；alpha 铺白
+                  ├─ 单图 ≤20MB 原始 / ≤5MB 编码后；每轮 ≤4 张；损坏静默跳过
+                  └─ 拼进当轮 user 消息的 image_url parts（只在内存消息里）
+```
+
+- 配置：`models_settings.json` 的模型段加 `"supports_vision": true`（显式 opt-in，默认 false；面板 REASONING/FLASH 卡片有勾选框）；
+- 自愈：首轮若返回 `API HTTP错误 (400)`，自动剥离图片重试一次纯文本（避免历史图片/模型不支持导致整轮失败）；
+- 回退：未开启、编码失败或超限时，仍走占位文本 + `read_file` 懒分析（多模态模型）老路径。
+
+### 8.5 影音生成（画图 / 语音）
+
+| 项 | 说明 |
+|---|---|
+| 配置段 | `IMAGE_GEN_MODEL`（qwen-image）/ `TTS_MODEL`（qwen-audio-tts），DashScope 原生接口，每次调用现读配置（面板热重载即时生效） |
+| 图像 | 文生图与参考图（图生图）共用 `multimodal-generation` 端点；同步返回图片 URL，立即下载落盘 |
+| 语音 | `SpeechSynthesizer` 端点，`voice` 来自角色声纹（`voice_pool` 分配 + 角色卡/UGC meta 覆盖）；返回音频 URL 仅 24h，必须立即落盘 |
+| 门槛 | 画图 Lv4、点播语音 Lv5、主动语音 Lv7（`media_image_min_level` 等可配） |
+| 配额 | 每日 admin 50 / vip 10 / regular 3（图、语音各自计算）；资产磁盘 1GB/300MB/100MB |
+| 安全 | 台词先过 LLM 内容审查（超时/失败按策略降级）；TTS 硬顶 600 字；并发闸 2；硬超时（图 60s / TTS 30s） |
+| 失败 | 任何失败返回 None，调用方降级为纯文本回复，不阻断回合 |
+
+### 8.6 多模态资产记忆
+
+- **资产卡**（`data/assets/{uid}/cards/{id}.md`）：markdown + frontmatter，记录类型、角色、模型、prompt、台词、标签、`prompt_hash`、`proactive` 标记 —— 这是"本体"，永不淘汰。
+- **二进制**（`data/assets/{uid}/{char_id}/{id}.png|mp3`）：可被 LRU 淘汰（score = recall×exp(-age/30)），淘汰后资产卡仍在，角色可"凭记忆描述"。
+- **去重**：`prompt_hash`（blake2b-16）窗口 168h，命中直接复用旧图/旧语音，避免重复计费；索引超过 4096 条丢最旧一半。
+- **注入**：`build_asset_injection(top_k=5)` 把最近/常被回指的资产以文本摘要注入 L4，供角色主动提及"上次那张图"。
+- **召回**：`recall_asset` 工具按关键词/时间召回；上传的图片/语音也会被文本化（≤60/≤80 字）后入卡。
+- **事件蒸馏**：里程碑（场景收尾、升级）蒸馏为 ≤300 字事件文本进三层记忆（`category=event`）。
+
 ---
 
 ## 九、测试系统
 
-`test_agent.py` 包含 **15 个测试套件, 105 个测试用例**（全部离线，使用 mock client，无网络依赖），覆盖所有核心组件:
+`test_agent.py` 包含 **51 个测试套件 / 282 个测试用例**（全部离线，使用 mock client，无网络依赖），覆盖核心组件、养成、双平面、官方渠道解析、影音资产、Direct Vision、会话人格绑定与面板逻辑。下表保留 v2.x 时代的 15 个基础套件（编号 1–15），新增套件按主题列在表后:
 
 | # | 测试套件 | 测试数 | 覆盖内容 |
 |---|----------|--------|----------|
@@ -1261,7 +1403,15 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 | 14 | `TestMemoryMigration` | 2 | 旧记忆 → 三层结构迁移（seed+归档、散落 legacy dump 归档） |
 | 15 | `TestCacheStability` | 6 | 前缀缓存稳定性（提示词头部用户不变量/易变内容置尾/画像变化头部字节稳定/历史头部迟滞修剪/压缩边界步进/无时间戳） |
 
-另有 `test_workspace.py`（11 个工作区/会话文件测试类）与 `test/` 下 8 个离线测试脚本（被 gitignore，仅存于开发机），由 `bash test.sh` 统一调度。
+**新增套件（16–51）**
+
+| 主题 | 套件 |
+|---|---|
+| 养成 / 角色 | `TestBondManager`、`TestBondContent`、`TestBondGiftPoke`、`TestBondEvents`、`TestBondScene`、`TestSceneSession`、`TestBondReunionAnniversary`、`TestInitialBond`、`TestCharacterRegistry`（含会话人格五层链单测）、`TestSessionPersonaBinding`（端到端：创建快照/会话内切换/`--全局`/拒绝/提示消息/`/clear` 保留绑定）、`TestCreateCharacterTool`、`TestCharCreationInterview`、`TestPersonalityMeta`、`TestReferencePortrait` |
+| 渠道 / 多模态 / 面板 | `TestQQOfficialQuoteParsing`、`TestOfficialStatusHeartbeat`、`TestWebuiOfficialStatus`、`TestMediaGen`、`TestProactiveMedia`、`TestMediaQuota`、`TestAnchorVoiceId`、`TestDirectVision`、`TestDelegation`、`TestAgentPersist`、`TestActiveGreeting`、`TestModelRouterClassify`、`TestPersonalityMarkerPersistence`、`TestWebuiPermissionsEditor`、`TestWebuiModelSections` |
+| 资产记忆 / 剧情 | `TestAssetCardsP4`、`TestAssetSearch`、`TestAssetRecall`、`TestUploadTextualization`、`TestEpisodeDistill`、`TestAssetEvictionInjection`、`TestStoryKbInjectionGate` |
+
+另有 `test_workspace.py`（11 个类）、`test_story_kb.py`（6 个类 / 37 个用例，离线合成语料）、`benchmarks/memory/bench_engine.py`（确定性场景流 benchmark），以及 `test/` 下 17 个离线脚本（其中 11 个被 `test.sh` 调用；`test/` 整体被 gitignore，仅存于开发机）。
 
 **运行方式**:
 ```bash
@@ -1294,7 +1444,7 @@ bash test.sh
 6. **配置 `.env`**: 设置 `DRIVER=~fastapi`, `HOST=0.0.0.0`, `PORT=8081`, `ONEBOT_ACCESS_TOKEN`, `SUPERUSERS`, `SEARXNG_ENDPOINT`
 7. **启动 NoneBot**: `cd QQBot && nb run`
 8. **启动 Napcat**: `xvfb-run -a /path/to/qq --no-sandbox`
-9. **验证**: 发送 `@Roxy /status` 确认 29 个工具已注册、SearXNG 可连通
+9. **验证**: 发送 `@Roxy /status` 确认 40 个工具已注册、SearXNG 可连通（官方渠道另发一条观察 `[qq_official]` 日志）
 10. **配置多模型 (可选)**: 编辑 `QQBot/config/models_settings.json` 填入各模型的 API 信息，参考 `models_settings_example.json` 格式；或在 WebUI 面板「配置热管理 → 模型」结构化编辑（保存前自动探测 API 可用性，保存后约 10 秒热生效，见 §11.6）
 11. **启动 Web 管理面板 (可选)**: `bash start_webui.sh`（绑定 `127.0.0.1:8090`，经 SSH 隧道访问）
 
@@ -1304,7 +1454,7 @@ bash test.sh
 docker compose up -d
 ```
 
-包含 SearXNG + Napcat + NoneBot + vLLM 完整栈。
+包含 searxng + qqbot 两个服务（NapCat + NoneBot）；vLLM 需用 `vllm-start.sh` 另行拉起（非 compose 服务）。
 
 ---
 
@@ -1321,6 +1471,8 @@ docker compose up -d
 | **MULTIMODAL_MODEL** | 图片理解 | 视觉能力。处理用户发送的图片 AI 分析 |
 | **AUDIO_MODEL** | 音频/语音理解 | 语音转文字 + 情绪/声线分析 (qwen3-omni-flash) |
 | **OCR_MODEL** | 战斗截图 OCR | 团战测速的文本提取 (qwen3.5-ocr) |
+| **IMAGE_GEN_MODEL** | 角色画图 | qwen-image（文生图 / 参考图 I2I，DashScope 原生） |
+| **TTS_MODEL** | 角色语音 | qwen-audio-tts（声纹 + 台词，DashScope 原生） |
 
 ### 11.2 任务路由流程
 
@@ -1354,11 +1506,11 @@ docker compose up -d
 {
   "REASONING_MODEL": {
     "api_key": "", "api_base": "", "model": "",
-    "max_tokens": 409600, "temperature": 0.7
+    "max_tokens": 409600, "temperature": 0.7, "supports_vision": false
   },
   "FLASH_MODEL": {
     "api_key": "", "api_base": "", "model": "",
-    "max_tokens": 102400, "temperature": 0.7
+    "max_tokens": 102400, "temperature": 0.7, "supports_vision": false
   },
   "MULTIMODAL_MODEL": {
     "api_key": "", "api_base": "", "model": "",
@@ -1372,6 +1524,14 @@ docker compose up -d
     "api_key": "", "api_base": "", "model": "qwen3.5-ocr",
     "max_tokens": 2048, "temperature": 0.0
   },
+  "IMAGE_GEN_MODEL": {
+    "api_key": "", "api_base": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+    "model": "qwen-image"
+  },
+  "TTS_MODEL": {
+    "api_key": "", "api_base": "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer",
+    "model": "qwen-audio-tts"
+  },
   "task_routing": {
     "triage": "FLASH_MODEL",
     "simple_task": "FLASH_MODEL",
@@ -1382,6 +1542,9 @@ docker compose up -d
   }
 }
 ```
+
+> `supports_vision` 是**显式 opt-in**：只有该模型段为 true 时，`turn.py` 才把本轮图片作为 `image_url` part 直传主模型（Direct Vision，§8.4）。
+> `IMAGE_GEN_MODEL` / `TTS_MODEL` 不走 ModelRouter，由 `lib/media_gen.py` 每次调用现读（面板热重载即时生效）；`api_base` 为 DashScope 原生端点。
 
 （完整模板见 `config/models_settings_example.json`，含各段用途注释。）
 
@@ -1395,6 +1558,9 @@ docker compose up -d
 | `models_settings.json` 不存在 | multimodal_client 回退到 `multimodal.json` |
 | `multimodal.json` 也不存在 | 图片仅返回元数据，音频返回元数据+配置指引 |
 | AUDIO_MODEL 未配置 | 音频分析回退到 MULTIMODAL_MODEL（若支持音频），否则仅返回元数据 |
+| IMAGE_GEN_MODEL 未配置 | `create_image` 直接返回不可用说明；主动发图跳过并降级文本 |
+| TTS_MODEL 未配置 | `send_voice` 返回不可用说明；主动语音跳过并降级文本 |
+| 主模型段未开 `supports_vision` | 不走 Direct Vision，仍由 MULTIMODAL_MODEL + `read_file` 懒分析 |
 
 ### 11.5 Token 优化效果
 
@@ -1425,11 +1591,11 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 
 ## 十二、Web 管理面板 (WebUI)
 
-位于仓库根 `webui/`，是与 bot **独立的 FastAPI 进程**（`start_webui.sh` 管理，默认绑定 `127.0.0.1:8090`，经 SSH 隧道访问；scrypt 口令哈希 + 内存会话鉴权）。入口 `webui/main.py`：71 个 `/api/` 端点 + 16 个页面路由 + 2 个 WebSocket；页面配置见 `PAGES` 列表。
+位于仓库根 `webui/`，是与 bot **独立的 FastAPI 进程**（`start_webui.sh` 管理，默认绑定 `127.0.0.1:8090`，经 SSH 隧道访问；scrypt 口令哈希 + 内存会话鉴权）。入口 `webui/main.py`：**74 个 `/api/` 端点 + 16 个页面路由（+ `/login`）+ 2 个 WebSocket**；页面配置见 `PAGES` 列表，模板 19 个。
 
 | 页面 | 功能 |
 |------|------|
-| `/` 仪表盘 | 服务状态、硬件监控、快捷入口 |
+| `/` 仪表盘 | 服务状态、硬件监控、快捷入口、**QQ 官方路由卡片**（读 `data/official_status.json`，mtime 判新鲜度） |
 | `/processes` 进程管理 | 启动/停止 bot，看门狗状态持久化（`process_manager.py`） |
 | `/logs` 日志查看 | bot 日志实时尾部（WebSocket） |
 | `/terminal` Web 终端 | 服务器 shell（WebSocket） |
@@ -1444,6 +1610,7 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | `/playground` Playground | 面板内直接对话调试（进程内构造 client，无需 nonebot driver） |
 | `/wiki` Wiki 缓存 | 角色/羁绊数据浏览、**别名字典编辑**（`character_dic.json` / `bonds_search_dic.json`） |
 | `/changelog` 更新日志 | 编辑更新记录（版本/日期/分类变更条目，`data/changelog/changelog.json`）、勾选群聊**群发更新公告** |
+| `/redeem` 兑换码管理 | 限时/长期兑换码人工维护（权威源，`_source=panel`），支持导入/清理与自动抓取联动 |
 
 ### 更新记录 / 群发（`data/changelog/`）
 
@@ -1567,6 +1734,7 @@ v2.4 基础上增加:
   ├── Agent 感知: [连续对话模式] 前缀 → 简洁回复, 适时建议退出
   ├── 超时清理: 90 秒无消息自动过期, 静默清理
   └── 防重复: continuous_router 检查 is_tome() 避免与 agent_router 重复处理
+```
 
 ### v2.6 — reasoning_content 全链路保留
 
@@ -1577,6 +1745,7 @@ v2.5 基础上增加:
   ├── Agent 主循环: assistant 消息携带 reasoning_content 回传 API
   ├── Agent 最终回复: 通过 session.add_message 保留 reasoning_content
   └── MultimodalClient: 单轮请求中 reasoning_content 以 [思考]...[回复] 格式呈现
+```
 
 **解决问题**: DeepSeek v4 pro / Qwen 等 thinking mode 模型要求 reasoning_content
 必须在后续请求中原样回传, 否则返回 HTTP 400:
@@ -1971,3 +2140,63 @@ v2.29 基础上增加:
 
 工具数量: 31 (不变)
 ```
+
+### 2026-10 之后的演进（按提交日期，尚未并入 v2.x 编号）
+
+> 说明：以下按 git 提交时间排列，暂不套用 v2.x 版本号；功能以代码为准，详细设计见仓库根目录的 `Bond-System-Design.md`、`Story-Knowledge-Base-Design.md`、`Cache-Hit-Rate-Plan.md` 等文档。
+
+#### 2026-10-20 / 10-21 — 记忆优化批次 1–2 + 缓存 Phase 6
+
+- **LONG 层落地**：LONG 对象索引行注入 L4，新增 `recall_memory` 工具按 id 召回快照（3 条 / 1200 字上限，带 query_log 计数）。
+- **记忆 schema v2**：条目类型化（`category`）+ `last_confirmed_ts` 时效标注；迁移脚本 `scripts/migrate_memory_p2_categories.py`。
+- **纠正与近重复合并**：引擎级纠正替换、Dice 系数 0.6 的近重复合并、preferences 修订路径。
+- **缓存 Phase 6-B1**：工具输出上限 100KB → 16KB（避免每轮循环重复计费），`read_file` 增加分段读取。
+- **错误治理**：`lib/errors.py` 异常分类 + 诊断编号，原始异常不再直接回给用户。
+
+#### 2026-10-21 — Bond 系统 P0：双平面路由 + 好感度核心
+
+- `agent/bond.py`：三值模型（Bond/Mood/Stats）、10 级阈值、加经验/心情回归、礼物/戳一戳/称呼演化/档案解锁。
+- `agent/delegation.py`：`SOCIAL_TOOLS`、`delegate_task`（任务面隔离 + 权限过滤 + 单层嵌套）、`revoice_task_result`。
+- `agent/character_registry.py` + `tools/creation_tools.py`：UGC 角色叠加层与创作落库（访谈 UI 在后续提交补齐）。
+
+#### 2026-10-22 — 内核抽取（阶段 1–3）+ QQ 官方渠道上线（阶段 4）
+
+- `agent/turn.py`：平台无关内核（命令分发、回合编排、发送、上下文设置）。
+- `agent/inbound.py` / `agent/outbound.py`：入站视图与出站契约（`Sender`/`OutImage`/`OutAudio`/`OutProgress`/`SendFailed`）。
+- `adapters/onebot.py`：OneBot 事件解析、附件下载、`OneBotSender` 下沉到适配层。
+- `adapters/qq_official.py` + `plugins/qq_official.py`：官方渠道入口、`QQOfficialSender`（缓冲/合并/配额/降级）、引用消息解析、openid 权限表、状态心跳；WebUI 仪表盘「QQ 官方路由」卡片。
+- 「正在思考…」在官方渠道独立即时发送，其余进度行吞掉（保护被动回复配额）。
+
+#### 2026-10-23 — Bond P3a/P3b：剧情场景 + 主动问候
+
+- **剧情场景**：`bond_scene` 特殊会话、开场演绎、`complete_scene` 结算、羁绊纪念卡、久别重逢与纪念日提示。
+- **主动问候**：`agent/greeting.py` 候选索引 + 日/月配额 + 冷却/概率门；`HEARTBEAT` 低频主动消息（仅官方 c2c）。
+
+#### 2026-10-24 — Bond P4/P5：影音生成、主动媒体、影音记忆、原作剧情 KB
+
+- `lib/media_gen.py`（qwen-image + qwen-audio-tts）+ `lib/image_parts.py` + `agent/asset_memory.py`：画图/语音生成、资产卡、`recall_asset`、事件蒸馏、LRU 淘汰、主动发媒体（Lv7+，与文本配额分账）。
+- `lib/story_kb.py` + `scripts/build_story_kb.py` + `test_story_kb.py`：原作剧情知识库（FTS5 + RRF），按人格白名单注入，`story_search` 工具。
+- WebUI 模型配置新增 `IMAGE_GEN_MODEL` / `TTS_MODEL` 段。
+
+#### 2026-10-25 — 数据目录 env 化 + 初始羁绊
+
+- `CHARACTERS_DIR` / `BONDS_DIR` / `MEMORY_DIR` / `ASSETS_DIR` 可整体迁到数据盘；UGC 非 UTF-8 文件优雅降级。
+- 自创角色支持设定初始羁绊（Lv1–5）；`/设好感` 下放给所有用户（仅作用于本人，可升可降）。
+
+#### 2026-10-26 — 剧情注入门控与数据修正
+
+- 剧情 KB 注入增加人格门控：解析不到剧情角色（UGC 等）时**不再全库检索**，避免把其他角色的剧情注入当前对话；`story_search` 主动检索不受影响。
+- `/刷新角色数据` 不再覆盖人工标注的别名/翻译。
+
+#### 2026-10-27 — 人格形象、剧情开场演绎、Direct Vision、会话人格绑定
+
+- 预置人格参考立绘（`agent/config/portraits/`）+ 用户上传人格形象（`/设形象`，`agent/portrait.py` 规整）。
+- 剧情场景开场改为角色口吻的 flash 演绎，不再发送第三人称提示。
+- **Direct Vision**：`models_settings.json` 模型段开启 `supports_vision` 后，本轮图片以 `image_url` part 直传主模型（1568px、≤4 张、≤5MB；首轮 400 自动剥图重试）。
+- `/帮助`、`/功能` 文档更新（HELP.md / FEATURES.md），功能卡渲染修复长文本溢出。
+- **会话人格绑定**：人格注册在特殊会话 `metadata.persona_key` 上，解析优先级 剧情钉住 > 会话绑定 > 个人设置 > 群默认 > 全局默认（`CharacterRegistry.set_session_provider` 单点注入，失效懒穿透、存量零迁移）；特殊会话内 `/人格切换` 只写会话绑定，`--全局` 逃生门改用户默认；`/新会话`、`/保存为会话` 创建时快照当前人格；切会话/结束会话/`/会话列表` 展示各会话人格；剧情/创作会话拒绝切换；`/clear` 保留绑定（§2.13、SESSION.md）。
+
+#### 设计稿（未实施）— QQ 官方渠道消息按钮
+
+- `docs/qqbot-official-buttons-design.md`：官方 API 按钮的能力边界、39 个可按钮化功能盘点、8 种交互模式、接入架构与降级方案、准入政策与申请材料。
+- 现状：**未落地任何代码**；自定义按钮需平台「内邀开通」（`304037`），未开通时必须能自动降级为纯 markdown/文本。
