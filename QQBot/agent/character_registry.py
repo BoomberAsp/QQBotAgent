@@ -35,6 +35,14 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CHARACTERS_DIR = os.path.join(
     os.path.dirname(__file__), "..", "data", "characters"
 )
+# 内置人格的立绘分两层：
+#   出厂层（代码盘，随 git 发布）: agent/config/portraits/<key>.<ext>
+#   覆盖层（数据盘，运营改图不用重新部署）: CHARACTERS_DIR/_builtin/<key>/assets/
+_PORTRAITS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "portraits"
+)
+_BUILTIN_SUBDIR = "_builtin"
+_PORTRAIT_EXTS = ("png", "jpg", "jpeg", "webp")
 
 # char_id slug 部分的最大长度（CJK 也算 1 字符）
 _SLUG_MAX_LEN = 16
@@ -98,14 +106,43 @@ class CharacterRegistry(PersonalityManager):
     def _card_path(self, char_id: str) -> str:
         return os.path.join(self._char_dir, char_id, "card.md")
 
+    def is_builtin(self, name: str) -> bool:
+        """True for a code-side persona card (``agent/config/personalities``)."""
+        return bool(name) and name in self._discover()
+
+    def _builtin_portrait_dir(self, key: str) -> str:
+        """Cover layer: built-in portraits live on the data disk."""
+        return os.path.join(self._char_dir, _BUILTIN_SUBDIR, key, "assets")
+
+    def _shipped_portrait_path(self, key: str) -> Optional[str]:
+        """Factory layer: ``agent/config/portraits/<key>.<ext>`` (may be absent)."""
+        for ext in _PORTRAIT_EXTS:
+            path = os.path.join(_PORTRAITS_DIR, f"{key}.{ext}")
+            if os.path.isfile(path):
+                return path
+        return None
+
     def reference_image_path(self, char_id: str) -> Optional[str]:
         """角色参考立绘（P4 视觉一致性 I2I 通路）——存在才返回。
 
-        ``data/characters/{char_id}/assets/reference.png``。缺失时调用方
-        优雅降级纯文生图（机制先就位，立绘后补）。此目录受资产 LRU
-        **永不淘汰**保护（asset_memory 硬保护路径）。
+        解析链（内置人格与自创角色共用同一个返回值契约）：
+
+          ① 运营覆盖  ``CHARACTERS_DIR/_builtin/<key>/assets/reference.*``
+          ② 出厂立绘  ``agent/config/portraits/<key>.*``（仅内置，随代码发布）
+          ③ 角色资产  ``CHARACTERS_DIR/<char_id>/assets/reference.*``
+
+        ①②给内置人格（rubi/roxy…）：覆盖图在数据盘，换图不用重新部署；
+        ③是自创角色的既有通路。缺图时调用方优雅降级纯文生图；两处目录都在
+        资产 LRU 硬保护范围内（asset_memory 只收用户资产目录内的文件）。
         """
-        for ext in ("png", "jpg", "jpeg", "webp"):
+        if self.is_builtin(char_id):
+            for ext in _PORTRAIT_EXTS:
+                path = os.path.join(
+                    self._builtin_portrait_dir(char_id), f"reference.{ext}")
+                if os.path.isfile(path):
+                    return path
+            return self._shipped_portrait_path(char_id)
+        for ext in _PORTRAIT_EXTS:
             path = os.path.join(
                 self._char_dir, char_id, "assets", f"reference.{ext}"
             )
@@ -116,8 +153,17 @@ class CharacterRegistry(PersonalityManager):
     # ── 参考立绘写端（/设形象 命令；读端见 reference_image_path）────
 
     def reference_image_dir(self, char_id: str) -> str:
-        """Directory that holds the character's reference portrait."""
-        return os.path.join(self._char_dir, char_id, "assets")
+        """Directory that holds the reference portrait for this key.
+
+        Built-in personas write to the data-disk cover layer
+        (``_builtin/<key>/assets``); UGC characters keep ``<char_id>/assets``.
+        Unknown ids raise, so a typo can never scatter portrait files around.
+        """
+        if self.is_builtin(char_id):
+            return self._builtin_portrait_dir(char_id)
+        if self.is_ugc(char_id):
+            return os.path.join(self._char_dir, char_id, "assets")
+        raise FileNotFoundError(f"未知人格/角色: {char_id}")
 
     def set_reference_image(
         self, char_id: str, data: bytes, ext: str = "png"
@@ -130,11 +176,15 @@ class CharacterRegistry(PersonalityManager):
         ``reference.*`` with other extensions so exactly one portrait wins
         the probe order used by :meth:`reference_image_path`.
         """
-        if not self.is_ugc(char_id):
-            raise FileNotFoundError(f"不是自创角色: {char_id}")
-        adir = self.reference_image_dir(char_id)
+        adir = self.reference_image_dir(char_id)   # 未知 key 在这里抛错
         os.makedirs(adir, exist_ok=True)
         target = os.path.join(adir, f"reference.{ext}")
+        # 内置人格的形象是全局设置：覆盖前留一份 .bak，改错了能手工回滚
+        if os.path.isfile(target):
+            try:
+                shutil.copyfile(target, target + ".bak")
+            except OSError:
+                pass
         tmp = target + ".tmp"
         with open(tmp, "wb") as f:
             f.write(data)
@@ -152,7 +202,10 @@ class CharacterRegistry(PersonalityManager):
 
     def clear_reference_image(self, char_id: str) -> bool:
         """Remove every reference portrait variant; True if anything went."""
-        adir = self.reference_image_dir(char_id)
+        try:
+            adir = self.reference_image_dir(char_id)
+        except FileNotFoundError:
+            return False
         removed = False
         for ext in ("png", "jpg", "jpeg", "webp"):
             path = os.path.join(adir, f"reference.{ext}")

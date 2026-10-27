@@ -8271,6 +8271,7 @@ class TestReferencePortrait:
         self.test_registry_roundtrip()
         self.test_command_chain()
         self.test_guardrails()
+        self.test_builtin_portrait()
 
     # ── helpers ──────────────────────────────────────────────────
     @staticmethod
@@ -8409,15 +8410,103 @@ class TestReferencePortrait:
             reg.resolve_effective_personality = lambda uid, gid=None: "rubi"
             asyncio.run(turn._handle_portrait_command(
                 "/设形象", "u1", self._view(img)))
-            assert "不是你的自创角色" in sent[-1], sent[-1]
+            assert "只有管理员" in sent[-1], sent[-1]
 
             # ④ 非本命令文本 → 不拦截
             assert asyncio.run(turn._handle_portrait_command(
                 "/人格切换", "u1", self._view(img))) is False
-            print_pass("guard: 无图提示 / 他人角色拒 / 内置人格拒 / 非本命令放行")
+            print_pass("guard: 无图提示 / 他人角色拒 / 内置人格需管理员 / 非本命令放行")
         finally:
             turn.get_character_registry, turn._safe_send = orig
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+
+    def test_builtin_portrait(self):
+        """内置人格：仅管理员可写 / 覆盖优先 / 清除回退出厂图 / 助手拒绝。"""
+        turn = self.turn
+        import agent.character_registry as cr
+        from agent.outbound import OutImage
+
+        tmp = tempfile.mkdtemp(prefix="portrait_builtin_")
+        shipped_dir = tempfile.mkdtemp(prefix="portrait_shipped_")
+        reg, _ = self._registry(tmp)
+        sent = []
+
+        async def fake_send(payload, sender=None):
+            sent.append(payload)
+
+        class _Role:
+            def __init__(self, value):
+                self.value = value
+
+        class _Perm:
+            def __init__(self, value):
+                self._value = value
+
+            def get_role(self, user_id):
+                return _Role(self._value)
+
+        orig = (turn.get_character_registry, turn._safe_send,
+                turn._perm_manager, cr._PORTRAITS_DIR)
+        try:
+            turn.get_character_registry = lambda: reg
+            turn._safe_send = fake_send
+            cr._PORTRAITS_DIR = shipped_dir
+            reg.resolve_effective_personality = lambda uid, gid=None: "rubi"
+
+            # 出厂立绘（代码盘）
+            shipped = os.path.join(shipped_dir, "rubi.png")
+            with open(shipped, "wb") as f:
+                f.write(self._png((512, 512)))
+            assert reg.reference_image_path("rubi") == shipped
+
+            up = os.path.join(tmp, "up.png")
+            with open(up, "wb") as f:
+                f.write(self._png((800, 800)))
+            view = self._view(up)
+
+            # ① 普通用户 → 拒绝，且不动全局图
+            turn._perm_manager = _Perm("regular")
+            assert asyncio.run(turn._handle_portrait_command("/设形象", "u1", view))
+            assert "只有管理员" in sent[-1], sent[-1]
+            assert reg.reference_image_path("rubi") == shipped
+
+            # ② 管理员 → 写入数据盘覆盖层，覆盖优先于出厂图
+            turn._perm_manager = _Perm("admin")
+            sent.clear()
+            assert asyncio.run(turn._handle_portrait_command("/设形象", "u1", view))
+            override = os.path.join(
+                tmp, "_builtin", "rubi", "assets", "reference.png")
+            assert os.path.isfile(override), override
+            assert reg.reference_image_path("rubi") == override
+            assert "全局生效" in sent[-1], sent[-1]
+
+            # ③ 清除 → 删覆盖层，回落出厂图
+            sent.clear()
+            assert asyncio.run(turn._handle_portrait_command("/清除形象", "u1", view))
+            assert not os.path.isfile(override)
+            assert reg.reference_image_path("rubi") == shipped
+            assert "回退到出厂立绘" in sent[-1], sent[-1]
+
+            # ④ 助手人格（unified，不画图）→ 拒绝
+            sent.clear()
+            reg.resolve_effective_personality = lambda uid, gid=None: "assistant"
+            assert asyncio.run(turn._handle_portrait_command("/设形象", "u1", view))
+            assert "不生成图片" in sent[-1], sent[-1]
+
+            # ⑤ 查看不需要管理员
+            sent.clear()
+            turn._perm_manager = _Perm("regular")
+            reg.resolve_effective_personality = lambda uid, gid=None: "rubi"
+            assert asyncio.run(turn._handle_portrait_command("/形象", "u1", view))
+            assert isinstance(sent[-1], OutImage), sent
+            print_pass("builtin: 非管理员拒 / 管理员覆盖 / 清除回落 / 助手拒 / 查看开放")
+        finally:
+            (turn.get_character_registry, turn._safe_send,
+             turn._perm_manager, cr._PORTRAITS_DIR) = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.rmtree(shipped_dir, ignore_errors=True)
 
 
 

@@ -4061,25 +4061,62 @@ def _owned_ugc(registry, char_id: str, user_id: str) -> bool:
     )
 
 
-def _portrait_target(registry, text: str, user_id: str, view):
-    """Resolve (char_id, display_name, error_msg) for a portrait command."""
+def _builtin_portrait_allowed(registry, char_id: str) -> bool:
+    """内置人格能不能有形象：必须是角色面（split），否则根本不画图。"""
+    try:
+        return registry.get_mode(char_id) == "split"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _role_value(user_id: str) -> str:
+    try:
+        return _perm_manager.get_role(user_id).value
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _portrait_target(registry, text: str, user_id: str, view, *, write: bool):
+    """Resolve (char_id, display_name, error_msg, scope) for a portrait command.
+
+    ``scope`` 为 "user"（自创角色，仅作者本人可见/可改）或 "builtin"
+    （内置人格，形象是全局资产）。写操作对内置人格要求管理员，查看不限。
+    """
     _, _, args = text.partition(" ")
     args = args.strip()
     if args:
         char_id = registry.resolve_name(args, user_id=user_id)
-        if not _owned_ugc(registry, char_id, user_id):
+        if char_id and registry.is_builtin(char_id):
+            scope = "builtin"
+        elif _owned_ugc(registry, char_id, user_id):
+            scope = "user"
+        else:
             return "", "", (
                 f"没找到你的自创角色「{args}」。参考立绘只能设在自己的自创角色上："
-                "用 /人格切换 查看可用角色，或 /创建角色 新建一个。")
-        return char_id, registry.get_display_name(char_id), ""
+                "用 /人格切换 查看可用角色，或 /创建角色 新建一个。"), ""
+    else:
+        char_id = registry.resolve_effective_personality(user_id, view.group_id)
+        if char_id and registry.is_builtin(char_id):
+            scope = "builtin"
+        elif _owned_ugc(registry, char_id, user_id):
+            scope = "user"
+        else:
+            name = registry.get_display_name(char_id) if char_id else "当前人格"
+            return "", "", (
+                f"当前人格「{name}」既不是你的自创角色，也不是内置人格，"
+                "设不了参考立绘。\n"
+                "可以先用 /人格切换 切到自己的角色，或直接写 `/设形象 <角色名>`。"), ""
 
-    char_id = registry.resolve_effective_personality(user_id, view.group_id)
-    if not _owned_ugc(registry, char_id, user_id):
-        name = registry.get_display_name(char_id) if char_id else "当前人格"
-        return "", "", (
-            f"当前人格「{name}」不是你的自创角色，设不了参考立绘。\n"
-            "可以先用 /人格切换 切到自己的角色，或直接写 `/设形象 <角色名>`。")
-    return char_id, registry.get_display_name(char_id), ""
+    display = registry.get_display_name(char_id)
+    if scope == "builtin":
+        if not _builtin_portrait_allowed(registry, char_id):
+            return "", "", (
+                f"「{display}」不是角色人格（不生成图片），给它设形象没有意义。"), ""
+        if write and _role_value(user_id) != "admin":
+            return "", "", (
+                f"「{display}」是内置人格，形象是全局设置，只有管理员能改。\n"
+                "你可以用 /创建角色 做一个自己的角色，形象只对你自己可见。"), ""
+    return char_id, display, "", scope
 
 
 def _read_bytes(path: str) -> bytes:
@@ -4112,15 +4149,22 @@ async def _portrait_source(view):
 
 
 async def _handle_portrait_command(text: str, user_id: str, view) -> bool:
-    """`/设形象` / `/形象` / `/清除形象` —— 自创角色的参考立绘（零 token）。"""
+    """`/设形象` / `/形象` / `/清除形象` —— 参考立绘（零 token）。
+
+    自创角色：只对作者本人可见/可改。
+    内置人格：形象是全局资产（所有人共用），只有管理员能改，改完立即生效。
+    """
     cmd = text.partition(" ")[0]
     if cmd not in (_PORTRAIT_SET_CMDS + _PORTRAIT_SHOW_CMDS + _PORTRAIT_CLEAR_CMDS):
         return False
+    write = cmd in (_PORTRAIT_SET_CMDS + _PORTRAIT_CLEAR_CMDS)
     registry = get_character_registry()
-    char_id, display, err = _portrait_target(registry, text, user_id, view)
+    char_id, display, err, scope = _portrait_target(
+        registry, text, user_id, view, write=write)
     if err:
         await _safe_send(err)
         return True
+    global_note = "（全局生效：所有用户看到的都会变）" if scope == "builtin" else ""
 
     if cmd in _PORTRAIT_SET_CMDS:
         path, source, err = await _portrait_source(view)
@@ -4140,9 +4184,13 @@ async def _handle_portrait_command(text: str, user_id: str, view) -> bool:
             code = log_exception("set reference portrait failed", e)
             await _safe_send(f"保存参考立绘失败（诊断编号 {code}），稍后再试。")
             return True
+        if scope == "builtin":
+            from nonebot import logger as _lg
+            _lg.info(f"[portrait] builtin set key={char_id} by={user_id} "
+                     f"size={width}x{height}")
         await _safe_send(
             f"✅ 已把{source}设为「{display}」的参考立绘"
-            f"（{describe_size(width, height, len(data))}）。\n"
+            f"（{describe_size(width, height, len(data))}）{global_note}。\n"
             "之后向 TA 要画图、以及 TA 主动发图，都会以这张图作为外观基准"
             "（文字外观设定 + 图片双重锚定），脸更稳。\n"
             "随时可发 /形象 查看，或 /清除形象 撤掉。")
@@ -4151,18 +4199,25 @@ async def _handle_portrait_command(text: str, user_id: str, view) -> bool:
     if cmd in _PORTRAIT_SHOW_CMDS:
         current = registry.reference_image_path(char_id)
         if not current:
-            await _safe_send(
-                f"「{display}」还没有参考立绘。\n"
-                "把一张图发给 TA 并附上 `/设形象`（或引用那张图再发 `/设形象`）即可设置。")
+            hint = ("内置人格的立绘由管理员统一设置。" if scope == "builtin"
+                    else "把一张图发给 TA 并附上 `/设形象`（或引用那张图再发 `/设形象`）即可设置。")
+            await _safe_send(f"「{display}」还没有参考立绘。\n{hint}")
             return True
-        await _safe_send(f"「{display}」当前的参考立绘：")
+        await _safe_send(f"「{display}」当前的参考立绘{global_note}：")
         await _safe_send(OutImage(path=current, label=f"{display} 参考立绘"))
         return True
 
     if not registry.clear_reference_image(char_id):      # /清除形象
-        await _safe_send(f"「{display}」本来就没有参考立绘。")
+        await _safe_send(f"「{display}」本来就没有自定义参考立绘。")
         return True
-    await _safe_send(f"已清除「{display}」的参考立绘，之后按文字外观设定作画。")
+    shipped = (registry.reference_image_path(char_id)
+               if scope == "builtin" else None)
+    if scope == "builtin":
+        tail = ("，已回退到出厂立绘" if shipped else
+                "（该人格暂无出厂立绘，之后按文字外观设定作画）")
+    else:
+        tail = "，之后按文字外观设定作画"
+    await _safe_send(f"已清除「{display}」的参考立绘{tail}{global_note}。")
     return True
 
 
