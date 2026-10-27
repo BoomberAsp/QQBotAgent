@@ -117,6 +117,10 @@ async def run_delegated_task(
             model_router.flash_client if complexity == "simple"
             else model_router.reasoning_client
         )
+        # NOTE (Direct Vision, future work): delegate_task 只转发 LLM 撰写的
+        # task 文本，不附带本轮用户图片（agent.run 的 images= 参数）。任务面
+        # 需要看图时可在 task 里写明图片路径，由 read_file 懒分析兜底；如需
+        # 直传，把调用方的 vision_image_paths 透传进来即可。
         result = await asyncio.wait_for(
             agent.run(
                 task.strip(), user_id,

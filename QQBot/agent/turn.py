@@ -1336,6 +1336,25 @@ def _attachment_error_line(att) -> str:
     return f"[用户发送了语音消息，但下载失败: {att.error}]"
 
 
+def _any_vision_client() -> bool:
+    """True when either main chat tier opted into Direct Vision.
+
+    Used BEFORE plane/complexity routing picks the actual client — e.g. to
+    decide whether a bare-image turn enters the agent (vision on) or gets
+    the legacy「已收到图片」ack (vision off). The per-call attachment at the
+    agent.run sites re-checks the *chosen* client's own flag, so a mismatch
+    (any=True but chosen client False) merely degrades to the text
+    placeholder + read_file lazy-analysis path.
+    """
+    try:
+        return bool(
+            getattr(_model_router.flash_client, "supports_vision", False)
+            or getattr(_model_router.reasoning_client, "supports_vision", False)
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _record_session_file(user_id: str, abs_path: str) -> None:
     """Attribute a newly written workspace file to the active special session.
 
@@ -2259,11 +2278,16 @@ async def handle_agent_turn(view: InboundMessage):
     except Exception:  # noqa: BLE001
         _upload_persona = ""
     has_quoted_attachment = False
+    # Direct Vision: 本轮成功落盘的图片路径（含引用图），当选中 client
+    # supports_vision 时随 user message 以 image_url parts 直传模型。
+    # 占位文本行照旧保留（工具/后续轮次的 read_file 懒分析回退仍靠它）。
+    vision_image_paths: list = []
     for att in await view.load_attachments():
         has_quoted_attachment = has_quoted_attachment or att.quoted
         if att.kind == "image":
             if att.path:
                 file_context_parts.append(_attachment_saved_line(att))
+                vision_image_paths.append(att.path)
                 _record_file(msg_id, att.name, att.path)
                 _record_session_file(user_id, att.path)
                 if _upload_persona:
@@ -2306,7 +2330,12 @@ async def handle_agent_turn(view: InboundMessage):
     has_files = bool(file_context_parts)
     # A quoted attachment means "look at this", not "here is a new upload":
     # never swallow that turn behind the file-received acknowledgement.
+    # Direct Vision exemption: a bare-image turn is now conversational too
+    # (like bare voice) — when a vision-capable model is configured, the
+    # agent sees the image directly and responds in character.
+    _vision_on = bool(vision_image_paths) and _any_vision_client()
     if (has_files and not has_voice and not has_quoted_attachment
+            and not _vision_on
             and not text_content and not reply_context):
         names = []
         for part in file_context_parts:
@@ -2343,6 +2372,16 @@ async def handle_agent_turn(view: InboundMessage):
             augmented_message = (
                 f"{context_prefix}\n用户发送了语音消息，请使用 read_file 工具"
                 f"分析音频内容，并根据其内容直接回应用户。"
+            )
+        elif _vision_on:
+            # Bare image turn (Direct Vision): the image is attached to the
+            # request when the chosen client supports vision; the read_file
+            # clause covers the tier-mismatch fallback (any-vision true but
+            # this turn's client has no flag → no parts attached).
+            augmented_message = (
+                f"{context_prefix}\n用户发送了一张图片（未附文字）。请直接结合"
+                f"图片内容、以你的身份自然回应用户；若你看不到图片，先用 "
+                f"read_file 工具分析已保存的图片路径再回应。"
             )
         else:
             augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请根据用户意图选择合适的工具查看内容。"
@@ -2548,6 +2587,12 @@ async def handle_agent_turn(view: InboundMessage):
                     session_type=session_type,
                     allowed_tools=allowed_tools,
                     user_role=role.value,
+                    # Direct Vision：仅当本轮选中的模型显式开启
+                    # supports_vision 才附图；否则维持占位文本 +
+                    # read_file 懒分析（历史行为不变）。
+                    images=(vision_image_paths
+                            if getattr(client, "supports_vision", False)
+                            else None),
                 ),
                 timeout=300.0,
             )
@@ -2727,10 +2772,13 @@ async def handle_continuous_turn(view: InboundMessage):
     # Stage 2: downloads moved to adapters/onebot.py (see handle_agent_turn).
     file_context_parts = []
     msg_id = view.message_id
+    # Direct Vision：连续会话窗口内的免@轮次同样收集图片路径（含引用图）。
+    vision_image_paths: list = []
     for att in await view.load_attachments():
         if att.kind == "image":
             if att.path:
                 file_context_parts.append(f"[用户上传了图片，已保存至: {att.path}]")
+                vision_image_paths.append(att.path)
                 _record_file(msg_id, att.name, att.path)
                 _record_session_file(user_id, att.path)
             elif att.error:
@@ -2783,10 +2831,19 @@ async def handle_continuous_turn(view: InboundMessage):
         "告别意图，且任务已完成、无需继续追问，请调用 end_continuous_mode 工具"
         "主动结束连续模式，而不是建议用户手动发送 /取消。"
     )
-    if context_parts:
-        augmented_message = f"{continuous_prefix}\n{'\n'.join(context_parts)}\n用户说: {text_content}"
+    # 裸图轮（连续窗口内只发图不带字）：给模型明确的看图指令，
+    # 与私聊路径的 bare-image 分支同款（含 read_file 回退提示）。
+    if not text_content and vision_image_paths:
+        _user_tail = (
+            "用户发送了一张图片（未附文字）。请直接结合图片内容自然回应；"
+            "若你看不到图片，先用 read_file 工具分析已保存的图片路径再回应。"
+        )
     else:
-        augmented_message = f"{continuous_prefix}\n用户说: {text_content}"
+        _user_tail = f"用户说: {text_content}"
+    if context_parts:
+        augmented_message = f"{continuous_prefix}\n{'\n'.join(context_parts)}\n{_user_tail}"
+    else:
+        augmented_message = f"{continuous_prefix}\n{_user_tail}"
 
     try:
         # ── Dual-plane routing (Bond-System-Design.md §3) ──
@@ -2877,7 +2934,12 @@ async def handle_continuous_turn(view: InboundMessage):
                 agent.run(augmented_message, user_id, client=client,
                            progress_callback=lambda msg: _safe_send(OutProgress(msg), sender=continuous_sender),
                            allowed_tools=allowed_tools,
-                           user_role=role.value),
+                           user_role=role.value,
+                           # Direct Vision：与主路径同款门控（选中 client
+                           # 显式开启 supports_vision 才附图）。
+                           images=(vision_image_paths
+                                   if getattr(client, "supports_vision", False)
+                                   else None)),
                 timeout=300.0,
             )
         finally:

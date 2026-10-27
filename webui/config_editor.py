@@ -296,17 +296,23 @@ MODEL_SECTIONS = ("REASONING_MODEL", "FLASH_MODEL", "MULTIMODAL_MODEL",
                   "AUDIO_MODEL", "OCR_MODEL", "IMAGE_GEN_MODEL", "TTS_MODEL")
 
 # Per-section editable extras beyond api_key/api_base/model.
-# Kinds: "int" | "float" | "num" (int when whole) | "str" | "str_list".
+# Kinds: "int" | "float" | "num" (int when whole) | "str" | "str_list" | "bool".
 # IMAGE_GEN/TTS are the Bond-P4 media sections consumed by lib/media_gen.py
 # (fresh-read per call → hot; only max_concurrency latches at first use and
 # needs a bot restart). voice_pool also accepts a comma-separated string
 # for the panel input's convenience.
+# supports_vision (Direct Vision gate, lib/image_parts.py): explicit opt-in
+# on the two main chat tiers — when true, user-uploaded images are attached
+# to the model request as image_url content parts; false/absent keeps the
+# text-placeholder + read_file lazy-analysis path. Pure client-side flag →
+# toggling it never triggers an API probe.
 _TEXT_EXTRAS = {"max_tokens": "int", "temperature": "float"}
+_VISION_TEXT_EXTRAS = {**_TEXT_EXTRAS, "supports_vision": "bool"}
 _MEDIA_EXTRAS = {"timeout": "num", "max_retries": "int",
                  "max_concurrency": "int"}
 _SECTION_EXTRAS = {
-    "REASONING_MODEL": _TEXT_EXTRAS,
-    "FLASH_MODEL": _TEXT_EXTRAS,
+    "REASONING_MODEL": _VISION_TEXT_EXTRAS,
+    "FLASH_MODEL": _VISION_TEXT_EXTRAS,
     "MULTIMODAL_MODEL": _TEXT_EXTRAS,
     "AUDIO_MODEL": _TEXT_EXTRAS,
     "OCR_MODEL": _TEXT_EXTRAS,
@@ -318,6 +324,16 @@ _SECTION_EXTRAS = {
 
 def _cast_extra(kind: str, v):
     """Cast one extra field; raises ValueError with a Chinese message."""
+    if kind == "bool":
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("1", "true", "yes", "on"):
+                return True
+            if s in ("0", "false", "no", "off"):
+                return False
+        raise ValueError("必须是布尔值")
     if kind == "str":
         return str(v).strip()
     if kind == "str_list":
@@ -367,6 +383,16 @@ def models_section_prepare(section: str, data: dict) -> dict:
         cleaned[f] = v.strip()
     for f, kind in _SECTION_EXTRAS.get(section, {}).items():
         v = data.get(f)
+        if kind == "bool":
+            # False is a meaningful toggle-off — don't skip it (the generic
+            # bool-skip below guards numeric fields against True/1 pollution).
+            if v is None or v == "":
+                continue  # field absent → keep whatever the old section had
+            try:
+                cleaned[f] = _cast_extra(kind, v)
+            except (TypeError, ValueError) as e:
+                return {"error": f"{f} {e}"}
+            continue
         if isinstance(v, bool) or v in (None, ""):
             continue  # keep whatever the old section had
         try:
