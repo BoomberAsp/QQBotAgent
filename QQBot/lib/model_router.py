@@ -68,7 +68,13 @@ class ModelRouter:
             return None  # Caller will fall back
 
         try:
-            return DeepSeekClient(api_key=api_key, api_base=api_base, model=model)
+            client = DeepSeekClient(api_key=api_key, api_base=api_base, model=model)
+            # Direct Vision gate: explicit opt-in per model section. When
+            # true, turn.py attaches user-uploaded images as image_url
+            # content parts to requests made with this client (see
+            # lib/image_parts.py). Absent/false → text-only behaviour.
+            client.supports_vision = bool(model_config.get("supports_vision", False))
+            return client
         except Exception:
             return None
 

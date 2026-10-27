@@ -3,21 +3,23 @@
   "_instructions": "Each model section requires: api_key (API key), api_base (endpoint URL), model (model name). Leave any field blank to fall back to the default DeepSeek config in .env.",
 
   "REASONING_MODEL": {
-    "_comment": "Primary reasoning model for complex tasks — multi-step reasoning, tool calling, code generation, search synthesis.",
+    "_comment": "Primary reasoning model for complex tasks — multi-step reasoning, tool calling, code generation, search synthesis. supports_vision (Direct Vision): set true ONLY when this model accepts OpenAI image_url content parts inline — user-uploaded images are then attached to the current-turn message so the model sees them directly (no tool round-trip); false/absent keeps the text-placeholder + read_file lazy-analysis path. A 400 rejection with images attached self-heals by retrying the turn text-only.",
     "api_key": "",
     "api_base": "",
     "model": "",
     "max_tokens": 409600,
-    "temperature": 0.7
+    "temperature": 0.7,
+    "supports_vision": false
   },
 
   "FLASH_MODEL": {
-    "_comment": "Lightweight fast model for triage classification and simple conversations (greetings, small talk, /status). Low max_tokens to save cost.",
+    "_comment": "Lightweight fast model for triage classification and simple conversations (greetings, small talk, /status). Low max_tokens to save cost. supports_vision: see REASONING_MODEL — when true, bare-image messages also enter the agent directly (character responds to the image instead of the legacy 已收到图片 ack).",
     "api_key": "",
     "api_base": "",
     "model": "",
     "max_tokens": 102400,
-    "temperature": 0.7
+    "temperature": 0.7,
+    "supports_vision": false
   },
 
   "MULTIMODAL_MODEL": {

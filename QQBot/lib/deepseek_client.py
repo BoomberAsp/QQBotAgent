@@ -24,6 +24,12 @@ class DeepSeekClient:
     API format is compatible with OpenAI's chat completions endpoint.
     """
 
+    # Direct Vision gate (class default). ModelRouter._create_client stamps
+    # a per-instance True when the model section in models_settings.json
+    # carries "supports_vision": true. Callers should read this via
+    # getattr(client, "supports_vision", False).
+    supports_vision = False
+
     def __init__(self, api_key=None, api_base=None, model=None):
         # When both api_key and api_base are passed explicitly (WebUI Playground,
         # ModelRouter._create_client), skip the NoneBot driver lookup entirely —

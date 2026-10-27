@@ -8592,6 +8592,286 @@ class TestReferencePortrait:
             shutil.rmtree(shipped_dir, ignore_errors=True)
 
 
+class TestDirectVision:
+    """Direct Vision: 主模型直连识图（image_url parts 注入当前轮 user message）。
+
+    Covers lib/image_parts encoder, ModelRouter supports_vision flag,
+    Agent._build_messages content parts (+ str regression lock), run()
+    400 self-heal retry, turn._any_vision_client gate, and the panel
+    config_editor bool extra round-trip.
+    """
+
+    def run(self):
+        print_header("50. Direct Vision (主模型直连识图)")
+        self.test_image_parts_encoder()
+        self.test_model_router_vision_flag()
+        self.test_build_messages_parts()
+        asyncio.run(self.test_run_injection_and_400_retry())
+        self.test_any_vision_client()
+        self.test_config_editor_bool_extra()
+
+    # ── helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_image(path, size=(64, 64), mode="RGBA", fmt=None, frames=1):
+        from PIL import Image
+        color = (255, 0, 0, 255) if mode == "RGBA" else (255, 0, 0)
+        im = Image.new(mode, size, color)
+        if frames > 1:  # animated GIF
+            frames_ims = [im.copy() for _ in range(frames)]
+            im.save(path, save_all=True, append_images=frames_ims[1:],
+                    duration=100, loop=0)
+        else:
+            im.save(path, format=fmt)
+        return path
+
+    @staticmethod
+    def _decode_part(part):
+        """(mime, PIL image) from an image_url content part."""
+        import base64 as _b64
+        import io as _io
+        from PIL import Image
+        url = part["image_url"]["url"]
+        head, _, b64 = url.partition(";base64,")
+        mime = head[len("data:"):]
+        return mime, Image.open(_io.BytesIO(_b64.b64decode(b64)))
+
+    def test_image_parts_encoder(self):
+        from lib import image_parts as ip
+        tmp = tempfile.mkdtemp(prefix="vision_enc_")
+        try:
+            # small RGBA png → PNG passthrough (alpha kept, no resize)
+            p = self._make_image(os.path.join(tmp, "a.png"), (64, 64), "RGBA")
+            part = ip.build_image_part(p)
+            mime, im = self._decode_part(part)
+            assert mime == "image/png" and im.size == (64, 64), (mime, im.size)
+            # oversized RGB jpeg → downscaled, long side ≤ MAX_SIDE
+            p2 = self._make_image(os.path.join(tmp, "big.jpg"),
+                                  (2400, 1800), "RGB", fmt="JPEG")
+            mime2, im2 = self._decode_part(ip.build_image_part(p2))
+            assert mime2 == "image/jpeg" and max(im2.size) <= ip.MAX_SIDE, im2.size
+            # oversized RGB png (screenshot) → downscaled to jpeg
+            p3 = self._make_image(os.path.join(tmp, "shot.png"),
+                                  (3000, 1500), "RGB", fmt="PNG")
+            mime3, im3 = self._decode_part(ip.build_image_part(p3))
+            assert mime3 == "image/jpeg" and max(im3.size) <= ip.MAX_SIDE
+            # animated GIF → first frame as JPEG
+            p4 = self._make_image(os.path.join(tmp, "ani.gif"), (80, 60),
+                                  "RGB", fmt="GIF", frames=3)
+            mime4, _ = self._decode_part(ip.build_image_part(p4))
+            assert mime4 == "image/jpeg", mime4
+            # extensionless QQ download → header sniffing
+            p5 = os.path.join(tmp, "noext_download")
+            with open(p, "rb") as f, open(p5, "wb") as g:
+                g.write(f.read())
+            mime5, _ = self._decode_part(ip.build_image_part(p5))
+            assert mime5 == "image/png", mime5
+            # corrupt / missing / unrecognised → None (never raises)
+            bad = os.path.join(tmp, "bad.png")
+            with open(bad, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\ngarbage!!")
+            assert ip.build_image_part(bad) is None
+            assert ip.build_image_part(os.path.join(tmp, "nope.png")) is None
+            txt = os.path.join(tmp, "note.txt")
+            with open(txt, "w") as f:
+                f.write("not an image")
+            assert ip.build_image_part(txt) is None
+            # raw-size cap (patched small) → None
+            old_cap = ip.RAW_SIZE_CAP
+            try:
+                ip.RAW_SIZE_CAP = 10
+                assert ip.build_image_part(p) is None
+            finally:
+                ip.RAW_SIZE_CAP = old_cap
+            # per-turn count cap, order preserved, invalid skipped
+            paths = [self._make_image(os.path.join(tmp, f"m{i}.png"),
+                                      (8, 8), "RGB", fmt="PNG")
+                     for i in range(6)]
+            parts = ip.build_image_parts(paths[:3] + [bad] + paths[3:])
+            assert len(parts) == ip.MAX_PER_TURN, len(parts)
+            assert ip.build_image_parts([]) == []
+            print_pass("encoder: 缩放/mime/GIF首帧/无扩展名嗅探/损坏None/上限")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_model_router_vision_flag(self):
+        from lib.model_router import ModelRouter
+        tmp = tempfile.mkdtemp(prefix="vision_router_")
+        cfg = os.path.join(tmp, "models_settings.json")
+        try:
+            with open(cfg, "w", encoding="utf-8") as f:
+                json.dump({
+                    "FLASH_MODEL": {"api_key": "k1", "api_base": "https://b1",
+                                    "model": "m1", "supports_vision": True},
+                    "REASONING_MODEL": {"api_key": "k2", "api_base": "https://b2",
+                                        "model": "m2"},
+                }, f)
+            router = ModelRouter(config_path=cfg)
+            assert router.flash_client.supports_vision is True
+            assert router.reasoning_client.supports_vision is False
+            # hot reload picks up the flipped flag
+            with open(cfg, "w", encoding="utf-8") as f:
+                json.dump({
+                    "FLASH_MODEL": {"api_key": "k1", "api_base": "https://b1",
+                                    "model": "m1", "supports_vision": False},
+                }, f)
+            router.reload()
+            assert router.flash_client.supports_vision is False
+            print_pass("ModelRouter: supports_vision 显式开启/缺省False/热重载")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _make_agent(self, client=None):
+        from agent.tool_registry import ToolRegistry
+        from agent.agent import Agent
+        return Agent(
+            deepseek_client=client or MockDeepSeekClient(),
+            tool_registry=ToolRegistry(),
+            config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+        )
+
+    def test_build_messages_parts(self):
+        from agent.session import Session
+        agent = self._make_agent()
+        sess = Session(user_id="u1")
+        tmp = tempfile.mkdtemp(prefix="vision_msgs_")
+        try:
+            png = self._make_image(os.path.join(tmp, "x.png"), (32, 32), "RGB",
+                                   fmt="PNG")
+            # no images → plain str (byte-identical regression lock)
+            m0 = agent._build_messages(sess, "hello", None)
+            assert isinstance(m0[-1]["content"], str) and m0[-1]["content"] == "hello"
+            # with images → parts: text first, then image_url
+            m1 = agent._build_messages(sess, "看这个", None, images=[png])
+            content = m1[-1]["content"]
+            assert isinstance(content, list) and len(content) == 2, content
+            assert content[0] == {"type": "text", "text": "看这个"}
+            assert content[1]["type"] == "image_url"
+            assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+            # all-invalid paths → graceful degradation to str
+            m2 = agent._build_messages(sess, "hello", None,
+                                       images=[os.path.join(tmp, "gone.png")])
+            assert isinstance(m2[-1]["content"], str)
+            print_pass("_build_messages: 无图=str不变 / 有图=parts / 坏路径降级")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def test_run_injection_and_400_retry(self):
+        agent_mod_client = MockDeepSeekClient()
+        agent = self._make_agent(agent_mod_client)
+        tmp = tempfile.mkdtemp(prefix="vision_run_")
+        try:
+            png = self._make_image(os.path.join(tmp, "y.png"), (32, 32), "RGB",
+                                   fmt="PNG")
+            # ① happy path: parts reach the API; session persists TEXT only
+            await agent.run("看这张图", "vu1", images=[png])
+            kind, messages, _ = agent_mod_client.chat_calls[-1]
+            assert kind == "chat_with_tools"
+            assert isinstance(messages[-1]["content"], list), "images not injected"
+            sess = agent.sessions.get("vu1")
+            user_stored = [m for m in sess.context if m["role"] == "user"][-1]
+            assert user_stored["content"] == "看这张图", user_stored
+            assert "base64" not in json.dumps(sess.context, ensure_ascii=False)
+
+            # ② 400 self-heal: first call rejects image parts → retry text-only
+            class _QueuedClient(MockDeepSeekClient):
+                def __init__(self, responses):
+                    super().__init__()
+                    self.responses = list(responses)
+                    self.captured = []
+
+                async def chat_completion_with_tools(self, messages, tools,
+                                                     timeout=180.0,
+                                                     purpose="agent_loop"):
+                    self.captured.append([dict(m) for m in messages])
+                    return self.responses.pop(0)
+
+            queued = _QueuedClient([
+                {"content": "API HTTP错误 (400): invalid image_url content",
+                 "tool_calls": None, "role": "assistant", "finish_reason": "error"},
+                {"content": "看到了", "tool_calls": None,
+                 "role": "assistant", "finish_reason": "stop"},
+            ])
+            agent2 = self._make_agent(queued)
+            resp = await agent2.run("看图", "vu2", images=[png])
+            assert resp == "看到了", resp
+            assert len(queued.captured) == 2, len(queued.captured)
+            assert isinstance(queued.captured[0][-1]["content"], list)
+            retry_content = queued.captured[1][-1]["content"]
+            assert isinstance(retry_content, str) and retry_content == "看图"
+            print_pass("run(): parts注入+会话仅存文本 / 400剥图自愈重试一次")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_any_vision_client(self):
+        turn = _import_turn_for_tests()
+        orig = turn._model_router
+        try:
+            r = MagicMock()
+            r.flash_client.supports_vision = False
+            r.reasoning_client.supports_vision = False
+            turn._model_router = r
+            assert turn._any_vision_client() is False
+            r.flash_client.supports_vision = True
+            assert turn._any_vision_client() is True
+            r.flash_client.supports_vision = False
+            r.reasoning_client.supports_vision = True
+            assert turn._any_vision_client() is True
+
+            class _Boom:
+                @property
+                def flash_client(self):
+                    raise RuntimeError("no driver")
+
+            turn._model_router = _Boom()
+            assert turn._any_vision_client() is False
+            print_pass("_any_vision_client: flash/reasoning 任一开启 / 异常安全False")
+        finally:
+            turn._model_router = orig
+
+    def test_config_editor_bool_extra(self):
+        """面板 supports_vision 复选框：prepare 接受 True/False、缺省保留旧值、非法拒绝。"""
+        from pathlib import Path as _Path
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from webui import config_editor as ce
+        tmp = tempfile.mkdtemp(prefix="vision_ce_")
+        try:
+            settings = _Path(tmp) / "models_settings.json"
+            settings.write_text(json.dumps({
+                "FLASH_MODEL": {"api_key": "k", "api_base": "b", "model": "m",
+                                "supports_vision": False},
+            }), encoding="utf-8")
+            with patch.object(ce, "MODELS_FILE", settings):
+                base = {"api_key": "k", "api_base": "b", "model": "m"}
+                # toggle ON (bool) — no probe needed (credentials unchanged)
+                r = ce.models_section_prepare(
+                    "FLASH_MODEL", {**base, "supports_vision": True})
+                assert r.get("ok") and r["section_data"]["supports_vision"] is True
+                assert r["needs_probe"] is False
+                # toggle OFF via bool False (must NOT be skipped like numerics)
+                r = ce.models_section_prepare(
+                    "FLASH_MODEL", {**base, "supports_vision": False})
+                assert r["section_data"]["supports_vision"] is False
+                # stringy values from raw forms accepted
+                r = ce.models_section_prepare(
+                    "FLASH_MODEL", {**base, "supports_vision": "true"})
+                assert r["section_data"]["supports_vision"] is True
+                # field absent → old value kept
+                r = ce.models_section_prepare("FLASH_MODEL", dict(base))
+                assert r["section_data"]["supports_vision"] is False
+                # invalid → field-level error
+                assert "error" in ce.models_section_prepare(
+                    "FLASH_MODEL", {**base, "supports_vision": 42})
+                # sections without the flag in schema ignore it (no injection)
+                r = ce.models_section_prepare(
+                    "MULTIMODAL_MODEL", {**base, "supports_vision": True})
+                assert r.get("ok") and "supports_vision" not in r["section_data"]
+            print_pass("config_editor: supports_vision bool 开关往返 + 越界拒绝")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 def main():
     print()
@@ -8650,6 +8930,7 @@ def main():
         ("Story-KB Injection Gate", TestStoryKbInjectionGate()),
         ("QQ Official Quote Parsing", TestQQOfficialQuoteParsing()),
         ("Reference Portrait (/设形象)", TestReferencePortrait()),
+        ("Direct Vision (主模型直连识图)", TestDirectVision()),
     ]
 
     passed = 0

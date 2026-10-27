@@ -140,14 +140,20 @@
     { name: 'max_tokens', label: 'max_tokens', type: 'number', min: 1, step: 'any' },
     { name: 'temperature', label: 'temperature', type: 'number', min: 0, max: 2, step: 'any' },
   ];
+  // Direct Vision 开关：仅主聊天两档（REASONING/FLASH）。勾选后用户上传/引用的
+  // 图片会以 image_url parts 直接附给该模型；不勾则维持文本占位 + read_file 懒分析。
+  const VISION_TEXT_EXTRAS = [
+    ...TEXT_EXTRAS,
+    { name: 'supports_vision', label: 'supports_vision（直传识图）', type: 'checkbox' },
+  ];
   const MEDIA_EXTRAS = [
     { name: 'timeout', label: 'timeout（秒）', type: 'number', min: 1, step: 'any' },
     { name: 'max_retries', label: 'max_retries', type: 'number', min: 0, step: 1 },
     { name: 'max_concurrency', label: 'max_concurrency ※', type: 'number', min: 1, step: 1 },
   ];
   const MODEL_SECTIONS = [
-    { key: 'REASONING_MODEL', label: '推理模型 REASONING', desc: '复杂任务主推理', extras: TEXT_EXTRAS },
-    { key: 'FLASH_MODEL', label: '轻量模型 FLASH', desc: '复杂度分类与简单任务', extras: TEXT_EXTRAS },
+    { key: 'REASONING_MODEL', label: '推理模型 REASONING', desc: '复杂任务主推理', extras: VISION_TEXT_EXTRAS },
+    { key: 'FLASH_MODEL', label: '轻量模型 FLASH', desc: '复杂度分类与简单任务', extras: VISION_TEXT_EXTRAS },
     { key: 'MULTIMODAL_MODEL', label: '多模态模型 MULTIMODAL', desc: '图片理解', extras: TEXT_EXTRAS },
     { key: 'AUDIO_MODEL', label: '音频模型 AUDIO', desc: '语音/音频分析', extras: TEXT_EXTRAS },
     { key: 'OCR_MODEL', label: 'OCR 模型', desc: '截图文字识别', extras: TEXT_EXTRAS },
@@ -179,6 +185,10 @@
 
   function extraFieldHtml(f, s) {
     const v = s[f.name];
+    if (f.type === 'checkbox') {
+      return `<label class="field" style="flex:1"><span>${esc(f.label)}</span>
+        <input data-field="${f.name}" type="checkbox" ${v ? 'checked' : ''}></label>`;
+    }
     const val = f.type === 'list'
       ? (Array.isArray(v) ? v.join(', ') : (v || ''))
       : (v != null ? v : '');
@@ -245,6 +255,12 @@
     };
     // extras: empty input = omit (backend keeps the stored value)
     for (const f of (sec && sec.extras) || TEXT_EXTRAS) {
+      if (f.type === 'checkbox') {
+        // unchecked (false) is a meaningful toggle-off → always submit
+        const el = card.querySelector(`[data-field="${f.name}"]`);
+        if (el) out[f.name] = el.checked;
+        continue;
+      }
       const raw = get(f.name);
       if (raw === '') continue;
       if (f.type === 'number') out[f.name] = Number(raw);

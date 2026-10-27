@@ -244,6 +244,7 @@ class Agent:
         allowed_tools: Optional[set] = None,
         user_role: Optional[str] = None,
         persist: bool = True,
+        images: Optional[List[str]] = None,
     ) -> str:
         """Process a user message through the agent loop.
 
@@ -260,6 +261,14 @@ class Agent:
                      a detached in-memory session with empty context — the
                      run neither reads the user's conversation history nor
                      writes back to it, and profile extraction is skipped.
+            images: Optional local image paths for Direct Vision — attached
+                     to the current-turn user message as image_url content
+                     parts when the chosen model supports vision. Ephemeral:
+                     they live only in this run's in-memory message list
+                     (across its tool iterations) and are NEVER persisted
+                     to session history — the text placeholder lines in
+                     user_message remain the durable reference. Callers
+                     gate on ``client.supports_vision`` before passing.
 
         Returns:
             The agent's final response string.
@@ -279,7 +288,10 @@ class Agent:
             session = Session(user_id=user_id)
 
         # Build messages: system prompt + history + current message
-        messages = self._build_messages(session, user_message, special_session, role_hint=user_role)
+        messages = self._build_messages(
+            session, user_message, special_session,
+            role_hint=user_role, images=images,
+        )
 
         # Track tool names for deduplication across iterations
         _last_reported_tools: Optional[frozenset] = None
@@ -311,6 +323,32 @@ class Agent:
                 timeout=self.thinking_timeout,
                 purpose="agent_loop",
             )
+
+            # ── Direct Vision 400 self-heal (misconfigured supports_vision):
+            # provider rejected the request outright on the first iteration
+            # while image parts were attached → strip the images, retry once
+            # with the text-only message (read_file lazy analysis remains as
+            # the model's fallback). A second 400 is NOT retried (images is
+            # already None), so the error surfaces normally.
+            if (
+                images
+                and iteration == 0
+                and not response.get("tool_calls")
+                and str(response.get("content") or "").startswith("API HTTP错误 (400)")
+            ):
+                print("[VISION] image parts rejected with HTTP 400 — "
+                      "retrying text-only (check supports_vision in "
+                      "models_settings.json)")
+                images = None
+                last = messages[-1]
+                if isinstance(last.get("content"), list):
+                    text_only = "".join(
+                        p.get("text", "")
+                        for p in last["content"]
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                    messages[-1] = {"role": "user", "content": text_only}
+                continue
 
             if response.get("tool_calls"):
                 # ── Report progress (with deduplication) ────────────
@@ -504,6 +542,7 @@ class Agent:
         user_message: str,
         special_session: Optional[SpecialSession] = None,
         role_hint: Optional[str] = None,
+        images: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Build the full message list for the LLM.
 
@@ -678,6 +717,24 @@ class Agent:
         messages.append({"role": "system", "content": "\n\n".join(volatile)})
 
         # ── Current user message ──
+        # Direct Vision: when image paths are provided (caller gated on
+        # client.supports_vision), attach them as image_url content parts
+        # AFTER the text. Parts live only in this request's message list —
+        # session history persists the text string, and the parts sit in
+        # the final message (after the volatile L4 tail), so the provider
+        # prefix cache is untouched. Without images the message stays a
+        # plain string — byte-identical to the historical behaviour.
+        if images:
+            try:
+                from lib.image_parts import build_image_parts
+                image_parts = build_image_parts(images)
+            except Exception:  # noqa: BLE001 — vision is best-effort
+                image_parts = []
+            if image_parts:
+                content: Any = [{"type": "text", "text": user_message}]
+                content.extend(image_parts)
+                messages.append({"role": "user", "content": content})
+                return messages
         messages.append({"role": "user", "content": user_message})
 
         return messages
