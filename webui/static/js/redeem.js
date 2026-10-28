@@ -17,10 +17,12 @@ function recentCutoff() {
   return d.toISOString().slice(0, 10);
 }
 
-/* Same classification rule as the bot plugin (valid date, or added ≤30d) */
+/* Same classification rule as the bot plugin: a valid date = 限时; the
+   "added ≤30d" heuristic is for scraped entries only — a panel entry with
+   a blank valid is the admin's explicit 长期 declaration. */
 function classify(e) {
   if (e.valid) return '限时';
-  if (e._added && e._added >= recentCutoff()) return '限时';
+  if (e._source !== 'panel' && e._added && e._added >= recentCutoff()) return '限时';
   return '长期';
 }
 

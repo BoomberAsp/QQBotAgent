@@ -1029,7 +1029,11 @@ def wiki_details_replace_entry(kind: str, title: str, entry: dict) -> dict:
 # panel saves take effect immediately. Envelope keys (scraped_at etc.)
 # are preserved; only `codes` is replaced. Manual entries carry
 # _source="panel" and are authoritative on the bot side (the scraper
-# never overwrites them, cleanup never removes them).
+# never overwrites them, cleanup never removes them). A panel entry's
+# blank `valid` means long-term (the form promises 留空 = 长期) — the
+# 30-day "fresh = time-limited" heuristic applies to scraped entries
+# only, in redeem_list/_class, redeem.js classify() and the plugin's
+# get_time_limited_codes/get_long_term_codes alike.
 
 REDEEM_FILE = REDEEM_DIR / "redeem_code.json"
 REDEEM_ALERT_FILE = REDEEM_DIR / "admin_alert.json"
@@ -1056,7 +1060,9 @@ def redeem_list() -> dict:
         added = c.get("_added", "") or ""
         if expiry:
             c["_class"] = "限时"
-        elif added and added >= recent_cutoff:
+        elif added and added >= recent_cutoff and c.get("_source") != "panel":
+            # 30 天新码启发式只适用于爬取数据（来源常不给活动码标有效期）；
+            # panel 条目是管理员的明确声明 —— 有效期留空即长期。
             c["_class"] = "限时"
         else:
             c["_class"] = "长期"
@@ -1079,6 +1085,19 @@ def redeem_save(codes) -> dict:
 
     if not isinstance(codes, list):
         return {"error": "codes 必须是数组"}
+
+    existing = {}
+    if REDEEM_FILE.exists():
+        try:
+            existing = json.loads(REDEEM_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+    existing_by_code = {
+        e.get("code"): e
+        for e in existing.get("codes", [])
+        if isinstance(e, dict) and e.get("code")
+    }
+
     seen = set()
     today = datetime.now().strftime("%Y-%m-%d")
     for i, entry in enumerate(codes):
@@ -1099,18 +1118,24 @@ def redeem_save(codes) -> dict:
                 return {"error": f"{code}: 有效期格式应为 YYYY-MM-DD（{valid}）"}
         entry["valid"] = valid
         entry["content"] = str(entry.get("content") or "").strip()
-        if not entry.get("_added"):
-            entry["_added"] = today
-        if not entry.get("_source"):
-            entry["_source"] = "panel"
+        old = existing_by_code.get(code)
+        if old is None:
+            # Brand-new entry → panel defaults
+            if not entry.get("_added"):
+                entry["_added"] = today
+            if not entry.get("_source"):
+                entry["_source"] = "panel"
+        else:
+            # Cached entry: backfill from the file, never fabricate. A made-up
+            # fresh _added would flip a long-term code into the time-limited
+            # bucket for 30 days; a made-up _source="panel" would wrongly make
+            # a scraped entry panel-authoritative.
+            if not entry.get("_added"):
+                entry["_added"] = old.get("_added") or ""
+            if not entry.get("_source"):
+                entry["_source"] = old.get("_source") or ""
         entry.pop("_class", None)  # transient annotation, never persisted
 
-    existing = {}
-    if REDEEM_FILE.exists():
-        try:
-            existing = json.loads(REDEEM_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            existing = {}
     envelope = {
         "scraped_at": existing.get("scraped_at", 0),
         "scraped_at_iso": existing.get("scraped_at_iso", ""),
