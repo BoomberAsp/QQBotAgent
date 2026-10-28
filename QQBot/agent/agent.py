@@ -41,6 +41,17 @@ _AUTO_COMPRESS_TOOLS = {"gacha_pull", "parse_battle_screenshots", "calculate_spe
 MAX_FOLD_MESSAGES = 8
 
 
+def _scene_archive_enabled() -> bool:
+    """剧情封档开关（scene-session-archive-design.md D8，热读）。
+
+    单一真源定义在这里（agent.py 是底层），turn.py 直接 import 复用。
+    关闭时：is_scene 退回仅看 kind、封档会话仍注入场景指令、配额统计退回
+    全量；数据保留，重新开启即恢复。
+    """
+    return os.environ.get("SCENE_ARCHIVE_ENABLED", "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
 # UGC 角色创作访谈指令（Bond-System-Design.md §5.1, P1）。注入在 L4 易变尾部，
 # 仅当特殊会话 metadata.kind == "char_creation" 时生效；create_character 工具
 # 由 agent_router 在该类会话中通过 allowed_tools 下发。逐项收集、一次一问、
@@ -690,7 +701,12 @@ class Agent:
             # Bond story-scene session (Bond-System-Design.md §4.4 形态3, P3):
             # scene sessions carry metadata {"kind": "bond_scene", ...} and get
             # complete_scene in allowed_tools (turn.py). The script body follows.
-            elif (special_session.metadata or {}).get("kind") == "bond_scene":
+            # 已封档（completed=true）的剧情按普通特殊会话运行：不再注入场景
+            # 指令与剧本（scene-session-archive-design.md D3/清单 #5b），否则
+            # 模型会反复尝试 complete_scene 并被 turn.py 守卫弹回。
+            elif (special_session.metadata or {}).get("kind") == "bond_scene" \
+                    and not (_scene_archive_enabled()
+                             and (special_session.metadata or {}).get("completed")):
                 volatile.append(_BOND_SCENE_INSTRUCTIONS)
                 script = (special_session.metadata or {}).get("script") or ""
                 if script:

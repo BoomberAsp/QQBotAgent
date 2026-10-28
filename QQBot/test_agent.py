@@ -5946,16 +5946,25 @@ class TestSceneSession:
             shutil.rmtree(tmp, ignore_errors=True)
 
     async def test_finish_bond_scene(self):
-        """post-run 收尾：纪念卡 entry 正确 + 图片发送 + 会话关闭；失败静默。"""
+        """post-run 收尾：completed 封档写入 + 纪念卡 + B1 封档提示（无升级独立发）。"""
+        from types import SimpleNamespace
         turn = self.turn
         tmp = tempfile.mkdtemp(prefix="scene_fin_")
         orig = (turn._bond_manager, turn._special_sessions, turn._safe_send,
                 turn.get_character_registry, turn.render_scene_card)
         sent, entries = [], []
+
+        def _active():
+            return SimpleNamespace(
+                name="剧情·雨夜谈心",
+                metadata={"kind": "bond_scene", "char_id": "rubi",
+                          "scene_title": "雨夜谈心", "completed": False})
+
         try:
             m = _tmp_bond_manager(tmp)
             turn._bond_manager = m
             special = MagicMock()
+            special.get_active.return_value = _active()
             turn._special_sessions = special
 
             async def fake_send(payload, sender=None):
@@ -5982,22 +5991,387 @@ class TestSceneSession:
             assert entries[0]["level"] == 4
             assert entries[0]["level_title"] == m.title_for(4)
             assert entries[0]["date"] == time.strftime("%Y-%m-%d")
-            # image sent with a label, session closed
-            assert len(sent) == 1
+            # 封档：写 completed/completed_at（§5.2）+ end_active
+            special.update_metadata.assert_called_once()
+            _um = special.update_metadata.call_args[0]
+            assert _um[0] == "u1" and _um[1] == "剧情·雨夜谈心", _um
+            assert _um[2].get("completed") is True and "completed_at" in _um[2], _um
+            special.end_active.assert_called_once_with("u1")
+            # 无升级 → 纪念卡 + 独立 B1 封档提示（2 条；§5.2/B1）
+            assert len(sent) == 2, sent
             assert getattr(sent[0], "path", "").endswith("card.png"), sent[0]
             assert "羁绊纪念" in getattr(sent[0], "label", ""), sent[0]
-            special.end_active.assert_called_once_with("u1")
-            # render failure (None) → no image, session still closed, no raise
+            assert isinstance(sent[1], str), sent[1]
+            assert "已完结" in sent[1] and "/切换会话 剧情·雨夜谈心" in sent[1], sent[1]
+            # render failure (None) → 无卡，但 B1 封档提示仍独立发，会话仍关闭
             sent.clear()
             special.reset_mock()
+            special.get_active.return_value = _active()
             turn.render_scene_card = lambda entry, out_path=None: None
             await turn._finish_bond_scene("u1", result)
-            assert sent == [] and special.end_active.called
-            print_pass("finish: card entry/send + end_active; render None degrades")
+            assert len(sent) == 1 and isinstance(sent[0], str), sent
+            assert special.end_active.called
+            print_pass("finish: completed 封档写入 + card + B1 提示；render None 降级")
         finally:
             (turn._bond_manager, turn._special_sessions, turn._safe_send,
              turn.get_character_registry, turn.render_scene_card) = orig
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestSceneArchive:
+    """剧情会话封档与配额豁免（scene-session-archive-design.md §8 T1–T15）。
+
+    用真实 SpecialSessionManager（tmp 根）验证配额/去重/封档/回填语义，
+    覆盖 4 个强制点与展示口径；LLM/开场/纪念卡渲染按需打桩。
+    """
+
+    def run(self):
+        print_header("32b. Scene-Session Archive & Quota Exemption")
+        self.turn = _import_turn_for_tests()
+        self.test_quota_helpers()
+        self.test_rollback_switch()
+        asyncio.run(self.test_start_dedup_resume())
+        asyncio.run(self.test_start_cap())
+        asyncio.run(self.test_finish_archive_merge())
+        self.test_injection_guard()
+        asyncio.run(self.test_complete_scene_guard())
+        self.test_webui_special_list()
+
+    # ── fixtures ────────────────────────────────────────────────
+    def _setup(self, role="regular", max_sessions=1, scene_cap=None):
+        turn = self.turn
+        tmp = tempfile.mkdtemp(prefix="scene_arch_")
+        from agent.special_session import SpecialSessionManager
+        mgr = SpecialSessionManager(
+            user_data_root=os.path.join(tmp, "users"), max_per_user=50)
+        m = _tmp_bond_manager(tmp)
+        sent = []
+
+        async def fake_send(payload, sender=None):
+            sent.append(payload)
+
+        reg = MagicMock()
+        reg._exists.return_value = True
+        reg.get_display_name.side_effect = lambda k, **kw: f"名称:{k}"
+        reg.get_short_name.side_effect = lambda k, **kw: "露比"
+        reg.resolve_effective_personality.return_value = "rubi"
+        perm = MagicMock()
+        perm.get_role.return_value = role
+        perm.get_max_special_sessions.return_value = max_sessions
+
+        orig = (turn._special_sessions, turn._bond_manager, turn._safe_send,
+                turn.get_character_registry, turn._perm_manager,
+                os.environ.get("SCENE_ARCHIVE_ENABLED"),
+                os.environ.get("MAX_SCENE_ARCHIVES"))
+        turn._special_sessions = mgr
+        turn._bond_manager = m
+        turn._safe_send = fake_send
+        turn.get_character_registry = lambda: reg
+        turn._perm_manager = perm
+        os.environ.pop("SCENE_ARCHIVE_ENABLED", None)  # 默认开启
+        if scene_cap is not None:
+            os.environ["MAX_SCENE_ARCHIVES"] = str(scene_cap)
+        return {"tmp": tmp, "mgr": mgr, "bond": m, "sent": sent,
+                "reg": reg, "orig": orig}
+
+    def _restore(self, ctx):
+        turn = self.turn
+        (turn._special_sessions, turn._bond_manager, turn._safe_send,
+         turn.get_character_registry, turn._perm_manager, _sae, _msa) = ctx["orig"]
+        if _sae is None:
+            os.environ.pop("SCENE_ARCHIVE_ENABLED", None)
+        else:
+            os.environ["SCENE_ARCHIVE_ENABLED"] = _sae
+        if _msa is None:
+            os.environ.pop("MAX_SCENE_ARCHIVES", None)
+        else:
+            os.environ["MAX_SCENE_ARCHIVES"] = _msa
+        turn._pending_bond_scene_done.pop("u1", None)
+        shutil.rmtree(ctx["tmp"], ignore_errors=True)
+
+    @staticmethod
+    def _mk_scene(mgr, uid, title, char_id="rubi", completed=None,
+                  kind="bond_scene"):
+        md = {"kind": kind, "char_id": char_id, "persona_key": char_id,
+              "scene_title": title}
+        if completed is not None:
+            md["completed"] = completed
+        return mgr.create(uid, f"剧情·{title}", metadata=md)
+
+    @staticmethod
+    def _entry(mgr, uid, name):
+        for e in mgr.list_sessions(uid):
+            if e["name"] == name:
+                return e
+        return None
+
+    # ── T1/T3/T12/T13 + B6：配额辅助 + 懒回填 ──────────────────
+    def test_quota_helpers(self):
+        turn = self.turn
+        ctx = self._setup(role="regular", max_sessions=1)
+        try:
+            mgr, uid = ctx["mgr"], "u1"
+            assert turn._quota_used(uid) == 0 and turn._scene_archives(uid) == []
+            # T1：剧情会话不计配额
+            self._mk_scene(mgr, uid, "雨夜谈心", completed=False)
+            assert turn._quota_used(uid) == 0
+            assert len(turn._scene_archives(uid)) == 1
+            # 普通会话计配额；创作会话豁免
+            mgr.create(uid, "普通A", metadata={})
+            self._mk_scene(mgr, uid, "创作", kind="char_creation")
+            assert turn._quota_used(uid) == 1, turn._quota_used(uid)
+            assert len(turn._quota_sessions(uid)) == 1  # 仅普通A
+            # B6 删除尾行：普通 vs 剧情
+            t_norm = turn._delete_quota_tail(uid, "")
+            assert "普通会话" in t_norm and "1/1" in t_norm, t_norm
+            t_scene = turn._delete_quota_tail(uid, "bond_scene")
+            assert "配额不变" in t_scene and "剧情归档剩 1" in t_scene, t_scene
+            t_create = turn._delete_quota_tail(uid, "char_creation")
+            assert "配额不变" in t_create, t_create
+            # T12：懒回填（无 completed 字段 + has_done_scene=True → 写回）
+            self._mk_scene(mgr, uid, "星空之约")  # 无 completed 字段
+            ctx["bond"].mark_scene_done(uid, "rubi", "星空之约")
+            e = self._entry(mgr, uid, "剧情·星空之约")
+            assert "completed" not in (e.get("metadata") or {})
+            turn._backfill_completed(uid, e)
+            assert e["metadata"]["completed"] is True and "completed_at" in e["metadata"]
+            # 回填已落盘（重读仍在）
+            e2 = self._entry(mgr, uid, "剧情·星空之约")
+            assert e2["metadata"]["completed"] is True
+            # 无法判定（未 done）→ 保持未回填，避免误封档
+            self._mk_scene(mgr, uid, "未定")
+            e3 = self._entry(mgr, uid, "剧情·未定")
+            turn._backfill_completed(uid, e3)
+            assert "completed" not in (e3.get("metadata") or {})
+            # _find_scene_session 命中 + 取最新
+            found = turn._find_scene_session(uid, "rubi", "星空之约")
+            assert found and found["name"] == "剧情·星空之约"
+            assert turn._find_scene_session(uid, "rubi", "不存在") is None
+            print_pass("quota helpers: 剧情/创作豁免 + B6 尾行 + 懒回填 (T1/T3/T12/T13)")
+        finally:
+            self._restore(ctx)
+
+    # ── 回滚开关 ────────────────────────────────────────────────
+    def test_rollback_switch(self):
+        turn = self.turn
+        ctx = self._setup(role="regular", max_sessions=1)
+        try:
+            os.environ["SCENE_ARCHIVE_ENABLED"] = "0"
+            mgr, uid = ctx["mgr"], "u1"
+            self._mk_scene(mgr, uid, "雨夜谈心", completed=True)
+            mgr.create(uid, "普通A", metadata={})
+            # 关闭：_quota_sessions 退回全量；_scene_completed 恒 False
+            assert turn._quota_used(uid) == 2, turn._quota_used(uid)
+            e = self._entry(mgr, uid, "剧情·雨夜谈心")
+            assert turn._scene_completed(e) is False
+            tail = turn._delete_quota_tail(uid, "bond_scene")
+            assert "当前特殊会话: 2/1" in tail, tail  # 统一口径
+            print_pass("rollback switch off → 统一配额语义 (SCENE_ARCHIVE_ENABLED=0)")
+        finally:
+            self._restore(ctx)
+
+    # ── T4/T7：/剧情 去重恢复 + 归档拒绝 ───────────────────────
+    async def test_start_dedup_resume(self):
+        turn = self.turn
+        ctx = self._setup(role="regular", max_sessions=1)
+        try:
+            mgr, sent, uid = ctx["mgr"], ctx["sent"], "u1"
+            # T4：中途 /结束会话 → /剧情 同标题 = 恢复（不新建、消息数不重置）
+            s = self._mk_scene(mgr, uid, "雨夜谈心", completed=False)
+            mgr.switch_to(uid, s.name)
+            mgr.add_message(uid, "user", "hello")
+            mgr.add_message(uid, "assistant", "hi")
+            before = self._entry(mgr, uid, s.name)["total_messages"]
+            mgr.end_active(uid)
+            await turn._start_bond_scene(
+                uid, "rubi", {"title": "雨夜谈心", "level": 1, "body": "【第一幕】…"})
+            assert len(turn._scene_archives(uid)) == 1, turn._scene_archives(uid)
+            active = mgr.get_active(uid)
+            assert active and active.name == s.name, active
+            assert self._entry(mgr, uid, s.name)["total_messages"] == before
+            assert any("继续上次未完成的剧情" in str(x) for x in sent), sent
+            # 幂等：正在此剧情中再发 → “你正在这段剧情中”
+            sent.clear()
+            await turn._start_bond_scene(
+                uid, "rubi", {"title": "雨夜谈心", "level": 1, "body": "…"})
+            assert any("你正在这段剧情" in str(x) for x in sent), sent
+            # T7：已封档（completed=True）→ 拒绝重开，不新建
+            sent.clear()
+            mgr.end_active(uid)
+            self._mk_scene(mgr, uid, "星空之约", completed=True)
+            await turn._start_bond_scene(
+                uid, "rubi", {"title": "星空之约", "level": 1, "body": "…"})
+            assert any("已完结封档" in str(x) for x in sent), sent
+            assert len(turn._scene_archives(uid)) == 2, turn._scene_archives(uid)
+            print_pass("/剧情 去重：恢复未完成 (T4) + 幂等 + 拒绝已封档 (T7)")
+        finally:
+            self._restore(ctx)
+
+    # ── T8：总量上限 + 恢复不受限 ──────────────────────────────
+    async def test_start_cap(self):
+        turn = self.turn
+        ctx = self._setup(role="regular", max_sessions=1, scene_cap=2)
+        try:
+            mgr, sent, uid = ctx["mgr"], ctx["sent"], "u1"
+            self._mk_scene(mgr, uid, "A", completed=True)
+            self._mk_scene(mgr, uid, "B", completed=True)
+            # 第 3 个新剧情 → 上限拒绝（不新建）
+            await turn._start_bond_scene(
+                uid, "rubi", {"title": "C", "level": 1, "body": "…"})
+            assert any("已达上限" in str(x) for x in sent), sent
+            assert len(turn._scene_archives(uid)) == 2, turn._scene_archives(uid)
+            # 恢复未完成会话仍允许（去重先于上限检查）
+            sent.clear()
+            self._mk_scene(mgr, uid, "D", completed=False)
+            await turn._start_bond_scene(
+                uid, "rubi", {"title": "D", "level": 1, "body": "…"})
+            assert any("继续上次未完成的剧情" in str(x) for x in sent), sent
+            active = mgr.get_active(uid)
+            assert active and active.name == "剧情·D", active
+            print_pass("剧情总量上限：新建被拒 + 恢复未完成仍允许 (T8)")
+        finally:
+            self._restore(ctx)
+
+    # ── B1b/T5：封档行并入升级 vs 独立发 + completed 写入 ──────
+    async def test_finish_archive_merge(self):
+        turn = self.turn
+        ctx = self._setup(role="regular", max_sessions=1)
+        orig_emit = turn._emit_level_ups
+        orig_render = turn.render_scene_card
+        orig_distill = turn._distill_bond_episode
+        try:
+            mgr, sent, uid = ctx["mgr"], ctx["sent"], "u1"
+            captured = {}
+
+            async def fake_emit(user_id, persona_key, level_ups, sender=None,
+                                is_group=False, archive_note=""):
+                captured["archive_note"] = archive_note
+
+            turn._emit_level_ups = fake_emit
+            turn.render_scene_card = lambda entry, out_path=None: None
+            turn._distill_bond_episode = lambda *a, **k: None
+            # 有升级：封档行并入升级（archive_note 非空），不独立发 B1
+            s = self._mk_scene(mgr, uid, "雨夜谈心", completed=False)
+            mgr.switch_to(uid, s.name)
+            await turn._finish_bond_scene(uid, {
+                "char_id": "rubi", "scene_title": "雨夜谈心", "level": 4,
+                "level_ups": [{"level": 4, "title": "挚友"}], "memento": "…"})
+            assert "已封档" in captured.get("archive_note", ""), captured
+            assert not any(isinstance(x, str) and "已完结，已为你封档" in x
+                           for x in sent), sent
+            e = self._entry(mgr, uid, s.name)
+            assert e["metadata"].get("completed") is True, e
+            assert "completed_at" in e["metadata"], e
+            # 无升级：archive_note 空 + 独立发 B1
+            sent.clear(); captured.clear()
+            s2 = self._mk_scene(mgr, uid, "星空之约", completed=False)
+            mgr.switch_to(uid, s2.name)
+            await turn._finish_bond_scene(uid, {
+                "char_id": "rubi", "scene_title": "星空之约", "level": 4,
+                "level_ups": [], "memento": "…"})
+            assert captured.get("archive_note", "x") == "", captured
+            assert any(isinstance(x, str) and "已完结，已为你封档" in x
+                       for x in sent), sent
+            print_pass("封档：有升级并入升级文案 / 无升级独立 B1 + completed 写入 (B1b/T5)")
+        finally:
+            turn._emit_level_ups = orig_emit
+            turn.render_scene_card = orig_render
+            turn._distill_bond_episode = orig_distill
+            self._restore(ctx)
+
+    # ── T6/#5b：归档运行态不注入剧情指令/剧本 ──────────────────
+    def test_injection_guard(self):
+        from agent.tool_registry import ToolRegistry
+        from agent.agent import Agent
+        from agent.session import Session
+        from agent.special_session import SpecialSession
+        agent = Agent(
+            deepseek_client=MockDeepSeekClient(),
+            tool_registry=ToolRegistry(),
+            config_dir=os.path.join(os.path.dirname(__file__), "agent", "config"),
+        )
+        sess = Session(user_id="u1")
+
+        def _tail(sp):
+            msgs = agent._build_messages(sess, "……", sp)
+            return [m for m in msgs if m["role"] == "system"][-1]["content"]
+
+        script = "【第一幕 · 骤雨】夜里突降暴雨。\n【终幕 · 雨停之约】雨停了。"
+        base = {"kind": "bond_scene", "char_id": "rubi",
+                "scene_title": "雨夜谈心", "script": script}
+        live = SpecialSession(session_id="sc1", user_id="u1", name="剧情·雨夜谈心",
+                              metadata=dict(base, completed=False))
+        t_live = _tail(live)
+        assert "剧情场景（进行中）" in t_live and "骤雨" in t_live, t_live
+        done = SpecialSession(session_id="sc2", user_id="u1", name="剧情·雨夜谈心",
+                              metadata=dict(base, completed=True))
+        t_done = _tail(done)
+        assert "剧情场景（进行中）" not in t_done, t_done
+        assert "骤雨" not in t_done and "complete_scene" not in t_done, t_done
+        print_pass("注入守卫：已封档剧情 volatile tail 无指令/剧本 (T6/#5b)")
+
+    # ── T6/§5.4：complete_scene 第三层防御 ─────────────────────
+    async def test_complete_scene_guard(self):
+        turn = self.turn
+        ctx = self._setup(role="regular", max_sessions=1)
+        try:
+            mgr, uid = ctx["mgr"], "u1"
+            fn = turn._tool_registry._tools["complete_scene"]["function"]
+            s = self._mk_scene(mgr, uid, "雨夜谈心", completed=True)
+            mgr.switch_to(uid, s.name)
+            tok_u = turn._current_user_id.set(uid)
+            tok_p = turn._current_personality.set("rubi")
+            try:
+                out = await fn(memento="x")
+                assert out.startswith("[Error]") and "没有进行中的剧情" in out, out
+                # 进行中 → 守卫放行（结算由底层 bond manager 处理，非 [Error]）
+                mgr.update_metadata(uid, s.name, {"completed": False})
+                out2 = await fn(memento="x")
+                assert not out2.startswith("[Error]"), out2
+            finally:
+                turn._current_user_id.reset(tok_u)
+                turn._current_personality.reset(tok_p)
+                turn._pending_bond_scene_done.pop(uid, None)
+            print_pass("complete_scene 守卫：已封档拒绝 / 进行中放行 (T6/§5.4)")
+        finally:
+            self._restore(ctx)
+
+    # ── T15：WebUI special_list 展平 + 配额摘要 ────────────────
+    def test_webui_special_list(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from webui import data_reader as dr
+        turn = self.turn
+        ctx = self._setup(role="regular", max_sessions=1)
+        orig_sm = dr._special_manager
+        orig_perm = dr._permissions
+        try:
+            mgr, uid = ctx["mgr"], "u1"
+            self._mk_scene(mgr, uid, "雨夜谈心", completed=True)
+            self._mk_scene(mgr, uid, "星空之约", completed=False)
+            self._mk_scene(mgr, uid, "创作", kind="char_creation")
+            mgr.create(uid, "普通A", metadata={})
+            perm_mock = MagicMock()
+            perm_mock.get_role.return_value = MagicMock(value="regular")
+            perm_mock.get_max_special_sessions.return_value = 1
+            dr._special_manager = lambda: mgr
+            dr._permissions = perm_mock
+            out = dr.special_list(uid)
+            assert out.get("quota_used") == 1, out       # 仅普通A
+            assert out.get("quota_max") == 1, out
+            assert out.get("scene_archives") == 2, out    # 雨夜谈心 + 星空之约
+            assert out.get("scene_done") == 1, out        # 雨夜谈心
+            by = {s["name"]: s for s in out["sessions"]}
+            assert by["剧情·雨夜谈心"]["completed"] is True
+            assert by["剧情·雨夜谈心"]["counts_quota"] is False
+            assert by["普通A"]["counts_quota"] is True
+            assert by["剧情·创作"]["kind"] == "char_creation"
+            print_pass("webui special_list：kind/completed 展平 + 配额摘要 (T15)")
+        finally:
+            dr._special_manager = orig_sm
+            dr._permissions = orig_perm
+            self._restore(ctx)
 
 
 class TestBondReunionAnniversary:
@@ -9374,7 +9748,7 @@ class TestOfficialMarkdown:
             await s.send_markdown("## d")
             await s.send_text("e")
             payloads = s._merged_payloads()
-            kinds = [(seg.type, k) for seg, k in payloads]
+            kinds = [(seg.type, k) for seg, k, _kb in payloads]
             assert kinds == [("text", "text"), ("markdown", "markdown"),
                              ("text", "text")], kinds
             assert payloads[0][0].data["text"] == "a\nb"
@@ -9585,6 +9959,564 @@ class TestOfficialMarkdown:
         print_pass("/兑换码 与 /长期兑换码 md 正文格式符合 §6.10.8")
 
 
+class TestOfficialButtons:
+    """52. QQ 官方渠道消息按钮（keyboard / inline buttons）P0+P1.
+
+    buttons-design 落地：平台无关 DSL（button_spec）、wire 转换
+    （to_message_keyboard / encode_cb / decode_cb）、合并与降级梯
+    （kb → md-only → text+命令清单）、能力熔断、回调链（幂等 / 限频 /
+    版本戳 / scene→role 复核）、共享渲染隐私（群会话列表不泄露）、以及
+    内核 _send_response 的 _turn_keyboard 一次性消费与 #n 别名。
+    """
+
+    def run(self):
+        print_header("52. QQ Official Buttons (keyboard P0+P1)")
+        os.environ.setdefault("USER_DATA_ROOT", "/tmp/qqbot_smoke")
+        asyncio.run(self.test_u1_validate_boundaries())
+        asyncio.run(self.test_u2_wire_field_map())
+        asyncio.run(self.test_u3_codec_roundtrip())
+        asyncio.run(self.test_u4_merge_rules())
+        asyncio.run(self.test_u5_degradation_ladder())
+        asyncio.run(self.test_u6_breaker())
+        asyncio.run(self.test_u7_version_stamp_guard())
+        asyncio.run(self.test_u8_idempotency_and_rate())
+        asyncio.run(self.test_u9_admin_role_gate())
+        asyncio.run(self.test_u10_group_session_privacy())
+        asyncio.run(self.test_onebot_keyboard_degrades())
+        asyncio.run(self.test_send_response_one_shot_keyboard())
+        asyncio.run(self.test_session_index_alias())
+
+    # ── helpers ──────────────────────────────────────────────────
+    @staticmethod
+    def _qo():
+        import adapters.qq_official as qo
+        return qo
+
+    @staticmethod
+    def _sender(bot=None, is_group=False):
+        qo = TestOfficialButtons._qo()
+        return qo.QQOfficialSender(bot or _MdFakeBot(), MagicMock(), is_group)
+
+    @staticmethod
+    def _kb_guard(qo):
+        """Snapshot/restore kb breaker + env (tests mutate both). Also
+        keeps the md breaker closed — keyboard availability requires it."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def guard():
+            kb = qo._kb_breaker
+            snap = (kb.state, kb.rejects, kb.disabled_until,
+                    kb.rejected_total, kb.last_reject_code, kb.last_reject_at)
+            md_rejects, md_disabled = (qo._md_breaker.rejects,
+                                       qo._md_breaker.disabled_until)
+            env_btn = os.environ.pop("QQ_OFFICIAL_BUTTONS", None)
+            env_md = os.environ.pop("QQ_OFFICIAL_MARKDOWN", None)
+            env_users = os.environ.pop("QQ_OFFICIAL_BUTTONS_USERS", None)
+            try:
+                kb.state, kb.rejects, kb.disabled_until = "unknown", 0, 0.0
+                kb.rejected_total, kb.last_reject_code = 0, None
+                kb.last_reject_at = 0.0
+                qo._md_breaker.rejects = 0
+                qo._md_breaker.disabled_until = 0.0
+                os.environ["QQ_OFFICIAL_BUTTONS"] = "on"
+                yield
+            finally:
+                (kb.state, kb.rejects, kb.disabled_until, kb.rejected_total,
+                 kb.last_reject_code, kb.last_reject_at) = snap
+                qo._md_breaker.rejects = md_rejects
+                qo._md_breaker.disabled_until = md_disabled
+                for k, v in (("QQ_OFFICIAL_BUTTONS", env_btn),
+                             ("QQ_OFFICIAL_MARKDOWN", env_md),
+                             ("QQ_OFFICIAL_BUTTONS_USERS", env_users)):
+                    if v is not None:
+                        os.environ[k] = v
+                    else:
+                        os.environ.pop(k, None)
+        return guard()
+
+    # ── U1: button_spec.validate / helpers ───────────────────────
+    async def test_u1_validate_boundaries(self):
+        import lib.button_spec as bs
+        from lib.button_spec import Btn
+        ok = [[Btn(label="确定", data="/ok", action="cmd")]]
+        assert bs.validate(ok) == []
+        assert bs.validate([]) == ["keyboard is empty"]
+        # 行数上限（6 行 > 默认 5）
+        six = [[Btn(label="x", data="/x", action="cmd")] for _ in range(6)]
+        assert any("too many rows" in p for p in bs.validate(six))
+        # 空行 / 每行超限
+        assert any("is empty" in p for p in bs.validate(
+            [[Btn(label="a", data="/a", action="cmd")], []]))
+        wide = [[Btn(label=str(i), data=f"/{i}", action="cmd")
+                 for i in range(4)]]
+        assert any("buttons >" in p for p in bs.validate(wide))
+        # label 宽度 / 空
+        assert any("empty label" in p for p in bs.validate(
+            [[Btn(label="", data="/x", action="cmd")]]))
+        assert any("label too wide" in p for p in bs.validate(
+            [[Btn(label="超超超超超超", data="/x", action="cmd")]]))
+        # cmd 分支
+        assert any("without data" in p for p in bs.validate(
+            [[Btn(label="X", data="", action="cmd")]]))
+        assert any("cmd data too long" in p for p in bs.validate(
+            [[Btn(label="X", data="x" * 61, action="cmd")]]))
+        assert any("modal is cb-only" in p for p in bs.validate(
+            [[Btn(label="X", data="/x", action="cmd", modal="m")]]))
+        # cb 分支
+        assert any("cb payload malformed" in p for p in bs.validate(
+            [[Btn(label="X", data="nope", action="cb")]]))
+        assert bs.validate(
+            [[Btn(label="X", data="qb1:session.del:1:abcd", action="cb")]]
+        ) == []
+        # url 分支
+        assert any("needs https" in p for p in bs.validate(
+            [[Btn(label="X", data="http://x", action="url")]]))
+        assert bs.validate(
+            [[Btn(label="X", data="https://x.com", action="url")]]) == []
+        # 未知 action
+        assert any("unknown action" in p for p in bs.validate(
+            [[Btn(label="X", data="d", action="zzz")]]))
+        # 总量上限（放宽每行/行数，只撞总量）
+        big = [[Btn(label=str(i), data=f"/{i}", action="cmd")
+                for i in range(4)] for _ in range(5)]
+        assert any("too many buttons total" in p
+                   for p in bs.validate(big, max_rows_=5, max_per_row_=5))
+        # 辅助函数
+        assert bs.display_width("abc") == 3 and bs.display_width("汉字") == 4
+        fit = bs.fit_label("超长角色名字超长", 10)
+        assert bs.display_width(fit) <= 10 and fit.endswith("…")
+        assert bs.fit_label("短名") == "短名"
+        clipped = bs.clip_rows(six)
+        assert len(clipped) <= bs._PLATFORM_MAX_ROWS
+        assert sum(len(r) for r in clipped) <= bs._PLATFORM_MAX_TOTAL
+        assert bs.stamp(["a", "b"]) == bs.stamp(["a", "b"])
+        assert bs.stamp(["a", "b"]) != bs.stamp(["a", "c"])
+        assert len(bs.stamp(["x"])) == 4
+        txt = bs.to_text([[Btn(label="甲", data="/a", action="cmd"),
+                           Btn(label="乙", data="qb1:x", action="cb"),
+                           Btn(label="丙", data="https://z", action="url")]])
+        assert "1. 甲 → 发送「/a」" in txt and "https://z" in txt
+        assert "qb1:x" not in txt   # cb 无文本等价，跳过
+        print_pass("U1 validate/fit/clip/stamp/to_text 边界全部符合")
+
+    # ── U2: to_message_keyboard 字段映射 ─────────────────────────
+    async def test_u2_wire_field_map(self):
+        from adapters.qq_official_buttons import to_message_keyboard
+        from lib.button_spec import Btn
+        cmd = to_message_keyboard(
+            [[Btn(label="Go", data="/go", action="cmd", reply=True,
+                  enter=True)]]).content.rows[0].buttons[0]
+        assert cmd.id == "b.0.0"
+        assert cmd.render_data.label == "Go"
+        assert cmd.render_data.visited_label == "Go"   # 缺省同 label
+        assert cmd.action.type == 2 and cmd.action.data == "/go"
+        assert cmd.action.reply is True and cmd.action.enter is True
+        assert cmd.action.permission.type == 2
+        # style 钳制到 {0,1}
+        clamped = to_message_keyboard(
+            [[Btn(label="S", data="/s", action="cmd", style=5)]]
+        ).content.rows[0].buttons[0]
+        assert clamped.render_data.style == 1
+        kept0 = to_message_keyboard(
+            [[Btn(label="S", data="/s", action="cmd", style=0)]]
+        ).content.rows[0].buttons[0]
+        assert kept0.render_data.style == 0
+        # visited_label 覆盖
+        vis = to_message_keyboard(
+            [[Btn(label="V", data="/v", action="cmd", visited="完成")]]
+        ).content.rows[0].buttons[0]
+        assert vis.render_data.visited_label == "完成"
+        # cb admin_only → permission type=1
+        adm = to_message_keyboard(
+            [[Btn(label="D", data="qb1:session.del:1:abcd", action="cb",
+                  admin_only=True)]]).content.rows[0].buttons[0]
+        assert adm.action.type == 1 and adm.action.permission.type == 1
+        # cb group+openid → permission type=0 specify_user_ids
+        grp = to_message_keyboard(
+            [[Btn(label="D", data="qb1:session.del:1:abcd", action="cb")]],
+            scope="group", openid="OU1").content.rows[0].buttons[0]
+        assert grp.action.permission.type == 0
+        assert grp.action.permission.specify_user_ids == ["OU1"]
+        # cb modal
+        mdl = to_message_keyboard(
+            [[Btn(label="D", data="qb1:session.del:1:abcd", action="cb",
+                  modal="确认删除？", confirm="删", cancel="算了")]]
+        ).content.rows[0].buttons[0]
+        assert mdl.action.modal.content == "确认删除？"
+        assert mdl.action.modal.confirm_text == "删"
+        assert mdl.action.modal.cancel_text == "算了"
+        # url → type=0
+        url = to_message_keyboard(
+            [[Btn(label="Site", data="https://x.com", action="url")]]
+        ).content.rows[0].buttons[0]
+        assert url.action.type == 0 and url.action.permission.type == 2
+        print_pass("U2 to_message_keyboard 字段映射对照 §50 全部符合")
+
+    # ── U3: encode/decode 往返 + 畸形 ────────────────────────────
+    async def test_u3_codec_roundtrip(self):
+        from adapters.qq_official_buttons import encode_cb, decode_cb
+        assert encode_cb("session.del", "1", "abcd") == "qb1:session.del:1:abcd"
+        assert decode_cb("qb1:session.del:1:abcd") == ("session.del",
+                                                       ["1", "abcd"])
+        v, a = "toggle.feature", ["gacha", "on"]
+        assert decode_cb(encode_cb(v, *a)) == (v, a)
+        assert decode_cb("qb1:session.page") == ("session.page", [])
+        for bad_encode in (lambda: encode_cb("Bad Verb"),
+                           lambda: encode_cb("session.del", "中文"),
+                           lambda: encode_cb("session.del", "a:b"),
+                           lambda: encode_cb("v", "1", "2", "3", "4")):
+            try:
+                bad_encode()
+                raise AssertionError("expected ValueError")
+            except ValueError:
+                pass
+        for bad in ("garbage", "qb2:x", "qb1:", "qb1:session.del:中文"):
+            try:
+                decode_cb(bad)
+                raise AssertionError(f"expected ValueError for {bad!r}")
+            except ValueError:
+                pass
+        print_pass("U3 encode/decode 往返一致，畸形载荷一律 ValueError")
+
+    # ── U4: _merged_payloads 键盘合并 ────────────────────────────
+    async def test_u4_merge_rules(self):
+        qo = self._qo()
+        from agent.outbound import OutKeyboard
+        from lib.button_spec import Btn
+        rows = [[Btn(label="X", data="/x", action="cmd")]]
+        with self._kb_guard(qo):
+            # [md, kb] → 1 条（kb 骑相邻 md）
+            s = self._sender()
+            await s.send_markdown("## 正文")
+            s._buffer.append(("kb", OutKeyboard(markdown="", rows=rows,
+                                                label="t")))
+            p = s._merged_payloads()
+            assert len(p) == 1 and p[0][1] == "markdown" and p[0][2], p
+            # [text, kb] → 2 条（kb 自带 md 独立成条）
+            s = self._sender()
+            await s.send_text("纯文本")
+            s._buffer.append(("kb", OutKeyboard(markdown="键盘正文",
+                                                rows=rows, label="t")))
+            p = s._merged_payloads()
+            assert len(p) == 2, p
+            assert [k for _, k, _ in p] == ["text", "markdown"], p
+            assert p[1][2] is not None
+            # [kb, text] → 2 条（kb 非最后，独立）
+            s = self._sender()
+            s._buffer.append(("kb", OutKeyboard(markdown="B", rows=rows,
+                                                label="t")))
+            await s.send_text("尾巴")
+            p = s._merged_payloads()
+            assert len(p) == 2 and [k for _, k, _ in p] == ["markdown",
+                                                             "text"], p
+            # [kb, kb] → 2 条独立
+            s = self._sender()
+            s._buffer.append(("kb", OutKeyboard(markdown="A", rows=rows,
+                                                label="t")))
+            s._buffer.append(("kb", OutKeyboard(markdown="B", rows=rows,
+                                                label="t")))
+            p = s._merged_payloads()
+            assert len(p) == 2 and all(x[2] for x in p), p
+        print_pass("U4 键盘合并：[md,kb]→1、[text,kb]/[kb,text]/[kb,kb]→2")
+
+    # ── U5: 降级梯（kb → md-only → text+命令清单）────────────────
+    async def test_u5_degradation_ladder(self):
+        qo = self._qo()
+        from agent.outbound import OutKeyboard
+        from lib.button_spec import Btn
+        rows = [[Btn(label="再抽", data="再抽一次", action="cmd")]]
+        with self._kb_guard(qo):
+            # 键盘被拒（304037）→ md-only 成功
+            bot = _MdFakeBot(fail_codes=[304037])
+            s = self._sender(bot)
+            await s.send_keyboard(OutKeyboard(markdown="## 结果",
+                                              rows=rows, label="gacha"))
+            await s.flush()
+            assert len(bot.sent) == 1, bot.sent
+            seg = bot.sent[0]
+            assert seg.type == "markdown", seg.type
+            assert qo._kb_breaker.state == "unsupported"
+        with self._kb_guard(qo):
+            # 键盘拒 + md 拒 → 纯文本含命令清单（L2）
+            bot = _MdFakeBot(fail_codes=[304037, 40034011])
+            s = self._sender(bot)
+            await s.send_keyboard(OutKeyboard(markdown="## 结果",
+                                              rows=rows, label="gacha"))
+            await s.flush()
+            assert len(bot.sent) == 1, bot.sent
+            seg = bot.sent[0]
+            assert seg.type == "text", seg.type
+            body = seg.data["text"]
+            assert "结果" in body and "按钮暂不可用" in body
+            assert "再抽一次" in body   # to_text 命令清单
+        print_pass("U5 降级梯：304037→md-only；md 再拒→纯文本+命令清单")
+
+    # ── U6: 熔断 ─────────────────────────────────────────────────
+    async def test_u6_breaker(self):
+        qo = self._qo()
+        with self._kb_guard(qo):
+            # 304037 → unsupported + 长熔断
+            qo._kb_record_reject(304037)
+            assert qo._kb_breaker.state == "unsupported"
+            assert qo._kb_available() is False
+            # 冷却期满 → 半开，state 回 unknown
+            qo._kb_breaker.disabled_until = time.monotonic() - 1
+            assert qo._kb_available() is True
+            assert qo._kb_breaker.state == "unknown"
+            # 连续 3 次普通拒绝 → 600s 熔断（非 unsupported）
+            qo._kb_breaker.state, qo._kb_breaker.rejects = "unknown", 0
+            qo._kb_breaker.disabled_until = 0.0
+            for _ in range(3):
+                qo._kb_record_reject(305007)
+            assert qo._kb_breaker.disabled_until > 0
+            assert qo._kb_breaker.state != "unsupported"
+            assert qo._kb_available() is False
+            # 成功一次即清计数
+            qo._kb_breaker.disabled_until = 0.0
+            qo._kb_record_reject(305007)
+            qo._kb_record_success()
+            assert qo._kb_breaker.rejects == 0
+            assert qo._kb_breaker.state == "ok"
+            snap = qo.kb_snapshot()
+            assert snap["state"] == "ok" and "available" in snap
+        print_pass("U6 熔断：304037 长熔断/半开；3 连拒 600s；成功清零")
+
+    # ── U7: 版本戳拦截（列表变更 → 拒绝执行删除）─────────────────
+    async def test_u7_version_stamp_guard(self):
+        import agent.button_actions as ba
+        from agent import session_render
+        turn = _import_turn_for_tests()
+
+        class _StubSessions:
+            def __init__(self):
+                self.deleted = []
+                self._s = [{"name": "Alpha", "created_at": 0,
+                            "total_messages": 2, "metadata": {}}]
+            def list_sessions(self, user):
+                return list(self._s)
+            def delete(self, user, name):
+                self.deleted.append(name)
+                return {}
+
+        stub = _StubSessions()
+        old_ss, turn._special_sessions = turn._special_sessions, stub
+        old_fresh = ba._fresh_session_page
+        ba._fresh_session_page = lambda u, p=1: ("STUB", [])
+        try:
+            # 版本戳不符 → code=1，不删除
+            wrong = ba.ButtonContext(user_id="u", group_id="", scene="c2c",
+                                     verb="session.del", args=["1", "ZZZZ"])
+            res = await ba._session_del(wrong)
+            assert res.code == 1, res
+            assert stub.deleted == [], "版本戳不符时绝不能删除"
+            # 版本戳正确 → 执行删除
+            ver = session_render.session_list_stamp(stub._s)
+            old_fs, turn._format_delete_summary = (
+                getattr(turn, "_format_delete_summary", None), lambda r: "")
+            old_qt, turn._delete_quota_tail = (
+                getattr(turn, "_delete_quota_tail", None), lambda u, k: "")
+            old_pm = getattr(turn, "_profile_manager", None)
+            turn._profile_manager = MagicMock()
+            try:
+                right = ba.ButtonContext(user_id="u", group_id="",
+                                         scene="c2c", verb="session.del",
+                                         args=["1", ver])
+                res2 = await ba._session_del(right)
+                assert res2.code == 0, res2
+                assert stub.deleted == ["Alpha"], stub.deleted
+            finally:
+                if old_fs is not None:
+                    turn._format_delete_summary = old_fs
+                if old_qt is not None:
+                    turn._delete_quota_tail = old_qt
+                if old_pm is not None:
+                    turn._profile_manager = old_pm
+        finally:
+            turn._special_sessions = old_ss
+            ba._fresh_session_page = old_fresh
+        print_pass("U7 版本戳：不符→code=1 拒绝删除；相符→执行删除")
+
+    # ── U8: 幂等 + 限频 ──────────────────────────────────────────
+    async def test_u8_idempotency_and_rate(self):
+        import types
+        import plugins.qq_official_buttons as pob
+        import agent.button_actions as ba
+        from agent import context as ac
+
+        # 纯函数层：seen / rate
+        pob._seen.clear()
+        assert pob._seen_before("k1") is False
+        assert pob._seen_before("k1") is True
+        pob._rate.clear()
+        assert all(pob._rate_limited("u", "v") is False for _ in range(3))
+        assert pob._rate_limited("u", "v") is True   # 第 4 次触发
+
+        # 处理器层：同 interaction_id 二次 → code=3，handler 只执行一次
+        calls = {"fresh": 0}
+        old_fresh = ba._fresh_session_page
+        ba._fresh_session_page = lambda u, p=1: (calls.__setitem__(
+            "fresh", calls["fresh"] + 1) or ("STUB", []))
+        tmp = tempfile.mkdtemp(prefix="btn_audit_")
+        old_audit = os.environ.get("QQ_OFFICIAL_BUTTONS_AUDIT")
+        os.environ["QQ_OFFICIAL_BUTTONS_AUDIT"] = os.path.join(tmp, "a.jsonl")
+        pob._seen.clear(); pob._rate.clear()
+        prev_platform = ac._current_platform.get()
+
+        class _FakeBot:
+            def __init__(self):
+                self.acks = []; self.sent = []
+            async def put_interaction(self, *, interaction_id, code):
+                self.acks.append((interaction_id, code))
+            async def send(self, event, msg):
+                self.sent.append(msg)
+
+        def ev(id):
+            return types.SimpleNamespace(
+                type=11, id=id, chat_type=2, user_openid="u_dup",
+                group_member_openid="", group_openid="",
+                data=types.SimpleNamespace(resolved=types.SimpleNamespace(
+                    button_data="qb1:session.page:1", button_id="b.0.0")))
+        try:
+            bot = _FakeBot()
+            await pob._on_interaction(bot, ev("dup-1"))
+            await pob._on_interaction(bot, ev("dup-1"))
+            assert calls["fresh"] == 1, calls   # handler 只跑一次
+            assert any(c == 3 for _, c in bot.acks), bot.acks
+        finally:
+            ba._fresh_session_page = old_fresh
+            ac._current_platform.set(prev_platform)
+            if old_audit is not None:
+                os.environ["QQ_OFFICIAL_BUTTONS_AUDIT"] = old_audit
+            else:
+                os.environ.pop("QQ_OFFICIAL_BUTTONS_AUDIT", None)
+            shutil.rmtree(tmp, ignore_errors=True)
+            pob._seen.clear(); pob._rate.clear()
+        print_pass("U8 幂等：重复 interaction_id→code=3、handler 单次；限频 3/10s")
+
+    # ── U9: regular 触发 admin_only → code=5 ─────────────────────
+    async def test_u9_admin_role_gate(self):
+        import agent.button_actions as ba
+        ctx = ba.ButtonContext(user_id="definitely_not_admin_xyz",
+                               group_id="g1", scene="group",
+                               verb="toggle.feature", args=["gacha", "on"])
+        res = await ba.dispatch(ctx)
+        assert res.code == 5, res
+        # scene 不符（c2c 触发 group-only verb）→ code=1
+        ctx2 = ba.ButtonContext(user_id="u", group_id="", scene="c2c",
+                                verb="toggle.feature", args=["gacha", "on"])
+        assert (await ba.dispatch(ctx2)).code == 1
+        # 未知 verb → code=1
+        ctx3 = ba.ButtonContext(user_id="u", group_id="", scene="c2c",
+                                verb="no.such", args=[])
+        assert (await ba.dispatch(ctx3)).code == 1
+        print_pass("U9 scene→role 复核：admin-only 越权 code=5，场景/verb 不符 code=1")
+
+    # ── U10: 群会话列表隐私 ──────────────────────────────────────
+    async def test_u10_group_session_privacy(self):
+        from agent import session_render
+        from lib.button_spec import Btn
+
+        class _StubSessions:
+            def list_sessions(self, user):
+                return [{"name": "私密剧情", "created_at": 0,
+                         "total_messages": 8, "metadata": {}}]
+
+        md, rows = session_render.render_session_page(
+            "u", 1, "group", sessions_mgr=_StubSessions(),
+            perm=MagicMock(), registry=MagicMock())
+        assert "私密剧情" not in md, md
+        assert "私聊" in md
+        # 只有一个「帮助」按钮，不含任何会话名
+        flat = [b for r in rows for b in r]
+        assert all(b.action == "cmd" for b in flat)
+        assert not any("私密剧情" in (b.data or "") for b in flat)
+        print_pass("U10 群会话列表：不泄露会话名，引导私聊（§9.2）")
+
+    # ── 附加：OneBot send_keyboard 文本降级 ──────────────────────
+    async def test_onebot_keyboard_degrades(self):
+        from adapters.onebot import OneBotSender
+        from agent.outbound import OutKeyboard
+        from lib.button_spec import Btn
+        assert OneBotSender(MagicMock()).supports_keyboard is False
+
+        class _RecMatcher:
+            def __init__(self):
+                self.sent = []
+            async def send(self, x):
+                self.sent.append(x)
+        m = _RecMatcher()
+        s = OneBotSender(m)
+        await s.send_keyboard(OutKeyboard(
+            markdown="**结果**", rows=[[Btn(label="再来", data="再抽一次",
+                                            action="cmd")]]))
+        assert len(m.sent) == 1
+        text = m.sent[0]
+        assert "**" not in text          # md 记号被清洗
+        assert "结果" in text and "再抽一次" in text
+        print_pass("OneBot send_keyboard：降级纯文本（清洗 md + 命令清单）")
+
+    # ── 附加：_send_response 一次性消费 _turn_keyboard ───────────
+    async def test_send_response_one_shot_keyboard(self):
+        turn = _import_turn_for_tests()
+        from lib.button_spec import Btn
+
+        class _KbRec:
+            platform = "qq_official"
+            max_messages_per_turn = 10
+            supports_markdown = True
+            supports_keyboard = True
+            def __init__(self):
+                self.kb = []; self.out = []
+            async def send_text(self, x): self.out.append(("text", x))
+            async def send_markdown(self, x): self.out.append(("md", x))
+            async def send_keyboard(self, msg): self.kb.append(msg)
+            async def send_image(self, x): pass
+            async def send_audio(self, x): pass
+            async def send_progress(self, x, *, immediate=False): pass
+
+        rows = [[Btn(label="再抽一次", data="再抽一次", action="cmd")]]
+        s = _KbRec()
+        p_tok = turn._current_platform.set("qq_official")
+        r_tok = turn._current_render_context.set(turn._RENDER_MD_DECLARATION)
+        try:
+            turn._turn_keyboard.set(rows)
+            await turn._send_response("## 抽卡结果", sender=s)
+            assert len(s.kb) == 1, s.kb
+            assert s.kb[0].rows == rows
+            assert turn._turn_keyboard.get() is None, "预约必须被清空（一次性）"
+            # 第二次无预约 → 不再挂键盘
+            s2 = _KbRec()
+            await turn._send_response("## 普通回复", sender=s2)
+            assert s2.kb == [], s2.kb
+        finally:
+            turn._turn_keyboard.set(None)
+            turn._current_platform.reset(p_tok)
+            turn._current_render_context.reset(r_tok)
+        print_pass("_send_response：_turn_keyboard 一次性消费，无预约不挂键盘")
+
+    # ── 附加：#n 别名解析 ────────────────────────────────────────
+    async def test_session_index_alias(self):
+        turn = _import_turn_for_tests()
+
+        class _StubSessions:
+            def list_sessions(self, user):
+                return [{"name": "Alpha"}, {"name": "Beta"}]
+        old_ss, turn._special_sessions = turn._special_sessions, _StubSessions()
+        try:
+            assert turn._resolve_session_index("u", "#1") == ("Alpha", None)
+            assert turn._resolve_session_index("u", "#2") == ("Beta", None)
+            name, err = turn._resolve_session_index("u", "#3")
+            assert name is None and err and "超出范围" in err
+            # 非 #<digits> 原样透传
+            assert turn._resolve_session_index("u", "我的会话") == ("我的会话",
+                                                                  None)
+            assert turn._resolve_session_index("u", "#abc") == ("#abc", None)
+        finally:
+            turn._special_sessions = old_ss
+        print_pass("#n 别名：按 list_sessions 序解析，越界报错，非序号透传")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -9626,6 +10558,7 @@ def main():
         ("Session-Persona Binding", TestSessionPersonaBinding()),
         ("Bond Scene Settlement (P3a)", TestBondScene()),
         ("Bond-Scene Session & Commands (P3a)", TestSceneSession()),
+        ("Scene-Session Archive & Quota Exemption", TestSceneArchive()),
         ("Bond Reunion & Anniversary (P3a)", TestBondReunionAnniversary()),
         ("Active Greeting & Quota (P3b)", TestActiveGreeting()),
         ("Media Generation Runner & Tools (P4)", TestMediaGen()),
@@ -9645,6 +10578,7 @@ def main():
         ("Reference Portrait (/设形象)", TestReferencePortrait()),
         ("Direct Vision (主模型直连识图)", TestDirectVision()),
         ("QQ Official Markdown (msg_type=2)", TestOfficialMarkdown()),
+        ("QQ Official Buttons (keyboard P0+P1)", TestOfficialButtons()),
     ]
 
     passed = 0

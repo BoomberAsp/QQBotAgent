@@ -539,11 +539,29 @@ class CharacterRegistry(PersonalityManager):
     #: resolve_effective_source 的标签（/personality 无参列表用）
     _SOURCE_LABELS = {
         "scene_pin": "剧情钉住",
+        "scene_archive": "剧情归档",
         "session_bind": "会话绑定",
         "user": "个人设置",
         "group": "群默认",
         "global": "全局默认",
     }
+
+    def _active_scene_completed(self, user_id: str) -> bool:
+        """当前活跃会话是否为已封档剧情（metadata.completed==true）。
+
+        自门控：completed 仅在封档特性开启时被写入，故无需在此读回滚开关。
+        provider 缺失/异常/无 completed → False（退回"剧情钉住"）。
+        """
+        if self._session_provider is None:
+            return False
+        try:
+            session = self._session_provider(user_id)
+        except Exception:  # noqa: BLE001
+            return False
+        if session is None:
+            return False
+        meta = getattr(session, "metadata", None) or {}
+        return bool(meta.get("completed"))
 
     def resolve_effective_source(
         self, user_id: str, group_id: str = None
@@ -551,6 +569,8 @@ class CharacterRegistry(PersonalityManager):
         """与 resolve_effective_personality 同链路，返回生效来源的中文标签。"""
         kind, session_key = self._session_persona(user_id)
         if session_key:
+            if kind == "bond_scene" and self._active_scene_completed(user_id):
+                return self._SOURCE_LABELS["scene_archive"]
             return self._SOURCE_LABELS[
                 "scene_pin" if kind == "bond_scene" else "session_bind"
             ]

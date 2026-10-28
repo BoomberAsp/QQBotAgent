@@ -44,9 +44,11 @@ import uuid
 
 import httpx
 
-from agent.agent import Agent
+from agent.agent import Agent, _scene_archive_enabled
 from agent.inbound import InboundMessage
-from agent.outbound import OutAudio, OutImage, OutMarkdown, OutProgress, SendFailed
+from agent.outbound import (
+    OutAudio, OutImage, OutKeyboard, OutMarkdown, OutProgress, SendFailed,
+)
 from agent.continuous_session import ContinuousSessionManager
 from agent.context import (
     _current_sender, _turn_sender, _current_platform,
@@ -57,7 +59,13 @@ from agent.context import (
     _personality_transition, _on_file_created, _current_quota_bytes,
     _pending_task_fold, _current_bond_context, _delegate_depth,
     _current_story_context, _current_story_char_id, _current_render_context,
+    _turn_keyboard,
 )
+from lib.button_spec import Btn, Rows, to_text as _buttons_to_text
+from lib.button_spec import validate as _validate_buttons
+from lib.button_spec import fit_label as _fit_label
+from lib.button_spec import sanitize_markdown_text as _sanitize_md_text
+from agent import session_render as _session_render
 from agent.bond import BondManager
 from agent import bond_content
 from agent.delegation import (
@@ -173,6 +181,13 @@ class _ToolSender:
         s = self._sender or _turn_sender.get() or default_sender
         return bool(getattr(s, "supports_markdown", False))
 
+    @property
+    def supports_keyboard(self) -> bool:
+        # Same delegation as supports_markdown — getattr-tolerant so
+        # pre-keyboard senders report False instead of exploding.
+        s = self._sender or _turn_sender.get() or default_sender
+        return bool(getattr(s, "supports_keyboard", False))
+
     async def send_text(self, text: str) -> None:
         await _safe_send(text, sender=self._sender)
 
@@ -184,6 +199,9 @@ class _ToolSender:
 
     async def send_markdown(self, text: str) -> None:
         await _safe_send(OutMarkdown(text), sender=self._sender)
+
+    async def send_keyboard(self, msg: OutKeyboard) -> None:
+        await _safe_send(msg, sender=self._sender)
 
     async def send_progress(self, text: str, *, immediate: bool = False) -> None:
         await _safe_send(OutProgress(text, immediate=immediate),
@@ -1000,6 +1018,8 @@ def _build_tool_registry() -> ToolRegistry:
         persona_key = _current_personality.get()
         char_id = persona_key
         scene_title = ""
+        active = None
+        md = {}
         try:
             active = _special_sessions.get_active(user_id)
             md = (active.metadata or {}) if active else {}
@@ -1007,6 +1027,12 @@ def _build_tool_registry() -> ToolRegistry:
             char_id = str(md.get("char_id") or persona_key)
         except Exception:
             pass
+        # 第三层防御（§5.4）：schema 过滤（is_scene）已挡住归档会话，这里兜住
+        # 强行调用——无活跃剧情会话、非 bond_scene、或已封档时拒绝收尾。
+        # 开关关闭时退回旧行为（不看 completed）。
+        if (not active or md.get("kind") != SCENE_KIND
+                or (_scene_archive_enabled() and md.get("completed"))):
+            return "[Error] 当前没有进行中的剧情场景，无法收尾。"
         out = await _complete_scene_impl(
             user_id=user_id,
             char_id=char_id,
@@ -1245,6 +1271,23 @@ UPGRADE_HINT_THRESHOLD = 15   # message count at which to start suggesting
 UPGRADE_HINT_INTERVAL = 10    # re-suggest at most every N messages
 _upgrade_hint_last: dict[str, int] = {}  # user_id -> message count at last hint
 
+# ── 剧情会话封档与配额豁免（scene-session-archive-design.md §2.4）──────
+# 单一真源：kind 为 bond_scene / char_creation 的会话不计普通特殊会话配额。
+# 所有配额判断与数字展示必须走 _quota_sessions()/_quota_used()，禁止再直接
+# len(list_sessions())。回滚开关 _scene_archive_enabled() 定义在 agent.py
+#（热读；关闭时配额统计退回全量、is_scene 退回仅看 kind）。
+SCENE_KIND = "bond_scene"
+CREATION_KIND = "char_creation"
+NON_QUOTA_KINDS = frozenset({SCENE_KIND, CREATION_KIND})
+
+
+def _max_scene_archives() -> int:
+    """剧情会话总量上限（D5；计数含进行中与已完结；热读可调）。"""
+    try:
+        return max(1, int(os.environ.get("MAX_SCENE_ARCHIVES", "20")))
+    except (TypeError, ValueError):
+        return 20
+
 
 # ── P5 (§8.3): 用户上传图/语音的后台文本化（对称通路）────────────────
 # split 人格下附件落盘后起后台任务：多模态 LLM 一句话描述/转录 → 写
@@ -1461,6 +1504,115 @@ def _quota_warning(user_id: str) -> str:
     return ""
 
 
+# ── 剧情封档：配额豁免辅助函数（scene-session-archive-design.md §2.4/§6）──
+# 单一真源。回滚开关关闭时 _quota_sessions 退回全量统计（§7）。
+
+def _quota_sessions(user_id: str) -> list:
+    """计入特殊会话配额的会话（普通特殊会话）。
+
+    开关关闭时退回全量（把剧情/创作会话也算进去），实现 §7 的回滚语义。
+    """
+    sessions = _special_sessions.list_sessions(user_id)
+    if not _scene_archive_enabled():
+        return sessions
+    return [
+        s for s in sessions
+        if (s.get("metadata") or {}).get("kind") not in NON_QUOTA_KINDS
+    ]
+
+
+def _quota_used(user_id: str) -> int:
+    """已用的普通特殊会话配额数（展示与判断统一走这里）。"""
+    return len(_quota_sessions(user_id))
+
+
+def _scene_archives(user_id: str) -> list:
+    """全部剧情会话（含进行中与已完结）——D5 上限口径。"""
+    return [
+        s for s in _special_sessions.list_sessions(user_id)
+        if (s.get("metadata") or {}).get("kind") == SCENE_KIND
+    ]
+
+
+def _scene_completed(entry: dict) -> bool:
+    """剧情会话是否已封档（completed==true）。开关关闭时恒为 False（退回旧行为）。"""
+    if not _scene_archive_enabled():
+        return False
+    return bool((entry.get("metadata") or {}).get("completed"))
+
+
+def _backfill_completed(user_id: str, entry) -> None:
+    """懒回填热点（D7）：存量 bond_scene 缺 completed 字段时按 has_done_scene 判定回写。
+
+    仅两个热点调用：run_agent_turn 评估 is_scene 时、_find_scene_session 命中时。
+    禁止在 list_sessions() 读路径回填（写放大 + mtime 抖动）。无法判定（羁绊状态
+    缺失）时保持未完成，避免误封档。completed_at 用回填时间（非真实完成时间）。
+
+    entry 可为 index dict（list_sessions 的元素）或 SpecialSession 对象（get_active）。
+    两者都用同一 metadata dict 引用，故 md.update 后调用方立即可见新值。
+    """
+    if isinstance(entry, dict):
+        md = entry.get("metadata")
+        name = entry.get("name")
+    else:
+        md = getattr(entry, "metadata", None)
+        name = getattr(entry, "name", None)
+    if not isinstance(md, dict) or md.get("kind") != SCENE_KIND:
+        return
+    if "completed" in md:
+        return  # 已有字段（True/False 均视为已定），不回填
+    char_id = str(md.get("char_id") or "")
+    title = str(md.get("scene_title") or "")
+    if not char_id or not title or not name:
+        return
+    try:
+        if _bond_manager.has_done_scene(user_id, char_id, title):
+            updates = {"completed": True, "completed_at": time.time()}
+            _special_sessions.update_metadata(user_id, name, updates)
+            md.update(updates)  # 同步内存 entry，本轮调用方立即可见
+            from nonebot import logger
+            logger.info(
+                f"[scene-archive] backfill completed user={user_id} "
+                f"char={char_id} title={title}")
+    except Exception as e:
+        log_exception("scene completed backfill failed", e)
+
+
+def _find_scene_session(user_id: str, char_id: str, title: str):
+    """按去重键 (char_id, scene_title) 查已有剧情会话（懒回填热点之二）。
+
+    存量重复项取最新创建的那个；其余保留给用户手动 /删除会话。
+    """
+    matches = []
+    for s in _scene_archives(user_id):
+        md = s.get("metadata") or {}
+        if (str(md.get("char_id") or "") == str(char_id)
+                and str(md.get("scene_title") or "") == str(title)):
+            _backfill_completed(user_id, s)  # 命中即回填（写回 index）
+            matches.append(s)
+    return max(matches, key=lambda s: s.get("created_at") or 0, default=None)
+
+
+def _delete_quota_tail(user_id: str, deleted_kind: str) -> str:
+    """删除会话后的配额提示尾行（scene-session-archive-design.md §4.2/B6）。
+
+    deleted_kind 是被删会话的 metadata.kind（删除前捕获）。删普通会话 → 显示
+    n/max；删剧情/创作会话 → 强调普通配额不变（它们本就不计配额）。开关关闭时
+    退回统一口径（_quota_used 已退回全量）。
+    """
+    role = _perm_manager.get_role(user_id)
+    max_sess = _perm_manager.get_max_special_sessions(role)
+    used = _quota_used(user_id)
+    if not _scene_archive_enabled():
+        return f"\n当前特殊会话: {used}/{max_sess}"
+    if deleted_kind == SCENE_KIND:
+        k = len(_scene_archives(user_id))
+        return f"\n普通会话配额不变（当前 {used}/{max_sess}），剧情归档剩 {k} 个。"
+    if deleted_kind == CREATION_KIND:
+        return f"\n普通会话配额不变（当前 {used}/{max_sess}）。"
+    return f"\n当前普通会话: {used}/{max_sess}"
+
+
 # ── Quota Cleanup Protocol (Feature 2) ───────────────────────────
 # Elastic-quota cleanup: when a user exceeds their workspace quota, the next
 # message triggers a cleanup protocol. The agent lists the earliest-mtime
@@ -1602,18 +1754,45 @@ def _get_user_info() -> str:
 
     lines = [f"用户信息快照", f"", f"用户 ID: {user_id}", f"权限级别: {role_label} ({role.value})"]
 
-    # ── 特殊会话 ──
+    # ── 特殊会话（scene-session-archive-design.md §4.2：普通/归档分开计数）──
     sessions = _special_sessions.list_sessions(user_id)
     active = _special_sessions.get_active(user_id)
     max_sessions = _perm_manager.get_max_special_sessions(role)
     lines.append(f"")
-    lines.append(f"特殊会话 ({len(sessions)}/{max_sessions}):")
-    if sessions:
-        for s in sessions:
-            marker = " ★ 当前" if active and s["name"] == active.name else ""
-            lines.append(f"  · {s['name']}{marker} — {s['total_messages']} 条消息")
+    if not _scene_archive_enabled():
+        # 回滚态：统一视图（与改造前一致；此时 _quota_sessions 退回全量）
+        lines.append(f"特殊会话 ({len(sessions)}/{max_sessions}):")
+        if sessions:
+            for s in sessions:
+                marker = " ★ 当前" if active and s["name"] == active.name else ""
+                lines.append(f"  · {s['name']}{marker} — {s['total_messages']} 条消息")
+        else:
+            lines.append(f"  (无特殊会话)")
     else:
-        lines.append(f"  (无特殊会话)")
+        quota_sessions = _quota_sessions(user_id)
+        scene_sessions = _scene_archives(user_id)
+        creation_sessions = [
+            s for s in sessions
+            if (s.get("metadata") or {}).get("kind") == CREATION_KIND
+        ]
+        lines.append(f"普通会话 ({len(quota_sessions)}/{max_sessions}):")
+        if quota_sessions:
+            for s in quota_sessions:
+                marker = " ★ 当前" if active and s["name"] == active.name else ""
+                lines.append(f"  · {s['name']}{marker} — {s['total_messages']} 条消息")
+        else:
+            lines.append(f"  (无普通特殊会话)")
+        if scene_sessions:
+            lines.append(f"剧情归档 {len(scene_sessions)}（不计配额）:")
+            for s in scene_sessions:
+                marker = " ★ 当前" if active and s["name"] == active.name else ""
+                done = "已完结" if _scene_completed(s) else "进行中"
+                lines.append(
+                    f"  · {s['name']}{marker} — {done} · {s['total_messages']} 条消息")
+        for s in creation_sessions:
+            marker = " ★ 当前" if active and s["name"] == active.name else ""
+            lines.append(
+                f"角色创作{marker}（进行中 · 不计配额）— {s['total_messages']} 条消息")
 
     # ── 工作区 ──
     ws_path = _workspace_manager.get_workspace(user_id)
@@ -2112,6 +2291,9 @@ async def run_agent_turn(view: InboundMessage):
     # Platform identity (stage 4, §7.7): PermissionManager.get_role() picks
     # the openid tables for qq_official, the QQ-number tables for onebot.
     _current_platform.set(view.platform)
+    # Defensive per-turn reset: a keyboard reservation is strictly
+    # turn-scoped (tools set it, _send_response consumes it once).
+    _turn_keyboard.set(None)
     user_id = view.user_id
     # ── Per-user concurrency guard ──
     if user_id in _user_busy:
@@ -2154,9 +2336,11 @@ async def handle_agent_turn(view: InboundMessage):
                     # (>K turns) submits its un-extracted profile tail; a
                     # transient one (≤K turns) drops it.
                     _del_turns = 0
+                    _del_kind = ""
                     for _s in _special_sessions.list_sessions(user_id):
                         if _s.get("name") == pending_delete[0]:
                             _del_turns = _s.get("total_messages", 0) // 2
+                            _del_kind = str((_s.get("metadata") or {}).get("kind") or "")
                             break
                     result = _special_sessions.delete(user_id, pending_delete[0])
                     _pending_delete_confirm.pop(user_id, None)
@@ -2164,14 +2348,11 @@ async def handle_agent_turn(view: InboundMessage):
                         _profile_manager.flush_on_session_end(user_id, _del_turns)
                     except Exception:
                         pass  # profile flush must never break session deletion
-                    role = _perm_manager.get_role(user_id)
-                    max_sess = _perm_manager.get_max_special_sessions(role)
-                    sessions = _special_sessions.list_sessions(user_id)
                     summary = _format_delete_summary(result)
                     msg = f"已删除特殊会话「{pending_delete[0]}」。"
                     if summary:
                         msg += "\n" + summary
-                    msg += f"\n当前特殊会话: {len(sessions)}/{max_sess}"
+                    msg += _delete_quota_tail(user_id, _del_kind)
                     await _safe_send(msg)
                 except ValueError as e:
                     await _safe_send(str(e))
@@ -2247,6 +2428,10 @@ async def handle_agent_turn(view: InboundMessage):
             return
         # /toggle command (group only, superuser only)
         cmd_handled = await _handle_toggle_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        # /按钮探测 command (qq_official c2c admin-only keyboard probe)
+        cmd_handled = await _handle_button_probe_command(text_content, user_id, view)
         if cmd_handled:
             return
         # /兑换码 / /redeem-code command (direct, no agent)
@@ -2481,15 +2666,23 @@ async def handle_agent_turn(view: InboundMessage):
             (active_special.metadata or {}).get("kind") == "char_creation"
         )
         # Bond story-scene session (Bond-System-Design.md §4.4 形态3, P3).
+        # 已封档（completed=true）的剧情按普通特殊会话运行（D3/§5.4）：is_scene=false，
+        # 不注入场景指令、不下发 complete_scene、走正常路由。开关关闭时退回仅看 kind。
+        _md_active = (active_special.metadata or {}) if active_special else {}
+        if (_scene_archive_enabled() and active_special
+                and _md_active.get("kind") == SCENE_KIND):
+            _backfill_completed(user_id, active_special)  # 懒回填热点之一（D7）
+            _md_active = (active_special.metadata or {})  # 回填后重取
         is_scene = bool(active_special) and (
-            (active_special.metadata or {}).get("kind") == "bond_scene"
+            _md_active.get("kind") == SCENE_KIND
+            and not (_scene_archive_enabled() and _md_active.get("completed"))
         )
         if is_scene:
             # 场景钉住已由 CharacterRegistry 会话层统一处理（scene 创建时写
             # metadata.persona_key=char_id，resolve 单点解析，2418 行的
             # persona_key 已含钉住结果）。这里只做一致性断言：char_id 与解析
             # 结果不一致（如 UGC 角色被删后懒校验穿透）时记日志便于排查。
-            _scene_char = str((active_special.metadata or {}).get("char_id") or "")
+            _scene_char = str(_md_active.get("char_id") or "")
             if _scene_char and _scene_char != persona_key:
                 from loguru import logger as _logger
                 _logger.warning(
@@ -2693,12 +2886,18 @@ async def handle_agent_turn(view: InboundMessage):
         # Send response (split long messages)
         await _send_response(response)
 
-        # ── Creation session auto-close: once create_character succeeded this
-        # turn (the tool closure flags it), leave the interview session so the
-        # next /人格切换 works cleanly. ──
+        # ── Creation session auto-close (scene-session-archive-design.md §5.2/D6):
+        # create_character 本轮成功 → 访谈会话无保留价值（设定已完整落入角色卡），
+        # 直接 delete（而非 end_active），列表立即清爽、配额不变（创作本就豁免）。
+        # delete() 顺带清 active 指针，回到临时会话。创作会话不设 _pending_naming，
+        # 且 auto_name 对删除后 get_active→None 安全，故无命名竞态（清单 #8 注记）。
         if is_creation and _pending_char_creation_done.pop(user_id, False):
             try:
-                _special_sessions.end_active(user_id)
+                _ca = _special_sessions.get_active(user_id)
+                if _ca and (_ca.metadata or {}).get("kind") == CREATION_KIND:
+                    _special_sessions.delete(user_id, _ca.name)
+                else:
+                    _special_sessions.end_active(user_id)
             except Exception:
                 pass
 
@@ -2738,6 +2937,7 @@ async def handle_agent_turn(view: InboundMessage):
 async def run_continuous_turn(view: InboundMessage):
     """Run one continuous-mode turn (active-window check + busy guard)."""
     _current_platform.set(view.platform)
+    _turn_keyboard.set(None)  # defensive per-turn reset (see run_agent_turn)
     user_id = view.user_id
     group_id = view.group_id
     # Check if user is in continuous mode
@@ -2795,9 +2995,11 @@ async def handle_continuous_turn(view: InboundMessage):
                     # (>K turns) submits its un-extracted profile tail; a
                     # transient one (≤K turns) drops it.
                     _del_turns = 0
+                    _del_kind = ""
                     for _s in _special_sessions.list_sessions(user_id):
                         if _s.get("name") == pending_delete[0]:
                             _del_turns = _s.get("total_messages", 0) // 2
+                            _del_kind = str((_s.get("metadata") or {}).get("kind") or "")
                             break
                     result = _special_sessions.delete(user_id, pending_delete[0])
                     _pending_delete_confirm.pop(user_id, None)
@@ -2805,14 +3007,11 @@ async def handle_continuous_turn(view: InboundMessage):
                         _profile_manager.flush_on_session_end(user_id, _del_turns)
                     except Exception:
                         pass  # profile flush must never break session deletion
-                    role = _perm_manager.get_role(user_id)
-                    max_sess = _perm_manager.get_max_special_sessions(role)
-                    sessions = _special_sessions.list_sessions(user_id)
                     summary = _format_delete_summary(result)
                     msg = f"已删除特殊会话「{pending_delete[0]}」。"
                     if summary:
                         msg += "\n" + summary
-                    msg += f"\n当前特殊会话: {len(sessions)}/{max_sess}"
+                    msg += _delete_quota_tail(user_id, _del_kind)
                     await _safe_send(msg, sender=continuous_sender)
                 except ValueError as e:
                     await _safe_send(str(e), sender=continuous_sender)
@@ -3061,6 +3260,18 @@ async def _safe_send(message, max_retries: int = 2, sender=None):
                 await s.send_image(message)
             elif isinstance(message, OutAudio):
                 await s.send_audio(message)
+            elif isinstance(message, OutKeyboard):
+                # getattr-probe: pre-keyboard Sender stubs (old test
+                # doubles, third-party slots) lack send_keyboard — they
+                # degrade to text body + command list instead of raising.
+                send_kb = getattr(s, "send_keyboard", None)
+                if send_kb is not None:
+                    await send_kb(message)
+                else:
+                    extra = _buttons_to_text(message.rows)
+                    await s.send_text(
+                        f"{message.markdown}\n\n{extra}" if extra
+                        else message.markdown)
             elif isinstance(message, OutMarkdown):
                 await s.send_markdown(message.text)
             elif isinstance(message, OutProgress):
@@ -3119,6 +3330,69 @@ def _channel_supports_markdown(sender=None) -> bool:
     their msg_type=2 form; OneBot is always False (buttons-design §6.10.7)."""
     s = sender or _turn_sender.get() or default_sender
     return bool(getattr(s, "supports_markdown", False))
+
+
+def _channel_supports_keyboard(sender=None) -> bool:
+    """True when the current turn's channel can attach inline buttons
+    RIGHT NOW (QQ official, permission granted, env≠off, breakers closed,
+    user passes the graylist). Commands gate every button render on this;
+    OneBot and pre-keyboard senders are always False (buttons-design §6.2)."""
+    s = sender or _turn_sender.get() or default_sender
+    return bool(getattr(s, "supports_keyboard", False))
+
+
+async def _safe_send_kb(markdown: str, rows: Rows, *, sender=None,
+                        label: str = "") -> None:
+    """Send a markdown body + buttons, degrading instead of failing.
+
+    The one entry point command handlers use for keyboard messages:
+      - channel can't do buttons → markdown-only (body never lost);
+      - layout invalid per button_spec.validate → WARNING + markdown-only;
+      - otherwise OutKeyboard → the platform sender (which owns the
+        wire-side rejection ladder: kb → md-only → text + command list).
+    """
+    if not _channel_supports_keyboard(sender):
+        await _safe_send(OutMarkdown(markdown), sender=sender)
+        return
+    problems = _validate_buttons(rows or [])
+    if problems:
+        from nonebot import logger
+        logger.warning(
+            f"[turn] keyboard dropped (label={label!r}): {problems[:2]}")
+        await _safe_send(OutMarkdown(markdown), sender=sender)
+        return
+    await _safe_send(OutKeyboard(markdown=markdown, rows=rows, label=label),
+                     sender=sender)
+
+
+async def _send_receipt_kb(text: str, rows: Rows, *, sender=None,
+                           label: str = "") -> None:
+    """Send a plain-text command receipt, riding nav buttons when possible.
+
+    The receipt text is bot-authored plain text (not LLM markdown), so it
+    goes through sanitize_markdown_text before riding a msg_type=2
+    keyboard message — leading #/>/-/* would otherwise render as md
+    syntax. Channels without keyboard support get the text verbatim
+    (byte-identical to the pre-button behavior).
+    """
+    if rows and _channel_supports_keyboard(sender):
+        await _safe_send_kb(_sanitize_md_text(text), rows,
+                            sender=sender, label=label)
+    else:
+        await _safe_send(text, sender=sender)
+
+
+# Shared navigation rows for session-command receipts (buttons P0).
+_NAV_SESSIONS: Rows = [[
+    Btn(label="新建会话", data="/新会话", action="cmd"),
+    Btn(label="会话列表", data="/会话列表", action="cmd"),
+    Btn(label="帮助", data="/帮助", action="cmd"),
+]]
+_NAV_SESSION_ACTIVE: Rows = [[
+    Btn(label="会话列表", data="/会话列表", action="cmd"),
+    Btn(label="结束会话", data="/结束会话", action="cmd"),
+    Btn(label="帮助", data="/帮助", action="cmd"),
+]]
 
 
 def _code_line_md(entry: dict, expiry_disp: str = "", expired: bool = False) -> str:
@@ -3224,7 +3498,16 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
 
         # 官方渠道 markdown 单条（§6.10.8）；OneBot 保持纯文本分块
         if _channel_supports_markdown():
-            await _safe_send(OutMarkdown(_redeem_long_md(lt_codes, stale_note)))
+            _lt_md = _redeem_long_md(lt_codes, stale_note)
+            # 键盘版（buttons P0）：刷新 / 限时码 / 官网活动页
+            if _channel_supports_keyboard():
+                await _safe_send_kb(_lt_md, [[
+                    Btn(label="刷新", data="/长期兑换码", action="cmd"),
+                    Btn(label="限时码", data="/兑换码", action="cmd"),
+                    Btn(label="活动页", data=_PUBLIC_SITE_URL, action="url"),
+                ]], label="redeem-long")
+                return True
+            await _safe_send(OutMarkdown(_lt_md))
             return True
 
         lines = [f"长期有效兑换码（无过期时间，共 {len(lt_codes)} 条）:", ""]
@@ -3275,9 +3558,18 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
     # 官方渠道：全部码合并为一条 markdown（现状 N+2 条纯文本必爆 4/5 条
     # 被动回复配额），并跳过逐条单发（§6.10.8 规则 4：逐条保留给 OneBot）
     if _channel_supports_markdown():
-        await _safe_send(OutMarkdown(_redeem_time_md(
+        _rt_md = _redeem_time_md(
             shown_active, recent_expired, hidden, stale_note,
-            format_expiry_display)))
+            format_expiry_display)
+        # 键盘版（buttons P0）：刷新 / 长期码 / 官网活动页（§6.6 M7）
+        if _channel_supports_keyboard():
+            await _safe_send_kb(_rt_md, [[
+                Btn(label="刷新", data="/兑换码", action="cmd"),
+                Btn(label="长期码", data="/长期兑换码", action="cmd"),
+                Btn(label="活动页", data=_PUBLIC_SITE_URL, action="url"),
+            ]], label="redeem-time")
+            return True
+        await _safe_send(OutMarkdown(_rt_md))
         return True
 
     lines = [f"当前有效限时兑换码（{len(active)} 条）:", ""]
@@ -3504,6 +3796,32 @@ async def _handle_personality_command(text: str, user_id: str, view: InboundMess
         if _active_for_hint is not None:
             lines.append("当前在特殊会话中：切换仅作用于本会话；加 --全局 修改默认人格。")
         lines.append("用 /创建角色 访谈式创建你自己的角色。")
+        # 键盘版（buttons P0）：每人格一个 [切换] 指令按钮（点击=替用户
+        # 打字 /人格切换 <显示名>，天然复用本命令的切换分支）。行数预算：
+        # 4 行人格（每行 3）+ 1 行导航 = 5 行上限，故容量 12；超过退回
+        # 纯文本列表，内容不丢。
+        if _channel_supports_keyboard() and len(personalities) <= 12:
+            _p_rows: Rows = []
+            _p_row: list = []
+            for p in personalities:
+                is_cur = p["key"] == current_key
+                _p_row.append(Btn(
+                    label=_fit_label(p["display_name"]),
+                    data=f"/人格切换 {p['display_name']}", action="cmd",
+                    style=0 if is_cur else 1,
+                    visited="当前" if is_cur else ""))
+                if len(_p_row) == 3:
+                    _p_rows.append(_p_row)
+                    _p_row = []
+            if _p_row:
+                _p_rows.append(_p_row)
+            _p_rows.append([
+                Btn(label="创建角色", data="/创建角色", action="cmd"),
+                Btn(label="帮助", data="/帮助", action="cmd"),
+            ])
+            await _safe_send_kb("\n".join(lines), _p_rows,
+                                label="personality-list")
+            return True
         await _safe_send("\n".join(lines))
         return True
 
@@ -3562,22 +3880,31 @@ async def _handle_personality_command(text: str, user_id: str, view: InboundMess
             f"历史回复风格不代表当前人格。"
         )
         _save_personality_markers()
+        # 键盘版追问（buttons P0）：[保留历史]/[清空上下文] 指令按钮，
+        # 点击即替用户发出「保留」/「清空」——正好命中下方 pending
+        # personality-switch 的关键字分支，无需任何新协议。
+        _switch_rows: Rows = [[
+            Btn(label="保留历史", data="保留", action="cmd",
+                style=1, reply=True),
+            Btn(label="清空上下文", data="清空", action="cmd",
+                style=0, reply=True),
+        ]]
         if session_scoped:
-            await _safe_send(
+            await _send_receipt_kb(
                 f"已将本会话切换至「{new_display}」人格"
                 f"（仅当前会话，你的默认人格不变；"
                 f"用 /人格切换 <名称> --全局 可修改默认人格）。\n"
                 f"是否保留历史对话记录？\n"
                 f"回复「保留」保留历史并注入切换提示词；\n"
-                f"回复「清空」清除当前上下文。"
-            )
+                f"回复「清空」清除当前上下文。",
+                _switch_rows, label="personality-switch-ask")
         else:
-            await _safe_send(
+            await _send_receipt_kb(
                 f"已切换至「{new_display}」人格。\n"
                 f"是否保留历史对话记录？\n"
                 f"回复「保留」保留历史并注入切换提示词；\n"
-                f"回复「清空」清除当前上下文。"
-            )
+                f"回复「清空」清除当前上下文。",
+                _switch_rows, label="personality-switch-ask")
     except ValueError as e:
         await _safe_send(str(e))
     except Exception as e:
@@ -3688,8 +4015,12 @@ async def _settle_bond_turn(user_id: str, persona_key: str, sender=None,
 
 
 async def _emit_level_ups(user_id, persona_key, level_ups, sender=None,
-                          is_group: bool = False):
-    """升级庆祝 + 分段解锁（P3 修正）：档案 tier 发解锁提示，场景 tier 发私聊邀请。"""
+                          is_group: bool = False, archive_note: str = ""):
+    """升级庆祝 + 分段解锁（P3 修正）：档案 tier 发解锁提示，场景 tier 发私聊邀请。
+
+    archive_note：剧情完成当轮的封档一行，拼在**首个**升级通知尾部（§5.2 硬性规则）；
+    多级连升时也只并一次，避免重复占用被动回复配额。
+    """
     level_ups = level_ups or []
     if not level_ups:
         return
@@ -3698,13 +4029,16 @@ async def _emit_level_ups(user_id, persona_key, level_ups, sender=None,
         card = get_character_registry().load(persona_key) or ""
     except Exception:
         card = ""
-    for up in level_ups:
+    for i, up in enumerate(level_ups):
         lv = up.get("level")
         _bond_manager.append_event(
             user_id, persona_key,
             f"羁绊提升到了 Lv{lv}（{up.get('title', '')}）",
         )
-        await _send_level_up_notice(user_id, persona_key, up, sender=sender)
+        await _send_level_up_notice(
+            user_id, persona_key, up, sender=sender,
+            archive_note=archive_note if i == 0 else "",
+        )
         # 非场景 tier（档案/语气解禁等）：方舟式解锁提示
         for tier in bond_content.tiers_unlocking_at(card, int(lv)):
             if bond_content.is_scene_tier(tier):
@@ -3740,19 +4074,64 @@ async def _invite_scene(user_id, persona_key, scene, is_group=False, sender=None
 
 
 async def _finish_bond_scene(user_id: str, result: dict, sender=None):
-    """场景完成 post-run 收尾（P3）：升级通知 + 纪念卡片 + 关闭会话。
+    """场景完成 post-run 收尾 + 封档（P3 / scene-session-archive-design.md §5.2）。
 
-    结算（+scene_exp/mark/事件日志）已在 social_tools.complete_scene 完成；
-    这里只做呈现。失败静默（增益功能不阻断）。
+    顺序：会话名快照 → 写 completed/completed_at → end_active → 解析临时人格 →
+    升级通知（有升级则并入封档行）→ 纪念卡 → 事件蒸馏 → 封档提示（仅无升级时独立发）。
+
+    结算（+scene_exp/mark/事件日志）已在 social_tools.complete_scene 完成；这里只做
+    呈现与封档。正文已在 agent.run 期间写入剧情会话，故 end_active 提前是安全的，
+    且能让随后的 resolve 落到临时会话人格（供封档提示展示）。失败静默（增益不阻断）。
     """
     try:
         char_id = str(result.get("char_id") or "")
         scene_title = str(result.get("scene_title") or "")
         pm = get_character_registry()
-        await _emit_level_ups(
-            user_id, char_id, result.get("level_ups") or [],
-            sender=sender, is_group=False,
+        level_ups = result.get("level_ups") or []
+
+        # 会话名（/切换会话 回看入口）——须在 end_active 之前取
+        active = _special_sessions.get_active(user_id)
+        session_name = active.name if active else f"剧情·{scene_title}"
+
+        # 封档：先写 completed/completed_at 再 end_active（§5.2 顺序约束）。
+        # 写失败不阻断 end_active（各自 try）。开关关闭时跳过（回滚语义）。
+        if _scene_archive_enabled() and active:
+            try:
+                _special_sessions.update_metadata(user_id, active.name, {
+                    "completed": True,
+                    "completed_at": time.time(),
+                })
+                from nonebot import logger
+                logger.info(
+                    f"[scene-archive] completed user={user_id} "
+                    f"char={char_id} title={scene_title}")
+            except Exception:
+                pass
+
+        # 回临时会话（正文已持久化；提前退出让随后 resolve 落到临时人格）
+        try:
+            _special_sessions.end_active(user_id)
+        except Exception:
+            pass
+
+        # 临时会话模式下的人格（供封档提示展示）
+        try:
+            display = pm.get_display_name(
+                pm.resolve_effective_personality(user_id, None))
+        except Exception:
+            display = ""
+
+        # 封档一行（B1b）：有升级时并入升级文案尾部，省 1 条被动回复（§5.2 硬性规则）
+        archive_note = (
+            f"剧情《{scene_title}》已封档，不占配额，"
+            f"随时 /切换会话 {session_name} 回看。"
         )
+        await _emit_level_ups(
+            user_id, char_id, level_ups,
+            sender=sender, is_group=False,
+            archive_note=archive_note if level_ups else "",
+        )
+
         level = int(result.get("level") or 1)
         entry = {
             "char_name": pm.get_display_name(char_id) or pm.get_short_name(char_id),
@@ -3777,10 +4156,15 @@ async def _finish_bond_scene(user_id: str, result: dict, sender=None):
             title=f"与用户一起完成了剧情「{scene_title}」",
             highlights=hl,
         )
-        try:
-            _special_sessions.end_active(user_id)
-        except Exception:
-            pass
+        # 封档提示：无升级时独立发送（有升级已并入升级通知，不再单发）
+        if not level_ups:
+            tail = f"\n已回到临时会话模式，当前人格：{display}。" if display else ""
+            await _safe_send(
+                f"剧情《{scene_title}》已完结，已为你封档保存。\n"
+                f"它不再占用特殊会话配额，想回看随时发 /切换会话 {session_name}。"
+                f"{tail}",
+                sender=sender,
+            )
     except Exception as e:
         log_exception("bond scene finish failed", e)
 
@@ -3838,7 +4222,14 @@ def _scene_opening_line(char_id: str, title: str, scene: dict) -> str:
 
 
 async def _start_bond_scene(user_id: str, char_id: str, scene: dict) -> None:
-    """启动羁绊剧情特殊会话（仅私聊；等级/已完成/会话槽守卫齐全）。"""
+    """启动/恢复羁绊剧情特殊会话（仅私聊）。
+
+    剧情会话**不计**普通特殊会话配额（scene-session-archive-design.md §4.1）；
+    同剧情去重恢复（D4）、总量上限 MAX_SCENE_ARCHIVES（D5）。
+    守卫顺序：身份类（等级/已完成）→ 去重恢复 → 活跃会话 → 角色存在性 →
+    总量上限 → 创建。去重先于活跃守卫，且先于存在性校验（允许恢复已删角色的
+    未完成剧情，会话层懒穿透）。
+    """
     title = str(scene.get("title") or "")
     try:
         lv = int(scene.get("level") or 1)
@@ -3846,6 +4237,7 @@ async def _start_bond_scene(user_id: str, char_id: str, scene: dict) -> None:
         lv = 1
     state = _bond_manager.get_state(user_id, char_id, create=False)
     level = int((state or {}).get("level", 1))
+    # 1) 身份类守卫
     if level < lv:
         await _safe_send(
             f"「{title}」需要羁绊 Lv{lv} 才能体验（当前 Lv{level}），再相处一阵子吧～"
@@ -3856,32 +4248,65 @@ async def _start_bond_scene(user_id: str, char_id: str, scene: dict) -> None:
             f"「{title}」你们已经经历过了，回忆已珍藏在纪念卡里～ 试试别的剧情吧。"
         )
         return
+    # 2) 同剧情去重恢复（D4）——必须先于活跃会话守卫，否则"已在剧情中再发
+    #    /剧情 同标题"会得到莫名其妙的"先 /结束会话"拒绝。命中即懒回填 completed。
+    existing = _find_scene_session(user_id, char_id, title)
+    if existing:
+        if _scene_completed(existing):
+            await _safe_send(
+                f"「{title}」这段剧情已完结封档，可用 /切换会话 {existing['name']} 回看～"
+            )
+            return
+        active0 = _special_sessions.get_active(user_id)
+        if active0 and active0.name == existing["name"]:
+            await _safe_send(
+                f"你正在这段剧情《{title}》中，继续吧～（/结束会话 可暂时退出）"
+            )
+            return
+        try:
+            _special_sessions.switch_to(user_id, existing["name"])
+        except Exception as e:
+            code = log_exception("bond scene resume switch failed", e)
+            await _safe_send(f"恢复剧情失败（诊断编号 {code}），请稍后重试。")
+            return
+        from nonebot import logger
+        logger.info(f"[scene-archive] resume name={existing['name']} user={user_id}")
+        await _safe_send(
+            f"继续上次未完成的剧情《{title}》——\n"
+            f"（发送 /结束会话 可暂时退出；该会话不占配额）"
+        )
+        return
+    # 3) 活跃会话守卫（走到这里 existing 必为其他会话或无）
     active = _special_sessions.get_active(user_id)
     if active:
         await _safe_send(
             "你现在还有一个进行中的特殊会话，先 /结束会话 再开始剧情吧～"
         )
         return
-    role = _perm_manager.get_role(user_id)
-    max_sessions = _perm_manager.get_max_special_sessions(role)
-    sessions = _special_sessions.list_sessions(user_id)
-    if len(sessions) >= max_sessions:
-        await _safe_send(
-            f"开始剧情需要占用一个特殊会话槽，但你已达到上限"
-            f"（{len(sessions)}/{max_sessions}）。请先 /删除会话 清理一个。"
-        )
-        return
-    # 钉住人格合法性前置校验：会话层对失效 char_id 是懒穿透的，
-    # 启动时就拦住，避免建出一个「钉不住」的剧情会话。
+    # 4) 钉住人格合法性校验（仅创建路径需要；恢复不受此限）。会话层对失效
+    #    char_id 懒穿透，启动时拦住，避免建出一个「钉不住」的剧情会话。
     _pm_scene = get_character_registry()
     if not _pm_scene._exists(char_id, user_id=user_id):
         await _safe_send("该剧情对应的角色已不存在，无法开始。")
         return
+    # 5) 总量上限（D5；计数含进行中与已完结的剧情会话）。开关关闭时不设限（回滚）。
+    if _scene_archive_enabled():
+        n_scene = len(_scene_archives(user_id))
+        cap = _max_scene_archives()
+        if n_scene >= cap:
+            from nonebot import logger
+            logger.info(f"[scene-archive] cap-hit user={user_id} n={n_scene}")
+            await _safe_send(
+                f"剧情会话已达上限（{n_scene}，含进行中与已完结）。"
+                f"请用 /删除会话 清理不再回看的剧情，再开始新剧情。"
+            )
+            return
+    # 6) 创建 + 切换 + 开场（与原实现一致；剧情不计普通配额，无槽位检查）
     try:
         session = _special_sessions.create(
             user_id, f"剧情·{title}",
             metadata={
-                "kind": "bond_scene", "char_id": char_id,
+                "kind": SCENE_KIND, "char_id": char_id,
                 # 会话人格绑定统一入口：scene 的钉住人格 = char_id，
                 # CharacterRegistry._session_persona 优先按 kind 读 char_id，
                 # 这里冗余写入便于 /会话列表 等展示逻辑统一读 persona_key。
@@ -3926,16 +4351,33 @@ async def _handle_scene_command(text: str, user_id: str, view) -> bool:
     level = int((state or {}).get("level", 1))
     if not args:
         lines = [f"与 {pm.get_display_name(persona_key)} 的剧情场景："]
+        unlocked: list = []
         for s in scenes:
             lv = int(s["level"])
             title = str(s["title"])
             if lv <= level:
-                mark = ("（已完成）" if _bond_manager.has_done_scene(
-                    user_id, persona_key, title) else "（可体验）")
+                done = _bond_manager.has_done_scene(
+                    user_id, persona_key, title)
+                mark = "（已完成）" if done else "（可体验）"
                 lines.append(f"  · Lv{lv} 《{title}》{mark}")
+                if not done:
+                    unlocked.append(title)
             else:
                 lines.append(f"  · Lv{lv} 《{title}》（羁绊 Lv{lv} 解锁）")
         lines.append("\n私聊发 /剧情 <标题> 开始一段剧情。")
+        # 键盘版（buttons P0，仅私聊——群里 /剧情 <标题> 本就会被拒绝）：
+        # 可体验场景各给一个 [进入] 指令按钮；行预算 4 场景 + 1 导航行。
+        if not view.is_group and _channel_supports_keyboard():
+            _s_rows: Rows = [
+                [Btn(label=_fit_label(t), data=f"/剧情 {t}", action="cmd")]
+                for t in unlocked[:4]
+            ]
+            _s_rows.append([
+                Btn(label="好感度", data="/好感度", action="cmd"),
+                Btn(label="换人格", data="/人格切换", action="cmd"),
+            ])
+            await _safe_send_kb("\n".join(lines), _s_rows, label="scene-list")
+            return True
         await _safe_send("\n".join(lines))
         return True
     if view.is_group:
@@ -3949,11 +4391,19 @@ async def _handle_scene_command(text: str, user_id: str, view) -> bool:
     return True
 
 
-async def _send_level_up_notice(user_id: str, persona_key: str, up: dict, sender=None):
-    """羁绊升级庆祝：角色口吻一句话（flash）+ 等级提示；LLM 失败降级固定文案。"""
+async def _send_level_up_notice(user_id: str, persona_key: str, up: dict, sender=None,
+                                archive_note: str = ""):
+    """羁绊升级庆祝：角色口吻一句话（flash）+ 等级提示；LLM 失败降级固定文案。
+
+    archive_note（scene-session-archive-design.md §5.2/B1b）：剧情完成当轮有升级时，
+    封档一行**必须**并入升级文案尾部，而非独立发送——省 1 条被动回复，避免在官方
+    渠道 4 条预算下挤掉纪念卡（media 先丢）。仅拼在正文之后，不影响 LLM 庆祝语。
+    """
     pm = get_character_registry()
     short = pm.get_short_name(persona_key)
     fallback = f"✨ 你与 {short} 的羁绊达到了 Lv{up['level']}（{up['title']}）！"
+    if archive_note:
+        fallback = f"{fallback}\n{archive_note}"
     opening = None
     try:
         persona_content = pm.load(persona_key) or ""
@@ -4086,12 +4536,22 @@ async def _handle_bond_command(
         )
         return True
     role_str = _perm_manager.get_role(user_id).value
-    await _safe_send(
-        _bond_manager.format_status(
-            user_id, persona_key, display_name=display, role=role_str
-        ),
-        sender=sender,
+    _bond_msg = _bond_manager.format_status(
+        user_id, persona_key, display_name=display, role=role_str
     )
+    # 键盘版（buttons P0）：养成动作导航。/剧情 仅私聊可用（群聊会拒绝），
+    # 群聊行换成帮助。设好感用 enter=False 预填，让用户补等级数字。
+    _bond_rows: Rows = [[
+        Btn(label="剧情", data="/剧情", action="cmd"),
+        Btn(label="设好感", data="/设好感 ", action="cmd", enter=False),
+        Btn(label="换人格", data="/人格切换", action="cmd"),
+    ]] if not view.is_group else [[
+        Btn(label="设好感", data="/设好感 ", action="cmd", enter=False),
+        Btn(label="换人格", data="/人格切换", action="cmd"),
+        Btn(label="帮助", data="/帮助", action="cmd"),
+    ]]
+    await _send_receipt_kb(_bond_msg, _bond_rows, sender=sender,
+                           label="bond-status")
     return True
 
 
@@ -4243,6 +4703,14 @@ async def _handle_features_command(text: str, user_id: str) -> bool:
         card_path = await asyncio.to_thread(render_feature_card, features_path)
         if card_path:
             await _safe_send(OutImage(path=card_path, label="feature card"))
+            # 键盘版（buttons P0）：卡片是图片，键盘必须骑在 md 消息上，
+            # 故补 1 条轻量导航（官方 c2c 4 条配额下图片+导航=2 条，安全）。
+            if _channel_supports_keyboard():
+                await _safe_send_kb("功能速查导航：", [[
+                    Btn(label="帮助", data="/帮助", action="cmd"),
+                    Btn(label="更新日志", data="/更新日志", action="cmd"),
+                    Btn(label="兑换码", data="/兑换码", action="cmd"),
+                ]], label="features-nav")
         else:
             await _safe_send("功能表为空或不存在，请联系管理员。")
     except Exception:
@@ -4284,6 +4752,14 @@ async def _handle_changelog_command(text: str, user_id: str) -> bool:
             await _safe_send(OutImage(path=card_path, label="changelog card"))
     except Exception:
         pass  # 卡片是锦上添花，渲染/发送失败绝不影响文本回复
+
+    # 3. 键盘版（buttons P0）：更多日志 / 官网 / 反馈预填
+    if _channel_supports_keyboard():
+        await _safe_send_kb("完整更新日志见官网：", [[
+            Btn(label="更多日志", data="/更新日志 10", action="cmd"),
+            Btn(label="官网", data=_PUBLIC_SITE_URL, action="url"),
+            Btn(label="反馈", data="#反馈 ", action="cmd", enter=False),
+        ]], label="changelog-nav")
     return True
 
 
@@ -4317,6 +4793,14 @@ async def _handle_toggle_command(text: str, user_id: str, view: InboundMessage) 
 
     # /toggle — show current settings
     if not args:
+        # 管理员面板键盘版（buttons P1，§C.3）：每功能 [开][关] 回调按钮。
+        # admin_only + wire 层把群聊 cb 按钮锁定到渲染者 openid（他人不可点）。
+        # 文本面板原样保留给 OneBot / 降级路径。
+        if _channel_supports_keyboard():
+            _kb_md, _kb_rows = _session_render.render_toggle_page(
+                group_id, gf=gf, registry=get_character_registry())
+            await _safe_send_kb(_kb_md, _kb_rows, label="toggle-panel")
+            return True
         features = gf.get_all_features(group_id)
         lines = ["当前群聊功能状态："]
         for key in FEATURE_ORDER:
@@ -4388,6 +4872,44 @@ async def _handle_toggle_command(text: str, user_id: str, view: InboundMessage) 
     except ValueError as e:
         await _safe_send(str(e))
 
+    return True
+
+
+# ── /按钮探测 — 官方渠道键盘能力探测（c2c + admin，buttons §6.7）────
+async def _handle_button_probe_command(
+        text: str, user_id: str, view: InboundMessage) -> bool:
+    """Send a minimal 1×1 probe keyboard + report the breaker state.
+
+    qq_official + c2c + admin only: the probe spends passive-reply quota
+    and the callback button needs the interaction intent, so it is a
+    deployment diagnostic, not a user feature.
+    """
+    cmd = text.split(maxsplit=1)[0]
+    if cmd not in ("/按钮探测", "#按钮探测"):
+        return False
+    if _current_platform.get() != "qq_official":
+        await _safe_send("按钮探测仅在 QQ 官方渠道可用（OneBot 渠道不支持键盘）。")
+        return True
+    if view.is_group:
+        await _safe_send("请在私聊中使用 /按钮探测。")
+        return True
+    if _perm_manager.get_role(user_id) != UserRole.ADMIN:
+        await _safe_send("此命令仅限管理员使用。")
+        return True
+    from adapters.qq_official import kb_snapshot
+    snap = kb_snapshot()
+    md = (
+        "**按钮能力探测**\n"
+        f"- 熔断状态: {snap['state']}（env={snap['env']}）\n"
+        f"- 当前可用: {'是' if snap['available'] else '否'}\n"
+        f"- 累计拒绝: {snap['rejected_total']} | "
+        f"最近拒绝码: {snap['last_reject_code'] or '无'}\n"
+        f"- 冷却剩余: {snap['disabled_seconds_left']:.0f}s\n\n"
+        "点击下方按钮验证回调链（需要 interaction intent 已授权）。"
+    )
+    rows = [[Btn(label="探测回调", data="qb1:admin.probe",
+                 action="cb", admin_only=True)]]
+    await _safe_send_kb(md, rows)
     return True
 
 
@@ -4570,6 +5092,29 @@ async def _handle_portrait_command(text: str, user_id: str, view) -> bool:
     return True
 
 
+def _resolve_session_index(user_id: str, args: str) -> tuple:
+    """Resolve a ``#n`` alias to a session name (buttons P0).
+
+    ``n`` indexes ``list_sessions`` order — the same flat order the
+    keyboard session page numbers its rows, so「切换 3」types
+    ``/切换会话 #3`` and lands on the row the user just saw.
+
+    Returns (name, error): exactly one is None. Non-``#<digits>`` input
+    (including names that merely start with #) passes through unchanged.
+    """
+    if not args.startswith("#") or not args[1:].isdigit():
+        return args, None
+    sessions = _special_sessions.list_sessions(user_id)
+    idx = int(args[1:])
+    if not (1 <= idx <= len(sessions)):
+        return None, (
+            f"序号 {args} 超出范围（当前 1..{len(sessions)}），"
+            f"请先发送 /会话列表 查看。" if sessions else
+            f"你目前没有特殊会话，序号 {args} 无效。"
+        )
+    return sessions[idx - 1]["name"], None
+
+
 async def _handle_session_command(
     text: str, user_id: str, group_id: str = None
 ) -> bool:
@@ -4588,15 +5133,34 @@ async def _handle_session_command(
     if cmd in ("/创建角色", "#创建角色"):
         registry = get_character_registry()
         role = _perm_manager.get_role(user_id)
-        # Already in a creation interview?
-        active = _special_sessions.get_active(user_id)
-        if active and (active.metadata or {}).get("kind") == "char_creation":
+        # 去重恢复（D6）：查已有 char_creation 会话（活跃与否），命中即恢复现场，
+        # 杜绝重复 /创建角色 产生「角色创作_1」膨胀。创作会话豁免配额（§2.1），
+        # 故不做特殊会话槽检查——豁免会话的创建不该被普通配额闸拦住。
+        existing_creation = next(
+            (s for s in _special_sessions.list_sessions(user_id)
+             if (s.get("metadata") or {}).get("kind") == CREATION_KIND),
+            None,
+        )
+        if existing_creation:
+            active = _special_sessions.get_active(user_id)
+            if active and active.name == existing_creation["name"]:
+                await _safe_send(
+                    "你已经在一个角色创作访谈中了，直接回答我的问题即可；"
+                    "想放弃请用 /结束会话 退出。"
+                )
+                return True
+            try:
+                _special_sessions.switch_to(user_id, existing_creation["name"])
+            except Exception as e:
+                code = log_exception("resume creation session failed", e)
+                await _safe_send(f"恢复角色创作失败（诊断编号 {code}），请稍后重试。")
+                return True
             await _safe_send(
-                "你已经在一个角色创作访谈中了，直接回答我的问题即可；"
-                "想放弃请用 /结束会话 退出。"
+                "继续上次未完成的角色创作——把剩下的设定告诉我吧。"
+                "（该会话不占配额；随时可用 /结束会话 放弃）"
             )
             return True
-        # Character quota
+        # Character quota（自创角色数量上限，与会话配额无关）
         max_chars = _perm_manager.get_max_characters(role)
         owned = registry.list_ugc(user_id)
         if len(owned) >= max_chars:
@@ -4606,18 +5170,10 @@ async def _handle_session_command(
                 "请先用 /删除角色 <名称> 清理，再创建新角色。"
             )
             return True
-        # Special-session slot quota (creation session occupies one)
-        max_sessions = _perm_manager.get_max_special_sessions(role)
-        sessions = _special_sessions.list_sessions(user_id)
-        if len(sessions) >= max_sessions:
-            await _safe_send(
-                f"创建角色需要占用一个特殊会话槽，但你已达到上限（{len(sessions)}/{max_sessions}）。\n"
-                "请先用 /删除会话 <名称> 清理一个会话后再试。"
-            )
-            return True
+        # 创作会话豁免配额（scene-session-archive-design.md §2.1/D6），无槽位检查。
         try:
             session = _special_sessions.create(
-                user_id, "角色创作", metadata={"kind": "char_creation"}
+                user_id, "角色创作", metadata={"kind": CREATION_KIND}
             )
             _special_sessions.switch_to(user_id, session.name)
             _temp_session_files.pop(user_id, None)
@@ -4641,6 +5197,13 @@ async def _handle_session_command(
     if cmd in ("/删除角色", "#删除角色"):
         registry = get_character_registry()
         if not args:
+            # 键盘版（buttons P1）：每角色一个 [删 n] 回调按钮 + modal 确认，
+            # 免走两步文本协议；文本列表原样保留给 OneBot / 降级路径。
+            if _channel_supports_keyboard():
+                _kb_md, _kb_rows = _session_render.render_character_page(
+                    user_id, registry=registry)
+                await _safe_send_kb(_kb_md, _kb_rows, label="char-list")
+                return True
             owned = registry.list_ugc(user_id)
             if not owned:
                 await _safe_send("你还没有自创角色。用 /创建角色 访谈式创建一个吧~")
@@ -4696,11 +5259,12 @@ async def _handle_session_command(
     if cmd in ("/新会话", "#新会话"):
         role = _perm_manager.get_role(user_id)
         max_sessions = _perm_manager.get_max_special_sessions(role)
-        sessions = _special_sessions.list_sessions(user_id)
+        sessions = _quota_sessions(user_id)
         if len(sessions) >= max_sessions:
             names = ", ".join(s["name"] for s in sessions)
+            _label = "特殊" if not _scene_archive_enabled() else "普通"
             await _safe_send(
-                f"已达到最大特殊会话数 ({max_sessions})。"
+                f"已达到最大{_label}会话数 ({max_sessions})。"
                 f"现有会话: {names}。请先删除一个再创建。"
             )
             return True
@@ -4725,8 +5289,7 @@ async def _handle_session_command(
                     f"已创建特殊会话「{session.name}」。\n"
                     f"会话人格: {_snapshot_display}（会话内 /人格切换 仅作用于本会话）。\n"
                     f"当前处于特殊会话模式，上下文将持续保存。\n"
-                    f"使用 /结束会话 退出，/会话列表 查看所有会话。\n"
-                    f"当前特殊会话: {len(sessions)+1}/{max_sessions}"
+                    f"使用 /结束会话 退出，/会话列表 查看所有会话。"
                 )
             else:
                 _pending_naming[user_id] = True
@@ -4734,61 +5297,130 @@ async def _handle_session_command(
                     f"已创建特殊会话「{session.name}」（名称待精炼）。\n"
                     f"会话人格: {_snapshot_display}（会话内 /人格切换 仅作用于本会话）。\n"
                     f"首次交互后会自动生成更贴切的名称。\n"
-                    f"当前处于特殊会话模式，上下文将持续保存。\n"
-                    f"当前特殊会话: {len(sessions)+1}/{max_sessions}"
+                    f"当前处于特殊会话模式，上下文将持续保存。"
                 )
+            msg += _delete_quota_tail(user_id, "")
             if quota_warn:
                 msg += f"\n\n{quota_warn}"
-            await _safe_send(msg)
+            await _send_receipt_kb(msg, _NAV_SESSION_ACTIVE,
+                                   label="new-session")
         except ValueError as e:
             await _safe_send(str(e))
         return True
 
     # ── /会话列表 ──────────────────────────────────────────────
     if cmd in ("/会话列表", "#会话列表", "/会话", "#会话"):
+        # 官方渠道键盘版（buttons P0/P1）：分页 + 切换/删除按钮。
+        # 群聊 scope 只渲染「请私聊」引导（§9.2 私密数据不落群）。
+        # 文本视图（含剧情归档分组）原样保留给 OneBot / 降级路径。
+        if _channel_supports_keyboard():
+            _kb_md, _kb_rows = _session_render.render_session_page(
+                user_id, 1, "group" if group_id else "c2c",
+                sessions_mgr=_special_sessions, perm=_perm_manager,
+                registry=get_character_registry())
+            await _safe_send_kb(_kb_md, _kb_rows, label="session-list")
+            return True
         role = _perm_manager.get_role(user_id)
         max_sessions = _perm_manager.get_max_special_sessions(role)
         sessions = _special_sessions.list_sessions(user_id)
-        if not sessions:
-            await _safe_send(
-                "你目前没有特殊会话。\n"
-                f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个）。"
-            )
-            return True
-
         active_name = _special_sessions._load_index(user_id).get("active_session")
         _pm_list = get_character_registry()
-        lines = ["你的特殊会话:"]
-        for s in sessions:
-            marker = " ← 当前" if s["name"] == active_name else ""
-            created = time.strftime("%m/%d %H:%M", time.localtime(s["created_at"]))
+
+        def _pnote(s: dict) -> str:
             # 会话人格绑定标注（scene 显示钉住角色；创作会话固定中性；
             # key 失效/未绑定的存量会话显示跟随默认）
             meta = s.get("metadata") or {}
             _kind = meta.get("kind")
             if _kind == "char_creation":
-                p_note = "人格: 固定（角色创作）"
-            else:
-                pkey = meta.get("persona_key") or (
-                    meta.get("char_id") if _kind == "bond_scene" else None)
-                if pkey and _pm_list._exists(str(pkey), user_id=user_id):
-                    p_note = f"人格: {_pm_list.get_display_name(str(pkey))}"
-                elif pkey:
-                    p_note = "人格: 已失效→跟随默认"
-                else:
-                    p_note = "人格: 跟随默认"
-            lines.append(
+                return "人格: 固定（角色创作）"
+            pkey = meta.get("persona_key") or (
+                meta.get("char_id") if _kind == "bond_scene" else None)
+            if pkey and _pm_list._exists(str(pkey), user_id=user_id):
+                return f"人格: {_pm_list.get_display_name(str(pkey))}"
+            if pkey:
+                return "人格: 已失效→跟随默认"
+            return "人格: 跟随默认"
+
+        def _row(s: dict) -> str:
+            marker = " ← 当前" if s["name"] == active_name else ""
+            created = time.strftime("%m/%d %H:%M", time.localtime(s["created_at"]))
+            return (
                 f"  {s['name']}{marker}\n"
-                f"    创建: {created} | 消息数: {s['total_messages']} | {p_note}"
+                f"    创建: {created} | 消息数: {s['total_messages']} | {_pnote(s)}"
             )
-        lines.append(f"\n共 {len(sessions)}/{max_sessions} 个会话")
+
+        # 回滚开关关闭：退回旧统一视图（scene-session-archive-design.md §7）
+        if not _scene_archive_enabled():
+            if not sessions:
+                await _safe_send(
+                    "你目前没有特殊会话。\n"
+                    f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个）。"
+                )
+                return True
+            lines = ["你的特殊会话:"]
+            for s in sessions:
+                lines.append(_row(s))
+            lines.append(f"\n共 {len(sessions)}/{max_sessions} 个会话")
+            await _safe_send("\n".join(lines))
+            return True
+
+        # 开关开启：普通 / 剧情归档 / 角色创作 三段分组（B5）
+        normal = [s for s in sessions
+                  if (s.get("metadata") or {}).get("kind") not in NON_QUOTA_KINDS]
+        scenes = [s for s in sessions
+                  if (s.get("metadata") or {}).get("kind") == SCENE_KIND]
+        creations = [s for s in sessions
+                     if (s.get("metadata") or {}).get("kind") == CREATION_KIND]
+
+        if not sessions:
+            await _safe_send(
+                "你目前没有特殊会话。\n"
+                f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个普通会话；"
+                f"剧情/创作会话不计配额）。"
+            )
+            return True
+
+        lines = [f"普通会话 ({len(normal)}/{max_sessions}):"]
+        if normal:
+            for s in normal:
+                lines.append(_row(s))
+        else:
+            lines.append("  （无）")
+
+        lines.append(f"\n剧情归档 {len(scenes)}（不计配额）:")
+        if scenes:
+            for s in scenes:
+                state = "已完结" if _scene_completed(s) else "进行中"
+                marker = " ← 当前" if s["name"] == active_name else ""
+                created = time.strftime(
+                    "%m/%d %H:%M", time.localtime(s["created_at"]))
+                lines.append(
+                    f"  {s['name']}{marker} [{state}]\n"
+                    f"    创建: {created} | 消息数: {s['total_messages']} | {_pnote(s)}"
+                )
+        else:
+            lines.append("  （无）")
+
+        if creations:
+            lines.append("\n角色创作（进行中 · 不计配额）:")
+            for s in creations:
+                lines.append(_row(s))
+
+        lines.append(
+            f"\n共 {len(normal)}/{max_sessions} 个普通会话 · "
+            f"{len(scenes)} 个剧情归档（不计配额）"
+        )
         await _safe_send("\n".join(lines))
         return True
 
-    # ── /切换会话 <名称> ───────────────────────────────────────
+    # ── /切换会话 <名称|#序号> ─────────────────────────────────
     if cmd in ("/切换会话", "#切换会话"):
         if not args:
-            await _safe_send("用法: /切换会话 <会话名称>")
+            await _safe_send("用法: /切换会话 <会话名称>（或 #序号，见 /会话列表）")
+            return True
+        args, _idx_err = _resolve_session_index(user_id, args)
+        if _idx_err:
+            await _safe_send(_idx_err)
             return True
         try:
             session = _special_sessions.switch_to(user_id, args)
@@ -4820,10 +5452,14 @@ async def _handle_session_command(
             await _safe_send(str(e))
         return True
 
-    # ── /删除会话 <名称> ───────────────────────────────────────
+    # ── /删除会话 <名称|#序号> ─────────────────────────────────
     if cmd in ("/删除会话", "#删除会话"):
         if not args:
-            await _safe_send("用法: /删除会话 <会话名称>")
+            await _safe_send("用法: /删除会话 <会话名称>（或 #序号，见 /会话列表）")
+            return True
+        args, _idx_err = _resolve_session_index(user_id, args)
+        if _idx_err:
+            await _safe_send(_idx_err)
             return True
 
         # Check for confirmation
@@ -4834,16 +5470,19 @@ async def _handle_session_command(
             if pending and pending[0] == args:
                 if time.time() < pending[1]:
                     try:
-                        result = _special_sessions.delete(user_id, args)
+                        # 与按钮回调 (qb1:session.del) 共用删除语义
+                        # （session_render.do_delete_session，§12.5）：
+                        # kind/turns 删除前捕获、profile flush、配额尾行。
+                        msg = _session_render.do_delete_session(
+                            user_id, args,
+                            sessions_mgr=_special_sessions,
+                            format_summary=_format_delete_summary,
+                            quota_tail=_delete_quota_tail,
+                            on_deleted=lambda turns:
+                                _profile_manager.flush_on_session_end(
+                                    user_id, turns),
+                        )
                         _pending_delete_confirm.pop(user_id, None)
-                        role = _perm_manager.get_role(user_id)
-                        max_sess = _perm_manager.get_max_special_sessions(role)
-                        sessions = _special_sessions.list_sessions(user_id)
-                        summary = _format_delete_summary(result)
-                        msg = f"已删除特殊会话「{args}」。"
-                        if summary:
-                            msg += "\n" + summary
-                        msg += f"\n当前特殊会话: {len(sessions)}/{max_sess}"
                         await _safe_send(msg)
                     except ValueError as e:
                         await _safe_send(str(e))
@@ -4886,17 +5525,41 @@ async def _handle_session_command(
     if cmd in ("/结束会话", "#结束会话", "/临时会话", "#临时会话", "/退出特殊会话", "/退出会话"):
         active = _special_sessions.get_active(user_id)
         if active:
+            _md_end = active.metadata or {}
+            _kind_end = _md_end.get("kind")
+            _title_end = _md_end.get("scene_title") or active.name
             _special_sessions.end_active(user_id)
             # 回落后的人格提示：end_active 后 provider 返回 None，
             # resolve 走 用户>群>全局 链，即临时会话生效的人格。
             _pm_end = get_character_registry()
             _p_disp = _pm_end.get_display_name(
                 _pm_end.resolve_effective_personality(user_id, group_id))
-            await _safe_send(
-                f"已退出特殊会话「{active.name}」，回到临时会话模式。\n"
-                f"当前人格: {_p_disp}\n"
-                f"特殊会话内容已保存，随时可以用 /切换会话 {active.name} 恢复。"
-            )
+            if _scene_archive_enabled() and _kind_end == SCENE_KIND:
+                # §5.3 / B2：剧情退出按是否已封档分流文案
+                if _md_end.get("completed"):
+                    await _send_receipt_kb(
+                        f"已退出剧情《{_title_end}》（已完结，已封档）。\n"
+                        f"可随时 /切换会话 {active.name} 回看；它不占特殊会话配额。\n"
+                        f"当前人格：{_p_disp}",
+                        _NAV_SESSIONS, label="end-session")
+                else:
+                    await _send_receipt_kb(
+                        f"已退出剧情《{_title_end}》（未完结），进度已保留。\n"
+                        f"继续体验发 /剧情 {_title_end}——不会新建会话，也不占配额。\n"
+                        f"当前人格：{_p_disp}",
+                        _NAV_SESSIONS, label="end-session")
+            elif _scene_archive_enabled() and _kind_end == CREATION_KIND:
+                await _send_receipt_kb(
+                    f"已退出角色创作「{active.name}」，进度已保留（不占配额）。\n"
+                    f"想继续创作请重新 /创建角色；想放弃可 /删除会话 {active.name}。\n"
+                    f"当前人格：{_p_disp}",
+                    _NAV_SESSIONS, label="end-session")
+            else:
+                await _send_receipt_kb(
+                    f"已退出特殊会话「{active.name}」，回到临时会话模式。\n"
+                    f"当前人格: {_p_disp}\n"
+                    f"特殊会话内容已保存，随时可以用 /切换会话 {active.name} 恢复。",
+                    _NAV_SESSIONS, label="end-session")
         else:
             await _safe_send("当前没有活跃的特殊会话。")
         return True
@@ -4915,11 +5578,12 @@ async def _handle_session_command(
 
         role = _perm_manager.get_role(user_id)
         max_sessions = _perm_manager.get_max_special_sessions(role)
-        sessions = _special_sessions.list_sessions(user_id)
+        sessions = _quota_sessions(user_id)
         if len(sessions) >= max_sessions:
             names = ", ".join(s["name"] for s in sessions)
+            _label = "特殊" if not _scene_archive_enabled() else "普通"
             await _safe_send(
-                f"已达到最大特殊会话数 ({max_sessions})。"
+                f"已达到最大{_label}会话数 ({max_sessions})。"
                 f"现有会话: {names}。请先删除一个再创建。"
             )
             return True
@@ -4957,21 +5621,18 @@ async def _handle_session_command(
         elif not name:
             _pending_naming[user_id] = True
 
-        sessions = _special_sessions.list_sessions(user_id)
-        role = _perm_manager.get_role(user_id)
-        max_sess = _perm_manager.get_max_special_sessions(role)
         quota_warn = _quota_warning(user_id)
         msg = (
             f"已将当前临时会话（最近 {min(len(temp_session.context), 20)} 条消息）"
             f"保存为特殊会话「{session.name}」。\n"
             f"会话人格: {_pm_save.get_display_name(_snapshot)}"
             f"（会话内 /人格切换 仅作用于本会话）。\n"
-            f"现在处于特殊会话模式，后续对话将持续保存。\n"
-            f"当前特殊会话: {len(sessions)}/{max_sess}"
+            f"现在处于特殊会话模式，后续对话将持续保存。"
         )
+        msg += _delete_quota_tail(user_id, "")
         if quota_warn:
             msg += f"\n\n{quota_warn}"
-        await _safe_send(msg)
+        await _send_receipt_kb(msg, _NAV_SESSION_ACTIVE, label="save-session")
         return True
 
     # ── /帮助 — 命令速查卡片（文本只在渲染失败时兜底）────────────
@@ -4985,6 +5646,22 @@ async def _handle_session_command(
         if _channel_supports_markdown():
             _help_md = _help_markdown()
             if _help_md:
+                # 键盘版（buttons P0）：高频命令导航，反馈预填空格让用户补内容
+                if _channel_supports_keyboard():
+                    await _safe_send_kb(_help_md, [
+                        [
+                            Btn(label="会话", data="/会话列表", action="cmd"),
+                            Btn(label="人格", data="/人格切换", action="cmd"),
+                            Btn(label="好感度", data="/好感度", action="cmd"),
+                        ],
+                        [
+                            Btn(label="兑换码", data="/兑换码", action="cmd"),
+                            Btn(label="更新日志", data="/更新日志", action="cmd"),
+                            Btn(label="反馈", data="#反馈 ", action="cmd",
+                                enter=False),
+                        ],
+                    ], label="help")
+                    return True
                 await _safe_send(OutMarkdown(_help_md))
                 return True
         card_path = None
@@ -5019,26 +5696,33 @@ async def _handle_feedback(text: str, user_id: str):
     cmd, _, content = text.partition(" ")
     content = content.strip()
 
+    # 键盘版（buttons P0/M2）：三选一预填按钮，enter=False 只把前缀填进
+    # 输入框，用户补完内容再发送——空内容提示的零输入成本入口。
+    _fb_rows: Rows = [[
+        Btn(label="写反馈", data="#反馈 ", action="cmd", enter=False),
+        Btn(label="报Bug", data="#bug ", action="cmd", enter=False),
+        Btn(label="提建议", data="#建议 ", action="cmd", enter=False),
+    ]]
     if cmd == "#反馈" and not content:
-        await _safe_send(
+        await _send_receipt_kb(
             "请按格式提交反馈：\n"
             "#反馈 <你的建议或问题>\n"
-            "例如：#反馈 execute_code 超时后临时文件没有清理"
-        )
+            "例如：#反馈 execute_code 超时后临时文件没有清理",
+            _fb_rows, label="feedback-empty")
         return
     if cmd == "#bug" and not content:
-        await _safe_send(
+        await _send_receipt_kb(
             "请按格式提交 Bug 报告：\n"
             "#bug <Bug 描述>\n"
-            "例如：#bug shell_exec 对大文件处理超时"
-        )
+            "例如：#bug shell_exec 对大文件处理超时",
+            _fb_rows, label="feedback-empty")
         return
     if cmd == "#建议" and not content:
-        await _safe_send(
+        await _send_receipt_kb(
             "请按格式提交改进建议：\n"
             "#建议 <你的建议>\n"
-            "例如：#建议 get_user_info 增加工作区目录快照"
-        )
+            "例如：#建议 get_user_info 增加工作区目录快照",
+            _fb_rows, label="feedback-empty")
         return
 
     fb_type = {"#反馈": "feedback", "#bug": "bug", "#建议": "suggestion"}[cmd]
@@ -5090,7 +5774,14 @@ async def _handle_special_command(command: str, user_id: str):
         _temp_session_files.pop(user_id, None)
         if _personality_switch_marker.pop(user_id, None) is not None:
             _save_personality_markers()
-        await _safe_send("已清除对话上下文，开始新对话~")
+        _clear_msg = "已清除对话上下文，开始新对话~"
+        # §5.6：/clear 会销毁归档剧情/创作会话的回看内容，命中时补一句提醒。
+        if _scene_archive_enabled() and (
+                _scene_archives(user_id)
+                or any((s.get("metadata") or {}).get("kind") == CREATION_KIND
+                       for s in _special_sessions.list_sessions(user_id))):
+            _clear_msg += "\n（注意：剧情归档与角色创作会话的历史也已被清除，回看内容不可恢复。）"
+        await _safe_send(_clear_msg)
     elif command == "/status":
         status = agent.get_status()
         tool_list = "\n  ".join(status["tool_names"])
@@ -5195,7 +5886,16 @@ async def _send_response(response: str, sender=None):
     byte-identical to before.
     """
     if not response:
+        _turn_keyboard.set(None)  # reservation must not survive an empty reply
         return
+
+    # One-shot consumption of the tool-reserved keyboard (buttons P1):
+    # a result-page tool (gacha/speed…) may have set _turn_keyboard this
+    # turn. Whatever render path we end up on, the reservation must not
+    # leak into the next turn — only the official unified-md branch can
+    # actually ride it (a keyboard needs a msg_type=2 carrier).
+    kb_rows = _turn_keyboard.get()
+    _turn_keyboard.set(None)
 
     # Append disclaimer to every agent response
     _pm = get_character_registry()
@@ -5209,6 +5909,17 @@ async def _send_response(response: str, sender=None):
         if (_current_render_context.get()
                 and getattr(s, "supports_markdown", False)):
             if not _md_violates_whitelist(response):
+                if kb_rows and _channel_supports_keyboard(s):
+                    # body + buttons in ONE payload (0 extra quota);
+                    # disclaimer keeps the existing inline/separate policy
+                    if len(response) <= _MD_INLINE_DISCLAIMER_LIMIT:
+                        await _safe_send_kb(response + disclaimer, kb_rows,
+                                            sender=sender, label="agent-reply")
+                    else:
+                        await _safe_send_kb(response, kb_rows, sender=sender,
+                                            label="agent-reply")
+                        await _safe_send(disclaimer.strip(), sender=sender)
+                    return
                 if len(response) <= _MD_INLINE_DISCLAIMER_LIMIT:
                     await _safe_send(OutMarkdown(response + disclaimer),
                                      sender=sender)

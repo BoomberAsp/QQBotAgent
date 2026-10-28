@@ -115,7 +115,9 @@ All file operations MUST stay within the user's workspace (`{USER_DATA_ROOT}/{ui
 | 上下文窗口 | 最近 20 条消息 | 完整保留（百万 token 级，含分层压缩） |
 | 持久化 | 重启/超时后丢失 | 永久保存，快照+增量双层存储 |
 | 工作区 | 用户工作区（所有会话共享） | 用户工作区（所有会话共享，按角色配额） |
-| 数量限制 | 无 | 按角色：管理员 10 / 会员 3 / 普通 1 个 |
+| 数量限制 | 无 | 按角色：管理员 10 / 会员 3 / 普通 1 个（仅普通特殊会话计配额） |
+
+**剧情归档（不占配额）：** 剧情会话（`/剧情`）与角色创作会话（`/创建角色`）**豁免**上面的数量配额——它们单独计数，剧情会话总量上限 `MAX_SCENE_ARCHIVES`（默认 20，含进行中与已完结）。剧情走到结局会自动**封档**（保留会话、可 `/切换会话` 回看，回看时按普通历史处理、不再推进剧情）；`/剧情 <同标题>` 命中既有会话时**恢复**而非新建。角色创建成功后其创作会话自动删除。
 
 **工作区配额（按角色）：**
 | 管理员 | 会员 | 普通 |
@@ -130,10 +132,10 @@ All file operations MUST stay within the user's workspace (`{USER_DATA_ROOT}/{ui
 |------|------|
 | `/新会话 [名称]` | 创建特殊会话（名称留空由 LLM 自动命名；创建时绑定当前生效人格） |
 | `/切换会话 <名称>` | 切换到已有会话（自动切回该会话绑定的人格，系统会发提示消息） |
-| `/会话列表` 或 `/会话` | 查看所有特殊会话（含消息数、创建时间、绑定人格） |
+| `/会话列表` 或 `/会话` | 查看所有特殊会话（普通会话 / 剧情归档 / 角色创作分组展示，含消息数、创建时间、绑定人格、封档状态） |
 | `/重命名会话 <旧名> <新名>` | 重命名会话 |
 | `/删除会话 <名称>` | 删除会话（需二次确认，60秒内有效） |
-| `/结束会话` 或 `/退出特殊会话` 或 `/退出会话` 或 `/临时会话` | 退出特殊会话，回到临时模式 |
+| `/结束会话` 或 `/退出特殊会话` 或 `/退出会话` 或 `/临时会话` | 退出特殊会话，回到临时模式（剧情中途退出保留进度，可 `/剧情 <同标题>` 恢复；已完结剧情退出即封档，`/切换会话` 回看） |
 | `/保存为会话 <名称>` | 将当前临时会话最近 20 条消息保存为新特殊会话 |
 | `/帮助` 或 `/help` 或 `/命令` | 显示完整系统命令列表 |
 
@@ -217,6 +219,7 @@ When a user message begins with `[连续对话模式]`, the user is continuing a
 3. **Be concise** — Don't repeat the tool output verbatim if it's long. Summarize key points.
 4. **Format for QQ** — QQ messages are limited in length. Break long responses into logical chunks; when the system declares markdown-capable rendering, output the full answer as block-structured markdown instead of forcing 300-character chunks.
 5. **Plain text by default** — Never use Markdown unless the system explicitly declares a markdown-capable renderer for this turn; that declaration takes precedence over this rule and limits you to its subset (`##` headings, `**bold**`, `-`/`1.` lists, `[text](https://…)`, `![](https://…)`; no tables, code blocks, inline code, or HTML). Without such a declaration, use plain text (parentheses, arrows, line breaks) even for file/workspace listings and summaries.
+6. **Don't narrate buttons** — Some result pages (gacha, speed calc, session/personality lists) may arrive with clickable QQ buttons attached automatically by the platform layer. When they're present, do NOT repeat the button labels in your prose or urge the user to click them — the buttons speak for themselves. Just give the answer.
 
 ## 权限系统 (Permission System)
 

@@ -64,7 +64,7 @@ QQBotAgent/
 └── QQBot/                      # NoneBot 机器人主体
     ├── .env / .env.example     # 环境配置（密钥）与逐行注释模板
     ├── requirements.txt / pyproject.toml / config.yml
-    ├── test_agent.py           # 主测试套件（51 个 Test 类 / 282 个用例）
+    ├── test_agent.py           # 主测试套件（53 个 Test 类 / 316 个用例）
     ├── test_workspace.py       # 工作区 / 会话文件测试（11 个类）
     ├── test_story_kb.py        # 剧情知识库检索测试（37 个用例，无网络）
     ├── DOCUMENTATION.md / PLAN.md / README.md
@@ -248,7 +248,7 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 | 入站视图 | `agent/inbound.py::InboundMessage` | 统一字段：`user_id / is_group / group_id / text / message_id / self_id / mentioned / reply_context / resolver / platform`；附件惰性下载，失败也记录为 `Attachment.error` |
 | OneBot 入口 | `plugins/agent_router.py` + `adapters/onebot.py` | 群消息手工判 `@`（不依赖 NapCat `to_me`）；附件经 NapCat `get_file`/`get_record` 或 HTTP 兜底 |
 | 官方入口 | `plugins/qq_official.py` + `adapters/qq_official.py` | 只处理 `C2CMessageCreateEvent` / `GroupAtMessageCreateEvent`；附件是公网 URL，直接下载；引用消息按 `msg_elements` + `ref_msg_idx` 解析 |
-| 出站契约 | `agent/outbound.py::Sender` | `send_text / send_markdown / send_image / send_audio / send_progress`；`OutImage` / `OutAudio` / `OutMarkdown` / `OutProgress` 描述语义，平台细节在适配器；`supports_markdown` 能力位是渠道隔离唯一判据（官方 True / OneBot False） |
+| 出站契约 | `agent/outbound.py::Sender` | `send_text / send_markdown / send_keyboard / send_image / send_audio / send_progress`；`OutImage` / `OutAudio` / `OutMarkdown` / `OutKeyboard` / `OutProgress` 描述语义，平台细节在适配器；`supports_markdown` / `supports_keyboard` 能力位是渠道隔离唯一判据（官方 True / OneBot False）。`OutKeyboard(markdown, rows)` 的 rows 是 `lib/button_spec.py` 的平台无关按钮 DSL（`Btn`/`Rows`/`validate`/`to_text`）；不支持键盘的渠道 `send_keyboard` 自动降级为 `send_text(markdown + to_text(rows))`。回调链：官方渠道 INTERACTION_CREATE → `plugins/qq_official_buttons.py`（幂等+限频+审计）→ `agent/button_actions.py`（scene/role 复核 + 2.5s 预算）→ `agent/session_render.py`（共享键盘页渲染），毫秒级本地状态变更走回调按钮（type=1），需 LLM/>3s 的一律指令按钮（type=2，替用户打字复用命令链） |
 | OneBot 出站 | `OneBotSender` | 文本原样发、300 字符分块由内核负责；图片 `MessageSegment.image(Path)`；`send_markdown` 降级纯文本 |
 | 官方出站 | `QQOfficialSender` | 缓冲 + 合并 + 配额（单聊 4 次/60min、群 5 次/5min）；图片/语音 base64 上传（本地文件不可直读）；语音被拒降级文件卡；markdown（msg_type=2）单独成组、按区块 ≤1500 字切分，被拒（40034011 等）同内容纯文本重发 + 连续 3 拒熔断 10 分钟，`QQ_OFFICIAL_MARKDOWN=off` 一键禁用（热读）；配额不足丢弃优先级 正文 > 免责 > 图片；进度行默认吞掉，仅「正在思考…」即时发送 |
 | 失败语义 | `SendFailed` | 只有它是可重试错误；其它异常记日志后丢弃 |
@@ -390,6 +390,8 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 | `add_message(user_id, role, content, reasoning_content=None)` | 追加消息: 写入 JSONL 增量日志，每 50 条 (`SNAPSHOT_INTERVAL`) 触发快照并清空 delta |
 | `add_file(user_id, name, file_path)` / `get_files(user_id, name)` | 记录/查询会话名下的工作区文件（文件溯源，供 delete 清理） |
 | `auto_name(user_id, first_message, first_response)` | 异步: LLM 根据首次对话内容自动总结会话名（≤12 字符），成功则 rename |
+
+**剧情归档与配额豁免**（详见 `docs/scene-session-archive-design.md`）：`metadata.kind` 为 `bond_scene`（剧情）/`char_creation`（角色创作）的会话**不计入**按角色的数量配额（10/3/1 只约束普通特殊会话）。剧情走到结局由 `agent/turn.py::_finish_bond_scene` 经 `update_metadata` 写入 `completed=true` + `completed_at`（封档真源），随后 `end_active`——会话保留，可 `/切换会话` 回看，回看时 `is_scene=false`（不再注入剧情指令/剧本、工具集无 `complete_scene`）。`completed` 缺失的存量会话按“未完结”处理，并在 `/剧情` 去重与 `is_scene` 判定两个热点懒回填。剧情会话总量上限由 `MAX_SCENE_ARCHIVES`（默认 20，含进行中与已完结）在 `turn.py` 层强制；`SCENE_ARCHIVE_ENABLED=0`（热读）为紧急回滚开关，退回统一配额语义。`create()` 本身仍不检查任何配额——普通配额与剧情上限都在 `turn.py` 命令层强制。
 
 **存储结构**:
 ```
@@ -805,7 +807,7 @@ v2.31 起，原本集中在 `plugins/agent_router.py` 的回合逻辑被整体�
 
 **加经验**：每日首聊 20、每消息 3（心情系数后 2–4）、每日聊天软上限 150（超出减半、2 倍后 1/4）、≥10 轮长会话 +30（每日一次）。
 **互动**：送礼三档（喜爱 30 / 普通 15 / 讨厌 5 经验，每日 3 次）、戳一戳（+5 经验、+3 心情，每日 3 次）、称呼演化、按级解锁档案。
-**剧情**：`complete_scene(title)` 结算（+100 经验、+10 心情），记录完成状态，供 `/剧情` 与纪念卡使用。
+**剧情**：`complete_scene(title)` 结算（+100 经验、+10 心情），记录完成状态（`has_done_scene` 真源），供 `/剧情` 门槛判定与纪念卡使用。**剧情场景生命周期**：`/剧情 <标题>` 启动 → 建 `kind=bond_scene` 会话（钉住 `char_id`，不占普通配额）→ 分幕共同演绎 → LLM 调 `complete_scene` 收尾 → `turn.py::_finish_bond_scene` 结算呈现（升级通知 + 羁绊纪念卡 + 事件蒸馏）并写 `metadata.completed=true` **封档**（会话保留、`end_active`、可 `/切换会话` 回看；回看态 `is_scene=false`）。`/剧情 <同标题>` 命中既有会话时**恢复**而非新建；剧情会话总量受 `MAX_SCENE_ARCHIVES`（默认 20）约束。详见 `docs/scene-session-archive-design.md`。
 **重逢 / 纪念日**：≥14 天未见触发重逢标记；相识 30/100/365/730/1095 天里程碑。
 **媒体门槛与配额**：画图 Lv4、语音 Lv5、主动语音 Lv7；每日配额 admin 50 / vip 10 / regular 3；影音资产磁盘配额 1000/300/100MB。
 **持久化**：`data/bonds/{user_id}.json`（按角色分区），进程内缓存 + `st_mtime_ns` 校验；数值可被 `config/bond_settings.json` 覆盖（该文件当前不存在，走默认值）。
@@ -815,7 +817,7 @@ v2.31 起，原本集中在 `plugins/agent_router.py` 的回合逻辑被整体�
 | 模块 | 职责 |
 |---|---|
 | `PersonalityManager` | 内置人格目录（`agent/config/personalities/*.md`）、卡片 HTML 注释元数据（`mode: split\|unified`、`task_voice`、`voice_id`）、用户级/群级绑定、模糊匹配与歧义拒绝（`CharacterRegistry` 基类） |
-| `CharacterRegistry` | 在人格之上叠加 UGC：`data/characters/{char_id}/card.md + meta.json`；按作者可见性隔离；解析显示名/模式/参考立绘/声纹；`_discover()` 仍只列内置，避免影响默认回退链。**人格解析单点**：`resolve_effective_personality` 五层链（见下）+ `resolve_effective_source` 来源标签 |
+| `CharacterRegistry` | 在人格之上叠加 UGC：`data/characters/{char_id}/card.md + meta.json`；按作者可见性隔离；解析显示名/模式/参考立绘/声纹；`_discover()` 仍只列内置，避免影响默认回退链。**人格解析单点**：`resolve_effective_personality` 五层链（见下）+ `resolve_effective_source` 来源标签（剧情钉住 / 剧情归档〔已封档剧情〕/ 会话绑定 / 个人设置 / 群默认 / 全局默认） |
 | `portrait.py` | 参考立绘规整纯函数：解码校验、EXIF 旋转、alpha 铺白、长边 ≤1536（兜底 1024）、最小边 128、输出 ≤4MB |
 
 **参考立绘双层路径**：出厂层 `agent/config/portraits/`（内置人格随仓库分发）+ 覆盖层 `CHARACTERS_DIR/_builtin/<key>/assets`（管理员上传）。
@@ -1383,7 +1385,7 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 
 ## 九、测试系统
 
-`test_agent.py` 包含 **51 个测试套件 / 282 个测试用例**（全部离线，使用 mock client，无网络依赖），覆盖核心组件、养成、双平面、官方渠道解析、影音资产、Direct Vision、会话人格绑定与面板逻辑。下表保留 v2.x 时代的 15 个基础套件（编号 1–15），新增套件按主题列在表后:
+`test_agent.py` 包含 **53 个测试套件 / 316 个测试用例**（全部离线，使用 mock client，无网络依赖），覆盖核心组件、养成、双平面、官方渠道解析、影音资产、Direct Vision、会话人格绑定与面板逻辑。下表保留 v2.x 时代的 15 个基础套件（编号 1–15），新增套件按主题列在表后:
 
 | # | 测试套件 | 测试数 | 覆盖内容 |
 |---|----------|--------|----------|
@@ -1403,12 +1405,12 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 | 14 | `TestMemoryMigration` | 2 | 旧记忆 → 三层结构迁移（seed+归档、散落 legacy dump 归档） |
 | 15 | `TestCacheStability` | 6 | 前缀缓存稳定性（提示词头部用户不变量/易变内容置尾/画像变化头部字节稳定/历史头部迟滞修剪/压缩边界步进/无时间戳） |
 
-**新增套件（16–51）**
+**新增套件（16–53）**
 
 | 主题 | 套件 |
 |---|---|
-| 养成 / 角色 | `TestBondManager`、`TestBondContent`、`TestBondGiftPoke`、`TestBondEvents`、`TestBondScene`、`TestSceneSession`、`TestBondReunionAnniversary`、`TestInitialBond`、`TestCharacterRegistry`（含会话人格五层链单测）、`TestSessionPersonaBinding`（端到端：创建快照/会话内切换/`--全局`/拒绝/提示消息/`/clear` 保留绑定）、`TestCreateCharacterTool`、`TestCharCreationInterview`、`TestPersonalityMeta`、`TestReferencePortrait` |
-| 渠道 / 多模态 / 面板 | `TestQQOfficialQuoteParsing`、`TestOfficialStatusHeartbeat`、`TestWebuiOfficialStatus`、`TestMediaGen`、`TestProactiveMedia`、`TestMediaQuota`、`TestAnchorVoiceId`、`TestDirectVision`、`TestDelegation`、`TestAgentPersist`、`TestActiveGreeting`、`TestModelRouterClassify`、`TestPersonalityMarkerPersistence`、`TestWebuiPermissionsEditor`、`TestWebuiModelSections` |
+| 养成 / 角色 | `TestBondManager`、`TestBondContent`、`TestBondGiftPoke`、`TestBondEvents`、`TestBondScene`、`TestSceneSession`、`TestSceneArchive`（封档/配额豁免：T1-T15 + 回滚开关 + 懒回填 + WebUI 摘要）、`TestBondReunionAnniversary`、`TestInitialBond`、`TestCharacterRegistry`（含会话人格五层链单测）、`TestSessionPersonaBinding`（端到端：创建快照/会话内切换/`--全局`/拒绝/提示消息/`/clear` 保留绑定）、`TestCreateCharacterTool`、`TestCharCreationInterview`、`TestPersonalityMeta`、`TestReferencePortrait` |
+| 渠道 / 多模态 / 面板 | `TestQQOfficialQuoteParsing`、`TestOfficialMarkdown`、`TestOfficialStatusHeartbeat`、`TestWebuiOfficialStatus`、`TestMediaGen`、`TestProactiveMedia`、`TestMediaQuota`、`TestAnchorVoiceId`、`TestDirectVision`、`TestDelegation`、`TestAgentPersist`、`TestActiveGreeting`、`TestModelRouterClassify`、`TestPersonalityMarkerPersistence`、`TestWebuiPermissionsEditor`、`TestWebuiModelSections` |
 | 资产记忆 / 剧情 | `TestAssetCardsP4`、`TestAssetSearch`、`TestAssetRecall`、`TestUploadTextualization`、`TestEpisodeDistill`、`TestAssetEvictionInjection`、`TestStoryKbInjectionGate` |
 
 另有 `test_workspace.py`（11 个类）、`test_story_kb.py`（6 个类 / 37 个用例，离线合成语料）、`benchmarks/memory/bench_engine.py`（确定性场景流 benchmark），以及 `test/` 下 17 个离线脚本（其中 11 个被 `test.sh` 调用；`test/` 整体被 gitignore，仅存于开发机）。
@@ -1602,7 +1604,7 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | `/tokens` Token 消耗 | `lib/token_ledger.py` 数据源；缓存命中率分口径观测（按提供商/模型分离） |
 | `/audit` 工具审计 | `data/audit/` JSONL 审计日志 + 面板自身操作审计（`audit.py`） |
 | `/feedback` 用户反馈 | `#反馈`/`#bug`/`#建议` 提交的处理流 |
-| `/sessions` 会话管理 | 临时会话查看/清除（写前备份到 `BACKUP_DIR/sessions`）、特殊会话查看 |
+| `/sessions` 会话管理 | 临时会话查看/清除（写前备份到 `BACKUP_DIR/sessions`）、特殊会话查看（剧情/已完结/角色创作徽标 + 普通配额摘要 `q/max · 剧情归档 k`；`special_list` 展平 `kind`/`completed`/`counts_quota`） |
 | `/tasks` 任务日志 | `data/task_log/{uid}.jsonl` 子任务记录浏览 |
 | `/memory` 记忆与画像 | MemorySystem Markdown 编辑、三层记忆查看、画像 JSON 编辑 |
 | `/workspace` 工作区磁盘 | 按用户配额/占用展示（角色感知） |

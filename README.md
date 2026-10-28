@@ -15,7 +15,7 @@
 - **影音生成与记忆** — Lv4 起可要图、Lv5 起可要语音，形象与声线保持一致；生成的图/语音落「资产卡」（文本卡是本体、二进制是可淘汰缓存），支持按记忆召回、事件蒸馏与 LRU 淘汰
 - **原作剧情知识库** — 本地 SQLite/FTS5 语料（约 5 万句对白，中英 bigram 索引 + RRF 重排），角色扮演时按人格白名单注入相关剧情，也可由 `story_search` 工具主动检索
 - **官方渠道主动互动** — 仅在官方单聊：`HEARTBEAT` 低频主动问候（好感等级门 + 冷却 + 概率 + 日/月配额）、Lv7+ 偶发主动发图/发语音，失败自动降级纯文本
-- **特殊会话** — 每用户至多 10/3/1 个（按角色），百万 token 上下文窗口，快照+增量双层存储
+- **特殊会话** — 每用户至多 10/3/1 个（按角色），百万 token 上下文窗口，快照+增量双层存储；**剧情/角色创作会话豁免此配额**（剧情完结自动封档、可回看，总量上限 `MAX_SCENE_ARCHIVES`，默认 20）
 - **用户工作区** — 每用户独立文件空间，配额管理（3 级策略），跨会话隔离
 - **流式交互** — 群聊连续对话模式：@一次后 90 秒内免 @，消息自动续期
 - **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）；完整结果自动存档（7 天/每用户 50 条），上下文折叠后可经 `recall_search_result` 按 id 取回，无需重搜
@@ -168,18 +168,18 @@ bash start.sh
 |------|------|
 | `/新会话 [名称]` | 创建特殊会话 (留空由 LLM 自动命名)；创建时快照当前生效人格，绑定到该会话 |
 | `/切换会话 <名称>` | 切换到指定会话（自动切换到该会话绑定的人格，系统发提示消息） |
-| `/会话列表` 或 `/会话` | 列出所有特殊会话（含各会话绑定的人格；绑定失效显示「已失效→跟随默认」） |
+| `/会话列表` 或 `/会话` | 列出所有特殊会话（普通会话 / 剧情归档 / 角色创作分组，含消息数、绑定人格与封档状态；绑定失效显示「已失效→跟随默认」） |
 | `/重命名会话 <旧名> <新名>` | 重命名会话 |
 | `/删除会话 <名称>` | 删除指定会话（回复「确认删除 <名称>」二次确认，60 秒内有效；删除前会列出将被清理的关联文件） |
 | `/保存为会话 [名称]` | 将当前临时对话保存为特殊会话（同样快照当前人格绑定到新会话） |
-| `/结束会话` 或 `/退出特殊会话` 或 `/退出会话` 或 `/临时会话` | 退出特殊会话，回到临时模式（提示回落后的人格） |
+| `/结束会话` 或 `/退出特殊会话` 或 `/退出会话` 或 `/临时会话` | 退出特殊会话，回到临时模式（提示回落后的人格）；剧情中途退出保留进度、可 `/剧情 <同标题>` 恢复，已完结剧情退出即封档 |
 | `/帮助` 或 `/help` 或 `/命令` | 显示完整系统命令列表 |
 
 **人格切换**
 
 | 命令 | 说明 |
 |------|------|
-| `/personality` 或 `/人格切换` | 查看当前人格、生效来源（剧情钉住/会话绑定/个人设置/群默认/全局默认）与可用人格列表 |
+| `/personality` 或 `/人格切换` | 查看当前人格、生效来源（剧情钉住/剧情归档/会话绑定/个人设置/群默认/全局默认）与可用人格列表 |
 | `/personality <名称>` 或 `/人格切换 <名称>` | 切换人格（支持模糊匹配，如「露比」「Rubi」）；切换后会追问**保留历史**还是**清空上下文**。**特殊会话内只改本会话的绑定**（你的默认人格不变）；临时会话内则修改用户默认；剧情/角色创作会话内拒绝切换 |
 | `/人格切换 <名称> --全局` | 逃生门：在特殊会话内修改**用户默认人格**（会话绑定不动，退出本会话后生效） |
 | `/toggle personality <名称>` | **仅超级用户 + 群聊**：把该人格设为「本群默认人格」 |
@@ -191,9 +191,9 @@ bash start.sh
 |------|------|
 | `/好感度`、`#好感度` 或 `/bond` | 查看等级/称号/心情/陪伴统计（零 token） |
 | `/剧情` | 列出当前角色的剧情场景（Lv 解锁与完成状态） |
-| `/剧情 <标题>` | 进入该剧情场景（**仅私聊**；占用一个特殊会话槽，`/结束会话` 可提前退出） |
+| `/剧情 <标题>` | 进入该剧情场景（**仅私聊**；**不占特殊会话配额**，`/结束会话` 中途退出保留进度、再发 `/剧情 <同标题>` 可恢复；走到结局自动封档、`/切换会话` 回看） |
 | `/设好感 <1-10>` | 把**你与当前角色**的羁绊等级直接设为指定值（可升可降，只作用于本人） |
-| `/创建角色` | 访谈式自创角色（姓名/性格/语气/外观/初始羁绊 Lv1–5），占用一个特殊会话槽 |
+| `/创建角色` | 访谈式自创角色（姓名/性格/语气/外观/初始羁绊 Lv1–5）；**不占特殊会话配额**，中途退出后再发 `/创建角色` 可恢复访谈，创建成功后该会话自动删除 |
 | `/删除角色 [名称]` | 不带名称列出你的自创角色；带名称删除（回复「确认删除角色 <名称>」二次确认）；删除时解除用户默认/群默认对该角色的引用（提示「已解除 N 处」），会话内绑定失效自动回落，好感数据保留 |
 | `/设形象 [角色名]` | 把图片设为自创角色的参考立绘（`/形象` 查看、`/清除形象` 撤销；内置人格仅管理员可改） |
 
@@ -294,7 +294,7 @@ QQBotAgent/
     ├── .env / .env.example     # 环境配置（密钥）与逐行注释模板
     ├── requirements.txt / pyproject.toml
     ├── config.yml              # 历史遗留的 go-cqhttp 配置（与 NoneBot 无关，可忽略）
-    ├── test_agent.py           # 主测试套件（51 个 Test 类 / 282 个用例）
+    ├── test_agent.py           # 主测试套件（53 个 Test 类 / 316 个用例）
     ├── test_workspace.py       # 工作区 / 会话文件测试（11 个类）
     ├── test_story_kb.py        # 剧情知识库检索测试（37 个用例，无网络）
     ├── DOCUMENTATION.md / PLAN.md / README.md
@@ -483,7 +483,7 @@ QQ 消息
 
 - **好感度（Bond）**：10 级（陌生 → 灵魂伴侣），只涨不掉；心情值 0–100 围绕基线回落，影响加经验系数与提示词语气；陪伴统计含相识天数/消息数/礼物数。
 - **互动动作**：送礼（喜爱/普通/讨厌三档，每日上限）、戳一戳（QQ 双击头像，每日上限）、称呼演化、按等级解锁角色档案。
-- **剧情场景**：`/剧情 <标题>` 进入一对一演绎（仅私聊，占用一个特殊会话槽），分幕推进，收尾结算经验/心情并发「羁绊纪念卡」。
+- **剧情场景**：`/剧情 <标题>` 进入一对一演绎（仅私聊，**不占特殊会话配额**），分幕推进，收尾结算经验/心情、发「羁绊纪念卡」并**自动封档**（会话保留、可 `/切换会话` 回看；同标题再进为恢复而非新建）。
 - **久别重逢 / 纪念日**：≥14 天未聊触发重逢语气；相识 30/100/365 天等里程碑提一句。
 - **画图与语音**：Lv4 起可要图（`create_image`，支持参考立绘做图生图）、Lv5 起可要语音（`send_voice`，角色声纹）；每日配额按角色：admin 50 / vip 10 / regular 3；资产磁盘配额 1GB / 300MB / 100MB。
 - **影音记忆**：每次生成/上传落「资产卡」（markdown + frontmatter 文本化本体），二进制可被 LRU 淘汰；`recall_asset` 支持「再发一次那张图」式召回，久远资产保留文字记忆。
@@ -583,7 +583,7 @@ class ContinuousSessionManager:
 |---|---|---|
 | `BondManager` | `agent/bond.py` | 好感度（EXP→10 级，只涨不掉）+ 心情（0–100，向基线回归）+ 陪伴统计；送礼/戳一戳/称呼演化/档案解锁/剧情场景/重逢/纪念日；每日媒体配额与资产配额；每用户一 JSON（`data/bonds/`），缓存按 mtime 校验 |
 | `BondContent` | `agent/bond_content.py` | 角色卡解析：外观锚点、称呼演化、档案分层、剧情场景定义 |
-| `CharacterRegistry` | `agent/character_registry.py` | 内置人格 + UGC 角色叠加层：UGC 落 `data/characters/{id}/card.md + meta.json`，按作者可见性隔离；解析 `split`/`unified` 模式、显示名、声纹。单点人格解析链 **剧情钉住 > 会话绑定 > 个人设置 > 群默认 > 全局默认**（活跃特殊会话经 `set_session_provider` 注入，绑定 key 失效懒校验穿透），`resolve_effective_source` 返回来源标签 |
+| `CharacterRegistry` | `agent/character_registry.py` | 内置人格 + UGC 角色叠加层：UGC 落 `data/characters/{id}/card.md + meta.json`，按作者可见性隔离；解析 `split`/`unified` 模式、显示名、声纹。单点人格解析链 **剧情钉住 > 会话绑定 > 个人设置 > 群默认 > 全局默认**（活跃特殊会话经 `set_session_provider` 注入，绑定 key 失效懒校验穿透），`resolve_effective_source` 返回来源标签（含已封档剧情的「剧情归档」） |
 | `PersonalityManager` | `agent/personality.py` | 内置人格目录 + 用户级/群级绑定 + 模糊匹配 + 切换标记（CharacterRegistry 的基类） |
 | `AssetMemory` | `agent/asset_memory.py` | 资产卡（markdown+frontmatter 为本体，二进制可淘汰）：建卡/检索/召回计数/prompt_hash 去重/事件蒸馏/LRU 淘汰/审计 |
 | `Delegation` | `agent/delegation.py` | 双平面路由执行核心：`SOCIAL_TOOLS` 白名单、`run_delegated_task`（隔离上下文 + 权限过滤 + 单层嵌套）、`revoice_task_result`（角色口吻转述） |
@@ -709,13 +709,13 @@ bash test.sh
 cd QQBot && python test_agent.py
 ```
 
-`test_agent.py` 共 **51 个测试套件 / 282 个用例**（全部离线，mock client，无网络），`test_workspace.py` 另有 11 个类，`test_story_kb.py` 6 个类 / 37 个用例：
+`test_agent.py` 共 **53 个测试套件 / 316 个用例**（全部离线，mock client，无网络），`test_workspace.py` 另有 11 个类，`test_story_kb.py` 6 个类 / 37 个用例：
 
 | 分组 | 套件 |
 |---|---|
 | 基础架构（15） | `TestToolRegistry`、`TestSessionManager`、`TestMemorySystem`、`TestAgentCore`、`TestUserProfile`、`TestProfileExtraction`、`TestDeepSeekClientParsing`、`TestBuiltinTools`、`TestSearchArchive`、`TestPersonality`、`TestTokenLedger`、`TestCacheStability`、`TestTieredMemory`、`TestMergedExtraction`、`TestMemoryMigration` |
-| 养成与角色 / 会话人格（14） | `TestBondManager`、`TestBondContent`、`TestBondGiftPoke`、`TestBondEvents`、`TestBondScene`、`TestSceneSession`、`TestBondReunionAnniversary`、`TestInitialBond`、`TestCharacterRegistry`、`TestSessionPersonaBinding`、`TestCreateCharacterTool`、`TestCharCreationInterview`、`TestPersonalityMeta`、`TestReferencePortrait` |
-| 渠道 / 多模态 / 面板（15） | `TestQQOfficialQuoteParsing`、`TestOfficialStatusHeartbeat`、`TestWebuiOfficialStatus`、`TestMediaGen`、`TestProactiveMedia`、`TestMediaQuota`、`TestAnchorVoiceId`、`TestDirectVision`、`TestDelegation`、`TestAgentPersist`、`TestActiveGreeting`、`TestModelRouterClassify`、`TestPersonalityMarkerPersistence`、`TestWebuiPermissionsEditor`、`TestWebuiModelSections` |
+| 养成与角色 / 会话人格（15） | `TestBondManager`、`TestBondContent`、`TestBondGiftPoke`、`TestBondEvents`、`TestBondScene`、`TestSceneSession`、`TestSceneArchive`、`TestBondReunionAnniversary`、`TestInitialBond`、`TestCharacterRegistry`、`TestSessionPersonaBinding`、`TestCreateCharacterTool`、`TestCharCreationInterview`、`TestPersonalityMeta`、`TestReferencePortrait` |
+| 渠道 / 多模态 / 面板（16） | `TestQQOfficialQuoteParsing`、`TestOfficialMarkdown`、`TestOfficialStatusHeartbeat`、`TestWebuiOfficialStatus`、`TestMediaGen`、`TestProactiveMedia`、`TestMediaQuota`、`TestAnchorVoiceId`、`TestDirectVision`、`TestDelegation`、`TestAgentPersist`、`TestActiveGreeting`、`TestModelRouterClassify`、`TestPersonalityMarkerPersistence`、`TestWebuiPermissionsEditor`、`TestWebuiModelSections` |
 | 资产记忆 / 剧情（7） | `TestAssetCardsP4`、`TestAssetSearch`、`TestAssetRecall`、`TestUploadTextualization`、`TestEpisodeDistill`、`TestAssetEvictionInjection`、`TestStoryKbInjectionGate` |
 
 `test.sh` 还会跑 `benchmarks/memory/bench_engine.py`（确定性场景流的记忆引擎 benchmark）与 `test/` 下 11 个离线脚本（测速管线、别名、卡片渲染、兑换码、web_fetch 等）。

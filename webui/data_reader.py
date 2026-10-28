@@ -396,15 +396,41 @@ def _special_manager():
     return SpecialSessionManager(user_data_root=str(config.USER_DATA_ROOT))
 
 
+# 剧情/创作会话不计普通特殊会话配额（scene-session-archive-design.md §2.1）
+_NON_QUOTA_KINDS = {"bond_scene", "char_creation"}
+
+
 def special_list(uid: str) -> dict:
     if not _safe_uid(uid):
         return {"error": "非法用户 ID"}
     try:
         mgr = _special_manager()
         active = mgr.get_active(uid)
+        raw = mgr.list_sessions(uid)
+        # 展平 kind/completed 便于模板渲染徽标（scene-session-archive §5.5/T15）
+        sessions = []
+        for s in raw:
+            meta = s.get("metadata") or {}
+            kind = meta.get("kind") or ""
+            item = dict(s)
+            item["kind"] = kind
+            item["completed"] = bool(meta.get("completed"))
+            item["counts_quota"] = kind not in _NON_QUOTA_KINDS
+            sessions.append(item)
+        # 配额摘要：普通会话计配额；剧情/创作不计（与 turn.py 口径一致）
+        try:
+            quota_max = _permissions.get_max_special_sessions(
+                _permissions.get_role(uid))
+        except Exception:
+            quota_max = None
         return {
-            "sessions": mgr.list_sessions(uid),
+            "sessions": sessions,
             "active": active.name if active else None,
+            "quota_used": sum(1 for s in sessions if s["counts_quota"]),
+            "quota_max": quota_max,
+            "scene_archives": sum(1 for s in sessions if s["kind"] == "bond_scene"),
+            "scene_done": sum(1 for s in sessions
+                              if s["kind"] == "bond_scene" and s["completed"]),
         }
     except Exception as e:
         return {"sessions": [], "active": None, "error": str(e)}

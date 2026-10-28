@@ -86,10 +86,28 @@
         detail.textContent = d.error || '该用户没有特殊会话';
         return;
       }
-      detail.innerHTML = d.sessions.map(s => `<div class="fb-item">
+      // 配额摘要：普通会话计配额，剧情/创作不计（scene-session-archive §5.5/T15）
+      const summary = (d.quota_max != null)
+        ? `<div class="row muted" style="margin-bottom:8px">
+             普通会话 ${d.quota_used}/${d.quota_max} ·
+             剧情归档 ${d.scene_archives}（已完结 ${d.scene_done}）· 不计配额
+           </div>`
+        : '';
+      const badge = (s) => {
+        if (s.kind === 'bond_scene') {
+          return s.completed
+            ? '<span class="pill badge-ok">剧情·已完结</span>'
+            : '<span class="pill">剧情·进行中</span>';
+        }
+        if (s.kind === 'char_creation') return '<span class="pill">角色创作</span>';
+        return '';
+      };
+      detail.innerHTML = summary + d.sessions.map(s => `<div class="fb-item">
         <div class="row">
           <strong>${esc(s.name)}</strong>
+          ${badge(s)}
           ${d.active === s.name ? '<span class="pill badge-ok">当前激活</span>' : ''}
+          ${s.counts_quota ? '' : '<span class="muted">不计配额</span>'}
           <span class="muted">${s.total_messages || 0} 条消息</span>
           <span class="muted">最后活跃 ${s.last_active ? fmtTs(s.last_active) : '—'}</span>
           <span class="spacer"></span>
