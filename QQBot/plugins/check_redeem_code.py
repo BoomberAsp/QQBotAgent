@@ -91,18 +91,22 @@ def get_redeem_codes() -> list[dict]:
     return valid
 
 
-# Codes first seen within this many days count as time-limited event codes
-# even when the source provides no expiry date (event codes typically live
-# 2–4 weeks; permanent codes eventually age out of this window).
+# Scraped codes first seen within this many days count as time-limited event
+# codes even when the source provides no expiry date (event codes typically
+# live 2–4 weeks; permanent codes eventually age out of this window).
+# Panel entries (_source="panel") are exempt: there the admin states the
+# intent explicitly — a blank `valid` means long-term, full stop.
 _RECENT_DAYS = 30
 
 
 def get_time_limited_codes(grace_days: int = _CLEANUP_DAYS) -> list[dict]:
     """Return time-limited codes.
 
-    Time-limited = has a known expiry date (`valid`), OR was first published
-    within the last _RECENT_DAYS days (fresh event codes whose expiry the
-    source doesn't state). Includes codes expired within `grace_days`.
+    Time-limited = has a known expiry date (`valid`), OR (scraped entries
+    only) was first published within the last _RECENT_DAYS days — fresh
+    event codes whose expiry the source doesn't state. A panel entry with
+    no `valid` is an admin-declared long-term code and never lands here.
+    Includes codes expired within `grace_days`.
 
     Each returned entry gets a transient "recently_expired" bool key
     (not persisted to the cache). Sorted: non-expired first, newest first.
@@ -120,7 +124,11 @@ def get_time_limited_codes(grace_days: int = _CLEANUP_DAYS) -> list[dict]:
                 continue  # expired beyond the grace window
             recently_expired = parsed < now
         else:
-            # No expiry info → only count as time-limited if recently added
+            # No expiry info. Panel entries are the admin's explicit
+            # statement (blank valid = long-term) — never guess. Scraped
+            # entries only count as time-limited if recently added.
+            if entry.get("_source") == "panel":
+                continue  # → long-term bucket
             added = entry.get("_added", "") or ""
             if not added or added < recent_cutoff:
                 continue  # old / undated → long-term bucket
@@ -135,11 +143,12 @@ def get_time_limited_codes(grace_days: int = _CLEANUP_DAYS) -> list[dict]:
 
 
 def get_long_term_codes() -> list[dict]:
-    """Return long-term codes: no known expiry AND not recently published.
+    """Return long-term codes: no known expiry AND not a fresh scraped code.
 
-    This bucket mixes genuinely permanent codes with old unverified ones —
-    sources stop tracking expiry for codes they no longer check.
-    Sorted by publish date (_added), newest first.
+    Panel entries with a blank `valid` always belong here (admin-declared
+    long-term). The scraped-entry bucket mixes genuinely permanent codes
+    with old unverified ones — sources stop tracking expiry for codes they
+    no longer check. Sorted by publish date (_added), newest first.
     """
     entries = _load_cache()
     recent_cutoff = (
@@ -150,9 +159,11 @@ def get_long_term_codes() -> list[dict]:
         expiry = entry.get("valid", "")
         if expiry and _parse_date(expiry):
             continue  # has expiry info → time-limited bucket
-        added = entry.get("_added", "") or ""
-        if added and added >= recent_cutoff:
-            continue  # fresh event code → time-limited bucket
+        if entry.get("_source") != "panel":
+            # Recency heuristic is for scraped data only (see _RECENT_DAYS)
+            added = entry.get("_added", "") or ""
+            if added and added >= recent_cutoff:
+                continue  # fresh event code → time-limited bucket
         out.append(entry)
     out.sort(key=lambda e: e.get("_added", "") or "", reverse=True)
     return out
@@ -663,13 +674,17 @@ def _parse_html(html: str) -> list[dict]:
                     content = content or clean_cells[1]
 
         if code and len(code) >= 8:
-            # Expiry often lives only in prose inside content — extract it
+            # Expiry and publish date often live only in prose inside the
+            # raw content cell — extract both BEFORE _normalize_content
+            # strips the "(Added on …)" parenthetical (the _load_cache
+            # backfill can't recover it once normalized).
             if not valid:
                 valid = _parse_prose_date(content)
             codes.append({
                 "code": code,
                 "content": _normalize_content(content),
                 "valid": valid,
+                "_added": _parse_added_date(content),
             })
 
     if not codes:
@@ -686,6 +701,7 @@ def _parse_html(html: str) -> list[dict]:
                 "code": match.group(1),
                 "content": _normalize_content(raw_content),
                 "valid": _parse_prose_date(raw_content),
+                "_added": _parse_added_date(raw_content),
             })
 
     print(f"[RedeemCode] Parsed {len(codes)} codes from HTML", file=sys.stderr)
