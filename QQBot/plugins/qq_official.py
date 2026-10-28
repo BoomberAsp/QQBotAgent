@@ -42,9 +42,11 @@ from adapters.qq_official import (
     HANDLED_EVENTS,
     QQOfficialSender,
     build_view,
+    kb_snapshot,
     send_active_c2c,
     send_active_c2c_media,
 )
+from adapters.qq_official_buttons import click_snapshot
 from agent import bond_content, greeting
 from agent.asset_memory import AssetCard, make_asset_id, prompt_hash_of
 from agent.character_registry import get_character_registry
@@ -113,7 +115,11 @@ async def _official_status_startup():
             # Unconditional: proves process liveness even while the
             # official websocket is down (state stays "disconnected"
             # and fresh, instead of degrading to "stale").
-            _write_status(messages_total=_msg_total, last_message_at=_last_msg_at)
+            # buttons= (§10.1): keyboard breaker state + click telemetry,
+            # so the panel/ops can see degradation without tailing logs.
+            _write_status(
+                messages_total=_msg_total, last_message_at=_last_msg_at,
+                buttons={**kb_snapshot(), **click_snapshot()})
 
     asyncio.create_task(_heartbeat())
 

@@ -63,6 +63,27 @@ class OutMarkdown:
 
 
 @dataclass
+class OutKeyboard:
+    """A markdown body + button rows (buttons-design §6.2, P0+P1).
+
+    ``markdown`` is the message the keyboard rides on — the official
+    API only attaches keyboards to msg_type=2, so a keyboard ALWAYS
+    carries its own body text (never glued onto a foreign payload).
+    ``rows`` is a lib.button_spec.Rows (list[list[Btn]]), validated by
+    every send path before the wire.
+
+    OneBot: degrades to send_text(markdown + to_text(rows)) — the
+    render layer gates on supports_keyboard, so this is a safety net
+    only. Official: QQOfficialSender buffers it and merges with the
+    adjacent markdown run at flush() (0 extra quota), with the
+    kb→md-only→plain-text rejection ladder in _send_payload().
+    """
+    markdown: str
+    rows: list                 # lib.button_spec.Rows — kept untyped here
+    label: str = ""            # for logs / fallback text
+
+
+@dataclass
 class OutProgress:
     """An intermediate progress line ("正在思考…" and friends).
 
@@ -116,9 +137,17 @@ class Sender(Protocol):
     # markdown on that route. send_markdown() must still accept text on
     # every implementation (degrading to plain text when False).
     supports_markdown: bool
+    # Keyboard capability (buttons-design §6.2): True only when the
+    # platform can attach inline buttons right now — official route:
+    # custom-button permission granted + markdown available + circuit
+    # breaker closed + graylist allows this user. OneBot is always
+    # False. The kernel probes this (getattr-tolerant, so pre-keyboard
+    # test stubs degrade to markdown/text) before rendering buttons.
+    supports_keyboard: bool
 
     async def send_text(self, text: str) -> None: ...
     async def send_image(self, img: OutImage) -> None: ...
     async def send_audio(self, audio: OutAudio) -> None: ...
     async def send_markdown(self, text: str) -> None: ...
+    async def send_keyboard(self, msg: OutKeyboard) -> None: ...
     async def send_progress(self, text: str, *, immediate: bool = False) -> None: ...

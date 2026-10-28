@@ -50,15 +50,21 @@ from nonebot.adapters.qq.exception import (
     NetworkError,
     RateLimitException,
 )
+from nonebot.adapters.qq.message import Message
 
 from agent.inbound import Attachment, InboundMessage
-from agent.outbound import OutAudio, OutImage
+from agent.outbound import OutAudio, OutImage, OutKeyboard
+from lib.button_spec import clip_rows, to_text
+from lib.button_spec import validate as validate_buttons
 
 # Reuse the neutral URL→disk download helper (stage 2 parked it in the
 # OneBot adapter; its bot=None path is pure httpx and platform-neutral).
 # Importing beats duplicating ~100 lines of naming/size/magic-byte logic
 # that must not drift between the two routes.
 from adapters.onebot import _download_and_save_file
+# Rows → wire MessageKeyboard (leaf module; it reaches back into THIS
+# module only inside functions, so the top-level import is acyclic).
+from adapters.qq_official_buttons import to_message_keyboard
 
 # Conservative per-message text cap for merged payloads. The kernel's
 # _send_response already chunks at 300 chars; this only guards the
@@ -139,6 +145,160 @@ def _md_record_reject() -> None:
 
 def _md_record_success() -> None:
     _md_breaker.rejects = 0
+
+
+# ── Keyboard (消息按钮) 能力层 ─────────────────────────────────────
+# 键盘只能挂在 msg_type=2（markdown）消息上，且自定义按钮属【内邀开通】
+# 能力——未开通统一 304037。错误码语义（docs 错误码表 + 设计稿 §8）：
+#   304037 没有发消息按钮组件的权限（未内邀）→ unsupported + 长熔断
+#   304038/304039/304040 组件不存在/解析错/内容错 → 载荷 bug，ERROR 日志
+#   305007 键盘样式参数错误 → 字段类型 bug，ERROR 日志
+#   40034029 内联键盘行/列超限、304062 按钮数量上限 → 先裁剪重试一次
+# 其余连续被拒走短熔断（3 次/600s），任何键盘失败都不丢正文：
+# kb → md-only（L1）→ 纯文本+命令清单（L2）。
+_KB_REJECT_CODES = frozenset({
+    304037, 304038, 304039, 304040, 305007, 40034029, 304062,
+})
+_KB_CLIP_CODES = frozenset({40034029, 304062})
+_KB_BUG_CODES = frozenset({304038, 304039, 304040, 305007})
+_KB_BREAKER_THRESHOLD = 3
+_KB_BREAKER_COOLDOWN = 600.0
+
+
+@dataclass
+class _KbBreaker:
+    """Module-level keyboard circuit-breaker state (design §8.3).
+
+    ``state``: unknown（尚未探测）| ok（平台已接受过键盘）|
+    unsupported（吃过 304037，冷却期内直接 L1）。半开：冷却期满
+    state 回 unknown，下一条键盘即试探。
+    """
+    state: str = "unknown"
+    rejects: int = 0
+    disabled_until: float = 0.0
+    rejected_total: int = 0
+    last_reject_code: int | None = None
+    last_reject_at: float = 0.0
+
+
+_kb_breaker = _KbBreaker()
+
+
+def _kb_env() -> str:
+    """QQ_OFFICIAL_BUTTONS：auto（默认，探测+熔断）| on | off（热读逃生门）。"""
+    return (os.environ.get("QQ_OFFICIAL_BUTTONS", "auto").strip().lower()
+            or "auto")
+
+
+def _kb_unsupported_hours() -> float:
+    try:
+        return max(0.0, float(os.environ.get(
+            "QQ_OFFICIAL_BUTTONS_CIRCUIT_HOURS", "24")))
+    except ValueError:
+        return 24.0
+
+
+def _kb_available() -> bool:
+    """键盘当前是否可发：env≠off && markdown 可发 && 熔断未开。
+
+    键盘必须骑 markdown（msg_type=2），所以 _md_available() 是硬前置；
+    熔断冷却期满自动半开（清计数、unsupported→unknown 重新探测）。
+    """
+    if _kb_env() == "off":
+        return False
+    if not _md_available():
+        return False
+    if _kb_breaker.disabled_until:
+        if time.monotonic() < _kb_breaker.disabled_until:
+            return False
+        _kb_breaker.disabled_until = 0.0
+        _kb_breaker.rejects = 0
+        if _kb_breaker.state == "unsupported":
+            _kb_breaker.state = "unknown"
+        logger.info("[qq_official] keyboard breaker half-open; retrying")
+    return True
+
+
+def _kb_record_reject(code) -> None:
+    _kb_breaker.rejected_total += 1
+    _kb_breaker.last_reject_code = code
+    _kb_breaker.last_reject_at = time.time()
+    if code == 304037:
+        # 权限未开通：长熔断，期间所有键盘直接 L1，不再逐条试错
+        _kb_breaker.state = "unsupported"
+        _kb_breaker.rejects = 0
+        _kb_breaker.disabled_until = (time.monotonic()
+                                      + _kb_unsupported_hours() * 3600.0)
+        logger.warning(
+            "[qq_official] keyboard permission not granted (304037); "
+            f"buttons disabled for {_kb_unsupported_hours():.0f}h")
+        return
+    if code in _KB_BUG_CODES:
+        logger.error(
+            f"[qq_official] keyboard payload rejected (code={code}) — "
+            "likely a render bug; check recent button payloads")
+    _kb_breaker.rejects += 1
+    if (_kb_breaker.rejects >= _KB_BREAKER_THRESHOLD
+            and not _kb_breaker.disabled_until):
+        _kb_breaker.disabled_until = time.monotonic() + _KB_BREAKER_COOLDOWN
+        logger.warning(
+            f"[qq_official] keyboard rejected {_kb_breaker.rejects}× "
+            f"consecutively; degrading to markdown-only for "
+            f"{_KB_BREAKER_COOLDOWN:.0f}s")
+
+
+def _kb_record_success() -> None:
+    _kb_breaker.rejects = 0
+    if _kb_breaker.state != "ok":
+        _kb_breaker.state = "ok"
+        logger.info("[qq_official] keyboard accepted by platform (state=ok)")
+
+
+def kb_snapshot() -> dict:
+    """Keyboard capability snapshot for the status heartbeat (§10.1)."""
+    left = 0.0
+    if _kb_breaker.disabled_until:
+        left = max(0.0, round(_kb_breaker.disabled_until - time.monotonic(), 1))
+    return {
+        "state": _kb_breaker.state,
+        "env": _kb_env(),
+        "available": _kb_available(),
+        "rejects": _kb_breaker.rejects,
+        "rejected_total": _kb_breaker.rejected_total,
+        "last_reject_code": _kb_breaker.last_reject_code,
+        "last_reject_at": _kb_breaker.last_reject_at,
+        "disabled_seconds_left": left,
+    }
+
+
+def _event_user_openid(event) -> str:
+    """The acting user's openid (group: member_openid; c2c: user_openid)."""
+    author = getattr(event, "author", None)
+    return str(getattr(author, "member_openid", "")
+               or getattr(author, "user_openid", "") or "")
+
+
+def _iter_segments(message):
+    """Message | MessageSegment → iterable of segments."""
+    if isinstance(message, Message):
+        return list(message)
+    return [message]
+
+
+def _message_has_markdown(message) -> bool:
+    return any(getattr(s, "type", "") == "markdown"
+               for s in _iter_segments(message))
+
+
+def _md_seg_content(message) -> str:
+    """The markdown text inside a segment/Message ('' when absent)."""
+    for seg in _iter_segments(message):
+        if getattr(seg, "type", "") == "markdown":
+            md = seg.data.get("markdown")
+            content = getattr(md, "content", None) or (
+                md.get("content") if isinstance(md, dict) else None) or ""
+            return str(content)
+    return ""
 
 
 def _drop_by_priority(payloads: list[tuple[MessageSegment, str]],
@@ -457,6 +617,7 @@ class QQOfficialSender:
     def __init__(self, bot: QQBot, event: QQMessageEvent, is_group: bool):
         self._bot = bot
         self._event = event
+        self._is_group = is_group
         # group: 5 replies / 5min; c2c: 4 replies / 60min (per msg_id)
         self.max_messages_per_turn = 5 if is_group else 4
         self._buffer: list[tuple[str, object]] = []
@@ -467,6 +628,19 @@ class QQOfficialSender:
         # Dynamic: env kill-switch (hot-read) + circuit breaker. The
         # kernel queries this per turn to pick the render format.
         return _md_available()
+
+    @property
+    def supports_keyboard(self) -> bool:
+        """Dynamic: keyboard layer available + this user passes the
+        QQ_OFFICIAL_BUTTONS_USERS graylist (empty list = everyone)."""
+        if not _kb_available():
+            return False
+        allow = os.environ.get("QQ_OFFICIAL_BUTTONS_USERS", "").strip()
+        if not allow:
+            return True
+        allowed = {x.strip() for x in allow.replace("，", ",").split(",")
+                   if x.strip()}
+        return _event_user_openid(self._event) in allowed
 
     def wants_reply(self, view: InboundMessage) -> bool:
         # c2c: always answer. Group: only when @-mentioned — the
@@ -511,6 +685,29 @@ class QQOfficialSender:
         else:
             await self.send_text(text)
 
+    async def send_keyboard(self, msg: OutKeyboard) -> None:
+        """Buffer a markdown-body + buttons payload (design §6.4).
+
+        Pre-wire degradation: an invalid layout or an unavailable
+        keyboard layer (env off / breaker open / markdown dead / user
+        not in graylist) drops ONLY the buttons — the body still goes
+        out through send_markdown (which itself degrades to text), so
+        content is never lost. Platform-side rejection is handled by
+        the ladder in _send_payload (kb → md-only → text + commands).
+        """
+        rows = msg.rows or []
+        problems = validate_buttons(rows)
+        if problems:
+            logger.warning(
+                f"[qq_official] keyboard invalid ({problems[:2]}); "
+                f"sending markdown-only (label={msg.label!r})")
+            await self.send_markdown(msg.markdown)
+            return
+        if not self.supports_keyboard:
+            await self.send_markdown(msg.markdown)
+            return
+        self._buffer.append(("kb", msg))
+
     async def send_image(self, img: OutImage) -> None:
         self._buffer.append(("image", img))
 
@@ -542,34 +739,97 @@ class QQOfficialSender:
             return
         if len(payloads) > remaining:
             payloads = _drop_by_priority(payloads, len(payloads) - remaining)
-        for seg, _kind in payloads:
-            await self._send_once(seg)
+        for message, _kind, kb_meta in payloads:
+            await self._send_payload(message, kb_meta)
 
     async def _send_once(self, seg: MessageSegment) -> None:
-        for attempt in range(2):
+        """Legacy single-segment send (immediate progress line)."""
+        await self._send_payload(seg, None)
+
+    async def _send_payload(self, message, kb_meta=None) -> None:
+        """Send one merged payload; drive its degradation ladder.
+
+        ``kb_meta`` = (md_text, OutKeyboard) when a keyboard rides this
+        payload. Ladder (design §8.1): kb reject code → clip-and-retry
+        once for the over-limit codes (40034029/304062) → md-only (L1)
+        → md reject → plain text + to_text command list (L2). Payloads
+        without a keyboard keep the pre-button behavior verbatim: audio
+        file-card fallback, _markdown_text_fallback, one network retry,
+        log-and-drop.
+        """
+        kb = kb_meta[1] if kb_meta else None
+        md_text = kb_meta[0] if kb_meta else ""
+        net_retried = False
+        clipped = False
+        kb_dropped = kb is None
+        md_dropped = False
+        audio_dropped = False
+        for _ in range(6):  # bounded: net(1)+clip(1)+kb(1)+md(1)+audio(1)
             try:
-                await self._bot.send(self._event, seg)
+                await self._bot.send(self._event, message)
                 self._sent += 1
-                if getattr(seg, "type", "") == "markdown":
+                if _message_has_markdown(message):
                     _md_record_success()
+                if kb is not None and not kb_dropped:
+                    _kb_record_success()
                 return
             except (NetworkError, RateLimitException) as e:
-                if attempt == 0:
+                if not net_retried:
+                    net_retried = True
                     await asyncio.sleep(1.0)
                     continue
                 logger.warning(f"[qq_official] send failed after retry: {e!r}")
+                return
             except ActionFailed as e:
-                # 语音条被拒 → 换文件卡再试一次（格式口径冲突的降级梯）
-                fallback = _audio_as_file_fallback(seg)
-                if fallback is None:
-                    # markdown 被拒（模板/语法/URL 类错误码）→ 同内容
-                    # 纯文本再试一次 + 熔断计数（设计稿 §6.10.10 / §8.1 L2）
-                    fallback = _markdown_text_fallback(seg, e)
-                if fallback is not None and attempt == 0:
+                code = getattr(e, "code", None)
+                # 1) keyboard rejected → clip retry / strip to md-only
+                if (kb is not None and not kb_dropped
+                        and code in _KB_REJECT_CODES):
+                    if code in _KB_CLIP_CODES and not clipped:
+                        clipped = True
+                        rows = clip_rows(kb.rows)
+                        logger.warning(
+                            f"[qq_official] keyboard over-limit "
+                            f"(code={code}); clipped to "
+                            f"{sum(len(r) for r in rows)} button(s), retrying")
+                        message = self._kb_message(md_text, rows)
+                        continue
+                    kb_dropped = True
+                    _kb_record_reject(code)
                     logger.warning(
-                        f"[qq_official] {seg.type} rejected ({e!r}); "
-                        f"retrying as {fallback.type}")
-                    seg = fallback
+                        f"[qq_official] keyboard rejected (code={code}); "
+                        f"retrying markdown-only")
+                    message = MessageSegment.markdown(md_text or " ")
+                    continue
+                # 2) markdown rejected on a kb payload → L2 text WITH the
+                #    command list (buttons are unreachable from here on)
+                fallback = None
+                if (code in _MD_REJECT_CODES and kb is not None
+                        and not md_dropped):
+                    md_dropped = True
+                    _md_record_reject()
+                    if not kb_dropped:
+                        # md dead ⇒ keyboard dead: converge both breakers
+                        _kb_record_reject(code)
+                        kb_dropped = True
+                    extra = to_text(kb.rows)
+                    body = md_text or _md_seg_content(message)
+                    fallback = MessageSegment.text(
+                        f"{body}\n\n{extra}" if extra else body)
+                elif isinstance(message, MessageSegment):
+                    # 语音条被拒 → 换文件卡再试一次（格式口径冲突的降级梯）
+                    fallback = _audio_as_file_fallback(message)
+                    if fallback is not None:
+                        audio_dropped = True
+                    elif not audio_dropped:
+                        # markdown 被拒（模板/语法/URL 类错误码）→ 同内容
+                        # 纯文本再试一次 + 熔断计数（§6.10.10 / §8.1 L2）
+                        fallback = _markdown_text_fallback(message, e)
+                if fallback is not None:
+                    logger.warning(
+                        f"[qq_official] {getattr(message, 'type', 'message')} "
+                        f"rejected ({e!r}); retrying as {fallback.type}")
+                    message = fallback
                     continue
                 # API rejection (audit, quota, bad payload) — not retryable
                 logger.warning(f"[qq_official] send rejected: {e!r}")
@@ -579,8 +839,17 @@ class QQOfficialSender:
                     f"[qq_official] send failed: {type(e).__name__}: {e}")
                 return
 
-    def _merged_payloads(self) -> list[tuple[MessageSegment, str]]:
-        """Merge the buffer into (segment, priority-kind) payloads.
+    def _kb_message(self, md_text: str, rows) -> Message:
+        """Build the wire md+keyboard message for a body/rows pair."""
+        wire = to_message_keyboard(
+            rows,
+            scope="group" if self._is_group else "c2c",
+            openid=_event_user_openid(self._event))
+        return Message([MessageSegment.markdown(md_text or " "),
+                        MessageSegment.keyboard(wire)])
+
+    def _merged_payloads(self) -> list[tuple]:
+        """Merge the buffer into (message, priority-kind, kb-meta) payloads.
 
         Consecutive text fragments join into one message (the kernel's
         1s-apart 300-char chunks collapse); images keep their position
@@ -588,11 +857,21 @@ class QQOfficialSender:
         markdown* (joined by a blank line, then block-split at
         _MD_CHUNK_LIMIT): mixing plain text into a msg_type=2 payload
         would render its markers verbatim, and splitting mid-line would
-        break md syntax. Kind is "text"/"markdown"/"media" for the
-        quota-drop priority in _drop_by_priority."""
-        out: list[tuple[MessageSegment, str]] = []
+        break md syntax.
+
+        A "kb" entry merges with the *immediately preceding* md run into
+        one md+keyboard message (§6.4) — after a text/image payload the
+        keyboard stands alone on its own markdown body (plain text is
+        never force-converted to md: escaping artifacts). The keyboard
+        rides the LAST chunk of a block-split body. kb-meta is
+        (body_text, OutKeyboard) — exactly what _send_payload's
+        degradation ladder needs to rebuild lower rungs. Kind is
+        "text"/"markdown"/"media" for _drop_by_priority (a kb payload
+        counts as "markdown" — body-class, dropped last)."""
+        out: list[tuple] = []
         text_run: list[str] = []
         md_run: list[str] = []
+        kb_count = 0
 
         def flush_text() -> None:
             if not text_run:
@@ -601,7 +880,7 @@ class QQOfficialSender:
             text_run.clear()
             for i in range(0, len(merged), _TEXT_CHUNK_LIMIT):
                 out.append((MessageSegment.text(merged[i:i + _TEXT_CHUNK_LIMIT]),
-                            "text"))
+                            "text", None))
 
         def flush_md() -> None:
             if not md_run:
@@ -609,7 +888,7 @@ class QQOfficialSender:
             merged = "\n\n".join(md_run)
             md_run.clear()
             for chunk in _split_markdown(merged):
-                out.append((MessageSegment.markdown(chunk), "markdown"))
+                out.append((MessageSegment.markdown(chunk), "markdown", None))
 
         for kind, item in self._buffer:
             if kind == "text":
@@ -618,13 +897,35 @@ class QQOfficialSender:
             elif kind == "markdown":
                 flush_text()
                 md_run.append(item)    # type: ignore[arg-type]
+            elif kind == "kb":
+                flush_text()
+                kb_count += 1
+                if kb_count > 1:
+                    logger.warning(
+                        "[qq_official] multiple keyboards in one turn; "
+                        "each becomes a standalone message")
+                kb: OutKeyboard = item                    # type: ignore[assignment]
+                body_parts = [p for p in md_run if p.strip()]
+                md_run.clear()
+                if (kb.markdown or "").strip():
+                    body_parts.append(kb.markdown.strip())
+                body = "\n\n".join(body_parts) or to_text(kb.rows) or " "
+                chunks = _split_markdown(body)
+                for chunk in chunks[:-1]:
+                    out.append((MessageSegment.markdown(chunk),
+                                "markdown", None))
+                # kb-meta carries the LAST chunk (the one this payload
+                # sends): the degradation ladder must rebuild exactly
+                # this message, not re-send earlier standalone chunks.
+                out.append((self._kb_message(chunks[-1], kb.rows),
+                            "markdown", (chunks[-1], kb)))
             else:
                 flush_text()
                 flush_md()
                 seg = (self._image_segment(item) if kind == "image"  # type: ignore[arg-type]
                        else self._audio_segment(item))               # type: ignore[arg-type]
                 if seg is not None:
-                    out.append((seg, "media"))
+                    out.append((seg, "media", None))
         flush_text()
         flush_md()
         return out

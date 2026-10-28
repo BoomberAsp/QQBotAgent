@@ -154,6 +154,16 @@ _turn_sender: contextvars.ContextVar[Optional["Sender"]] = (
     contextvars.ContextVar("_turn_sender", default=None)
 )
 
+# Per-turn keyboard reservation (buttons P1). A tool that produces a
+# "result page" (gacha pull, speed check…) sets this to a
+# lib.button_spec.Rows list; _send_response's official-markdown branch
+# consumes it ONCE (get → set None) and rides the buttons on the reply
+# body at zero extra quota. Plain/split render paths and OneBot ignore
+# and clear it — a keyboard can only ride a msg_type=2 markdown message.
+_turn_keyboard: contextvars.ContextVar[Optional[list]] = (
+    contextvars.ContextVar("_turn_keyboard", default=None)
+)
+
 # ── Story knowledge base (Ark Re:Code 原作剧情) ────────────────────
 # Per-turn retrieved original-story block. Built by agent/turn.py from the
 # local FTS index when a character persona is about to speak, then injected by

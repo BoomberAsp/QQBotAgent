@@ -64,6 +64,9 @@ class OneBotSender:
     # NapCat/QQ has no native markdown rendering; the render layer must
     # never emit markdown on this route (buttons-design §6.10.7).
     supports_markdown = False
+    # No inline keyboards on the OneBot route either — the render layer
+    # gates on this, so send_keyboard below is a pure safety net.
+    supports_keyboard = False
 
     def __init__(self, matcher):
         self._matcher = matcher
@@ -101,6 +104,22 @@ class OneBotSender:
 
     async def send_markdown(self, text: str) -> None:
         await self.send_text(text)
+
+    async def send_keyboard(self, msg) -> None:
+        """Safety-net degradation (supports_keyboard=False gates this).
+
+        The render layer never emits OutKeyboard on the OneBot route;
+        if one leaks through anyway (a tool preset _turn_keyboard on a
+        shared code path), render body + command list as plain text so
+        the content is never lost — with markdown markers stripped,
+        because this channel renders them verbatim.
+        """
+        from lib.button_spec import to_text
+
+        from agent.turn import _clean_md_markers
+        body = _clean_md_markers(msg.markdown or "").strip()
+        commands = to_text(msg.rows)
+        await self.send_text(f"{body}\n\n{commands}" if commands else body)
 
     async def send_progress(self, text: str, *, immediate: bool = False) -> None:
         # OneBot has no per-turn reply quota — progress lines go out
