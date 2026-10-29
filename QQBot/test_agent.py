@@ -99,6 +99,26 @@ class MockDeepSeekClient:
                 "finish_reason": "stop",
             }
 
+    async def chat_completion_with_tools_stream(self, messages, tools,
+                                                timeout=180.0,
+                                                purpose="agent_loop",
+                                                *, content_callback=None):
+        """Streaming mock: fires content_callback ONCE with the full text.
+
+        Mirrors the real client's suppression rule — a tool_call round
+        emits no content (so content_callback never fires), the final
+        round forwards its content. Returns the identical dict shape.
+        """
+        result = await self.chat_completion_with_tools(
+            messages, tools, timeout=timeout, purpose=purpose)
+        content = result.get("content")
+        if content_callback is not None and content and not result.get("tool_calls"):
+            import asyncio as _aio
+            _maybe = content_callback(content)
+            if _aio.iscoroutine(_maybe):
+                await _maybe
+        return result
+
 
 # ── Test Cases ────────────────────────────────────────────────────
 
@@ -9757,7 +9777,7 @@ class TestOfficialMarkdown:
         print_pass("md/text 分组互不混入，相对顺序保持")
 
     async def test_md_block_split(self):
-        """超长 md 按区块边界切分，每块 ≤1500，不切行中。"""
+        """超长 md 按区块边界切分，每块 ≤_MD_CHUNK_LIMIT，不切行中。"""
         qo = self._qo()
         body = "\n\n".join(f"## 段落{i}\n内容行A\n内容行B" for i in range(150))
         chunks = qo._split_markdown(body)
@@ -9765,7 +9785,8 @@ class TestOfficialMarkdown:
         assert all(len(c) <= qo._MD_CHUNK_LIMIT for c in chunks)
         assert not any(c.endswith("内容行") for c in chunks), "不得切在行中"
         assert qo._split_markdown("短文本") == ["短文本"]
-        print_pass(f"区块切分：{len(body)}字 → {len(chunks)} 块，均 ≤1500")
+        print_pass(f"区块切分：{len(body)}字 → {len(chunks)} 块，"
+                   f"均 ≤{qo._MD_CHUNK_LIMIT}")
 
     async def test_reject_code_degrades_to_text(self):
         """md 被拒（40034011）→ 同内容纯文本重发一次，内容不丢。"""
@@ -9932,7 +9953,9 @@ class TestOfficialMarkdown:
         # 不得残留裸 #命令：# 紧跟非空白「非 #」字符且前面不是反斜杠
         # （排除 ## 真标题——其首 # 后是 #，属 [^\s#] 之外，不会被误判）
         assert not re.search(r"(?<!\\)#(?=[^\s#])", md), "存在未转义的 # 命令前缀"
-        assert len(md) <= 1500, f"帮助应单条发出，实际 {len(md)} 字"
+        import adapters.qq_official as qo
+        assert len(md) <= qo._MD_CHUNK_LIMIT, \
+            f"帮助应单条发出，实际 {len(md)} 字"
         print_pass(f"/帮助 → 单条 md（{len(md)} 字，白名单安全，# 命令已转义）")
 
     async def test_redeem_markdown_bodies(self):
@@ -10517,6 +10540,951 @@ class TestOfficialButtons:
         print_pass("#n 别名：按 list_sessions 序解析，越界报错，非序号透传")
 
 
+# ── streaming test fakes (qq_official c2c stream_messages) ─────────
+
+def _stream_action_failed(code, status=400):
+    """Build a nonebot QQ ActionFailed carrying a platform error code."""
+    from nonebot.drivers import Response
+    from nonebot.adapters.qq.exception import ActionFailed
+    return ActionFailed(Response(
+        status_code=status, headers={},
+        content=json.dumps({"code": code, "message": "rejected"}).encode()))
+
+
+class _FakeAPIBase:
+    def joinpath(self, *parts):
+        return "https://test.local/" + "/".join(str(p) for p in parts)
+
+
+class _StreamFakeBot:
+    """Fake QQBot for MessageStreamer: captures stream_messages POSTs.
+
+    ``responder(payload)`` returns a response dict or raises. The default
+    returns a per-stream id (so progress/answer get distinct
+    stream_msg_id) plus a generous remain budget.
+    """
+
+    def __init__(self, responder=None):
+        self.posts = []
+        self._responder = responder or self._default_responder
+        self.adapter = self
+
+    def get_api_base(self):
+        return _FakeAPIBase()
+
+    @staticmethod
+    def _default_responder(payload):
+        return {"id": f"smid_{payload['msg_seq']}",
+                "timestamp": 0, "remain_msg_len": 5000}
+
+    async def _request(self, request):
+        payload = request.json
+        self.posts.append(payload)
+        return self._responder(payload)
+
+
+class _FakeStreamCtx:
+    def __init__(self, lines, status=200, body=b""):
+        self._lines = lines
+        self.status_code = status
+        self._body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def aread(self):
+        return self._body
+
+    async def aiter_lines(self):
+        for ln in self._lines:
+            yield ln
+
+
+class _FakeHttpClient:
+    """Stand-in for httpx.AsyncClient yielding canned SSE lines."""
+
+    _lines: list = []
+    _status = 200
+    _body = b""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def stream(self, method, url, headers=None, json=None, timeout=None):
+        return _FakeStreamCtx(self._lines, self._status, self._body)
+
+
+def _sse(obj):
+    return f"data: {__import__('json').dumps(obj)}"
+
+
+class TestOfficialStream:
+    """53. QQ 官方渠道流式消息（stream_messages，仅单聊，§6.10.11.2）.
+
+    三层离线覆盖：① deepseek_client SSE 解析器（罐装 chunk → 与非流式
+    同形结果、工具碎片按 index 累积、content 抑制、reasoning 永不转发、
+    usage 末片、HTTP≥400 错误前缀、畸形行跳过）；② MessageStreamer 传输
+    + 熔断（双流时序/同锚点、open_answer 失败回退、remain 耗尽截断、
+    3 连拒 600s + 半开、is_wakeup 开流重试、50002 退避、ApiNotAvailable
+    长熔断、免责末片、纯进度轮、env 门控）；③ Mock 客户端流式回调。
+    """
+
+    def run(self):
+        print_header("53. QQ Official Stream (stream_messages, c2c)")
+        os.environ.setdefault("USER_DATA_ROOT", "/tmp/qqbot_smoke")
+        # ① SSE parser
+        asyncio.run(self.test_sse_content_streaming())
+        asyncio.run(self.test_sse_tool_fragments_suppress_content())
+        asyncio.run(self.test_sse_reasoning_never_forwarded())
+        asyncio.run(self.test_sse_http_error_prefix())
+        asyncio.run(self.test_sse_malformed_lines_skipped())
+        # ② MessageStreamer transport + breaker
+        asyncio.run(self.test_sender_stream_capability())
+        asyncio.run(self.test_dual_stream_sequencing())
+        asyncio.run(self.test_open_answer_failure_marks_broken())
+        asyncio.run(self.test_remain_exhaustion_truncates())
+        asyncio.run(self.test_disclaimer_rides_final_shard())
+        asyncio.run(self.test_progress_only_no_answer_stream())
+        asyncio.run(self.test_breaker_three_strike_and_half_open())
+        asyncio.run(self.test_api_not_available_long_circuit())
+        asyncio.run(self.test_is_wakeup_retry_on_opening())
+        asyncio.run(self.test_50002_backoff_retry())
+        asyncio.run(self.test_env_off_disables_stream())
+        # ③ mock client
+        asyncio.run(self.test_mock_client_stream_callback())
+
+    # ── helpers ──────────────────────────────────────────────────
+    @staticmethod
+    def _qs():
+        import adapters.qq_official_stream as qs
+        return qs
+
+    @staticmethod
+    def _qo():
+        import adapters.qq_official as qo
+        return qo
+
+    @staticmethod
+    def _stream_guard(qs, qo):
+        import contextlib
+
+        @contextlib.contextmanager
+        def guard():
+            b = qs._stream_breaker
+            snap = (b.state, b.rejects, b.disabled_until, b.rejected_total,
+                    b.last_error, b.last_error_at)
+            md_rejects = qo._md_breaker.rejects
+            md_disabled = qo._md_breaker.disabled_until
+            keys = ("QQ_OFFICIAL_STREAM", "QQ_OFFICIAL_STREAM_INTERVAL",
+                    "QQ_OFFICIAL_STREAM_CIRCUIT_HOURS", "QQ_OFFICIAL_MARKDOWN")
+            envs = {k: os.environ.pop(k, None) for k in keys}
+            try:
+                b.state, b.rejects, b.disabled_until = "unknown", 0, 0.0
+                b.rejected_total, b.last_error, b.last_error_at = 0, "", 0.0
+                qo._md_breaker.rejects = 0
+                qo._md_breaker.disabled_until = 0.0
+                os.environ["QQ_OFFICIAL_STREAM"] = "auto"
+                os.environ["QQ_OFFICIAL_STREAM_INTERVAL"] = "0.2"
+                yield
+            finally:
+                (b.state, b.rejects, b.disabled_until, b.rejected_total,
+                 b.last_error, b.last_error_at) = snap
+                qo._md_breaker.rejects = md_rejects
+                qo._md_breaker.disabled_until = md_disabled
+                for k, v in envs.items():
+                    if v is not None:
+                        os.environ[k] = v
+                    else:
+                        os.environ.pop(k, None)
+        return guard()
+
+    @staticmethod
+    def _mk_streamer(qs, bot, anchor="ANCHOR"):
+        import types
+        return qs.MessageStreamer(bot, types.SimpleNamespace(id=anchor), "OID1")
+
+    @staticmethod
+    def _mk_client(dsc, lines, status=200, body=b""):
+        client = dsc.DeepSeekClient(api_key="k", api_base="http://x", model="m")
+        captured = {}
+        client._record_usage = lambda result, purpose: captured.setdefault(
+            "usage", result)
+        orig = dsc.httpx.AsyncClient
+
+        class _Patched(_FakeHttpClient):
+            _lines = lines
+            _status = status
+            _body = body
+
+        dsc.httpx.AsyncClient = lambda *a, **k: _Patched()
+        return client, captured, orig, dsc
+
+    # ── ① SSE parser ─────────────────────────────────────────────
+    async def test_sse_content_streaming(self):
+        """content 增量实时转发 + 结果与非流式同形 + usage 末片入账。"""
+        import lib.deepseek_client as dsc
+        lines = [
+            _sse({"choices": [{"delta": {"role": "assistant", "content": "你"}}]}),
+            _sse({"choices": [{"delta": {"content": "好"}}]}),
+            _sse({"choices": [{"delta": {"content": "世界"},
+                               "finish_reason": "stop"}],
+                  "usage": {"prompt_tokens": 3, "completion_tokens": 5,
+                            "total_tokens": 8}}),
+            "data: [DONE]",
+        ]
+        client, captured, orig, dsc = self._mk_client(dsc, lines)
+        try:
+            got = []
+
+            async def cb(d):
+                got.append(d)
+
+            res = await client.chat_completion_with_tools_stream(
+                messages=[{"role": "user", "content": "hi"}], tools=[],
+                content_callback=cb)
+            assert res["content"] == "你好世界", res
+            assert res["tool_calls"] is None
+            assert res["role"] == "assistant"
+            assert res["finish_reason"] == "stop"
+            assert got == ["你", "好", "世界"], got
+            assert captured["usage"]["usage"]["total_tokens"] == 8, captured
+        finally:
+            dsc.httpx.AsyncClient = orig
+        print_pass("SSE：content 增量转发 + 同形结果 + usage 末片入账")
+
+    async def test_sse_tool_fragments_suppress_content(self):
+        """工具碎片按 index 累积；碎片出现后的 content 被抑制（不转发）。"""
+        import lib.deepseek_client as dsc
+        lines = [
+            _sse({"choices": [{"delta": {"role": "assistant", "tool_calls": [
+                {"index": 0, "id": "c1", "type": "function",
+                 "function": {"name": "get_", "arguments": ""}}]}}]}),
+            _sse({"choices": [{"delta": {"content": "thinking out loud"}}]}),
+            _sse({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "time",
+                                          "arguments": '{"tz"'}}]}}]}),
+            _sse({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": ':"UTC"}'}}]},
+                "finish_reason": "tool_calls"}]}),
+            "data: [DONE]",
+        ]
+        client, captured, orig, dsc = self._mk_client(dsc, lines)
+        try:
+            got = []
+            res = await client.chat_completion_with_tools_stream(
+                messages=[], tools=[], content_callback=lambda d: got.append(d))
+            assert got == [], f"工具轮 content 不得转发: {got}"
+            assert res["content"] == "thinking out loud", res
+            assert res["finish_reason"] == "tool_calls"
+            tc = res["tool_calls"]
+            assert tc and len(tc) == 1, tc
+            assert tc[0]["id"] == "c1"
+            assert tc[0]["function"]["name"] == "get_time", tc
+            assert tc[0]["function"]["arguments"] == '{"tz":"UTC"}', tc
+        finally:
+            dsc.httpx.AsyncClient = orig
+        print_pass("SSE：工具碎片按 index 累积；content 抑制；name/args 拼接")
+
+    async def test_sse_reasoning_never_forwarded(self):
+        """reasoning_content 增量静默丢弃，但保留在结果里。"""
+        import lib.deepseek_client as dsc
+        lines = [
+            _sse({"choices": [{"delta": {"reasoning_content": "内部思考"}}]}),
+            _sse({"choices": [{"delta": {"content": "答案"}}]}),
+            "data: [DONE]",
+        ]
+        client, captured, orig, dsc = self._mk_client(dsc, lines)
+        try:
+            got = []
+            res = await client.chat_completion_with_tools_stream(
+                messages=[], tools=[], content_callback=lambda d: got.append(d))
+            assert got == ["答案"], got
+            assert res["reasoning_content"] == "内部思考", res
+            assert res["content"] == "答案"
+        finally:
+            dsc.httpx.AsyncClient = orig
+        print_pass("SSE：reasoning 永不转发，仅留存结果")
+
+    async def test_sse_http_error_prefix(self):
+        """HTTP≥400 → 错误 dict，前缀与非流式逐字一致（保 Direct Vision 自愈）。"""
+        import lib.deepseek_client as dsc
+        client, captured, orig, dsc = self._mk_client(
+            dsc, [], status=400, body=b'{"error":"bad request"}')
+        try:
+            got = []
+            res = await client.chat_completion_with_tools_stream(
+                messages=[], tools=[], content_callback=lambda d: got.append(d))
+            assert res["finish_reason"] == "error", res
+            assert res["tool_calls"] is None
+            assert res["content"].startswith("API HTTP错误 (400): "), res
+            assert got == []
+        finally:
+            dsc.httpx.AsyncClient = orig
+        print_pass("SSE：HTTP≥400 错误前缀与非流式一致")
+
+    async def test_sse_malformed_lines_skipped(self):
+        """畸形 SSE 行 log+skip，不中断后续解析。"""
+        import lib.deepseek_client as dsc
+        lines = [
+            "data: {not valid json",
+            "garbage without data prefix",
+            _sse({"choices": [{"delta": {"content": "ok"}}]}),
+            "data: [DONE]",
+        ]
+        client, captured, orig, dsc = self._mk_client(dsc, lines)
+        try:
+            got = []
+            res = await client.chat_completion_with_tools_stream(
+                messages=[], tools=[], content_callback=lambda d: got.append(d))
+            assert got == ["ok"], got
+            assert res["content"] == "ok", res
+        finally:
+            dsc.httpx.AsyncClient = orig
+        print_pass("SSE：畸形行跳过，正常行仍解析")
+
+    # ── ② MessageStreamer transport + breaker ────────────────────
+    async def test_sender_stream_capability(self):
+        """能力位：c2c True / 群聊 False / OneBot False（渠道隔离）。"""
+        qs, qo = self._qs(), self._qo()
+        with self._stream_guard(qs, qo):
+            s_c2c = qo.QQOfficialSender(_MdFakeBot(), MagicMock(), False)
+            assert s_c2c.supports_stream is True
+            s_grp = qo.QQOfficialSender(_MdFakeBot(), MagicMock(), True)
+            assert s_grp.supports_stream is False
+            assert await s_grp.open_stream("x") is None
+            from adapters.onebot import OneBotSender
+            assert OneBotSender(MagicMock()).supports_stream is False
+        print_pass("supports_stream：c2c=True / 群聊=False / OneBot=False")
+
+    async def test_dual_stream_sequencing(self):
+        """双流时序：同 msg_id 锚点、进度 seq900 / 回答 seq1800、各自
+        stream_msg_id 回显、进度收束(state10)先于回答开流、answer_sent 精确。"""
+        qs, qo = self._qs(), self._qo()
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot()
+            st = self._mk_streamer(qs, bot)
+            assert await st.open_progress("⏳ 正在思考…")
+            await st.append_progress("⏳ 正在搜索…")
+            await st.finish_progress()
+            assert await st.open_answer("你好")
+            st.append_answer("，世界！")
+            await st.finish_answer("免责声明。")
+            await st.close()
+            posts = bot.posts
+            assert posts and all(p["msg_id"] == "ANCHOR" for p in posts)
+            prog = [p for p in posts if p["msg_seq"] == 900]
+            ans = [p for p in posts if p["msg_seq"] == 1800]
+            assert prog and ans, posts
+            # opening shard carries no stream_msg_id; later shards echo it
+            assert "stream_msg_id" not in prog[0]
+            assert all(p.get("stream_msg_id") == "smid_900" for p in prog[1:])
+            assert "stream_msg_id" not in ans[0]
+            assert all(p.get("stream_msg_id") == "smid_1800" for p in ans[1:])
+            # progress final (state10) precedes answer open in wire order
+            prog_final_i = next(i for i, p in enumerate(posts)
+                                if p["msg_seq"] == 900 and p["input_state"] == 10)
+            ans_open_i = next(i for i, p in enumerate(posts)
+                              if p["msg_seq"] == 1800)
+            assert prog_final_i < ans_open_i, (prog_final_i, ans_open_i)
+            assert st.answer_sent == "你好，世界！\n\n免责声明。", st.answer_sent
+            assert not st.broken and not st.truncated
+        print_pass("双流时序：同锚点/双 smid/进度先收束/answer_sent 精确")
+
+    async def test_open_answer_failure_marks_broken(self):
+        """open_answer 被拒 → broken=True、answer_opened=False（内核回退全文）。"""
+        qs, qo = self._qs(), self._qo()
+
+        def resp(payload):
+            if payload["msg_seq"] == 1800:
+                raise _stream_action_failed(40007)
+            return _StreamFakeBot._default_responder(payload)
+
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot(resp)
+            st = self._mk_streamer(qs, bot)
+            assert await st.open_progress("⏳")
+            await st.finish_progress()
+            assert await st.open_answer("你好") is False
+            assert st.answer_opened is False
+            assert st.broken is True
+            await st.close()
+        print_pass("open_answer 失败 → broken，内核走缓冲全文回退")
+
+    async def test_remain_exhaustion_truncates(self):
+        """remain_msg_len 耗尽 → 截断到预算、truncated=True（余量走缓冲补发）。"""
+        qs, qo = self._qs(), self._qo()
+
+        def resp(payload):
+            return {"id": f"smid_{payload['msg_seq']}", "remain_msg_len": 8}
+
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot(resp)
+            st = self._mk_streamer(qs, bot)
+            await st.open_progress("⏳")
+            await st.finish_progress()
+            await st.open_answer("ABCD")          # opening ships 4
+            st.append_answer("EFGHIJKLMNOP")      # 12 buffered
+            await st.finish_answer("")            # cut to remain=8
+            await st.close()
+            assert st.truncated is True
+            assert st.answer_sent == "ABCDEFGHIJKLMNOP"[:12], st.answer_sent
+            # the final answer shard was cut to the 8-char budget
+            ans = [p for p in bot.posts if p["msg_seq"] == 1800]
+            assert len(ans[-1]["content_raw"]) <= 8, ans[-1]
+        print_pass("remain 耗尽 → 截断到预算 + truncated（余量缓冲补发）")
+
+    async def test_disclaimer_rides_final_shard(self):
+        """免责声明随末片(state10)发出；正文在开流片。"""
+        qs, qo = self._qs(), self._qo()
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot()
+            st = self._mk_streamer(qs, bot)
+            await st.open_progress("⏳")
+            await st.finish_progress()
+            await st.open_answer("正文")
+            await st.finish_answer("免责句")
+            await st.close()
+            ans = [p for p in bot.posts if p["msg_seq"] == 1800]
+            assert ans[0]["content_raw"] == "正文", ans[0]
+            assert ans[-1]["input_state"] == 10
+            assert ans[-1]["content_raw"] == "免责句", ans[-1]
+        print_pass("免责声明随末片(state10)；正文在开流片")
+
+    async def test_progress_only_no_answer_stream(self):
+        """纯工具轮（无 final content）：只收束进度流，从不开回答流。"""
+        qs, qo = self._qs(), self._qo()
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot()
+            st = self._mk_streamer(qs, bot)
+            await st.open_progress("⏳ 正在思考…")
+            await st.append_progress("⏳ 正在搜索…")
+            await st.finish_progress()
+            await st.close()
+            seqs = {p["msg_seq"] for p in bot.posts}
+            assert seqs == {900}, seqs
+            finals = [p for p in bot.posts if p["input_state"] == 10]
+            assert finals and all(p["msg_seq"] == 900 for p in finals)
+            assert st.answer_opened is False
+        print_pass("纯进度轮：仅 seq900 + state10 收束，无回答流")
+
+    async def test_breaker_three_strike_and_half_open(self):
+        """连续 3 次开流被拒 → 熔断 600s；冷却期满半开恢复。"""
+        qs, qo = self._qs(), self._qo()
+
+        def resp(payload):
+            raise _stream_action_failed(50000)
+
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot(resp)
+            for _ in range(3):
+                st = self._mk_streamer(qs, bot)
+                assert await st.open_progress("⏳") is False
+            assert qs._stream_available() is False
+            assert qs._stream_breaker.disabled_until > 0
+            qs._stream_breaker.disabled_until = time.monotonic() - 1
+            assert qs._stream_available() is True
+            assert qs._stream_breaker.rejects == 0
+        print_pass("熔断：3 连拒 600s；冷却后半开恢复")
+
+    async def test_api_not_available_long_circuit(self):
+        """ApiNotAvailable（404/405）→ unsupported + 长熔断（默认 24h）。"""
+        qs, qo = self._qs(), self._qo()
+        from nonebot.adapters.qq.exception import ApiNotAvailable
+
+        def resp(payload):
+            raise ApiNotAvailable()
+
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot(resp)
+            st = self._mk_streamer(qs, bot)
+            assert await st.open_progress("⏳") is False
+            assert qs._stream_breaker.state == "unsupported"
+            assert qs._stream_available() is False
+            assert qs._stream_breaker.disabled_until > time.monotonic() + 3600
+        print_pass("ApiNotAvailable → unsupported + 24h 长熔断")
+
+    async def test_is_wakeup_retry_on_opening(self):
+        """开流首片被拒（非 5000x）→ is_wakeup=true 重试一次成功续流。"""
+        qs, qo = self._qs(), self._qo()
+        calls = {"n": 0}
+
+        def resp(payload):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _stream_action_failed(40007)
+            return _StreamFakeBot._default_responder(payload)
+
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot(resp)
+            st = self._mk_streamer(qs, bot)
+            assert await st.open_progress("⏳") is True
+            assert calls["n"] == 2
+            assert "is_wakeup" not in bot.posts[0]
+            assert bot.posts[1].get("is_wakeup") is True
+        print_pass("is_wakeup：开流首片失败 → 携 is_wakeup 重试成功")
+
+    async def test_50002_backoff_retry(self):
+        """50002 频率限制 → 退避重试一次（同 payload，不带 is_wakeup）。"""
+        qs, qo = self._qs(), self._qo()
+        calls = {"n": 0}
+
+        def resp(payload):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _stream_action_failed(50002)
+            return _StreamFakeBot._default_responder(payload)
+
+        with self._stream_guard(qs, qo):
+            orig_sleep = asyncio.sleep
+
+            async def _fast_sleep(_s):
+                return None
+            qs.asyncio.sleep = _fast_sleep
+            try:
+                bot = _StreamFakeBot(resp)
+                st = self._mk_streamer(qs, bot)
+                assert await st.open_progress("⏳") is True
+                assert calls["n"] == 2
+                assert "is_wakeup" not in bot.posts[1]
+            finally:
+                qs.asyncio.sleep = orig_sleep
+        print_pass("50002 → 退避重试一次（不带 is_wakeup）")
+
+    async def test_env_off_disables_stream(self):
+        """QQ_OFFICIAL_STREAM=off → 能力位 False（热读逃生门）。"""
+        qs, qo = self._qs(), self._qo()
+        with self._stream_guard(qs, qo):
+            os.environ["QQ_OFFICIAL_STREAM"] = "off"
+            assert qs._stream_available() is False
+            s = qo.QQOfficialSender(_MdFakeBot(), MagicMock(), False)
+            assert s.supports_stream is False
+            os.environ["QQ_OFFICIAL_STREAM"] = "on"
+            assert qs._stream_available() is True
+        print_pass("env kill-switch：off→False / on→True（热读）")
+
+    # ── ③ mock client ────────────────────────────────────────────
+    async def test_mock_client_stream_callback(self):
+        """MockDeepSeekClient 流式变体：final 轮一次性回调全文；工具轮不回调。"""
+        m = MockDeepSeekClient()
+        m.plain_response = "完整回答"
+        got = []
+        res = await m.chat_completion_with_tools_stream(
+            messages=[], tools=[], content_callback=got.append)
+        assert res["content"] == "完整回答", res
+        assert got == ["完整回答"], got
+
+        m2 = MockDeepSeekClient()
+        m2.tool_call_response = {
+            "content": None, "tool_calls": [{"id": "x"}],
+            "role": "assistant", "finish_reason": "tool_calls"}
+        got2 = []
+        res2 = await m2.chat_completion_with_tools_stream(
+            messages=[], tools=[], content_callback=got2.append)
+        assert got2 == [], got2
+        assert res2["tool_calls"], res2
+        print_pass("Mock 流式：final 轮回调全文；工具轮静默")
+
+
+class TestSessionCompression:
+    """特殊会话压缩（PLAN.md Idea 4 Phase A+B）。
+
+    覆盖三层：存储写回（apply_compression 原子交换 + 一代备份）、命令层
+    （/压缩会话 守卫 + 确认 + 滚动摘要失败中止）、读时防线（L4 85% 人格化
+    提示 + 95% 紧急截断）。LLM 全部打桩，离线运行。
+    """
+
+    def run(self):
+        print_header("54. Session Compression (/压缩会话 + window thresholds)")
+        self.turn = _import_turn_for_tests()
+        self.test_token_estimation()
+        self.test_apply_compression_writeback()
+        self.test_clear_context_drops_compression_state()
+        asyncio.run(self.test_command_guards())
+        asyncio.run(self.test_command_confirm_flow())
+        asyncio.run(self.test_compression_llm_failure_aborts())
+        self.test_emergency_truncate()
+        asyncio.run(self.test_l4_hint_and_hard_truncation())
+
+    # ── fixtures ────────────────────────────────────────────────
+
+    @staticmethod
+    def _mgr(tmp):
+        from agent.special_session import SpecialSessionManager
+        return SpecialSessionManager(
+            user_data_root=os.path.join(tmp, "users"), max_per_user=10)
+
+    @staticmethod
+    def _fill(mgr, uid, name, n, char="测", active=True, metadata=None):
+        """Create a session with n messages (CJK content, ≈ len+1 tokens each)."""
+        s = mgr.create(uid, name, metadata=metadata)
+        if active:
+            mgr.switch_to(uid, s.name)
+        for i in range(n):
+            mgr.add_message(uid, "user" if i % 2 == 0 else "assistant",
+                            f"{char * 24}{i:02d}")  # 25 CJK chars ≈ 26 tokens
+        return s
+
+    class _StubFlash:
+        """Stub for _model_router.flash_client (chat_completion contract)."""
+
+        def __init__(self, reply):
+            self.reply = reply
+            self.calls = []
+
+        async def chat_completion(self, message, history=None,
+                                  timeout_set=180.0, purpose="chat"):
+            self.calls.append({"prompt": message, "purpose": purpose})
+            return self.reply
+
+    def _stub_turn(self, tmp, flash_reply="SUMMARY-OK"):
+        """Swap turn module globals; returns (ctx, flash_stub)."""
+        turn = self.turn
+        from types import SimpleNamespace
+        mgr = self._mgr(tmp)
+        sent = []
+
+        async def fake_send(payload, sender=None):
+            sent.append(payload)
+
+        flash = self._StubFlash(flash_reply)
+        orig = (turn._special_sessions, turn._safe_send, turn._model_router,
+                dict(turn._pending_compress_confirm))
+        turn._special_sessions = mgr
+        turn._safe_send = fake_send
+        turn._model_router = SimpleNamespace(flash_client=flash)
+        turn._pending_compress_confirm.clear()
+        ctx = {"mgr": mgr, "sent": sent, "orig": orig, "tmp": tmp}
+        return ctx, flash
+
+    def _restore_turn(self, ctx):
+        turn = self.turn
+        (turn._special_sessions, turn._safe_send, turn._model_router,
+         _pend) = ctx["orig"]
+        turn._pending_compress_confirm.clear()
+        turn._pending_compress_confirm.update(_pend)
+        shutil.rmtree(ctx["tmp"], ignore_errors=True)
+
+    # ── token 估算 ──────────────────────────────────────────────
+
+    def test_token_estimation(self):
+        from agent.special_session import (
+            estimate_text_tokens, estimate_context_tokens)
+        # CJK ≈ 1 token/char (+1), ASCII ≈ 4 chars/token
+        assert estimate_text_tokens("测试文字测试") == 7
+        assert estimate_text_tokens("abcd") == 2, estimate_text_tokens("abcd")
+        assert estimate_text_tokens("") == 0
+        ctx = [{"role": "user", "content": "测" * 100},
+               {"role": "assistant", "content": "x" * 400}]
+        est = estimate_context_tokens(ctx)
+        # 100 CJK ≈ 100 tok + 400 ASCII ≈ 100 tok + per-msg overhead
+        assert 200 <= est <= 220, est
+        assert estimate_context_tokens([]) == 0
+        print_pass("Token 估算：CJK≈1/字、ASCII≈4字/token、逐条开销计入")
+
+    # ── 存储写回 ────────────────────────────────────────────────
+
+    def test_apply_compression_writeback(self):
+        from agent.special_session import COMPRESSION_SUMMARY_PREFIX
+        tmp = tempfile.mkdtemp(prefix="sess_compress_")
+        try:
+            mgr = self._mgr(tmp)
+            uid = "u1"
+            self._fill(mgr, uid, "长会话", 40)
+            old_tail = mgr.get_by_name(uid, "长会话").context[-10:]
+
+            stats = mgr.apply_compression(uid, "长会话", "## 关键结论\n- A",
+                                          keep_recent=10)
+            assert stats["before_messages"] == 40
+            assert stats["after_messages"] == 11, stats
+            assert stats["kept_recent"] == 10 and stats["compress_count"] == 1
+            assert stats["after_tokens_est"] < stats["before_tokens_est"]
+
+            # Reload from disk: summary head + untouched tail
+            s = mgr.get_by_name(uid, "长会话")
+            assert s.total_messages == 11
+            head = s.context[0]
+            assert head["role"] == "system"
+            assert head["content"].startswith(COMPRESSION_SUMMARY_PREFIX)
+            assert "关键结论" in head["content"] and "第 1 次压缩" in head["content"]
+            assert s.context[1:] == old_tail, "尾部原文必须逐字节保留"
+
+            # Directory state: exactly one new snapshot, no delta, backup holds old 40
+            sdir = mgr._session_dir(uid, "长会话")
+            snaps = [f for f in os.listdir(sdir) if f.startswith("snapshot_")]
+            assert snaps == ["snapshot_00011.json"], snaps
+            assert not os.path.exists(os.path.join(sdir, "delta.jsonl"))
+            with open(os.path.join(sdir, "pre_compress_backup.json"),
+                      encoding="utf-8") as f:
+                assert len(json.load(f)) == 40
+
+            # Index metadata is the truth source
+            entry = [e for e in mgr.list_sessions(uid)
+                     if e["name"] == "长会话"][0]
+            md = entry["metadata"]
+            assert md["compress_count"] == 1 and md["pre_compress_messages"] == 40
+            assert "compressed_at" in md and "pre_compress_tokens_est" in md
+
+            # Post-compression appends + second compression (backup rolls one gen)
+            for i in range(5):
+                mgr.add_message(uid, "user", f"新消息{i}")
+            assert mgr.get_by_name(uid, "长会话").total_messages == 16
+            stats2 = mgr.apply_compression(uid, "长会话", "第二次摘要",
+                                           keep_recent=5)
+            assert stats2["compress_count"] == 2 and stats2["before_messages"] == 16
+            s2 = mgr.get_by_name(uid, "长会话")
+            assert "第二次摘要" in s2.context[0]["content"]
+            assert "第 2 次压缩" in s2.context[0]["content"]
+            with open(os.path.join(sdir, "pre_compress_backup.json"),
+                      encoding="utf-8") as f:
+                assert len(json.load(f)) == 16, "备份只保留一代（压缩前状态）"
+
+            # Guards: unknown session / empty summary
+            for bad in (lambda: mgr.apply_compression(uid, "不存在", "x"),
+                        lambda: mgr.apply_compression(uid, "长会话", "  ")):
+                try:
+                    bad()
+                    assert False, "expected ValueError"
+                except ValueError:
+                    pass
+            print_pass("apply_compression：摘要头+尾部原文写回、一代备份、索引元数据、二次压缩")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_clear_context_drops_compression_state(self):
+        tmp = tempfile.mkdtemp(prefix="sess_compress_clear_")
+        try:
+            mgr = self._mgr(tmp)
+            uid = "u1"
+            self._fill(mgr, uid, "会话", 32)
+            mgr.apply_compression(uid, "会话", "摘要", keep_recent=10)
+            sdir = mgr._session_dir(uid, "会话")
+            assert os.path.exists(os.path.join(sdir, "pre_compress_backup.json"))
+            mgr.clear_context(uid)
+            s = mgr.get_active(uid)
+            assert s.context == [] and s.total_messages == 0
+            assert not os.path.exists(os.path.join(sdir, "pre_compress_backup.json"))
+            entry = [e for e in mgr.list_sessions(uid) if e["name"] == "会话"][0]
+            md = entry.get("metadata") or {}
+            assert "compress_count" not in md and "compressed_at" not in md, md
+            print_pass("/clear 同步清理压缩备份与元数据")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── 命令层 ──────────────────────────────────────────────────
+
+    async def test_command_guards(self):
+        tmp = tempfile.mkdtemp(prefix="sess_compress_cmd_")
+        ctx, _ = self._stub_turn(tmp)
+        turn, mgr, sent = self.turn, ctx["mgr"], ctx["sent"]
+        try:
+            uid = "u1"
+            # No active session
+            assert await turn._handle_session_command("/压缩会话", uid) is True
+            assert any("没有活跃" in s for s in sent), sent
+            # Group chat → private-only
+            self._fill(mgr, uid, "会话", 40)
+            sent.clear()
+            assert await turn._handle_session_command(
+                "/压缩会话", uid, group_id="g1") is True
+            assert any("私聊" in s for s in sent), sent
+            assert uid not in turn._pending_compress_confirm
+            # Exempt kinds (archive = review truth source)
+            for kind in ("bond_scene", "char_creation"):
+                self._fill(mgr, uid, f"豁免{kind}", 40,
+                           metadata={"kind": kind})
+                sent.clear()
+                await turn._handle_session_command("/压缩会话", uid)
+                assert any("不支持压缩" in s for s in sent), (kind, sent)
+                assert uid not in turn._pending_compress_confirm
+            # Too short
+            self._fill(mgr, uid, "短会话", 10)
+            sent.clear()
+            await turn._handle_session_command("/压缩会话", uid)
+            assert any("不需要压缩" in s for s in sent), sent
+            assert uid not in turn._pending_compress_confirm
+            # Eligible → confirmation requested, pending armed
+            self._fill(mgr, uid, "长会话", 40)
+            sent.clear()
+            assert await turn._handle_session_command("/压缩会话", uid) is True
+            msg = sent[-1]
+            assert "确认压缩会话" in msg and "长会话" in msg, msg
+            assert "40 条" in msg and "最近 10 条" in msg, msg
+            pending = turn._pending_compress_confirm.get(uid)
+            assert pending and pending[0] == "长会话"
+            assert pending[1] > time.time() + 30
+            print_pass("/压缩会话 守卫：无会话/群聊/豁免 kind/短会话拒绝，达标进入 60s 确认")
+        finally:
+            self._restore_turn(ctx)
+
+    async def test_command_confirm_flow(self):
+        tmp = tempfile.mkdtemp(prefix="sess_compress_ok_")
+        ctx, flash = self._stub_turn(tmp, flash_reply="## 摘要\n- 结论A")
+        turn, mgr, sent = self.turn, ctx["mgr"], ctx["sent"]
+        try:
+            uid = "u1"
+            self._fill(mgr, uid, "长会话", 40)
+            await turn._handle_session_command("/压缩会话", uid)
+            assert uid in turn._pending_compress_confirm
+            # Simulate the bare-text confirm intercept in handle_agent_turn
+            await turn._run_session_compression(
+                uid, turn._pending_compress_confirm.pop(uid)[0])
+
+            # Summarizer ran on the flash tier with the rendered head
+            assert len(flash.calls) == 1, flash.calls
+            prompt = flash.calls[0]["prompt"]
+            assert flash.calls[0]["purpose"] == "session_compress"
+            assert "已有摘要" in prompt and "user: 测" in prompt
+            assert "结论A" not in prompt  # reply, not prompt
+
+            # Storage compressed; completion receipt sent
+            s = mgr.get_by_name(uid, "长会话")
+            assert s.total_messages == 11
+            assert "结论A" in s.context[0]["content"]
+            assert any("整理完毕" in m for m in sent), sent
+            receipt = sent[-1]
+            assert "40 条 → 摘要 + 最近 10 条" in receipt, receipt
+            print_pass("确认执行：flash 滚动摘要 → 写回 11 条 → 回执含前后对比")
+        finally:
+            self._restore_turn(ctx)
+
+    async def test_compression_llm_failure_aborts(self):
+        tmp = tempfile.mkdtemp(prefix="sess_compress_fail_")
+        ctx, _ = self._stub_turn(
+            tmp, flash_reply="调用DeepSeek API时出错: boom")
+        turn, mgr, sent = self.turn, ctx["mgr"], ctx["sent"]
+        try:
+            uid = "u1"
+            self._fill(mgr, uid, "长会话", 40)
+            await turn._run_session_compression(uid, "长会话")
+            assert any("压缩失败" in m and "保持原样" in m for m in sent), sent
+            assert mgr.get_by_name(uid, "长会话").total_messages == 40
+            assert not os.path.exists(os.path.join(
+                mgr._session_dir(uid, "长会话"), "pre_compress_backup.json"))
+            # Empty summary is also a failure
+            ctx2_flash = self._StubFlash("   ")
+            turn._model_router.flash_client = ctx2_flash
+            sent.clear()
+            await turn._run_session_compression(uid, "长会话")
+            assert any("压缩失败" in m for m in sent), sent
+            assert mgr.get_by_name(uid, "长会话").total_messages == 40
+            # Missing session → cancel message, no crash
+            sent.clear()
+            await turn._run_session_compression(uid, "不存在")
+            assert any("不存在" in m for m in sent), sent
+            print_pass("LLM 失败/空摘要/会话缺失：干净中止，存储零改动")
+        finally:
+            self._restore_turn(ctx)
+
+    # ── 读时防线 ────────────────────────────────────────────────
+
+    def test_emergency_truncate(self):
+        from agent.agent import Agent
+        from agent.special_session import COMPRESSION_SUMMARY_PREFIX
+
+        summary = {"role": "system",
+                   "content": COMPRESSION_SUMMARY_PREFIX + "（第 1 次）\n- 结论"}
+        body = [{"role": "user" if i % 2 == 0 else "assistant",
+                 "content": "内容" * 50 + f"{i:03d}"} for i in range(50)]
+
+        # With summary head: head kept, tail fits budget, note reports drops
+        out = Agent._emergency_truncate([summary] + body, budget_tokens=600)
+        assert out[0] is summary
+        assert out[1]["role"] == "system" and "上下文溢出保护" in out[1]["content"]
+        assert len(out) < len(body) + 2
+        assert out[-1] is body[-1], "尾部最新消息必须保留"
+
+        # No summary head → note + tail only
+        out2 = Agent._emergency_truncate(body, budget_tokens=600)
+        assert "上下文溢出保护" in out2[0]["content"]
+        assert out2[-1] is body[-1]
+
+        # Pathological budget: single clipped last message survives
+        out3 = Agent._emergency_truncate(body, budget_tokens=10)
+        assert len(out3) >= 1 and out3[-1]["content"].endswith("049")
+        assert len(out3[-1]["content"]) <= 4000
+
+        # Everything fits → unchanged, no note
+        out4 = Agent._emergency_truncate(body[:2], budget_tokens=100000)
+        assert out4 == body[:2]
+        print_pass("紧急截断：摘要头恒保留、尾部按预算装填、溢出报数、病态预算兜底")
+
+    async def test_l4_hint_and_hard_truncation(self):
+        from agent.agent import Agent
+        import agent.agent as agent_mod
+        from agent.tool_registry import ToolRegistry
+        from agent.context import _current_personality, _current_group_context
+
+        tmp = tempfile.mkdtemp(prefix="sess_compress_l4_")
+        p_tok = _current_personality.set("")
+        g_tok = _current_group_context.set("")
+        agent_mod._compress_hint_last.clear()
+        try:
+            mgr = self._mgr(tmp)
+            agent = Agent(
+                deepseek_client=MockDeepSeekClient(),
+                tool_registry=ToolRegistry(),
+                config_dir=os.path.join(os.path.dirname(__file__),
+                                        "agent", "config"),
+                special_session_manager=mgr,
+            )
+            uid = "u1"
+            # 30 msgs × ≈30 est tokens ≈ 900 tokens
+            self._fill(mgr, uid, "会话", 30)
+            sess = agent.sessions.get_or_create(uid)
+
+            def tail_of(msgs):
+                sys_msgs = [m for m in msgs if m.get("role") == "system"]
+                return sys_msgs[-1]["content"]
+
+            # Below threshold (window 100k) → no hint
+            mgr.set_context_window_provider(lambda: 100000)
+            sp = mgr.get_active(uid)
+            msgs = agent._build_messages(sess, "hi", special_session=sp)
+            assert "记忆负荷提醒" not in tail_of(msgs)
+            assert len([m for m in msgs if m.get("role") != "system"]) >= 30
+
+            # 90% → persona-voiced hint in L4 tail, history intact
+            mgr.set_context_window_provider(lambda: 1000)
+            sp = mgr.get_active(uid)
+            msgs = agent._build_messages(sess, "hi", special_session=sp)
+            tail = tail_of(msgs)
+            assert "记忆负荷提醒" in tail and "/压缩会话" in tail, tail
+            assert "人格口吻" in tail and "token 数字" in tail
+            assert "上下文溢出保护" not in tail  # still below 95%
+            assert len([m for m in msgs if m.get("role") != "system"]) >= 30
+
+            # Rate limit: immediate rebuild → no hint; +10 messages → hint again
+            msgs2 = agent._build_messages(sess, "hi again", special_session=sp)
+            assert "记忆负荷提醒" not in tail_of(msgs2)
+            for i in range(10):
+                mgr.add_message(uid, "user", f"追加{i:02d}消息内容")
+            sp = mgr.get_active(uid)
+            msgs3 = agent._build_messages(sess, "hi", special_session=sp)
+            assert "记忆负荷提醒" in tail_of(msgs3)
+
+            # ≥95% → history emergency-truncated + overflow notice in tail
+            mgr.set_context_window_provider(lambda: 100)
+            sp = mgr.get_active(uid)
+            msgs4 = agent._build_messages(sess, "hi", special_session=sp)
+            assert "上下文溢出保护" in tail_of(msgs4)
+            non_system = [m for m in msgs4 if m.get("role") != "system"]
+            assert len(non_system) < 40, f"history should be truncated: {len(non_system)}"
+            assert any("未载入" in str(m.get("content")) for m in msgs4
+                       if m.get("role") == "system"), "history 内应有截断说明"
+            print_pass("L4 提示：≥85% 人格化建议 /压缩会话（限流），≥95% 读时紧急截断")
+        finally:
+            agent_mod._compress_hint_last.clear()
+            _current_personality.reset(p_tok)
+            _current_group_context.reset(g_tok)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -10579,6 +11547,8 @@ def main():
         ("Direct Vision (主模型直连识图)", TestDirectVision()),
         ("QQ Official Markdown (msg_type=2)", TestOfficialMarkdown()),
         ("QQ Official Buttons (keyboard P0+P1)", TestOfficialButtons()),
+        ("QQ Official Stream (stream_messages, c2c)", TestOfficialStream()),
+        ("Session Compression (/压缩会话)", TestSessionCompression()),
     ]
 
     passed = 0

@@ -307,7 +307,11 @@ MODEL_SECTIONS = ("REASONING_MODEL", "FLASH_MODEL", "MULTIMODAL_MODEL",
 # text-placeholder + read_file lazy-analysis path. Pure client-side flag →
 # toggling it never triggers an API probe.
 _TEXT_EXTRAS = {"max_tokens": "int", "temperature": "float"}
-_VISION_TEXT_EXTRAS = {**_TEXT_EXTRAS, "supports_vision": "bool"}
+# context_window: model INPUT window (tokens) — drives the special-session
+# compression thresholds (85% hint / 95% emergency truncation, PLAN.md Idea 4).
+# Only meaningful on the two chat tiers, hence scoped to _VISION_TEXT_EXTRAS.
+_VISION_TEXT_EXTRAS = {**_TEXT_EXTRAS, "supports_vision": "bool",
+                       "context_window": "int"}
 _MEDIA_EXTRAS = {"timeout": "num", "max_retries": "int",
                  "max_concurrency": "int"}
 _SECTION_EXTRAS = {

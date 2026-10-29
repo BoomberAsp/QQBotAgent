@@ -212,6 +212,12 @@ class QQOfficialInteractionSender:
         from adapters.qq_official import _kb_available
         return _kb_available()
 
+    # A button receipt is a single fixed message — never streamed.
+    supports_stream = False
+
+    async def open_stream(self, first_text: str = ""):
+        return None
+
     def _budget_left(self) -> bool:
         if self._sent >= self.max_messages_per_turn:
             logger.warning(

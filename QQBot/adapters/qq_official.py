@@ -65,6 +65,9 @@ from adapters.onebot import _download_and_save_file
 # Rows → wire MessageKeyboard (leaf module; it reaches back into THIS
 # module only inside functions, so the top-level import is acyclic).
 from adapters.qq_official_buttons import to_message_keyboard
+# Streaming transport (same acyclic discipline: qq_official_stream
+# reaches back into this module only via function-level lazy imports).
+from adapters.qq_official_stream import MessageStreamer, _stream_available
 
 # Conservative per-message text cap for merged payloads. The kernel's
 # _send_response already chunks at 300 chars; this only guards the
@@ -79,9 +82,10 @@ _BINARY_UPLOAD_LIMIT = 5 * 1024 * 1024
 # ── Markdown (msg_type=2) 能力层 ───────────────────────────────────
 # 2026/04/23 起单聊/群聊自定义 markdown 对所有机器人开放（无需模板），
 # 见 docs/qqbot-api-v2-full-docs.md §36。单条长度上限官方未公布（通用
-# 40054007 消息长度超限），按设计稿 §6.10.10 保守取 1500 字，切分只落
-# 在区块边界（空行 / 标题行），绝不切在行中。
-_MD_CHUNK_LIMIT = 1500
+# 40054007 消息长度超限）。原设计稿 §6.10.10 保守取 1500 字，但 /帮助
+# 等长文被迫拆条——调至 2000 字；若真机撞 40054007 会走既有纯文本降级
+# 链（内容不丢）。切分只落在区块边界（空行 / 标题行），绝不切在行中。
+_MD_CHUNK_LIMIT = 2000
 
 # markdown 被拒的平台错误码 → 同内容纯文本降级重发一次（内容不丢）。
 # 来源：docs/qqbot-api-v2-full-docs.md 错误码表（50037/50041/50054-57、
@@ -641,6 +645,30 @@ class QQOfficialSender:
         allowed = {x.strip() for x in allow.replace("，", ",").split(",")
                    if x.strip()}
         return _event_user_openid(self._event) in allowed
+
+    @property
+    def supports_stream(self) -> bool:
+        """Dynamic: c2c only (stream_messages is a c2c endpoint) + the
+        streaming capability layer (env hot-read + breaker + md gate)."""
+        return (not self._is_group) and _stream_available()
+
+    async def open_stream(self, first_text: str = ""):
+        """Open the progress stream (stream #1) for this turn.
+
+        Returns a live MessageStreamer, or None when the first shard was
+        rejected — the caller then falls back to the buffered path with
+        zero user-visible difference (the breaker was already fed inside
+        the streamer, so repeated failures stop wasting requests).
+        """
+        if not self.supports_stream:
+            return None
+        openid = _event_user_openid(self._event)
+        if not openid:
+            return None
+        streamer = MessageStreamer(self._bot, self._event, openid)
+        if await streamer.open_progress(first_text or "⏳ 正在思考…"):
+            return streamer
+        return None
 
     def wants_reply(self, view: InboundMessage) -> bool:
         # c2c: always answer. Group: only when @-mentioned — the

@@ -29,6 +29,46 @@ SNAPSHOT_INTERVAL = 50  # Generate a snapshot every N messages
 DEFAULT_MAX_SESSIONS = 3
 MAX_AUTO_NAME_LENGTH = 12
 
+# ── Context compression (PLAN.md Idea 4, Phase A+B) ──────────────
+# Head marker of the synthetic summary message that apply_compression()
+# writes; agent.py's emergency truncation keys on it to always keep the
+# summary at the head of the (re-)built history.
+COMPRESSION_SUMMARY_PREFIX = "[会话摘要]"
+
+# One-generation rollback insurance written by apply_compression(); removed
+# by clear_context() and overwritten on the next compression.
+COMPRESSION_BACKUP_FILE = "pre_compress_backup.json"
+
+# Fallback input window when no provider is wired / config lacks
+# context_window. Canonical per-model values live in models_settings.json
+# and are surfaced by ModelRouter.effective_context_window (lib side owns
+# the config read; this constant is only the manager's own last resort).
+DEFAULT_CONTEXT_WINDOW = 131072  # 128k
+
+# Heuristic token estimation (PLAN.md Idea 4: avoid a tiktoken-class
+# dependency). CJK ≈ 1 token/char, other text ≈ 4 chars/token. Regex
+# counting keeps this C-speed even for MB-scale contexts.
+_CJK_RE = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]")
+
+
+def estimate_text_tokens(text: str) -> int:
+    """Rough token count for a string (CJK≈1/char, else ≈4 chars/token)."""
+    if not text:
+        return 0
+    cjk = len(_CJK_RE.findall(text))
+    return int(cjk + (len(text) - cjk) * 0.25) + 1
+
+
+def estimate_context_tokens(context: List[Dict]) -> int:
+    """Rough token count for a message list (content only + per-msg overhead)."""
+    total = 0
+    for msg in context:
+        content = msg.get("content")
+        if isinstance(content, str):
+            total += estimate_text_tokens(content)
+        total += 4  # role / structure overhead
+    return total
+
 
 @dataclass
 class SpecialSession:
@@ -72,11 +112,33 @@ class SpecialSessionManager:
         self.user_data_root = user_data_root
         self.max_per_user = max_per_user
         self.llm_client = llm_client  # For auto-naming (can be set later)
+        self._context_window_provider = None
         os.makedirs(user_data_root, exist_ok=True)
 
     def set_client(self, client):
         """Set or update the LLM client (for lazy initialization)."""
         self.llm_client = client
+
+    # ── Context window awareness (PLAN.md Idea 4, Phase B) ────────
+
+    def set_context_window_provider(self, provider) -> None:
+        """Wire a zero-arg callable returning the effective input window.
+
+        turn.py passes ``lambda: _model_router.effective_context_window`` so
+        panel edits + hot reloads are picked up per call without re-wiring.
+        """
+        self._context_window_provider = provider
+
+    def get_context_window(self) -> int:
+        """Effective model input window (tokens); falls back to 128k."""
+        if self._context_window_provider is not None:
+            try:
+                window = int(self._context_window_provider())
+                if window > 0:
+                    return window
+            except Exception:
+                pass
+        return DEFAULT_CONTEXT_WINDOW
 
     # ── CRUD ──────────────────────────────────────────────────────
 
@@ -297,7 +359,8 @@ class SpecialSessionManager:
         session_dir = self._session_dir(user_id, session.name)
         if os.path.exists(session_dir):
             for f in os.listdir(session_dir):
-                if f.startswith("snapshot_") or f == "delta.jsonl":
+                if (f.startswith("snapshot_") or f == "delta.jsonl"
+                        or f == COMPRESSION_BACKUP_FILE):
                     try:
                         os.remove(os.path.join(session_dir, f))
                     except OSError:
@@ -308,6 +371,12 @@ class SpecialSessionManager:
         session.last_active = time.time()
         session._last_snapshot_seq = 0
         session._delta_count = 0
+        # Compression bookkeeping is per-context-generation — drop it so the
+        # cleared session doesn't carry stale stats (index is the metadata
+        # source of truth and is rewritten by _update_index below).
+        for key in ("compressed_at", "compress_count",
+                    "pre_compress_messages", "pre_compress_tokens_est"):
+            session.metadata.pop(key, None)
         self._update_index(user_id, session)
 
     # ── Message Operations ─────────────────────────────────────────
@@ -341,6 +410,122 @@ class SpecialSessionManager:
 
         # Update index
         self._update_index(user_id, session)
+
+    # ── Context Compression (PLAN.md Idea 4, Phase A) ──────────────
+
+    def apply_compression(
+        self,
+        user_id: str,
+        name: str,
+        summary_text: str,
+        keep_recent: int = 10,
+    ) -> dict:
+        """Replace a session's stored context with summary + recent tail.
+
+        The write-side counterpart of agent.py's read-time Layer 1+2
+        truncation: ``/压缩会话`` generates ``summary_text`` (rolling LLM
+        summarization, orchestrated by turn.py) and this method persists the
+        result atomically:
+
+        - new context = [system summary message] + last ``keep_recent`` msgs
+        - one-generation backup of the full old context
+          (``pre_compress_backup.json``, overwritten on next compression)
+        - old snapshots + delta removed; a fresh snapshot of the new context
+          written so ``_load`` round-trips it unchanged
+        - index metadata records compressed_at / compress_count /
+          pre_compress_messages / pre_compress_tokens_est
+
+        Returns:
+            Stats dict: before_messages / after_messages / before_tokens_est /
+            after_tokens_est / kept_recent / compress_count.
+
+        Raises:
+            ValueError: If the session doesn't exist or has too few messages.
+        """
+        session = self._load(user_id, name)
+        if session is None:
+            raise ValueError(f"会话「{name}」不存在。")
+
+        context = session.context
+        keep_recent = max(0, min(int(keep_recent), len(context) - 1))
+        if len(context) <= keep_recent:
+            raise ValueError(f"会话「{name}」消息不足，无需压缩。")
+
+        summary_text = (summary_text or "").strip()
+        if not summary_text:
+            raise ValueError("摘要为空，压缩已取消。")
+
+        tail = context[len(context) - keep_recent:] if keep_recent else []
+        compress_count = int((session.metadata or {}).get("compress_count", 0)) + 1
+        before_messages = len(context)
+        before_tokens = estimate_context_tokens(context)
+
+        summary_msg = {
+            "role": "system",
+            "content": (
+                f"{COMPRESSION_SUMMARY_PREFIX}"
+                f"（第 {compress_count} 次压缩，覆盖此前 "
+                f"{before_messages - len(tail)} 条消息，"
+                f"{time.strftime('%Y-%m-%d %H:%M')}）\n{summary_text}"
+            ),
+        }
+        new_context = [summary_msg] + tail
+
+        session_dir = self._session_dir(user_id, name)
+        os.makedirs(session_dir, exist_ok=True)
+
+        # 1) One-generation backup (best-effort — never block compression on
+        #    a backup failure, but log-less by design: disk issues surface on
+        #    the snapshot write below anyway).
+        backup_path = os.path.join(session_dir, COMPRESSION_BACKUP_FILE)
+        tmp_path = backup_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(context, f, ensure_ascii=False)
+            os.replace(tmp_path, backup_path)
+        except Exception:
+            pass
+
+        # 2) Remove old snapshots + delta (they describe the old context).
+        for f in os.listdir(session_dir):
+            if ((f.startswith("snapshot_") and f.endswith(".json"))
+                    or f == "delta.jsonl"):
+                try:
+                    os.remove(os.path.join(session_dir, f))
+                except OSError:
+                    pass
+
+        # 3) Write the new snapshot; abort before touching the index if this
+        #    fails (backup still holds the old context for manual recovery).
+        seq = len(new_context)
+        snapshot_path = os.path.join(session_dir, f"snapshot_{seq:05d}.json")
+        with open(snapshot_path, "w", encoding="utf-8") as f:
+            json.dump(new_context, f, ensure_ascii=False, indent=2)
+
+        # 4) Commit session state + index.
+        session.context = new_context
+        session.total_messages = seq
+        session.last_active = time.time()
+        session._last_snapshot_seq = seq
+        session._delta_count = 0
+        meta = dict(session.metadata or {})
+        meta.update({
+            "compressed_at": time.time(),
+            "compress_count": compress_count,
+            "pre_compress_messages": before_messages,
+            "pre_compress_tokens_est": before_tokens,
+        })
+        session.metadata = meta
+        self._update_index(user_id, session)
+
+        return {
+            "before_messages": before_messages,
+            "after_messages": seq,
+            "before_tokens_est": before_tokens,
+            "after_tokens_est": estimate_context_tokens(new_context),
+            "kept_recent": len(tail),
+            "compress_count": compress_count,
+        }
 
     # ── File Provenance ─────────────────────────────────────────
 

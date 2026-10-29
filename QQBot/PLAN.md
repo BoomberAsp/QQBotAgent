@@ -522,9 +522,9 @@ AGENTS.md 中也有文档记录 (`config/AGENTS.md:95`)：
 
 ## Idea 4: 上下文长度达到 85% 时提示压缩
 
-### 当前状态：**部分实现（仅 Layer 1+2 截断）— 待严密设计，暂不实现**
+### 当前状态：**已实现（2026-10-29，Phase A+B）**
 
-> ⚠️ 智能体的记忆系统（上下文压缩 / 摘要 / token 管理）需要严密设计后再动手。本 Idea 当前只做现状核查与设计预留，**不进入实现**。
+> ✅ 已落地：`/压缩会话` 命令（turn.py，两步确认 + 滚动批量 LLM 摘要 + `apply_compression` 写回 + 一代备份）、启发式 token 估算（special_session.py `estimate_text_tokens/estimate_context_tokens`）、`context_window` 配置（models_settings.json，ModelRouter `effective_context_window` 取 min）、85% L4「记忆负荷提醒」（人格口吻建议，每 10 条消息限流）、95% `_emergency_truncate` 读时紧急截断。Phase C（读时 Layer 3 自动渐进摘要）**有意不做**——由写侧 `/压缩会话` + 紧急截断承担。下文为当时的现状核查与初稿设计，保留作历史参考。
 
 ### 问题
 
@@ -618,7 +618,7 @@ AGENTS.md 中也有文档记录 (`config/AGENTS.md:95`)：
 | 1 | 临时会话文件迁移 | 已实现（方案 B） | 文件系统隔离 + `/保存为会话` 归属迁移 |
 | 2 | 两种创建方式 | 已实现 | 无需改动 |
 | 3 | 15+ 条消息升级建议 | 已实现（方案 A） | `message_count` + augmented message 注入 + 限流 |
-| 4 | 85% 上下文压缩提示 | 部分实现（Layer 1+2 截断） | 待严密设计，暂不实现（token 估算 + `/压缩会话`） |
+| 4 | 85% 上下文压缩提示 | **已实现**（Phase A+B） | `/压缩会话` + token 估算 + 85% L4 提示 + 95% 紧急截断（Phase C 有意不做） |
 | 5 | 群聊文件延迟下载 | **未实现** | 待实现（元数据记录 + 按需下载 + 进度反馈） |
 
 ---
@@ -756,12 +756,12 @@ async def read_file(path: str) -> str:
 
 > 来源：`next_step.md` §8.2
 
-### 当前状态：**Layer 1+2 已实现，Layer 3 未实现**
+### 当前状态：**Layer 1+2 已实现；Layer 3 读时自动摘要有意不做（由写侧 `/压缩会话` 承担，2026-10-29）**
 
-当前 `agent.py:538-571` `_compress_context()` 已实现：
+当前 `agent.py` `_compress_context()` 已实现：
 - **Layer 1**：最近 20 条消息保留完整原文
 - **Layer 2**：20 条之前的消息压缩 tool result 到首行
-- **Layer 3**：**未实现**。代码注释 (`agent.py:543-544`): `"Layer 3: Progressive summary not yet implemented"`
+- **Layer 3**：**读时自动渐进摘要不实现**（docstring 已注明设计决策）。深度压缩改由三条机制承担：① 写侧 `/压缩会话` 命令（用户触发，滚动批量 LLM 摘要 + `apply_compression` 写回，见 Idea 4）；② ≥85% 窗口时 L4「记忆负荷提醒」引导 agent 以人格口吻建议压缩；③ ≥95% 时 `_emergency_truncate` 读时紧急截断兜底。下文保留作 Layer 3 自动化的设计参考（若未来需要无人值守的长会话，可按此实现 Phase C）。
 
 ### 问题
 
@@ -1157,8 +1157,8 @@ OCR 文字块: (text="Boss名称", bbox=[x1, y1, x2, y2])
 | 1 | 临时会话文件迁移 | 已实现（方案 B） | 文件系统隔离 + `/保存为会话` 归属迁移 |
 | 2 | 两种创建方式 | 已实现 | 无需改动 |
 | 3 | 15+ 条消息升级建议 | 已实现（方案 A） | `message_count` + augmented message 注入 + 限流 |
-| 4 | 85% 上下文压缩提示 | 部分实现（Layer 1+2 截断） | 待严密设计，暂不实现（token 估算 + `/压缩会话`） |
+| 4 | 85% 上下文压缩提示 | **已实现**（Phase A+B） | `/压缩会话` + token 估算 + 85% L4 提示 + 95% 紧急截断（Phase C 有意不做） |
 | 5 | 群聊文件延迟下载 | **未实现** | 待实现（元数据记录 + 按需下载 + 进度反馈） |
-| 6 | 分层上下文 Layer 3 | **未实现** | 待实现（每 30 条异步生成渐进式摘要） |
+| 6 | 分层上下文 Layer 3 | 读时自动化**有意不做** | 由写侧 `/压缩会话` + 85% 提示 + 95% 紧急截断承担（Phase C 设计已预留） |
 | 7 | 配额柔性处理 | **部分实现** | 80% 提醒已实现（`check_quota`/`get_quota_context`）；>100% 柔性超额与 150% 硬限待实现 |
 | 8 | 截图测速（OCR+LLM 两层降级） | **已实现** | qwen3.5-ocr 单调用提取 + 字形名称纠偏 + 颜色带阵营判定 + 两规则校验（进战 buff 阻断 + 免疫套装提示）；名称/值 285/285 全对（见 `docs/implements-for-idea-8.md`） |

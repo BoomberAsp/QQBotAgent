@@ -78,7 +78,10 @@ from agent.group_features import get_group_features
 from agent.permissions import PermissionManager, UserRole
 from agent.character_registry import get_character_registry
 from agent.hardware import HardwareDetector
-from agent.special_session import SpecialSessionManager
+from agent.special_session import (
+    SpecialSessionManager,
+    estimate_context_tokens, estimate_text_tokens,
+)
 from agent.tool_registry import ToolRegistry
 from agent.session import SessionManager
 from agent.memory import MemorySystem, TieredMemory
@@ -187,6 +190,21 @@ class _ToolSender:
         # pre-keyboard senders report False instead of exploding.
         s = self._sender or _turn_sender.get() or default_sender
         return bool(getattr(s, "supports_keyboard", False))
+
+    @property
+    def supports_stream(self) -> bool:
+        # Same delegation — getattr-tolerant so pre-stream stubs and
+        # OneBot report False and the kernel keeps the buffered path.
+        s = self._sender or _turn_sender.get() or default_sender
+        return bool(getattr(s, "supports_stream", False))
+
+    async def open_stream(self, first_text: str = ""):
+        """Bridge to the platform sender's stream factory (None = no stream)."""
+        s = self._sender or _turn_sender.get() or default_sender
+        opener = getattr(s, "open_stream", None)
+        if opener is None:
+            return None
+        return await opener(first_text)
 
     async def send_text(self, text: str) -> None:
         await _safe_send(text, sender=self._sender)
@@ -1106,6 +1124,11 @@ _special_sessions = SpecialSessionManager(
     max_per_user=_max_special_sessions,
     llm_client=_model_router.reasoning_client,
 )
+# 上下文窗口感知（PLAN.md Idea 4 Phase B）：压缩阈值（85% 提示 / 95% 紧急
+# 截断）需要 min(REASONING, FLASH) 的输入窗口。lambda 间接寻址 → 面板热保存
+# 触发 ModelRouter.reload() 后无需重新接线。
+_special_sessions.set_context_window_provider(
+    lambda: _model_router.effective_context_window)
 
 # 会话人格绑定：把活跃特殊会话查询入口注入 CharacterRegistry，使
 # resolve_effective_personality 自动获得「剧情钉住 > 会话绑定」两层
@@ -1123,6 +1146,9 @@ _pending_delete_confirm: dict = {}
 
 # Track pending UGC character deletion: user_id -> (char_id, expiry_timestamp)
 _pending_char_delete_confirm: dict = {}
+
+# Track pending /压缩会话 confirmations: user_id -> (session_name, expiry_ts)
+_pending_compress_confirm: dict = {}
 
 # Set by the create_character tool closure on success; the message handler
 # pops it after the run to auto-close the interview special session.
@@ -1279,6 +1305,15 @@ _upgrade_hint_last: dict[str, int] = {}  # user_id -> message count at last hint
 SCENE_KIND = "bond_scene"
 CREATION_KIND = "char_creation"
 NON_QUOTA_KINDS = frozenset({SCENE_KIND, CREATION_KIND})
+
+# ── /压缩会话（PLAN.md Idea 4 Phase A）────────────────────────────────
+# 用户触发的一次性深度压缩：头部历史 → flash 模型滚动摘要 → apply_compression
+# 写回（摘要 system 消息 + 尾部原文）。剧情归档/角色创作会话豁免（历史是回看
+# 真相源，压缩即销毁）。读时防线（85% 提示 / 95% 紧急截断）在 agent.py。
+COMPRESS_MIN_MESSAGES = 30       # 少于该消息数拒绝压缩（还不值得压）
+COMPRESS_KEEP_RECENT = 10        # 尾部保留原文的消息数
+COMPRESS_SUMMARY_BATCH_TOKENS = 24000   # 滚动摘要每批的估算 token 预算
+COMPRESS_MSG_RENDER_LIMIT = 1200        # 摘要输入中单条消息的截断长度
 
 
 def _max_scene_archives() -> int:
@@ -2383,6 +2418,17 @@ async def handle_agent_turn(view: InboundMessage):
                 await _safe_send("确认已超时（60秒），请重新发起 /删除角色。")
             return
 
+    # ── Handle pending session-compression confirmation (bare text) ──
+    pending_compress = _pending_compress_confirm.get(user_id)
+    if pending_compress:
+        if text_content in ("确认压缩会话", "/确认压缩会话"):
+            _pending_compress_confirm.pop(user_id, None)
+            if time.time() < pending_compress[1]:
+                await _run_session_compression(user_id, pending_compress[0])
+            else:
+                await _safe_send("确认已超时（60秒），请重新发起 /压缩会话。")
+            return
+
     # ── Handle pending personality-switch choice (keep vs clear) ────
     pending_switch = _pending_personality_switch.pop(user_id, None)
     if pending_switch:
@@ -2432,6 +2478,10 @@ async def handle_agent_turn(view: InboundMessage):
             return
         # /按钮探测 command (qq_official c2c admin-only keyboard probe)
         cmd_handled = await _handle_button_probe_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        # /流式探测 command (qq_official c2c admin-only stream probe)
+        cmd_handled = await _handle_stream_probe_command(text_content, user_id, view)
         if cmd_handled:
             return
         # /兑换码 / /redeem-code command (direct, no agent)
@@ -2632,17 +2682,12 @@ async def handle_agent_turn(view: InboundMessage):
         await _handle_special_command(augmented_message, user_id)
         return
 
-    # Send thinking indicator (non-critical, ignore send failures).
-    # immediate=True: on the official route this is the one progress
-    # line worth spending passive-reply quota on — it must go out as a
-    # standalone message right away, not merged into the final reply.
-    try:
-        _gid = view.group_id
-        _pm = get_character_registry()
-        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, _gid))
-        await _safe_send(OutProgress(f"{_short} 正在思考...", immediate=True))
-    except Exception:
-        pass
+    # The thinking indicator moved below persona resolution: the stream
+    # gate needs the render context (split personas never stream), and
+    # when stream #1 opens, its first shard carries the thinking line —
+    # the legacy immediate message is then skipped (saves 1 quota).
+    # `streamer` is function-scoped so the except handlers can close it.
+    streamer = None
 
     try:
         # ── Dual-plane routing: resolve persona & its mode first ──
@@ -2658,6 +2703,34 @@ async def handle_agent_turn(view: InboundMessage):
         # binding makes "一会 markdown、一会纯文本" a legal combination.
         # Always set ("" clears any inherited value).
         _current_render_context.set(_build_render_context(persona_mode))
+
+        # ── Thinking indicator OR stream #1 open (§6.10.11.2) ──────
+        # Stream gate: c2c only (stream_messages is a c2c endpoint),
+        # unified persona only (render context non-empty — split answers
+        # get re-voiced, which streaming cannot represent), sender's
+        # stream layer available (env hot-read + breaker + md gate).
+        # On success the first shard carries the thinking line, so the
+        # legacy immediate progress message is skipped entirely.
+        _pm_think = get_character_registry()
+        thinking_text = f"{_pm_think.get_short_name(persona_key)} 正在思考..."
+        _sdr = _turn_sender.get() or default_sender
+        if (not view.is_group and _current_render_context.get()
+                and getattr(_sdr, "supports_stream", False)):
+            try:
+                streamer = await _sdr.open_stream(thinking_text)
+            except Exception:
+                streamer = None
+        if streamer is None:
+            # Legacy path (non-critical, ignore send failures).
+            # immediate=True: on the official route this is the one
+            # progress line worth spending passive-reply quota on — it
+            # must go out standalone right away, not merged into the
+            # final reply.
+            try:
+                await _safe_send(
+                    OutProgress(thinking_text, immediate=True))
+            except Exception:
+                pass
 
         # Detect session type (also gates the UGC creation interview below)
         active_special = _special_sessions.get_active(user_id)
@@ -2715,7 +2788,35 @@ async def handle_agent_turn(view: InboundMessage):
 
         # Run the agent loop with timeout
         async def _progress(msg: str):
+            if streamer is not None and not streamer.broken:
+                if streamer.answer_opened:
+                    # Multi-round edge: the answer stream is already open
+                    # and another tool round starts — keep the user
+                    # informed in-stream (stream #1 is already closed).
+                    streamer.append_answer(f"\n\n{msg}\n\n")
+                else:
+                    await streamer.append_progress(msg)
+                return
             await _safe_send(OutProgress(msg))
+
+        # ── Streaming answer deltas (§6.10.11.2, stream #2) ───────
+        # Lazy open on the first delta. The keyboard check MUST happen
+        # here: reservations are set during tool execution, i.e. right
+        # before the final round's deltas arrive — and buttons cannot
+        # ride stream messages, so a reserved keyboard forces the
+        # buffered md+kb path. open_answer failure sets streamer.broken,
+        # which silences every later delta (answer ships buffered).
+        async def _content_delta(delta: str):
+            if streamer is None or streamer.broken:
+                return
+            if not streamer.answer_opened:
+                if _turn_keyboard.get():
+                    return
+                await streamer.finish_progress()
+                await streamer.open_answer(delta)
+                return
+            streamer.append_answer(delta)
+
         token = _current_sender.set(_ToolSender())
 
         # Resolve user permissions
@@ -2848,6 +2949,11 @@ async def handle_agent_turn(view: InboundMessage):
                     images=(vision_image_paths
                             if getattr(client, "supports_vision", False)
                             else None),
+                    # Official c2c streaming: deltas flow only when a
+                    # streamer opened this turn (None keeps every other
+                    # route on the non-streaming LLM call, byte-identical).
+                    content_callback=(_content_delta
+                                      if streamer is not None else None),
                 ),
                 timeout=300.0,
             )
@@ -2883,8 +2989,41 @@ async def handle_agent_turn(view: InboundMessage):
             if session_type == "temporary":
                 repatch_last_assistant(_session_manager, user_id, raw_response, response)
 
-        # Send response (split long messages)
-        await _send_response(response)
+        # ── Stream close / fallback tree (§6.10.11.2) ─────────────
+        # happy:     answer fully streamed → tail + inline disclaimer as
+        #            the final shard; skip _send_response (session was
+        #            already persisted inside agent.run).
+        # truncated: remain_msg_len exhausted cleanly → close the stream,
+        #            ship only the REMAINDER buffered (_send_response
+        #            applies its own disclaimer policy to it).
+        # broken / prefix mismatch (error dict, max-iteration fallback):
+        #            resend the FULL response buffered — the half-written
+        #            stream message stays on screen (no cancel API).
+        # answer never opened (tool-only turn, kb override, open fail):
+        #            close() finishes stream #1; buffered path unchanged.
+        sent_via_stream = False
+        if streamer is not None:
+            _pm_disc = get_character_registry()
+            _persona_disc = _current_personality.get() or _pm_disc.get_default()
+            _disc = (f"{_pm_disc.get_short_name(_persona_disc)} "
+                     "的回答并非总是准确无误，请理性判断。")
+            _streamed = streamer.answer_sent
+            _prefix_ok = (isinstance(response, str)
+                          and response.startswith(_streamed))
+            if (streamer.answer_opened and not streamer.broken
+                    and _prefix_ok):
+                if streamer.truncated:
+                    await streamer.finish_answer("")
+                    remainder = response[len(_streamed):].strip()
+                    await _send_response(remainder or _disc)
+                    sent_via_stream = True
+                else:
+                    await streamer.finish_answer(_disc)
+                    sent_via_stream = not streamer.broken
+            await streamer.close()
+        if not sent_via_stream:
+            # Send response (split long messages)
+            await _send_response(response)
 
         # ── Creation session auto-close (scene-session-archive-design.md §5.2/D6):
         # create_character 本轮成功 → 访谈会话无保留价值（设定已完整落入角色卡），
@@ -2928,8 +3067,18 @@ async def handle_agent_turn(view: InboundMessage):
             _continuous_sessions.start(view.group_id, user_id)
 
     except asyncio.TimeoutError:
+        if streamer is not None:
+            try:
+                await streamer.close()   # never leave a stream generating
+            except Exception:
+                pass
         await _safe_send("抱歉，思考超时了。请尝试用更简单的方式提问~")
     except Exception as e:
+        if streamer is not None:
+            try:
+                await streamer.close()
+            except Exception:
+                pass
         code = log_exception("agent message handling failed", e)
         await _safe_send(f"处理消息时出现内部错误（诊断编号 {code}）。请稍后重试；若持续出现请用 #bug 反馈。")
 
@@ -4913,6 +5062,72 @@ async def _handle_button_probe_command(
     return True
 
 
+# ── /流式探测 — 官方渠道流式能力探测（c2c + admin，§6.10.11.2）──────
+async def _handle_stream_probe_command(
+        text: str, user_id: str, view: InboundMessage) -> bool:
+    """Report the stream breaker state + send a minimal dual-stream probe.
+
+    qq_official + c2c + admin only (mirrors /按钮探测): streaming rides
+    the passive-reply anchor and burns stream quota, so it is a
+    deployment diagnostic. The live probe verifies the ONE unverified
+    platform assumption end-to-end — whether a single msg_id anchor can
+    host TWO stream messages (progress stream #1 + answer stream #2);
+    if not, the design degrades to a single stream.
+    """
+    cmd = text.split(maxsplit=1)[0]
+    if cmd not in ("/流式探测", "#流式探测"):
+        return False
+    if _current_platform.get() != "qq_official":
+        await _safe_send("流式探测仅在 QQ 官方渠道可用（OneBot 渠道不支持流式消息）。")
+        return True
+    if view.is_group:
+        await _safe_send("请在私聊中使用 /流式探测。")
+        return True
+    if _perm_manager.get_role(user_id) != UserRole.ADMIN:
+        await _safe_send("此命令仅限管理员使用。")
+        return True
+    from adapters.qq_official_stream import stream_snapshot
+    snap = stream_snapshot()
+    lines = [
+        "**流式能力探测**",
+        f"- 熔断状态: {snap['state']}（env={snap['env']}）",
+        f"- 当前可用: {'是' if snap['available'] else '否'}",
+        f"- 累计拒绝: {snap['rejected_total']} | "
+        f"最近错误: {snap['last_error'] or '无'}",
+        f"- 冷却剩余: {snap['disabled_seconds_left']:.0f}s",
+    ]
+    if not snap["available"]:
+        lines.append("\n能力不可用，跳过实发探测（本回合走缓冲路径）。")
+        await _safe_send(OutMarkdown("\n".join(lines)))
+        return True
+    s = _turn_sender.get() or default_sender
+    streamer = None
+    try:
+        opener = getattr(s, "open_stream", None)
+        if opener is not None:
+            streamer = await opener("⏳ 流式探测：进度流首片…")
+    except Exception as e:  # noqa: BLE001 — probe never raises
+        lines.append(f"\n进度流打开异常: {type(e).__name__}: {e}")
+    if streamer is None:
+        lines.append("\n❌ 进度流首片被拒（详见上方熔断状态）。")
+        await _safe_send(OutMarkdown("\n".join(lines)))
+        return True
+    await streamer.append_progress("⏳ 探测第二片…")
+    await streamer.finish_progress()
+    dual = await streamer.open_answer("回答流首片…")
+    if dual:
+        streamer.append_answer("增量片段…")
+        await streamer.finish_answer("探测完成。")
+    await streamer.close()
+    lines.append(f"\n- 进度流(流#1): {'❌ 中途断裂' if streamer.broken else '✅ 全程无拒绝'}")
+    lines.append(
+        f"- 双流同锚点(流#2): "
+        f"{'✅ 双流模型可行' if dual and not streamer.broken else '❌ 平台拒绝，需降级单流'}")
+    lines.append(f"- remain_msg_len 实测: {streamer.remain_msg_len}")
+    await _safe_send(OutMarkdown("\n".join(lines)))
+    return True
+
+
 # ── 参考立绘：/设形象 · /形象 · /清除形象（UGC 角色，零 token）──────
 # 参考立绘是角色卡之外的第二条视觉锚：文字锚是卡里的 ## Appearance Anchor，
 # 图片锚是 CHARACTERS_DIR/<char_id>/assets/reference.*（I2I 用）。只在自创
@@ -5113,6 +5328,129 @@ def _resolve_session_index(user_id: str, args: str) -> tuple:
             f"你目前没有特殊会话，序号 {args} 无效。"
         )
     return sessions[idx - 1]["name"], None
+
+
+# ── /压缩会话 实现（PLAN.md Idea 4 Phase A）───────────────────────────
+
+_COMPRESS_SUMMARY_PROMPT = (
+    "你是对话记录整理员。请把下面的对话历史浓缩为一份结构化摘要，"
+    "它将替代这些消息、作为后续对话的长期记忆。要求覆盖：\n"
+    "1. 关键决策与结论\n"
+    "2. 已完成的任务与产出（保留文件名、链接、数字等具体信息）\n"
+    "3. 未完成 / 待办事项\n"
+    "4. 用户偏好与习惯\n"
+    "用条目式中文输出，不超过 800 字；丢弃寒暄与重复内容，"
+    "不要输出与摘要无关的话。\n\n"
+    "已有摘要（为空则忽略）：\n{previous}\n\n"
+    "新增对话：\n{batch}\n\n"
+    "更新后的完整摘要：")
+
+# DeepSeekClient.chat_completion returns error strings instead of raising —
+# a rolling-summary batch must never fold an error message into the summary.
+_COMPRESS_ERROR_PREFIXES = (
+    "思考超时", "响应超时", "调用DeepSeek API时出错", "[Error]", "[HTTP")
+
+
+def _render_context_for_summary(context: list) -> str:
+    """Render context messages as compact plain text for the summarizer."""
+    lines = []
+    for msg in context:
+        role = msg.get("role", "?")
+        content = msg.get("content")
+        if not isinstance(content, str):
+            content = str(content) if content is not None else ""
+        if role == "tool":
+            content = content.split("\n")[0][:200]  # tool results: first line
+        elif len(content) > COMPRESS_MSG_RENDER_LIMIT:
+            content = content[:COMPRESS_MSG_RENDER_LIMIT] + "…"
+        if content.strip():
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+async def _summarize_in_batches(head: list) -> str:
+    """Rolling LLM summary of ``head``; raises RuntimeError on LLM failure.
+
+    The head may itself approach the model window, so it is folded in
+    batches of ~COMPRESS_SUMMARY_BATCH_TOKENS: each flash-model call merges
+    the previous summary + one batch into the next summary. Uses FLASH (a
+    low-stakes condensation task, same rationale as profile extraction).
+    """
+    client = _model_router.flash_client
+    summary = ""
+    batch: list = []
+    batch_tokens = 0
+
+    async def _fold(b: list) -> str:
+        prompt = _COMPRESS_SUMMARY_PROMPT.format(
+            previous=summary or "（无）",
+            batch=_render_context_for_summary(b))
+        result = await client.chat_completion(
+            prompt, timeout_set=120.0, purpose="session_compress")
+        result = (result or "").strip()
+        if not result or result.startswith(_COMPRESS_ERROR_PREFIXES):
+            raise RuntimeError(f"摘要生成失败: {result[:120] or '空响应'}")
+        return result
+
+    for msg in head:
+        batch.append(msg)
+        batch_tokens += estimate_text_tokens(str(msg.get("content") or ""))
+        if batch_tokens >= COMPRESS_SUMMARY_BATCH_TOKENS:
+            summary = await _fold(batch)
+            batch, batch_tokens = [], 0
+    if batch or not summary:
+        summary = await _fold(batch)
+    return summary
+
+
+async def _run_session_compression(user_id: str, name: str):
+    """Execute a confirmed /压缩会话: rolling summary + storage write-back.
+
+    Any failure (LLM or storage) aborts BEFORE touching the stored context —
+    the session stays exactly as it was.
+    """
+    session = _special_sessions.get_by_name(user_id, name)
+    if session is None:
+        await _safe_send(f"会话「{name}」不存在，已取消压缩。")
+        return
+    if session.total_messages < COMPRESS_MIN_MESSAGES:
+        await _safe_send(
+            f"会话「{name}」当前只有 {session.total_messages} 条消息，"
+            "不满足压缩条件，已取消。")
+        return
+
+    await _safe_send("⏳ 正在整理会话记忆，可能需要一点时间…")
+
+    context = session.context
+    keep = min(COMPRESS_KEEP_RECENT, len(context) - 1)
+    head = context[:-keep] if keep else list(context)
+
+    try:
+        summary = await _summarize_in_batches(head)
+    except Exception as e:  # noqa: BLE001 — any LLM failure aborts cleanly
+        code = log_exception("session compression summary failed", e)
+        await _safe_send(
+            f"压缩失败（诊断编号 {code}），会话保持原样，请稍后重试。")
+        return
+
+    try:
+        stats = _special_sessions.apply_compression(
+            user_id, name, summary, keep_recent=keep)
+    except ValueError as e:
+        await _safe_send(str(e))
+        return
+    except Exception as e:  # noqa: BLE001 — storage failure aborts cleanly
+        code = log_exception("session compression write-back failed", e)
+        await _safe_send(
+            f"压缩写回失败（诊断编号 {code}），会话保持原样，请联系管理员。")
+        return
+
+    await _safe_send(
+        f"呼～整理完毕！会话「{name}」的记忆已压缩：\n"
+        f"  {stats['before_messages']} 条 → 摘要 + 最近 {stats['kept_recent']} 条\n"
+        f"  估算 token: {max(1, stats['before_tokens_est'] // 1000)}k → "
+        f"{max(1, stats['after_tokens_est'] // 1000)}k\n"
+        f"关键结论、产出与待办都收进摘要里了；最近的对话原样保留。")
 
 
 async def _handle_session_command(
@@ -5519,6 +5857,46 @@ async def _handle_session_command(
             msg += "\n".join(f"  - {rel}" for rel in kept_repos) + "\n"
         msg += f"请回复「确认删除 {args}」来执行（60秒内有效）。"
         await _safe_send(msg)
+        return True
+
+    # ── /压缩会话 ─────────────────────────────────────────────
+    # PLAN.md Idea 4 Phase A：把当前活跃特殊会话的头部历史浓缩为摘要，
+    # 仅保留最近 COMPRESS_KEEP_RECENT 条原文。破坏性操作 → 60s 两步确认
+    # （确认文本在主消息流拦截，见 _pending_compress_confirm）。
+    if cmd in ("/压缩会话", "#压缩会话"):
+        if group_id:
+            # §9.2 私密数据不落群：会话记忆属私聊范畴
+            await _safe_send("会话记忆属于私密数据，请在私聊中使用 /压缩会话。")
+            return True
+        active = _special_sessions.get_active(user_id)
+        if active is None:
+            await _safe_send(
+                "当前没有活跃的特殊会话。压缩只作用于特殊会话——"
+                "先用 /切换会话 <名称> 激活要压缩的会话（临时会话请用 /clear）。")
+            return True
+        if (active.metadata or {}).get("kind") in NON_QUOTA_KINDS:
+            await _safe_send(
+                "剧情归档与角色创作会话不支持压缩：它们的历史是回看的真相源，"
+                "压缩会不可逆地销毁细节。不再需要时可用 /删除会话 清理。")
+            return True
+        if active.total_messages < COMPRESS_MIN_MESSAGES:
+            await _safe_send(
+                f"会话「{active.name}」目前只有 {active.total_messages} 条消息，"
+                f"还不算长（{COMPRESS_MIN_MESSAGES} 条起压），暂时不需要压缩~")
+            return True
+        est = estimate_context_tokens(active.context)
+        window = _special_sessions.get_context_window()
+        pct = min(100, est * 100 // window) if window else 0
+        keep = min(COMPRESS_KEEP_RECENT, len(active.context) - 1)
+        _pending_compress_confirm[user_id] = (active.name, time.time() + 60)
+        await _safe_send(
+            f"确认压缩特殊会话「{active.name}」？\n"
+            f"当前 {active.total_messages} 条消息（估算约 {max(1, est // 1000)}k "
+            f"token，占上下文窗口约 {pct}%）。\n"
+            f"压缩会把前 {active.total_messages - keep} 条浓缩为一段结构化摘要，"
+            f"仅保留最近 {keep} 条原文；细节将不可恢复"
+            f"（系统仅保留一代压缩前备份）。\n"
+            f"请回复「确认压缩会话」来执行（60秒内有效）。")
         return True
 
     # ── /结束会话 ──────────────────────────────────────────────

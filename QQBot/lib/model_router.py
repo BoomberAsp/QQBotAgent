@@ -18,6 +18,13 @@ from typing import Dict, Optional
 from .deepseek_client import DeepSeekClient
 
 
+# Fallback input window when a chat-tier section lacks `context_window`.
+# NOTE: `max_tokens` in models_settings.json is the OUTPUT cap — the input
+# window is a separate field consumed only by effective_context_window
+# (special-session compression thresholds, PLAN.md Idea 4 Phase B).
+DEFAULT_CONTEXT_WINDOW = 131072  # 128k
+
+
 class ModelRouter:
     """Manages multiple LLM clients and routes tasks based on complexity.
 
@@ -127,6 +134,32 @@ class ModelRouter:
             except Exception:
                 self._default = DeepSeekClient()
         return self._default
+
+    # ── Context Window (PLAN.md Idea 4, Phase B) ─────────────────────
+
+    def _section_window(self, section: str) -> int:
+        """Read `context_window` from a config section (fallback 128k).
+
+        Computed per call from self._config so reload() (panel hot-save)
+        takes effect immediately without extra wiring.
+        """
+        try:
+            window = int((self._config.get(section) or {}).get("context_window", 0))
+            return window if window > 0 else DEFAULT_CONTEXT_WINDOW
+        except (TypeError, ValueError):
+            return DEFAULT_CONTEXT_WINDOW
+
+    @property
+    def effective_context_window(self) -> int:
+        """Input-window ceiling a special session's context must respect.
+
+        Special sessions run on either chat tier depending on triage, so the
+        binding constraint is the SMALLER of the two windows.
+        """
+        return min(
+            self._section_window("REASONING_MODEL"),
+            self._section_window("FLASH_MODEL"),
+        )
 
     # ── Routing ───────────────────────────────────────────────────────
 

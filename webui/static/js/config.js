@@ -145,6 +145,8 @@
   const VISION_TEXT_EXTRAS = [
     ...TEXT_EXTRAS,
     { name: 'supports_vision', label: 'supports_vision（直传识图）', type: 'checkbox' },
+    // 输入窗口（token）：特殊会话压缩阈值（85% 提示 / 95% 紧急截断）用；留空按 128k。
+    { name: 'context_window', label: 'context_window（输入窗口）', type: 'number', min: 1, step: 1 },
   ];
   const MEDIA_EXTRAS = [
     { name: 'timeout', label: 'timeout（秒）', type: 'number', min: 1, step: 'any' },

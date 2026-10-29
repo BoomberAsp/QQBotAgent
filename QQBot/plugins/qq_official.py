@@ -47,6 +47,7 @@ from adapters.qq_official import (
     send_active_c2c_media,
 )
 from adapters.qq_official_buttons import click_snapshot
+from adapters.qq_official_stream import stream_snapshot
 from agent import bond_content, greeting
 from agent.asset_memory import AssetCard, make_asset_id, prompt_hash_of
 from agent.character_registry import get_character_registry
@@ -117,9 +118,12 @@ async def _official_status_startup():
             # and fresh, instead of degrading to "stale").
             # buttons= (§10.1): keyboard breaker state + click telemetry,
             # so the panel/ops can see degradation without tailing logs.
+            # stream= (§6.10.11.2): streaming breaker state + env, same
+            # observability rationale for the c2c stream route.
             _write_status(
                 messages_total=_msg_total, last_message_at=_last_msg_at,
-                buttons={**kb_snapshot(), **click_snapshot()})
+                buttons={**kb_snapshot(), **click_snapshot()},
+                stream=stream_snapshot())
 
     asyncio.create_task(_heartbeat())
 

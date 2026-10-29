@@ -67,9 +67,16 @@ class OneBotSender:
     # No inline keyboards on the OneBot route either — the render layer
     # gates on this, so send_keyboard below is a pure safety net.
     supports_keyboard = False
+    # Streaming output is an official-route c2c capability only
+    # (stream_messages API); OneBot always answers buffered.
+    supports_stream = False
 
     def __init__(self, matcher):
         self._matcher = matcher
+
+    async def open_stream(self, first_text: str = ""):
+        """OneBot never streams — the kernel falls back to buffered sends."""
+        return None
 
     async def send_text(self, text: str) -> None:
         try:

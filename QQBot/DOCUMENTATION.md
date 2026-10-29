@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-**QQBot** 是基于 [NoneBot2](https://nonebot.dev/) 构建的 **LLM Agent 智能体**，支持工具调用（Tool Calling）、用户画像、三层长期记忆、特殊会话（百万 token 上下文）与用户工作区隔离。当前同时接入 **两条 QQ 协议渠道**：NapCat / OneBot V11（QQ 号身份）与 **QQ 官方机器人 API**（openid 身份，单聊与群 @）。
+**QQBot** 是基于 [NoneBot2](https://nonebot.dev/) 构建的 **LLM Agent 智能体**，支持工具调用（Tool Calling）、用户画像、三层长期记忆、特殊会话（持久化上下文 + `/压缩会话` 深度压缩）与用户工作区隔离。当前同时接入 **两条 QQ 协议渠道**：NapCat / OneBot V11（QQ 号身份）与 **QQ 官方机器人 API**（openid 身份，单聊与群 @）。
 
 - **智能体架构**: Think→Act→Observe→Respond 循环，Markdown 配置文件驱动；平台无关内核（`agent/turn.py`）+ 入口适配器（`adapters/`）
 - **运行框架**: NoneBot2 (Python)
@@ -14,7 +14,7 @@
 - **原作剧情知识库**: 本地 SQLite FTS5 检索（约 5 万句对白），按人格白名单注入 L4；`story_search` 工具主动检索
 - **直连识图（Direct Vision）**: 模型段开启 `supports_vision` 时，本轮图片以 `image_url` content part 直接进主模型
 - **搜索引擎**: SearXNG (Docker 自托管，聚合 Bing 等) + `web_fetch` 直接抓取网页（TLS 指纹伪装 + 可选无头浏览器兜底）
-- **特殊会话**: 每用户持久化会话（按角色：管理员 10 / 会员 3 / 普通 1），百万 token 上下文，快照+增量存储；**人格绑定在会话上**（`metadata.persona_key`），切换会话自动切换人格（解析链：剧情钉住 > 会话绑定 > 个人设置 > 群默认 > 全局默认）
+- **特殊会话**: 每用户持久化会话（按角色：管理员 10 / 会员 3 / 普通 1），快照+增量存储，读时分层截断适配模型窗口，`/压缩会话` 可将早期历史浓缩为摘要（保留最近 10 条原文）；**人格绑定在会话上**（`metadata.persona_key`），切换会话自动切换人格（解析链：剧情钉住 > 会话绑定 > 个人设置 > 群默认 > 全局默认）
 - **用户工作区**: 每用户独立文件空间，配额管理（2GB/500MB/100MB），跨会话隔离，80% 预警 + 超限清理协议
 - **三层记忆引擎**: `TieredMemory`（SHORT/MEDIUM/LONG），LLM judge 归类 + 频次晋升/年龄降级状态机；LONG 支持索引注入与 `recall_memory` 召回
 - **Web 管理面板**: FastAPI 独立服务（`webui/`，93 个 API + 18 个页面），进程管理、配置热编辑、记忆/画像/别名管理、**角色管理**（用户自创角色卡的浏览/编辑/体检/版本回滚/立绘）、Token 看板、反馈处理、更新记录编辑与群发、Playground、官方路由状态卡
@@ -94,11 +94,14 @@ QQBotAgent/
     │
     ├── adapters/               # 平台入口适配器
     │   ├── onebot.py           #   OneBot V11：事件→InboundMessage、附件下载、OneBotSender
-    │   └── qq_official.py      #   QQ 官方：build_view、附件解析、QQOfficialSender（缓冲+合并+配额）、主动消息
+    │   ├── qq_official.py      #   QQ 官方：build_view、附件解析、QQOfficialSender（缓冲+合并+配额+流式能力位）、主动消息
+    │   ├── qq_official_buttons.py  # 官方键盘 wire 格式 + 回调编解码 + 交互回执发送器 + 点击遥测
+    │   └── qq_official_stream.py   # 官方 c2c 流式消息：MessageStreamer 双流传输 + 熔断器 + stream_snapshot
     │
     ├── plugins/                # NoneBot 插件
     │   ├── agent_router.py     #   OneBot 入口 + 配置看门狗 + 更新公告群发/群列表导出
     │   ├── qq_official.py      #   官方入口 + 主动问候 / 主动发媒体 + 状态心跳
+    │   ├── qq_official_buttons.py  # 官方 INTERACTION_CREATE 回调入口（幂等+限频+审计）
     │   ├── pullingMonitor.py / check_redeem_code.py / ruyipage_fetch.py / offline_logger.py
     │   └── group.py / speed.py / photos.py / test.py / utils.py（旧插件，仅保留个别工具函数）
     │
@@ -215,7 +218,8 @@ QQ 消息
 | `session_timeout` | 1800.0s | 临时会话 30 分钟无活动过期 |
 | 连续对话窗口 | 90s | 群聊 @ 一次后免 @ 窗口 |
 | 重复工具熔断 | 同工具同参数失败 ≥2 次 | 中断循环并给出说明 |
-| 上下文压缩 | `COMPRESS_STEP=4` / 尾部全文 20 条 | 特殊会话阶梯压缩，保前缀稳定 |
+| 上下文压缩 | `COMPRESS_STEP=4` / 尾部全文 20 条 | 特殊会话读时阶梯压缩，保前缀稳定 |
+| 会话压缩阈值 | `context_window` 的 85% / 95% | ≥85% 时在 L4 注入「记忆负荷提醒」，让 agent 以人格口吻建议 `/压缩会话`（每 10 条消息限流一次）；≥95% 触发 `_emergency_truncate` 读时紧急截断，防 API 400 |
 | 自动折叠 | 结果 >600 字（抽卡/测速/截图解析） | 折叠为 `TaskRecord` 摘要 |
 
 ### 1.2 系统提示词结构（四层分级，前缀缓存友好）
@@ -233,6 +237,7 @@ L3 用户级稳定 (system) → 工作区路径 + 权限角色说明（同用户
 L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊状态（等级/进度/心情/
                           陪伴/重逢/纪念日/已解锁档案）、原作剧情记忆块、
                           影音资产注入（top 5）、特殊会话标记 + 创作/剧情指令、
+                          记忆负荷提醒（≥85% 窗口）/ 上下文溢出保护通告（≥95%）、
                           工作区配额用量、用户画像、MEDIUM 记忆 + LONG 索引行
 ```
 
@@ -250,9 +255,9 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 | 入站视图 | `agent/inbound.py::InboundMessage` | 统一字段：`user_id / is_group / group_id / text / message_id / self_id / mentioned / reply_context / resolver / platform`；附件惰性下载，失败也记录为 `Attachment.error` |
 | OneBot 入口 | `plugins/agent_router.py` + `adapters/onebot.py` | 群消息手工判 `@`（不依赖 NapCat `to_me`）；附件经 NapCat `get_file`/`get_record` 或 HTTP 兜底 |
 | 官方入口 | `plugins/qq_official.py` + `adapters/qq_official.py` | 只处理 `C2CMessageCreateEvent` / `GroupAtMessageCreateEvent`；附件是公网 URL，直接下载；引用消息按 `msg_elements` + `ref_msg_idx` 解析 |
-| 出站契约 | `agent/outbound.py::Sender` | `send_text / send_markdown / send_keyboard / send_image / send_audio / send_progress`；`OutImage` / `OutAudio` / `OutMarkdown` / `OutKeyboard` / `OutProgress` 描述语义，平台细节在适配器；`supports_markdown` / `supports_keyboard` 能力位是渠道隔离唯一判据（官方 True / OneBot False）。`OutKeyboard(markdown, rows)` 的 rows 是 `lib/button_spec.py` 的平台无关按钮 DSL（`Btn`/`Rows`/`validate`/`to_text`）；不支持键盘的渠道 `send_keyboard` 自动降级为 `send_text(markdown + to_text(rows))`。回调链：官方渠道 INTERACTION_CREATE → `plugins/qq_official_buttons.py`（幂等+限频+审计）→ `agent/button_actions.py`（scene/role 复核 + 2.5s 预算）→ `agent/session_render.py`（共享键盘页渲染），毫秒级本地状态变更走回调按钮（type=1），需 LLM/>3s 的一律指令按钮（type=2，替用户打字复用命令链） |
-| OneBot 出站 | `OneBotSender` | 文本原样发、300 字符分块由内核负责；图片 `MessageSegment.image(Path)`；`send_markdown` 降级纯文本 |
-| 官方出站 | `QQOfficialSender` | 缓冲 + 合并 + 配额（单聊 4 次/60min、群 5 次/5min）；图片/语音 base64 上传（本地文件不可直读）；语音被拒降级文件卡；markdown（msg_type=2）单独成组、按区块 ≤1500 字切分，被拒（40034011 等）同内容纯文本重发 + 连续 3 拒熔断 10 分钟，`QQ_OFFICIAL_MARKDOWN=off` 一键禁用（热读）；配额不足丢弃优先级 正文 > 免责 > 图片；进度行默认吞掉，仅「正在思考…」即时发送 |
+| 出站契约 | `agent/outbound.py::Sender` | `send_text / send_markdown / send_keyboard / send_image / send_audio / send_progress / open_stream`；`OutImage` / `OutAudio` / `OutMarkdown` / `OutKeyboard` / `OutProgress` 描述语义，平台细节在适配器；`supports_markdown` / `supports_keyboard` / `supports_stream` 能力位是渠道隔离唯一判据（官方 True / OneBot False）。`OutKeyboard(markdown, rows)` 的 rows 是 `lib/button_spec.py` 的平台无关按钮 DSL（`Btn`/`Rows`/`validate`/`to_text`）；不支持键盘的渠道 `send_keyboard` 自动降级为 `send_text(markdown + to_text(rows))`。回调链：官方渠道 INTERACTION_CREATE → `plugins/qq_official_buttons.py`（幂等+限频+审计）→ `agent/button_actions.py`（scene/role 复核 + 2.5s 预算）→ `agent/session_render.py`（共享键盘页渲染），毫秒级本地状态变更走回调按钮（type=1），需 LLM/>3s 的一律指令按钮（type=2，替用户打字复用命令链）。`supports_stream`/`open_stream()`（仅官方 c2c）返回 `MessageStreamer` 承载流式进度+回答，`None` 即回退缓冲路径 |
+| OneBot 出站 | `OneBotSender` | 文本原样发、300 字符分块由内核负责；图片 `MessageSegment.image(Path)`；`send_markdown` 降级纯文本；`supports_stream=False`、`open_stream()` 恒 `None` |
+| 官方出站 | `QQOfficialSender` | 缓冲 + 合并 + 配额（单聊 4 次/60min、群 5 次/5min）；图片/语音 base64 上传（本地文件不可直读）；语音被拒降级文件卡；markdown（msg_type=2）单独成组、按区块 ≤2000 字切分，被拒（40034011 等）同内容纯文本重发 + 连续 3 拒熔断 10 分钟，`QQ_OFFICIAL_MARKDOWN=off` 一键禁用（热读）；配额不足丢弃优先级 正文 > 免责 > 图片；进度行默认吞掉，仅「正在思考…」即时发送；**流式消息**（`adapters/qq_official_stream.py`，仅 c2c）走 `POST /v2/users/{openid}/stream_messages`：双流同锚点（进度流 `msg_seq` 基 900、回答流基 1800），工具进度「⏳ …」与 LLM 回答逐字上屏，免责声明随回答流末片（`input_state=10`）；开流失败/中途断裂/`remain_msg_len` 耗尽均自动回退缓冲路径（内容不丢），熔断器（3 连拒 600s / ApiNotAvailable 长熔断）+ `QQ_OFFICIAL_STREAM=off` 热读逃生门；split 人格与群聊不流式 |
 | 失败语义 | `SendFailed` | 只有它是可重试错误；其它异常记日志后丢弃 |
 
 ### 1.4 双平面路由（`split` 人格）
@@ -303,9 +308,10 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 |------|------|
 | `build_system_prompt()` | 拼接 L1 全局静态层: SOUL + IDENTITY + AGENTS + MEMORY(三层记忆规则) + 硬件信息，结果缓存；不含时间戳（时间在 L4 尾部） |
 | `reload_configs()` | 清空缓存，重新加载所有配置文件（配置看门狗调用） |
-| `run(user_message, user_id, client=None, progress_callback=None, session_type="temporary")` | **主入口**。执行完整 Think→Act→Observe→Respond 循环。可选 `client` 参数支持运行时模型切换 (ModelRouter)。可选 `progress_callback` 在每轮工具执行前推送进度消息 (如 "⏳ 正在搜索...")。`session_type` 参数支持 `"temporary"` (30min 超时) 和 `"special"` (百万 token 持久化) 两种模式 |
+| `run(user_message, user_id, client=None, progress_callback=None, session_type="temporary")` | **主入口**。执行完整 Think→Act→Observe→Respond 循环。可选 `client` 参数支持运行时模型切换 (ModelRouter)。可选 `progress_callback` 在每轮工具执行前推送进度消息 (如 "⏳ 正在搜索...")。`session_type` 参数支持 `"temporary"` (30min 超时) 和 `"special"` (持久化特殊会话，读时截断适配模型窗口) 两种模式 |
 | `_build_messages(session, user_message, optional_special_session=None)` | 按 §1.2 四层结构构建消息列表 (L1-L3 system + history + L4 易变尾部 + current)。L4 含时间/特殊会话标记/quota/画像/MEDIUM 记忆注入。历史消息中的 `reasoning_content` 自动保留以支持 thinking mode 模型 |
-| `_compress_context(context, recent_full=20)` | 特殊会话上下文压缩: 最近 20 条保留完整，更早的 tool result 压缩为摘要首行；压缩边界按 `COMPRESS_STEP=4` 步进（相邻 4 轮字节级稳定，保护前缀缓存） |
+| `_compress_context(context, recent_full=20)` | 特殊会话读时压缩（Layer 1+2）: 最近 20 条保留完整，更早的 tool result 压缩为摘要首行；压缩边界按 `COMPRESS_STEP=4` 步进（相邻 4 轮字节级稳定，保护前缀缓存）。Layer 3 深度压缩不在读时做——由写侧 `/压缩会话`（turn.py）+ `_emergency_truncate` + L4 记忆负荷提示承担 |
+| `_emergency_truncate(context, budget_tokens)` | classmethod。上下文估算 token ≥95% 窗口时的读时兜底: 保留头部 `[会话摘要]` system 消息，插入「中间 N 条历史本轮未载入」系统注记，从尾部倒序回填至预算内；病态场景（单条超预算）退化为仅保留最后一条并截尾 4000 字 |
 | `_execute_tool_calls(tool_calls, session)` | 通过 ToolRegistry 执行 LLM 返回的工具调用；抽卡/测速类工具回复超 600 字自动折叠为降级记录 (`task_record`) |
 | `_schedule_profile_update(user_id, msg, response)` | 调用 `ProfileManager.observe_turn()`（同步缓冲，达 5 轮后台批量 extract+judge），不阻塞回复。旧 `_maybe_remember` 原始转储路径已移除——长期记忆完全由画像提取流水线驱动 |
 | `bootstrap()` | 启动健康检查 (API 连通性、工具数量、配置状态) |
@@ -367,7 +373,7 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 
 #### 类: `SpecialSessionManager` (v2.13)
 
-管理持久化的「特殊会话」——按角色限制数量（管理员 10 / 会员 3 / 普通 1），百万 token 上下文窗口，快照 + 增量双层存储。
+管理持久化的「特殊会话」——按角色限制数量（管理员 10 / 会员 3 / 普通 1），快照 + 增量双层存储；上下文按模型 `context_window` 读时截断，支持 `apply_compression()` 写侧深度压缩（`/压缩会话`）。
 
 | 构造参数 | 类型 | 默认值 | 说明 |
 |----------|------|--------|------|
@@ -392,6 +398,10 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 | `add_message(user_id, role, content, reasoning_content=None)` | 追加消息: 写入 JSONL 增量日志，每 50 条 (`SNAPSHOT_INTERVAL`) 触发快照并清空 delta |
 | `add_file(user_id, name, file_path)` / `get_files(user_id, name)` | 记录/查询会话名下的工作区文件（文件溯源，供 delete 清理） |
 | `auto_name(user_id, first_message, first_response)` | 异步: LLM 根据首次对话内容自动总结会话名（≤12 字符），成功则 rename |
+| `set_context_window_provider(provider)` / `get_context_window()` | 上下文窗口感知（PLAN.md Idea 4 Phase B）：turn.py 注入 `lambda: _model_router.effective_context_window`（min(REASONING, FLASH) 的 `context_window`，面板热保存即时生效）；无 provider 时回退 `DEFAULT_CONTEXT_WINDOW=131072` |
+| `apply_compression(user_id, name, summary_text, keep_recent=10)` | `/压缩会话` 的存储写回：新 context = [`[会话摘要]` system 消息] + 尾部 `keep_recent` 条原文；旧 context 全量存一代备份 `pre_compress_backup.json`（下次压缩覆盖、`/clear` 删除）；删旧 snapshot+delta、写新 snapshot、index metadata 记 `compressed_at`/`compress_count`/`pre_compress_messages`/`pre_compress_tokens_est`。返回前后统计。摘要生成（flash 滚动分块）由 turn.py 编排，LLM 失败时不落盘 |
+
+模块级还提供启发式 token 估算 `estimate_text_tokens()` / `estimate_context_tokens()`（CJK≈1 token/字、其余≈4 字/token，正则计数、无 tiktoken 依赖），供压缩阈值与 `/压缩会话` 展示口径使用。
 
 **剧情归档与配额豁免**（详见 `docs/scene-session-archive-design.md`）：`metadata.kind` 为 `bond_scene`（剧情）/`char_creation`（角色创作）的会话**不计入**按角色的数量配额（10/3/1 只约束普通特殊会话）。剧情走到结局由 `agent/turn.py::_finish_bond_scene` 经 `update_metadata` 写入 `completed=true` + `completed_at`（封档真源），随后 `end_active`——会话保留，可 `/切换会话` 回看，回看时 `is_scene=false`（不再注入剧情指令/剧本、工具集无 `complete_scene`）。`completed` 缺失的存量会话按“未完结”处理，并在 `/剧情` 去重与 `is_scene` 判定两个热点懒回填。剧情会话总量上限由 `MAX_SCENE_ARCHIVES`（默认 20，含进行中与已完结）在 `turn.py` 层强制；`SCENE_ARCHIVE_ENABLED=0`（热读）为紧急回滚开关，退回统一配额语义。`create()` 本身仍不检查任何配额——普通配额与剧情上限都在 `turn.py` 命令层强制。
 
@@ -402,7 +412,8 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 └── {session_name}/
     ├── snapshot_00050.json  # 第 50 条消息时的完整快照（滚动清理旧快照）
     ├── snapshot_00100.json  # 第 100 条消息时的快照
-    └── delta.jsonl          # 上次快照以来的增量消息
+    ├── delta.jsonl          # 上次快照以来的增量消息
+    └── pre_compress_backup.json  # /压缩会话 前一代完整上下文（回滚保险，仅保留一代）
 ```
 
 ### 2.4 `agent/memory.py` — 长期记忆系统
@@ -684,7 +695,7 @@ turn.py / 入口插件
 
 | 类别 | 命令（含别名） |
 |---|---|
-| 会话 | `/新会话`、`/会话列表`（`/会话`）、`/切换会话`、`/重命名会话`、`/删除会话`（回复「确认删除 <名称>」）、`/结束会话`（`/临时会话`/`/退出会话`/`/退出特殊会话`）、`/保存为会话`、`/clear`（`清除上下文`/`新对话`）、`/帮助`（`/help`/`/命令`）、`/status` |
+| 会话 | `/新会话`、`/会话列表`（`/会话`）、`/切换会话`、`/重命名会话`、`/删除会话`（回复「确认删除 <名称>」）、`/压缩会话`（回复「确认压缩会话」；仅私聊，剧情/创作会话不支持）、`/结束会话`（`/临时会话`/`/退出会话`/`/退出特殊会话`）、`/保存为会话`、`/clear`（`清除上下文`/`新对话`）、`/帮助`（`/help`/`/命令`）、`/status` |
 | 人格 | `/personality`、`/人格切换`（均支持带名称；无 `#` 变体；特殊会话内只写会话绑定，`--全局` 后缀改写用户默认） |
 | 养成 | `/好感度`（`#好感度`/`/bond`）、`/剧情`、`/设好感 <1-10>`、`/创建角色`、`/删除角色`（回复「确认删除角色 <名称>」）、`/设形象`、`/形象`（`/查看形象`）、`/清除形象`（`/删形象`） |
 | 游戏 | `/兑换码`（`/redeem-code`）、`/长期兑换码`、`/角色详情 <名>`、`/羁绊详情 <名>`、`/刷新角色数据`（仅 admin） |
@@ -1397,7 +1408,7 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 
 ## 九、测试系统
 
-`test_agent.py` 包含 **53 个测试套件 / 316 个测试用例**（全部离线，使用 mock client，无网络依赖），覆盖核心组件、养成、双平面、官方渠道解析、影音资产、Direct Vision、会话人格绑定与面板逻辑。下表保留 v2.x 时代的 15 个基础套件（编号 1–15），新增套件按主题列在表后:
+`test_agent.py` 包含 **56 个测试套件 / 354 个测试用例**（全部离线，使用 mock client，无网络依赖），覆盖核心组件、养成、双平面、官方渠道解析、影音资产、Direct Vision、会话人格绑定、会话压缩、官方渠道流式消息与面板逻辑。下表保留 v2.x 时代的 15 个基础套件（编号 1–15），新增套件按主题列在表后:
 
 | # | 测试套件 | 测试数 | 覆盖内容 |
 |---|----------|--------|----------|
@@ -1417,13 +1428,14 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 | 14 | `TestMemoryMigration` | 2 | 旧记忆 → 三层结构迁移（seed+归档、散落 legacy dump 归档） |
 | 15 | `TestCacheStability` | 6 | 前缀缓存稳定性（提示词头部用户不变量/易变内容置尾/画像变化头部字节稳定/历史头部迟滞修剪/压缩边界步进/无时间戳） |
 
-**新增套件（16–53）**
+**新增套件（16–55）**
 
 | 主题 | 套件 |
 |---|---|
 | 养成 / 角色 | `TestBondManager`、`TestBondContent`、`TestBondGiftPoke`、`TestBondEvents`、`TestBondScene`、`TestSceneSession`、`TestSceneArchive`（封档/配额豁免：T1-T15 + 回滚开关 + 懒回填 + WebUI 摘要）、`TestBondReunionAnniversary`、`TestInitialBond`、`TestCharacterRegistry`（含会话人格五层链单测）、`TestSessionPersonaBinding`（端到端：创建快照/会话内切换/`--全局`/拒绝/提示消息/`/clear` 保留绑定）、`TestCreateCharacterTool`、`TestCharCreationInterview`、`TestPersonalityMeta`、`TestReferencePortrait` |
-| 渠道 / 多模态 / 面板 | `TestQQOfficialQuoteParsing`、`TestOfficialMarkdown`、`TestOfficialStatusHeartbeat`、`TestWebuiOfficialStatus`、`TestMediaGen`、`TestProactiveMedia`、`TestMediaQuota`、`TestAnchorVoiceId`、`TestDirectVision`、`TestDelegation`、`TestAgentPersist`、`TestActiveGreeting`、`TestModelRouterClassify`、`TestPersonalityMarkerPersistence`、`TestWebuiPermissionsEditor`、`TestWebuiModelSections` |
+| 渠道 / 多模态 / 面板 | `TestQQOfficialQuoteParsing`、`TestOfficialMarkdown`、`TestOfficialButtons`、`TestOfficialStatusHeartbeat`、`TestWebuiOfficialStatus`、`TestMediaGen`、`TestProactiveMedia`、`TestMediaQuota`、`TestAnchorVoiceId`、`TestDirectVision`、`TestDelegation`、`TestAgentPersist`、`TestActiveGreeting`、`TestModelRouterClassify`、`TestPersonalityMarkerPersistence`、`TestWebuiPermissionsEditor`、`TestWebuiModelSections` |
 | 资产记忆 / 剧情 | `TestAssetCardsP4`、`TestAssetSearch`、`TestAssetRecall`、`TestUploadTextualization`、`TestEpisodeDistill`、`TestAssetEvictionInjection`、`TestStoryKbInjectionGate` |
+| 会话压缩 | `TestSessionCompression`（token 估算 / `apply_compression` 写回+备份滚动 / `clear_context` 清理压缩态 / 命令守卫（群聊·无会话·豁免 kind·消息过少）/ 确认流端到端 / LLM 失败中止零改动 / `_emergency_truncate` / L4 记忆负荷提示+限流+溢出保护） |
 
 另有 `test_workspace.py`（11 个类）、`test_story_kb.py`（6 个类 / 37 个用例，离线合成语料）、`benchmarks/memory/bench_engine.py`（确定性场景流 benchmark），以及 `test/` 下 17 个离线脚本（其中 11 个被 `test.sh` 调用；`test/` 整体被 gitignore，仅存于开发机）。
 
@@ -1857,7 +1869,7 @@ v2.7 基础上增加:
 v2.12 基础上增加:
   ├── agent/hardware.py: 硬件自动检测 (CPU/内存/磁盘/GPU/OS)，首次启动缓存到 .hardware.json
   ├── agent/workspace.py: 用户工作区隔离 (per-user 目录, contextvars 传递), 配额管理 (3 级策略)
-  ├── agent/special_session.py: 特殊会话 (百万 token 上下文, 快照+增量双层存储, 按角色限制数量)
+  ├── agent/special_session.py: 特殊会话 (快照+增量双层存储, /压缩会话 深度压缩, 按角色限制数量)
   ├── agent/agent.py 更新:
   │   ├── build_system_prompt(): 动态注入硬件上下文 (替换硬编码规格表)
   │   ├── run(): 新增 session_type 参数 → 路由到 SpecialSessionManager
@@ -2210,7 +2222,20 @@ v2.29 基础上增加:
 - `/帮助`、`/功能` 文档更新（HELP.md / FEATURES.md），功能卡渲染修复长文本溢出。
 - **会话人格绑定**：人格注册在特殊会话 `metadata.persona_key` 上，解析优先级 剧情钉住 > 会话绑定 > 个人设置 > 群默认 > 全局默认（`CharacterRegistry.set_session_provider` 单点注入，失效懒穿透、存量零迁移）；特殊会话内 `/人格切换` 只写会话绑定，`--全局` 逃生门改用户默认；`/新会话`、`/保存为会话` 创建时快照当前人格；切会话/结束会话/`/会话列表` 展示各会话人格；剧情/创作会话拒绝切换；`/clear` 保留绑定（§2.13、SESSION.md）。
 
-#### 设计稿（未实施）— QQ 官方渠道消息按钮
+#### 2026-10-28 — QQ 官方渠道 markdown + 消息按钮（P0+P1）
+
+- **官方 markdown**（msg_type=2）：unified 人格回复 + `/帮助`/`/兑换码` 走原生 md，每轮 `_build_render_context` 判定（绝不按用户缓存），白名单声明只注入 L4 易变尾（缓存前缀不动）；区块 ≤2000 字切分、拒绝码降级纯文本 + 连续 3 拒熔断 10 分钟、`QQ_OFFICIAL_MARKDOWN=off` 热读逃生门。
+- **消息按钮**（keyboard，P0 指令按钮 + P1 回调按钮）：平台无关 DSL `lib/button_spec.py`（`Btn`/`Rows`/`validate`/`to_text`）→ `adapters/qq_official_buttons.py`（wire 转换 + `qb1:` 回调编解码 + 交互回执发送器 + 点击遥测）；回调链 `plugins/qq_official_buttons.py`（幂等+限频+审计）→ `agent/button_actions.py`（scene/role 复核 + 2.5s 预算）→ `agent/session_render.py`；降级梯 键盘 → md-only → 纯文本命令清单；`QQ_OFFICIAL_BUTTONS=auto/on/off` + 熔断 + 灰度白名单；`/按钮探测` 管理员诊断命令。
+
+#### 2026-10-29 — QQ 官方渠道流式消息（c2c，§6.10.11.2）
+
+- `lib/deepseek_client.py::chat_completion_with_tools_stream`：SSE 流式变体，`content` 增量经 `content_callback` 实时转发（工具碎片出现后抑制、`reasoning_content` 永不转发），工具碎片按 index 累积、usage 末片入账，返回与非流式**逐字同形**（保 Direct Vision 400 自愈）。
+- `adapters/qq_official_stream.py`：`MessageStreamer` 双流传输（同 `msg_id` 被动锚点；进度流 `msg_seq` 基 900 承载「⏳ …」工具进度、回答流基 1800 承载 LLM 增量 + 免责声明末片 `input_state=10`）+ `_StreamBreaker`（3 连拒 600s / ApiNotAvailable 长熔断 / 半开恢复）+ `stream_snapshot()`。裸 HTTP `POST /v2/users/{openid}/stream_messages`（`bot._request`），is_wakeup 开流重试、50001/50002 退避、`remain_msg_len` 耗尽截断。
+- 接线：`agent/outbound.py` Sender 增 `supports_stream`/`open_stream()`；`QQOfficialSender`（仅 c2c + md 能力）实现，OneBot 恒 `None`；`agent/agent.py::run` 增 `content_callback`（getattr 探测流式方法，mock 零改动兼容）；`agent/turn.py` 开流决策（render context 设定后、triage 前）+ `_progress`/`_content_delta` 路由 + 回退树（happy/truncated/broken/未开流）+ 键盘预约时禁开回答流 + `/流式探测` 管理员命令（验证双流同锚点这一平台未证假设）。
+- 纪律：OneBot 与群聊零变化；split 人格（revoice）不流式（render context 为空自动排除）；流式仅传输层，会话持久化不变。
+- 配置：`QQ_OFFICIAL_STREAM=auto/on/off`、`QQ_OFFICIAL_STREAM_INTERVAL=1.0`、`QQ_OFFICIAL_STREAM_CIRCUIT_HOURS=24`（均热读）；心跳 `official_status.json` 增 `stream=` 段；新增 `TestOfficialStream`（17 用例，离线）。
+
+#### 设计稿 — QQ 官方渠道消息按钮
 
 - `docs/qqbot-official-buttons-design.md`：官方 API 按钮的能力边界、39 个可按钮化功能盘点、8 种交互模式、接入架构与降级方案、准入政策与申请材料。
-- 现状：**未落地任何代码**；自定义按钮需平台「内邀开通」（`304037`），未开通时必须能自动降级为纯 markdown/文本。
+- 现状：**P0（指令按钮）+ P1（回调按钮）已落地**（见 2026-10-28 条）；自定义回调按钮需平台「内邀开通」，未开通时自动降级为纯 markdown/文本命令清单。流式消息（§6.10.11.2）已于 2026-10-29 落地。

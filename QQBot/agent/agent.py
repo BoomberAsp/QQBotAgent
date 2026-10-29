@@ -18,7 +18,11 @@ from .memory import MemorySystem, TieredMemory
 from .profile import ProfileManager
 from .hardware import HardwareDetector, HardwareProfile
 from .workspace import UserWorkspaceManager
-from .special_session import SpecialSessionManager, SpecialSession
+from .special_session import (
+    SpecialSessionManager, SpecialSession,
+    COMPRESSION_SUMMARY_PREFIX,
+    estimate_context_tokens, estimate_text_tokens,
+)
 from .task_record import build_auto_record, build_compact_line, append_task_log
 
 
@@ -39,6 +43,21 @@ _AUTO_COMPRESS_TOOLS = {"gacha_pull", "parse_battle_screenshots", "calculate_spe
 # treated as stale/abandoned and the fold is skipped — a guard against an old
 # begin_task window wiping unrelated history on a later finalize_subtask.
 MAX_FOLD_MESSAGES = 8
+
+# ── Context-load thresholds for special sessions (PLAN.md Idea 4 Phase B) ──
+# 85%: L4 volatile-tail hint asking the agent to suggest /压缩会话 IN ITS OWN
+#      PERSONA VOICE (volatile tail → zero prefix-cache impact).
+# 95%: read-time emergency truncation so the request can never exceed the
+#      model input window (last-resort defense against API 400s; storage is
+#      NOT touched — the durable fix remains a user-confirmed /压缩会话).
+CONTEXT_HINT_RATIO = 0.85
+CONTEXT_HARD_RATIO = 0.95
+CONTEXT_HARD_BUDGET_RATIO = 0.90
+# Re-hint at most once per this many new session messages (≈5 turns).
+COMPRESS_HINT_INTERVAL = 10
+# session_id → total_messages when the 85% hint last fired (in-memory only;
+# a restart just re-arms the hint, which is harmless).
+_compress_hint_last: Dict[str, int] = {}
 
 
 def _scene_archive_enabled() -> bool:
@@ -256,6 +275,7 @@ class Agent:
         user_role: Optional[str] = None,
         persist: bool = True,
         images: Optional[List[str]] = None,
+        content_callback: Optional[Callable[[str], Any]] = None,
     ) -> str:
         """Process a user message through the agent loop.
 
@@ -280,6 +300,15 @@ class Agent:
                      to session history — the text placeholder lines in
                      user_message remain the durable reference. Callers
                      gate on ``client.supports_vision`` before passing.
+            content_callback: Optional async/sync callback receiving raw
+                     LLM answer-text deltas as they arrive (QQ official
+                     c2c streaming, buttons-design §6.10.11.2). When set
+                     AND the client exposes chat_completion_with_tools_-
+                     stream, every agent-loop LLM call goes through the
+                     SSE variant: tool-call rounds never fire the callback
+                     (fragments suppress forwarding), so deltas only flow
+                     for the final-answer round. Transport-only — session
+                     persistence still stores the full assembled text.
 
         Returns:
             The agent's final response string.
@@ -328,12 +357,31 @@ class Agent:
                 if allowed_tools
                 else self.tools.get_schemas()
             )
-            response = await llm_client.chat_completion_with_tools(
-                messages=messages,
-                tools=schemas,
-                timeout=self.thinking_timeout,
-                purpose="agent_loop",
+            # Streaming variant when a content_callback is wired AND the
+            # client supports it (getattr probe keeps every existing mock
+            # on the non-streaming path). Tool-call rounds suppress the
+            # callback internally — deltas only surface on the final
+            # answer round. Return shape is identical, so the rest of
+            # the loop is streaming-agnostic.
+            stream_fn = (
+                getattr(llm_client, "chat_completion_with_tools_stream", None)
+                if content_callback is not None else None
             )
+            if stream_fn is not None:
+                response = await stream_fn(
+                    messages=messages,
+                    tools=schemas,
+                    timeout=self.thinking_timeout,
+                    purpose="agent_loop",
+                    content_callback=content_callback,
+                )
+            else:
+                response = await llm_client.chat_completion_with_tools(
+                    messages=messages,
+                    tools=schemas,
+                    timeout=self.thinking_timeout,
+                    purpose="agent_loop",
+                )
 
             # ── Direct Vision 400 self-heal (misconfigured supports_vision):
             # provider rejected the request outright on the first iteration
@@ -624,9 +672,30 @@ class Agent:
         ]
 
         # ── Conversation history (append-only cached prefix) ──
+        # Context-load awareness (PLAN.md Idea 4 Phase B): estimate the
+        # special session's token load against the effective model input
+        # window. ≥95% → read-time emergency truncation (never touch storage
+        # here); the 85%/truncation states are re-used in the L4 tail below.
+        _ctx_window = 0
+        _ctx_est = 0
+        _ctx_truncated = False
         if special_session:
-            # Special session: full untrimmed context with layered compression
-            messages.extend(self._compress_context(special_session.context))
+            if self.special_sessions is not None:
+                try:
+                    _ctx_window = self.special_sessions.get_context_window()
+                except Exception:  # noqa: BLE001 — awareness is best-effort
+                    _ctx_window = 0
+            if _ctx_window:
+                _ctx_est = estimate_context_tokens(special_session.context)
+            if _ctx_window and _ctx_est >= _ctx_window * CONTEXT_HARD_RATIO:
+                _ctx_truncated = True
+                messages.extend(self._emergency_truncate(
+                    special_session.context,
+                    int(_ctx_window * CONTEXT_HARD_BUDGET_RATIO),
+                ))
+            else:
+                # Special session: full untrimmed context with layered compression
+                messages.extend(self._compress_context(special_session.context))
         else:
             # Temporary session: trimmed context
             messages.extend(session.context)
@@ -693,6 +762,35 @@ class Agent:
                 f"你处于特殊会话模式，拥有完整的对话上下文记忆。"
                 f"如果任务已完成，可以建议用户使用 /结束会话 退出特殊会话模式。"
             )
+            # 85% context-load hint: persona-consistent nudge (user-facing
+            # wording is the agent's job — we only set the intent and forbid
+            # system-error tone / raw numbers). Rate-limited per session.
+            if _ctx_window and _ctx_est >= _ctx_window * CONTEXT_HINT_RATIO:
+                _sid = special_session.session_id
+                _last_hint = _compress_hint_last.get(_sid)
+                if (_last_hint is None
+                        or special_session.total_messages - _last_hint
+                        >= COMPRESS_HINT_INTERVAL
+                        or special_session.total_messages < _last_hint):
+                    _compress_hint_last[_sid] = special_session.total_messages
+                    volatile.append(
+                        "## 记忆负荷提醒\n"
+                        "当前特殊会话的记忆已接近你的容量上限，快要装不下了。"
+                        "请在本轮回复的结尾用你自己的人格口吻、自然地告诉用户："
+                        "你要记的东西太多啦，脑子快装不下了，建议发送 /压缩会话 "
+                        "让你休息整理一下脑子（早期细节会浓缩成一段摘要，"
+                        "最近的对话原样保留）。示例语气：「我要记的东西太多啦，"
+                        "用 /压缩会话 让我休息整理一下脑子吧～」——请按当前人格"
+                        "改写。不要以系统报错的口吻播报，也不要提及 token 数字。"
+                    )
+            if _ctx_truncated:
+                volatile.append(
+                    "## ⚠️ 上下文溢出保护\n"
+                    "本轮请求的会话历史已被系统紧急截断（超出模型输入窗口保护线，"
+                    "仅载入了摘要与最近的对话）。请用你自己的口吻提醒用户：记忆"
+                    "已经超载，本轮只能想起最近的事情，强烈建议尽快发送 /压缩会话 "
+                    "整理记忆。"
+                )
             # UGC character interview session (Bond-System-Design.md §5.1, P1):
             # creation sessions carry metadata {"kind": "char_creation"} and
             # get create_character in allowed_tools (agent_router).
@@ -779,8 +877,12 @@ class Agent:
 
         Layer 1 (tail window): keep full original.
         Layer 2 (head): compress tool results to first line only.
-        Layer 3: Progressive summary not yet implemented — all messages
-                before Layer 1 are kept but with compressed tool results.
+        Layer 3 (progressive summary) is intentionally NOT done here at read
+        time — deep compression is a write-side, user-confirmed operation:
+        ``/压缩会话`` (turn.py) rolls the head into a persisted summary
+        message via ``SpecialSessionManager.apply_compression``. Read-time
+        window protection lives in ``_emergency_truncate`` (≥95% of the
+        model input window) plus the L4 85% persona hint (PLAN.md Idea 4).
 
         Cache-friendly stepping: the number of compressed head messages is
         ``floor((len - recent_full) / COMPRESS_STEP) * COMPRESS_STEP`` — the
@@ -813,6 +915,61 @@ class Agent:
                 compressed.append(msg)
 
         return compressed
+
+    @classmethod
+    def _emergency_truncate(
+        cls, context: List[Dict], budget_tokens: int
+    ) -> List[Dict]:
+        """Last-resort read-time truncation at ≥95% of the model input window.
+
+        Keeps: leading ``[会话摘要]`` system messages (the persisted
+        /压缩会话 output) + a system note + as many trailing messages as fit
+        the budget. Storage is never touched — this only guarantees the
+        outgoing request stays under the window so the API can't 400; the
+        durable fix is a user-confirmed /压缩会话.
+        """
+        head: List[Dict] = []
+        for msg in context:
+            if (msg.get("role") == "system"
+                    and str(msg.get("content") or "").startswith(
+                        COMPRESSION_SUMMARY_PREFIX)):
+                head.append(msg)
+            else:
+                break
+        used = sum(
+            estimate_text_tokens(str(m.get("content") or "")) for m in head
+        )
+
+        note_reserve = 60  # tokens reserved for the truncation note below
+        tail: List[Dict] = []
+        for msg in reversed(context[len(head):]):
+            cost = estimate_text_tokens(str(msg.get("content") or "")) + 4
+            if used + cost > budget_tokens - note_reserve:
+                break
+            tail.append(msg)
+            used += cost
+        tail.reverse()
+
+        if not tail and context:
+            # Pathological: even one message exceeds the budget — keep the
+            # last message, hard-clipped, so the turn still has an anchor.
+            last = dict(context[-1])
+            content = last.get("content")
+            if isinstance(content, str):
+                last["content"] = content[-4000:]
+            tail = [last]
+
+        dropped = len(context) - len(head) - len(tail)
+        if dropped > 0:
+            note = {
+                "role": "system",
+                "content": (
+                    f"[系统] 上下文溢出保护：中间 {dropped} 条历史本轮未载入。"
+                    "请提醒用户尽快 /压缩会话 整理会话记忆。"
+                ),
+            }
+            return head + [note] + tail
+        return head + tail
 
     # ── Tool Execution ────────────────────────────────────────────
 
