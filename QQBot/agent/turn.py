@@ -67,6 +67,7 @@ from lib.button_spec import fit_label as _fit_label
 from lib.button_spec import sanitize_markdown_text as _sanitize_md_text
 from agent import session_render as _session_render
 from agent.bond import BondManager
+from agent.mailbox import MailboxManager
 from agent import bond_content
 from agent.delegation import (
     SOCIAL_TOOLS, run_delegated_task, revoice_task_result, repatch_last_assistant,
@@ -239,6 +240,7 @@ _USER_DATA_ROOT = os.environ.get("USER_DATA_ROOT", os.path.join(_AGENT_DIR, "dat
 # JSON 留在 QQBot/data/ 系统盘，可丢可重建。
 _CHARACTERS_DIR = os.environ.get("CHARACTERS_DIR") or os.path.join(_DATA_DIR, "characters")
 _BONDS_DIR = os.environ.get("BONDS_DIR") or os.path.join(_DATA_DIR, "bonds")
+_MAILBOX_DIR = os.environ.get("MAILBOX_DIR") or os.path.join(_DATA_DIR, "mailboxes")
 _MEMORY_DIR = os.environ.get("MEMORY_DIR") or os.path.join(_DATA_DIR, "memory")
 _ASSETS_DIR = os.environ.get("ASSETS_DIR") or os.path.join(_DATA_DIR, "assets")
 _HELP_MD_PATH = os.path.join(_CONFIG_DIR, "HELP.md")
@@ -1276,6 +1278,11 @@ _bond_manager = BondManager(
     base_dir=_BONDS_DIR,
     characters_dir=_CHARACTERS_DIR,
 )
+
+# 主动消息「角色信箱」存储（proactive-mail-design.md v0.5 §7）：
+# data/mailboxes/{safe_openid}.json 每用户一文件；/邮件 命令直连层与
+# plugins/qq_official.py 的每日 mail pass 共用这一个实例（bot 单写者）。
+_mailbox_manager = MailboxManager(base_dir=_MAILBOX_DIR)
 
 
 # Per-user busy flag — prevents concurrent message processing for the
@@ -2993,9 +3000,11 @@ async def handle_agent_turn(view: InboundMessage):
         # happy:     answer fully streamed → tail + inline disclaimer as
         #            the final shard; skip _send_response (session was
         #            already persisted inside agent.run).
-        # truncated: remain_msg_len exhausted cleanly → close the stream,
-        #            ship only the REMAINDER buffered (_send_response
-        #            applies its own disclaimer policy to it).
+        # truncated: DEFENSIVE ONLY — the streamer currently never sets
+        #            truncated (remain_msg_len proved not to be a send
+        #            budget, live check 2026-10-30), but if it ever does,
+        #            close the stream and ship only the REMAINDER buffered
+        #            (_send_response applies its own disclaimer policy).
         # broken / prefix mismatch (error dict, max-iteration fallback):
         #            resend the FULL response buffered — the half-written
         #            stream message stays on screen (no cancel API).
@@ -5123,7 +5132,8 @@ async def _handle_stream_probe_command(
     lines.append(
         f"- 双流同锚点(流#2): "
         f"{'✅ 双流模型可行' if dual and not streamer.broken else '❌ 平台拒绝，需降级单流'}")
-    lines.append(f"- remain_msg_len 实测: {streamer.remain_msg_len}")
+    lines.append(f"- remain_msg_len 实测: {streamer.remain_msg_len}"
+                 "（平台挂起长度，0=正常，非发送预算）")
     await _safe_send(OutMarkdown("\n".join(lines)))
     return True
 

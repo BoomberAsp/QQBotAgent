@@ -19,9 +19,13 @@ Platform facts that shaped this code (docs §20):
     from 0 per successfully-sent shard — retries reuse the same index;
   - the first shard's response carries `id` → stream_msg_id, which
     every later shard must echo;
-  - response `remain_msg_len` = remaining character budget → tracked;
-    on exhaustion the streamer marks truncated and stops sending (the
-    caller ships the remainder via the buffered path);
+  - response `remain_msg_len`: docs say「流式消息剩余长度」but the real
+    platform returns 0 after every accepted shard (verified 2026-10-30
+    via /流式探测) — it reads like the server-side pending/unrendered
+    remainder (0 = caught up, healthy), NOT a send budget. Gating sends
+    on it silently drops the whole answer tail, so it is telemetry only;
+    a real over-budget condition surfaces as a shard error code →
+    broken → the caller's buffered fallback;
   - NO cancel API: a broken stream stays on screen half-written; every
     failure path best-effort finishes with input_state=10;
   - errors: 40007 prefix-modified (fatal), 50001 internal (retry once),
@@ -215,8 +219,8 @@ class MessageStreamer:
         self._answer_sent = ""       # everything successfully flushed
         self._flush_interval = _stream_flush_interval()
         self._broken = False
-        self._truncated = False
-        self._remain_msg_len: int | None = None
+        self._truncated = False      # reserved — see truncated docstring
+        self._remain_msg_len: int | None = None   # telemetry only
         self._flusher_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._closed = False
@@ -229,6 +233,13 @@ class MessageStreamer:
 
     @property
     def truncated(self) -> bool:
+        """Reserved: the kernel ships only ``response[len(answer_sent):]``
+        buffered when this is True. Currently NEVER set — remain_msg_len
+        turned out not to be a send budget (live check 2026-10-30: the
+        platform returns 0 after every accepted shard), and shard errors
+        mark ``broken`` instead (full-resend fallback). The kernel keeps
+        its truncated branch defensively.
+        """
         return self._truncated
 
     @property
@@ -251,6 +262,8 @@ class MessageStreamer:
 
     @property
     def remain_msg_len(self) -> int | None:
+        """Last platform-reported「流式消息剩余长度」— telemetry only
+        (0 after accepted shards is the normal, healthy value)."""
         return self._remain_msg_len
 
     # ── stream #1: progress ───────────────────────────────────────
@@ -339,9 +352,6 @@ class MessageStreamer:
                 slot = self._answer
                 if not slot.buffer or slot.finished or self._broken:
                     continue
-                if self._truncated:
-                    slot.buffer = ""   # budget gone; remainder ships later
-                    continue
                 await self._flush_slot(slot)
         except asyncio.CancelledError:
             pass
@@ -394,17 +404,11 @@ class MessageStreamer:
             text = slot.buffer
             if not text and not final:
                 return
-            # remaining-budget guard (answer stream only)
-            if slot is self._answer and self._remain_msg_len is not None:
-                if self._remain_msg_len <= 0:
-                    self._truncated = True
-                    slot.buffer = ""
-                    if not final:
-                        return
-                    text = ""
-                elif len(text) > self._remain_msg_len:
-                    text = text[:self._remain_msg_len]
-                    self._truncated = True
+            # NOTE: no remain_msg_len gate here — the field is NOT a send
+            # budget (real platform returns 0 after every accepted shard;
+            # see module docstring). An actual over-budget/over-length
+            # condition arrives as a shard error code → broken → the
+            # kernel's buffered fallback resends the content.
             resp = await self._post(
                 slot, self._payload(slot, text, final=final),
                 opening=False)
@@ -423,9 +427,6 @@ class MessageStreamer:
             if final:
                 slot.finished = True
                 slot.buffer = ""
-            if (slot is self._answer and self._remain_msg_len is not None
-                    and self._remain_msg_len <= 0 and not slot.finished):
-                self._truncated = True
 
     async def _finish_slot(self, slot: _StreamSlot) -> None:
         if not slot.opened or slot.finished:
