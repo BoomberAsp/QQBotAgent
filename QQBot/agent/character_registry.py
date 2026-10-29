@@ -608,6 +608,77 @@ class CharacterRegistry(PersonalityManager):
         self._ugc_cache.pop(char_id, None)
         return char_dir
 
+    def update_character(
+        self,
+        char_id: str,
+        *,
+        card_content: Optional[str] = None,
+        meta_patch: Optional[dict] = None,
+        meta_replace: Optional[dict] = None,
+    ) -> dict:
+        """编辑已存在的 UGC 角色（``register_character`` 之后的唯一写入口）。
+
+        面板 ``webui/character_admin.py`` 是主要调用方，但本方法不依赖 webui ——
+        将来 bot 侧要改卡也可以直接调。
+
+        - 只接受已存在的 UGC（``is_ugc``）；未知 id 抛 ``FileNotFoundError``
+        - 两个文件都走 tmp + ``os.replace``：**mtime 必然变化**，于是 bot 进程里
+          ``load()`` 的 mtime 缓存自动失效（这正是「面板↔bot 缓存一致性」教训的
+          正解；反例是用 ``shutil.copy2`` 恢复备份 —— 它会还原 mtime，让 bot
+          继续读到旧内容）
+        - ``meta_patch`` 浅合并，值为 ``None`` 表示**删除**该键；``meta_replace``
+          整体替换（版本回滚 / 损坏修复用），优先于 ``meta_patch``
+        - 未知键原样保留；写前做一次 JSON 自检，坏数据绝不落盘
+        - ``char_id`` 以目录名为准回写（INV-1），``source`` 缺省补 ``ugc``
+
+        Returns ``{"char_id", "card_mtime"?, "meta_bytes"?}``.
+        """
+        if not self.is_ugc(char_id):
+            raise FileNotFoundError(f"未找到自创角色: {char_id}")
+
+        result: dict = {"char_id": char_id}
+
+        if card_content is not None:
+            if not isinstance(card_content, str) or not card_content.strip():
+                raise ValueError("card.md 内容为空")
+            path = self._card_path(char_id)
+            tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(card_content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            self._ugc_cache.pop(char_id, None)
+            result["card_mtime"] = os.path.getmtime(path)
+
+        if meta_replace is not None or meta_patch is not None:
+            if meta_replace is not None:
+                merged = dict(meta_replace)
+            else:
+                current = self.get_meta(char_id)
+                if current is None:
+                    raise ValueError("meta.json 不可读，请先修复后再保存")
+                merged = dict(current)
+                for key, value in (meta_patch or {}).items():
+                    if value is None:
+                        merged.pop(key, None)
+                    else:
+                        merged[key] = value
+            merged["char_id"] = char_id          # 目录名即权威
+            merged.setdefault("source", "ugc")
+            blob = json.dumps(merged, ensure_ascii=False, indent=2)
+            json.loads(blob)                     # 自检：不可序列化/坏结构不落盘
+            path = self._meta_path(char_id)
+            tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(blob)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            result["meta_bytes"] = len(blob.encode("utf-8"))
+
+        return result
+
     def delete(self, char_id: str) -> bool:
         """Remove a UGC character directory. Returns True if deleted."""
         if not self.is_ugc(char_id):

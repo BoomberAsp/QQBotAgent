@@ -43,6 +43,30 @@ def bot_env(key: str, default: str = "") -> str:
 
 USER_DATA_ROOT = Path(bot_env("USER_DATA_ROOT", str(ROOT / "data" / "users")))
 
+# 角色卡 / 羁绊 / 多模态资产（与 bot 侧同源约定）。
+# ⚠️ 面板进程**不调用 load_dotenv**（只用 dotenv_values 读 _BOT_ENV），所以
+# os.environ 里没有 CHARACTERS_DIR —— 必须在这里显式解析，并显式传参给
+# CharacterRegistry(characters_dir=...)。否则会退回系统盘的空目录
+# QQBot/data/characters：列表是空的，写还会写到错误的位置。
+# 同源处：QQBot/agent/character_registry.py:74-78、QQBot/agent/turn.py:222-225。
+CHARACTERS_DIR = Path(bot_env("CHARACTERS_DIR",
+                              str(QQBOT_DIR / "data" / "characters")))
+BONDS_DIR = Path(bot_env("BONDS_DIR", str(QQBOT_DIR / "data" / "bonds")))
+ASSETS_DIR = Path(bot_env("ASSETS_DIR", str(QQBOT_DIR / "data" / "assets")))
+
+# 同时写进 os.environ：agent.* 里有一部分代码路径读的是 os.environ 而不是
+# dotenv_values —— 典型例子是 `get_character_registry()` 的默认 characters_dir，
+# 而 `agent._build_messages` 的 L2 注入正是走那个单例。不补这一步，
+# 「注入预览」会预览不到 UGC 卡（读到的却是系统盘上的空目录）。
+# setdefault：显式环境变量优先，不覆盖部署者的选择。
+for _key, _path in (("CHARACTERS_DIR", CHARACTERS_DIR),
+                    ("BONDS_DIR", BONDS_DIR),
+                    ("ASSETS_DIR", ASSETS_DIR)):
+    os.environ.setdefault(_key, str(_path))
+
+# 角色卡版本快照根目录（每次保存前全量备份，见 webui/character_admin.py）
+CHARACTER_BACKUP_DIR = BACKUP_DIR / "characters"
+
 # 公开使用站点（bot.oneweblog.cn）：面板每次保存更新记录时向 PUBLIC_SITE_DIR
 # 导出脱敏 changelog.json；nginx root 指向该目录即完成发布（见 docs/bot-site-nginx.md）。
 # 与 USER_DATA_ROOT 同经 bot_env 读取 —— 部署专属路径（如 /var/www/bot-oneweblog）写在

@@ -7,9 +7,10 @@ Supports:
 - Structured response parsing for agent loop
 """
 
+import asyncio
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 from nonebot import get_driver
@@ -175,6 +176,179 @@ class DeepSeekClient:
                     "role": "assistant",
                     "finish_reason": "error",
                 }
+
+    # ── Streaming Tool-Enabled Chat Completion ───────────────────
+
+    async def chat_completion_with_tools_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[dict],
+        timeout: float = 180.0,
+        purpose: str = "agent_loop",
+        *,
+        content_callback: Optional[Callable[[str], Any]] = None,
+    ) -> Dict[str, Any]:
+        """Streaming variant of chat_completion_with_tools (SSE).
+
+        Fires ``content_callback(delta)`` live for answer-text deltas —
+        but ONLY while no tool_call fragment has appeared (tool rounds
+        must accumulate fully before execution, so their content is
+        never forwarded). ``reasoning_content`` deltas are silently
+        dropped (never forwarded to any transport).
+
+        Returns the identical dict shape as the non-streaming method
+        ('content'/'tool_calls'/'role'/'finish_reason', plus
+        'reasoning_content' when the model produced it), so callers can
+        treat both interchangeably. Usage is extracted from the final
+        SSE chunk (stream_options.include_usage) and recorded to the
+        token ledger; absence is tolerated.
+        """
+        data = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "tools": tools,
+            "tool_choice": "auto",
+        }
+
+        async def _emit(delta: str) -> None:
+            if content_callback is None or not delta:
+                return
+            try:
+                maybe = content_callback(delta)
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+            except Exception:
+                # A broken transport callback must never kill the LLM
+                # round — the accumulated content is still returned.
+                pass
+
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        # index -> {id, type, name, arguments}; arguments arrive chunked
+        tool_fragments: Dict[int, Dict[str, str]] = {}
+        finish_reason = "stop"
+        role = "assistant"
+        usage_chunk: Optional[dict] = None
+
+        async with httpx.AsyncClient() as client:
+            try:
+                async with client.stream(
+                    "POST",
+                    f"{self.api_base}/chat/completions",
+                    headers=self._headers(),
+                    json=data,
+                    timeout=timeout,
+                ) as response:
+                    if response.status_code >= 400:
+                        body = (await response.aread()).decode(
+                            "utf-8", "replace")[:200]
+                        return {
+                            "content": (
+                                f"API HTTP错误 ({response.status_code}): "
+                                f"{body}"
+                            ),
+                            "tool_calls": None,
+                            "role": "assistant",
+                            "finish_reason": "error",
+                        }
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload)
+                        except (json.JSONDecodeError, ValueError):
+                            # Malformed SSE line — log-and-skip, keep going.
+                            continue
+                        if not isinstance(chunk, dict):
+                            continue
+                        if chunk.get("usage"):
+                            usage_chunk = chunk
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        choice = choices[0] or {}
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                        delta = choice.get("delta") or {}
+                        if delta.get("role"):
+                            role = delta["role"]
+                        if delta.get("reasoning_content"):
+                            reasoning_parts.append(delta["reasoning_content"])
+                        for frag in delta.get("tool_calls") or []:
+                            if not isinstance(frag, dict):
+                                continue
+                            idx = frag.get("index", 0) or 0
+                            slot = tool_fragments.setdefault(idx, {
+                                "id": "", "type": "function",
+                                "name": "", "arguments": "",
+                            })
+                            if frag.get("id"):
+                                slot["id"] = frag["id"]
+                            if frag.get("type"):
+                                slot["type"] = frag["type"]
+                            fn = frag.get("function") or {}
+                            if fn.get("name"):
+                                slot["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                slot["arguments"] += fn["arguments"]
+                        text = delta.get("content")
+                        if text:
+                            content_parts.append(text)
+                            if not tool_fragments:
+                                await _emit(text)
+            except httpx.ConnectTimeout:
+                return {
+                    "content": f"思考超时，最大时长{timeout}秒。",
+                    "tool_calls": None,
+                    "role": "assistant",
+                    "finish_reason": "error",
+                }
+            except httpx.ReadTimeout:
+                return {
+                    "content": f"响应超时，最大时长{timeout}秒。",
+                    "tool_calls": None,
+                    "role": "assistant",
+                    "finish_reason": "error",
+                }
+            except Exception as e:
+                return {
+                    "content": f"调用DeepSeek API时出错: {str(e)}",
+                    "tool_calls": None,
+                    "role": "assistant",
+                    "finish_reason": "error",
+                }
+
+        if usage_chunk is not None:
+            self._record_usage(usage_chunk, purpose)
+
+        parsed: Dict[str, Any] = {
+            "role": role,
+            "content": "".join(content_parts) if content_parts else None,
+            "finish_reason": finish_reason,
+        }
+        if reasoning_parts:
+            parsed["reasoning_content"] = "".join(reasoning_parts)
+        if tool_fragments:
+            parsed["tool_calls"] = [
+                {
+                    "id": slot["id"],
+                    "type": slot["type"],
+                    "function": {
+                        "name": slot["name"],
+                        "arguments": slot["arguments"],
+                    },
+                }
+                for _, slot in sorted(tool_fragments.items())
+            ]
+        else:
+            parsed["tool_calls"] = None
+        return parsed
 
     # ── Usage Metering ────────────────────────────────────────────
 

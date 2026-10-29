@@ -1,0 +1,322 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row" style="align-items:flex-start;gap:14px;flex-wrap:nowrap">
+
+  <!-- ── 左：列表 ─────────────────────────────────────────── -->
+  <div class="card char-side">
+    <div class="row" style="margin-bottom:8px">
+      <h2 class="card-title" style="margin:0">角色列表</h2>
+      <span class="spacer"></span>
+      <button class="btn btn-sm btn-primary" id="char-new">新建</button>
+    </div>
+    <p class="muted char-stats" id="char-stats">加载中…</p>
+    <label class="field"><span>作者</span>
+      <select id="char-author"><option value="">全部作者</option></select></label>
+    <label class="field"><span>来源</span>
+      <select id="char-source">
+        <option value="ugc">自创角色（UGC）</option>
+        <option value="builtin">内置人格（只读）</option>
+        <option value="all">全部</option>
+      </select></label>
+    <label class="field"><span>筛选</span>
+      <select id="char-issue">
+        <option value="">全部</option>
+        <option value="any">⚠ 只看异常</option>
+        <option value="meta_corrupt">meta 损坏（不可见）</option>
+        <option value="meta_missing">缺 meta.json（不可见）</option>
+        <option value="name_drift">显示名与 H1 不一致</option>
+        <option value="no_portrait">未设置立绘</option>
+        <option value="orphan_dir">僵尸目录</option>
+      </select></label>
+    <input id="char-search" type="text" placeholder="搜索 名称 / ID / 作者"
+           style="width:100%;margin-bottom:10px">
+    <div id="char-list" class="char-list"><span class="muted">加载中…</span></div>
+  </div>
+
+  <!-- ── 右：详情 ─────────────────────────────────────────── -->
+  <div class="card char-main">
+    <div id="char-empty" class="muted" style="padding:28px 0;text-align:center">
+      从左侧选择一张角色卡；或点「新建」由管理员代办创建。<br>
+      <span style="font-size:12px">UGC 卡与 bot 读的是同一份文件，保存后从下一轮对话起生效。</span>
+    </div>
+
+    <div id="char-detail" style="display:none">
+      <div class="row" style="margin-bottom:4px">
+        <h2 class="card-title" id="char-title" style="margin:0">—</h2>
+        <span id="char-badges"></span>
+        <span class="spacer"></span>
+        <button class="btn btn-sm" id="char-refresh" title="重新从磁盘加载（放弃未保存改动）">重新加载</button>
+        <button class="btn btn-sm btn-danger" id="char-delete">删除</button>
+      </div>
+      <p class="muted mono char-sub" id="char-sub"></p>
+
+      <div class="tab-bar" id="char-tabs">
+        <div class="tab active" data-tab="overview">概览</div>
+        <div class="tab" data-tab="prompt">提示词</div>
+        <div class="tab" data-tab="meta">元数据</div>
+        <div class="tab" data-tab="portrait">形象</div>
+        <div class="tab" data-tab="bond">羁绊与绑定</div>
+        <div class="tab" data-tab="versions">版本</div>
+        <div class="tab" data-tab="lint">体检与修复</div>
+      </div>
+
+      <!-- 概览 -->
+      <div class="char-pane" id="pane-overview">
+        <div class="char-cols">
+          <div>
+            <h3 class="char-h3">文件</h3>
+            <table class="kv-table" id="ov-files"></table>
+          </div>
+          <div>
+            <h3 class="char-h3">卡片结构</h3>
+            <div id="ov-sections"></div>
+          </div>
+        </div>
+        <h3 class="char-h3" style="margin-top:14px">meta.json</h3>
+        <pre class="log-box" id="ov-meta" style="max-height:240px">—</pre>
+      </div>
+
+      <!-- 提示词 -->
+      <div class="char-pane" id="pane-prompt" style="display:none">
+        <div class="row" style="margin-bottom:8px">
+          <button class="btn btn-sm" id="pm-mode-sections">分区模式</button>
+          <button class="btn btn-sm" id="pm-mode-raw">原文模式</button>
+          <span class="spacer"></span>
+          <span class="muted" id="pm-size"></span>
+          <button class="btn btn-sm" id="pm-diff">预览差异</button>
+          <button class="btn btn-sm btn-primary" id="pm-save">保存</button>
+        </div>
+        <p class="muted char-note" id="pm-hint">
+          保存前自动备份到面板备份目录；卡片每轮作为 L2 注入系统提示词，改动从下一轮对话起生效。
+          分区模式只改你动过的段，其余段落字节不变。
+        </p>
+        <pre class="log-box" id="pm-diff-box" style="display:none;max-height:280px;margin:0 0 10px"></pre>
+
+        <div id="pm-sections">
+          <div class="card" style="background:var(--bg);margin-bottom:10px">
+            <div class="row">
+              <span class="mono" id="pm-h1-label">—</span>
+              <span class="muted" style="font-size:12px">标题请到「元数据」页修改（会同步 H1）</span>
+              <span class="spacer"></span>
+              <span class="muted mono" style="font-size:11.5px" id="pm-meta-label"></span>
+            </div>
+            <div class="row" style="margin-top:8px;align-items:flex-end">
+              <label class="field" style="margin:0;flex:1"><span>mode</span>
+                <select id="pm-mode">
+                  <option value="">(未设置)</option>
+                  <option value="split">split</option>
+                  <option value="unified">unified</option>
+                </select></label>
+              <label class="field" style="margin:0;flex:1"><span>task_voice</span>
+                <select id="pm-task-voice">
+                  <option value="">(未设置)</option>
+                  <option value="character">character</option>
+                  <option value="template">template</option>
+                </select></label>
+              <label class="field" style="margin:0;flex:1"><span>voice_id（卡片注释）</span>
+                <input id="pm-voice" type="text" placeholder="留空 = 不写"></label>
+            </div>
+          </div>
+          <div class="field" style="margin-bottom:12px">
+            <span>前言（扮演指令）</span>
+            <textarea id="pm-preamble" class="code-editor" rows="3" style="width:100%"></textarea>
+          </div>
+          <div class="row" style="margin-bottom:6px">
+            <span class="muted" style="font-size:12.5px">段落</span>
+            <span class="spacer"></span>
+            <button class="btn btn-sm" id="pm-add-section">＋ 新增段落</button>
+          </div>
+          <div id="pm-section-list"></div>
+        </div>
+
+        <div id="pm-raw" style="display:none">
+          <textarea id="pm-raw-editor" class="code-editor" rows="26"
+                    style="width:100%" spellcheck="false"></textarea>
+        </div>
+
+        <details style="margin-top:12px">
+          <summary class="muted" style="cursor:pointer;font-size:13px">
+            注入预览（该角色真实的 L1+L2 系统提示词）
+          </summary>
+          <div class="row" style="margin-top:8px">
+            <button class="btn btn-sm" id="pm-preview-btn">生成预览</button>
+            <span class="muted" id="pm-preview-meta"></span>
+          </div>
+          <pre class="log-box" id="pm-preview-body"
+               style="max-height:360px;margin-top:8px;display:none"></pre>
+        </details>
+      </div>
+
+      <!-- 元数据 -->
+      <div class="char-pane" id="pane-meta" style="display:none">
+        <div class="card" style="background:var(--bg);max-width:640px">
+          <label class="field"><span>显示名 display_name（≤24 字符）</span>
+            <input id="mt-name" type="text"></label>
+          <label class="row" style="gap:6px;margin:2px 0 14px">
+            <input id="mt-sync-h1" type="checkbox" checked style="width:auto">
+            <span class="muted">同时改写卡片 H1（推荐，避免「显示名/H1 不一致」告警）</span></label>
+          <label class="field"><span>可见性 visibility</span>
+            <select id="mt-visibility">
+              <option value="private">private（仅作者可见）</option>
+              <option value="gallery">gallery（预留，bot 尚未启用）</option>
+            </select></label>
+          <label class="field"><span>音色 voice_id（meta 主通路；留空 = 按 char_id 确定性分配）</span>
+            <input id="mt-voice" type="text" list="mt-voice-list">
+            <datalist id="mt-voice-list"></datalist></label>
+          <label class="field"><span>初始羁绊 initial_bond_level（1–5，仅对尚无羁绊记录的用户生效）</span>
+            <input id="mt-bond" type="number" min="1" max="5"></label>
+          <p class="muted" style="font-size:12px" id="mt-auto-voice"></p>
+          <div class="row">
+            <button class="btn btn-primary" id="mt-save">保存元数据</button>
+            <span class="muted" id="mt-author"></span>
+          </div>
+        </div>
+
+        <div class="card" style="background:var(--bg);max-width:640px;margin-top:12px">
+          <h3 class="char-h3">作者 / 归属</h3>
+          <p class="muted" style="font-size:12px">
+            author 决定谁能看到这个角色；改派会让原作者的绑定失效（羁绊数据保留）。
+          </p>
+          <div class="row">
+            <input id="mt-author-input" type="text" placeholder="新的 uid" style="flex:1">
+            <button class="btn btn-sm" id="mt-author-btn">转移归属</button>
+          </div>
+        </div>
+
+        <div class="card" style="background:var(--bg);max-width:640px;margin-top:12px">
+          <h3 class="char-h3">未知字段</h3>
+          <p class="muted" style="font-size:12px">meta.json 里面板不认识的键会原样保留（前向兼容）。</p>
+          <pre class="log-box" id="mt-unknown" style="max-height:160px">—</pre>
+        </div>
+      </div>
+
+      <!-- 形象 -->
+      <div class="char-pane" id="pane-portrait" style="display:none">
+        <div class="row" style="align-items:flex-start;gap:16px;flex-wrap:nowrap">
+          <div style="width:240px;flex-shrink:0">
+            <img id="pt-img" alt="参考立绘"
+                 style="width:240px;border-radius:10px;border:1px solid var(--border);background:#0a0e17">
+            <p class="muted" id="pt-info" style="font-size:12px"></p>
+          </div>
+          <div style="flex:1;min-width:0">
+            <p class="muted char-note" id="pt-note"></p>
+            <input id="pt-file" type="file" accept="image/*" style="margin:10px 0">
+            <div class="row">
+              <button class="btn btn-sm btn-primary" id="pt-upload">上传并归一化</button>
+              <button class="btn btn-sm btn-danger" id="pt-clear">清除立绘</button>
+            </div>
+            <p class="muted char-note" style="margin-top:12px">
+              参考立绘是 I2I 出图的视觉锚，应与卡片「## Appearance Anchor」的描述一致。
+              上传后自动做 EXIF 旋转 / 透明底铺白 / 长边 ≤1536 / 体积兜底，无需手工压图。
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- 羁绊与绑定 -->
+      <div class="char-pane" id="pane-bond" style="display:none">
+        <h3 class="char-h3">羁绊（只读 —— 养成结果，不是可配置项）</h3>
+        <div id="bd-bond" class="muted">—</div>
+        <h3 class="char-h3" style="margin-top:16px">个人设置引用（personality_settings.json）</h3>
+        <div id="bd-users" class="muted">—</div>
+        <h3 class="char-h3" style="margin-top:16px">群绑定（group_personality.json）</h3>
+        <div id="bd-groups" class="muted">—</div>
+      </div>
+
+      <!-- 版本 -->
+      <div class="char-pane" id="pane-versions" style="display:none">
+        <div class="row" style="margin-bottom:8px">
+          <span class="muted mono" id="vs-root" style="font-size:11.5px"></span>
+          <span class="spacer"></span>
+          <button class="btn btn-sm" id="vs-refresh">刷新</button>
+        </div>
+        <div class="char-cols" style="align-items:flex-start">
+          <div id="vs-list" style="max-height:420px;overflow:auto"></div>
+          <div>
+            <div class="row">
+              <span class="muted" id="vs-selected">未选择版本</span>
+              <span class="spacer"></span>
+              <button class="btn btn-sm btn-danger" id="vs-restore" disabled>回滚到此版本</button>
+            </div>
+            <pre class="log-box" id="vs-diff" style="max-height:360px;margin-top:8px">选择左侧版本查看与当前内容的差异</pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- 体检与修复 -->
+      <div class="char-pane" id="pane-lint" style="display:none">
+        <div class="row" style="margin-bottom:10px">
+          <button class="btn btn-sm" id="ln-review">跑一次内容审查（LLM）</button>
+          <span class="muted" id="ln-review-result"></span>
+        </div>
+        <h3 class="char-h3">问题</h3>
+        <div id="ln-issues" class="muted">—</div>
+        <h3 class="char-h3" style="margin-top:14px">静态体检</h3>
+        <div id="ln-lint" class="muted">—</div>
+        <h3 class="char-h3" style="margin-top:14px">修复动作</h3>
+        <div class="row" id="ln-fixes"></div>
+        <p class="muted char-note" style="margin-top:10px">
+          所有修复动作都会先整树快照到面板备份目录，再改盘。
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── 新建角色（管理员代办）───────────────────────────────── -->
+<div id="new-mask" class="char-mask">
+  <div class="card char-dialog">
+    <div class="row">
+      <h2 class="card-title" style="margin:0">新建角色（管理员代办）</h2>
+      <span class="spacer"></span>
+      <button class="btn btn-sm" id="new-cancel">关闭</button>
+    </div>
+    <p class="muted char-note">
+      字段与 QQ 创作访谈一致（同一套 build_card）；默认先跑内容审查，与 QQ 通道同口径。
+    </p>
+    <div class="char-cols">
+      <label class="field"><span>作者 uid *</span>
+        <input id="new-author" type="text" placeholder="10001"></label>
+      <label class="field"><span>角色名 *（≤24 字符）</span>
+        <input id="new-name" type="text"></label>
+      <label class="field"><span>性别</span>
+        <input id="new-gender" type="text"></label>
+      <label class="field"><span>初始羁绊（1–5）</span>
+        <input id="new-bond" type="number" min="1" max="5" value="1"></label>
+    </div>
+    <label class="field"><span>性格 *</span>
+      <textarea id="new-personality" class="code-editor" rows="2"></textarea></label>
+    <label class="field"><span>说话风格 *</span>
+      <textarea id="new-speech" class="code-editor" rows="2"></textarea></label>
+    <label class="field"><span>外观锚点 *（与立绘一致）</span>
+      <textarea id="new-appearance" class="code-editor" rows="2"></textarea></label>
+    <div class="char-cols">
+      <label class="field"><span>世界观</span>
+        <input id="new-worldview" type="text" placeholder="现代日常"></label>
+      <label class="field"><span>与用户的关系</span>
+        <input id="new-relationship" type="text"></label>
+      <label class="field"><span>初始称呼</span>
+        <input id="new-greeting" type="text"></label>
+      <label class="field"><span>喜爱礼物（逗号分隔）</span>
+        <input id="new-gift" type="text"></label>
+    </div>
+    <div class="row" style="margin:4px 0 12px">
+      <label class="row" style="gap:6px">
+        <input id="new-bypass" type="checkbox" style="width:auto">
+        <span class="muted">忽略配额</span></label>
+      <label class="row" style="gap:6px">
+        <input id="new-skip-review" type="checkbox" style="width:auto">
+        <span class="muted">跳过内容审查</span></label>
+    </div>
+    <div class="row">
+      <button class="btn btn-primary" id="new-submit">创建</button>
+      <span class="muted" id="new-status"></span>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/characters.js"></script>
+{% endblock %}

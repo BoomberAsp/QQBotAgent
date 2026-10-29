@@ -39,9 +39,13 @@
     try {
       const d = await api('/api/playground/options');
       const pSel = document.getElementById('pg-personality');
-      const pers = (d.personalities || []);
+      // personality_options 带显示名与来源，含用户自创角色（[自创] 前缀）；
+      // 回退到旧的纯 key 列表，保证接口降级时下拉仍可用。
+      const opts = Array.isArray(d.personality_options) && d.personality_options.length
+        ? d.personality_options
+        : (d.personalities || []).map(k => ({ key: k, label: k }));
       pSel.innerHTML = '<option value="">(默认 / 无人格覆盖)</option>' +
-        pers.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
+        opts.map(p => `<option value="${esc(p.key)}">${esc(p.label || p.key)}</option>`).join('');
       const tSel = document.getElementById('pg-tier');
       const models = (d.models || []);
       tSel.innerHTML = models.length

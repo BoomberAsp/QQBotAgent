@@ -63,6 +63,33 @@ def available_personalities() -> list:
         return []
 
 
+def personality_options() -> list:
+    """[{key, label, source, author}] —— Playground 下拉用，含用户自创角色。
+
+    内置人格来自代码盘 ``config/personalities``；自创角色来自 ``CHARACTERS_DIR``
+    （经 character_admin 聚合，display_name 走 registry 语义）。角色管理页改完卡
+    就能在下拉里选中试聊，形成「改提示词 → 立刻验证」的闭环。
+    """
+    rows = []
+    try:
+        from . import character_admin
+        rows = character_admin.list_characters(source="all", size=200)["items"]
+    except Exception:                      # noqa: BLE001 — 降级为只列内置人格
+        rows = [{"char_id": p.stem, "display_name": p.stem, "source": "builtin"}
+                for p in sorted(PERSONALITIES_DIR.glob("*.md"))]
+    options = []
+    for row in rows:
+        source = row.get("source", "builtin")
+        label = row.get("display_name") or row["char_id"]
+        options.append({
+            "key": row["char_id"],
+            "label": f"[自创] {label}" if source == "ugc" else label,
+            "source": source,
+            "author": row.get("author", ""),
+        })
+    return options
+
+
 def _load_model_block(tier: str) -> dict:
     try:
         data = json.loads(MODELS_FILE.read_text(encoding="utf-8"))

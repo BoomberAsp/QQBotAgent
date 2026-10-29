@@ -291,6 +291,53 @@ textarea.code-editor { font-family: var(--mono); font-size: 13px; line-height: 1
 .qr-wrap.logged-in img { filter: grayscale(1); opacity: .5; }
 .qr-wrap.logged-in .qr-overlay { display: flex; }
 
+/* ── 角色管理（/characters）── */
+.char-side {
+  width: 280px; flex-shrink: 0; align-self: flex-start;
+  position: sticky; top: 12px; max-height: calc(100vh - 110px); overflow: auto;
+}
+.char-main { flex: 1; min-width: 0; }
+.char-stats { font-size: 12px; line-height: 1.55; margin: 0 0 10px; word-break: break-all; }
+.char-list { display: flex; flex-direction: column; gap: 4px; }
+.char-item {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 9px; cursor: pointer; background: var(--bg);
+}
+.char-item:hover { border-color: var(--accent); }
+.char-item.active { border-color: var(--accent); background: var(--accent-soft); }
+.char-item-err { border-left: 3px solid var(--red); }
+.char-item-warn { border-left: 3px solid var(--yellow); }
+.char-item-name { font-size: 13px; font-weight: 600; }
+.char-item-sub {
+  font-size: 11px; color: var(--text-dim); font-family: var(--mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.char-item-mark { font-size: 11px; color: var(--yellow); margin-top: 2px; }
+.char-sub { font-size: 11.5px; margin: 0 0 12px; word-break: break-all; }
+.char-note { font-size: 12px; margin: 0 0 12px; line-height: 1.5; }
+.char-h3 { font-size: 13px; margin: 0 0 6px; color: var(--text-dim); }
+.char-cols {
+  display: grid; gap: 14px; align-items: start;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+.char-sec {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; margin-bottom: 10px; background: var(--bg);
+}
+.char-sec:focus-within { border-color: var(--accent); }
+.char-sec-head { font-size: 12.5px; color: var(--accent); }
+.char-lint { margin: 4px 0 8px; padding-left: 20px; font-size: 12.5px; }
+.char-lint li { margin: 2px 0; }
+.char-mask {
+  display: none; position: fixed; inset: 0; z-index: 900;
+  background: rgba(0, 0, 0, .6); align-items: center; justify-content: center;
+}
+.char-dialog { width: min(720px, 94vw); max-height: 88vh; overflow: auto; }
+.diff-add { color: var(--green); }
+.diff-del { color: var(--red); }
+.diff-ctx { color: var(--text-dim); }
+.btn.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+
 @media (max-width: 860px) {
   .layout { flex-direction: column; }
   .sidebar { width: 100%; height: auto; position: static; flex-direction: row; align-items: center; }

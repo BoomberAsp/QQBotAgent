@@ -25,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from . import (audit, auth, config, config_editor, data_reader,
+from . import (audit, auth, character_admin, config, config_editor, data_reader,
                hardware_monitor, log_viewer, napcat_login, official_status,
                playground, process_manager)
 from .config import HOST, PORT
@@ -77,6 +77,7 @@ PAGES = [
     ("/tasks", "任务日志"),
     ("/memory", "记忆与画像"),
     ("/workspace", "工作区磁盘"),
+    ("/characters", "角色管理"),
     ("/config", "配置热管理"),
     ("/playground", "Playground"),
     ("/wiki", "Wiki 缓存"),
@@ -88,7 +89,7 @@ PAGES = [
 _IMPLEMENTED = {"/", "/processes", "/logs", "/terminal",
                 "/tokens", "/audit", "/feedback", "/sessions",
                 "/tasks", "/workspace", "/config", "/memory", "/wiki",
-                "/playground", "/redeem", "/changelog"}
+                "/playground", "/redeem", "/changelog", "/characters"}
 
 _PUBLIC_PREFIXES = ("/static/", "/api/auth/")
 _PUBLIC_PATHS = {"/login", "/favicon.ico"}
@@ -797,6 +798,292 @@ async def api_config_personality_put(payload: PersonalityPayload, request: Reque
     return {"ok": True, "note": "已保存，新消息即生效"}
 
 
+# ── Character management API（角色管理页）────────────────────────
+#
+# 设计：docs/character-admin-ui-design.md。写路径统一走
+# character_admin → CharacterRegistry.update_character()，面板不自己拼文件格式。
+# ⚠️ 静态路径段（stats/authors/voices）必须声明在 /{cid} 之前，否则会被当成 cid。
+
+def _api_error(result: dict, default: int = 400):
+    """把业务层的 {"error", "status"} 映射成 HTTP 错误响应。"""
+    body = {"error": result.get("error", "操作失败")}
+    for key in ("lint", "issues"):
+        if key in result:
+            body[key] = result[key]
+    return JSONResponse(body, status_code=int(result.get("status", default)))
+
+
+@app.get("/api/characters")
+async def api_characters_list(author: str = "", q: str = "", source: str = "ugc",
+                              issue: str = "", page: int = 1, size: int = 50):
+    return await asyncio.to_thread(character_admin.list_characters,
+                                   author, q, source, issue, page, size)
+
+
+@app.get("/api/characters/stats")
+async def api_characters_stats():
+    return await asyncio.to_thread(character_admin.stats)
+
+
+@app.get("/api/characters/authors")
+async def api_characters_authors():
+    return await asyncio.to_thread(character_admin.authors)
+
+
+@app.get("/api/characters/voices")
+async def api_characters_voices():
+    return await asyncio.to_thread(character_admin.voices)
+
+
+class CharCreatePayload(BaseModel):
+    author: str
+    fields: dict
+    allow_quota_bypass: bool = False
+    skip_review: bool = False
+
+
+@app.post("/api/characters")
+async def api_characters_create(payload: CharCreatePayload, request: Request):
+    """管理员代办新建：组卡 → （默认）内容审查 → 落盘。"""
+    prepared = await asyncio.to_thread(
+        lambda: character_admin.prepare_create(
+            payload.author, payload.fields,
+            allow_quota_bypass=payload.allow_quota_bypass))
+    if "error" in prepared:
+        return _api_error(prepared)
+
+    review = None
+    if not payload.skip_review:
+        review = await character_admin.review_text(prepared["card"])
+        if "error" in review:
+            return JSONResponse(
+                {"error": f"内容审查不可用（可勾选「跳过审查」）：{review['error']}"},
+                status_code=400)
+        if not review.get("approved"):
+            return JSONResponse(
+                {"error": f"内容审查未通过：{review.get('reason') or '未说明原因'}"},
+                status_code=400)
+
+    result = await asyncio.to_thread(character_admin.commit_create, prepared)
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.create",
+                     f"{result['char_id']} · 作者 {payload.author}"
+                     f"{' · 已审' if review else ' · 跳过审查'}", _ip(request))
+    result["review"] = review
+    return result
+
+
+@app.get("/api/characters/{cid}")
+async def api_character_detail(cid: str):
+    result = await asyncio.to_thread(character_admin.detail, cid)
+    if "error" in result:
+        return _api_error(result, 404)
+    return result
+
+
+class CharCardPayload(BaseModel):
+    content: str
+    expected_sha256: str = ""
+    force: bool = False
+
+
+@app.put("/api/characters/{cid}/card")
+async def api_character_card_put(cid: str, payload: CharCardPayload,
+                                 request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.save_card(
+            cid, payload.content, expected_sha256=payload.expected_sha256,
+            force=payload.force, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.card_write",
+                     f"{cid} · {result.get('bytes')} B", _ip(request))
+    return result
+
+
+class CharSectionEdit(BaseModel):
+    index: int
+    body: str
+
+
+class CharSectionsPayload(BaseModel):
+    sections: list[CharSectionEdit] = []
+    h1: str | None = None
+    preamble: str | None = None
+    meta: dict | None = None
+    expected_sha256: str = ""
+    force: bool = False
+
+
+@app.put("/api/characters/{cid}/sections")
+async def api_character_sections_put(cid: str, payload: CharSectionsPayload,
+                                     request: Request):
+    edits = [{"index": s.index, "body": s.body} for s in payload.sections]
+    result = await asyncio.to_thread(
+        lambda: character_admin.save_sections(
+            cid, edits, h1=payload.h1, preamble=payload.preamble,
+            meta_values=payload.meta, expected_sha256=payload.expected_sha256,
+            force=payload.force, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    if not result.get("unchanged"):
+        audit.log_action("character.sections_write", f"{cid}", _ip(request))
+    return result
+
+
+class CharMetaPayload(BaseModel):
+    patch: dict
+    expected_sha256: str = ""
+    sync_h1: bool = False
+
+
+@app.put("/api/characters/{cid}/meta")
+async def api_character_meta_put(cid: str, payload: CharMetaPayload,
+                                 request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.save_meta(
+            cid, payload.patch, expected_sha256=payload.expected_sha256,
+            sync_h1=payload.sync_h1, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.meta_write",
+                     f"{cid} · {', '.join(payload.patch)}", _ip(request))
+    return result
+
+
+class CharRepairPayload(BaseModel):
+    action: str
+    payload: dict = {}
+
+
+@app.post("/api/characters/{cid}/repair")
+async def api_character_repair(cid: str, payload: CharRepairPayload,
+                               request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.repair(cid, payload.action, payload.payload,
+                                       actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.repair",
+                     f"{cid} · {payload.action}", _ip(request))
+    return result
+
+
+@app.get("/api/characters/{cid}/portrait")
+async def api_character_portrait(cid: str):
+    info = await asyncio.to_thread(character_admin.portrait_file, cid)
+    if "error" in info:
+        return _api_error(info, 404)
+    # no-cache：换了图必须立刻看到（同 _NoCacheStatic 的教训）
+    return FileResponse(info["path"], media_type=info["mime"],
+                        headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
+class CharPortraitPayload(BaseModel):
+    data_b64: str
+    filename: str = ""
+
+
+@app.post("/api/characters/{cid}/portrait")
+async def api_character_portrait_put(cid: str, payload: CharPortraitPayload,
+                                     request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.save_portrait(cid, payload.data_b64,
+                                              actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.portrait_write",
+                     f"{cid} · {result.get('describe')}", _ip(request))
+    return result
+
+
+@app.delete("/api/characters/{cid}/portrait")
+async def api_character_portrait_delete(cid: str, request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.clear_portrait(cid, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.portrait_clear", cid, _ip(request))
+    return result
+
+
+@app.get("/api/characters/{cid}/preview")
+async def api_character_preview(cid: str):
+    result = await asyncio.to_thread(character_admin.preview, cid)
+    if "error" in result:
+        return _api_error(result)
+    return result
+
+
+@app.get("/api/characters/{cid}/versions")
+async def api_character_versions(cid: str):
+    return await asyncio.to_thread(character_admin.versions, cid)
+
+
+@app.get("/api/characters/{cid}/versions/{ts}")
+async def api_character_version(cid: str, ts: str):
+    result = await asyncio.to_thread(character_admin.version_content, cid, ts)
+    if "error" in result:
+        return _api_error(result, 404)
+    return result
+
+
+class CharRestorePayload(BaseModel):
+    ts: str
+
+
+@app.post("/api/characters/{cid}/restore")
+async def api_character_restore(cid: str, payload: CharRestorePayload,
+                                request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.restore(cid, payload.ts, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.restore", f"{cid} ← {payload.ts}", _ip(request))
+    return result
+
+
+class CharReviewPayload(BaseModel):
+    content: str = ""
+
+
+@app.post("/api/characters/{cid}/review")
+async def api_character_review(cid: str, payload: CharReviewPayload,
+                               request: Request):
+    """可选的内容审查（复用 QQ 创作通道的审查口径）。"""
+    text = payload.content
+    if not text:
+        detail_ = await asyncio.to_thread(character_admin.detail, cid)
+        if "error" in detail_:
+            return _api_error(detail_, 404)
+        text = detail_["card"]["content"]
+    result = await character_admin.review_text(text)
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.review",
+                     f"{cid} · {result.get('verdict')}", _ip(request))
+    return result
+
+
+class CharDeletePayload(BaseModel):
+    confirm_name: str
+
+
+@app.delete("/api/characters/{cid}")
+async def api_character_delete(cid: str, payload: CharDeletePayload,
+                               request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.delete_character(
+            cid, payload.confirm_name, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.delete",
+                     f"{cid} · {result.get('display_name')} · purge={result.get('purged')}",
+                     _ip(request))
+    return result
+
+
 # ── Memory & profile API ──────────────────────────────────────────
 
 @app.get("/api/memory")
@@ -1153,6 +1440,9 @@ async def api_changelog_broadcast_status():
 async def api_playground_options():
     return {
         "models": await asyncio.to_thread(playground.available_models),
+        # personality_options 带 label/source，含用户自创角色（角色管理页 Phase 3）
+        "personality_options": await asyncio.to_thread(playground.personality_options),
+        # 旧字段保留（纯 key 列表），避免其它调用方被破坏
         "personalities": await asyncio.to_thread(playground.available_personalities),
     }
 

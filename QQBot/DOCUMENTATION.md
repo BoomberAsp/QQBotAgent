@@ -17,7 +17,7 @@
 - **特殊会话**: 每用户持久化会话（按角色：管理员 10 / 会员 3 / 普通 1），百万 token 上下文，快照+增量存储；**人格绑定在会话上**（`metadata.persona_key`），切换会话自动切换人格（解析链：剧情钉住 > 会话绑定 > 个人设置 > 群默认 > 全局默认）
 - **用户工作区**: 每用户独立文件空间，配额管理（2GB/500MB/100MB），跨会话隔离，80% 预警 + 超限清理协议
 - **三层记忆引擎**: `TieredMemory`（SHORT/MEDIUM/LONG），LLM judge 归类 + 频次晋升/年龄降级状态机；LONG 支持索引注入与 `recall_memory` 召回
-- **Web 管理面板**: FastAPI 独立服务（`webui/`，74 个 API + 16 个页面），进程管理、配置热编辑、记忆/画像/别名管理、Token 看板、反馈处理、更新记录编辑与群发、Playground、官方路由状态卡
+- **Web 管理面板**: FastAPI 独立服务（`webui/`，93 个 API + 18 个页面），进程管理、配置热编辑、记忆/画像/别名管理、**角色管理**（用户自创角色卡的浏览/编辑/体检/版本回滚/立绘）、Token 看板、反馈处理、更新记录编辑与群发、Playground、官方路由状态卡
 - **更新记录**: 结构化更新日志（版本/日期/分类变更条目），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询，管理员在面板编辑并群发更新公告；QQ 端以图片卡片呈现，并同步脱敏快照到公开站点 `bot.oneweblog.cn`
 - **部署方式**: Docker Compose（searxng + qqbot；vLLM 由 `vllm-start.sh` 可选单独拉起）或手动部署
 
@@ -39,16 +39,18 @@ QQBotAgent/
 ├── searxng/settings.yml        # SearXNG 搜索引擎配置（国内可用引擎）
 │
 ├── webui/                      # ★ Web 管理面板（FastAPI 独立进程）
-│   ├── main.py                 #   入口（74 个 /api/ 端点 + 16 个页面路由 + 2 个 WebSocket）
+│   ├── main.py                 #   入口（93 个 /api/ 端点 + 18 个页面路由 + 2 个 WebSocket）
 │   ├── auth.py                 #   登录鉴权（scrypt 口令哈希 + 内存会话）
 │   ├── process_manager.py      #   启停 bot / 看门狗状态持久化
 │   ├── config_editor.py        #   提示词 / 人格 / .env / JSON 配置热编辑（密钥脱敏 + 原子写）
+│   ├── character_admin.py      #   角色管理：UGC 卡读写/体检/备份版本/修复/立绘（写路径经 CharacterRegistry.update_character）
+│   ├── card_parser.py          #   card.md 结构化解析与「偏移切片」编辑（纯函数，零 IO）
 │   ├── model_probe.py          #   模型 API 可用性探测（最小真实调用 + 分级判定）
 │   ├── data_reader.py          #   记忆/画像/会话/Wiki 别名/兑换码/更新记录 数据读写
 │   ├── log_viewer.py / audit.py / hardware_monitor.py / playground.py / napcat_login.py
 │   ├── official_status.py      #   QQ 官方路由状态（只读 official_status.json，mtime 判新鲜度）
 │   ├── config.py               #   面板配置（从 QQBot/.env 读 USER_DATA_ROOT 等）
-│   ├── templates/ static/      #   19 个页面模板与静态资源
+│   ├── templates/ static/      #   20 个页面模板与静态资源
 │   └── data/                   #   面板运行时数据（webui.pid / logs / watchdog_state.json / backups）
 │
 ├── public_site/                # ★ 公开使用站点（bot.oneweblog.cn，纯静态只读）
@@ -830,6 +832,16 @@ v2.31 起，原本集中在 `plugins/agent_router.py` 的回合逻辑被整体�
 - **删除角色联动**：`CharacterRegistry.purge_references(char_id)` 清理**用户默认人格**与**群默认人格**中指向该角色的条目（`/删除角色` 回复「已解除 N 处人格设置引用」）；会话级 `metadata.persona_key` 不批量清理，由 `_exists` 懒校验自动穿透；好感数据（`data/bonds/`）保留，重逢时仍在。
 - **创建快照**：`/新会话`、`/保存为会话` 在 create/switch_to **之前** resolve 当前生效人格写入 `persona_key`；bond_scene 冗余写 `persona_key=char_id`（展示统一读 persona_key，解析按 kind 优先 char_id）。
 - 切会话/结束会话发人格提示消息但不注入 personality marker；`/clear` 清历史保留绑定。
+
+**面板写路径**（`docs/character-admin-ui-design.md`，`webui/character_admin.py`）：UGC 卡的编辑统一走
+`CharacterRegistry.update_character(char_id, card_content=…, meta_patch=… | meta_replace=…)` ——
+写盘用 tmp + `os.replace`，**mtime 必然变化**，于是 bot 进程里 `load()` 的 mtime 缓存自动失效
+（这正是「面板↔bot 缓存一致性」教训的正解；反例是用 `copy2` 恢复备份，它会还原 mtime 让 bot 继续读旧卡）。
+`card.md` 的段落编辑由 `webui/card_parser.py` 做**偏移切片**：只替换被改段落所在的字符区间，
+其余段落字节级不变（围栏代码块内的 `#` 不当标题、`###` 归父段），保存时行尾统一 LF。
+面板侧额外负责：每写必先全量快照（`webui/data/backups/characters/<char_id>/<ts>/`）、
+sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非 UTF-8 / 无 H1 / 体积 / 元数据值域等 error 阻断）、
+版本列表与一键回滚。生效时机：**`card.md` 下一轮对话生效**，`meta.json`（显示名/音色/可见性）立即生效。
 
 ### 2.14 `agent/asset_memory.py` + `lib/media_gen.py` + `lib/image_parts.py` — 影音资产与生成
 
