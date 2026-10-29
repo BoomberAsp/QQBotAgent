@@ -3863,6 +3863,13 @@ def _mail_fmt_full(ts: float) -> str:
     return f"{dt.month}月{dt.day}日"
 
 
+def _mail_letter_label(letter: dict) -> str:
+    """列表/日期视图里的发信人名：系统邮件显示【系统】+标题（§16.4.4）。"""
+    if letter.get("system"):
+        return f"【系统】{letter.get('title') or ''}".rstrip()
+    return letter.get("name") or letter.get("persona") or "?"
+
+
 async def _mail_send_list(user_id: str, letters: list, page: int) -> None:
     """B3 列表：每页 5 封，未读标 ●，编号可见（供 /邮件 <编号> 展开）。"""
     if not letters:
@@ -3878,7 +3885,7 @@ async def _mail_send_list(user_id: str, letters: list, page: int) -> None:
     for letter in chunk:
         ts = float(letter.get("created_at", 0) or 0)
         mark = "●" if not letter.get("read") else "　"
-        name = letter.get("name") or letter.get("persona") or "?"
+        name = _mail_letter_label(letter)
         preview = letter.get("preview") or ""
         lines.append(f"{mark} {_mail_fmt_md(ts)}  {name}：{preview}")
         lines.append(f"   编号 {letter.get('id', '')}")
@@ -3891,8 +3898,12 @@ async def _mail_send_list(user_id: str, letters: list, page: int) -> None:
 async def _mail_send_detail(user_id: str, letter: dict) -> None:
     """B4 详情：全文 + 标记已读 + 返回信箱按钮；纯文本，不带免责尾。"""
     ts = float(letter.get("created_at", 0) or 0)
-    name = letter.get("name") or letter.get("persona") or "?"
-    body = (f"【{name} · {_mail_fmt_full(ts)}】\n"
+    if letter.get("system"):
+        head = (f"【系统邮件 · {letter.get('title') or '通知'}"
+                f" · {_mail_fmt_full(ts)}】")
+    else:
+        head = f"【{letter.get('name') or letter.get('persona') or '?'} · {_mail_fmt_full(ts)}】"
+    body = (f"{head}\n"
             f"{letter.get('text', '')}\n\n"
             f"—— 发送 /邮件 返回信箱")
     _mailbox_manager.mark_read(user_id, letter.get("id", ""))
@@ -3942,20 +3953,29 @@ async def _handle_mail_command(text: str, user_id: str,
         lines = [f"【角色信箱 · {mmdd}】", ""]
         for letter in day_letters:
             mark = "●" if not letter.get("read") else "　"
-            name = letter.get("name") or letter.get("persona") or "?"
-            lines.append(f"{mark} {name}：{letter.get('preview', '')}")
+            lines.append(f"{mark} {_mail_letter_label(letter)}："
+                         f"{letter.get('preview', '')}")
             lines.append(f"   编号 {letter.get('id', '')}")
         lines += ["", "发送 /邮件 <编号> 查看全文。"]
         await _safe_send("\n".join(lines))
         return True
 
     # 按编号展开详情（按钮点击等价用户发出 /邮件 <id>）
-    letter_id = rest.split()[0].upper()
+    raw_id = rest.split()[0]
+    letter_id = raw_id.upper()
     letter = _mailbox_manager.get_letter(user_id, letter_id)
-    if letter is None and letter_id != rest.split()[0]:
-        letter = _mailbox_manager.get_letter(user_id, rest.split()[0])
+    if letter is None and letter_id != raw_id:
+        letter = _mailbox_manager.get_letter(user_id, raw_id)
     if letter is not None:
         await _mail_send_detail(user_id, letter)
+        return True
+
+    # digest 仍引用该 id 但信件已不在 → 管理员撤回（§16.4.3），
+    # 与「过了保留期/编号打错」区分开，不装作这封信从未存在
+    if (_mailbox_manager.is_withdrawn(user_id, letter_id)
+            or (letter_id != raw_id
+                and _mailbox_manager.is_withdrawn(user_id, raw_id))):
+        await _safe_send("这封信已被撤回。\n发送 /邮件 返回信箱。")
         return True
 
     await _safe_send(

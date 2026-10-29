@@ -16,6 +16,7 @@ result, never an exception.
 
 import json
 import os
+import random
 import re
 import shutil
 import time
@@ -1215,6 +1216,7 @@ def redeem_alert_clear() -> dict:
 # 是独立进程，无法直接调用 bot.send_group_msg）。
 
 CHANGELOG_FILE = CHANGELOG_DIR / "changelog.json"
+ANNOUNCEMENTS_FILE = CHANGELOG_DIR / "announcements.json"
 KNOWN_GROUPS_FILE = CHANGELOG_DIR / "known_groups.json"
 PENDING_FILE = CHANGELOG_DIR / "pending_broadcast.json"
 STATUS_FILE = CHANGELOG_DIR / "broadcast_status.json"
@@ -1335,55 +1337,101 @@ def _export_public_changelog(entries) -> None:
 
 
 def changelog_groups() -> dict:
-    """读取 bot 导出的群列表（群号+群名），供群发勾选。"""
+    """读取 bot 导出的群列表（OneBot 群 + 官方群），供群发勾选（§16.5.1）。
+
+    统一结构：groups[] 每项带 channel；官方群附 status/active_enabled/
+    sendable/reason（关闭通知或已退群的标灰由前端处理）。
+    """
     data = {}
     if KNOWN_GROUPS_FILE.exists():
         try:
             data = json.loads(KNOWN_GROUPS_FILE.read_text(encoding="utf-8"))
         except Exception:
             data = {}
-    groups = data.get("groups") if isinstance(data, dict) else None
     out = []
+    groups = data.get("groups") if isinstance(data, dict) else None
     if isinstance(groups, dict):
         for gid, info in groups.items():
             info = info if isinstance(info, dict) else {}
             out.append({
+                "channel": "onebot",
                 "id": str(gid),
                 "name": info.get("name") or "",
                 "member_count": info.get("member_count", 0),
+                "sendable": True,
+                "reason": "",
             })
-    out.sort(key=lambda g: g["name"] or g["id"])
+    official = data.get("official_groups") if isinstance(data, dict) else None
+    if isinstance(official, dict):
+        for g_openid, info in official.items():
+            info = info if isinstance(info, dict) else {}
+            status = str(info.get("status") or "unknown")
+            enabled = bool(info.get("active_enabled", True))
+            sendable = status == "active" and enabled
+            out.append({
+                "channel": "official",
+                "id": str(g_openid),
+                "name": f"官方群 {_mask_openid(g_openid)}",
+                "status": status,
+                "active_enabled": enabled,
+                "sendable": sendable,
+                "reason": "" if sendable else (
+                    "已退群" if status == "left" else
+                    "已关闭通知" if not enabled else "状态未知"),
+                "last_seen_at": info.get("last_seen_at", 0),
+            })
+    out.sort(key=lambda g: (g["channel"] != "onebot", g.get("name") or g["id"]))
     return {
         "groups": out,
         "updated_at": data.get("updated_at") if isinstance(data, dict) else None,
-        "note": "群列表由 bot 启动后每 10 分钟自动导出；若为空，请确认 bot 已连接。",
+        "note": "群列表由 bot 每 10 分钟自动导出（官方群来自群内 @ 消息登记表）；"
+                "若为空，请确认 bot 已连接。",
     }
 
 
-def changelog_broadcast(entry_index, targets) -> dict:
-    """入队一次群发请求（写 pending_broadcast.json，由 bot 轮询器认领执行）。"""
-    if not isinstance(entry_index, int) or entry_index < 0:
-        return {"error": "entry_index 非法"}
-    entries = changelog_list().get("entries", [])
-    if entry_index >= len(entries):
-        return {"error": "entry_index 越界（请先保存后再群发）"}
+def _norm_broadcast_targets(targets):
+    """群发目标归一化（§16.5.2）→ list 或 {"error": …}。
+
+    接受："all"、{channel,id} 对象、旧格式裸字符串（视为 onebot 群号）。
+    """
     if not isinstance(targets, list) or not targets:
         return {"error": "请至少选择一个目标群"}
     norm = []
     for t in targets:
-        s = str(t).strip()
-        if not s:
+        if t == "all":
+            norm.append("all")
             continue
-        if s != "all" and not s.isdigit():
-            return {"error": f"非法群号: {s}"}
-        norm.append(s)
+        if isinstance(t, dict):
+            ch = str(t.get("channel") or "onebot")
+            gid = str(t.get("id") or "").strip()
+        else:
+            ch, gid = "onebot", str(t).strip()
+        if not gid:
+            continue
+        if ch not in ("onebot", "official"):
+            return {"error": f"未知渠道: {ch}"}
+        if ch == "onebot":
+            if not gid.isdigit():
+                return {"error": f"非法群号: {gid}"}
+        elif not re.fullmatch(r"[A-Za-z0-9_\-]{1,128}", gid):
+            return {"error": f"非法官方群 openid: {gid[:12]}…"}
+        norm.append({"channel": ch, "id": gid})
     if not norm:
         return {"error": "请至少选择一个目标群"}
+    return norm
+
+
+def _enqueue_broadcast(kind: str, ref: dict, targets) -> dict:
+    """写 pending_broadcast.json（新格式 kind/ref/targets，bot 兼容旧格式）。"""
+    norm = _norm_broadcast_targets(targets)
+    if isinstance(norm, dict):
+        return norm
     # 避免覆盖尚未被认领的上一个请求
     if PENDING_FILE.exists():
         return {"error": "已有群发请求待处理，请稍后再试"}
     _atomic_write_json(PENDING_FILE, {
-        "entry_index": entry_index,
+        "kind": kind,
+        "ref": ref,
         "targets": norm,
         "queued_at": time.time(),
     })
@@ -1391,11 +1439,417 @@ def changelog_broadcast(entry_index, targets) -> dict:
             "note": "已入队 — bot 轮询器约 5 秒内开始发送，可在下方查看进度"}
 
 
+def changelog_broadcast(entry_index, targets) -> dict:
+    """入队一次更新记录群发（写 pending_broadcast.json，bot 轮询器认领执行）。"""
+    if not isinstance(entry_index, int) or entry_index < 0:
+        return {"error": "entry_index 非法"}
+    entries = changelog_list().get("entries", [])
+    if entry_index >= len(entries):
+        return {"error": "entry_index 越界（请先保存后再群发）"}
+    return _enqueue_broadcast("changelog", {"entry_index": entry_index}, targets)
+
+
 def changelog_broadcast_status() -> dict:
-    """读取最近一次群发的执行状态（供面板轮询显示进度/结果）。"""
+    """读取最近一次群发的执行状态（供面板轮询显示进度/结果）。
+
+    新状态含 kind/ref/skipped/by_channel（§16.5.3.5）；旧文件原样返回。
+    """
     if not STATUS_FILE.exists():
         return {}
     try:
         return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+# ── 公告（announcements，proactive-mail-design.md §16.3）──────────────
+# 与 changelog.json 分离存储；面板全量快照保存，id 服务端生成并按 id
+# 定位（不用数组下标）；sent_at/last_targets 由 bot 群发成功后回写。
+
+ANNOUNCEMENT_TITLE_MAX = 60
+ANNOUNCEMENT_BODY_MAX = 2000
+ANNOUNCEMENT_FORMATS = ["text", "markdown"]
+
+
+def _new_announcement_id() -> str:
+    return "ann_%s_%06x" % (datetime.now().strftime("%Y%m%d"),
+                            random.randrange(0x1000000))
+
+
+def _load_announcement_entries() -> list:
+    if not ANNOUNCEMENTS_FILE.exists():
+        return []
+    try:
+        data = json.loads(ANNOUNCEMENTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def announcement_list() -> dict:
+    """全部公告（新→旧），供面板编辑与发送。"""
+    entries = _load_announcement_entries()
+    entries.sort(key=lambda e: float(e.get("created_at") or 0), reverse=True)
+    return {
+        "entries": entries,
+        "formats": ANNOUNCEMENT_FORMATS,
+        "note": "公告按 id 定位（编辑/群发均需先保存）；发送状态由 bot 群发后回写。",
+    }
+
+
+def announcement_save(entries) -> dict:
+    """校验并全量保存公告快照；id/created_at/updated_at 服务端维护。"""
+    from . import config_editor
+
+    if not isinstance(entries, list):
+        return {"error": "entries 必须是数组"}
+    current = {str(e.get("id")): e for e in _load_announcement_entries()}
+    now = time.time()
+    seen: set = set()
+    clean = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            return {"error": f"第 {i + 1} 条公告不是对象"}
+        title = str(entry.get("title") or "").strip()
+        body = str(entry.get("body") or "")
+        fmt = str(entry.get("format") or "text")
+        if not title:
+            return {"error": f"第 {i + 1} 条公告缺少标题"}
+        if len(title) > ANNOUNCEMENT_TITLE_MAX:
+            return {"error": f"第 {i + 1} 条公告标题超 {ANNOUNCEMENT_TITLE_MAX} 字"}
+        if not body.strip():
+            return {"error": f"第 {i + 1} 条公告缺少正文"}
+        if len(body) > ANNOUNCEMENT_BODY_MAX:
+            return {"error": f"第 {i + 1} 条公告正文超 {ANNOUNCEMENT_BODY_MAX} 字"}
+        if fmt not in ANNOUNCEMENT_FORMATS:
+            return {"error": f"第 {i + 1} 条公告 format 必须是 "
+                             f"{'/'.join(ANNOUNCEMENT_FORMATS)}"}
+        aid = str(entry.get("id") or "").strip()
+        if aid and not re.fullmatch(r"ann_[0-9A-Za-z_\-]{1,64}", aid):
+            aid = ""                       # 非法 id 视为新建，重新生成
+        if not aid:
+            aid = _new_announcement_id()
+        if aid in seen:
+            return {"error": f"公告 id 重复: {aid}"}
+        seen.add(aid)
+        old = current.get(aid)
+        created = (old or {}).get("created_at")
+        if not isinstance(created, (int, float)):
+            created = entry.get("created_at") \
+                if isinstance(entry.get("created_at"), (int, float)) else now - i
+        content_changed = (old is None
+                           or str(old.get("title") or "") != title
+                           or str(old.get("body") or "") != body
+                           or str(old.get("format") or "text") != fmt)
+        updated = now if content_changed else (old or {}).get("updated_at", now)
+        clean.append({
+            "id": aid, "title": title, "body": body, "format": fmt,
+            "created_at": created, "updated_at": updated,
+            # bot 是 sent_at/last_targets 的唯一写者：保存时原样保留旧值
+            "sent_at": (old or {}).get("sent_at", 0),
+            "last_targets": (old or {}).get("last_targets", []),
+        })
+    raw = json.dumps({"entries": clean}, ensure_ascii=False, indent=2)
+    result = config_editor.json_config_write(ANNOUNCEMENTS_FILE, raw)
+    if result.get("ok"):
+        result["note"] = f"已保存 {len(clean)} 条公告"
+        result["entries"] = clean   # 含服务端生成的 id，前端直接刷新本地状态
+    return result
+
+
+def announcement_broadcast(announcement_id, targets) -> dict:
+    """入队一次公告群发（按 id 取内容；保存后需重新发送才用新内容）。"""
+    aid = str(announcement_id or "").strip()
+    if not any(e.get("id") == aid for e in _load_announcement_entries()):
+        return {"error": "公告不存在（请先保存后再群发）"}
+    return _enqueue_broadcast("announcement", {"announcement_id": aid}, targets)
+
+
+# ── 邮件管理（mail，proactive-mail-design.md §16.4）─────────────────────
+# data/mailboxes/*.json 由 bot 单写、面板**只读**；删除信件/发送系统邮件
+# 写 data/mail_admin/queue/ 文件队列，bot 的 _mail_admin_worker 认领执行并
+# 回写 status/（按 id 幂等；status 保留 7 天，由 bot 清理）。
+
+MAILBOX_DIR = Path(config.bot_env("MAILBOX_DIR", str(DATA / "mailboxes")))
+MAIL_ADMIN_DIR = DATA / "mail_admin"
+MAIL_QUEUE_DIR = MAIL_ADMIN_DIR / "queue"
+MAIL_PROC_DIR = MAIL_ADMIN_DIR / "processing"
+MAIL_STATUS_DIR = MAIL_ADMIN_DIR / "status"
+GREET_TARGETS_FILE = DATA / "bond_greet_targets.json"
+
+MAIL_SYS_TITLE_MAX = 60          # 与 bot 端 _SYS_TITLE_MAX 一致
+MAIL_SYS_BODY_MAX = 2000
+MAIL_SYS_FORMATS = ["text", "markdown"]
+
+
+def _mask_openid(openid) -> str:
+    """列表脱敏（W4）：abcd…wxyz；完整 openid 只在详情页展示。"""
+    s = str(openid or "")
+    if len(s) <= 8:
+        return (s[:2] + "…") if s else ""
+    return f"{s[:4]}…{s[-4:]}"
+
+
+def _safe_openid_file(openid: str) -> str:
+    """与 bot 侧 mailbox.py::_safe_id 同款文件名规则。"""
+    return re.sub(r"[^0-9A-Za-z_.-]", "_", str(openid or "anonymous")) + ".json"
+
+
+def _load_json_file(path: Path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _mail_boxes() -> list:
+    """扫描信箱目录 → [(openid, box)]；openid 取文件内字段（bot 写入）。"""
+    out = []
+    try:
+        files = sorted(MAILBOX_DIR.glob("*.json"))
+    except OSError:
+        return out
+    for f in files:
+        box = _load_json_file(f)
+        if box is None:
+            continue                     # 损坏文件跳过（bot 端会降级重建）
+        out.append((str(box.get("openid") or f.stem), box))
+    return out
+
+
+def _mail_openid_known(openid: str) -> bool:
+    """§16.4.2 校验：openid 必须存在于 mailboxes/ 或 bond_greet_targets.json。"""
+    openid = str(openid or "").strip()
+    if not openid:
+        return False
+    if (MAILBOX_DIR / _safe_openid_file(openid)).exists():
+        return True
+    data = _load_json_file(GREET_TARGETS_FILE)
+    return isinstance(data, dict) and openid in data
+
+
+def mail_overview() -> dict:
+    """统计卡：用户数 / 信件总数 / 未读 / 系统邮件 / 关闭主动消息 / 队列待处理。"""
+    users = letters = unread = system_letters = disabled = 0
+    for _openid, box in _mail_boxes():
+        users += 1
+        ls = [l for l in (box.get("letters") or []) if isinstance(l, dict)]
+        letters += len(ls)
+        unread += sum(1 for l in ls if not l.get("read"))
+        system_letters += sum(1 for l in ls if l.get("system"))
+        if not box.get("active_enabled", True):
+            disabled += 1
+    pending = 0
+    for d in (MAIL_QUEUE_DIR, MAIL_PROC_DIR):
+        try:
+            pending += len(list(d.glob("*.json")))
+        except OSError:
+            pass
+    return {"users": users, "letters": letters, "unread": unread,
+            "system_letters": system_letters, "disabled_users": disabled,
+            "queue_pending": pending}
+
+
+def mail_users(query: str = "", page: int = 1, page_size: int = 20) -> dict:
+    """用户列表（分页 + 搜索：openid 片段/信件 id/人格名）。
+
+    行内 openid 供前端取详情用，**展示必须用 openid_masked**（W4 脱敏是
+    展示纪律；接口本身在登录中间件之后，面板即管理员）。
+    """
+    q = str(query or "").strip().lower()
+    rows = []
+    for openid, box in _mail_boxes():
+        letters = [l for l in (box.get("letters") or []) if isinstance(l, dict)]
+        personas = box.get("personas") if isinstance(box.get("personas"), dict) else {}
+        known = box.get("known_personas") \
+            if isinstance(box.get("known_personas"), dict) else {}
+        if q:
+            haystack = [openid.lower()]
+            haystack += [str(l.get("id") or "").lower() for l in letters]
+            haystack += [str(l.get("name") or "").lower() for l in letters]
+            haystack += [str(p).lower() for p in list(personas) + list(known)]
+            if not any(q in h for h in haystack if h):
+                continue
+        rows.append({
+            "openid": openid,
+            "openid_masked": _mask_openid(openid),
+            "personas": len(known) or len(personas),
+            "letters": len(letters),
+            "unread": sum(1 for l in letters if not l.get("read")),
+            "system": sum(1 for l in letters if l.get("system")),
+            "last_digest_date": str(box.get("last_digest_date") or ""),
+            "last_digest_at": box.get("last_digest_at", 0),
+            "active_enabled": bool(box.get("active_enabled", True)),
+        })
+    rows.sort(key=lambda r: float(r.get("last_digest_at") or 0), reverse=True)
+    return _paginate(rows, page, page_size)
+
+
+def mail_user(openid: str) -> dict:
+    """单用户详情：完整 openid（W4）+ 人格状态 + 信件 + 信封历史。
+
+    信件含全文（管理员本就有权读信箱文件；页面不提供批量导出，§16.6）。
+    digest 的 letter_ids 中已不在 letters[] 的标 withdrawn=「已撤回」。
+    """
+    openid = str(openid or "").strip()
+    if not _mail_openid_known(openid):
+        return {"error": "用户不存在（无此信箱，也不在主动发送登记表）"}
+    path = MAILBOX_DIR / _safe_openid_file(openid)
+    box = _load_json_file(path) if path.exists() else None
+    if box is None:
+        # 仅登记过主动发送、还没有信箱文件：返回空信箱视图
+        box = {"active_enabled": True, "known_personas": {}, "personas": {},
+               "letters": [], "digests": [], "last_digest_at": 0,
+               "last_digest_date": ""}
+    letters = sorted([l for l in (box.get("letters") or []) if isinstance(l, dict)],
+                     key=lambda l: float(l.get("created_at") or 0), reverse=True)
+    letter_ids = {l.get("id") for l in letters}
+    digests = sorted([d for d in (box.get("digests") or []) if isinstance(d, dict)],
+                     key=lambda d: float(d.get("sent_at") or 0), reverse=True)
+    for d in digests:
+        d["letter_states"] = [
+            {"id": lid, "withdrawn": lid not in letter_ids}
+            for lid in (d.get("letter_ids") or [])]
+    return {
+        "openid": openid,
+        "openid_masked": _mask_openid(openid),
+        "active_enabled": bool(box.get("active_enabled", True)),
+        "last_digest_at": box.get("last_digest_at", 0),
+        "last_digest_date": str(box.get("last_digest_date") or ""),
+        "personas": box.get("personas") if isinstance(box.get("personas"), dict) else {},
+        "known_personas": box.get("known_personas")
+                          if isinstance(box.get("known_personas"), dict) else {},
+        "letters": letters,
+        "digests": digests,
+    }
+
+
+def _new_mail_op_id() -> str:
+    return "mailop_%s_%04x" % (datetime.now().strftime("%Y%m%d"),
+                               random.randrange(0x10000))
+
+
+def _mail_pending_ops() -> list:
+    """队列中待处理 + 已认领未完成的项（幂等去重与队列状态共用）。"""
+    out = []
+    for d, state in ((MAIL_QUEUE_DIR, "pending"), (MAIL_PROC_DIR, "processing")):
+        try:
+            files = sorted(d.glob("*.json"))
+        except OSError:
+            continue
+        for f in files:
+            op = _load_json_file(f) or {"id": f.stem}
+            op.setdefault("id", f.stem)
+            op["_state"] = state
+            out.append(op)
+    return out
+
+
+def _mail_enqueue(op: dict) -> dict:
+    """写 queue/<id>.json（原子）；bot 每 3–5s 扫描认领。"""
+    op_id = str(op.get("id") or _new_mail_op_id())
+    op["id"] = op_id
+    op.setdefault("created_at", time.time())
+    try:
+        MAIL_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return {"error": f"无法创建队列目录: {e}"}
+    _atomic_write_json(MAIL_QUEUE_DIR / f"{op_id}.json", op)
+    return {"ok": True, "queued": True, "id": op_id}
+
+
+def mail_enqueue_delete(openid, letter_id) -> dict:
+    """删除信件入队（§16.4.3；v1 不提供编辑——删除即「撤回」）。"""
+    openid = str(openid or "").strip()
+    letter_id = str(letter_id or "").strip()
+    if not openid or not letter_id:
+        return {"error": "缺少 openid / letter_id"}
+    path = MAILBOX_DIR / _safe_openid_file(openid)
+    box = _load_json_file(path) if path.exists() else None
+    if box is None:
+        return {"error": "用户信箱不存在"}
+    letters = [l for l in (box.get("letters") or []) if isinstance(l, dict)]
+    if not any(l.get("id") == letter_id for l in letters):
+        return {"error": "信件不存在或不属于该用户"}
+    for op in _mail_pending_ops():          # 幂等：同操作已在队列则拒绝（§16.7）
+        if (op.get("type") == "delete_letter" and op.get("openid") == openid
+                and op.get("letter_id") == letter_id):
+            return {"error": "相同的删除操作已在队列中"}
+    return _mail_enqueue({"type": "delete_letter", "openid": openid,
+                          "letter_id": letter_id})
+
+
+def mail_enqueue_send(openids, title, body, format="text") -> dict:
+    """系统邮件入队（§16.4.4）；批量多选 = 每用户一个队列文件。"""
+    if isinstance(openids, str):
+        openids = [openids]
+    if not isinstance(openids, list) or not openids:
+        return {"error": "请至少选择一个用户"}
+    title = str(title or "").strip()
+    body = str(body or "")
+    fmt = str(format or "text")
+    if not title or not body.strip():
+        return {"error": "标题/正文不能为空"}
+    if len(title) > MAIL_SYS_TITLE_MAX:
+        return {"error": f"标题超 {MAIL_SYS_TITLE_MAX} 字"}
+    if len(body) > MAIL_SYS_BODY_MAX:
+        return {"error": f"正文超 {MAIL_SYS_BODY_MAX} 字"}
+    if fmt not in MAIL_SYS_FORMATS:
+        return {"error": f"format 必须是 {'/'.join(MAIL_SYS_FORMATS)}"}
+    clean: list = []
+    seen: set = set()
+    for o in openids:
+        o = str(o or "").strip()
+        if not o or o in seen:
+            continue
+        seen.add(o)
+        if not _mail_openid_known(o):
+            return {"error": f"用户不存在: {_mask_openid(o)}"}
+        clean.append(o)
+    if not clean:
+        return {"error": "请至少选择一个用户"}
+    pending = _mail_pending_ops()
+    for o in clean:
+        for op in pending:                  # 幂等：同用户同标题系统邮件
+            if (op.get("type") == "send_system" and op.get("openid") == o
+                    and str(op.get("title") or "") == title):
+                return {"error":
+                        f"{_mask_openid(o)} 已有同标题系统邮件在队列中"}
+    ids = []
+    for o in clean:
+        r = _mail_enqueue({"type": "send_system", "openid": o,
+                           "title": title, "body": body, "format": fmt})
+        if "error" in r:
+            return r
+        ids.append(r["id"])
+    return {"ok": True, "queued": True, "ids": ids, "count": len(ids),
+            "note": f"已入队 {len(ids)} 个用户的系统邮件 — "
+                    f"bot 将逐条立即发送（独立主动消息，限速 1 条/秒）"}
+
+
+def mail_queue_status(limit: int = 30) -> dict:
+    """队列状态：pending/processing + 最近完成的 status（前后端轮询）。"""
+    pending = []
+    for op in _mail_pending_ops():
+        pending.append({
+            "id": str(op.get("id")), "type": op.get("type"),
+            "openid_masked": _mask_openid(op.get("openid")),
+            "letter_id": op.get("letter_id"), "title": op.get("title"),
+            "state": op.get("_state"), "created_at": op.get("created_at", 0),
+        })
+    pending.sort(key=lambda o: float(o.get("created_at") or 0), reverse=True)
+    recent = []
+    try:
+        files = sorted(MAIL_STATUS_DIR.glob("*.json"),
+                       key=lambda f: f.stat().st_mtime, reverse=True)
+    except OSError:
+        files = []
+    for f in files[:max(1, int(limit))]:
+        st = _load_json_file(f)
+        if st:
+            recent.append(st)
+    return {"pending": pending, "recent": recent}

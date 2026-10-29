@@ -279,16 +279,48 @@ class MailboxManager:
         return hit
 
     def delete_letter(self, openid: str, letter_id: str) -> bool:
-        """WebUI 管理队列删除信件（§16.4.3，v1 预留）。"""
+        """WebUI 管理队列删除信件（§16.4.3）：从 letters[] 移除。
+
+        digest 的 letter_ids **保留**该 id——/邮件 详情据此区分「已撤回」
+        与「查无此信」（is_withdrawn），信封历史不装作没发过。
+        """
         box = self.load_user(openid)
         before = len(box.get("letters", []))
         box["letters"] = [l for l in box.get("letters", []) if l.get("id") != letter_id]
         if len(box["letters"]) == before:
             return False
-        for d in box.get("digests", []):
-            d["letter_ids"] = [i for i in (d.get("letter_ids") or []) if i != letter_id]
         self.save_user(openid, box)
         return True
+
+    def write_system_letter(self, openid: str, title: str, text: str,
+                            now: Optional[float] = None,
+                            retention_days: int = 28) -> Optional[str]:
+        """WebUI 系统邮件发送成功后入账（§16.4.3/§16.4.4）。
+
+        persona="__system__"、system=true、digest_id=null；**不动**
+        personas / known_personas / last_digest_*——系统邮件不是角色信件，
+        不参与信封聚合，也不占用「同日只发一封」幂等键。
+        返回 letter id；写盘失败返回 None。
+        """
+        now = now if now is not None else time.time()
+        box = self.load_user(openid)
+        letter = {
+            "id": new_letter_id(now),
+            "persona": "__system__",
+            "name": "系统",
+            "system": True,
+            "title": title or "",
+            "text": text or "",
+            "preview": make_preview(text or ""),
+            "created_at": now,
+            "read": False,
+            "digest_id": None,
+        }
+        box.setdefault("letters", []).append(letter)
+        self.prune(box, now=now, retention_days=retention_days)
+        if self.save_user(openid, box):
+            return letter["id"]
+        return None
 
     # ── 查询（只读，不落盘）──────────────────────────────────────
 
@@ -307,6 +339,16 @@ class MailboxManager:
             if letter.get("id") == letter_id:
                 return letter
         return None
+
+    def is_withdrawn(self, openid: str, letter_id: str) -> bool:
+        """信件已不在 letters[] 但仍被某 digest 引用 → 管理员撤回（§16.4.3）。"""
+        if not letter_id:
+            return False
+        box = self.load_user(openid)
+        if any(l.get("id") == letter_id for l in box.get("letters", [])):
+            return False
+        return any(letter_id in (d.get("letter_ids") or [])
+                   for d in box.get("digests", []))
 
     def letters_on_date(self, openid: str, mmdd: str) -> List[Dict[str, Any]]:
         """``/邮件 <MM-DD>``：该日全部信件（本地时区，倒序）。"""

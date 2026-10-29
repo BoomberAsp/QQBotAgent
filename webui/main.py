@@ -82,14 +82,16 @@ PAGES = [
     ("/playground", "Playground"),
     ("/wiki", "Wiki 缓存"),
     ("/redeem", "兑换码管理"),
-    ("/changelog", "更新日志"),
+    ("/changelog", "更新日志与公告"),
+    ("/mail", "邮件管理"),
 ]
 
 # Pages fully implemented so far (others render the placeholder template)
 _IMPLEMENTED = {"/", "/processes", "/logs", "/terminal",
                 "/tokens", "/audit", "/feedback", "/sessions",
                 "/tasks", "/workspace", "/config", "/memory", "/wiki",
-                "/playground", "/redeem", "/changelog", "/characters"}
+                "/playground", "/redeem", "/changelog", "/characters",
+                "/mail"}
 
 _PUBLIC_PREFIXES = ("/static/", "/api/auth/")
 _PUBLIC_PATHS = {"/login", "/favicon.ico"}
@@ -1423,15 +1425,138 @@ async def api_changelog_broadcast(payload: ChangelogBroadcastPayload, request: R
         data_reader.changelog_broadcast, payload.entry_index, payload.targets)
     if "error" in result:
         return JSONResponse(result, status_code=400)
-    tgt = "全部群" if "all" in payload.targets else f"{len(payload.targets)} 个群"
     audit.log_action("changelog.broadcast",
-                     f"群发更新记录 #{payload.entry_index} 到 {tgt}", _ip(request))
+                     f"群发更新记录 #{payload.entry_index} 到 "
+                     f"{_describe_targets(payload.targets)}", _ip(request))
     return result
 
 
 @app.get("/api/changelog/broadcast/status")
 async def api_changelog_broadcast_status():
     return await asyncio.to_thread(data_reader.changelog_broadcast_status)
+
+
+def _describe_targets(targets) -> str:
+    """审计用目标描述：全部群 / N 个 OneBot 群 + M 个官方群（§16.6）。"""
+    if not isinstance(targets, list):
+        return "?"
+    if "all" in targets:
+        return "全部群"
+    chans: dict = {}
+    for t in targets:
+        ch = t.get("channel", "onebot") if isinstance(t, dict) else "onebot"
+        chans[ch] = chans.get(ch, 0) + 1
+    if not chans:
+        return "0 个群"
+    return " + ".join(
+        f"{n} 个{'官方群' if ch == 'official' else ' OneBot 群'}"
+        for ch, n in sorted(chans.items()))
+
+
+# ── 公告（announcements，更新日志与公告页第二 Tab，§16.3）API ─────────
+
+@app.get("/api/changelog/announcements")
+async def api_announcement_list():
+    return await asyncio.to_thread(data_reader.announcement_list)
+
+
+class AnnouncementSavePayload(BaseModel):
+    entries: list  # [{id?, title, body, format(text|markdown), ...}]
+
+
+@app.put("/api/changelog/announcements")
+async def api_announcement_save(payload: AnnouncementSavePayload, request: Request):
+    result = await asyncio.to_thread(data_reader.announcement_save, payload.entries)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("announcement.save",
+                     f"保存公告: {len(payload.entries)} 条", _ip(request))
+    return result
+
+
+class AnnouncementBroadcastPayload(BaseModel):
+    announcement_id: str
+    targets: list  # ["all"] 或 [{channel,id}…]（裸字符串视为 onebot）
+
+
+@app.post("/api/changelog/announcements/broadcast")
+async def api_announcement_broadcast(payload: AnnouncementBroadcastPayload,
+                                     request: Request):
+    result = await asyncio.to_thread(
+        data_reader.announcement_broadcast,
+        payload.announcement_id, payload.targets)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("announcement.broadcast",
+                     f"群发公告 {payload.announcement_id} 到 "
+                     f"{_describe_targets(payload.targets)}", _ip(request))
+    return result
+
+
+# ── 邮件管理（/mail，§16.4）API ──────────────────────────────────────
+# 信箱面板只读；删除/系统邮件走 data/mail_admin/queue 文件队列由 bot 执行。
+
+@app.get("/api/mail/overview")
+async def api_mail_overview():
+    return await asyncio.to_thread(data_reader.mail_overview)
+
+
+@app.get("/api/mail/users")
+async def api_mail_users(query: str = "", page: int = 1, page_size: int = 20):
+    return await asyncio.to_thread(data_reader.mail_users, query, page, page_size)
+
+
+@app.get("/api/mail/user")
+async def api_mail_user(openid: str = ""):
+    result = await asyncio.to_thread(data_reader.mail_user, openid)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class MailLetterDeletePayload(BaseModel):
+    openid: str
+    letter_id: str
+
+
+@app.post("/api/mail/letters/delete")
+async def api_mail_letter_delete(payload: MailLetterDeletePayload, request: Request):
+    result = await asyncio.to_thread(
+        data_reader.mail_enqueue_delete, payload.openid, payload.letter_id)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("mail.delete",
+                     f"删除信件 {payload.letter_id}"
+                     f"（用户 {data_reader._mask_openid(payload.openid)}）",
+                     _ip(request))
+    return result
+
+
+class MailSendPayload(BaseModel):
+    openids: list = []   # 批量多选（每个用户一个队列文件）
+    openid: str = ""     # 单用户兼容字段
+    title: str
+    body: str
+    format: str = "text"
+
+
+@app.post("/api/mail/send")
+async def api_mail_send(payload: MailSendPayload, request: Request):
+    targets = payload.openids or ([payload.openid] if payload.openid else [])
+    result = await asyncio.to_thread(
+        data_reader.mail_enqueue_send, targets,
+        payload.title, payload.body, payload.format)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("mail.send_system",
+                     f"发送系统邮件「{payload.title}」到 "
+                     f"{result.get('count', len(targets))} 个用户", _ip(request))
+    return result
+
+
+@app.get("/api/mail/queue")
+async def api_mail_queue():
+    return await asyncio.to_thread(data_reader.mail_queue_status)
 
 
 # ── Playground / system-prompt preview API ────────────────────────

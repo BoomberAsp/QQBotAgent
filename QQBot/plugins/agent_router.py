@@ -162,11 +162,31 @@ async def _start_changelog_tasks():
             nonebot_logger.warning(f"[changelog] get_group_list 失败: {e}")
             return None
 
+    # 官方群登记表（§4.5/§16.5）：与 plugins/qq_official.py 指向同一文件；
+    # 那边只 upsert_seen（入站记账），这边只读 + 群发时 mark_left，
+    # 原子写保证不损坏，低频写入下 lost-update 风险可忽略。
+    from adapters.qq_official import send_active_group
+    from agent.group_registry import GroupRegistry
+    _official_registry = GroupRegistry(
+        str(Path(__file__).resolve().parent.parent / "data" / "group_registry.json"))
+
+    def _get_qq_bot():
+        import nonebot
+        from nonebot.adapters.qq import Bot as _QQBot
+        return next((b for b in nonebot.get_bots().values()
+                     if isinstance(b, _QQBot)), None)
+
     async def _group_exporter():
-        # 启动后稍等 bot 上线，再首次导出；之后每 10 分钟刷新
+        # 启动后稍等 bot 上线，再首次导出；之后每 10 分钟刷新。
+        # 合并导出（§16.5.4）：OneBot 群走 get_group_list()（拉取失败时保留
+        # 上次快照）；官方群读 group_registry.json —— 没有 OneBot bot 也要写。
         await asyncio.sleep(15)
         while True:
             try:
+                cur = _cl.read_known_groups()
+                if not isinstance(cur, dict):
+                    cur = {}
+                groups = cur.get("groups") if isinstance(cur.get("groups"), dict) else {}
                 bot = _get_bot()
                 if bot is not None:
                     gl = await _fetch_group_list(bot)
@@ -178,103 +198,233 @@ async def _start_changelog_tasks():
                                 "name": g.get("group_name") or "",
                                 "member_count": g.get("member_count", 0),
                             }
-                        _cl.write_known_groups(groups)
+                official = {}
+                for g_openid, e in _official_registry.load().get("groups", {}).items():
+                    if isinstance(e, dict):
+                        official[g_openid] = {
+                            "status": e.get("status") or "unknown",
+                            "active_enabled": bool(e.get("active_enabled", True)),
+                            "last_seen_at": float(e.get("last_seen_at") or 0),
+                        }
+                _cl.write_known_groups(groups, official_groups=official)
             except Exception as e:
                 nonebot_logger.warning(f"[changelog] 群列表导出异常: {e}")
             await asyncio.sleep(600)
 
     async def _do_broadcast(payload):
-        bot = _get_bot()
-        if bot is None:
-            _cl.write_status({"state": "error", "error": "bot 未连接",
-                              "sent": 0, "failed": 0})
-            return
+        """执行一次群发（§16.5.3）。
 
-        entries = _cl.load_entries()  # 文件顺序（面板新→旧），entry_index 与之对齐
-        idx = payload.get("entry_index", 0)
-        if not isinstance(idx, int) or idx < 0 or idx >= len(entries):
-            _cl.write_status({"state": "error", "error": "entry_index 越界",
-                              "sent": 0, "failed": 0})
-            return
-        entry = entries[idx]
-        text = "\n".join(_cl.format_announcement(entry, site_url=_PUBLIC_SITE_URL))
+        payload 新格式 ``{kind, ref, targets}``；旧格式（裸 entry_index +
+        字符串 targets）按 changelog/onebot 兼容解释。
+        kind=changelog：更新记录纯文本（W3：官方渠道也不上 markdown）+ 卡片图；
+        kind=announcement：公告，format=markdown 时官方渠道 msg_type=2、
+        OneBot 回退纯文本。官方群发送前实时校验 group_registry，
+        40034101/40034105 → mark_left。
+        """
+        # ── kind/ref 解析 ──
+        kind = payload.get("kind") or "changelog"
+        ref = payload.get("ref") if isinstance(payload.get("ref"), dict) else {}
+        if kind == "changelog" and "entry_index" not in ref:
+            ref = {"entry_index": payload.get("entry_index", 0)}
 
-        targets = payload.get("targets") or []
-        if not isinstance(targets, list) or not targets:
-            _cl.write_status({"state": "error", "error": "未选择目标群",
-                              "sent": 0, "failed": 0})
-            return
-        if "all" in targets:
-            gl = await _fetch_group_list(bot)
-            if gl is None:
-                _cl.write_status({"state": "error", "error": "获取群列表失败",
+        entry = ann = None
+        text = md_text = None
+        if kind == "announcement":
+            ann = _cl.get_announcement(str(ref.get("announcement_id") or ""))
+            if ann is None:
+                _cl.write_status({"state": "error", "kind": kind, "ref": ref,
+                                  "error": "公告不存在或已被删除",
                                   "sent": 0, "failed": 0})
                 return
-            group_ids = [str(g.get("group_id")) for g in gl]
+            text = _cl.format_announcement_text(ann)
+            if str(ann.get("format") or "text") == "markdown":
+                # 官方渠道 msg_type=2（拒绝时适配器内降级 text）；OneBot 用 text
+                md_text = f"## 📢 {ann.get('title') or '公告'}\n{ann.get('body') or ''}"
         else:
-            group_ids = [str(t) for t in targets]
+            kind = "changelog"
+            entries = _cl.load_entries()  # 文件顺序（面板新→旧），entry_index 对齐
+            idx = ref.get("entry_index", 0)
+            if not isinstance(idx, int) or idx < 0 or idx >= len(entries):
+                _cl.write_status({"state": "error", "kind": kind, "ref": ref,
+                                  "error": "entry_index 越界",
+                                  "sent": 0, "failed": 0})
+                return
+            entry = entries[idx]
+            text = "\n".join(
+                _cl.format_announcement(entry, site_url=_PUBLIC_SITE_URL))
 
-        if not group_ids:
-            _cl.write_status({"state": "error", "error": "目标群为空",
-                              "sent": 0, "failed": 0})
+        # ── targets 归一化：{channel,id} 对象 / 裸字符串(=onebot) / "all" ──
+        raw_targets = payload.get("targets") or []
+        if not isinstance(raw_targets, list) or not raw_targets:
+            _cl.write_status({"state": "error", "kind": kind, "ref": ref,
+                              "error": "未选择目标群", "sent": 0, "failed": 0})
+            return
+        expand_all = any(t == "all" for t in raw_targets)
+        onebot_ids: list = []
+        official_ids: list = []
+        for t in raw_targets:
+            if t == "all":
+                continue
+            if isinstance(t, dict):
+                ch = str(t.get("channel") or "onebot")
+                tid = str(t.get("id") or "").strip()
+            else:
+                ch, tid = "onebot", str(t).strip()   # 旧格式：裸字符串=OneBot
+            if not tid:
+                continue
+            (onebot_ids if ch == "onebot" else official_ids).append(tid)
+
+        ob_bot = _get_bot() if (expand_all or onebot_ids) else None
+        qq_bot = _get_qq_bot() if (expand_all or official_ids) else None
+        if expand_all:
+            gl = await _fetch_group_list(ob_bot) if ob_bot is not None else None
+            if gl is not None:
+                onebot_ids += [str(g.get("group_id")) for g in gl]
+            elif isinstance(cur_groups := (_cl.read_known_groups() or {}).get("groups"), dict):
+                onebot_ids += list(cur_groups.keys())   # 兜底：上次导出快照
+            official_ids += _official_registry.list_active()
+        onebot_ids = list(dict.fromkeys(onebot_ids))
+        official_ids = list(dict.fromkeys(official_ids))
+        total = len(onebot_ids) + len(official_ids)
+        if not total:
+            _cl.write_status({"state": "error", "kind": kind, "ref": ref,
+                              "error": "目标群为空", "sent": 0, "failed": 0})
+            return
+        if onebot_ids and ob_bot is None and not official_ids:
+            _cl.write_status({"state": "error", "kind": kind, "ref": ref,
+                              "error": "bot 未连接", "sent": 0, "failed": 0})
+            return
+        if official_ids and qq_bot is None and not onebot_ids:
+            _cl.write_status({"state": "error", "kind": kind, "ref": ref,
+                              "error": "官方 bot 未连接", "sent": 0, "failed": 0})
             return
 
-        _cl.write_status({"state": "sending", "total": len(group_ids),
-                          "sent": 0, "failed": 0})
-        chunks = _split_text(text, 300) or [text]
+        by_channel = {"onebot": {"sent": 0, "failed": 0, "skipped": 0},
+                      "official": {"sent": 0, "failed": 0, "skipped": 0}}
+        _cl.write_status({"state": "sending", "kind": kind, "ref": ref,
+                          "total": total, "sent": 0, "failed": 0, "skipped": 0,
+                          "by_channel": by_channel})
+        sent = failed = skipped = 0
 
-        # 卡片在循环外渲染一次（best-effort）；渲染失败则仅发文本
-        from nonebot.adapters.onebot.v11 import MessageSegment
-        card_path = None
-        try:
-            card_path = await asyncio.to_thread(
-                render_changelog_card, [entry], title="更新公告",
-                site_url=_PUBLIC_SITE_URL)
-        except Exception:
+        # ── OneBot 渠道：300 字分块 + 卡片图（仅 changelog）+ 1s 限速 ──
+        if onebot_ids:
+            chunks = _split_text(text, 300) or [text]
+            from nonebot.adapters.onebot.v11 import MessageSegment
             card_path = None
-
-        sent = failed = 0
-        for gid in group_ids:
-            # 先发卡片图（best-effort；失败降级为仅文本，不计入 failed）
-            if card_path:
+            if entry is not None:
+                # 卡片在循环外渲染一次（best-effort）；失败则仅发文本
                 try:
-                    await bot.send_group_msg(
-                        group_id=int(gid),
-                        message=MessageSegment.image(Path(card_path)))
-                    await asyncio.sleep(1.0)
-                except Exception as e:
+                    card_path = await asyncio.to_thread(
+                        render_changelog_card, [entry], title="更新公告",
+                        site_url=_PUBLIC_SITE_URL)
+                except Exception:
+                    card_path = None
+            for gid in onebot_ids:
+                if ob_bot is None:
+                    failed += 1
+                    by_channel["onebot"]["failed"] += 1
                     nonebot_logger.warning(
-                        f"[changelog] 群发卡片到 {gid} 失败（降级文本）: {e}")
-            ok = True
-            for j, chunk in enumerate(chunks):
-                try:
-                    await bot.send_group_msg(group_id=int(gid), message=chunk)
-                except Exception as e:
-                    ok = False
-                    nonebot_logger.warning(f"[changelog] 群发到 {gid} 失败: {e}")
-                    break
-                if j < len(chunks) - 1:
-                    await asyncio.sleep(1.0)  # 段间限速
-            if ok:
-                sent += 1
-            else:
-                failed += 1
-            await asyncio.sleep(1.0)  # 群间限速
+                        f"[changelog] OneBot bot 未连接，跳过群 {gid}")
+                    continue
+                # 先发卡片图（best-effort；失败降级为仅文本，不计入 failed）
+                if card_path:
+                    try:
+                        await ob_bot.send_group_msg(
+                            group_id=int(gid),
+                            message=MessageSegment.image(Path(card_path)))
+                        await asyncio.sleep(1.0)
+                    except Exception as e:
+                        nonebot_logger.warning(
+                            f"[changelog] 群发卡片到 {gid} 失败（降级文本）: {e}")
+                ok = True
+                for j, chunk in enumerate(chunks):
+                    try:
+                        await ob_bot.send_group_msg(group_id=int(gid),
+                                                    message=chunk)
+                    except Exception as e:
+                        ok = False
+                        nonebot_logger.warning(
+                            f"[changelog] 群发到 {gid} 失败: {e}")
+                        break
+                    if j < len(chunks) - 1:
+                        await asyncio.sleep(1.0)  # 段间限速
+                if ok:
+                    sent += 1
+                    by_channel["onebot"]["sent"] += 1
+                else:
+                    failed += 1
+                    by_channel["onebot"]["failed"] += 1
+                await asyncio.sleep(1.0)  # 群间限速
 
-        # 仅当至少成功发出一个群时才回写 broadcast_at，避免"全部失败仍标记已群发"
+        # ── 官方渠道：markdown 单条（md_text 时长文由面板 2000 字上限约束）；
+        #    纯文本按 800 字分块；1 条/秒（Bot 维度 60 qpm 保守值，§16.5.3.2）──
+        if official_ids:
+            of_chunks = _split_text(text, 800) or [text]
+            for g_openid in official_ids:
+                if qq_bot is None:
+                    failed += 1
+                    by_channel["official"]["failed"] += 1
+                    nonebot_logger.warning(
+                        f"[changelog] 官方 bot 未连接，跳过群 {g_openid[:8]}…")
+                    continue
+                reg = _official_registry.get(g_openid)
+                if (reg is None or reg.get("status") != "active"
+                        or not reg.get("active_enabled", True)):
+                    # 关闭通知/已退群/未登记的群：跳过不试发（§16.5.3.3）
+                    skipped += 1
+                    by_channel["official"]["skipped"] += 1
+                    continue
+                if md_text:
+                    res = await send_active_group(qq_bot, g_openid, text,
+                                                  md_text=md_text)
+                else:
+                    res = "ok"
+                    for j, chunk in enumerate(of_chunks):
+                        res = await send_active_group(qq_bot, g_openid, chunk)
+                        if res != "ok":
+                            break
+                        if j < len(of_chunks) - 1:
+                            await asyncio.sleep(1.0)
+                if res == "ok":
+                    sent += 1
+                    by_channel["official"]["sent"] += 1
+                else:
+                    if res == "left":
+                        # GROUP_DEL_ROBOT 可能丢失：发送侧发现即标 left（§4.5）
+                        _official_registry.mark_left(g_openid)
+                        nonebot_logger.warning(
+                            f"[changelog] 官方群 {g_openid[:8]}… 无权限/不存在，"
+                            f"已标记 left")
+                    failed += 1
+                    by_channel["official"]["failed"] += 1
+                await asyncio.sleep(1.0)  # 群间限速
+
+        # 仅当至少成功发出一个群时才回写已群发标记，避免"全部失败仍标记"
         all_failed = sent == 0
         if not all_failed:
-            _cl.mark_broadcast(entry.get("created_at"))
+            if kind == "announcement":
+                _cl.mark_announcement_sent(
+                    str(ann.get("id")),
+                    ([{"channel": "onebot", "id": g} for g in onebot_ids]
+                     + [{"channel": "official", "id": g} for g in official_ids]))
+            else:
+                _cl.mark_broadcast(entry.get("created_at"))
         status = {
             "state": "error" if all_failed else "done",
-            "total": len(group_ids),
-            "sent": sent, "failed": failed,
-            "entry_version": entry.get("version", ""),
-            "entry_date": entry.get("date", ""),
+            "kind": kind, "ref": ref,
+            "total": total,
+            "sent": sent, "failed": failed, "skipped": skipped,
+            "by_channel": by_channel,
             "finished_at": time.time(),
         }
+        if entry is not None:
+            status["entry_version"] = entry.get("version", "")
+            status["entry_date"] = entry.get("date", "")
+        if ann is not None:
+            status["announcement_title"] = ann.get("title", "")
         if all_failed:
-            status["error"] = "所有目标群发送失败"
+            status["error"] = ("所有目标群发送失败" if failed
+                               else "所有目标群被跳过（关闭通知/不可用）")
         _cl.write_status(status)
 
     async def _broadcast_poller():

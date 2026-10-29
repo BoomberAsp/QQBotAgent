@@ -1181,6 +1181,84 @@ async def send_active_c2c_markdown(bot: QQBot, openid: str, md_text: str,
     return False
 
 
+# ── Active group messaging (announcement broadcast, mail-design §16.5) ──
+# bot.send_to_group WITHOUT msg_id is an *active* group message. Error
+# taxonomy for the caller (_do_broadcast), returned as a string:
+#   "ok"     — confirmed send;
+#   "left"   — ActionFailed 40034101 (机器人非群成员) / 40034105 (无权限):
+#              GROUP_DEL_ROBOT may be lost, so treat the group as gone and
+#              let the caller mark it left in group_registry (§4.5);
+#   "failed" — anything else (network after retry, audit, quota, payload…).
+
+_GROUP_LEFT_CODES = (40034101, 40034105)
+
+
+async def send_active_group(bot: QQBot, group_openid: str, text: str,
+                            md_text: str | None = None) -> str:
+    """Send one ACTIVE group message → "ok" | "left" | "failed".
+
+    ``md_text`` (announcement format=markdown) rides msg_type=2 when the
+    route's shared markdown breaker allows; md rejects record on the
+    breaker and degrade to ``text`` once — the c2c envelope ladder minus
+    keyboard (v1 announcements carry no buttons). Error policy mirrors
+    send_active_c2c: ActionFailed → no retry; NetworkError /
+    RateLimitException → one retry per tier.
+    """
+    group_openid = str(group_openid or "").strip()
+    if not group_openid:
+        return "failed"
+    plain = text if (text and text.strip()) else (md_text or "")
+    if not plain.strip():
+        return "failed"
+    tier = ("md" if (md_text and md_text.strip() and _md_available())
+            else "plain")
+    for _ in range(3):  # bounded: net-retry inline; md→plain degrade once
+        message = (MessageSegment.markdown(md_text or " ") if tier == "md"
+                   else MessageSegment.text(plain))
+        try:
+            for attempt in range(2):
+                try:
+                    await bot.send_to_group(group_openid=group_openid,
+                                            message=message)
+                    if tier == "md":
+                        _md_record_success()
+                    return "ok"
+                except (NetworkError, RateLimitException):
+                    if attempt == 0:
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise
+        except (NetworkError, RateLimitException) as e:
+            logger.warning(
+                f"[qq_official] active group ({tier}) to "
+                f"{group_openid[:8]}… failed after retry: {e!r}")
+            return "failed"
+        except ActionFailed as e:
+            code = getattr(e, "code", None)
+            if tier == "md" and code in _MD_REJECT_CODES:
+                _md_record_reject()
+                logger.warning(
+                    f"[qq_official] group announcement markdown rejected "
+                    f"({e!r}); retrying plain text")
+                tier = "plain"
+                continue
+            if code in _GROUP_LEFT_CODES:
+                logger.warning(
+                    f"[qq_official] active group to {group_openid[:8]}… "
+                    f"rejected (code={code}); treating group as left")
+                return "left"
+            logger.warning(
+                f"[qq_official] active group to {group_openid[:8]}… "
+                f"rejected: {e!r}")
+            return "failed"
+        except Exception as e:
+            logger.warning(
+                f"[qq_official] active group to {group_openid[:8]}… "
+                f"failed: {type(e).__name__}: {e}")
+            return "failed"
+    return "failed"
+
+
 # Event types this route handles — the entry plugin's isinstance guard
 # and the intent config (c2c_group_at_messages) must agree on this set.
 HANDLED_EVENTS = (C2CMessageCreateEvent, GroupAtMessageCreateEvent)

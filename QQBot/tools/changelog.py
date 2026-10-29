@@ -9,8 +9,12 @@ WebUI（``webui/data_reader.py``）是唯一编辑入口，bot 侧只读并把�
 
 数据目录 ``QQBot/data/changelog/``：
   - ``changelog.json``          更新记录主数据（entries 数组，新→旧）
-  - ``known_groups.json``       群列表（群号→{name, member_count}），bot 写、面板读
-  - ``pending_broadcast.json``  群发请求队列，面板写、bot 轮询认领
+  - ``announcements.json``      公告主数据（entries 数组，按 id 定位，§16.3）
+  - ``known_groups.json``       群列表：OneBot ``groups`` + 官方 ``official_groups``，
+                                bot 写、面板读（§16.5.1）
+  - ``pending_broadcast.json``  群发请求队列，面板写、bot 轮询认领；
+                                ``{kind: changelog|announcement, ref, targets}``，
+                                旧格式（裸 entry_index/字符串 targets）仍兼容
   - ``broadcast_status.json``   群发结果回写，bot 写、面板读
 """
 
@@ -27,6 +31,7 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_TOOLS_DIR, "..", "data", "changelog")
 
 CHANGELOG_FILE = os.path.join(_DATA_DIR, "changelog.json")
+ANNOUNCEMENTS_FILE = os.path.join(_DATA_DIR, "announcements.json")
 KNOWN_GROUPS_FILE = os.path.join(_DATA_DIR, "known_groups.json")
 PENDING_FILE = os.path.join(_DATA_DIR, "pending_broadcast.json")
 STATUS_FILE = os.path.join(_DATA_DIR, "broadcast_status.json")
@@ -189,12 +194,65 @@ def mark_broadcast(created_at: Any, ts: Optional[float] = None) -> bool:
     return hit
 
 
+# ── 公告读写（§16.3；面板全量快照保存，bot 发送后回写 sent_at）────────
+
+def load_announcements() -> List[Dict[str, Any]]:
+    """返回全部公告（entries 数组）。缺失/损坏时返回空列表。"""
+    data = _read_json(ANNOUNCEMENTS_FILE, {})
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def save_announcements(entries: List[Dict[str, Any]]) -> None:
+    """全量快照写入公告 entries（保留 envelope 结构）。"""
+    _atomic_write_json(ANNOUNCEMENTS_FILE, {"entries": entries})
+
+
+def get_announcement(ann_id: str) -> Optional[Dict[str, Any]]:
+    """按服务端生成的 id 定位公告（不再用数组下标，§16.3.1）。"""
+    for e in load_announcements():
+        if e.get("id") == ann_id:
+            return e
+    return None
+
+
+def mark_announcement_sent(ann_id: str, targets: List[Any],
+                           ts: Optional[float] = None) -> bool:
+    """群发成功后回写 ``sent_at/last_targets``（§16.5.3.6）。成功返回 True。"""
+    entries = load_announcements()
+    hit = False
+    for e in entries:
+        if e.get("id") == ann_id:
+            e["sent_at"] = ts if ts is not None else time.time()
+            e["last_targets"] = targets
+            hit = True
+    if hit:
+        save_announcements(entries)
+    return hit
+
+
+def format_announcement_text(ann: Dict[str, Any]) -> str:
+    """公告 → 群发纯文本（§16.5.3.1：``📢 公告\\n{title}\\n\\n{body}``）。"""
+    title = str(ann.get("title") or "").strip()
+    body = str(ann.get("body") or "")
+    return f"📢 公告\n{title}\n\n{body}".strip()
+
+
 # ── 群列表（bot 写、面板读）─────────────────────────────────────────
 
-def write_known_groups(groups: Dict[str, Dict[str, Any]]) -> None:
-    """原子写入群列表快照。groups: {group_id(str): {name, member_count}}。"""
+def write_known_groups(groups: Dict[str, Dict[str, Any]],
+                       official_groups: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+    """原子写入群列表快照（§16.5.1）。
+
+    groups: OneBot ``{group_id(str): {name, member_count}}``；
+    official_groups: 官方 ``{group_openid: {status, active_enabled, last_seen_at}}``
+    （由 data/group_registry.json 合并而来；缺省空 dict，旧读取方不受影响）。
+    """
     _atomic_write_json(KNOWN_GROUPS_FILE, {
         "groups": groups,
+        "official_groups": official_groups or {},
         "updated_at": time.time(),
     })
 

@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card-grid">
+  <div class="card stat-card">
+    <div class="stat-label">信箱用户</div>
+    <div class="stat-value" id="ml-users">—</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-label">信件总数</div>
+    <div class="stat-value" id="ml-letters">—</div>
+    <div class="stat-sub" id="ml-letters-sub">系统邮件 —</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-label">未读信件</div>
+    <div class="stat-value" id="ml-unread">—</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-label">已关闭主动消息</div>
+    <div class="stat-value" id="ml-disabled">—</div>
+    <div class="stat-sub">拒收用户不发送系统邮件</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-label">队列待处理</div>
+    <div class="stat-value" id="ml-queue">—</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row" style="flex-wrap:wrap">
+    <h2 class="card-title" style="margin:0">用户邮箱</h2>
+    <input type="text" id="ml-q" placeholder="搜索：openid 片段 / 信件编号 / 人格名" style="min-width:260px">
+    <button class="btn btn-sm" id="ml-search">搜索</button>
+    <span class="spacer"></span>
+    <button class="btn btn-sm" id="ml-refresh">刷新</button>
+    <button class="btn btn-primary btn-sm" id="ml-compose">发送系统邮件</button>
+  </div>
+  <p class="muted" style="margin:6px 0 0">
+    列表默认<b>脱敏 openid</b>，完整值仅在详情页显示。勾选用户后点「发送系统邮件」可批量发送；
+    面板对信箱<b>只读</b> —— 删除/发送均入队，由 bot 执行（约 3–5 秒内认领）。
+  </p>
+  <div id="ml-user-table" style="margin-top:10px">
+    <p class="muted">加载中…</p>
+  </div>
+  <div class="row" style="margin-top:8px;gap:8px">
+    <button class="btn btn-sm" id="ml-prev">上一页</button>
+    <span class="muted mono" id="ml-pageinfo"></span>
+    <button class="btn btn-sm" id="ml-next">下一页</button>
+  </div>
+</div>
+
+<div class="card" id="ml-compose-card" style="display:none">
+  <div class="row">
+    <h2 class="card-title" style="margin:0">发送系统邮件</h2>
+    <span class="spacer"></span>
+    <button class="btn btn-sm" id="ml-compose-close">取消</button>
+  </div>
+  <p class="muted" style="margin:6px 0 10px">
+    系统邮件是<b>立即发送</b>的独立单聊主动消息（不走每日 10:00 信封、不写羁绊事件、不带免责尾），
+    发送成功后写入用户信箱（/邮件 列表显示【系统】）。目标用户已关闭主动消息时该用户会失败并给出原因。
+  </p>
+  <div class="row" style="gap:8px;align-items:flex-end;flex-wrap:wrap">
+    <div class="field" style="margin:0;flex:1;min-width:240px">
+      <span>标题 <b class="muted mono" id="ml-c-tcount">0/60</b></span>
+      <input type="text" id="ml-c-title" maxlength="60" placeholder="系统邮件标题（≤60 字）" style="width:100%">
+    </div>
+    <div class="field" style="margin:0">
+      <span>格式</span>
+      <select id="ml-c-format" style="width:130px">
+        <option value="text" selected>纯文本</option>
+        <option value="markdown">markdown</option>
+      </select>
+    </div>
+  </div>
+  <div class="field" style="margin:8px 0 0">
+    <span>正文 <b class="muted mono" id="ml-c-bcount">0/2000</b></span>
+    <textarea id="ml-c-body" rows="5" maxlength="2000" style="width:100%"
+              placeholder="正文（≤2000 字）；纯文本格式会自动转义 markdown 敏感字符"></textarea>
+  </div>
+  <details style="margin-top:6px">
+    <summary class="muted" style="cursor:pointer">预览（发送效果）</summary>
+    <pre class="muted" id="ml-c-preview" style="white-space:pre-wrap;margin:6px 0 0"></pre>
+  </details>
+  <div class="row" style="margin-top:12px;align-items:center">
+    <span class="muted" id="ml-c-targets">未选择用户</span>
+    <span class="spacer"></span>
+    <button class="btn btn-primary btn-sm" id="ml-c-send">入队发送</button>
+  </div>
+</div>
+
+<div class="card" id="ml-detail-card" style="display:none">
+  <div class="row" style="flex-wrap:wrap">
+    <h2 class="card-title" style="margin:0">用户详情</h2>
+    <span class="mono muted" id="ml-d-openid"></span>
+    <span id="ml-d-active"></span>
+    <span class="spacer"></span>
+    <button class="btn btn-sm" id="ml-detail-close">关闭</button>
+  </div>
+  <div id="ml-detail-body" style="margin-top:10px"><p class="muted">加载中…</p></div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <h2 class="card-title" style="margin:0">管理队列</h2>
+    <span class="spacer"></span>
+    <button class="btn btn-sm" id="ml-queue-refresh">刷新</button>
+  </div>
+  <p class="muted" style="margin:6px 0 0">
+    删除信件 / 系统邮件的操作队列（bot 每 3–5 秒认领执行；结果保留 7 天）。
+  </p>
+  <div id="ml-queue-table" style="margin-top:10px"><p class="muted">（空）</p></div>
+</div>
+
+<p class="muted">
+  数据源 <code>QQBot/data/mailboxes/*.json</code>（bot 单写者，面板只读）；
+  管理操作走 <code>QQBot/data/mail_admin/queue/</code> 文件队列。v1 不提供信件编辑 ——
+  删除即「撤回」，用户 <code>/邮件</code> 查看该编号会显示「已被撤回」。
+  数值配置（保留天数/每日上限等）在 <code>config/bond_settings.json</code> 的 <code>mail_*</code> 组。
+</p>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/mail.js"></script>
+{% endblock %}

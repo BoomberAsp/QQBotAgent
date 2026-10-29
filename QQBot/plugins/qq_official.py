@@ -11,8 +11,11 @@ Official-route specifics vs the OneBot entry (plan §7.5/§7.6):
   - no continuous-session router: group messages only ever arrive
     @-gated (c2c_group_at_messages intent) and c2c has no @ concept,
     so "no-@ window" mode has nothing to act on;
-  - no poke router and no changelog-broadcast / group-list-export
-    startup tasks: no official API equivalents;
+  - no poke router (no official API equivalent); changelog/announcement
+    broadcast and the merged group-list export live in agent_router
+    (they serve both routes), while this plugin owns the official group
+    registry (GROUP_AT bookkeeping, §4.5), the daily mail pass, and the
+    WebUI mail-admin queue worker (§16.2);
   - the handler is annotated with QQ event types — NoneBot dispatches by
     annotation, so this matcher never sees OneBot events and vice versa
     (both entries safely coexist at priority=1, block=False);
@@ -29,6 +32,8 @@ The periodic heartbeat is essential: message-driven writes alone would
 let a quiet evening degrade the panel card to "stale" falsely.
 """
 import asyncio
+import json
+import os
 import random
 import re
 import time
@@ -570,9 +575,11 @@ async def _run_mail_pass(catch_up: bool = False) -> None:
             if greeting.active_sent_today(str(_GREET_QUOTA_FILE), openid,
                                           kind="media"):
                 continue                         # 双向互斥：当天已发媒体
-            # sessions 索引补齐 known_personas（一旦写入，删会话也保留）
-            _mailbox_manager.ensure_known_personas(
-                openid, _known_personas_from_sessions(openid))
+            # sessions 索引补齐 known_personas（一旦写入，删会话也保留）；
+            # 每用户锁：与 WebUI 管理队列 worker 串行同用户信箱 RMW（§16.7）
+            async with _mail_lock(openid):
+                _mailbox_manager.ensure_known_personas(
+                    openid, _known_personas_from_sessions(openid))
             mailbox = _mailbox_manager.load_user(openid)
             candidates = _mail_candidates(openid, mailbox, cfg)
             if not candidates:
@@ -619,8 +626,9 @@ async def _run_mail_pass(catch_up: bool = False) -> None:
                 bot, openid, md, rows=rows, plain_text=plain)
             if not ok:
                 continue                         # 发送失败不写任何记录（§7.2）
-            digest_id = _mailbox_manager.record_digest(
-                openid, letters, retention_days=retention)
+            async with _mail_lock(openid):
+                digest_id = _mailbox_manager.record_digest(
+                    openid, letters, retention_days=retention)
             if digest_id is None:
                 continue                         # 并发 pass 已发过（幂等拦截）
             greeting.record_active_send(str(_GREET_QUOTA_FILE), openid,
@@ -638,6 +646,177 @@ async def _run_mail_pass(catch_up: bool = False) -> None:
             logger.warning(f"[mail] send {openid[:8]}… failed: {e!r}")
     if sent:
         logger.info(f"[mail] pass: {sent} envelope(s) sent")
+
+
+# ── WebUI 邮件管理队列（proactive-mail-design.md v0.5 §16.2/§16.4）──────
+#
+# 面板与 bot 是两个进程，管理操作（删除信件/发送系统邮件）走文件队列：
+#   WebUI 写 data/mail_admin/queue/<uuid>.json
+#   → bot os.replace 认领到 processing/
+#   → 执行（type 白名单 bot 端复校验，§16.6）
+#   → 写 status/<id>.json（done|failed）→ 删 processing 文件
+# 信箱 bot 单写者：WebUI 对 mailboxes/*.json 只读。每用户 asyncio.Lock
+# 串行「10:00 pass」与本 worker 的同用户信箱 RMW（mailbox.py 是同步模块，
+# 锁只能挂在插件层，§16.7）。启动时把残留 processing 标 failed: bot
+# restarted，并裁剪 7 天前的 status（W5）。
+
+_MAIL_ADMIN_DIR = Path(__file__).resolve().parent.parent / "data" / "mail_admin"
+_MAIL_QUEUE_DIR = _MAIL_ADMIN_DIR / "queue"
+_MAIL_PROC_DIR = _MAIL_ADMIN_DIR / "processing"
+_MAIL_STATUS_DIR = _MAIL_ADMIN_DIR / "status"
+_MAIL_OP_TYPES = ("delete_letter", "send_system")   # v1 白名单；edit_letter 归 v2
+_MAIL_STATUS_RETENTION = 7 * 86400                  # status 保留 7 天（W5）
+_SYS_TITLE_MAX = 60                                 # §16.4.2 校验
+_SYS_BODY_MAX = 2000
+
+# 每用户信箱写锁（进程内）：_run_mail_pass 与管理 worker 共用
+_mail_locks: dict[str, asyncio.Lock] = {}
+
+
+def _mail_lock(openid: str) -> asyncio.Lock:
+    lock = _mail_locks.get(openid)
+    if lock is None:
+        lock = _mail_locks[openid] = asyncio.Lock()
+    return lock
+
+
+def _mail_op_status_write(op_id: str, state: str, error: str = "") -> None:
+    """status/<id>.json 原子写（bot 端唯一写者，WebUI 只读轮询）。"""
+    try:
+        _MAIL_STATUS_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"id": op_id, "state": state, "error": error,
+                   "finished_at": time.time()}
+        tmp = _MAIL_STATUS_DIR / f"{_safe_filename(op_id)}.json.tmp"
+        tmp.write_text(json.dumps(payload, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(tmp, _MAIL_STATUS_DIR / f"{_safe_filename(op_id)}.json")
+    except OSError as e:
+        logger.warning(f"[mail-admin] status write failed: {e!r}")
+
+
+def _safe_filename(name: str) -> str:
+    return re.sub(r"[^0-9A-Za-z_.-]", "_", str(name or "op"))[:80]
+
+
+def _mail_admin_recover() -> None:
+    """启动恢复（§16.4.3.6）：残留 processing → failed；status 剪 7 天。"""
+    for d in (_MAIL_QUEUE_DIR, _MAIL_PROC_DIR, _MAIL_STATUS_DIR):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    for f in sorted(_MAIL_PROC_DIR.glob("*.json")):
+        op_id = f.stem
+        try:
+            op = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(op, dict) and op.get("id"):
+                op_id = str(op["id"])
+        except (json.JSONDecodeError, OSError):
+            pass
+        _mail_op_status_write(op_id, "failed", "bot restarted（操作被中断）")
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    cutoff = time.time() - _MAIL_STATUS_RETENTION
+    for f in _MAIL_STATUS_DIR.glob("*.json"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+async def _mail_admin_exec(op: dict) -> tuple[str, str]:
+    """执行一个已认领操作 → (state, error)。白名单外类型一律拒绝。"""
+    op_type = op.get("type")
+    openid = str(op.get("openid") or "").strip()
+    if op_type not in _MAIL_OP_TYPES or not openid:
+        return "failed", f"非法操作类型或缺少 openid（type={op_type!r}）"
+
+    if op_type == "delete_letter":
+        letter_id = str(op.get("letter_id") or "").strip()
+        if not letter_id:
+            return "failed", "缺少 letter_id"
+        async with _mail_lock(openid):
+            ok = _mailbox_manager.delete_letter(openid, letter_id)
+        return ("done", "") if ok else ("failed", "信件不存在或已删除")
+
+    # ── send_system：立即独立 c2c 主动消息（§16.4.4），不走 10:00 pass、
+    #    不参与角色信件聚合、不写 bond 事件、不记每日配额（管理员显式操作）──
+    title = str(op.get("title") or "").strip()
+    body = str(op.get("body") or "").strip()
+    fmt = str(op.get("format") or "text")
+    if not title or not body:
+        return "failed", "标题/正文为空"
+    if len(title) > _SYS_TITLE_MAX:
+        return "failed", f"标题超 {_SYS_TITLE_MAX} 字"
+    if len(body) > _SYS_BODY_MAX:
+        return "failed", f"正文超 {_SYS_BODY_MAX} 字"
+    if fmt not in ("text", "markdown"):
+        return "failed", "format 必须是 text 或 markdown"
+    if not _mailbox_manager.load_user(openid).get("active_enabled", True):
+        return "failed", "用户已关闭主动消息（拒收），系统邮件未发送"
+    bot = _get_qq_bot()
+    if bot is None:
+        return "failed", "官方 bot 未连接"
+    md = (f"## 系统邮件 · {escape_md_text(title)}\n"
+          f"{body if fmt == 'markdown' else escape_md_text(body)}\n\n"
+          f"> 发送 `/邮件` 查看信箱")
+    plain = f"【系统邮件 · {title}】\n{body}\n\n发送 /邮件 查看信箱"
+    ok = await send_active_c2c_markdown(bot, openid, md, plain_text=plain)
+    if not ok:
+        return "failed", "主动消息发送失败（配额/审核/网络，详见 bot 日志）"
+    async with _mail_lock(openid):
+        letter_id = _mailbox_manager.write_system_letter(
+            openid, title, body,
+            retention_days=int(
+                _bond_manager._config.get("mail_retention_days", 28)))
+    if letter_id is None:
+        return "failed", "发送成功但信箱写入失败"
+    return "done", ""
+
+
+async def _mail_admin_worker() -> None:
+    """3–5s 扫描 queue/ → 认领 → 执行 → status/（§16.2）。"""
+    while True:
+        await asyncio.sleep(3.0 + random.uniform(0, 2.0))
+        try:
+            files = sorted(_MAIL_QUEUE_DIR.glob("*.json"))
+        except OSError:
+            continue
+        for qf in files:
+            proc = _MAIL_PROC_DIR / qf.name
+            try:
+                os.replace(qf, proc)         # 认领；失败=已被认领/消失
+            except OSError:
+                continue
+            try:
+                op = json.loads(proc.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as e:
+                _mail_op_status_write(qf.stem, "failed", f"队列文件损坏: {e!r}")
+                proc.unlink(missing_ok=True)
+                continue
+            if not isinstance(op, dict):
+                op = {}
+            op_id = str(op.get("id") or qf.stem)
+            try:
+                state, error = await _mail_admin_exec(op)
+            except Exception as e:               # 兜底：worker 永不因单操作死掉
+                state, error = "failed", f"执行异常: {type(e).__name__}: {e}"
+            _mail_op_status_write(op_id, state, error)
+            proc.unlink(missing_ok=True)
+            logger.info(f"[mail-admin] {op.get('type')} {op_id} → {state}"
+                        + (f" ({error})" if error else ""))
+            if op.get("type") == "send_system":
+                await asyncio.sleep(1.0)   # 批量系统邮件限速，防 bot 维度频控
+
+
+@get_driver().on_startup
+async def _mail_admin_startup():
+    # 与 mail_enabled 无关：管理队列是管理员显式操作，回滚开关只管每日 pass
+    _mail_admin_recover()
+    asyncio.create_task(_mail_admin_worker())
 
 
 async def _run_greeting_pass() -> None:
