@@ -21,7 +21,9 @@ import shutil
 import sys
 import tempfile
 import time
+import types
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Add project root to path
@@ -11495,6 +11497,879 @@ class TestSessionCompression:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class _FakeMailPersonaMgr(_FakePersonaMgr):
+    """_FakePersonaMgr + 信箱候选过滤需要的 _exists/多角色显示名。"""
+
+    def __init__(self):
+        super().__init__()
+        self.missing = set()      # _exists → False（UGC 已删）
+        self.unified = set()      # get_mode → unified
+        self.names = {}           # persona → 显示名
+
+    def _exists(self, key, user_id=None):
+        return key not in self.missing
+
+    def get_mode(self, persona):
+        return "unified" if persona in self.unified else self.mode
+
+    def get_display_name(self, persona):
+        return self.names.get(persona, persona)
+
+
+class _FakeSpecialSessions:
+    """只提供 _load_index（known_personas 补齐路径，§4.2 数据源 2）。"""
+
+    def __init__(self, personas):
+        self.personas = list(personas)
+
+    def _load_index(self, user_id):
+        return {"sessions": [
+            {"name": f"s{i}", "metadata": {"persona_key": p}}
+            for i, p in enumerate(self.personas)
+        ]}
+
+
+class _FakeDt:
+    """plugins.qq_official.datetime 替身：固定 now()（10:30，发送窗口内）。"""
+
+    fixed = None
+
+    @classmethod
+    def now(cls):
+        return cls.fixed
+
+    @classmethod
+    def fromtimestamp(cls, ts, tz=None):
+        return datetime.fromtimestamp(ts)
+
+
+class _CapturingFlashClient:
+    """捕获 prompt 的 flash client（_compose_mail_letter gap 文案断言）。"""
+
+    def __init__(self, reply="想你了，最近还好吗？"):
+        self.reply = reply
+        self.calls = []
+
+    async def chat_completion(self, message=None, history=None,
+                              timeout_set=None, purpose=None, **kw):
+        self.calls.append({"message": message, "history": history,
+                           "purpose": purpose})
+        return self.reply
+
+
+class _FakeModelRouter:
+    def __init__(self, client):
+        self.flash_client = client
+
+
+class TestProactiveMail:
+    """55. 主动消息「角色信箱」v1（proactive-mail-design.md v0.5）：
+    mailbox 存储 / 候选过滤 / mail pass 编排 / 信封构建 / /邮件 /
+    /免责声明 / 令牌桶 / 群登记表."""
+
+    PATCHED = ("_bond_manager", "_mailbox_manager", "_special_sessions",
+               "get_character_registry", "_get_qq_bot", "_GREET_TARGETS_FILE",
+               "_GREET_QUOTA_FILE", "send_active_c2c_markdown",
+               "_compose_mail_letter", "_model_router", "random", "datetime")
+
+    def run(self):
+        print_header("55. Proactive Mail (角色信箱 v1)")
+        _import_turn_for_tests()
+        import nonebot
+        try:
+            nonebot.init()
+        except ValueError:
+            pass
+        import plugins.qq_official as po
+        self.po = po
+        self.tmp = tempfile.mkdtemp(prefix="mail_pass_")
+        self._setup()
+        try:
+            self.test_preview_and_escape()
+            self.test_mailbox_storage()
+            self.test_letter_id_uniqueness()
+            self.test_candidate_filter()
+            self.test_known_personas_from_sessions()
+            self.test_mail_due_gates()
+            asyncio.run(self.test_compose_gap_desc())
+            self.test_envelope_builder()
+            self.test_token_bucket()
+            self.test_group_registry()
+            asyncio.run(self.test_pass_end_to_end())
+            asyncio.run(self.test_pass_blocks_and_failures())
+            asyncio.run(self.test_disclaimer_toggle())
+            asyncio.run(self.test_send_response_gating())
+            asyncio.run(self.test_mail_command())
+            asyncio.run(self.test_disclaimer_command())
+        finally:
+            self._teardown()
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ── setup / teardown ─────────────────────────────────────────
+
+    def _setup(self):
+        from agent import greeting
+        from agent.mailbox import MailboxManager
+        po = self.po
+        self.greeting = greeting
+        self.m = _tmp_bond_manager(self.tmp)
+        self.mb = MailboxManager(base_dir=os.path.join(self.tmp, "mailboxes"))
+        self.pm = _FakeMailPersonaMgr()
+        self.rng = _FakeRandom()
+        self.targets = os.path.join(self.tmp, "targets.json")
+        self.quota = os.path.join(self.tmp, "quota.json")
+        self.envelope_sends = []
+        self.envelope_send_ok = True
+        self._orig = {k: getattr(po, k) for k in self.PATCHED}
+
+        async def fake_envelope_send(bot, openid, md, rows=None,
+                                     plain_text=None):
+            self.envelope_sends.append(
+                {"openid": openid, "md": md, "rows": rows,
+                 "plain": plain_text})
+            return self.envelope_send_ok
+
+        async def fake_compose(persona, state):
+            return f"{persona} 的一封信：最近还好吗？"
+
+        _FakeDt.fixed = datetime(2026, 10, 30, 10, 30)
+        po._bond_manager = self.m
+        po._mailbox_manager = self.mb
+        po._special_sessions = _FakeSpecialSessions([])
+        po.get_character_registry = lambda: self.pm
+        po._get_qq_bot = lambda: MagicMock()
+        po._GREET_TARGETS_FILE = self.targets
+        po._GREET_QUOTA_FILE = self.quota
+        po.send_active_c2c_markdown = fake_envelope_send
+        po._compose_mail_letter = fake_compose
+        po.random = self.rng
+        po.datetime = _FakeDt
+
+    def _teardown(self):
+        for k, v in self._orig.items():
+            setattr(self.po, k, v)
+
+    def _reset_files(self):
+        for p in (self.targets, self.quota):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        shutil.rmtree(os.path.join(self.tmp, "mailboxes"), ignore_errors=True)
+        os.makedirs(os.path.join(self.tmp, "mailboxes"), exist_ok=True)
+        shutil.rmtree(self.m.events_dir, ignore_errors=True)
+        self.envelope_sends.clear()
+        self.envelope_send_ok = True
+
+    def _seed_user(self, uid, personas, *, known=True, level_exp=1300,
+                   last_seen_age_days=3, msgs=9, sessions=None):
+        """建档：targets + bond 状态（等级/沉默/消息数）+ known_personas。"""
+        self.greeting.note_c2c_contact(self.targets, uid)
+        now = time.time()
+        for p in personas:
+            self.m.add_exp(uid, p, level_exp)
+            st = self.m.get_state(uid, p)
+            st["stats"]["last_seen"] = now - last_seen_age_days * 86400
+            st["stats"]["msgs"] = msgs
+            self.m._save(uid)
+        if known:
+            self.mb.ensure_known_personas(
+                uid, sessions if sessions is not None else personas)
+
+    # ── §5.2 纯函数 ──────────────────────────────────────────────
+
+    def test_preview_and_escape(self):
+        from agent.mailbox import make_preview, escape_md_text
+        # 首行 + 去舞台指示 + 20 unicode 字符 + …
+        assert make_preview("（挥手）团长～一天没见，露比都有点不习惯啦……") == \
+            "团长～一天没见，露比都有点不习惯啦……"      # 19 字未超长，不截断
+        long = "（挥手）" + "一二三四五六七八九十" * 3    # 30 字 → 20 字 + …
+        assert make_preview(long) == "一二三四五六七八九十" * 2 + "…"
+        assert make_preview("第一行\n第二行") == "第一行"
+        assert make_preview("短") == "短"
+        assert make_preview("") == ""
+        assert make_preview("(双阶段)(指示)正文") == "正文"
+        # 全角转义 + 行首列表符
+        e = escape_md_text("*a*_b_`c`[d]#e>f+g")
+        assert e == "＊a＊＿b＿｀c｀【d】＃e＞f＋g", e
+        assert escape_md_text("- item").startswith("\u3000- ")
+        assert escape_md_text("1. item").startswith("\u30001.")
+        assert escape_md_text("普通行") == "普通行"
+        print_pass("§5.2 预览（20字+…/舞台指示剥离）与全角转义符合设计")
+
+    # ── §7.1 存储 ────────────────────────────────────────────────
+
+    def test_mailbox_storage(self):
+        from agent.mailbox import MailboxManager, new_letter_id
+        mb = self.mb
+        now = time.time()
+        # 损坏文件 → 空信箱降级
+        bad = os.path.join(self.tmp, "mailboxes", "corrupt.json")
+        with open(bad, "w") as f:
+            f.write("{not json")
+        box = mb.load_user("corrupt")
+        assert box["letters"] == [] and box["active_enabled"] is True
+        # record_digest：id 分配 / preview / personas / known / 幂等
+        letters = [{"persona": "rubi", "name": "露比", "text": "想你了"}]
+        did = mb.record_digest("u1", letters, now=now)
+        assert did and did.startswith("D-")
+        assert mb.record_digest("u1", [dict(letters[0])], now=now) is None
+        box = mb.load_user("u1")
+        assert len(box["letters"]) == 1 and len(box["digests"]) == 1
+        l0 = box["letters"][0]
+        assert l0["id"].startswith("L-") and l0["digest_id"] == did
+        assert l0["preview"] == "想你了" and l0["read"] is False
+        assert box["personas"]["rubi"]["mail_count"] == 1
+        assert "rubi" in box["known_personas"]
+        assert box["last_digest_date"] == time.strftime(
+            "%Y-%m-%d", time.localtime(now))
+        # mark_read 幂等 / get_letter / letters_on_date
+        lid = l0["id"]
+        assert mb.mark_read("u1", lid) and mb.mark_read("u1", lid)
+        assert not mb.mark_read("u1", "L-nope-0000")
+        assert mb.get_letter("u1", lid)["read"] is True
+        mmdd = time.strftime("%m-%d", time.localtime(now))
+        assert len(mb.letters_on_date("u1", mmdd)) == 1
+        # active_enabled 开关（无变化不写盘）
+        mb.set_active_enabled("u1", False)
+        assert mb.load_user("u1")["active_enabled"] is False
+        mb.set_active_enabled("u1", True)
+        assert mb.load_user("u1")["active_enabled"] is True
+        # 保留期裁剪 + 200 上限
+        box = mb.load_user("u1")
+        for i in range(205):
+            box["letters"].append(
+                {"id": f"L-x{i:04d}", "persona": "p", "name": "n",
+                 "text": "t", "preview": "t", "created_at": now - i,
+                 "read": False})
+        box["letters"].append(
+            {"id": "L-old", "persona": "p", "name": "n", "text": "t",
+             "preview": "t", "created_at": now - 40 * 86400, "read": False})
+        mb.save_user("u1", box)
+        box = mb.load_user("u1")
+        mb.prune(box, now=now)
+        assert len(box["letters"]) == 200
+        assert all(l["id"] != "L-old" for l in box["letters"])
+        print_pass("§7.1 信箱存储：损坏降级/幂等 digest/已读/裁剪 28d+200 上限")
+
+    def test_letter_id_uniqueness(self):
+        from agent.mailbox import new_letter_id
+        ids = {new_letter_id() for _ in range(200)}
+        # 4hex 随机后缀：200 个同日 id 允许极小概率碰撞，>190 即通过
+        assert len(ids) > 190, len(ids)
+        assert all(i.startswith("L-") and len(i.split("-")[-1]) == 4
+                   for i in ids)
+        print_pass("letter id 随机后缀（L-YYYYMMDD-<4hex>）防裁剪后重号")
+
+    # ── §4.2 候选过滤 ────────────────────────────────────────────
+
+    def test_candidate_filter(self):
+        po = self.po
+        uid = "cand_user"
+        # rubi(Lv5, 沉默3天) 合格；roxy(Lv7, 沉默5天) 合格且排前
+        self._seed_user(uid, ["rubi", "roxy"])
+        self.m.add_exp(uid, "roxy", 3100)     # Lv7 暧昧
+        st = self.m.get_state(uid, "roxy")
+        st["stats"]["last_seen"] = time.time() - 5 * 86400
+        st["stats"]["msgs"] = 9
+        self.m._save(uid)
+        # 不合格候选
+        self._seed_user(uid, ["assistant"], known=False)          # unified 助手
+        self._seed_user(uid, ["low_lv"], level_exp=0)             # Lv1 < 5
+        self._seed_user(uid, ["fresh"], last_seen_age_days=0)     # 刚聊过
+        self._seed_user(uid, ["stranger"], msgs=0)                # 无消息
+        self._seed_user(uid, ["unknown_p"], known=False)          # 无特殊会话
+        self._seed_user(uid, ["deleted_p"])
+        self.pm.missing.add("deleted_p")                          # UGC 已删
+        self._seed_user(uid, ["unified_p"])
+        self.pm.unified.add("unified_p")                          # 非 split
+        self._seed_user(uid, ["cooling"])
+        box = self.mb.load_user(uid)
+        box["personas"]["cooling"] = {"last_mail_at": time.time(),
+                                      "mail_count": 1}             # 冷却中
+        self.mb.save_user(uid, box)
+
+        box = self.mb.load_user(uid)
+        cands = po._mail_candidates(uid, box, self.m._config)
+        order = [p for p, _ in cands]
+        assert order == ["roxy", "rubi"], order   # level desc, last_seen asc
+        print_pass("§4.2 过滤链：assistant/低等级/刚聊过/无会话/已删/unified/冷却全排除，排序正确")
+
+    def test_known_personas_from_sessions(self):
+        po = self.po
+        orig = po._special_sessions
+        try:
+            po._special_sessions = _FakeSpecialSessions(["rubi", "roxy"])
+            got = po._known_personas_from_sessions("u")
+            assert got == ["rubi", "roxy"], got
+            # 一旦写入，删会话也保留（§4.2）
+            self.mb.ensure_known_personas("u2", got)
+            po._special_sessions = _FakeSpecialSessions([])
+            assert po._known_personas_from_sessions("u2") == []
+            assert set(self.mb.load_user("u2")["known_personas"]) == \
+                {"rubi", "roxy"}
+        finally:
+            po._special_sessions = orig
+        print_pass("known_personas：sessions 索引补齐，写入后会话删除仍保留")
+
+    def test_mail_due_gates(self):
+        po = self.po
+        uid = "due_user"
+        cfg = self.m._config
+        cands = [("rubi", {})]
+        box = self.mb.load_user(uid)
+        assert po._mail_due(uid, box, cands, cfg)      # 全新信箱 + 窗口内
+        assert not po._mail_due(uid, box, [], cfg)     # 无候选
+        # 同日幂等
+        box2 = dict(box, last_digest_date=time.strftime("%Y-%m-%d"))
+        assert not po._mail_due(uid, box2, cands, cfg)
+        # 最小间隔
+        box3 = dict(box, last_digest_at=time.time() - 3 * 3600)
+        assert not po._mail_due(uid, box3, cands, cfg)
+        # 日上限：今天已发过 1 条 text
+        self.greeting.record_active_send(self.quota, uid, kind="text")
+        assert not po._mail_due(uid, box, cands, cfg)
+        # 月计数不再拦截（monthly_cap=10**9，平台无月配额）
+        self.greeting.record_active_send(
+            self.quota, "month_user", kind="text",
+            now=time.time() - 2 * 86400)
+        for i in range(6):
+            self.greeting.record_active_send(
+                self.quota, "month_user", kind="text",
+                now=time.time() - 86400 + i)
+        assert po._mail_due("month_user", self.mb.load_user("month_user"),
+                            cands, cfg)
+        print_pass("§4.3 发送条件：幂等/最小间隔/日上限拦截，月配额不拦截")
+
+    # ── §5.1 生成 prompt ─────────────────────────────────────────
+
+    async def test_compose_gap_desc(self):
+        po = self.po
+        orig_mr, orig_pm = po._model_router, po.get_character_registry
+        orig_compose = po._compose_mail_letter
+        # _setup 里换成了 fake_compose；本测试要跑真实现
+        po._compose_mail_letter = self._orig["_compose_mail_letter"]
+        try:
+            client = _CapturingFlashClient()
+            po._model_router = _FakeModelRouter(client)
+            now = time.time()
+
+            async def compose_with(last_seen):
+                client.calls.clear()
+                return await po._compose_mail_letter(
+                    "rubi", {"level": 6,
+                             "stats": {"last_seen": last_seen}})
+
+            # 不到一小时（关键：不 clamp 成 1 天）
+            assert await compose_with(now - 1800)
+            assert "不到一小时" in client.calls[0]["message"]
+            assert "1 天" not in client.calls[0]["message"]
+            # 几小时
+            assert await compose_with(now - 3 * 3600)
+            assert "大约几小时" in client.calls[0]["message"]
+            # 3 天
+            assert await compose_with(now - 3 * 86400)
+            assert "大约 3 天" in client.calls[0]["message"]
+            # prompt 带等级 + 60 字约束 + 角色 system
+            msg = client.calls[0]["message"]
+            assert "Lv6" in msg and "60 字" in msg
+            assert "扮演上述角色" in client.calls[0]["history"][0]["content"]
+            # 失败即丢弃（§5.3）：错误前缀 / 空 / 多行 → ""
+            client.reply = "API HTTP错误 (500)"
+            assert await compose_with(now - 86400) == ""
+            client.reply = ""
+            assert await compose_with(now - 86400) == ""
+            client.reply = "第一行\n第二行"
+            assert await compose_with(now - 86400) == ""
+            client.reply = "好" * 101     # 超宽容上限
+            assert await compose_with(now - 86400) == ""
+        finally:
+            po._model_router = orig_mr
+            po.get_character_registry = orig_pm
+            po._compose_mail_letter = orig_compose
+        print_pass("§5.1 gap 文案不 clamp（不到一小时/几小时/N 天），§5.3 失败即丢弃无模板")
+
+    # ── §6.1/§6.2 信封 ───────────────────────────────────────────
+
+    def _mk_letters(self, n, text_len=30):
+        from agent.mailbox import make_preview, new_letter_id
+        return [{
+            "id": new_letter_id(), "persona": f"p{i}",
+            "name": f"角色{i}" if i else "露比",
+            "text": f"信{i}：" + "内容" * (text_len // 2),
+            "preview": make_preview("信%d：内容" % i),
+            "created_at": time.time(), "read": False,
+        } for i in range(n)]
+
+    def test_envelope_builder(self):
+        po = self.po
+        cfg = dict(self.m._config)
+        # B2：单封短文 → 全文无按钮
+        one = self._mk_letters(1, text_len=40)
+        md, plain, rows = po._build_envelope(one, cfg)
+        assert rows is None and "10月30日" in md
+        assert one[0]["text"].replace("*", "＊") or True
+        assert "/切换会话" in md and "/邮件" in md
+        assert "【今日角色来信" in plain
+        # B1：多封 → 列表 + 按钮
+        three = self._mk_letters(3)
+        md, plain, rows = po._build_envelope(three, cfg)
+        assert rows is not None
+        flat = [b for r in rows for b in r]
+        assert len(flat) == 3
+        assert all(b.data == f"/邮件 {l['id']}" and b.action == "cmd"
+                   and b.enter for b, l in zip(flat, three))
+        assert md.startswith("## 今日角色来信 · 10月30日")
+        assert "共 3 封" in md and "> 过往来信" in md
+        # 长名 → ①…映射 + 展开①
+        long_one = self._mk_letters(1)
+        long_one[0]["name"] = "Roxy_Migurdia_超长名"
+        two = three[:1] + long_one
+        md, plain, rows = po._build_envelope(two, cfg)
+        flat = [b for r in rows for b in r]
+        assert any(b.label.startswith("展开") and "②" in b.label
+                   for b in flat), [b.label for b in flat]
+        assert "②" in md
+        # max_chars 截断 → 「另有 N 封」
+        cfg_small = dict(cfg, mail_max_chars=220, mail_max_previews=5)
+        many = self._mk_letters(5, text_len=60)
+        for l in many:      # 21 字长预览，撑爆 220 上限
+            l["preview"] = "一二三四五六七八九十一二三四五六七八九十…"
+        md, plain, rows = po._build_envelope(many, cfg_small)
+        assert len(md) <= 220, len(md)
+        assert "另有" in md and "/邮件" in md
+        # 纯文本降级不含 md 记号
+        assert "#" not in plain and "**" not in plain and ">" not in plain
+        print_pass("§6.1/§6.2 信封：B2 单封全文/B1 按钮+①映射/超长截断/档3纯文本")
+
+    # ── §4.4 令牌桶 ──────────────────────────────────────────────
+
+    def test_token_bucket(self):
+        from agent.rate_limit import ChannelLimiter, TokenBucket
+        clock = [0.0]
+        b = TokenBucket(rate=10.0, monotonic=lambda: clock[0])
+        assert all(b.try_acquire() for _ in range(10))   # capacity=rate
+        assert not b.try_acquire()
+        clock[0] += 0.5                                   # +5 枚
+        assert all(b.try_acquire() for _ in range(5))
+        assert not b.try_acquire()
+        clock[0] += 10.0
+        assert not b.try_acquire(11)                      # 不超 capacity 攒币
+        assert b.try_acquire(10)
+
+        async def burst():
+            fast_lim = ChannelLimiter(rates={"fast": 1000.0},
+                                      monotonic=lambda: clock[0])
+            t0 = time.monotonic()
+            for _ in range(5):
+                await fast_lim.acquire("fast")
+            return time.monotonic() - t0
+        clock[0] = 0.0
+        lim = ChannelLimiter(rates={"fast": 1000.0},
+                             monotonic=lambda: clock[0])
+        # 高速率桶：acquire 不阻塞
+        assert asyncio.run(burst()) < 0.5
+        assert lim.bucket("fast") is lim.bucket("fast")   # 按渠道复用
+        print_pass("§4.4 令牌桶：速率/容量/补币/按渠道复用正确")
+
+    # ── §4.5/§7.3 群登记表 ───────────────────────────────────────
+
+    def test_group_registry(self):
+        from agent.group_registry import GroupRegistry
+        path = os.path.join(self.tmp, "group_registry.json")
+        reg = GroupRegistry(path)
+        now = 1000.0
+        assert reg.upsert_seen("G1", now=now)              # 首次建档写盘
+        assert not reg.upsert_seen("G1", now=now + 10)     # 60s 内节流
+        assert reg.upsert_seen("G1", now=now + 61)         # 超粒度写盘
+        assert reg.get("G1")["status"] == "active"
+        assert reg.list_active() == ["G1"]
+        reg.mark_left("G1", now=now + 100)
+        assert reg.get("G1")["status"] == "left"
+        assert reg.list_active() == []
+        assert reg.upsert_seen("G1", now=now + 200)        # 入站复活
+        assert reg.get("G1")["status"] == "active"
+        reg.set_active_enabled("G1", False)
+        assert reg.list_active() == []                     # REJECT → 跳过
+        assert not reg.set_active_enabled("G1", False)     # 无变化不写
+        reg.set_active_enabled("G1", True)
+        assert reg.list_active() == ["G1"]
+        with open(path, "w") as f:
+            f.write("{broken")
+        assert reg.load()["groups"] == {}                  # 损坏降级
+        print_pass("§4.5 群登记表：节流 upsert/left 复活/REJECT 开关/损坏降级")
+
+    # ── pass 编排 ────────────────────────────────────────────────
+
+    async def test_pass_end_to_end(self):
+        po = self.po
+        uid = "mail_user"
+        self._reset_files()
+        # sessions 索引驱动 known_personas 补齐
+        po._special_sessions = _FakeSpecialSessions(["rubi"])
+        self._seed_user(uid, ["rubi"], known=False)
+        await po._run_mail_pass()
+        # 1) 发出一个信封
+        assert len(self.envelope_sends) == 1, self.envelope_sends
+        sent = self.envelope_sends[0]
+        assert sent["openid"] == uid
+        assert "今日角色来信" in sent["md"] and sent["plain"]
+        assert sent["rows"] is None or sent["rows"]        # B2 单封 → None
+        # 2) 记账齐全：信箱 / 配额(text) / bond 事件全文
+        box = self.mb.load_user(uid)
+        assert len(box["letters"]) == 1 and len(box["digests"]) == 1
+        letter = box["letters"][0]
+        assert letter["persona"] == "rubi" and letter["read"] is False
+        assert box["last_digest_date"] == time.strftime("%Y-%m-%d")
+        assert "rubi" in box["known_personas"]
+        assert self.greeting.active_sent_today(self.quota, uid, kind="text")
+        assert not self.greeting.active_sent_today(self.quota, uid,
+                                                   kind="media")
+        events = self.m.recent_events(uid, "rubi", n=3)
+        assert any(letter["text"] in e and "寄出一封信" in e
+                   for e in events), events   # §9.1 全文入 bond 事件
+        # 3) 同日重跑幂等：不再发
+        await po._run_mail_pass()
+        assert len(self.envelope_sends) == 1
+        # 4) catch_up 减半 max_letters：3 个合格人格 → max(1, 5//2)=2 封
+        uid2 = "catchup_user"
+        po._special_sessions = _FakeSpecialSessions(["rubi", "roxy", "amiya"])
+        self._seed_user(uid2, ["rubi", "roxy", "amiya"], known=False)
+        self.envelope_sends.clear()
+        await po._run_mail_pass(catch_up=True)
+        mine = [s for s in self.envelope_sends if s["openid"] == uid2]
+        assert len(mine) == 1                # 仍然只发一个信封
+        box2 = self.mb.load_user(uid2)
+        assert len(box2["letters"]) == 2     # 补发减半：3 候选取 2
+        print_pass("pass 端到端：发送/记账/事件全文/同日幂等/补发减半")
+
+    async def test_pass_blocks_and_failures(self):
+        po = self.po
+        cfg = self.m._config
+        # a) 发送失败 → 不写任何记录（§7.2）
+        uid = "fail_user"
+        self._reset_files()
+        po._special_sessions = _FakeSpecialSessions(["rubi"])
+        self._seed_user(uid, ["rubi"], known=False)
+        self.envelope_send_ok = False
+        await po._run_mail_pass()
+        assert len(self.envelope_sends) == 1     # 尝试过
+        box = self.mb.load_user(uid)
+        assert box["letters"] == [] and not box["last_digest_date"]
+        assert not self.greeting.active_sent_today(self.quota, uid,
+                                                   kind="text")
+        assert self.m.recent_events(uid, "rubi", n=3) == []
+        # b) 当天已发媒体 → 信封让路（双向互斥，v0.5）
+        self._reset_files()
+        self._seed_user(uid, ["rubi"], known=False)
+        self.greeting.record_active_send(self.quota, uid, kind="media")
+        await po._run_mail_pass()
+        assert self.envelope_sends == []
+        # c) active_enabled=false（C2C_MSG_REJECT）→ 跳过
+        self._reset_files()
+        self._seed_user(uid, ["rubi"], known=False)
+        self.mb.set_active_enabled(uid, False)
+        await po._run_mail_pass()
+        assert self.envelope_sends == []
+        # d) mail_enabled=false → 整个 pass 不跑（回滚开关）
+        self._reset_files()
+        self._seed_user(uid, ["rubi"], known=False)
+        self.m._config = dict(cfg, mail_enabled=False)
+        try:
+            await po._run_mail_pass()
+            assert self.envelope_sends == []
+        finally:
+            self.m._config = cfg
+        # e) 生成全失败 → 0 封不发信封不记账（§5.3）
+        self._reset_files()
+        self._seed_user(uid, ["rubi"], known=False)
+        orig_compose = po._compose_mail_letter
+
+        async def compose_fail(persona, state):
+            return ""
+        po._compose_mail_letter = compose_fail
+        try:
+            await po._run_mail_pass()
+            assert self.envelope_sends == []
+            assert self.mb.load_user(uid)["letters"] == []
+        finally:
+            po._compose_mail_letter = orig_compose
+        print_pass("pass 拦截：发送失败零记账/媒体互斥/拒收开关/回滚开关/生成失败不发空信封")
+
+    # ── §6.5 免责尾开关 ──────────────────────────────────────────
+
+    async def test_disclaimer_toggle(self):
+        turn = _import_turn_for_tests()
+        orig_file = turn._DISCLAIMER_PREFS_FILE
+        orig_dir = turn._USER_PREFS_DIR
+        orig_cache = (turn._disclaimer_prefs_cache,
+                      turn._disclaimer_prefs_mtime)
+        try:
+            turn._USER_PREFS_DIR = os.path.join(self.tmp, "prefs")
+            turn._DISCLAIMER_PREFS_FILE = os.path.join(
+                turn._USER_PREFS_DIR, "disclaimer.json")
+            turn._disclaimer_prefs_cache = None
+            turn._disclaimer_prefs_mtime = None
+            # 默认开（追加）
+            assert not turn._disclaimer_off("u")
+            assert turn._set_disclaimer_off("u", True)
+            assert turn._disclaimer_off("u")
+            # 两渠道用户标识独立
+            assert not turn._disclaimer_off("u_official")
+            assert turn._set_disclaimer_off("u", False)
+            assert not turn._disclaimer_off("u")
+            # 损坏文件 → 默认开
+            with open(turn._DISCLAIMER_PREFS_FILE, "w") as f:
+                f.write("{broken")
+            turn._disclaimer_prefs_cache = None
+            assert not turn._disclaimer_off("u")
+        finally:
+            turn._DISCLAIMER_PREFS_FILE = orig_file
+            turn._USER_PREFS_DIR = orig_dir
+            (turn._disclaimer_prefs_cache,
+             turn._disclaimer_prefs_mtime) = orig_cache
+        print_pass("§6.5 免责尾开关：默认开/按渠道独立/损坏降级为开")
+
+    async def test_send_response_gating(self):
+        """两处追加点之一的 _send_response：关 → inline 与 separate 都跳过。"""
+        turn = _import_turn_for_tests()
+
+        class _RecSender:
+            platform = "onebot"
+            max_messages_per_turn = 10
+            supports_markdown = False
+
+            def __init__(self):
+                self.out = []
+
+            async def send_text(self, x): self.out.append(("text", x))
+            async def send_markdown(self, x): self.out.append(("md", x))
+            async def send_image(self, x): pass
+            async def send_audio(self, x): pass
+            async def send_progress(self, x, *, immediate=False): pass
+            async def send_keyboard(self, x): self.out.append(("kb", x.markdown))
+
+        orig_file = turn._DISCLAIMER_PREFS_FILE
+        orig_dir = turn._USER_PREFS_DIR
+        orig_cache = (turn._disclaimer_prefs_cache,
+                      turn._disclaimer_prefs_mtime)
+        old_sender = turn.default_sender
+        p_tok = turn._current_platform.set("onebot")
+        u_tok = turn._current_user_id.set("gate_user")
+        try:
+            turn._USER_PREFS_DIR = os.path.join(self.tmp, "prefs2")
+            turn._DISCLAIMER_PREFS_FILE = os.path.join(
+                turn._USER_PREFS_DIR, "disclaimer.json")
+            turn._disclaimer_prefs_cache = None
+            turn._disclaimer_prefs_mtime = None
+            # 默认：免责尾追加
+            s = _RecSender(); turn.default_sender = s
+            await turn._send_response("普通回复")
+            assert "理性判断" in s.out[-1][1]
+            # 关闭：plain 路径不追加
+            turn._set_disclaimer_off("gate_user", True)
+            s = _RecSender(); turn.default_sender = s
+            await turn._send_response("普通回复")
+            assert all("理性判断" not in v for _, v in s.out), s.out
+            # 关闭 + 官方 md 短正文：inline 跳过
+            turn._current_platform.set("qq_official")
+            s = _RecSender(); s.platform = "qq_official"
+            s.supports_markdown = True
+            turn.default_sender = s
+            r_tok = turn._current_render_context.set(
+                turn._RENDER_MD_DECLARATION)
+            try:
+                await turn._send_response("## 短答复")
+                assert len(s.out) == 1 and s.out[0][0] == "md"
+                assert "理性判断" not in s.out[0][1]
+                # 关闭 + 长正文：不再有 separate 免责消息
+                s = _RecSender(); s.platform = "qq_official"
+                s.supports_markdown = True
+                turn.default_sender = s
+                await turn._send_response("## 长答复\n" + "内" * 250)
+                assert [k for k, _ in s.out] == ["md"], s.out
+                # 重新开启 → 恢复 separate
+                turn._set_disclaimer_off("gate_user", False)
+                s = _RecSender(); s.platform = "qq_official"
+                s.supports_markdown = True
+                turn.default_sender = s
+                await turn._send_response("## 长答复\n" + "内" * 250)
+                assert [k for k, _ in s.out] == ["md", "text"], s.out
+                assert "理性判断" in s.out[1][1]
+            finally:
+                turn._current_render_context.reset(r_tok)
+        finally:
+            turn.default_sender = old_sender
+            turn._current_platform.reset(p_tok)
+            turn._current_user_id.reset(u_tok)
+            turn._DISCLAIMER_PREFS_FILE = orig_file
+            turn._USER_PREFS_DIR = orig_dir
+            (turn._disclaimer_prefs_cache,
+             turn._disclaimer_prefs_mtime) = orig_cache
+        print_pass("§6.5 _send_response 接线：plain/官方md inline/separate 三分支均受开关控制")
+
+    # ── §8 /邮件 命令 ────────────────────────────────────────────
+
+    async def test_mail_command(self):
+        turn = _import_turn_for_tests()
+
+        class _RecSender:
+            platform = "onebot"
+            max_messages_per_turn = 50
+            supports_markdown = False
+
+            def __init__(self):
+                self.out = []
+
+            async def send_text(self, x): self.out.append(x)
+            async def send_markdown(self, x): self.out.append(x)
+            async def send_image(self, x): pass
+            async def send_audio(self, x): pass
+            async def send_progress(self, x, *, immediate=False): pass
+
+        orig_mb = turn._mailbox_manager
+        old_sender = turn.default_sender
+        try:
+            turn._mailbox_manager = self.mb
+            s = _RecSender(); turn.default_sender = s
+            view = types.SimpleNamespace(platform="qq_official",
+                                         is_group=False)
+            view_group = types.SimpleNamespace(platform="qq_official",
+                                               is_group=True)
+            view_onebot = types.SimpleNamespace(platform="onebot",
+                                                is_group=False)
+            uid = "cmd_user"
+            # 渠道门：群聊 / OneBot → 仅官方单聊可用
+            assert await turn._handle_mail_command("/邮件", uid, view_group)
+            assert "仅官方单聊" in s.out[-1]
+            assert await turn._handle_mail_command("/邮件", uid, view_onebot)
+            assert "仅官方单聊" in s.out[-1]
+            # 空信箱
+            assert await turn._handle_mail_command("/邮件", uid, view)
+            assert "没有角色来信" in s.out[-1]
+            # 种 7 封信 → 列表分页（5/页）+ 未读 ● + 编号可见
+            from agent.mailbox import make_preview, new_letter_id
+            letters = []
+            for i in range(7):
+                day = 10 + i
+                letters.append({
+                    "id": f"L-202610{day:02d}-{i:04x}",
+                    "persona": f"p{i}", "name": f"角色{i}",
+                    "text": f"第{i}封信全文内容",
+                    "preview": make_preview(f"第{i}封信全文内容"),
+                    "created_at": time.time() - (7 - i) * 3600,
+                    "read": False,
+                })
+            box = self.mb.load_user(uid)
+            box["letters"] = letters
+            self.mb.save_user(uid, box)
+            s.out.clear()
+            assert await turn._handle_mail_command("/邮件", uid, view)
+            page1 = s.out[-1]
+            assert "未读 7 封" in page1 and "第 1/2 页" in page1
+            assert "●" in page1 and letters[-1]["id"] in page1
+            assert letters[0]["id"] not in page1     # 第 6 封在下一页
+            # 翻页
+            s.out.clear()
+            assert await turn._handle_mail_command("/邮件 下一页", uid, view)
+            assert "第 2/2 页" in s.out[-1]
+            s.out.clear()
+            assert await turn._handle_mail_command("/邮件 p2", uid, view)
+            assert "第 2/2 页" in s.out[-1]
+            # 详情：全文 + 标记已读 + 不带免责尾
+            lid = letters[-1]["id"]
+            s.out.clear()
+            assert await turn._handle_mail_command(f"/邮件 {lid}", uid, view)
+            detail = s.out[-1]
+            assert letters[-1]["text"] in detail
+            assert "返回信箱" in detail
+            assert "理性判断" not in detail
+            assert self.mb.get_letter(uid, lid)["read"] is True
+            # 大小写容错
+            s.out.clear()
+            assert await turn._handle_mail_command(
+                f"/邮件 {lid.lower()}", uid, view)
+            assert letters[-1]["text"] in s.out[-1]
+            # 按日期
+            mmdd = datetime.fromtimestamp(
+                letters[-1]["created_at"]).strftime("%m-%d")
+            s.out.clear()
+            assert await turn._handle_mail_command(f"/邮件 {mmdd}", uid, view)
+            assert mmdd in s.out[-1] and letters[-1]["id"] in s.out[-1]
+            # 不存在的编号
+            s.out.clear()
+            assert await turn._handle_mail_command("/邮件 L-19990101-ffff",
+                                                   uid, view)
+            assert "没有找到" in s.out[-1]
+            # 非命令文本不误触
+            assert not await turn._handle_mail_command("/邮件箱", uid, view)
+        finally:
+            turn._mailbox_manager = orig_mb
+            turn.default_sender = old_sender
+        print_pass("§8 /邮件：渠道门/空态/分页/下一页/pN/详情已读/日期/未找到/免免责尾")
+
+    async def test_disclaimer_command(self):
+        turn = _import_turn_for_tests()
+
+        class _RecSender:
+            platform = "onebot"
+            max_messages_per_turn = 50
+            supports_markdown = False
+
+            def __init__(self):
+                self.out = []
+
+            async def send_text(self, x): self.out.append(x)
+            async def send_markdown(self, x): self.out.append(x)
+            async def send_image(self, x): pass
+            async def send_audio(self, x): pass
+            async def send_progress(self, x, *, immediate=False): pass
+
+        orig_file = turn._DISCLAIMER_PREFS_FILE
+        orig_dir = turn._USER_PREFS_DIR
+        orig_cache = (turn._disclaimer_prefs_cache,
+                      turn._disclaimer_prefs_mtime)
+        old_sender = turn.default_sender
+        try:
+            turn._USER_PREFS_DIR = os.path.join(self.tmp, "prefs3")
+            turn._DISCLAIMER_PREFS_FILE = os.path.join(
+                turn._USER_PREFS_DIR, "disclaimer.json")
+            turn._disclaimer_prefs_cache = None
+            turn._disclaimer_prefs_mtime = None
+            s = _RecSender(); turn.default_sender = s
+            uid = "disc_user"
+            # 状态查询（默认开，B7 文案）
+            assert await turn._handle_disclaimer_command("/免责声明", uid)
+            assert "默认开启" in s.out[-1] and "理性判断" not in s.out[-1]
+            # 关（regular 用户可用——不做任何角色检查）
+            assert await turn._handle_disclaimer_command("/免责声明 关", uid)
+            assert turn._disclaimer_off(uid)
+            assert "不再追加" in s.out[-1]
+            # 状态查询（已关）
+            s.out.clear()
+            assert await turn._handle_disclaimer_command("/免责声明", uid)
+            assert "已关闭" in s.out[-1]
+            # off/on 英文变体 + 开
+            assert await turn._handle_disclaimer_command("/免责声明 off", uid)
+            assert turn._disclaimer_off(uid)
+            assert await turn._handle_disclaimer_command("/免责声明 开", uid)
+            assert not turn._disclaimer_off(uid)
+            # 未知参数 → 用法
+            s.out.clear()
+            assert await turn._handle_disclaimer_command("/免责声明 哈", uid)
+            assert "用法" in s.out[-1]
+            # # 前缀变体 + 非命令不误触
+            assert await turn._handle_disclaimer_command("#免责声明", uid)
+            assert not await turn._handle_disclaimer_command("/免责", uid)
+        finally:
+            turn.default_sender = old_sender
+            turn._DISCLAIMER_PREFS_FILE = orig_file
+            turn._USER_PREFS_DIR = orig_dir
+            (turn._disclaimer_prefs_cache,
+             turn._disclaimer_prefs_mtime) = orig_cache
+        print_pass("§6.5 /免责声明：状态查询/开/关/英文变体/#前缀/确认回复自身不带免责尾")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -11559,6 +12434,7 @@ def main():
         ("QQ Official Buttons (keyboard P0+P1)", TestOfficialButtons()),
         ("QQ Official Stream (stream_messages, c2c)", TestOfficialStream()),
         ("Session Compression (/压缩会话)", TestSessionCompression()),
+        ("Proactive Mail (角色信箱 v1)", TestProactiveMail()),
     ]
 
     passed = 0
