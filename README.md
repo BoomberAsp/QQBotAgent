@@ -14,7 +14,7 @@
 - **自创角色（UGC）** — `/创建角色` 访谈式创作（姓名/性格/语气/外观/初始羁绊），可设参考立绘与声纹，保存为仅自己可见的角色卡，`/人格切换` 后即可养成
 - **影音生成与记忆** — Lv4 起可要图、Lv5 起可要语音，形象与声线保持一致；生成的图/语音落「资产卡」（文本卡是本体、二进制是可淘汰缓存），支持按记忆召回、事件蒸馏与 LRU 淘汰
 - **原作剧情知识库** — 本地 SQLite/FTS5 语料（约 5 万句对白，中英 bigram 索引 + RRF 重排），角色扮演时按人格白名单注入相关剧情，也可由 `story_search` 工具主动检索
-- **官方渠道主动互动** — 仅在官方单聊：`HEARTBEAT` 低频主动问候（好感等级门 + 冷却 + 概率 + 日/月配额）、Lv7+ 偶发主动发图/发语音，失败自动降级纯文本
+- **官方渠道主动互动** — 仅在官方单聊：**角色信箱**每日 10:00–22:00 发一封「信封」摘要（沉默 ≥24h 且羁绊 Lv≥5 的角色各写一句 ≤60 字留言，markdown + 展开按钮，失败逐档降级纯文本；`/邮件` 回看，信件保留 28 天）、Lv7+ 偶发主动发图/发语音；两类主动消息同日互斥不双发，发送经令牌桶限速（c2c 10 条/秒），用户点「拒收」自动停发（`C2C_MSG_REJECT`/`RECEIVE` 事件驱动）
 - **官方渠道原生渲染** — 仅在 QQ 官方路由（OneBot 恒纯文本）：unified 人格回复与 `/帮助`/`/兑换码` 走原生 markdown（msg_type=2）；消息按钮（指令按钮替用户打字 + 回调按钮毫秒级本地操作，如会话列表/删除），不支持时自动降级为纯文本命令清单；**流式消息**（仅单聊）让工具进度「⏳ …」与回答逐字上屏（替代「输入中状态」），开流失败/中途断裂自动回退缓冲全文，内容不丢。三者各有熔断器 + 热读开关（`QQ_OFFICIAL_MARKDOWN` / `QQ_OFFICIAL_BUTTONS` / `QQ_OFFICIAL_STREAM`）
 - **特殊会话** — 每用户至多 10/3/1 个（按角色），快照+增量双层存储，读时分层截断适配模型上下文窗口；`/压缩会话` 可将长会话早期历史浓缩为摘要（≥85% 窗口时人格化主动建议，≥95% 紧急截断保护）；**剧情/角色创作会话豁免此配额**（剧情完结自动封档、可回看，总量上限 `MAX_SCENE_ARCHIVES`，默认 20）
 - **用户工作区** — 每用户独立文件空间，配额管理（3 级策略），跨会话隔离
@@ -198,6 +198,7 @@ bash start.sh
 | `/创建角色` | 访谈式自创角色（姓名/性格/语气/外观/初始羁绊 Lv1–5）；**不占特殊会话配额**，中途退出后再发 `/创建角色` 可恢复访谈，创建成功后该会话自动删除 |
 | `/删除角色 [名称]` | 不带名称列出你的自创角色；带名称删除（回复「确认删除角色 <名称>」二次确认）；删除时解除用户默认/群默认对该角色的引用（提示「已解除 N 处」），会话内绑定失效自动回落，好感数据保留 |
 | `/设形象 [角色名]` | 把图片设为自创角色的参考立绘（`/形象` 查看、`/清除形象` 撤销；内置人格仅管理员可改） |
+| `/邮件` | 查看角色信箱（**仅官方单聊**）：不带参数列出信件（分页，`●` 为未读）、`下一页`/`p2` 翻页、`MM-DD` 按日期查看、信件编号看全文并标记已读（零 token，不带免责尾） |
 
 **群聊功能管理**（仅超级用户，仅群聊）
 
@@ -231,6 +232,7 @@ bash start.sh
 | `/功能` 或 `/features` | 渲染 `FEATURES.md` 为功能卡片图片返回（零 token） |
 | `/更新日志 [d]` 或 `/update record [d]` | 查看机器人最近 d 条更新记录（默认 3，最多 20）；也可自然语言询问「最近有什么更新」（落入 `get_changelog` 工具） |
 | `/管理工作区` | 触发智能体调用 `get_user_info` 展示工作区快照并引导清理（落入 Agent 处理，非拦截命令） |
+| `/免责声明` | 查看免责尾状态；`/免责声明 关` 关闭对话回复末尾的免责声明追加（所有用户可用，按渠道独立记录；主动信件本就不带免责尾） |
 
 **反馈 & Bug 报告**（零 token 消耗，直达开发者）
 
@@ -315,7 +317,10 @@ QQBotAgent/
     │   ├── bond.py / bond_content.py       # 好感度 / 心情 / 送礼 / 戳一戳 / 剧情场景 / 重逢 / 纪念日
     │   ├── asset_memory.py     #   多模态资产卡（文本化本体 + 去重 + 检索 + LRU）
     │   ├── delegation.py       #   双平面路由：任务面委派 + 角色口吻转述
-    │   ├── greeting.py         #   主动问候候选索引 + 主动消息配额（官方渠道）
+    │   ├── greeting.py         #   主动消息候选索引 + 配额簿记（官方渠道；日上限共享，无月配额）
+    │   ├── mailbox.py          #   角色信箱存储：每用户信件/摘要 JSON（28 天保留 + 200 封上限）
+    │   ├── rate_limit.py       #   主动消息令牌桶（c2c 10/s、group 1/s，按渠道复用）
+    │   ├── group_registry.py   #   官方群登记表（GROUP_AT 入站纯记账，60s 节流）
     │   ├── portrait.py         #   参考立绘校验 / 规整 / 描述
     │   ├── hardware.py / workspace.py / workspace_snapshot.py / quota_cleanup.py
     │   │                       #   硬件检测（bootstrap 时注入约束）/ 工作区配额 / 目录快照 / 清理协议
@@ -325,13 +330,13 @@ QQBotAgent/
     │
     ├── adapters/               # 平台入口适配器
     │   ├── onebot.py           #   OneBot V11：事件→InboundMessage、附件下载、OneBotSender
-    │   ├── qq_official.py      #   QQ 官方：build_view、附件解析、QQOfficialSender（缓冲+合并+配额+流式能力位）、主动消息
+    │   ├── qq_official.py      #   QQ 官方：build_view、附件解析、QQOfficialSender（缓冲+合并+配额+流式能力位）、主动消息（含 markdown+按钮信封阶梯降级）
     │   ├── qq_official_buttons.py  # 官方键盘 wire 格式 + 回调编解码 + 交互回执发送器 + 点击遥测
     │   └── qq_official_stream.py   # 官方 c2c 流式消息：MessageStreamer 双流传输 + 熔断器 + stream_snapshot
     │
     ├── plugins/                # NoneBot 插件
     │   ├── agent_router.py     #   OneBot 入口 + 配置看门狗 + 更新公告群发/群列表导出
-    │   ├── qq_official.py      #   官方入口 + 主动问候 / 主动发媒体 + 状态心跳
+    │   ├── qq_official.py      #   官方入口 + 每日主动循环（角色信箱信封 + 主动发媒体，双向互斥）+ 拒收/恢复事件 + 状态心跳
     │   ├── qq_official_buttons.py  # 官方 INTERACTION_CREATE 回调入口（幂等+限频+审计）
     │   ├── pullingMonitor.py / check_redeem_code.py / ruyipage_fetch.py / offline_logger.py
     │   └── group.py / speed.py / photos.py / test.py / utils.py（旧插件，仅保留个别工具函数）
@@ -593,6 +598,8 @@ class ContinuousSessionManager:
 | `AssetMemory` | `agent/asset_memory.py` | 资产卡（markdown+frontmatter 为本体，二进制可淘汰）：建卡/检索/召回计数/prompt_hash 去重/事件蒸馏/LRU 淘汰/审计 |
 | `Delegation` | `agent/delegation.py` | 双平面路由执行核心：`SOCIAL_TOOLS` 白名单、`run_delegated_task`（隔离上下文 + 权限过滤 + 单层嵌套）、`revoice_task_result`（角色口吻转述） |
 | `GreetingState` | `agent/greeting.py` | 官方渠道主动消息簿记：候选索引（仅 c2c 入站）+ 日/月配额 + 冷却 + 概率 + 批量上限（纯函数可单测） |
+| `MailboxManager` | `agent/mailbox.py` | 角色信箱：每用户一 JSON（`data/mailboxes/`），信件/摘要落库、幂等 digest、28 天 + 200 封裁剪、预览/全角转义纯函数 |
+| `GroupRegistry` | `agent/group_registry.py` | 官方群登记表（`data/group_registry.json`）：GROUP_AT 入站 upsert（60s 节流）、left/unknown 状态机、active_enabled 开关（v1 纯记账） |
 | `StoryKB` | `lib/story_kb.py` | 原作剧情检索：SQLite FTS5（中文 bigram / 英文 unicode61）+ BM25 → RRF → 场景/角色加权重排 |
 | `QQOfficialSender` | `adapters/qq_official.py` | 官方渠道 Sender：缓冲 + 合并 + 配额控制、图片/语音 base64 上传、语音被拒降级文件卡、`/正在思考/` 即时进度 |
 | `TokenLedger` | `lib/token_ledger.py` | Token 用量记账（按日聚合，WebUI 看板数据源） |

@@ -85,7 +85,10 @@ QQBotAgent/
     │   ├── bond.py / bond_content.py       # 好感度 / 心情 / 送礼 / 戳一戳 / 剧情场景 / 重逢 / 纪念日
     │   ├── asset_memory.py     #   多模态资产卡（文本化本体 + 去重 + 检索 + LRU）
     │   ├── delegation.py       #   双平面路由：任务面委派 + 角色口吻转述
-    │   ├── greeting.py         #   主动问候候选索引 + 主动消息配额（官方渠道）
+    │   ├── greeting.py         #   主动消息候选索引 + 配额簿记（官方渠道；日上限共享，无月配额）
+    │   ├── mailbox.py          #   角色信箱存储：每用户信件/摘要 JSON（28 天保留 + 200 封上限）
+    │   ├── rate_limit.py       #   主动消息令牌桶（c2c 10/s、group 1/s，按渠道复用）
+    │   ├── group_registry.py   #   官方群登记表（GROUP_AT 入站纯记账，60s 节流）
     │   ├── portrait.py         #   参考立绘校验 / 规整 / 描述
     │   ├── hardware.py / workspace.py / workspace_snapshot.py / quota_cleanup.py
     │   ├── task_record.py / search_archive.py / group_features.py
@@ -94,13 +97,13 @@ QQBotAgent/
     │
     ├── adapters/               # 平台入口适配器
     │   ├── onebot.py           #   OneBot V11：事件→InboundMessage、附件下载、OneBotSender
-    │   ├── qq_official.py      #   QQ 官方：build_view、附件解析、QQOfficialSender（缓冲+合并+配额+流式能力位）、主动消息
+    │   ├── qq_official.py      #   QQ 官方：build_view、附件解析、QQOfficialSender（缓冲+合并+配额+流式能力位）、主动消息（含 markdown+按钮信封阶梯降级）
     │   ├── qq_official_buttons.py  # 官方键盘 wire 格式 + 回调编解码 + 交互回执发送器 + 点击遥测
     │   └── qq_official_stream.py   # 官方 c2c 流式消息：MessageStreamer 双流传输 + 熔断器 + stream_snapshot
     │
     ├── plugins/                # NoneBot 插件
     │   ├── agent_router.py     #   OneBot 入口 + 配置看门狗 + 更新公告群发/群列表导出
-    │   ├── qq_official.py      #   官方入口 + 主动问候 / 主动发媒体 + 状态心跳
+    │   ├── qq_official.py      #   官方入口 + 每日主动循环（角色信箱信封 + 主动发媒体，双向互斥）+ 拒收/恢复事件 + 状态心跳
     │   ├── qq_official_buttons.py  # 官方 INTERACTION_CREATE 回调入口（幂等+限频+审计）
     │   ├── pullingMonitor.py / check_redeem_code.py / ruyipage_fetch.py / offline_logger.py
     │   └── group.py / speed.py / photos.py / test.py / utils.py（旧插件，仅保留个别工具函数）
@@ -166,7 +169,10 @@ QQBotAgent/
         ├── name_index/         #   角色名索引缓存
         ├── wiki_cache/         #   Wiki 爬取缓存与卡片图
         ├── redeem_code/        #   兑换码缓存
+        ├── mailboxes/          #   角色信箱（每用户信件/摘要 JSON，28 天保留）
+        ├── user_prefs/         #   用户偏好（disclaimer.json 免责尾开关，按渠道 user_id）
         ├── personality_config.json / personality_settings.json / group_personality.json
+        ├── group_registry.json #   官方群登记表（GROUP_AT 入站记账，v1）
         └── official_status.json #  官方路由状态（面板仪表盘读取；按需生成）
 ```
 
@@ -697,13 +703,13 @@ turn.py / 入口插件
 |---|---|
 | 会话 | `/新会话`、`/会话列表`（`/会话`）、`/切换会话`、`/重命名会话`、`/删除会话`（回复「确认删除 <名称>」）、`/压缩会话`（回复「确认压缩会话」；仅私聊，剧情/创作会话不支持）、`/结束会话`（`/临时会话`/`/退出会话`/`/退出特殊会话`）、`/保存为会话`、`/clear`（`清除上下文`/`新对话`）、`/帮助`（`/help`/`/命令`）、`/status` |
 | 人格 | `/personality`、`/人格切换`（均支持带名称；无 `#` 变体；特殊会话内只写会话绑定，`--全局` 后缀改写用户默认） |
-| 养成 | `/好感度`（`#好感度`/`/bond`）、`/剧情`、`/设好感 <1-10>`、`/创建角色`、`/删除角色`（回复「确认删除角色 <名称>」）、`/设形象`、`/形象`（`/查看形象`）、`/清除形象`（`/删形象`） |
+| 养成 | `/好感度`（`#好感度`/`/bond`）、`/剧情`、`/设好感 <1-10>`、`/创建角色`、`/删除角色`（回复「确认删除角色 <名称>」）、`/设形象`、`/形象`（`/查看形象`）、`/清除形象`（`/删形象`）、`/邮件`（角色信箱，仅官方单聊：列表/`下一页`/`p<N>`/`MM-DD`/信件编号看全文并标记已读） |
 | 游戏 | `/兑换码`（`/redeem-code`）、`/长期兑换码`、`/角色详情 <名>`、`/羁绊详情 <名>`、`/刷新角色数据`（仅 admin） |
 | 群管理 | `/toggle`、`/toggle <gacha\|image\|voice> <on\|off>`、`/toggle personality [名称\|默认]`（仅群聊 + admin） |
-| 其他 | `/功能`（`/features`）、`/更新日志 [d]`（多个别名）、`/管理工作区`（落入 agent）、`/取消`（`#取消`/`/结束`/`#结束`，连续对话窗口内） |
+| 其他 | `/功能`（`/features`）、`/更新日志 [d]`（多个别名）、`/管理工作区`（落入 agent）、`/取消`（`#取消`/`/结束`/`#结束`，连续对话窗口内）、`/免责声明`（`#免责声明`；查看/`关`/`开` 免责尾追加，三级用户均可，按渠道独立） |
 | 反馈 | `#反馈 <内容>`、`#bug <描述>`、`#建议 <内容>`（**必须用空格分隔**，且三者都零 token 直达开发者） |
 
-> 分发顺序（命中即 return）：反馈 → `/取消` → `/toggle` → `/兑换码` → `/角色详情` → `/羁绊详情` → `/刷新角色数据` → `/功能` → `/更新日志` → `/人格切换` → `/好感度` → `/设好感` → `/剧情` → 会话族 → 形象族 → 元命令（`/clear`、`/status` 等）→ Agent。
+> 分发顺序（命中即 return）：反馈 → `/取消` → `/toggle` → `/兑换码` → `/角色详情` → `/羁绊详情` → `/邮件` → `/免责声明` → `/刷新角色数据` → `/功能` → `/更新日志` → `/人格切换` → `/好感度` → `/设好感` → `/剧情` → 会话族 → 形象族 → 元命令（`/clear`、`/status` 等）→ Agent。
 > 特例：`/帮助` 由会话族处理（渲染 HELP.md 卡片）；`/管理工作区` 与私聊 `/取消` 会落入 Agent。
 
 #### 已注册工具（40 个）
@@ -785,7 +791,7 @@ v2.31 起，原本集中在 `plugins/agent_router.py` 的回合逻辑被整体�
 | 职责 | 说明 |
 |---|---|
 | 回合编排 | `run_agent_turn(view)` / `run_continuous_turn(view)`：平台上下文、权限、工作区、群功能限制、双平面选面、Agent 调用、收尾结算 |
-| 命令直连层 | 反馈 → `/取消` → `/toggle` → `/兑换码` → `/角色详情` → `/羁绊详情` → `/刷新角色数据` → `/功能` → `/更新日志` → `/人格切换` → `/好感度` → `/设好感` → `/剧情` → 会话族 → 形象族；随后元命令 `/clear`、`/status` 等 |
+| 命令直连层 | 反馈 → `/取消` → `/toggle` → `/兑换码` → `/角色详情` → `/羁绊详情` → `/邮件` → `/免责声明` → `/刷新角色数据` → `/功能` → `/更新日志` → `/人格切换` → `/好感度` → `/设好感` → `/剧情` → 会话族 → 形象族；随后元命令 `/clear`、`/status` 等 |
 | 发送语义 | `_safe_send()` / `_send_response()` / `_send_text_chunks()`：文本、图片、语音、进度统一走 `Sender`；300 字符分块 + 1s 间隔 |
 | 上下文 | 用户/角色/工作区/平台/群/Sender/人格/羁绊/剧情/委派深度等 contextvars 在回合开始时统一设置 |
 | 单例装配 | `Agent`、`SessionManager`、`SpecialSessionManager`、`TieredMemory`、`ProfileManager`、`BondManager`、`AssetMemory`、`CharacterRegistry`、`ToolRegistry` 在此构造并互相注入 |
@@ -799,7 +805,7 @@ v2.31 起，原本集中在 `plugins/agent_router.py` 的回合逻辑被整体�
 | `agent/inbound.py` | `InboundMessage`（平台无关视图）+ `Attachment`（kind/path/name/error/quoted）+ `AttachmentResolver` 协议 |
 | `agent/outbound.py` | `Sender` 协议 + `OutImage` / `OutAudio` / `OutProgress` + `SendFailed`（唯一可重试错误） |
 | `adapters/onebot.py` | OneBot 事件 → 视图；附件下载（`get_file`/`get_record` + HTTP 兜底）；引用消息解析；`OneBotSender` |
-| `adapters/qq_official.py` | 官方事件 → 视图（剥离内联表情伪 XML）；公网 URL 附件下载；引用消息（`message_type=103` + `msg_elements`）；`QQOfficialSender`；主动消息 `send_active_c2c` / `send_active_c2c_media` |
+| `adapters/qq_official.py` | 官方事件 → 视图（剥离内联表情伪 XML）；公网 URL 附件下载；引用消息（`message_type=103` + `msg_elements`）；`QQOfficialSender`；主动消息 `send_active_c2c` / `send_active_c2c_media` / `send_active_c2c_markdown`（信封阶梯：kb→md→plain，喂共享熔断器，40034029/304062 剪按钮重试） |
 
 **官方渠道的现实约束**（代码注释与实现）：
 
@@ -823,7 +829,7 @@ v2.31 起，原本集中在 `plugins/agent_router.py` 的回合逻辑被整体�
 **剧情**：`complete_scene(title)` 结算（+100 经验、+10 心情），记录完成状态（`has_done_scene` 真源），供 `/剧情` 门槛判定与纪念卡使用。**剧情场景生命周期**：`/剧情 <标题>` 启动 → 建 `kind=bond_scene` 会话（钉住 `char_id`，不占普通配额）→ 分幕共同演绎 → LLM 调 `complete_scene` 收尾 → `turn.py::_finish_bond_scene` 结算呈现（升级通知 + 羁绊纪念卡 + 事件蒸馏）并写 `metadata.completed=true` **封档**（会话保留、`end_active`、可 `/切换会话` 回看；回看态 `is_scene=false`）。`/剧情 <同标题>` 命中既有会话时**恢复**而非新建；剧情会话总量受 `MAX_SCENE_ARCHIVES`（默认 20）约束。详见 `docs/scene-session-archive-design.md`。
 **重逢 / 纪念日**：≥14 天未见触发重逢标记；相识 30/100/365/730/1095 天里程碑。
 **媒体门槛与配额**：画图 Lv4、语音 Lv5、主动语音 Lv7；每日配额 admin 50 / vip 10 / regular 3；影音资产磁盘配额 1000/300/100MB。
-**持久化**：`data/bonds/{user_id}.json`（按角色分区），进程内缓存 + `st_mtime_ns` 校验；数值可被 `config/bond_settings.json` 覆盖（该文件当前不存在，走默认值）。
+**持久化**：`data/bonds/{user_id}.json`（按角色分区），进程内缓存 + `st_mtime_ns` 校验；数值可被 `config/bond_settings.json` 覆盖（该文件当前不存在，走默认值；`config/bond_settings.example.json` 提供角色信箱 `mail_*` 组示例，复制后按需修改）。
 
 ### 2.13 `agent/character_registry.py` + `agent/personality.py` + `agent/portrait.py` — 人格与 UGC 角色
 
@@ -872,10 +878,14 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 - **工具**：`story_search`（public，但 schema 按人格裁剪），返回带出处的检索结果。
 - **测试**：`test_story_kb.py` 6 个类 / 37 个用例，离线合成语料建临时 SQLite。
 
-### 2.16 `agent/delegation.py` + `agent/greeting.py` — 双平面与主动消息
+### 2.16 `agent/delegation.py` + `agent/greeting.py` + `agent/mailbox.py` — 双平面与主动消息（角色信箱）
 
 - `delegation.py`：`SOCIAL_TOOLS` 白名单、`run_delegated_task`（中立 Roxy、`persist=False`、权限过滤、单层嵌套、默认 240s 超时）、`revoice_task_result`（角色开场白 + 正文透传，群聊用固定模板）、`repatch_last_assistant`（把持久化历史改写成角色口吻）。
-- `greeting.py`：官方 c2c 主动消息簿记（纯函数、可注入 rng/now）。候选索引 `data/bond_greet_targets.json` 只由 **c2c 入站**写入（群 member_openid 不能用于 c2c 主动消息）；配额 `data/official_active_quota.json` 按自然日/月滚动，文本与媒体**分账**（月配额共享、日配额各自独立）。选靶四门：羁绊等级 ≥5、冷却 7 天、概率 0.25、批量 ≤5。
+- `greeting.py`：官方 c2c 主动消息簿记（纯函数、可注入 rng/now）。候选索引 `data/bond_greet_targets.json` 只由 **c2c 入站**写入（群 member_openid 不能用于 c2c 主动消息）；配额 `data/official_active_quota.json` 按自然日/月滚动，文本与媒体**分账**（日配额各自独立；信箱信封走 `monthly_cap=10**9` 免月配额——平台已无主动消息月限额）。旧问候选靶四门（等级 ≥5、冷却 7 天、概率 0.25、批量 ≤5）保留为 `mail_enabled=false` 时的回滚路径。
+- **角色信箱（proactive-mail-design.md v0.5，v1）**：`plugins/qq_official.py::_daily_active_loop` 每日 `mail_hour`（默认 10 点，+0–600s 抖动）先跑 mail pass 再跑 media pass，启动时若在 10–22 点窗口内做减半补发。mail pass 三段式：A 收集候选（串行本地读，`_mail_candidates` 过滤链：非 assistant、`split` 模式、Lv≥5、有消息、在 known_personas、沉默 ≥24h、人格 7 天冷却，按等级降序）→ B 生成（跨用户 `Semaphore(4)`，用户内串行，角色面 flash 写 ≤60 字留言，失败即丢弃**无模板兜底**，pass 预算 20 分钟）→ C 发送（串行，令牌桶 10 qps + 2–6s 随机间隔，`send_active_c2c_markdown` 信封 = markdown 摘要 + 「展开」按钮，共享 md/kb 熔断器逐档降级纯文本）。发送成功才记账：`record_digest`（同日幂等）+ 配额（kind=text）+ bond 事件（信件全文）。与媒体 pass **双向互斥**（同日只发一类）。`C2C_MSG_REJECT`/`RECEIVE` 事件（`on_notice`）翻 `active_enabled`，拒收即停发。
+- `mailbox.py`：信箱存储（纯同步、可单测）。每用户一 JSON（`data/mailboxes/{openid}.json`，原子写、损坏降级空箱）；信件 28 天保留 + 200 封上限裁剪；`letters`（id `L-YYYYMMDD-<4hex>`、preview、read）与 `digests`（id `D-…`，1 digest = 1 次主动调用）；`make_preview`（首行去舞台指示、20 字 + …）、`escape_md_text`（全角转义）为纯函数。`/邮件` 命令（turn.py 直连层）读侧再过滤保留期。
+- `rate_limit.py`：`TokenBucket`/`ChannelLimiter`（c2c 10/s、group 1/s，按渠道懒建复用，可注入 monotonic）。
+- `group_registry.py`：官方群登记表 `data/group_registry.json`（v1 纯记账）：`GROUP_AT_MESSAGE_CREATE` 入站 upsert（60s 粒度节流防文件 churn），status `active/left/unknown` 状态机 + `active_enabled` 开关，为 P1 群主动消息预铺。
 
 ---
 
@@ -2234,6 +2244,16 @@ v2.29 基础上增加:
 - 接线：`agent/outbound.py` Sender 增 `supports_stream`/`open_stream()`；`QQOfficialSender`（仅 c2c + md 能力）实现，OneBot 恒 `None`；`agent/agent.py::run` 增 `content_callback`（getattr 探测流式方法，mock 零改动兼容）；`agent/turn.py` 开流决策（render context 设定后、triage 前）+ `_progress`/`_content_delta` 路由 + 回退树（happy/truncated/broken/未开流）+ 键盘预约时禁开回答流 + `/流式探测` 管理员命令（验证双流同锚点这一平台未证假设）。
 - 纪律：OneBot 与群聊零变化；split 人格（revoice）不流式（render context 为空自动排除）；流式仅传输层，会话持久化不变。
 - 配置：`QQ_OFFICIAL_STREAM=auto/on/off`、`QQ_OFFICIAL_STREAM_INTERVAL=1.0`、`QQ_OFFICIAL_STREAM_CIRCUIT_HOURS=24`（均热读）；心跳 `official_status.json` 增 `stream=` 段；新增 `TestOfficialStream`（17 用例，离线）。
+
+#### 2026-10-30 — 角色信箱 v1（proactive-mail-design.md v0.5）+ 免责尾用户开关
+
+- **角色信箱**：`HEARTBEAT` 低频问候升级为每日「信封」摘要（仅官方 c2c）。`plugins/qq_official.py::_daily_active_loop`（`mail_hour` 默认 10 点 + 0–600s 抖动，启动窗口内减半补发）→ `_run_mail_pass` 三段式（A 收集候选过滤链 / B 跨用户 `Semaphore(4)` 角色面 flash 生成 ≤60 字留言，失败即丢弃无模板 / C 串行发送：令牌桶 10 qps + 2–6s 抖动），成功才记账（`record_digest` 同日幂等 + 配额 kind=text + bond 事件全文）；与媒体 pass 同日**双向互斥**。
+- **信封渲染**：`adapters/qq_official.py::send_active_c2c_markdown`（kb→md→plain 阶梯，喂 md/kb 共享熔断器，40034029/304062 剪按钮重试）；单封短文 B2 全文无按钮，多封 B1 列表 + 「展开」指令按钮（`data=/邮件 <id>`），超 `mail_max_chars` 截断为「另有 N 封」。
+- **存储**：`agent/mailbox.py`（`data/mailboxes/{openid}.json`，原子写、损坏降级、28 天 + 200 封裁剪，letter id `L-YYYYMMDD-<4hex>` 随机后缀防重号）；`agent/rate_limit.py` 令牌桶；`agent/group_registry.py` 官方群登记表（GROUP_AT 入站 60s 节流 upsert，v1 纯记账，P1 群发送预铺）。
+- **事件**：`C2C_MSG_REJECT`/`C2C_MSG_RECEIVE`（`on_notice`）翻 mailbox `active_enabled`，拒收即停发、恢复即续。
+- **命令**：`/邮件`（列表分页/`下一页`/`p<N>`/`MM-DD`/编号看全文并标记已读，仅官方单聊，零 token 不带免责尾）；`/免责声明 [关|开]`（免责尾追加开关，三级用户均可，`data/user_prefs/disclaimer.json` 按渠道独立、mtime 热读，bot 单写者；信件/信封本就不带免责尾）。
+- **配置**：`bond_settings.json` 新增 `mail_*` 组（`mail_enabled` 为总回滚开关——关掉即回旧 `_greeting_loop`）；新增 `TestProactiveMail`（16 用例，离线）。
+- WebUI 邮件管理页、群公告通道（P1）、`check_mail` 工具与信件编辑（v2）不在本版。
 
 #### 设计稿 — QQ 官方渠道消息按钮
 
