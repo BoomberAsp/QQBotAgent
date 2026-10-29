@@ -10630,7 +10630,7 @@ class TestOfficialStream:
     三层离线覆盖：① deepseek_client SSE 解析器（罐装 chunk → 与非流式
     同形结果、工具碎片按 index 累积、content 抑制、reasoning 永不转发、
     usage 末片、HTTP≥400 错误前缀、畸形行跳过）；② MessageStreamer 传输
-    + 熔断（双流时序/同锚点、open_answer 失败回退、remain 耗尽截断、
+    + 熔断（双流时序/同锚点、open_answer 失败回退、remain_msg_len=0 常态回归、
     3 连拒 600s + 半开、is_wakeup 开流重试、50002 退避、ApiNotAvailable
     长熔断、免责末片、纯进度轮、env 门控）；③ Mock 客户端流式回调。
     """
@@ -10648,7 +10648,7 @@ class TestOfficialStream:
         asyncio.run(self.test_sender_stream_capability())
         asyncio.run(self.test_dual_stream_sequencing())
         asyncio.run(self.test_open_answer_failure_marks_broken())
-        asyncio.run(self.test_remain_exhaustion_truncates())
+        asyncio.run(self.test_remain_zero_is_healthy())
         asyncio.run(self.test_disclaimer_rides_final_shard())
         asyncio.run(self.test_progress_only_no_answer_stream())
         asyncio.run(self.test_breaker_three_strike_and_half_open())
@@ -10916,28 +10916,38 @@ class TestOfficialStream:
             await st.close()
         print_pass("open_answer 失败 → broken，内核走缓冲全文回退")
 
-    async def test_remain_exhaustion_truncates(self):
-        """remain_msg_len 耗尽 → 截断到预算、truncated=True（余量走缓冲补发）。"""
+    async def test_remain_zero_is_healthy(self):
+        """remain_msg_len=0 是健康常态，不得触发截断/丢弃。
+
+        真机回归（2026-10-30）：平台每片被接受后都返回 remain_msg_len=0
+        （挂起长度语义，非发送预算）；旧版把它当预算耗尽，导致回答流只
+        发出开流片「今天」、后续增量全部被客户端丢弃。
+        """
         qs, qo = self._qs(), self._qo()
 
         def resp(payload):
-            return {"id": f"smid_{payload['msg_seq']}", "remain_msg_len": 8}
+            return {"id": f"smid_{payload['msg_seq']}", "remain_msg_len": 0}
 
         with self._stream_guard(qs, qo):
             bot = _StreamFakeBot(resp)
             st = self._mk_streamer(qs, bot)
             await st.open_progress("⏳")
             await st.finish_progress()
-            await st.open_answer("ABCD")          # opening ships 4
-            st.append_answer("EFGHIJKLMNOP")      # 12 buffered
-            await st.finish_answer("")            # cut to remain=8
+            await st.open_answer("今天")
+            st.append_answer("（10月30日）新闻如下…")
+            await st.finish_answer("免责句")
             await st.close()
-            assert st.truncated is True
-            assert st.answer_sent == "ABCDEFGHIJKLMNOP"[:12], st.answer_sent
-            # the final answer shard was cut to the 8-char budget
+            assert st.truncated is False
+            assert st.broken is False
+            assert st.remain_msg_len == 0
+            assert st.answer_sent == "今天（10月30日）新闻如下…\n\n免责句", \
+                st.answer_sent
             ans = [p for p in bot.posts if p["msg_seq"] == 1800]
-            assert len(ans[-1]["content_raw"]) <= 8, ans[-1]
-        print_pass("remain 耗尽 → 截断到预算 + truncated（余量缓冲补发）")
+            # the buffered tail + disclaimer ride the final shard (state10)
+            assert "新闻如下" in ans[-1]["content_raw"], ans[-1]
+            assert "免责句" in ans[-1]["content_raw"], ans[-1]
+            assert ans[-1]["input_state"] == 10
+        print_pass("remain_msg_len=0 → 正常流完整送达（真机回归：不再误截断）")
 
     async def test_disclaimer_rides_final_shard(self):
         """免责声明随末片(state10)发出；正文在开流片。"""

@@ -1075,6 +1075,112 @@ async def send_active_c2c_media(bot: QQBot, openid: str,
     return False
 
 
+async def send_active_c2c_markdown(bot: QQBot, openid: str, md_text: str,
+                                   rows=None,
+                                   plain_text: str | None = None) -> bool:
+    """Send one ACTIVE c2c markdown envelope (mail digest, design §6.4).
+
+    Degradation ladder, sharing the route's md/keyboard breakers (v0.5 —
+    never a private copy):
+      1. markdown + keyboard (only when ``_kb_available()`` and rows given);
+         kb over-limit codes clip-and-retry once, other kb rejects strip to
+      2. markdown-only (only when ``_md_available()``);
+         md rejects record on BOTH breakers (md dead ⇒ kb dead) and fall to
+      3. plain text (``plain_text`` when given, else the raw md source).
+    When both breakers are open / ``QQ_OFFICIAL_MARKDOWN=off`` the send
+    starts directly at tier 3 — no per-user wall-banging during cooldown.
+
+    Error policy mirrors send_active_c2c: ActionFailed → ladder step or
+    False, no network retry of a rejection; NetworkError/RateLimitException
+    → one retry per tier. Returns True only on confirmed send.
+    """
+    openid = str(openid or "").strip()
+    if not openid or not (md_text and md_text.strip()):
+        return False
+    plain = plain_text if (plain_text and plain_text.strip()) else md_text
+
+    kb_on = bool(rows) and _kb_available()
+    md_on = _md_available()
+    if not kb_on and not md_on:
+        return await send_active_c2c(bot, openid, plain)
+
+    wire_rows = rows
+    clipped = False
+    tier = "kb" if kb_on else ("md" if md_on else "plain")
+    for _ in range(6):  # bounded: net(1)+clip(1)+kb(1)+md(1) per tier
+        try:
+            if tier == "kb":
+                wire = to_message_keyboard(wire_rows, scope="c2c",
+                                           openid=openid)
+                message = Message([MessageSegment.markdown(md_text or " "),
+                                   MessageSegment.keyboard(wire)])
+            elif tier == "md":
+                message = MessageSegment.markdown(md_text or " ")
+            else:
+                message = MessageSegment.text(plain)
+            for attempt in range(2):
+                try:
+                    await bot.send_to_c2c(openid=openid, message=message)
+                    _md_record_success()
+                    if tier == "kb":
+                        _kb_record_success()
+                    return True
+                except (NetworkError, RateLimitException):
+                    if attempt == 0:
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise
+        except (NetworkError, RateLimitException) as e:
+            logger.warning(
+                f"[qq_official] active c2c envelope ({tier}) to "
+                f"{openid[:8]}… failed after retry: {e!r}")
+            return False
+        except ActionFailed as e:
+            code = getattr(e, "code", None)
+            if tier == "kb":
+                if code in _KB_CLIP_CODES and not clipped:
+                    clipped = True
+                    wire_rows = clip_rows(wire_rows)
+                    logger.warning(
+                        f"[qq_official] envelope keyboard over-limit "
+                        f"(code={code}); clipped, retrying")
+                    continue
+                if code in _KB_REJECT_CODES:
+                    _kb_record_reject(code)
+                    logger.warning(
+                        f"[qq_official] envelope keyboard rejected "
+                        f"(code={code}); retrying markdown-only")
+                    tier = "md" if md_on else "plain"
+                    continue
+                if code in _MD_REJECT_CODES:
+                    _md_record_reject()
+                    _kb_record_reject(code)  # md dead ⇒ kb dead: converge
+                    logger.warning(
+                        f"[qq_official] envelope markdown rejected "
+                        f"({e!r}); retrying plain text")
+                    tier = "plain"
+                    continue
+            elif tier == "md":
+                if code in _MD_REJECT_CODES:
+                    _md_record_reject()
+                    logger.warning(
+                        f"[qq_official] envelope markdown rejected "
+                        f"({e!r}); retrying plain text")
+                    tier = "plain"
+                    continue
+            # unrecoverable rejection (quota/audit/bad payload) — no retry
+            logger.warning(
+                f"[qq_official] active c2c envelope to {openid[:8]}… "
+                f"rejected: {e!r}")
+            return False
+        except Exception as e:
+            logger.warning(
+                f"[qq_official] active c2c envelope to {openid[:8]}… "
+                f"failed: {type(e).__name__}: {e}")
+            return False
+    return False
+
+
 # Event types this route handles — the entry plugin's isinstance guard
 # and the intent config (c2c_group_at_messages) must agree on this set.
 HANDLED_EVENTS = (C2CMessageCreateEvent, GroupAtMessageCreateEvent)

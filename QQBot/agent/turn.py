@@ -41,6 +41,7 @@ import re
 import sys
 import time
 import uuid
+from datetime import datetime
 
 import httpx
 
@@ -2503,6 +2504,15 @@ async def handle_agent_turn(view: InboundMessage):
         cmd_handled = await _handle_bond_detail_command(text_content, user_id)
         if cmd_handled:
             return
+        # /邮件 command (角色信箱, direct, no agent, zero token; 按钮点击
+        # 等价用户发出 /邮件 <id>，必须在会话记录之前拦截，§8)
+        cmd_handled = await _handle_mail_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        # /免责声明 command (免责尾开关, 三级用户均可, direct, zero token)
+        cmd_handled = await _handle_disclaimer_command(text_content, user_id)
+        if cmd_handled:
+            return
         # /刷新角色数据 command (admin-only forced wiki cache refresh)
         cmd_handled = await _handle_refresh_data_command(text_content, user_id)
         if cmd_handled:
@@ -3014,8 +3024,12 @@ async def handle_agent_turn(view: InboundMessage):
         if streamer is not None:
             _pm_disc = get_character_registry()
             _persona_disc = _current_personality.get() or _pm_disc.get_default()
+            # 用户开关（§6.5）：关闭者 _disc 置空串，finish_answer("") 收尾，
+            # 不发独立尾巴（与 _send_response 的 inline/separate 双分支对齐）。
             _disc = (f"{_pm_disc.get_short_name(_persona_disc)} "
                      "的回答并非总是准确无误，请理性判断。")
+            if _disclaimer_off(user_id):
+                _disc = ""
             _streamed = streamer.answer_sent
             _prefix_ok = (isinstance(response, str)
                           and response.startswith(_streamed))
@@ -3024,7 +3038,8 @@ async def handle_agent_turn(view: InboundMessage):
                 if streamer.truncated:
                     await streamer.finish_answer("")
                     remainder = response[len(_streamed):].strip()
-                    await _send_response(remainder or _disc)
+                    if remainder or _disc:
+                        await _send_response(remainder or _disc)
                     sent_via_stream = True
                 else:
                     await streamer.finish_answer(_disc)
@@ -3809,6 +3824,184 @@ async def _handle_bond_detail_command(text: str, user_id: str) -> bool:
         await _safe_send(OutImage(path=card_path, label="bond card"))
     else:
         await _safe_send(text_result)
+    return True
+
+
+# ── /邮件 — 角色信箱（proactive-mail-design.md v0.5 §8）────────────────
+# 命令直连层，零 token；被动回复不占主动配额；输出纯文本 + 分隔线，
+# **不带免责尾**（§6.5）。仅官方 c2c 有意义（信箱只发 c2c）。
+
+_MAIL_PAGE_SIZE = 5
+_NAV_MAILBOX: Rows = [[
+    Btn(label="返回信箱", data="/邮件", action="cmd"),
+]]
+
+
+def _mail_retention_seconds() -> float:
+    try:
+        days = int(_bond_manager.get_config("mail_retention_days", 28))
+    except (TypeError, ValueError):
+        days = 28
+    return max(1, days) * 86400.0
+
+
+def _mail_recent_letters(user_id: str) -> list:
+    """保留期内的信件，倒序（新在前）——读侧也过滤，防未写盘的过期信。"""
+    cutoff = time.time() - _mail_retention_seconds()
+    return [
+        l for l in _mailbox_manager.list_letters(user_id)
+        if float(l.get("created_at", 0) or 0) >= cutoff
+    ]
+
+
+def _mail_fmt_md(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%m-%d")
+
+
+def _mail_fmt_full(ts: float) -> str:
+    dt = datetime.fromtimestamp(ts)
+    return f"{dt.month}月{dt.day}日"
+
+
+async def _mail_send_list(user_id: str, letters: list, page: int) -> None:
+    """B3 列表：每页 5 封，未读标 ●，编号可见（供 /邮件 <编号> 展开）。"""
+    if not letters:
+        await _safe_send(
+            "【角色信箱】\n\n最近 28 天没有角色来信。\n"
+            "和角色多聊聊、提升羁绊（/好感度），TA 们会主动给你写信的~")
+        return
+    total_pages = max(1, (len(letters) + _MAIL_PAGE_SIZE - 1) // _MAIL_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    chunk = letters[(page - 1) * _MAIL_PAGE_SIZE: page * _MAIL_PAGE_SIZE]
+    unread = sum(1 for l in letters if not l.get("read"))
+    lines = [f"【角色信箱】最近 28 天（未读 {unread} 封）", ""]
+    for letter in chunk:
+        ts = float(letter.get("created_at", 0) or 0)
+        mark = "●" if not letter.get("read") else "　"
+        name = letter.get("name") or letter.get("persona") or "?"
+        preview = letter.get("preview") or ""
+        lines.append(f"{mark} {_mail_fmt_md(ts)}  {name}：{preview}")
+        lines.append(f"   编号 {letter.get('id', '')}")
+    lines.append("")
+    nav = f"第 {page}/{total_pages} 页 · " if total_pages > 1 else ""
+    lines.append(f"{nav}发送 /邮件 <编号> 查看全文，/邮件 下一页 翻页。")
+    await _safe_send("\n".join(lines))
+
+
+async def _mail_send_detail(user_id: str, letter: dict) -> None:
+    """B4 详情：全文 + 标记已读 + 返回信箱按钮；纯文本，不带免责尾。"""
+    ts = float(letter.get("created_at", 0) or 0)
+    name = letter.get("name") or letter.get("persona") or "?"
+    body = (f"【{name} · {_mail_fmt_full(ts)}】\n"
+            f"{letter.get('text', '')}\n\n"
+            f"—— 发送 /邮件 返回信箱")
+    _mailbox_manager.mark_read(user_id, letter.get("id", ""))
+    await _send_receipt_kb(body, _NAV_MAILBOX, label="mail-detail")
+
+
+async def _handle_mail_command(text: str, user_id: str,
+                               view: InboundMessage) -> bool:
+    """Handle /邮件 [编号|MM-DD|下一页|pN] — direct, no agent (zero token)."""
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/邮件", "#邮件"):
+        return False
+    # 信箱只发官方 c2c（§4.6）：NapCat/群聊调用一律返回说明
+    if getattr(view, "platform", "") != "qq_official" or view.is_group:
+        await _safe_send("角色信箱仅官方单聊可用~\n"
+                         "在官方 bot 的私聊里发送 /邮件 即可查看角色来信。")
+        return True
+
+    rest = text.strip()[len(cmd):].strip()
+    letters = _mail_recent_letters(user_id)
+
+    if not rest:
+        await _mail_send_list(user_id, letters, 1)
+        return True
+
+    low = rest.lower()
+    if low in ("下一页", "下页", "next"):
+        # 无状态翻页：这里只回第 2 页起点提示——真正的页码由 pN 携带
+        m_page = 2
+        await _mail_send_list(user_id, letters, m_page)
+        return True
+    m = re.fullmatch(r"p(\d{1,3})", low)
+    if m:
+        await _mail_send_list(user_id, letters, int(m.group(1)))
+        return True
+    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})", rest)
+    if m:
+        mmdd = f"{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+        day_letters = [
+            l for l in letters
+            if datetime.fromtimestamp(
+                float(l.get("created_at", 0) or 0)).strftime("%m-%d") == mmdd
+        ]
+        if not day_letters:
+            await _safe_send(f"{mmdd} 没有角色来信。发送 /邮件 查看信箱。")
+            return True
+        lines = [f"【角色信箱 · {mmdd}】", ""]
+        for letter in day_letters:
+            mark = "●" if not letter.get("read") else "　"
+            name = letter.get("name") or letter.get("persona") or "?"
+            lines.append(f"{mark} {name}：{letter.get('preview', '')}")
+            lines.append(f"   编号 {letter.get('id', '')}")
+        lines += ["", "发送 /邮件 <编号> 查看全文。"]
+        await _safe_send("\n".join(lines))
+        return True
+
+    # 按编号展开详情（按钮点击等价用户发出 /邮件 <id>）
+    letter_id = rest.split()[0].upper()
+    letter = _mailbox_manager.get_letter(user_id, letter_id)
+    if letter is None and letter_id != rest.split()[0]:
+        letter = _mailbox_manager.get_letter(user_id, rest.split()[0])
+    if letter is not None:
+        await _mail_send_detail(user_id, letter)
+        return True
+
+    await _safe_send(
+        "没有找到这封信（可能已过 28 天保留期）。\n"
+        "用法：/邮件 查看列表 · /邮件 <编号> 查看全文 · "
+        "/邮件 <MM-DD> 按日期 · /邮件 下一页 翻页")
+    return True
+
+
+async def _handle_disclaimer_command(text: str, user_id: str) -> bool:
+    """Handle /免责声明 [开|关] — 三级用户均可（§6.5，命令直连层，不进
+    工具表/permissions）。无参数 = 查询状态；回复本身不带免责尾。"""
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/免责声明", "#免责声明"):
+        return False
+    rest = text.strip()[len(cmd):].strip().lower()
+
+    if rest in ("关", "off", "关闭"):
+        if _set_disclaimer_off(user_id, True):
+            await _safe_send(
+                "已关闭：对话回复末尾不再追加免责声明。\n"
+                "发送 /免责声明 开 可随时恢复。")
+        else:
+            await _safe_send("设置保存失败，请稍后再试。")
+        return True
+    if rest in ("开", "on", "开启"):
+        if _set_disclaimer_off(user_id, False):
+            await _safe_send("已恢复：对话回复末尾将追加免责声明。")
+        else:
+            await _safe_send("设置保存失败，请稍后再试。")
+        return True
+    if rest:
+        await _safe_send(
+            "用法：/免责声明 关 停止追加免责尾；/免责声明 开 恢复追加；"
+            "/免责声明 查询当前状态。")
+        return True
+
+    # B7 状态查询
+    if _disclaimer_off(user_id):
+        current = ("当前设置：已关闭——对话回复末尾不追加免责声明。\n"
+                   "发送 /免责声明 开 可恢复追加。")
+    else:
+        current = ("当前设置：对话回复末尾追加免责声明（默认开启）。\n"
+                   "发送 /免责声明 关 可停止追加；/免责声明 开 恢复。")
+    await _safe_send(
+        current + "\n作用域仅限对话回复——角色来信与系统邮件本就不带免责尾。")
     return True
 
 
@@ -6205,6 +6398,75 @@ _RENDER_MD_DECLARATION = (
 # 紧跟正文之后（先于图片），配额紧张时免责优先于媒体。
 _MD_INLINE_DISCLAIMER_LIMIT = 200
 
+# ── 免责尾用户开关（proactive-mail-design.md v0.5 §6.5）──────────────
+# 对话回复默认追加免责尾；三级用户均可 `/免责声明 开|关` 切换（命令直连
+# 层，不进工具表/permissions）。存储 data/user_prefs/disclaimer.json，
+# key = 按渠道用户标识（OneBot QQ 号 / 官方 openid，两渠道独立）；bot 单
+# 写者，mtime 热读（profile/session 同款模式）。信封/信件详情//邮件/系统
+# 邮件本就不带免责尾，不受开关影响。免责尾是发送后处理，不进 system
+# prompt / 会话历史 → 前缀缓存零影响。
+_USER_PREFS_DIR = os.path.join(_DATA_DIR, "user_prefs")
+_DISCLAIMER_PREFS_FILE = os.path.join(_USER_PREFS_DIR, "disclaimer.json")
+_disclaimer_prefs_cache = None   # dict | None
+_disclaimer_prefs_mtime = None   # int | None
+
+
+def _load_disclaimer_prefs() -> dict:
+    """Hot read with mtime validation; corrupt/missing → {} (= default on)."""
+    global _disclaimer_prefs_cache, _disclaimer_prefs_mtime
+    try:
+        disk_mtime = os.stat(_DISCLAIMER_PREFS_FILE).st_mtime_ns
+    except OSError:
+        disk_mtime = None
+    if _disclaimer_prefs_cache is not None \
+            and disk_mtime == _disclaimer_prefs_mtime:
+        return _disclaimer_prefs_cache
+    data: dict = {}
+    if disk_mtime is not None:
+        try:
+            with open(_DISCLAIMER_PREFS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (json.JSONDecodeError, IOError, OSError):
+            data = {}
+    _disclaimer_prefs_cache = data
+    _disclaimer_prefs_mtime = disk_mtime
+    return data
+
+
+def _disclaimer_off(user_id: str) -> bool:
+    """该用户是否关闭了对话免责尾（默认 False = 维持追加现状）。"""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False
+    rec = _load_disclaimer_prefs().get(uid)
+    return bool(isinstance(rec, dict) and rec.get("off"))
+
+
+def _set_disclaimer_off(user_id: str, off: bool) -> bool:
+    """写入开关；成功 True。off=False 时删除条目（回到默认态）。"""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False
+    global _disclaimer_prefs_cache, _disclaimer_prefs_mtime
+    data = dict(_load_disclaimer_prefs())
+    if off:
+        data[uid] = {"off": True, "ts": int(time.time())}
+    else:
+        data.pop(uid, None)
+    try:
+        os.makedirs(_USER_PREFS_DIR, exist_ok=True)
+        tmp = _DISCLAIMER_PREFS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, _DISCLAIMER_PREFS_FILE)
+    except (IOError, OSError):
+        return False
+    _disclaimer_prefs_cache = None   # 强制下次热读重取 mtime
+    _disclaimer_prefs_mtime = None
+    return True
+
 _MD_FENCE_RE = re.compile(r"^\s*(```|~~~)", re.MULTILINE)
 _MD_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|", re.MULTILINE)
 
@@ -6285,11 +6547,15 @@ async def _send_response(response: str, sender=None):
     kb_rows = _turn_keyboard.get()
     _turn_keyboard.set(None)
 
-    # Append disclaimer to every agent response
+    # Append disclaimer to every agent response — unless this user turned
+    # it off via /免责声明 (§6.5): inline AND separate-message variants
+    # both skip; empty disclaimer keeps every send path shape-identical.
     _pm = get_character_registry()
     _persona = _current_personality.get() or _pm.get_default()
     _short = _pm.get_short_name(_persona)
     disclaimer = f"\n\n{_short} 的回答并非总是准确无误，请理性判断。"
+    if _disclaimer_off(_current_user_id.get()):
+        disclaimer = ""
 
     on_official = _current_platform.get() == "qq_official"
     if on_official:
@@ -6306,14 +6572,16 @@ async def _send_response(response: str, sender=None):
                     else:
                         await _safe_send_kb(response, kb_rows, sender=sender,
                                             label="agent-reply")
-                        await _safe_send(disclaimer.strip(), sender=sender)
+                        if disclaimer.strip():
+                            await _safe_send(disclaimer.strip(), sender=sender)
                     return
                 if len(response) <= _MD_INLINE_DISCLAIMER_LIMIT:
                     await _safe_send(OutMarkdown(response + disclaimer),
                                      sender=sender)
                 else:
                     await _safe_send(OutMarkdown(response), sender=sender)
-                    await _safe_send(disclaimer.strip(), sender=sender)
+                    if disclaimer.strip():
+                        await _safe_send(disclaimer.strip(), sender=sender)
                 return
             # whitelist violation → sanitize, fall through to plain path
         # plain send on the official channel: never show raw md markers

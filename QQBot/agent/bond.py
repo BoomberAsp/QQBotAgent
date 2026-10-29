@@ -97,6 +97,27 @@ _DEFAULTS: Dict[str, Any] = {
     "upload_exp": 3,               # 用户上传图/语音被文本化入库的小额好感
     "upload_exp_daily_cap": 3,     # 每日授予次数封顶（防刷图刷好感）
     "episode_distill_enabled": True,  # 里程碑事件蒸馏进 TieredMemory 开关
+    # ── 主动消息「角色信箱」（proactive-mail-design.md v0.5 §11）──
+    "mail_enabled": True,          # 信箱总开关；false 回滚旧 greeting 路径
+    "mail_hour": 10,               # 每日发送目标时刻（服务器本地时间）
+    "mail_daily_cap": 1,           # 每人每天最多 1 个信封（产品级防打扰）
+    "mail_min_gap_hours": 20,      # 防「10:00 正常 + 启动补发」同日双发
+    "mail_inactive_hours": 24,     # 角色级沉默门槛：刚聊过不发
+    "mail_persona_cooldown_days": 7,  # 同一角色两封信的最小间隔
+    "mail_min_level": 5,           # 只给高好感角色发
+    "mail_max_letters": 5,         # 信封内最多几封信
+    "mail_max_previews": 5,        # 带按钮的预览数；超出只列文字
+    "mail_max_chars": 800,         # 信封 markdown 总长上限
+    "mail_retention_days": 28,     # letters/digests 保留天数
+    "mail_gen_concurrency": 4,     # 用户间信件生成信号量并发
+    "mail_pass_budget_minutes": 20,  # pass 级时间预算；超时顺延次日
+    "mail_review_enabled": False,  # 本地审核默认关（§5.3）
+    "mail_full_when_single": True, # 单封且 ≤80 字直接显示全文（B2 格式）
+    "mail_group_enabled": False,   # 群公告通道（P1）独立开关，v1 不实现群发
+    "mail_group_announcement": "", # 群公告文案；为空不发
+    "mail_rate_c2c_per_sec": 10,   # c2c Bot 维度令牌桶速率
+    "mail_rate_group_per_min": 60, # 群 Bot 维度速率（保守 1/s）
+    "mail_rate_group_per_relation_qpm": 20,  # 单群速率
 }
 
 # 角色面动态层固定提示：历史中的任务结果来自任务智能体（中立口吻），
@@ -315,6 +336,15 @@ class BondManager:
             self._seed_initial_bond(state, user_id, char_id)
             data[char_id] = state
         return state
+
+    def list_personas(self, user_id: str) -> List[str]:
+        """Return char_id keys present in the user's bond file (read-only).
+
+        角色信箱候选人格发现的第一数据源（proactive-mail-design.md §4.2）：
+        bond 文件本身就是 {char_id: state}。不创建、不落盘。
+        """
+        data = self._get_user_data(user_id)
+        return [k for k, v in data.items() if isinstance(v, dict)]
 
     def _seed_initial_bond(self, state: dict, user_id: str, char_id: str):
         """Apply the UGC card's initial_bond_level to a brand-new state.
