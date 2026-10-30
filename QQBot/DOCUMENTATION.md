@@ -885,7 +885,7 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 
 - `delegation.py`：`SOCIAL_TOOLS` 白名单、`run_delegated_task`（中立 Roxy、`persist=False`、权限过滤、单层嵌套、默认 240s 超时）、`revoice_task_result`（角色开场白 + 正文透传，群聊用固定模板）、`repatch_last_assistant`（把持久化历史改写成角色口吻）。
 - `greeting.py`：官方 c2c 主动消息簿记（纯函数、可注入 rng/now）。候选索引 `data/bond_greet_targets.json` 只由 **c2c 入站**写入（群 member_openid 不能用于 c2c 主动消息）；配额 `data/official_active_quota.json` 按自然日/月滚动，文本与媒体**分账**（日配额各自独立；信箱信封走 `monthly_cap=10**9` 免月配额——平台已无主动消息月限额）。旧问候选靶四门（等级 ≥5、冷却 7 天、概率 0.25、批量 ≤5）保留为 `mail_enabled=false` 时的回滚路径。
-- **角色信箱（proactive-mail-design.md v0.5，v1）**：`plugins/qq_official.py::_daily_active_loop` 每日 `mail_hour`（默认 10 点，+0–600s 抖动）先跑 mail pass 再跑 media pass，启动时若在 10–22 点窗口内做减半补发。mail pass 三段式：A 收集候选（串行本地读，`_mail_candidates` 过滤链：非 assistant、`split` 模式、Lv≥5、有消息、在 known_personas、沉默 ≥24h、人格 7 天冷却，按等级降序）→ B 生成（跨用户 `Semaphore(4)`，用户内串行，角色面 flash 写 ≤60 字留言，失败即丢弃**无模板兜底**，pass 预算 20 分钟）→ C 发送（串行，令牌桶 10 qps + 2–6s 随机间隔，`send_active_c2c_markdown` 信封 = markdown 摘要 + 「展开」按钮，共享 md/kb 熔断器逐档降级纯文本）。发送成功才记账：`record_digest`（同日幂等）+ 配额（kind=text）+ bond 事件（信件全文）。与媒体 pass **双向互斥**（同日只发一类）。`C2C_MSG_REJECT`/`RECEIVE` 事件（`on_notice`）翻 `active_enabled`，拒收即停发。
+- **角色信箱（proactive-mail-design.md v0.5，v1）**：`plugins/qq_official.py::_daily_active_loop` 每日 `mail_hour`（默认 10 点，+0–600s 抖动）先跑 mail pass 再跑 media pass，启动时若在 10–22 点窗口内做减半补发。mail pass 三段式：A 收集候选（串行本地读，先按**并集**播种 `known_personas`——会话索引 `metadata.persona_key`（`_known_personas_from_sessions`）∪ 羁绊文件中 msgs>0 的角色（`_known_personas_from_bonds`，§4.2 权威源；兜住「靠默认人格攒羁绊、特殊会话没绑 persona_key」的用户，否则他们永远过不了 known 门、信箱永不建档）——再跑 `_mail_candidates` 过滤链：非 assistant、`split` 模式、Lv≥5、有消息、在 known_personas、沉默 ≥24h、人格 7 天冷却，按等级降序）→ B 生成（跨用户 `Semaphore(4)`，用户内串行，角色面 flash 写 ≤60 字留言，失败即丢弃**无模板兜底**，pass 预算 20 分钟）→ C 发送（串行，令牌桶 10 qps + 2–6s 随机间隔，`send_active_c2c_markdown` 信封 = markdown 摘要 + 「展开」按钮，共享 md/kb 熔断器逐档降级纯文本）。发送成功才记账：`record_digest`（同日幂等）+ 配额（kind=text）+ bond 事件（信件全文）。与媒体 pass **双向互斥**（同日只发一类）。`C2C_MSG_REJECT`/`RECEIVE` 事件（`on_notice`）翻 `active_enabled`，拒收即停发。
 - `mailbox.py`：信箱存储（纯同步、可单测）。每用户一 JSON（`data/mailboxes/{openid}.json`，原子写、损坏降级空箱）；信件 28 天保留 + 200 封上限裁剪；`letters`（id `L-YYYYMMDD-<4hex>`、preview、read）与 `digests`（id `D-…`，1 digest = 1 次主动调用）；`make_preview`（首行去舞台指示、20 字 + …）、`escape_md_text`（全角转义）为纯函数。`/邮件` 命令（turn.py 直连层）读侧再过滤保留期。面板邮件管理追加三个写入口：`delete_letter`（**撤回**：从 letters[] 移除但信封 letter_ids 保留该 id → `is_withdrawn()` 成立，`/邮件 <id>` 显示「这封信已被撤回。」）、`write_system_letter`（系统信：persona=`__system__`、`system=true`，不写 personas/known_personas、不动信封记账）、`set_active_enabled`。
 - **邮件管理队列（§16.2，面板→bot 文件 IPC）**：`plugins/qq_official.py::_mail_admin_worker` 每 3–5s 扫 `data/mail_admin/queue/`，`os.replace` 改名到 `processing/` 原子认领，执行后回写 `status/`（操作 id `mailop_YYYYMMDD_<4hex>` 幂等；状态保留 7 天由 bot 清理）；操作类型白名单 `delete_letter` / `send_system`。系统邮件经 `send_active_c2c_markdown` 真实主动发送（markdown 信封样式 `## 系统邮件 · {title}`，共享熔断降级纯文本），**成功才** `write_system_letter` 入账；用户已拒收（`active_enabled=false`）→ 发送失败不入账。启动时 `_mail_admin_recover` 把上次进程中断的残留认领标记 `failed: bot restarted`。worker 不受 `mail_enabled` 开关影响（撤回/系统邮件独立于每日信封）。
 - `rate_limit.py`：`TokenBucket`/`ChannelLimiter`（c2c 10/s、group 1/s，按渠道懒建复用，可注入 monotonic）。
@@ -1687,6 +1687,7 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | `status/` | bot worker | 面板 | 结果回写（`state` ∈ `done`/`failed` + `error`；保留 7 天由 bot 清理） |
 
 - **用户列表并集**（W4 脱敏）：`mail_users()`/`mail_overview()` 取 **信箱建档用户 ∪ `bond_greet_targets.json`（c2c 联系人登记表）**——只扫描信箱目录会漏掉「聊过天但还没收到过信」的用户（信箱文件惰性建档），而他们正是系统邮件的合法发送目标（`_mail_openid_known` 承认登记表 openid）。仅登记未建档者以空信箱行出现（`has_mailbox=false`、`active_enabled` 视为开启——拒收状态只存信箱文件里），排序键 `max(last_digest_at, last_seen)` 保证活跃联系人不沉底；列表展示 openid 一律脱敏（`abcd…wxyz`），完整值仅详情页。
+- **人格数直接读羁绊**：信箱 `known_personas` 是惰性缓存（每日 mail pass 才播种），靠默认人格攒羁绊的用户在建档前会一直显示 0 个人格——面板 `_bond_personas()` 直接读 `BONDS_DIR/{openid}.json`（§4.2 权威源，msgs>0、排除 assistant）：列表 `personas` 计数与搜索取 **信箱 ∪ 羁绊** 并集，详情 `known_personas` 合并羁绊兜底（时间戳记 0 → 前端显示「—」，信箱里的真实记录不被覆盖）。bot 侧同源修复：mail pass 播种改为 `_known_personas_from_sessions` ∪ `_known_personas_from_bonds`（§2.16）。
 - **面板端点**：`GET /api/mail/overview`、`GET /api/mail/users`、`GET /api/mail/user`、`POST /api/mail/letters/delete`、`POST /api/mail/send`、`GET /api/mail/queue`（`data_reader.mail_*`）。入队**幂等去重**（delete 按 type+openid+letter_id；send 按 type+openid+title，同标题待处理时拒绝重复入队）。
 - **bot worker**：见 §2.16「邮件管理队列」——`plugins/qq_official.py::_mail_admin_worker` 认领执行、系统邮件经 `send_active_c2c_markdown` 真实发送后 `write_system_letter` 入账、撤回经 `delete_letter`（保留信封 id → `/邮件 <id>` 显示「已被撤回」）。
 
@@ -2322,6 +2323,14 @@ v2.29 基础上增加:
 - **配置**：`QQ_OFFICIAL_STREAM_CIRCUIT_HOURS` 默认 24→1（热读）；`QQ_OFFICIAL_STREAM=off` 仍是总闸。
 - 已知残余：若某片在服务端已生效而客户端判定失败（平台无读回接口），最多重复该片一次；replace 语义下
   下一片或收尾片会整体覆盖，最终正文不会重复。
+
+#### 2026-10-31 — 信箱 known_personas 漏档修复（默认人格攒羁绊进不了邮件候选）
+
+- **现象**：生产用户（`92E1…8950`）邮件页人格显示 0、信箱文件从未建档、每日信封永远收不到——尽管她有 Lv6 / 382 条消息的 UGC 角色「夏以昼」（split 模式、本人创建）。
+- **根因（系统性）**：`known_personas` 的唯一播种源是会话索引 `metadata.persona_key`，而该字段只由特殊会话内 `/人格切换`（或剧情会话）写入；靠**个人默认人格**（resolve 链的个人层）攒羁绊的用户，会话 metadata 没有绑定 → known 恒空 → `_mail_candidates` 的 `persona not in known` 门永远拦下 → 信箱永不建档。
+- **bot 修复**：`plugins/qq_official.py` 新增 `_known_personas_from_bonds()`（羁绊文件 msgs>0 的角色，排除 assistant；§4.2 数据源 1 权威），mail pass Phase A 播种改为 **sessions ∪ bonds** 并集（每用户锁内 `ensure_known_personas`）。部署后下一次每日 mail pass 即为存量用户补建档。
+- **面板修复**：`webui/data_reader.py` 新增 `_bond_personas()` 直接读 `BONDS_DIR`——列表 `personas` 计数与搜索取信箱 ∪ 羁绊并集（未建档用户立即显示正确人格数、可按角色名搜到），详情 `known_personas` 合并羁绊兜底（时间戳 0 → 前端显示「—」，信箱真实记录不被覆盖）。
+- **测试**：新增 `test_known_personas_from_bonds`（并集播种 → known 门放行 → 进候选），`test_webui_mail_api` 扩展羁绊 fixture（msgs>0 计入 / msgs=0 与 assistant 排除 / 角色名可搜 / 详情合并）；59 套件全绿。
 
 #### 设计稿 — QQ 官方渠道消息按钮
 

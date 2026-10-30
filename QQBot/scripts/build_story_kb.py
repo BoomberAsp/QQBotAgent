@@ -1528,6 +1528,14 @@ def build_index(units: Sequence[Unit], zh: dict, db_path: str,
                         title_zh if ci == 0 else "", gist, kw, chars_zh, unit_zh,
                         aliases=alias_zh,
                     )
+                    if not zh_blob and text_en:
+                        # gamedata 数据源：正文本身就是中文，不需要 LLM 摘要。
+                        # 直接按 cjk_bigrams 建索引；把 unit 标题也带上，否则
+                        # "按角色名找羁绊剧情" 会检索不到（标题里有角色名）。
+                        zh_blob = _zh_blob(
+                            scene.title or "", text_en, (), (), unit_zh or unit.page_title,
+                            aliases=alias_zh,
+                        )
                     if zh_blob:
                         conn.execute(
                             "INSERT INTO chunk_zh_fts (rowid, zh) VALUES (?,?)",
@@ -1667,6 +1675,286 @@ def migrate() -> dict:
 
 
 
+# ── gamedata 数据源（P3）：把解包出来的剧情/羁绊写进同一个 story.db ──
+# 设计：换数据源、不换检索语义。Unit/Scene/Line 结构完全复用，build_index 不变，
+# 因此 lib/story_kb.py 的 FTS 检索、中文 bigram、persona 加成全部原样生效。
+
+def _gd_paths(lines: List[dict]) -> List[List[str]]:
+    """把一段 drama 展开成多条完整路径（分支不压平，与 gamedata_source 同算法）。"""
+    index = {r.get("id"): r for r in lines}
+    succ = {r.get("id"): [n for n in str(r.get("next") or "").split("~") if n in index]
+            for r in lines}
+    pred: set = set()
+    for v in succ.values():
+        pred.update(v)
+    roots = [r.get("id") for r in lines if r.get("id") not in pred] or [lines[0].get("id")]
+    paths: List[List[str]] = []
+
+    def walk(node: str, acc: List[str]) -> None:
+        if len(paths) >= 24 or node in acc:
+            if node in acc:
+                paths.append(acc)
+            return
+        acc = acc + [node]
+        nxt = succ.get(node) or []
+        if len(nxt) > 1:
+            for n in nxt:
+                walk(n, acc)
+            return
+        if not nxt:
+            paths.append(acc)
+            return
+        walk(nxt[0], acc)
+
+    for r in roots:
+        walk(r, [])
+    return paths or [[r.get("id") for r in lines]]
+
+
+def _clean_text(text: str) -> str:
+    """剥掉游戏内富文本标签：``<size=85>``/``<br>``/``<color>`` 之类，保留换行语义。"""
+    if not text:
+        return ""
+    s = re.sub(r"<br\s*/?>", "\n", text)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = s.replace("\u3000", " ")
+    return re.sub(r"[ \t]{2,}", " ", s).strip()
+
+
+def units_from_gamedata(gdata_dir: str, with_outline: bool = True) -> List[Unit]:
+    """读 gamedata 产物 → wiki 同构的 Unit 列表（羁绊剧情台词 + 章节场景目录）。"""
+    import hashlib
+
+    def load(*parts):
+        p = os.path.join(gdata_dir, *parts)
+        if not os.path.isfile(p):
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    bonds_raw = load("bonds.json") or {}
+    # bonds.json 是 {"bonds": {id: {...}}} 包装结构；直接 .values() 会拿到壳 dict
+    bonds = bonds_raw.get("bonds") if isinstance(bonds_raw.get("bonds"), dict) else bonds_raw
+    roles = load("roles.json") or {}
+    chapters = load("story", "chapters.json") or {}
+    scenes_idx = load("story", "scenes.json") or {}
+    line_dialogs = load("story", "line_dialogs.json") or []
+    text_zh = load("story", "text_zh_hans.json") or {}
+    text_en = load("story", "text_en.json") or {}
+
+    role_name = {}
+    for code, info in (roles.get("roles") or {}).items():
+        names = info.get("name") or {}
+        role_name[code] = names.get("zh_hans") or names.get("en") or code
+
+    by_drama: Dict[str, List[dict]] = {}
+    for r in line_dialogs:
+        by_drama.setdefault(r.get("drama"), []).append(r)
+
+    def mk_scene(title: str, ord_: int, entries: List[Tuple[str, str, str]]) -> Optional[Scene]:
+        lines = [Line(speaker=spk or "旁白", text=txt, char_id=cid,
+                      kind="say" if cid else "narration")
+                 for spk, txt, cid in entries if txt]
+        if not lines:
+            return None
+        blob = "\n".join(f"{ln.speaker}: {ln.text}" for ln in lines)
+        return Scene(title=title, lines=lines, ord=ord_,
+                     content_hash=hashlib.md5(blob.encode("utf-8")).hexdigest())
+
+    units: List[Unit] = []
+    seen_titles: set = set()
+    seen_drama: set = set()
+
+    # 1) 羁绊剧情：每条路径一个 scene，文本用游戏内原文（中文优先）
+    for bond in bonds.values():
+        code = bond.get("role")
+        if not code:
+            continue
+        for did in bond.get("drama_ids") or []:
+            # 同一角色可能有多条 RoleCollection 记录指向同一 drama → 去重
+            if not did or (code, did) in seen_drama:
+                continue
+            seen_drama.add((code, did))
+            rows = by_drama.get(did) or []
+            if not rows:
+                continue
+            index = {r.get("id"): r for r in rows}
+            scenes: List[Scene] = []
+            for i, path in enumerate(_gd_paths(rows)):
+                entries = []
+                for pid in path:
+                    row = index.get(pid) or {}
+                    key = row.get("text_key") or ""
+                    txt = text_zh.get(key) or text_en.get(key) or ""
+                    spk = row.get("speaker") or ""
+                    entries.append((role_name.get(spk, "") if spk else "", txt, spk))
+                sc = mk_scene(f"{did} 第{i + 1}段" if i else f"{did} 主线",
+                              i, entries)
+                if sc:
+                    scenes.append(sc)
+            if not scenes:
+                continue
+            title = f"{role_name.get(code, code)} 羁绊剧情 {did}"
+            if title in seen_titles:      # unit.page_title 有 UNIQUE 约束
+                continue
+            seen_titles.add(title)
+            units.append(Unit(
+                page_title=title,
+                url="",
+                meta={"work": "bond", "episode": did.split("_")[0],
+                      "chapter_no": 0,
+                      "chapter_title_en": did,
+                      "chapter_title_zh": f"{role_name.get(code, code)} 羁绊",
+                      "member": role_name.get(code, code)},
+                scenes=scenes,
+            ))
+
+    # 2) 主线（逐场景切、unit 挂章节）+ 活动（客户端原文，用于持续补充中文活动库）
+    dialog_index = load("story", "dialog_index.json") or {}
+    main_scenes = (dialog_index.get("main_scenes") or {})
+    events_idx = (dialog_index.get("events") or {})
+    # 活动归档优先：out/events/<event>.json 是跨版本累积的中文原文，
+    # 客户端表里只有当期活动（下线后行会被删）。
+    archive_events: Dict[str, dict] = {}
+    ev_dir = os.path.join(gdata_dir, "events")
+    if os.path.isdir(ev_dir):
+        for fn in sorted(os.listdir(ev_dir)):
+            if not fn.endswith(".json") or fn.startswith("_"):
+                continue
+            try:
+                with open(os.path.join(ev_dir, fn), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("event"):
+                    archive_events[data["event"]] = data
+            except Exception:  # noqa: BLE001
+                continue
+    for ev_id, data in archive_events.items():
+        events_idx.setdefault(ev_id, {"segment_list": []})
+    hash_seen: set = set()
+
+    def push_unit(title: str, meta: dict, scenes: List[Scene]) -> None:
+        if not scenes or title in seen_titles:
+            return
+        seen_titles.add(title)
+        units.append(Unit(page_title=title, url="", meta=meta, scenes=scenes))
+
+    if main_scenes:
+        by_chapter: Dict[str, List[dict]] = {}
+        for sc in scenes_idx.values():
+            if sc.get("dialog_refs"):
+                by_chapter.setdefault(sc.get("chapter") or "", []).append(sc)
+        for ch_id, sc_list in by_chapter.items():
+            ch = chapters.get(ch_id) or {}
+            ch_name = ((ch.get("name") or {}).get("zh_hans")
+                       or (ch.get("name") or {}).get("en") or ch_id)
+            sc_list.sort(key=lambda s: (str((s.get("num") or {}).get("zh_hans") or ""), s.get("id")))
+            ch_scenes: List[Scene] = []
+            for si, sc in enumerate(sc_list):
+                entries: List[Tuple[str, str, str]] = []
+                for ref in sc.get("dialog_refs") or []:
+                    grp = main_scenes.get(ref) or {}
+                    for ln in grp.get("lines") or []:
+                        key = ln.get("text_key") or ""
+                        txt = _clean_text(text_zh.get(key) or text_en.get(key) or "")
+                        if not txt:
+                            continue
+                        spk_key = ln.get("speaker") or ""
+                        spk = _clean_text(text_zh.get(spk_key) or "")
+                        entries.append((spk, txt, ""))
+                if not entries:
+                    continue
+                num = (sc.get("num") or {}).get("zh_hans") or ""
+                nm = (sc.get("name") or {}).get("zh_hans") or \
+                     (sc.get("name") or {}).get("en") or ""
+                s_ob = mk_scene(f"{num} {nm}".strip() or sc.get("id", ""), si, entries)
+                if s_ob and s_ob.content_hash not in hash_seen:
+                    hash_seen.add(s_ob.content_hash)
+                    ch_scenes.append(s_ob)
+            push_unit(f"{ch_id} {ch_name}（剧情）",
+                      {"work": "main", "episode": ch.get("episode") or "",
+                       "chapter_no": 0, "chapter_title_en": (ch.get("name") or {}).get("en") or "",
+                       "chapter_title_zh": ch_name},
+                      ch_scenes)
+
+    for ev_id, ev in events_idx.items():
+        # 优先用活动归档（out/events/，跨版本累积；活动下线后客户端文本会消失）
+        arch = archive_events.get(ev_id)
+        if arch and arch.get("segments"):
+            segs = [{"segment": s.get("segment"),
+                     "lines": [{"text_key": None, "id": l.get("id"),
+                                "speaker": None, "text": l.get("text")}
+                               for l in s.get("lines") or []]}
+                    for s in arch["segments"]]
+            ev_title = arch.get("title") or ev_id
+        else:
+            segs = ev.get("segment_list") or []
+            ev_title = ""
+        ev_scenes: List[Scene] = []
+        for si, seg in enumerate(segs):
+            entries = []
+            for ln in seg.get("lines") or []:
+                if ln.get("text") is not None:          # 归档来源：文本已就绪
+                    txt = _clean_text(ln.get("text") or "")
+                    spk = ln.get("speaker") or ""
+                else:                                    # 客户端表来源：查 locale
+                    key = ln.get("text_key") or ""
+                    txt = _clean_text(text_zh.get(key) or text_en.get(key) or "")
+                    spk = _clean_text(text_zh.get(ln.get("speaker") or "") or "")
+                if not txt:
+                    continue
+                if not ev_title:
+                    head = [x.strip() for x in txt.split("\n") if x.strip()]
+                    if head:
+                        ev_title = " · ".join(head[:2])
+                entries.append((spk, txt, ""))
+            s_ob = mk_scene(f"{seg.get('segment')}", si, entries)
+            if s_ob and s_ob.content_hash not in hash_seen:
+                hash_seen.add(s_ob.content_hash)
+                ev_scenes.append(s_ob)
+        if ev_scenes:
+            push_unit(f"{ev_id} {ev_title or ev_id}（活动·客户端原文）",
+                      {"work": "event", "episode": ev_id, "chapter_no": 0,
+                       "chapter_title_zh": ev_title, "event_name_zh": ev_title},
+                      ev_scenes)
+
+    # 3) 章节目录：让"久别重逢"这类场景名也能被检索到（无台词，仅标题行）
+    if with_outline:
+        # 只为"没有台词、进不了剧情 unit"的章节建目录 unit：
+        # 两者都建会让目录文本与剧情 unit 抢排名（实测「猫祭 羁绊」被目录挤掉）。
+        by_chapter2: Dict[str, List[dict]] = {}
+        for sc in scenes_idx.values():
+            by_chapter2.setdefault(sc.get("chapter"), []).append(sc)
+        has_story = {ch_id for ch_id, scs in by_chapter2.items()
+                     if any(sc.get("dialog_refs") for sc in scs)}
+        for ch_id, ch in chapters.items():
+            if not ch.get("name") or ch_id in has_story:
+                continue
+            rows = sorted(by_chapter2.get(ch_id) or [], key=lambda s: str(s.get("id")))
+            if not rows:
+                continue
+            entries = []
+            for sc in rows:
+                num = (sc.get("num") or {}).get("zh_hans") or ""
+                nm = (sc.get("name") or {}).get("zh_hans") or \
+                     (sc.get("name") or {}).get("en") or ""
+                if nm:
+                    entries.append(("", f"{num} {nm}".strip(), ""))
+            sc_ob = mk_scene(f"{ch_id} 场景目录", 0, entries)
+            if not sc_ob:
+                continue
+            units.append(Unit(
+                page_title=f"{ch_id} {ch['name'].get('zh_hans') or ch['name'].get('en')}（场景目录）",
+                url="",
+                meta={"work": "main", "episode": ch.get("episode") or "",
+                      "chapter_no": 0,
+                      "chapter_title_en": ch["name"].get("en") or "",
+                      "chapter_title_zh": ch["name"].get("zh_hans") or ""},
+                scenes=[sc_ob],
+            ))
+    return units
+
+
+
 # ── CLI ────────────────────────────────────────────────────────────
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1692,7 +1980,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--concurrency", type=int, default=3, help="enrichment concurrency")
     ap.add_argument("--force-enrich", action="store_true", help="re-enrich cached units")
     ap.add_argument("--db", default=DB_PATH, help="output database path")
+    ap.add_argument("--gamedata", metavar="DIR",
+                    help="用解包产物建库（读 DIR/story/*.json + bonds.json），"
+                         "不需要 --crawl；与 wiki 同构写入同一 schema")
     args = ap.parse_args(argv)
+
+    # ── gamedata 数据源模式（独立于 wiki 爬取）──
+    if args.gamedata:
+        units = units_from_gamedata(args.gamedata)
+        if not units:
+            print(f"[gamedata] {args.gamedata} 下没有可入库的剧情/羁绊数据")
+            return 2
+        lines = sum(len(s.lines) for u in units for s in u.scenes)
+        print(f"[gamedata] {len(units)} units, "
+              f"{sum(len(u.scenes) for u in units)} scenes, {lines} lines")
+        stats = build_index(units, {}, args.db, source_note="gamedata:ARCode")
+        print(f"[gamedata] {json.dumps(stats, ensure_ascii=False)}")
+        return 0
 
     do_all = args.all or not any((args.crawl, args.index, args.enrich, args.stats,
                                   args.export_md, args.migrate))

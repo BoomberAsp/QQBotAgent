@@ -576,8 +576,90 @@ def build_index(cache_path: str | None = None) -> dict:
             "stars": entry.get("stars", ""),
             "skills": parsed_skills,
         }
+        _merge_gamedata_effects(parsed_skills, name)
 
     return index
+
+
+# ── 解包数据源补充（P2b）──────────────────────────────────────────
+# 行动值操纵的**精确数值**来自 Skill 表的 Fun DSL（``Fun:"AddTime",Value:0.3``），
+# 而不是从中文文案里推断；这里把它合并进 wiki 解析出的 ag_effects（按值去重）。
+_GD_TRIGGER_MAP = {
+    "StartBattle": "battle_start",
+    "FirstStartBattle": "battle_start",
+    "StartBattleFirst": "battle_start",
+    "PostStartBattle": "battle_start",
+}
+
+
+def _gamedata_ag_effects(char_name: str, slot: int) -> list[dict]:
+    """(角色, 槽位) → 数据源里的行动值操纵；槽位在 ag 索引里是 0 基。
+
+    契约：索引 slot 0/1/2 对应 S1/S2/S3；gamedata 的 ``role_skills[].slot`` 是 1 基。
+    触发时机：只有进战族能确定映射，其余（AnyEnemyAfterSkill 之类）一律归为
+    ``conditional``——引擎会把它放进 uncertain，不会自动当作已触发。
+    """
+    try:
+        from lib.gamedata_source import get_source
+        src = get_source()
+        if not src.available:
+            return []
+        code = src.resolve_role(char_name)
+        if not code:
+            return []
+        effects: list[dict] = []
+        for s in src.role_skills(code):
+            try:
+                if int(s.get("slot") or 0) != int(slot) + 1:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            for op in src.ag_ops_for_skill(s.get("id") or ""):
+                trigger = _GD_TRIGGER_MAP.get(op.get("trigger") or "", "conditional")
+                if op.get("condition") and trigger != "battle_start":
+                    trigger = "conditional"
+                pct = op.get("magnitude") or ""
+                try:
+                    value = abs(float(op.get("value") or 0)) * 100
+                except (TypeError, ValueError):
+                    value = None
+                effects.append({
+                    "direction": op.get("direction"),
+                    # 与 wiki 侧同构的 magnitude dict，引擎的 _mag_str 才能处理
+                    "magnitude": {"kind": "fixed", "value": value,
+                                  "raw": pct} if value is not None else None,
+                    "target": (op.get("target") or "").lower() or None,
+                    "clause": f"gamedata:AddTime Value={op.get('value')}",
+                    "trigger": trigger,
+                    "condition": op.get("condition"),
+                    "source": "gamedata",
+                })
+        return effects
+    except Exception:
+        return []
+
+
+def _effect_key(e: dict) -> str:
+    """ag_effect 的稳定去重键（magnitude 可能是 dict/str，不能直接入 set）。"""
+    return json.dumps([e.get("direction"), e.get("magnitude"), e.get("target")],
+                      sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _merge_gamedata_effects(skills: list, char_name: str) -> None:
+    for sk in skills or []:
+        slot = getattr(sk, "slot", None)
+        if slot is None:
+            continue
+        extra = _gamedata_ag_effects(char_name, slot)
+        if not extra:
+            continue
+        seen = {_effect_key(e) for e in sk.ag_effects}
+        for e in extra:
+            key = _effect_key(e)
+            if key in seen:
+                continue
+            seen.add(key)
+            sk.ag_effects.append(e)
 
 
 # ── Report ───────────────────────────────────────────────────────────

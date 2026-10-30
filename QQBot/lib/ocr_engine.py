@@ -430,6 +430,58 @@ class BuffDetector:
     # Minimum correlation coefficient for a positive match (0.0–1.0).
     MATCH_THRESHOLD = 0.70
 
+    # 状态图标列（帧相对宽度比例）：图标紧跟三个技能格右侧。
+    # 技能格按 SKILL_SLOT_X 到 0.658 结束，状态图标实测始于 0.674 → 取 0.665 起步，
+    # 否则窗口会压到第 3 个技能图标上（实测会产生大量误报）。
+    # 1920x884：图标 0.674–0.789；1280x579：0.675–0.817 → 上界取 0.87 留余量。
+    ROI_BAND = (0.665, 0.87)
+    ROI_MIN_WIDTH = 40          # 带宽不足时退回整行，避免极端分辨率漏检
+
+    # 数据源模板（无回合角标）的匹配阈值。
+    # 实测：无角标行 0.90+；带角标行会掉到 0.71–0.84（猫祭 NEXT ON 行 Shield 0.714 / H167S2 0.710），
+    # 因此仍用 0.70；精确性靠「行级白名单 + 只扫状态图标列 + Voronoi cell」保证。
+    MATCH_THRESHOLD_GAMEDATA = 0.70
+
+    # 角标遮罩：游戏在图标左上角叠加「N回合」数字，而数据源模板是干净的。
+    # 把**模板**的左上角裁掉再做一次匹配，等价于忽略角标区域（角标落在模板外，不参与比较）。
+    # 实测这是带角标行召回下跌的主因（0.71 → 0.88 量级）。
+    BADGE_CROP = 0.34
+
+    @staticmethod
+    def row_cells(rows: list[list[dict]], frame: tuple[int, int, int, int] | None
+                  ) -> dict[int, tuple[int, int]]:
+        """每行的 Voronoi 纵向 cell（相邻行带中线切分）→ {行号: (y1, y2)}。
+
+        单独抽出来，供"只重扫某一行"的调用方复用——否则只传一行时该行会独占
+        整个面板高度，把别的行的图标也扫进来（实测会产出跨行误报）。
+        """
+        h = frame[3] if frame else None
+        top_edge, bot_edge = (frame[1], frame[3]) if frame else (0, None)
+        bands: list[tuple[int, int] | None] = []
+        for row_blocks in rows:
+            if not row_blocks:
+                bands.append(None)
+                continue
+            ys = [p[1] for b in row_blocks for p in b["bbox"]]
+            bands.append((min(ys), max(ys)))
+        order = sorted((i for i, b in enumerate(bands) if b is not None),
+                       key=lambda i: (bands[i][0] + bands[i][1]) / 2)
+        cells: dict[int, tuple[int, int]] = {}
+        for pos, i in enumerate(order):
+            y1 = top_edge if pos == 0 else (
+                bands[order[pos - 1]][1] + bands[i][0]) / 2
+            y2 = bot_edge if pos == len(order) - 1 else (
+                bands[i][1] + bands[order[pos + 1]][0]) / 2
+            if y2 is None:
+                y2 = bands[i][1]
+            # 关键：OCR 行带可能互相重叠（长名字行、相邻行合并），纯中线切分会把
+            # 本行的图标区裁掉（实测 11-1 的安熙恩行：cell 275..362 落在行带
+            # 205..346 之下，导致漏检）。cell 至少必须覆盖本行自己的行带。
+            y1 = min(y1, bands[i][0])
+            y2 = max(y2, bands[i][1])
+            cells[i] = (int(max(top_edge, y1)), int(min(y2, bot_edge) if bot_edge else y2))
+        return cells
+
     # Scale range for multi-scale matching (relative to the template's native
     # size).  Game screenshots vary in resolution; buff icons are typically
     # 20–48 px in the central panel.
@@ -438,18 +490,81 @@ class BuffDetector:
     def __init__(self, icon_dir: str | None = None):
         self._icon_dir = icon_dir or self._ICON_DIR
         self._templates: dict[str, Any] = {}   # name → BGR ndarray
+        self._core: dict[str, Any] = {}        # name → 去掉左上角（角标区）的版本
         self._loaded = False
+        self.source = "manual"                 # "gamedata" | "manual"
 
     # ── Template loading ──────────────────────────────────────────
 
+    def _load_gamedata_templates(self) -> bool:
+        """载入解包数据源的状态图标（键 = 状态 ID，不含回合角标）。成功返回 True。
+
+        **默认启用**（有产物即用）：模板无角标，匹配时用 ``BADGE_CROP`` 版做
+        角标遮罩补偿；实测 fixture 召回 20/20（此前手工模板也是 20/20）。
+        需要退回手工图标时设 ``GAMEDATA_STATUS_ICONS=0``（例如数据源产物异常）。
+        """
+        flag = str(os.environ.get("GAMEDATA_STATUS_ICONS", "")).strip().lower()
+        if flag in ("0", "false", "no", "off"):
+            return False
+        try:
+            from lib.gamedata_source import get_source
+        except Exception:
+            return False
+        try:
+            src = get_source()
+        except Exception as e:
+            print(f"[BuffDetector] gamedata 源不可用: {type(e).__name__}: {e}", file=sys.stderr)
+            return False
+        if not src.available:
+            return False
+        icon_dir = src.template_dir()
+        if not os.path.isdir(icon_dir):
+            return False
+        for fname in sorted(os.listdir(icon_dir)):
+            if not fname.endswith(".png"):
+                continue
+            img = BuffDetector._read_icon(os.path.join(icon_dir, fname))
+            if img is not None:
+                self._templates[fname[:-4]] = img
+                self._core[fname[:-4]] = BuffDetector._badge_free(img)
+        if not self._templates:
+            return False
+        self.source = "gamedata"
+        print(f"[BuffDetector] gamedata 模板 {len(self._templates)} 个（状态 ID 键）",
+              file=sys.stderr)
+        return True
+
+    @classmethod
+    def _badge_free(cls, img):
+        """裁掉左上角的「N回合」角标区域，得到只含图标本体的匹配模板。"""
+        try:
+            h, w = img.shape[:2]
+            dx = int(w * cls.BADGE_CROP)
+            dy = int(h * cls.BADGE_CROP)
+            if w - dx >= 8 and h - dy >= 8:
+                return img[dy:, dx:]
+        except Exception:
+            pass
+        return img
+
     def _load_templates(self):
-        """Load all reference icon PNGs into memory (idempotent)."""
+        """Load reference icons into memory (idempotent).
+
+        两个来源**二选一**（避免同一图标同时以中文标签和状态 ID 重复匹配）：
+          1. 解包数据源（优先）：``<GAMEDATA_DIR>/icons/status/<status_id>.png``；
+          2. 手工/wiki 图标（回落）：``images/cal-speed-data/*图标.png`` +
+             ``data/wiki_cache/status_icons/``，键为中文标签。
+        """
         if self._loaded:
             return
         try:
             import cv2
         except ImportError:
             print("[BuffDetector] OpenCV not available", file=sys.stderr)
+            self._loaded = True
+            return
+
+        if self._load_gamedata_templates():
             self._loaded = True
             return
 
@@ -620,11 +735,17 @@ class BuffDetector:
         roi = image[y1:y2, x1:x2]
 
         results: dict[str, float] = {}
+        threshold = (self.MATCH_THRESHOLD_GAMEDATA
+                     if self.source == "gamedata" else self.MATCH_THRESHOLD)
         for name, template in self._templates.items():
             if template_filter is not None and name not in template_filter:
                 continue
             conf = self._match_template_multiscale(roi, template)
-            if conf >= self.MATCH_THRESHOLD:
+            core = self._core.get(name)
+            if core is not None and self.source == "gamedata":
+                # 角标遮罩版再匹配一次：角标落在模板外，不参与比较
+                conf = max(conf, self._match_template_multiscale(roi, core))
+            if conf >= threshold:
                 results[name] = conf
 
         return results
@@ -664,40 +785,29 @@ class BuffDetector:
         """
         h, w = image.shape[:2]
         left, right = 0, w
-        top_edge, bot_edge = 0, h
         if frame is not None:
-            left, top_edge, right, bot_edge = frame
+            left, _top_edge, right, _bot_edge = frame
 
-        bands: list[tuple[int, int] | None] = []
-        for row_blocks in rows:
-            if not row_blocks:
-                bands.append(None)
-                continue
-            ys = [p[1] for b in row_blocks for p in b["bbox"]]
-            bands.append((min(ys), max(ys)))
-
-        order = sorted(
-            (i for i, b in enumerate(bands) if b is not None),
-            key=lambda i: (bands[i][0] + bands[i][1]) / 2,
-        )
-        cells: dict[int, tuple[int, int]] = {}
-        for pos, i in enumerate(order):
-            y1 = top_edge if pos == 0 else (
-                bands[order[pos - 1]][1] + bands[i][0]) / 2
-            y2 = bot_edge if pos == len(order) - 1 else (
-                bands[i][1] + bands[order[pos + 1]][0]) / 2
-            cells[i] = (int(max(top_edge, y1)), int(min(bot_edge, y2)))
+        cells = self.row_cells(rows, frame)
 
         # Load templates once before spawning threads — the lazy loader is not
         # re-entrant, and cv2.matchTemplate reads templates read-only afterwards.
         self._load_templates()
+
+        # 只扫「状态图标列」而不是整行：图标固定在技能格右侧，整行扫描是纯浪费。
+        band_x0 = left + int((right - left) * self.ROI_BAND[0])
+        band_x1 = left + int((right - left) * self.ROI_BAND[1])
+        if band_x1 - band_x0 >= self.ROI_MIN_WIDTH:
+            scan_x0, scan_x1 = band_x0, band_x1
+        else:
+            scan_x0, scan_x1 = left, right
 
         tasks: list[tuple[int, tuple[int, int, int, int], set[str] | None]] = []
         for i, row_blocks in enumerate(rows):
             if not row_blocks or i not in cells:
                 continue
             y1, y2 = cells[i]
-            region = (left, y1, right, y2)
+            region = (scan_x0, y1, scan_x1, y2)
             flt = template_filters[i] if template_filters and i < len(template_filters) else None
             tasks.append((i, region, flt))
 

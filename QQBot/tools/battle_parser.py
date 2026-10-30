@@ -538,6 +538,7 @@ async def parse_battle_screenshots(paths: list[str], mode: str = "full") -> str:
         pre_valid_reasons=validity_warnings,
         action_gauge_skills=ag_skills,
         ag_trigger_hypothesis=hypothesis,
+        observed_status=_observed_status(all_results[0], all_results[1]),
     )
 
 
@@ -953,28 +954,24 @@ async def _parse_single(path: str) -> dict:
     # characters[i] — _post_process sorts/dedups, which broke the old
     # loop-order alignment.
     row_buffs: list[dict] = []
+    morale: list[dict] = []
+    buff_source = "manual"
     try:
         import cv2
         img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        from lib.ocr_engine import BuffDetector
+        from lib.ocr_engine import BuffDetector, MoraleFocusDetector
         detector = BuffDetector()
+        buff_source = detector.source
         rows_for_buffs = [
             [{"bbox": c["bbox"]}] if c.get("bbox") else [] for c in characters
         ]
-        # Narrow the template set per row to the buffs that character's skills
-        # can apply (plus 免疫 gear, which is not in any skill text).  Unknown
-        # characters fall back to the full template set (None) for that row only.
-        buff_filters: list[set[str] | None] = []
-        for c in characters:
-            info = get_character_skill_info(c["name"])
-            if info is None:
-                buff_filters.append(None)
-            else:
-                flt = set(info.get("buffs") or [])
-                flt.add("免疫")
-                buff_filters.append(flt)
+        buff_filters = _row_template_filters(characters, detector)
         row_buffs = detector.detect_in_rows(
             img_bgr, rows_for_buffs, frame, template_filters=buff_filters)
+        row_buffs = _fallback_missing_rows(
+            detector, img_bgr, rows_for_buffs, frame, row_buffs, characters)
+        # 战意/集中力条（此前从未被调用；实测读数与游戏值一致）
+        morale = MoraleFocusDetector.detect_in_rows(img_bgr, rows_for_buffs, frame)
     except Exception as e:
         print(f"[battle_parser] Buff detection skipped: {type(e).__name__}: {e}",
               file=sys.stderr)
@@ -984,7 +981,152 @@ async def _parse_single(path: str) -> dict:
         "characters": characters,
         "frame": frame,
         "row_buffs": row_buffs,
+        "morale": morale,
+        "buff_source": buff_source,
     }
+
+
+# ── 数据源驱动的行级模板过滤（P2）────────────────────────────────────
+
+
+def _gamedata():
+    """解包数据源；不可用时返回 None（调用方回落到 wiki 逻辑）。"""
+    try:
+        from lib.gamedata_source import get_source
+        src = get_source()
+        return src if src.available else None
+    except Exception:
+        return None
+
+
+def _roster_grants(characters: list[dict]) -> tuple[set[str], dict[str, str]]:
+    """本截图全部角色可授予的状态 ID 并集 + {角色显示名: 角色ID}。
+
+    并集而非「本角色自己的状态」：团队增益（夏妮全队护盾）、装备、条件赋予
+    都不会出现在受益者自己的技能文案里（本次事故的根因 A）。
+    """
+    src = _gamedata()
+    if src is None:
+        return set(), {}
+    allowed: set[str] = set()
+    role_of: dict[str, str] = {}
+    for c in characters:
+        name = c.get("name") or ""
+        code = src.resolve_role(name)
+        if not code:
+            continue
+        role_of[name] = code
+        allowed.update(src.all_grant_ids(code))
+    # 免疫套装不属于任何技能文案，必须始终可选
+    allowed.add("Immune")
+    return allowed, role_of
+
+
+def _teamwide_grants(characters: list[dict]) -> set[str]:
+    """本截图里「对全队授予」的状态 ID（camp=self_side 且 target=All）。
+
+    这类状态会出现在**受益者**那一行，但不会出现在受益者自己的技能文案里
+    （夏妮觉醒护盾 → 安熙恩/猫祭行也有）；行级白名单必须把它带上。
+    """
+    src = _gamedata()
+    if src is None:
+        return set()
+    out: set[str] = set()
+    for c in characters:
+        code = src.resolve_role(c.get("name") or "")
+        if not code:
+            continue
+        for g in src.role_grants_of(code).get("grants") or []:
+            if (g.get("camp") == "self_side"
+                    and str(g.get("target") or "").lower() == "all"):
+                out.add(g["id"])
+    return out
+
+
+def _row_template_filters(characters: list[dict], detector) -> list[set[str] | None]:
+    """行级白名单（数据源驱动）。
+
+    = 本角色所有授予 ∪ 全队型授予 ∪ {Immune}（套装不属于任何技能文案）。
+    未在图鉴里的角色 → None（不过滤），避免把它的图标挡掉。
+    """
+    src = _gamedata()
+    if src is not None and detector.source == "gamedata":
+        teamwide = _teamwide_grants(characters)
+        out: list[set[str] | None] = []
+        for c in characters:
+            code = src.resolve_role(c.get("name") or "")
+            if not code:
+                out.append(None)
+                continue
+            out.append(set(src.all_grant_ids(code)) | teamwide | {"Immune"})
+        return out
+
+    # ---- 回落：wiki 索引 per-char 白名单（旧行为）----
+    filters: list[set[str] | None] = []
+    for c in characters:
+        info = get_character_skill_info(c["name"])
+        if info is None:
+            filters.append(None)
+        else:
+            flt = set(info.get("buffs") or [])
+            flt.add("免疫")
+            filters.append(flt)
+    return filters
+
+
+def _fallback_missing_rows(detector, img_bgr, rows_for_buffs, frame,
+                           row_buffs: list[dict], characters: list[dict]) -> list[dict]:
+    """某行的「规则关键状态」一个都没检到 → 该行回退全量模板重扫一次。
+
+    白名单是性能优化，不能成为漏检的保险丝：一旦行内没有命中任何期望状态，
+    用全量模板再判一次（只影响这一行，成本可接受）。
+    """
+    src = _gamedata()
+    if src is None or detector.source != "gamedata":
+        return row_buffs
+    out = list(row_buffs)
+    for i, c in enumerate(characters):
+        expected = set(src.pre_grants(src.resolve_role(c.get("name") or "") or "")) | \
+                   set(src.advisory_grants(src.resolve_role(c.get("name") or "") or ""))
+        expected = {s for s in expected if src.has_row_icon(s)}
+        if not expected:
+            continue
+        got = set((out[i] if i < len(out) else {}) or {})
+        if got & expected:
+            continue
+        try:
+            # 只重扫这一行，但 cell 必须用全量行算出来的（否则该行会独占整个面板高度，
+            # 把相邻行的图标扫进来 —— 实测会产出跨行误报）。
+            cells = detector.row_cells(rows_for_buffs, frame)
+            y1, y2 = cells.get(i, (None, None))
+            if y1 is None:
+                continue
+            region = _status_band_region(img_bgr, frame, y1, y2)
+            hits = detector.detect_in_region(img_bgr, region, None)
+            if hits:
+                merged = dict(got)
+                merged.update(hits)
+                out[i] = merged
+                print(f"[battle_parser] 行级回退全量模板: {c.get('name')} → "
+                      f"{sorted(hits)}", file=sys.stderr)
+        except Exception as e:
+            print(f"[battle_parser] 行级回退失败 {c.get('name')}: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+    return out
+
+
+def _status_band_region(img_bgr, frame, y1: int, y2: int) -> tuple[int, int, int, int]:
+    """行 cell × 状态图标列带 → ``(x1, y1, x2, y2)``。"""
+    h, w = img_bgr.shape[:2]
+    if frame:
+        left, _t, right, _b = frame
+    else:
+        left, right = 0, w
+    x1 = left + int((right - left) * 0.665)
+    x2 = left + int((right - left) * 0.87)
+    if x2 - x1 < 40:
+        x1, x2 = left, right
+    return (max(0, x1), max(0, y1), min(w, x2), min(h, y2))
 
 
 # Known UI labels that are not character names.
@@ -1171,30 +1313,71 @@ def _validate_pre_screenshot(
                 return row_buffs[i]
         return {}
 
-    # ── Rule 1: Entry-battle buffs ──
+    # ── Rule 1a: 数据源驱动（P2）──    # blocking = 早于乱速即应可见的进战状态（role_grants.pre_grants）；
+    # advisory = 觉醒源 / PostStartBattle（时序在乱速之后），只提示不否决。
     rule1_ok = True
-    for c in pre_chars:
-        name = c.get("name", "")
-        info = get_character_skill_info(name)
-        if info is None:
-            # Character not in index — can't validate, assume OK
-            continue
-        if not info.get("has_entry_buff"):
-            continue  # vacuously valid
+    src = _gamedata()
+    if src is not None and pre.get("buff_source") == "gamedata":
+        for c in pre_chars:
+            name = c.get("name", "")
+            code = src.resolve_role(name)
+            if not code:
+                continue
+            row_buffs = _buffs_for_char(pre_chars, pre_row_buffs, name)
+            got = {src.resolve(k) or k for k in row_buffs}
 
-        # Character has entry-battle buff skill → must see buffs
-        row_buffs = _buffs_for_char(pre_chars, pre_row_buffs, name)
-        if not row_buffs:
-            warnings.append(
-                f"规则1（进战buff）：角色「{name}」拥有进战buff技能，"
-                f"但跑条前截图中未检测到buff图标（可能乱速尚未完成）"
-            )
-            rule1_ok = False
+            blocking = [s for s in src.pre_grants(code) if src.has_row_icon(s)]
+            missing = [s for s in blocking if s not in got]
+            if missing:
+                rules = src.role_grants_of(code).get("grants") or []
+                detail = "、".join(
+                    f"{src.display_name(s, 'zh_hans')}({s})" for s in missing)
+                warn = (f"规则1（进战buff）：角色「{name}」的进战状态 {detail} "
+                        f"应早于乱速可见，但跑条前截图中未检出（可能乱速尚未完成）")
+                trig = next((g.get("trigger") for g in rules
+                             if g["id"] in missing and g.get("entry")), None)
+                if trig:
+                    warn += f"；触发时机={trig}"
+                warnings.append(warn)
+                rule1_ok = False
+
+            advisory = [s for s in src.advisory_grants(code)
+                        if src.has_row_icon(s) and s not in got]
+            if advisory:
+                detail = "、".join(
+                    f"{src.display_name(s, 'zh_hans')}({s})" for s in advisory)
+                warnings.append(
+                    f"提示（时序/养成）：角色「{name}」的 {detail} 属觉醒或"
+                    f"战斗开始后（PostStartBattle）授予，跑条前未出现属正常，不影响行动值。")
+            continue
+
+    # ── Rule 1b: 回落 wiki 索引（gamedata 不可用时）──
+    if src is None or pre.get("buff_source") != "gamedata":
+        for c in pre_chars:
+            name = c.get("name", "")
+            info = get_character_skill_info(name)
+            if info is None:
+                continue
+            if not info.get("has_entry_buff"):
+                continue
+            row_buffs = _buffs_for_char(pre_chars, pre_row_buffs, name)
+            if not row_buffs:
+                warnings.append(
+                    f"规则1（进战buff）：角色「{name}」拥有进战buff技能，"
+                    f"但跑条前截图中未检测到buff图标（可能乱速尚未完成）"
+                )
+                rule1_ok = False
 
     # ── Rule 2 (advisory): immunity seen post but not pre ──
     # Not blocking: post-only immunity has two indistinguishable causes
     # (unloaded gear vs skill grant / conditional trigger mid-battle).
     if post:
+        def _has_immune(d: dict) -> bool:
+            for k in (d or {}):
+                if "免疫" in str(k) or src and src.resolve(k) == "Immune":
+                    return True
+            return False
+
         # Step A: Find characters in post-screenshot with 免疫 but no 免疫 skill
         gear_immune_names: set[str] = set()
         for c in post_chars:
@@ -1202,14 +1385,12 @@ def _validate_pre_screenshot(
             info = get_character_skill_info(name)
             if info and info.get("has_immunity_skill"):
                 continue  # immunity comes from skill, not gear
-            row_buffs = _buffs_for_char(post_chars, post_row_buffs, name)
-            if any("免疫" in bn for bn in row_buffs):
+            if _has_immune(_buffs_for_char(post_chars, post_row_buffs, name)):
                 gear_immune_names.add(name)
 
         # Step B: For each gear-immune character, check pre-screenshot
         for name in gear_immune_names:
-            row_buffs = _buffs_for_char(pre_chars, pre_row_buffs, name)
-            if not any("免疫" in bn for bn in row_buffs):
+            if not _has_immune(_buffs_for_char(pre_chars, pre_row_buffs, name)):
                 warnings.append(
                     f"提示（免疫套装）：角色「{name}」跑条后检测到免疫（且无免疫技能），"
                     f"但跑条前截图中未检测到免疫图标。若其穿戴免疫套装，说明乱速尚未"
@@ -1487,9 +1668,16 @@ def _build_ag_trigger_hypothesis(results: list[dict],
         from tools.ag_trigger_engine import build_hypothesis
     except Exception:
         return None
+    # 战意/集中力实测值（MoraleFocusDetector 输出）→ 让 on_morale_full 门可控
+    morale_map: dict[str, dict] = {}
+    for result in results:
+        for c, m in zip(result.get("characters", []), result.get("morale") or []):
+            if m and m.get("kind"):
+                morale_map[c.get("name", "")] = m
     return build_hypothesis(team, first_actor, idx,
                             first_skill_slot=observed_slot,
-                            observed=observed)
+                            observed=observed,
+                            morale=morale_map or None)
 
 
 async def _apply_l4(hypothesis: dict | None) -> None:
@@ -1585,6 +1773,7 @@ def _format_pair_result(
     pre_valid_reasons: list[str] | None = None,
     action_gauge_skills: list[dict] | None = None,
     ag_trigger_hypothesis: dict | None = None,
+    observed_status: dict | None = None,
     analysis_mode: str = "full",
 ) -> str:
     """Format a two-screenshot (pre+post) result as JSON."""
@@ -1687,6 +1876,14 @@ def _format_pair_result(
                 "初始行动值不可靠，无法用于测速计算。请等待乱速完成后重新截图。"
             )
 
+    if observed_status:
+        result["observed_status"] = observed_status
+        result["observed_status_note"] = (
+            "observed_status.appeared = 跑条后新生出现的状态（状态 ID）。"
+            "若该状态是某个（角色专属/觉醒）技能授予的，即为「该技能在本窗口已发动」的证据；"
+            "与 observed_cooldown（技能格灰显）互为独立佐证。"
+        )
+
     if action_gauge_skills:
         result["action_gauge_skills"] = action_gauge_skills
         result["action_gauge_note"] = (
@@ -1707,6 +1904,47 @@ def _format_pair_result(
         )
 
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _observed_status(pre: dict, post: dict) -> dict | None:
+    """跑条后「新出现」的状态 → 授予它的技能在本窗口已发动（§6 证据通道，P2 起输出）。"""
+    src = _gamedata()
+    if src is None:
+        return None
+
+    def _ids(result: dict) -> dict[str, set[str]]:
+        chars = result.get("characters") or []
+        buffs = result.get("row_buffs") or []
+        out: dict[str, set[str]] = {}
+        for i, c in enumerate(chars):
+            rb = buffs[i] if i < len(buffs) else {}
+            out[c.get("name", "")] = {src.resolve(k) or k for k in (rb or {})}
+        return out
+
+    before, after = _ids(pre), _ids(post)
+    appeared: dict[str, list[str]] = {}
+    for name, sids in after.items():
+        new = sids - (before.get(name) or set())
+        if new:
+            appeared[name] = sorted(new)
+
+    morale: dict[str, dict] = {}
+    post_chars = post.get("characters") or []
+    post_morale = post.get("morale") or []
+    for i, c in enumerate(post_chars):
+        m = post_morale[i] if i < len(post_morale) else None
+        if m and m.get("kind"):
+            morale[c.get("name", "")] = m
+
+    if not appeared and not morale:
+        return None
+    return {
+        "appeared": appeared,
+        "owners": {name: src.exclusive_owner(sid)
+                   for name, sids in appeared.items() for sid in sids
+                   if src.exclusive_owner(sid)},
+        "morale": morale,
+    }
 
 
 def _build_raw_format(

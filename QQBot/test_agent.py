@@ -11765,6 +11765,7 @@ class TestProactiveMail:
             self.test_letter_id_uniqueness()
             self.test_candidate_filter()
             self.test_known_personas_from_sessions()
+            self.test_known_personas_from_bonds()
             self.test_mail_due_gates()
             asyncio.run(self.test_compose_gap_desc())
             self.test_envelope_builder()
@@ -11986,6 +11987,42 @@ class TestProactiveMail:
         finally:
             po._special_sessions = orig
         print_pass("known_personas：sessions 索引补齐，写入后会话删除仍保留")
+
+    def test_known_personas_from_bonds(self):
+        """羁绊=权威源（§4.2 源 1）：靠默认人格攒羁绊、特殊会话没绑
+        persona_key 的用户，旧实现 known_personas 恒空 → 候选门永远拦下。"""
+        po = self.po
+        uid = "bond_only_user"
+        self.greeting.note_c2c_contact(self.targets, uid)
+        # 夏以昼：Lv5+、沉默 3 天、msgs>0（合格候选的全部前置）
+        self.m.add_exp(uid, "夏以昼", 1300)
+        st = self.m.get_state(uid, "夏以昼")
+        st["stats"]["last_seen"] = time.time() - 3 * 86400
+        st["stats"]["msgs"] = 5
+        self.m._save(uid)
+        # 干扰项：msgs=0（没聊过）与 assistant（unified）都不计入
+        for p, msgs in (("zero", 0), ("assistant", 9)):
+            st = self.m.get_state(uid, p)
+            st["stats"]["msgs"] = msgs
+        self.m._save(uid)
+        assert po._known_personas_from_bonds(uid) == ["夏以昼"]
+        assert po._known_personas_from_bonds("no_bonds_user") == []
+        orig = po._special_sessions
+        try:
+            # 会话索引查不到（persona_key 未绑定）——并集补齐仍建档 known
+            po._special_sessions = _FakeSpecialSessions([])
+            assert po._known_personas_from_sessions(uid) == []
+            self.mb.ensure_known_personas(
+                uid, po._known_personas_from_sessions(uid)
+                + po._known_personas_from_bonds(uid))
+            box = self.mb.load_user(uid)
+            assert set(box["known_personas"]) == {"夏以昼"}
+            # 建档后即可通过 _mail_candidates 的 known 门
+            cands = [p for p, _ in po._mail_candidates(uid, box, self.m._config)]
+            assert cands == ["夏以昼"], cands
+        finally:
+            po._special_sessions = orig
+        print_pass("known_personas：羁绊权威源补齐，默认人格攒羁绊不再漏档")
 
     def test_mail_due_gates(self):
         po = self.po
@@ -12902,11 +12939,20 @@ class TestMailAdmin:
         (tmp / "greet.json").write_text(
             json.dumps({"EEEE9999": {"last_seen": now - 50}}),
             encoding="utf-8")
+        # 羁绊文件（§4.2 权威源）：EEEE9999 靠默认人格攒了「夏以昼」的羁绊，
+        # 信箱尚未建档 → 面板人格数/搜索/详情都必须直接读 bonds 兜底
+        (tmp / "bonds").mkdir(parents=True, exist_ok=True)
+        (tmp / "bonds" / "EEEE9999.json").write_text(json.dumps({
+            "夏以昼": {"stats": {"msgs": 5}},
+            "zero": {"stats": {"msgs": 0}},
+            "assistant": {"stats": {"msgs": 9}},
+        }), encoding="utf-8")
         with patch.object(dr, "MAILBOX_DIR", tmp / "mailboxes"), \
                 patch.object(dr, "MAIL_QUEUE_DIR", tmp / "queue"), \
                 patch.object(dr, "MAIL_PROC_DIR", tmp / "proc"), \
                 patch.object(dr, "MAIL_STATUS_DIR", tmp / "status"), \
-                patch.object(dr, "GREET_TARGETS_FILE", tmp / "greet.json"):
+                patch.object(dr, "GREET_TARGETS_FILE", tmp / "greet.json"), \
+                patch.object(dr.config, "BONDS_DIR", tmp / "bonds"):
             # W4 脱敏
             assert dr._mask_openid(oa) == "AAAA…CCCC"
             assert dr._mask_openid("short") == "sh…"
@@ -12929,11 +12975,16 @@ class TestMailAdmin:
             assert rows[1]["has_mailbox"] is False and rows[1]["letters"] == 0
             assert rows[1]["active_enabled"] is True
             assert rows[1]["last_seen"] == now - 50
+            # 未建档用户的人格数直接读羁绊（msgs>0、排除 assistant/zero）
+            assert rows[1]["personas"] == 1
             hit = dr.mail_users(query="roxy")
             assert hit["total"] == 1 and hit["items"][0]["openid"] == "DDDD1234"
             hit = dr.mail_users(query=lid_a)
             assert hit["total"] == 1 and hit["items"][0]["openid"] == oa
             hit = dr.mail_users(query="EEEE")
+            assert hit["total"] == 1 and hit["items"][0]["openid"] == "EEEE9999"
+            # 羁绊角色名可搜（未建档用户没有信件/known_personas 可匹配）
+            hit = dr.mail_users(query="夏以昼")
             assert hit["total"] == 1 and hit["items"][0]["openid"] == "EEEE9999"
             assert dr.mail_users(query="查无此人")["total"] == 0
             # 详情：全文 openid + 倒序信件 + digest letter_states
@@ -12950,6 +13001,11 @@ class TestMailAdmin:
             # greet-only 用户 → 空信箱视图；未知用户 → error
             g = dr.mail_user("EEEE9999")
             assert g["letters"] == [] and g["active_enabled"] is True
+            # 详情 known_personas 合并羁绊兜底（信箱建档前的空窗期可见角色）
+            assert g["known_personas"] == {"夏以昼": 0}
+            # 已建档用户：信箱里的真实互动计数不被羁绊兜底覆盖
+            d = dr.mail_user(oa)
+            assert d["known_personas"]["rubi"] > 0
             assert "error" in dr.mail_user("NO_SUCH_USER_XX")
             # 删除入队：信件必须存在；成功写 queue 文件；重复入队拒绝
             assert "error" in dr.mail_enqueue_delete("DDDD1234", "L-nope")

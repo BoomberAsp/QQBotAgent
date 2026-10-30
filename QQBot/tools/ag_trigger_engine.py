@@ -290,9 +290,11 @@ def _seed_events(first_actor: str, side: str, sk: Skill | None) -> list[dict]:
     return events
 
 
-def _mag_str(mag: dict | None) -> str:
+def _mag_str(mag: dict | str | None) -> str:
     if not mag:
         return "?"
+    if isinstance(mag, str):          # 数据源直出（"25%"）时无需再解析
+        return mag
     kind = mag.get("kind")
     if kind == "range":
         return f"{mag['min']:g}%~{mag['max']:g}%"
@@ -323,6 +325,7 @@ def resolve_trigger_chain(
     first_skill_slot: int,
     index: dict,
     observed: dict | None = None,
+    morale: dict | None = None,
 ) -> dict:
     """L3 — resolve the window-1 trigger chain, then reconcile with evidence.
 
@@ -480,6 +483,11 @@ def resolve_trigger_chain(
 
     uncertain.extend(_check_counter_gear(team, index, event_log))
 
+    # ── 战意/集中力 门控（P2b）：有实测值时给确定结论，否则保持"不可观测" ──
+    gate_unc, gate_nt = _resource_gate_verdicts(team, index, morale)
+    uncertain.extend(gate_unc)
+    not_triggered.extend(gate_nt)
+
     return {
         "chain": chain,
         "not_triggered": not_triggered,
@@ -487,6 +495,61 @@ def resolve_trigger_chain(
         "battle_start": battle_start,
         "terminated": terminated,
     }
+
+
+def _resource_gate_verdicts(team: list[dict], index: dict,
+                            morale: dict | None) -> tuple[list[dict], list[dict]]:
+    """把 ``on_morale_full`` / ``on_focus_full`` 门控的效果按**实测战意**结算。
+
+    *morale* 形如 ``{角色名: {"kind": "morale"|"focus", "cells": float|None}}``
+    （``MoraleFocusDetector`` 的输出，5 格 = 100）。
+      - 读到且满格  → 条件门满足，进 uncertain（"可能已触发，需确认目标"）
+      - 读到且未满  → 条件门不满足，进 not_triggered（确定没触发）
+      - 读不到      → 维持旧行为：进 uncertain（"不可观测"）
+    """
+    unc: list[dict] = []
+    nt: list[dict] = []
+    if not morale:
+        return unc, nt
+    for c in team:
+        name, side = c["name"], c["side"]
+        ch = index.get(name)
+        if not ch:
+            continue
+        state = morale.get(name) or {}
+        cells = state.get("cells")
+        kind = state.get("kind") or "战意/集中力"
+        for sk in (_as_skill(s) for s in ch.get("skills", [])):
+            for eff in sk.ag_effects:
+                trigger = eff.get("trigger")
+                if trigger not in _RESOURCE_GATE:
+                    continue
+                item = {
+                    "char": name,
+                    "side": side,
+                    "skill": _SLOT_LABEL[sk.slot],
+                    "skill_name": sk.name,
+                    "trigger": trigger,
+                    "direction": eff.get("direction"),
+                    "magnitude": _mag_str(eff.get("magnitude")),
+                    "target": eff.get("target"),
+                    "observable": True,
+                }
+                if cells is None:
+                    item["evidence"] = "resource_unobserved"
+                    item["note"] = f"{kind}条未读到，条件门无法确认（需人工核对）"
+                    unc.append(item)
+                elif float(cells) >= 5.0:
+                    item["evidence"] = "resource_full"
+                    item["note"] = (f"实测 {kind} 已满（{cells}/5 格）→ 条件门满足，"
+                                    f"本窗口可能已触发")
+                    unc.append(item)
+                else:
+                    item["evidence"] = "resource_not_full"
+                    item["note"] = (f"实测 {kind} 未满（{cells}/5 格）→ 条件门不满足，"
+                                    f"本窗口不会触发")
+                    nt.append(item)
+    return unc, nt
 
 
 def _reconcile(
@@ -635,6 +698,7 @@ def build_hypothesis(
     index: dict,
     first_skill_slot: int | None = None,
     observed: dict | None = None,
+    morale: dict | None = None,
 ) -> dict:
     """Build the §5.1 ``ag_trigger_hypothesis`` for a team + first actor.
 
@@ -668,7 +732,7 @@ def build_hypothesis(
     skill_name = actual_sk.name if actual_sk else pred.get("skill_name", "")
 
     chain = resolve_trigger_chain(team, first_actor, slot, index,
-                                  observed=observed)
+                                  observed=observed, morale=morale)
     has_chain = bool(chain["chain"]) or bool(chain["battle_start"])
     return {
         "first_actor": first_actor,

@@ -358,6 +358,29 @@ class StoryHit:
 
 # ── Text helpers ───────────────────────────────────────────────────
 
+def _source_label(hit) -> str:
+    """命中片段的来源标注 —— 让模型分清「游戏原文」与「wiki 英文原文/中文摘要」。
+
+    混合数据源后这点很关键：主线/活动/羁绊（客户端）是**中文原文**，可以直接按
+    措辞转述；wiki 来源是英文原文 + LLM 中文摘要，只能转述、不能当原话引用。
+    """
+    title = getattr(hit, "page_title", "") or ""
+    work = getattr(hit, "work", "") or ""
+    if work == "bond":
+        return "〔来源：羁绊剧情·游戏原文〕"
+    if "（活动·客户端原文）" in title:
+        return "〔来源：活动剧情·游戏原文〕"
+    if "（剧情）" in title:
+        return "〔来源：主线剧情·游戏原文〕"
+    if "（场景目录）" in title:
+        return "〔来源：章节场景索引〕"
+    if work == "event":
+        return "〔来源：活动剧情·wiki〕"
+    if work in ("main", "hard", "prologue"):
+        return "〔来源：主线剧情·wiki〕"
+    return "〔来源：wiki〕"
+
+
 def has_cjk(text: str) -> bool:
     """True if ``text`` contains at least one CJK (Han) character."""
     return bool(_CJK_RE.search(text or ""))
@@ -835,6 +858,10 @@ class StoryKB:
                 return True
         return False
 
+    def source_label(hit: "StoryHit") -> str:
+        """兼容旧引用：模块级 source_label 的转发（勿在新代码里用）。"""
+        return _source_label(hit)
+
     def render_block(
         self,
         hits: Sequence[StoryHit],
@@ -857,7 +884,9 @@ class StoryKB:
                     "以下片段检索自《星陨计划》原作剧情，请当作**你自己的亲身记忆**使用：\n"
                     "- 只在与当前话题相关时自然提及，不要朗读原文，"
                     "不要提「知识库/检索/资料」之类的系统用词。\n"
-                    f"- 台词原文是英文；对团长复述时用中文口语转述，并保持{who}的语气。\n"
+                    "- 标注〔来源：…·游戏原文〕的片段是**中文原文**，可以按其措辞转述；"
+                    "标注〔来源：…·wiki〕的是英文原文+中文摘要，只转述不引用原文。\n"
+                    f"- 转述时用中文口语，并保持{who}的语气。\n"
                     "- 人名的中文写法**一律**按每段的「本段人物」一行（官方译名），"
                     "不要自己音译。\n"
                     "- 标注「你（本角色）在场」的段落你是当事人，用第一人称；"
@@ -871,7 +900,9 @@ class StoryKB:
                     "供你回答玩家问题时引用：\n"
                     "- 只在与当前话题相关时引用，不要大段朗读原文，"
                     "不要提「知识库/检索/资料」之类的系统用词。\n"
-                    "- 台词原文是英文；向玩家讲述时用中文转述。\n"
+                    "- 标注〔来源：…·游戏原文〕的片段是中文原文，可以按其措辞转述；"
+                    "标注〔来源：…·wiki〕的是英文原文+中文摘要，只转述不引用原文。\n"
+                    "- 向玩家讲述时用中文。\n"
                     "- 人名的中文写法**一律**按每段的「本段人物」一行（官方译名）。\n"
                     "- 你是助手而不是剧中角色：描述这些内容时用第三人称/说书口吻，"
                     "不要用「我亲身经历」的语气。\n"
@@ -882,7 +913,7 @@ class StoryKB:
         used = 0
         emitted = 0
         for i, hit in enumerate(hits, 1):
-            body: List[str] = [f"【{i}】{hit.label(persona_char_id)}"]
+            body: List[str] = [f"【{i}】{hit.label(persona_char_id)} {_source_label(hit)}"]
             if hit.zh_gist:
                 body.append(f"梗概：{hit.zh_gist}")
             elif hit.zh_summary:

@@ -328,6 +328,31 @@ def _known_personas_from_sessions(openid: str) -> list:
     return out
 
 
+def _known_personas_from_bonds(openid: str) -> list:
+    """羁绊数据 → 有过真实互动的人格 char_id（§4.2 数据源 1，权威源）。
+
+    bond 文件本身即 ``{char_id: state}``；只要 ``msgs>0``（确实聊过）就计入，
+    **不依赖会话是否绑定 persona_key**。修复系统性漏档：靠「默认人格」
+    （resolve 链的个人/群/全局层）攒羁绊的用户，其特殊会话 metadata 往往
+    没有 ``persona_key``——仅用 :func:`_known_personas_from_sessions` 会漏掉
+    他们，导致 known_personas 恒空 → ``_mail_candidates`` 的 ``persona not in
+    known`` 门永远拦下 → 信箱永不建档、每日信封永远收不到。
+    """
+    out = []
+    try:
+        for persona in _bond_manager.list_personas(openid):
+            if not persona or persona == "assistant":
+                continue                       # unified，不算角色
+            state = _bond_manager.get_state(openid, persona, create=False)
+            if not isinstance(state, dict):
+                continue
+            if int((state.get("stats") or {}).get("msgs", 0) or 0) > 0:
+                out.append(str(persona))
+    except Exception:
+        pass
+    return out
+
+
 def _mail_candidates(openid: str, mailbox: dict, cfg: dict) -> list:
     """过滤链（§4.2）→ [(persona, state)]，按 (level desc, last_seen asc) 排序。"""
     pm = get_character_registry()
@@ -603,11 +628,15 @@ async def _run_mail_pass(catch_up: bool = False) -> None:
             if greeting.active_sent_today(str(_GREET_QUOTA_FILE), openid,
                                           kind="media"):
                 continue                         # 双向互斥：当天已发媒体
-            # sessions 索引补齐 known_personas（一旦写入，删会话也保留）；
+            # 补齐 known_personas（一旦写入，删会话也保留）：sessions 索引
+            # （§4.2 源 2）∪ 羁绊（§4.2 源 1，权威）——后者兜住「靠默认人格
+            # 攒羁绊、会话没绑 persona_key」的用户，否则他们永远进不了候选。
             # 每用户锁：与 WebUI 管理队列 worker 串行同用户信箱 RMW（§16.7）
             async with _mail_lock(openid):
                 _mailbox_manager.ensure_known_personas(
-                    openid, _known_personas_from_sessions(openid))
+                    openid,
+                    _known_personas_from_sessions(openid)
+                    + _known_personas_from_bonds(openid))
             mailbox = _mailbox_manager.load_user(openid)
             candidates = _mail_candidates(openid, mailbox, cfg)
             if not candidates:

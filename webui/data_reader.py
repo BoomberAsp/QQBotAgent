@@ -1646,6 +1646,29 @@ def _mail_openid_known(openid: str) -> bool:
     return openid in _greet_targets()
 
 
+def _bond_personas(openid: str) -> list:
+    """羁绊文件 → 有过真实互动的角色 char_id（§4.2 数据源 1，权威）。
+
+    与 bot 侧 ``_known_personas_from_bonds`` 同源同规则（msgs>0、排除
+    assistant）。面板直接读 ``BONDS_DIR``，使**未建档（无信箱文件）用户**
+    也能正确显示人格数——信箱的 ``known_personas`` 是惰性缓存，靠默认人格
+    攒羁绊的用户在每日 mail pass 建档前会一直为空。
+    """
+    data = _load_json_file(config.BONDS_DIR / _safe_openid_file(openid))
+    if not isinstance(data, dict):
+        return []
+    out = []
+    for k, v in data.items():
+        if not str(k or "").strip() or k == "assistant" or not isinstance(v, dict):
+            continue
+        try:
+            if int((v.get("stats") or {}).get("msgs", 0) or 0) > 0:
+                out.append(str(k))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def mail_overview() -> dict:
     """统计卡：用户数 / 信件总数 / 未读 / 系统邮件 / 关闭主动消息 / 队列待处理。
 
@@ -1694,17 +1717,20 @@ def mail_users(query: str = "", page: int = 1, page_size: int = 20) -> dict:
         personas = box.get("personas") if isinstance(box.get("personas"), dict) else {}
         known = box.get("known_personas") \
             if isinstance(box.get("known_personas"), dict) else {}
+        # 人格数取并集：信箱 known_personas（惰性缓存）∪ 羁绊（权威源）。
+        # 只读信箱会漏掉「靠默认人格攒羁绊、还没建档 known_personas」的角色。
+        persona_keys = set(list(personas) + list(known)) | set(_bond_personas(openid))
         if q:
             haystack = [openid.lower()]
             haystack += [str(l.get("id") or "").lower() for l in letters]
             haystack += [str(l.get("name") or "").lower() for l in letters]
-            haystack += [str(p).lower() for p in list(personas) + list(known)]
+            haystack += [str(p).lower() for p in persona_keys]
             if not any(q in h for h in haystack if h):
                 continue
         rows.append({
             "openid": openid,
             "openid_masked": _mask_openid(openid),
-            "personas": len(known) or len(personas),
+            "personas": len(persona_keys),
             "letters": len(letters),
             "unread": sum(1 for l in letters if not l.get("read")),
             "system": sum(1 for l in letters if l.get("system")),
@@ -1718,7 +1744,9 @@ def mail_users(query: str = "", page: int = 1, page_size: int = 20) -> dict:
     for openid, entry in _greet_targets().items():
         if openid in boxed:
             continue
-        if q and q not in openid.lower():
+        bond_ps = _bond_personas(openid)
+        if q and not (q in openid.lower()
+                      or any(q in str(p).lower() for p in bond_ps)):
             continue
         try:
             last_seen = float(entry.get("last_seen") or 0)
@@ -1727,7 +1755,7 @@ def mail_users(query: str = "", page: int = 1, page_size: int = 20) -> dict:
         rows.append({
             "openid": openid,
             "openid_masked": _mask_openid(openid),
-            "personas": 0,
+            "personas": len(bond_ps),
             "letters": 0,
             "unread": 0,
             "system": 0,
@@ -1767,6 +1795,13 @@ def mail_user(openid: str) -> dict:
         d["letter_states"] = [
             {"id": lid, "withdrawn": lid not in letter_ids}
             for lid in (d.get("letter_ids") or [])]
+    known = box.get("known_personas")
+    known = dict(known) if isinstance(known, dict) else {}
+    # 羁绊是权威源（§4.2 源 1）：信箱的 known_personas 是惰性缓存，靠默认人格
+    # 攒羁绊的用户在下一次每日 mail pass 补齐前会显示为空——详情页直接合并
+    # 羁绊角色，保证与列表页 personas 计数一致（msgs=0 表示尚无已建档互动记录）。
+    for p in _bond_personas(openid):
+        known.setdefault(p, 0)
     return {
         "openid": openid,
         "openid_masked": _mask_openid(openid),
@@ -1774,8 +1809,7 @@ def mail_user(openid: str) -> dict:
         "last_digest_at": box.get("last_digest_at", 0),
         "last_digest_date": str(box.get("last_digest_date") or ""),
         "personas": box.get("personas") if isinstance(box.get("personas"), dict) else {},
-        "known_personas": box.get("known_personas")
-                          if isinstance(box.get("known_personas"), dict) else {},
+        "known_personas": known,
         "letters": letters,
         "digests": digests,
     }
