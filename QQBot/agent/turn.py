@@ -2329,6 +2329,63 @@ _tool_registry.register(
 # event->view conversion live in plugins/agent_router.py +
 # adapters/onebot.py; everything below consumes InboundMessage views.
 
+# ── Streaming delivery accounting (§6.10.11.2, 2026-10-30) ─────────
+
+def _delivered_prefix_len(response: str, streamed: str) -> int:
+    """已上屏文本里，属于最终正文前缀的最长长度（0..len(response)）。
+
+    为什么不能直接 ``response.startswith(streamed)``：回答流里除了正文，还
+    可能混进**非正文**内容——工具轮的开场白（SSE 客户端在工具碎片出现之前
+    照发 content），以及 answer 流已开时被并进去的「⏳ 正在…」进度行
+    （本文件的 _progress）。一旦混入，严格前缀判定必然失败，旧代码于是整篇
+    重发 → 用户在 QQ 里看到同一条答案两遍（2026-10-30 线上 A 形态重复）。
+
+    工具轮永远发生在最终回答轮**之前**，所以正文一定是流里最后一段连续内容
+    → 取「streamed 的后缀 == response 的前缀」的最长解即为已送达长度。
+    """
+    if not response or not streamed:
+        return 0
+    upper = min(len(streamed), len(response))
+    for k in range(upper, 0, -1):
+        if streamed.endswith(response[:k]):
+            return k
+    return 0
+
+
+def _plan_stream_delivery(response, streamer, *, happy: bool):
+    """流式回合的收尾决策（纯函数，便于单测）。
+
+    返回 ``(decision, remainder)``：
+      ``buffered_full``  一次都没开成 → 调用方走 ``_send_response(全文)``，
+                         这是唯一允许整篇发送的情形；
+      ``stream_only``    正文已全部上屏 → 不再发任何消息；
+      ``remainder``      断流且正文未上屏完 → 调用方只发 ``remainder``。
+
+    「已上屏多少」用 :func:`_delivered_prefix_len` 计算（容忍开场白/进度行
+    污染），所以 ``happy=False`` 且正文其实已全覆盖时结论是 ``stream_only``：
+    整篇重发就是用户看到的重复（A 形态）。
+    """
+    if streamer is None or not streamer.answer_opened:
+        return "buffered_full", ""
+    if happy:
+        return "stream_only", ""
+    resp = response if isinstance(response, str) else str(response or "")
+    delivered = _delivered_prefix_len(resp, streamer.answer_sent)
+    remainder = resp[delivered:]
+    if remainder.strip():
+        return "remainder", remainder
+    return "stream_only", ""
+
+
+def _stream_delivery(kind: str) -> None:
+    """流式交付决策计数（面板 status 快照读取；导入失败不影响回退逻辑）。"""
+    try:
+        from adapters.qq_official_stream import record_delivery
+        record_delivery(kind)
+    except Exception:  # noqa: BLE001 — 遥测绝不影响发送
+        pass
+
+
 async def run_agent_turn(view: InboundMessage):
     """Run one agent turn under the per-user busy guard."""
     # Platform identity (stage 4, §7.7): PermissionManager.get_role() picks
@@ -2705,6 +2762,8 @@ async def handle_agent_turn(view: InboundMessage):
     # the legacy immediate message is then skipped (saves 1 quota).
     # `streamer` is function-scoped so the except handlers can close it.
     streamer = None
+    # 本回合是否真的尝试过开流（只有尝试过的回合计入交付统计）
+    _stream_attempted = False
 
     try:
         # ── Dual-plane routing: resolve persona & its mode first ──
@@ -2733,6 +2792,7 @@ async def handle_agent_turn(view: InboundMessage):
         _sdr = _turn_sender.get() or default_sender
         if (not view.is_group and _current_render_context.get()
                 and getattr(_sdr, "supports_stream", False)):
+            _stream_attempted = True
             try:
                 streamer = await _sdr.open_stream(thinking_text)
             except Exception:
@@ -3006,21 +3066,24 @@ async def handle_agent_turn(view: InboundMessage):
             if session_type == "temporary":
                 repatch_last_assistant(_session_manager, user_id, raw_response, response)
 
-        # ── Stream close / fallback tree (§6.10.11.2) ─────────────
-        # happy:     answer fully streamed → tail + inline disclaimer as
-        #            the final shard; skip _send_response (session was
-        #            already persisted inside agent.run).
-        # truncated: DEFENSIVE ONLY — the streamer currently never sets
-        #            truncated (remain_msg_len proved not to be a send
-        #            budget, live check 2026-10-30), but if it ever does,
-        #            close the stream and ship only the REMAINDER buffered
-        #            (_send_response applies its own disclaimer policy).
-        # broken / prefix mismatch (error dict, max-iteration fallback):
-        #            resend the FULL response buffered — the half-written
-        #            stream message stays on screen (no cancel API).
-        # answer never opened (tool-only turn, kb override, open fail):
-        #            close() finishes stream #1; buffered path unchanged.
+        # ── Stream close / fallback tree (§6.10.11.2, 2026-10-30 重写) ──
+        # 铁律：回答流一旦把正文上过屏，就**绝不整篇重发**。旧版只要
+        # 「已上屏文本不是最终回复的严格前缀」就整篇补发，而工具轮开场白
+        # 或并进回答流的进度行一混入，前缀判定必然失败 → 用户在 QQ 里看到
+        # 同一条答案两遍（2026-10-30 线上 A 形态重复）。新决策只看"已送达
+        # 前缀长度"（_plan_stream_delivery）：
+        #   ① 流还活着 → 收尾片把 pending（含尾巴 + 免责）一次送完，不再
+        #      发第二条消息；
+        #   ② 流断过   → 只补 response[delivered:]（_send_response 自带免责）
+        #      delivered==0 时等价于整篇（与旧行为同）；delivered==len 时一条
+        #      都不补（正文早就全在流里，重发就是重复）；
+        #   ③ 一次都没开成（answer_opened=False）→ 缓冲路径整篇，这是唯一
+        #      允许整篇发送的情形。
+        # 前提：close() 现在对断流也补发 state=10 收尾片（平台侧未收尾的流
+        # 会被回滚到首包），否则 ② 的"只补尾巴"会丢内容。
         sent_via_stream = False
+        _decision = "buffered_full"
+        _remainder = ""
         if streamer is not None:
             _pm_disc = get_character_registry()
             _persona_disc = _current_personality.get() or _pm_disc.get_default()
@@ -3030,21 +3093,34 @@ async def handle_agent_turn(view: InboundMessage):
                      "的回答并非总是准确无误，请理性判断。")
             if _disclaimer_off(user_id):
                 _disc = ""
-            _streamed = streamer.answer_sent
-            _prefix_ok = (isinstance(response, str)
-                          and response.startswith(_streamed))
-            if (streamer.answer_opened and not streamer.broken
-                    and _prefix_ok):
-                if streamer.truncated:
-                    await streamer.finish_answer("")
-                    remainder = response[len(_streamed):].strip()
-                    if remainder or _disc:
-                        await _send_response(remainder or _disc)
-                    sent_via_stream = True
-                else:
-                    await streamer.finish_answer(_disc)
-                    sent_via_stream = not streamer.broken
-            await streamer.close()
+            # 还活着的流：末片一次送完（尾巴 + 免责），不留第二条消息。
+            if streamer.answer_opened and not streamer.broken:
+                await streamer.finish_answer(_disc)
+            _happy = streamer.answer_opened and not streamer.broken
+            await streamer.close()      # 断流也补 state=10（防平台回滚）
+            _decision, _remainder = _plan_stream_delivery(
+                response, streamer, happy=_happy)
+            if _remainder:
+                await _send_response(_remainder)
+            sent_via_stream = _decision != "buffered_full"
+        if _stream_attempted:
+            _stream_delivery(_decision)
+        if streamer is not None:
+            try:
+                from nonebot import logger as _stream_logger
+                _stream_logger.info(
+                    "[stream] turn done user={} ans_open={} broken={} "
+                    "sent={} resp={} decision={} remainder={} "
+                    "shards={}/{} retries={} last_err={}",
+                    user_id, streamer.answer_opened, streamer.broken,
+                    len(streamer.answer_sent),
+                    len(response) if isinstance(response, str) else -1,
+                    _decision, len(_remainder),
+                    streamer.progress_shards, streamer.answer_shards,
+                    streamer.retry_total, streamer.last_error or "-",
+                )
+            except Exception:  # noqa: BLE001 — 日志绝不影响发送
+                pass
         if not sent_via_stream:
             # Send response (split long messages)
             await _send_response(response)
@@ -5324,6 +5400,10 @@ async def _handle_stream_probe_command(
         return True
     s = _turn_sender.get() or default_sender
     streamer = None
+    # 探测的意义就是"现在再试一次"：先清掉长熔断，否则上面的 available
+    # 判定会把探测本身挡在门外（2026-10-30：一次 404 后探测无法复验）。
+    from adapters.qq_official_stream import stream_force_probation
+    stream_force_probation()
     try:
         opener = getattr(s, "open_stream", None)
         if opener is not None:

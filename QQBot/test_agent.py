@@ -10658,6 +10658,12 @@ class TestOfficialStream:
         asyncio.run(self.test_is_wakeup_retry_on_opening())
         asyncio.run(self.test_50002_backoff_retry())
         asyncio.run(self.test_env_off_disables_stream())
+        asyncio.run(self.test_non_expiry_code_no_wakeup_retry())
+        asyncio.run(self.test_replace_retry_is_idempotent())
+        asyncio.run(self.test_broken_stream_still_closes())
+        asyncio.run(self.test_continuation_404_keeps_capability())
+        asyncio.run(self.test_delivery_plan())
+        asyncio.run(self.test_inbound_event_dedup())
         # ③ mock client
         asyncio.run(self.test_mock_client_stream_callback())
 
@@ -10952,7 +10958,7 @@ class TestOfficialStream:
         print_pass("remain_msg_len=0 → 正常流完整送达（真机回归：不再误截断）")
 
     async def test_disclaimer_rides_final_shard(self):
-        """免责声明随末片(state10)发出；正文在开流片。"""
+        """replace 语义：每片都是累计全文；免责随末片(state10)一起上去。"""
         qs, qo = self._qs(), self._qo()
         with self._stream_guard(qs, qo):
             bot = _StreamFakeBot()
@@ -10962,11 +10968,13 @@ class TestOfficialStream:
             await st.open_answer("正文")
             await st.finish_answer("免责句")
             await st.close()
+            assert all(p["input_mode"] == "replace" for p in bot.posts), bot.posts
             ans = [p for p in bot.posts if p["msg_seq"] == 1800]
             assert ans[0]["content_raw"] == "正文", ans[0]
-            assert ans[-1]["input_state"] == 10
-            assert ans[-1]["content_raw"] == "免责句", ans[-1]
-        print_pass("免责声明随末片(state10)；正文在开流片")
+            assert ans[-1]["input_state"] == 10, ans[-1]
+            assert ans[-1]["content_raw"].startswith("正文\n\n免责句"), ans[-1]
+            assert st.answer_sent == "正文\n\n免责句", st.answer_sent
+        print_pass("replace：累计全文 + 免责随末片(state10)")
 
     async def test_progress_only_no_answer_stream(self):
         """纯工具轮（无 final content）：只收束进度流，从不开回答流。"""
@@ -11005,7 +11013,7 @@ class TestOfficialStream:
         print_pass("熔断：3 连拒 600s；冷却后半开恢复")
 
     async def test_api_not_available_long_circuit(self):
-        """ApiNotAvailable（404/405）→ unsupported + 长熔断（默认 24h）。"""
+        """开流首片 404/405：单次只记遥测，连续两次才判能力缺失（默认 1h）。"""
         qs, qo = self._qs(), self._qo()
         from nonebot.adapters.qq.exception import ApiNotAvailable
 
@@ -11016,20 +11024,29 @@ class TestOfficialStream:
             bot = _StreamFakeBot(resp)
             st = self._mk_streamer(qs, bot)
             assert await st.open_progress("⏳") is False
+            assert qs._stream_breaker.state != "unsupported"
+            assert qs._stream_breaker.disabled_until == 0.0
+            assert qs._stream_breaker.api_rejects == 1
+            st2 = self._mk_streamer(qs, bot)
+            assert await st2.open_progress("⏳") is False
             assert qs._stream_breaker.state == "unsupported"
             assert qs._stream_available() is False
-            assert qs._stream_breaker.disabled_until > time.monotonic() + 3600
-        print_pass("ApiNotAvailable → unsupported + 24h 长熔断")
+            left = qs._stream_breaker.disabled_until - time.monotonic()
+            assert 3500 < left <= 3600, left
+            qs.stream_force_probation()
+            assert qs._stream_breaker.disabled_until == 0.0
+            assert qs._stream_breaker.state == "unknown"
+        print_pass("开流 404×2 → 1h 熔断；单次不熔断；探测可强制半开复验")
 
     async def test_is_wakeup_retry_on_opening(self):
-        """开流首片被拒（非 5000x）→ is_wakeup=true 重试一次成功续流。"""
+        """开流首片被拒且是锚点过期类 → is_wakeup=true 重试一次。"""
         qs, qo = self._qs(), self._qo()
         calls = {"n": 0}
 
         def resp(payload):
             calls["n"] += 1
             if calls["n"] == 1:
-                raise _stream_action_failed(40007)
+                raise _stream_action_failed(40034005)
             return _StreamFakeBot._default_responder(payload)
 
         with self._stream_guard(qs, qo):
@@ -11039,7 +11056,26 @@ class TestOfficialStream:
             assert calls["n"] == 2
             assert "is_wakeup" not in bot.posts[0]
             assert bot.posts[1].get("is_wakeup") is True
-        print_pass("is_wakeup：开流首片失败 → 携 is_wakeup 重试成功")
+            assert st.retry_total == 1
+        print_pass("is_wakeup：只有锚点过期类(40034005)才重试一次")
+
+    async def test_non_expiry_code_no_wakeup_retry(self):
+        """40007 等非锚点过期码 → 不发起 is_wakeup 重试（避免开第二条流）。"""
+        qs, qo = self._qs(), self._qo()
+        calls = {"n": 0}
+
+        def resp(payload):
+            calls["n"] += 1
+            raise _stream_action_failed(40007)
+
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot(resp)
+            st = self._mk_streamer(qs, bot)
+            assert await st.open_progress("⏳") is False
+            assert calls["n"] == 1, calls
+            assert st.broken is True
+            assert all("is_wakeup" not in p for p in bot.posts), bot.posts
+        print_pass("非锚点过期错误码：不发起 is_wakeup 重试")
 
     async def test_50002_backoff_retry(self):
         """50002 频率限制 → 退避重试一次（同 payload，不带 is_wakeup）。"""
@@ -11079,6 +11115,145 @@ class TestOfficialStream:
             os.environ["QQ_OFFICIAL_STREAM"] = "on"
             assert qs._stream_available() is True
         print_pass("env kill-switch：off→False / on→True（热读）")
+
+    async def test_replace_retry_is_idempotent(self):
+        """续片网络重试：重发同一份累计正文（replace）→ answer_sent 不翻倍。"""
+        qs, qo = self._qs(), self._qo()
+        calls = {"n": 0}
+
+        def resp(payload):
+            calls["n"] += 1
+            if calls["n"] == 4:          # 第二次回答分片的首个尝试
+                from nonebot.adapters.qq.exception import NetworkError
+                raise NetworkError("timeout")
+            return _StreamFakeBot._default_responder(payload)
+
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot(resp)
+            st = self._mk_streamer(qs, bot)
+            await st.open_progress("⏳")
+            await st.finish_progress()
+            await st.open_answer("你好")
+            st.append_answer("，世界")
+            await asyncio.sleep(0.6)     # 让 flusher 跑一轮（interval 0.2）
+            await st.finish_answer("")
+            await st.close()
+            assert st.broken is False, st.last_error
+            assert st.retry_total >= 1, st.retry_total
+            assert st.answer_sent == "你好，世界", st.answer_sent
+            ans = [p for p in bot.posts if p["msg_seq"] == 1800]
+            retried = [p for p in ans if p["content_raw"] == "你好，世界"]
+            assert len(retried) == 2, ans
+            assert retried[0]["index"] == retried[1]["index"], retried
+        print_pass("replace：续片重试复用同一 index/同一累计正文 → 不重复上屏")
+
+    async def test_broken_stream_still_closes(self):
+        """断流后 close() 仍补发 state=10，且只重复已上屏正文。"""
+        qs, qo = self._qs(), self._qo()
+        calls = {"n": 0}
+
+        def resp(payload):
+            calls["n"] += 1
+            if calls["n"] == 4:          # finish_answer 的末片被拒
+                raise _stream_action_failed(40007)
+            return _StreamFakeBot._default_responder(payload)
+
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot(resp)
+            st = self._mk_streamer(qs, bot)
+            await st.open_progress("⏳")
+            await st.finish_progress()
+            await st.open_answer("前半")
+            st.append_answer("后半")
+            await st.finish_answer("")
+            assert st.broken is True
+            await st.close()
+            ans = [p for p in bot.posts if p["msg_seq"] == 1800]
+            assert ans[-1]["input_state"] == 10, ans[-1]
+            assert ans[-1]["content_raw"].startswith("前半"), ans[-1]
+            assert "后半" not in ans[-1]["content_raw"], ans[-1]
+            assert st.answer_sent == "前半", st.answer_sent
+        print_pass("断流收尾：close() 补发 state=10，不重复未送达内容")
+
+    async def test_continuation_404_keeps_capability(self):
+        """续片 404/405 → 只断这条流，能力位与后续流式不受影响。"""
+        qs, qo = self._qs(), self._qo()
+        from nonebot.adapters.qq.exception import ApiNotAvailable
+        calls = {"n": 0}
+
+        def resp(payload):
+            calls["n"] += 1
+            if calls["n"] == 4:
+                raise ApiNotAvailable()
+            return _StreamFakeBot._default_responder(payload)
+
+        with self._stream_guard(qs, qo):
+            bot = _StreamFakeBot(resp)
+            st = self._mk_streamer(qs, bot)
+            await st.open_progress("⏳")
+            await st.finish_progress()
+            await st.open_answer("正文")
+            st.append_answer("尾巴")
+            await st.finish_answer("")
+            assert st.broken is True
+            await st.close()
+            assert qs._stream_breaker.state == "ok", qs._stream_breaker
+            assert qs._stream_breaker.disabled_until == 0.0
+            assert qs._stream_breaker.shard_404_total == 1
+            assert qs._stream_available() is True
+            assert st.last_error == "api_not_available"
+        print_pass("续片 404：断开本条流，能力位保持 ok（不再 24h 误熔断）")
+
+    async def test_delivery_plan(self):
+        """收尾决策：开场白污染不重发 / 断流只补尾巴 / 未开流整篇。"""
+        import types
+        from agent import turn as _turn
+        dpl = _turn._delivered_prefix_len
+        plan = _turn._plan_stream_delivery
+
+        # ① 开场白 + 进度行污染：正文已全覆盖 → 一条都不补（A 形态根治）
+        st = types.SimpleNamespace(
+            answer_opened=True,
+            answer_sent="好的我查一下\n\n⏳ 正在搜索…\n\n今天的新闻是……",
+        )
+        resp = "今天的新闻是……"
+        assert dpl(resp, st.answer_sent) == len(resp), dpl(resp, st.answer_sent)
+        assert plan(resp, st, happy=False) == ("stream_only", "")
+
+        # ② 中途断裂：只补未上屏的尾巴
+        st2 = types.SimpleNamespace(answer_opened=True, answer_sent="今天的新闻")
+        decision, remainder = plan("今天的新闻是……", st2, happy=False)
+        assert (decision, remainder) == ("remainder", "是……"), (decision, remainder)
+
+        # ③ 一片没上屏 → 整篇（与旧行为一致，内容不丢）
+        st3 = types.SimpleNamespace(answer_opened=False, answer_sent="")
+        assert plan("全文", st3, happy=False) == ("buffered_full", "")
+
+        # ④ 流还活着 → 收尾片已送完，不再补
+        st4 = types.SimpleNamespace(answer_opened=True, answer_sent="全文")
+        assert plan("全文", st4, happy=True) == ("stream_only", "")
+
+        # ⑤ 无重叠（如兜底文案替换）：delivered=0 → 整篇补发
+        st5 = types.SimpleNamespace(answer_opened=True, answer_sent="完全无关")
+        assert dpl("正文", "完全无关") == 0
+        assert plan("正文", st5, happy=False) == ("remainder", "正文")
+        print_pass("交付决策：开场白污染不重发 / 断流只补尾巴 / 未开流整篇")
+
+    async def test_inbound_event_dedup(self):
+        """同一 msg_id 重推（平台文档明确可能发生）只处理一次。"""
+        import plugins.qq_official as po
+        po._seen_events.clear()
+        anchor = "ROBOT1.0_TEST_ANCHOR"
+        try:
+            assert po._is_duplicate_event(anchor) is False
+            assert po._is_duplicate_event(anchor) is True
+            assert po._is_duplicate_event("ROBOT1.0_OTHER") is False
+            assert po._is_duplicate_event("") is False
+            po._seen_events[anchor] = time.time() - po._SEEN_EVENT_TTL - 1
+            assert po._is_duplicate_event(anchor) is False
+        finally:
+            po._seen_events.clear()
+        print_pass("入站事件去重：同锚点 60s 内只处理一次，过期放行")
 
     # ── ③ mock client ────────────────────────────────────────────
     async def test_mock_client_stream_callback(self):
@@ -12370,6 +12545,968 @@ class TestProactiveMail:
         print_pass("§6.5 /免责声明：状态查询/开/关/英文变体/#前缀/确认回复自身不带免责尾")
 
 
+class TestMailAdmin:
+    """56. WebUI 邮件管理（proactive-mail-design.md §16.2/§16.4）：
+    mailbox 系统信/撤回语义、/邮件 撤回分支、_mail_admin_exec 白名单与
+    校验链、worker 认领/启动恢复、data_reader 邮件 API（脱敏/幂等入队）."""
+
+    PATCHED = ("_mailbox_manager", "_bond_manager", "_get_qq_bot",
+               "send_active_c2c_markdown", "random",
+               "_MAIL_QUEUE_DIR", "_MAIL_PROC_DIR", "_MAIL_STATUS_DIR")
+
+    def run(self):
+        print_header("56. Mail Admin (WebUI 邮件管理 §16)")
+        _import_turn_for_tests()
+        import nonebot
+        try:
+            nonebot.init()
+        except ValueError:
+            pass
+        import plugins.qq_official as po
+        self.po = po
+        self.tmp = tempfile.mkdtemp(prefix="mail_admin_")
+        self._setup()
+        try:
+            self.test_system_letter_and_withdraw()
+            asyncio.run(self.test_mail_command_system_and_withdrawn())
+            asyncio.run(self.test_admin_exec())
+            self.test_admin_recover()
+            asyncio.run(self.test_admin_worker())
+            self.test_webui_mail_api()
+        finally:
+            self._teardown()
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ── setup / teardown ─────────────────────────────────────────
+
+    def _setup(self):
+        from pathlib import Path as _Path
+        from agent.mailbox import MailboxManager
+        po = self.po
+        self.mb = MailboxManager(base_dir=os.path.join(self.tmp, "mailboxes"))
+        self.m = _tmp_bond_manager(self.tmp)
+        self.c2c_sends = []
+        self.c2c_ok = True
+        self._orig = {k: getattr(po, k) for k in self.PATCHED}
+
+        async def fake_c2c(bot, openid, md, rows=None, plain_text=None):
+            self.c2c_sends.append(
+                {"openid": openid, "md": md, "plain": plain_text})
+            return self.c2c_ok
+
+        po._mailbox_manager = self.mb
+        po._bond_manager = self.m
+        po._get_qq_bot = lambda: MagicMock()
+        po.send_active_c2c_markdown = fake_c2c
+        po.random = _FakeRandom()
+        po._MAIL_QUEUE_DIR = _Path(self.tmp) / "queue"
+        po._MAIL_PROC_DIR = _Path(self.tmp) / "processing"
+        po._MAIL_STATUS_DIR = _Path(self.tmp) / "status"
+        for d in (po._MAIL_QUEUE_DIR, po._MAIL_PROC_DIR, po._MAIL_STATUS_DIR):
+            d.mkdir(parents=True, exist_ok=True)
+
+    def _teardown(self):
+        for k, v in self._orig.items():
+            setattr(self.po, k, v)
+
+    # ── §16.4.3 存储语义：系统信入账 + 删除=撤回 ─────────────────
+
+    def test_system_letter_and_withdraw(self):
+        mb = self.mb
+        now = time.time()
+        # 系统信：字段齐全，不动 personas/known_personas/last_digest_*
+        sid = mb.write_system_letter("sys_u", "维护通知", "今晚十点停服",
+                                     now=now)
+        box = mb.load_user("sys_u")
+        sl = next(l for l in box["letters"] if l["id"] == sid)
+        assert sl["persona"] == "__system__" and sl["name"] == "系统"
+        assert sl["system"] is True and sl["title"] == "维护通知"
+        assert sl["digest_id"] is None and sl["read"] is False
+        assert sl["preview"] == "今晚十点停服"
+        assert box["personas"] == {} and box["known_personas"] == {}
+        assert box["last_digest_date"] == "" and box["last_digest_at"] == 0
+        # 角色信 + 信封 → 删除后 digest 仍引用（撤回语义，§16.4.3）
+        did = mb.record_digest(
+            "adm_u", [{"persona": "rubi", "name": "露比", "text": "想你了"}],
+            now=now)
+        lid = mb.load_user("adm_u")["letters"][0]["id"]
+        assert mb.delete_letter("adm_u", lid) is True
+        assert mb.get_letter("adm_u", lid) is None
+        assert mb.delete_letter("adm_u", lid) is False      # 幂等：再删 False
+        box = mb.load_user("adm_u")
+        assert lid in box["digests"][0]["letter_ids"]       # 信封历史保留
+        # is_withdrawn 三态：digest 引用→True；仍在→False；从未存在→False
+        assert mb.is_withdrawn("adm_u", lid) is True
+        assert mb.is_withdrawn("sys_u", sid) is False
+        assert mb.is_withdrawn("adm_u", "L-19990101-ffff") is False
+        assert mb.is_withdrawn("adm_u", "") is False
+        print_pass("§16.4.3 系统信入账（不动角色态）+ 删除=撤回（digest 留痕）")
+
+    # ── /邮件：撤回分支 + 系统信标签/详情头 ───────────────────────
+
+    async def test_mail_command_system_and_withdrawn(self):
+        turn = _import_turn_for_tests()
+
+        class _RecSender:
+            platform = "onebot"
+            max_messages_per_turn = 50
+            supports_markdown = False
+
+            def __init__(self):
+                self.out = []
+
+            async def send_text(self, x): self.out.append(x)
+            async def send_markdown(self, x): self.out.append(x)
+            async def send_image(self, x): pass
+            async def send_audio(self, x): pass
+            async def send_progress(self, x, *, immediate=False): pass
+
+        orig_mb = turn._mailbox_manager
+        old_sender = turn.default_sender
+        try:
+            turn._mailbox_manager = self.mb
+            s = _RecSender(); turn.default_sender = s
+            view = types.SimpleNamespace(platform="qq_official",
+                                         is_group=False)
+            uid = "cmd_adm_u"
+            now = time.time()
+            # 手工建档：已撤回信（digest 引用）+ 普通角色信 + 系统信
+            box = self.mb.load_user(uid)
+            box["letters"] = [
+                {"id": "L-20261029-0001", "persona": "rubi", "name": "露比",
+                 "text": "昨天见", "preview": "昨天见",
+                 "created_at": now - 86400, "read": True, "digest_id": "D-1"},
+                {"id": "L-20261030-0009", "persona": "roxy", "name": "罗克西",
+                 "text": "今天见", "preview": "今天见",
+                 "created_at": now, "read": False, "digest_id": None},
+            ]
+            box["digests"] = [{"id": "D-1", "date": "2026-10-29",
+                               "letter_ids": ["L-20261029-0001"],
+                               "sent_at": now - 80000}]
+            self.mb.save_user(uid, box)
+            assert self.mb.delete_letter(uid, "L-20261029-0001")
+            sys_lid = self.mb.write_system_letter(uid, "维护通知", "今晚停服",
+                                                  now=now)
+            # 列表：系统信显示【系统】+标题，角色信显示名字
+            assert await turn._handle_mail_command("/邮件", uid, view)
+            page = s.out[-1]
+            assert "【系统】维护通知" in page and "罗克西" in page
+            assert "L-20261029-0001" not in page       # 已删的信不在列表
+            # 撤回编号 → 「已被撤回」，与「查无此信」区分（大小写均命中）
+            for variant in ("L-20261029-0001", "l-20261029-0001"):
+                s.out.clear()
+                assert await turn._handle_mail_command(
+                    f"/邮件 {variant}", uid, view)
+                assert "已被撤回" in s.out[-1]
+            # 系统信详情：【系统邮件 · 标题 · 日期】+ 标记已读
+            s.out.clear()
+            assert await turn._handle_mail_command(f"/邮件 {sys_lid}", uid,
+                                                   view)
+            assert "【系统邮件 · 维护通知" in s.out[-1]
+            assert "今晚停服" in s.out[-1]
+            assert self.mb.get_letter(uid, sys_lid)["read"] is True
+            # 真正不存在的编号仍走「没有找到」
+            s.out.clear()
+            assert await turn._handle_mail_command("/邮件 L-19990101-ffff",
+                                                   uid, view)
+            assert "没有找到" in s.out[-1]
+        finally:
+            turn._mailbox_manager = orig_mb
+            turn.default_sender = old_sender
+        print_pass("§16.4 /邮件：撤回分支（大小写）/【系统】标签/系统信详情已读")
+
+    # ── §16.4.2/§16.4.4 _mail_admin_exec：白名单 + 校验链 ─────────
+
+    async def test_admin_exec(self):
+        po = self.po
+        mb = self.mb
+        now = time.time()
+        exec_op = po._mail_admin_exec
+        # 白名单外类型 / 缺 openid / 缺 letter_id
+        st, err = await exec_op({"type": "edit_letter", "openid": "x",
+                                 "letter_id": "L"})
+        assert st == "failed" and "非法操作类型" in err
+        st, _ = await exec_op({"type": "delete_letter"})
+        assert st == "failed"
+        st, err = await exec_op({"type": "delete_letter", "openid": "u"})
+        assert st == "failed" and "letter_id" in err
+        # delete_letter：成功 / 不存在
+        uid = "exec_u"
+        box = mb.load_user(uid)
+        box["letters"] = [{"id": "L-20261030-0002", "persona": "p",
+                           "name": "n", "text": "t", "preview": "t",
+                           "created_at": now, "read": False,
+                           "digest_id": None}]
+        mb.save_user(uid, box)
+        st, _ = await exec_op({"type": "delete_letter", "openid": uid,
+                               "letter_id": "L-20261030-0002"})
+        assert st == "done" and mb.get_letter(uid, "L-20261030-0002") is None
+        st, err = await exec_op({"type": "delete_letter", "openid": uid,
+                                 "letter_id": "L-20261030-0002"})
+        assert st == "failed" and "信件不存在" in err
+        # send_system 校验链：空/超长/format
+        base = {"type": "send_system", "openid": uid, "title": "T",
+                "body": "B"}
+        assert (await exec_op({**base, "title": "  "}))[0] == "failed"
+        assert (await exec_op({**base, "title": "x" * 61}))[0] == "failed"
+        assert (await exec_op({**base, "body": "x" * 2001}))[0] == "failed"
+        st, err = await exec_op({**base, "format": "html"})
+        assert st == "failed" and "format" in err
+        # 拒收用户 → 失败并给出原因（不发送）
+        mb.set_active_enabled(uid, False)
+        self.c2c_sends.clear()
+        st, err = await exec_op(base)
+        assert st == "failed" and "拒收" in err and not self.c2c_sends
+        mb.set_active_enabled(uid, True)
+        # 官方 bot 未连接
+        po._get_qq_bot = lambda: None
+        st, err = await exec_op(base)
+        assert st == "failed" and "未连接" in err
+        po._get_qq_bot = lambda: MagicMock()
+        # 发送失败 → 不入账
+        self.c2c_ok = False
+        st, err = await exec_op(base)
+        assert st == "failed" and "发送失败" in err
+        assert not any(l.get("system") for l in mb.load_user(uid)["letters"])
+        # 成功 → md/plain 文案 + 信箱入账
+        self.c2c_ok = True
+        self.c2c_sends.clear()
+        st, err = await exec_op({**base, "title": "*维护*",
+                                 "body": "今晚十点\n- 项目一"})
+        assert st == "done"
+        send = self.c2c_sends[-1]
+        assert send["openid"] == uid
+        assert send["md"].startswith("## 系统邮件 · ＊维护＊")   # 全角转义
+        assert "\u3000- 项目一" in send["md"]                    # 行首列表符
+        assert "> 发送 `/邮件` 查看信箱" in send["md"]
+        assert send["plain"].startswith("【系统邮件 · *维护*】")
+        assert "发送 /邮件 查看信箱" in send["plain"]
+        sl = [l for l in mb.load_user(uid)["letters"] if l.get("system")]
+        assert len(sl) == 1 and sl[0]["title"] == "*维护*"
+        assert sl[0]["read"] is False and sl[0]["digest_id"] is None
+        print_pass("§16.4 exec：白名单/校验链/拒收原因/失败不入账/成功入账+文案")
+
+    # ── §16.4.3.6 启动恢复 ────────────────────────────────────────
+
+    def test_admin_recover(self):
+        po = self.po
+        # 残留 processing → failed 状态（bot restarted）+ 清理
+        proc = po._MAIL_PROC_DIR / "mailop_20261030_abcd.json"
+        proc.write_text(json.dumps(
+            {"id": "mailop_20261030_abcd", "type": "delete_letter",
+             "openid": "u"}), encoding="utf-8")
+        # status 保留 7 天（W5）：8 天前的清掉，新的保留
+        old = po._MAIL_STATUS_DIR / "mailop_old.json"
+        old.write_text(json.dumps({"id": "mailop_old", "state": "done"}),
+                       encoding="utf-8")
+        t8 = time.time() - 8 * 86400
+        os.utime(old, (t8, t8))
+        fresh = po._MAIL_STATUS_DIR / "mailop_fresh.json"
+        fresh.write_text(json.dumps({"id": "mailop_fresh", "state": "done"}),
+                         encoding="utf-8")
+        po._mail_admin_recover()
+        assert not proc.exists()
+        st = json.loads((po._MAIL_STATUS_DIR /
+                         "mailop_20261030_abcd.json").read_text("utf-8"))
+        assert st["state"] == "failed" and "bot restarted" in st["error"]
+        assert not old.exists() and fresh.exists()
+        # 损坏 processing 文件 → 以文件名为 id 记 failed
+        bad = po._MAIL_PROC_DIR / "mailop_bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        po._mail_admin_recover()
+        assert not bad.exists()
+        st = json.loads((po._MAIL_STATUS_DIR /
+                         "mailop_bad.json").read_text("utf-8"))
+        assert st["state"] == "failed"
+        print_pass("§16.4.3.6 恢复：残留认领→failed(bot restarted)/status 剪 7 天")
+
+    # ── §16.2 队列 worker：认领 → 执行 → 回写 ─────────────────────
+
+    async def test_admin_worker(self):
+        po = self.po
+        uid = "worker_u"
+        now = time.time()
+        box = self.mb.load_user(uid)
+        box["letters"] = [{"id": "L-20261030-0003", "persona": "p",
+                           "name": "n", "text": "t", "preview": "t",
+                           "created_at": now, "read": False,
+                           "digest_id": None}]
+        self.mb.save_user(uid, box)
+        q = po._MAIL_QUEUE_DIR
+        (q / "mailop_w001.json").write_text(json.dumps(
+            {"id": "mailop_w001", "type": "delete_letter", "openid": uid,
+             "letter_id": "L-20261030-0003"}), encoding="utf-8")
+        (q / "mailop_w002.json").write_text("{broken", encoding="utf-8")
+        (q / "mailop_w003.json").write_text(json.dumps(
+            {"id": "mailop_w003", "type": "send_system", "openid": uid,
+             "title": "T", "body": "B"}), encoding="utf-8")
+        self.c2c_ok = True
+        self.c2c_sends.clear()
+
+        real_sleep = asyncio.sleep
+        calls = {"n": 0}
+
+        async def fast_sleep(delay, *a, **k):
+            calls["n"] += 1
+            if calls["n"] > 10:
+                raise asyncio.CancelledError      # 终止无限扫描循环
+            await real_sleep(0)
+
+        with patch.object(asyncio, "sleep", fast_sleep):
+            task = asyncio.ensure_future(po._mail_admin_worker())
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        # 队列/认领目录清空；status 逐项回写
+        assert list(q.glob("*.json")) == []
+        assert list(po._MAIL_PROC_DIR.glob("*.json")) == []
+        st1 = json.loads((po._MAIL_STATUS_DIR /
+                          "mailop_w001.json").read_text("utf-8"))
+        assert st1["state"] == "done"
+        st2 = json.loads((po._MAIL_STATUS_DIR /
+                          "mailop_w002.json").read_text("utf-8"))
+        assert st2["state"] == "failed" and "队列文件损坏" in st2["error"]
+        st3 = json.loads((po._MAIL_STATUS_DIR /
+                          "mailop_w003.json").read_text("utf-8"))
+        assert st3["state"] == "done" and st3["error"] == ""
+        # 副作用落地：信件被删 + 系统信入账（仅发了一次 c2c）
+        assert self.mb.get_letter(uid, "L-20261030-0003") is None
+        assert len(self.c2c_sends) == 1
+        assert any(l.get("system") for l in self.mb.load_user(uid)["letters"])
+        print_pass("§16.2 worker：认领(os.replace)/损坏文件 failed/执行回写 status")
+
+    # ── WebUI data_reader 邮件 API（§16.4.1/§16.4.2/W4）───────────
+
+    def test_webui_mail_api(self):
+        from pathlib import Path as _Path
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from webui import data_reader as dr
+        from agent.mailbox import MailboxManager
+        tmp = _Path(self.tmp) / "webui"
+        (tmp / "mailboxes").mkdir(parents=True, exist_ok=True)
+        mb2 = MailboxManager(base_dir=str(tmp / "mailboxes"))
+        now = time.time()
+        oa = "AAAAAAAAAAAABBBBCCCC"
+        mb2.record_digest(oa, [{"persona": "rubi", "name": "露比",
+                                "text": "信内容"}], now=now)
+        lid_a = mb2.load_user(oa)["letters"][0]["id"]
+        mb2.write_system_letter(oa, "系统标题", "系统正文", now=now)
+        mb2.set_active_enabled(oa, False)
+        mb2.record_digest("DDDD1234", [{"persona": "roxy", "name": "罗克西",
+                                        "text": "hi"}], now=now - 100)
+        lid_d = mb2.load_user("DDDD1234")["letters"][0]["id"]
+        # 仅登记过主动发送、还没有信箱文件的用户
+        (tmp / "greet.json").write_text(json.dumps({"EEEE9999": {}}),
+                                        encoding="utf-8")
+        with patch.object(dr, "MAILBOX_DIR", tmp / "mailboxes"), \
+                patch.object(dr, "MAIL_QUEUE_DIR", tmp / "queue"), \
+                patch.object(dr, "MAIL_PROC_DIR", tmp / "proc"), \
+                patch.object(dr, "MAIL_STATUS_DIR", tmp / "status"), \
+                patch.object(dr, "GREET_TARGETS_FILE", tmp / "greet.json"):
+            # W4 脱敏
+            assert dr._mask_openid(oa) == "AAAA…CCCC"
+            assert dr._mask_openid("short") == "sh…"
+            assert dr._mask_openid("") == ""
+            # 统计卡
+            ov = dr.mail_overview()
+            assert ov == {"users": 2, "letters": 3, "unread": 3,
+                          "system_letters": 1, "disabled_users": 1,
+                          "queue_pending": 0}, ov
+            # 用户列表：排序（最近信封在前）+ 脱敏 + 搜索
+            page = dr.mail_users()
+            assert page["total"] == 2
+            rows = page["items"]
+            assert rows[0]["openid"] == oa and rows[0]["openid_masked"] == "AAAA…CCCC"
+            assert rows[0]["active_enabled"] is False and rows[0]["system"] == 1
+            assert rows[0]["letters"] == 2 and rows[0]["unread"] == 2
+            hit = dr.mail_users(query="roxy")
+            assert hit["total"] == 1 and hit["items"][0]["openid"] == "DDDD1234"
+            hit = dr.mail_users(query=lid_a)
+            assert hit["total"] == 1 and hit["items"][0]["openid"] == oa
+            assert dr.mail_users(query="查无此人")["total"] == 0
+            # 详情：全文 openid + 倒序信件 + digest letter_states
+            d = dr.mail_user(oa)
+            assert d["openid"] == oa and d["active_enabled"] is False
+            ts = [l["created_at"] for l in d["letters"]]
+            assert ts == sorted(ts, reverse=True)
+            assert d["digests"][0]["letter_states"] == \
+                [{"id": lid_a, "withdrawn": False}]
+            mb2.delete_letter(oa, lid_a)
+            d = dr.mail_user(oa)
+            assert d["digests"][0]["letter_states"] == \
+                [{"id": lid_a, "withdrawn": True}]
+            # greet-only 用户 → 空信箱视图；未知用户 → error
+            g = dr.mail_user("EEEE9999")
+            assert g["letters"] == [] and g["active_enabled"] is True
+            assert "error" in dr.mail_user("NO_SUCH_USER_XX")
+            # 删除入队：信件必须存在；成功写 queue 文件；重复入队拒绝
+            assert "error" in dr.mail_enqueue_delete("DDDD1234", "L-nope")
+            assert "error" in dr.mail_enqueue_delete("NO_SUCH_USER_XX", lid_d)
+            r = dr.mail_enqueue_delete("DDDD1234", lid_d)
+            assert r.get("ok") and r["id"].startswith("mailop_")
+            op = json.loads((tmp / "queue" / f"{r['id']}.json")
+                            .read_text("utf-8"))
+            assert op["type"] == "delete_letter" and op["openid"] == "DDDD1234"
+            assert op["letter_id"] == lid_d and op["created_at"]
+            r2 = dr.mail_enqueue_delete("DDDD1234", lid_d)
+            assert "已在队列" in r2.get("error", "")
+            # 系统邮件入队：校验链 / 去重 / 未知用户 / 批量 / 同标题幂等
+            assert "error" in dr.mail_enqueue_send([], "t", "b")
+            assert "error" in dr.mail_enqueue_send("DDDD1234", "", "b")
+            assert "error" in dr.mail_enqueue_send(["DDDD1234"], "t" * 61, "b")
+            assert "error" in dr.mail_enqueue_send(["DDDD1234"], "t", "x" * 2001)
+            assert "format" in dr.mail_enqueue_send(
+                ["DDDD1234"], "t", "b", format="html").get("error", "")
+            assert "error" in dr.mail_enqueue_send(["GHOST_USER_X"], "t", "b")
+            r = dr.mail_enqueue_send(["DDDD1234", "DDDD1234", "EEEE9999"],
+                                     "通知", "正文", format="markdown")
+            assert r.get("ok") and r["count"] == 2 and len(r["ids"]) == 2
+            r2 = dr.mail_enqueue_send(["EEEE9999"], "通知", "正文")
+            assert "同标题" in r2.get("error", "")
+            # 队列状态：pending 脱敏（不含裸 openid）+ recent 读 status
+            (tmp / "status").mkdir(parents=True, exist_ok=True)
+            (tmp / "status" / "mailop_done.json").write_text(json.dumps(
+                {"id": "mailop_done", "state": "done", "error": "",
+                 "finished_at": now}), encoding="utf-8")
+            qs = dr.mail_queue_status()
+            assert len(qs["pending"]) == 3
+            for p in qs["pending"]:
+                assert "openid" not in p and p["openid_masked"]
+                assert p["state"] == "pending" and p["type"] in (
+                    "delete_letter", "send_system")
+            assert qs["recent"][0]["id"] == "mailop_done"
+        print_pass("§16.4 WebUI API：脱敏/统计/搜索/详情撤回标记/入队校验+幂等")
+
+
+class TestAnnouncementBroadcast:
+    """57. 公告与双渠道群发（proactive-mail-design.md §16.3/§16.5）：
+    tools.changelog 公告存储、send_active_group 错误分类（ok/left/failed +
+    md 降级）、_do_broadcast kind/渠道分流/skipped/legacy 兼容、
+    data_reader 公告 API 与目标归一化."""
+
+    def run(self):
+        print_header("57. Announcement Broadcast (公告群发 §16.3/§16.5)")
+        _import_turn_for_tests()
+        import nonebot
+        try:
+            nonebot.init()
+        except ValueError:
+            pass
+        self.test_changelog_announcements_store()
+        asyncio.run(self.test_send_active_group())
+        asyncio.run(self.test_do_broadcast())
+        self.test_webui_announcement_api()
+
+    # ── §16.3 存储（tools/changelog.py）──────────────────────────
+
+    def test_changelog_announcements_store(self):
+        from tools import changelog as cl
+        tmp = tempfile.mkdtemp(prefix="ann_store_")
+        try:
+            with patch.object(cl, "ANNOUNCEMENTS_FILE",
+                              os.path.join(tmp, "announcements.json")), \
+                    patch.object(cl, "KNOWN_GROUPS_FILE",
+                                 os.path.join(tmp, "known_groups.json")):
+                assert cl.load_announcements() == []        # 缺失 → 空
+                assert cl.get_announcement("ann_x") is None
+                cl.save_announcements([
+                    {"id": "ann_20261030_000001", "title": "维护",
+                     "body": "今晚停服", "format": "text", "created_at": 100.0}])
+                ann = cl.get_announcement("ann_20261030_000001")
+                assert ann and ann["title"] == "维护"
+                # 群发成功回写 sent_at/last_targets（bot 是唯一写者）
+                assert cl.mark_announcement_sent(
+                    "ann_20261030_000001",
+                    [{"channel": "onebot", "id": "111"}], ts=200.0)
+                ann = cl.get_announcement("ann_20261030_000001")
+                assert ann["sent_at"] == 200.0
+                assert ann["last_targets"] == [{"channel": "onebot",
+                                                "id": "111"}]
+                assert cl.mark_announcement_sent("ann_nope", []) is False
+                assert cl.format_announcement_text(ann) == \
+                    "📢 公告\n维护\n\n今晚停服"
+                # 损坏文件 → 空列表降级
+                with open(cl.ANNOUNCEMENTS_FILE, "w") as f:
+                    f.write("{bad")
+                assert cl.load_announcements() == []
+                # write_known_groups：OneBot + 官方两段（§16.5.1）
+                cl.write_known_groups(
+                    {"111": {"name": "群A", "member_count": 3}},
+                    official_groups={"OID1": {"status": "active",
+                                              "active_enabled": True,
+                                              "last_seen_at": 5.0}})
+                data = cl.read_known_groups()
+                assert data["groups"]["111"]["name"] == "群A"
+                assert data["official_groups"]["OID1"]["status"] == "active"
+                assert data["updated_at"] > 0
+                cl.write_known_groups({})       # 缺省 official_groups → {}
+                assert cl.read_known_groups()["official_groups"] == {}
+            print_pass("§16.3 公告存储：CRUD/sent_at 回写/损坏降级/双段群列表")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── §16.5.3.4 send_active_group：ok/left/failed + md 降级 ─────
+
+    async def test_send_active_group(self):
+        import contextlib
+        import adapters.qq_official as qo
+        from nonebot.adapters.qq.exception import NetworkError
+
+        class _GroupBot:
+            """send_to_group 假 bot：按预置序列抛错，记录成功发送。"""
+
+            def __init__(self, fails=()):
+                self.sent = []
+                self.calls = 0
+                self._fails = list(fails)
+
+            async def send_to_group(self, *, group_openid, message):
+                self.calls += 1
+                if self._fails:
+                    f = self._fails.pop(0)
+                    if f == "net":
+                        raise NetworkError("timeout")
+                    raise _stream_action_failed(f)
+                self.sent.append((group_openid, message))
+
+        @contextlib.contextmanager
+        def guard():
+            r, du = qo._md_breaker.rejects, qo._md_breaker.disabled_until
+            env = os.environ.pop("QQ_OFFICIAL_MARKDOWN", None)
+            qo._md_breaker.rejects, qo._md_breaker.disabled_until = 0, 0.0
+            try:
+                yield
+            finally:
+                qo._md_breaker.rejects, qo._md_breaker.disabled_until = r, du
+                if env is not None:
+                    os.environ["QQ_OFFICIAL_MARKDOWN"] = env
+
+        real_sleep = asyncio.sleep
+
+        async def zero_sleep(d, *a, **k):
+            await real_sleep(0)
+
+        with guard(), patch.object(asyncio, "sleep", zero_sleep):
+            sag = qo.send_active_group
+            # 纯文本 ok（无 msg_id = 主动群消息）
+            bot = _GroupBot()
+            assert await sag(bot, "G1", "你好") == "ok"
+            gid, msg = bot.sent[0]
+            assert gid == "G1" and msg.type == "text" \
+                and msg.data["text"] == "你好"
+            # md tier：markdown 段 + 成功清零熔断计数
+            qo._md_breaker.rejects = 2
+            bot = _GroupBot()
+            assert await sag(bot, "G1", "plain", md_text="## md") == "ok"
+            assert bot.sent[0][1].type == "markdown"
+            assert qo._md_breaker.rejects == 0
+            # md 被拒（40034011）→ 记熔断 + 降级纯文本重发一次 → ok
+            bot = _GroupBot(fails=[40034011])
+            assert await sag(bot, "G1", "纯文本", md_text="## md") == "ok"
+            assert bot.calls == 2 and bot.sent[0][1].type == "text"
+            assert bot.sent[0][1].data["text"] == "纯文本"
+            assert qo._md_breaker.rejects == 1
+            # 熔断打开 → md_text 也直接走 plain tier
+            qo._md_breaker.disabled_until = time.monotonic() + 600
+            bot = _GroupBot()
+            assert await sag(bot, "G1", "纯文本", md_text="## md") == "ok"
+            assert bot.sent[0][1].type == "text"
+            qo._md_breaker.disabled_until = 0.0
+            # 退群码 → "left"（ActionFailed 不重试）
+            for code in (40034101, 40034105):
+                bot = _GroupBot(fails=[code])
+                assert await sag(bot, "G1", "x") == "left"
+                assert bot.calls == 1
+            # 其他 ActionFailed（如频控 40034100）→ failed 不重试
+            bot = _GroupBot(fails=[40034100])
+            assert await sag(bot, "G1", "x") == "failed"
+            assert bot.calls == 1
+            # NetworkError → 每 tier 重试一次：两次失败 → failed；闪断恢复 → ok
+            bot = _GroupBot(fails=["net", "net"])
+            assert await sag(bot, "G1", "x") == "failed"
+            assert bot.calls == 2
+            bot = _GroupBot(fails=["net"])
+            assert await sag(bot, "G1", "x") == "ok"
+            assert bot.calls == 2
+            # 参数守卫
+            assert await sag(_GroupBot(), "", "x") == "failed"
+            assert await sag(_GroupBot(), "G1", "   ") == "failed"
+        print_pass("§16.5.3.4 send_active_group：ok/left/failed 分类 + md 降级熔断")
+
+    # ── §16.5.3 _do_broadcast：kind/渠道分流（闭包提取）───────────
+
+    @staticmethod
+    async def _grab_do_broadcast(ar):
+        """启动 _start_changelog_tasks，从 _broadcast_poller 闭包提取
+        _do_broadcast，随即取消后台任务（测试直接驱动广播函数）。"""
+        await ar._start_changelog_tasks()
+        do_bc = None
+        extras = []
+        for t in asyncio.all_tasks():
+            coro = t.get_coro()
+            name = getattr(coro, "__name__", "") or \
+                getattr(getattr(coro, "cr_code", None), "co_name", "")
+            if name == "_broadcast_poller":
+                frame = getattr(coro, "cr_frame", None)
+                if frame is not None:
+                    do_bc = frame.f_locals.get("_do_broadcast")
+            if name in ("_broadcast_poller", "_group_exporter"):
+                extras.append(t)
+        for t in extras:
+            t.cancel()
+        await asyncio.gather(*extras, return_exceptions=True)
+        assert do_bc is not None, "未能从闭包提取 _do_broadcast"
+        return do_bc
+
+    async def test_do_broadcast(self):
+        import nonebot
+        import plugins.agent_router as ar
+        from tools import changelog as cl
+        from nonebot.adapters.onebot.v11 import Bot as OBBot
+        from nonebot.adapters.qq import Bot as QQBot
+
+        class _FakeReg:
+            instance = None
+
+            def __init__(self, path):
+                self.path = path
+                self.groups = {}
+                self.left = []
+                _FakeReg.instance = self
+
+            def load(self):
+                return {"groups": {k: dict(v)
+                                   for k, v in self.groups.items()}}
+
+            def get(self, gid):
+                e = self.groups.get(gid)
+                return dict(e) if e else None
+
+            def list_active(self):
+                return [g for g, e in self.groups.items()
+                        if e.get("status") == "active"
+                        and e.get("active_enabled", True)]
+
+            def mark_left(self, gid, now=None):
+                self.left.append(gid)
+                if gid in self.groups:
+                    self.groups[gid]["status"] = "left"
+
+        ob_bot = MagicMock(spec=OBBot)
+        ob_bot.send_group_msg = AsyncMock()
+        ob_bot.get_group_list = AsyncMock(return_value=[
+            {"group_id": 111, "group_name": "群A"},
+            {"group_id": 222, "group_name": "群B"}])
+        qq_bot = MagicMock(spec=QQBot)
+
+        self.bc_sends = []
+        self.bc_result = "ok"
+
+        async def fake_sag(bot, gid, text, md_text=None):
+            self.bc_sends.append({"gid": gid, "text": text, "md": md_text})
+            return self.bc_result(gid) if callable(self.bc_result) \
+                else self.bc_result
+
+        tmp = tempfile.mkdtemp(prefix="bcast_")
+        try:
+            with patch.object(cl, "CHANGELOG_FILE",
+                              os.path.join(tmp, "changelog.json")), \
+                    patch.object(cl, "ANNOUNCEMENTS_FILE",
+                                 os.path.join(tmp, "announcements.json")), \
+                    patch.object(cl, "KNOWN_GROUPS_FILE",
+                                 os.path.join(tmp, "known_groups.json")), \
+                    patch.object(cl, "PENDING_FILE",
+                                 os.path.join(tmp, "pending.json")), \
+                    patch.object(cl, "STATUS_FILE",
+                                 os.path.join(tmp, "status.json")), \
+                    patch("agent.group_registry.GroupRegistry", _FakeReg), \
+                    patch("adapters.qq_official.send_active_group", fake_sag), \
+                    patch.object(ar, "render_changelog_card",
+                                 MagicMock(return_value=None)), \
+                    patch.object(nonebot, "get_bots",
+                                 lambda: {"ob": ob_bot, "qq": qq_bot}):
+                do_bc = await self._grab_do_broadcast(ar)
+                real_sleep = asyncio.sleep
+
+                async def zero_sleep(d, *a, **k):
+                    await real_sleep(0)
+
+                with patch.object(asyncio, "sleep", zero_sleep):
+                    await self._bc_scenarios(do_bc, cl, ob_bot, _FakeReg)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        print_pass("§16.5.3 群发：legacy/kind 分流/skipped/left 标记/all 兜底/错误路径")
+
+    async def _bc_scenarios(self, do_bc, cl, ob_bot, _FakeReg):
+        """_do_broadcast 场景集（在 zero-sleep + 全套 patch 内直接驱动）。"""
+        reg = _FakeReg.instance
+        # 种子：更新记录 + 两条公告（一条 markdown）
+        cl.save_entries([{"version": "v1.1", "date": "2026-10-30",
+                          "created_at": 111.0,
+                          "changes": [{"type": "新增", "text": "公告系统"}]}])
+        cl.save_announcements([
+            {"id": "ann_20261030_000001", "title": "版本活动",
+             "body": "**奖励加倍**", "format": "markdown",
+             "created_at": 222.0},
+            {"id": "ann_20261030_000002", "title": "预热", "body": "敬请期待",
+             "format": "text", "created_at": 333.0}])
+
+        # ── 场景 1：legacy payload（裸 entry_index + 字符串 targets）──
+        self.bc_result = "ok"
+        self.bc_sends.clear()
+        ob_bot.send_group_msg.reset_mock()
+        await do_bc({"entry_index": 0,
+                     "targets": ["111", "111",
+                                 {"channel": "onebot", "id": "111"}]})
+        st = cl.read_status()
+        assert st["state"] == "done" and st["kind"] == "changelog"
+        assert st["ref"] == {"entry_index": 0}
+        assert st["total"] == 1 and st["sent"] == 1        # 去重
+        assert st["by_channel"]["onebot"]["sent"] == 1
+        assert st["entry_version"] == "v1.1"
+        msg = ob_bot.send_group_msg.await_args_list[0].kwargs["message"]
+        assert isinstance(msg, str) and "📢 更新公告" in msg and "v1.1" in msg
+        assert not self.bc_sends                            # 官方渠道未触发
+        assert cl.load_entries()[0].get("broadcast_at")     # 已群发回写
+
+        # ── 场景 2：公告 + markdown + 混合渠道 + 官方预检 skipped ──
+        reg.groups = {
+            "OID_ACTIVE": {"status": "active", "active_enabled": True},
+            "OID_OFF": {"status": "active", "active_enabled": False},
+            "OID_LEFT": {"status": "left", "active_enabled": True},
+        }
+        self.bc_sends.clear()
+        ob_bot.send_group_msg.reset_mock()
+        await do_bc({
+            "kind": "announcement",
+            "ref": {"announcement_id": "ann_20261030_000001"},
+            "targets": [{"channel": "onebot", "id": "111"},
+                        {"channel": "official", "id": "OID_ACTIVE"},
+                        {"channel": "official", "id": "OID_OFF"},
+                        {"channel": "official", "id": "OID_LEFT"}]})
+        st = cl.read_status()
+        assert st["state"] == "done" and st["kind"] == "announcement"
+        assert st["total"] == 4 and st["sent"] == 2 and st["skipped"] == 2
+        assert st["by_channel"]["official"] == {"sent": 1, "failed": 0,
+                                                "skipped": 2}
+        assert st["announcement_title"] == "版本活动"
+        # 官方渠道：单条 markdown（text 为降级备份）
+        assert len(self.bc_sends) == 1
+        s = self.bc_sends[0]
+        assert s["gid"] == "OID_ACTIVE"
+        assert s["md"] == "## 📢 版本活动\n**奖励加倍**"
+        assert s["text"] == "📢 公告\n版本活动\n\n**奖励加倍**"
+        # OneBot 渠道：纯文本（W3 不带 markdown 语法）
+        ob_msg = ob_bot.send_group_msg.await_args_list[0].kwargs["message"]
+        assert "📢 公告" in ob_msg and "##" not in ob_msg
+        # 成功回写 sent_at/last_targets（全部尝试目标）
+        ann = cl.get_announcement("ann_20261030_000001")
+        assert ann["sent_at"]
+        assert ann["last_targets"] == [
+            {"channel": "onebot", "id": "111"},
+            {"channel": "official", "id": "OID_ACTIVE"},
+            {"channel": "official", "id": "OID_OFF"},
+            {"channel": "official", "id": "OID_LEFT"}]
+
+        # ── 场景 3：left → mark_left + 全部失败 → error 且不回写 ──
+        self.bc_sends.clear()
+        self.bc_result = lambda gid: "left"
+        await do_bc({
+            "kind": "announcement",
+            "ref": {"announcement_id": "ann_20261030_000002"},
+            "targets": [{"channel": "official", "id": "OID_ACTIVE"}]})
+        st = cl.read_status()
+        assert st["state"] == "error" and st["failed"] == 1
+        assert st["sent"] == 0 and "失败" in st["error"]
+        assert "OID_ACTIVE" in reg.left
+        assert reg.groups["OID_ACTIVE"]["status"] == "left"
+        ann2 = cl.get_announcement("ann_20261030_000002")
+        assert not ann2.get("sent_at")          # 全部失败不写已发送标记
+        self.bc_result = "ok"
+
+        # ── 场景 4：错误路径（公告不存在/越界/未选目标）──────────
+        await do_bc({
+            "kind": "announcement", "ref": {"announcement_id": "ann_nope"},
+            "targets": ["all"]})
+        assert "公告不存在" in cl.read_status()["error"]
+        await do_bc({"kind": "changelog", "ref": {"entry_index": 99},
+                     "targets": ["111"]})
+        assert "越界" in cl.read_status()["error"]
+        await do_bc({"kind": "changelog", "ref": {"entry_index": 0},
+                     "targets": []})
+        assert "未选择目标群" in cl.read_status()["error"]
+
+        # ── 场景 5："all" 扩展（live 列表 + registry；失败退快照）──
+        reg.groups = {"OID_A": {"status": "active", "active_enabled": True},
+                      "OID_BAD": {"status": "active",
+                                  "active_enabled": False}}
+        self.bc_sends.clear()
+        ob_bot.send_group_msg.reset_mock()
+        await do_bc({"kind": "changelog", "ref": {"entry_index": 0},
+                     "targets": ["all"]})
+        st = cl.read_status()
+        assert st["total"] == 3 and st["sent"] == 3     # 111+222+OID_A
+        assert ob_bot.send_group_msg.await_count == 2
+        assert [x["gid"] for x in self.bc_sends] == ["OID_A"]
+        # get_group_list 失败 → known_groups 快照兜底
+        cl.write_known_groups({"333": {"name": "群C", "member_count": 1}})
+        ob_bot.get_group_list = AsyncMock(side_effect=RuntimeError("down"))
+        ob_bot.send_group_msg.reset_mock()
+        self.bc_sends.clear()
+        await do_bc({"kind": "changelog", "ref": {"entry_index": 0},
+                     "targets": ["all"]})
+        st = cl.read_status()
+        assert st["total"] == 2 and st["sent"] == 2     # 333+OID_A
+        assert [c.kwargs["group_id"]
+                for c in ob_bot.send_group_msg.await_args_list] == [333]
+
+        # ── 场景 6：bot 未连接 ────────────────────────────────────
+        import nonebot as _nb
+        with patch.object(_nb, "get_bots", lambda: {}):
+            await do_bc({"kind": "changelog", "ref": {"entry_index": 0},
+                         "targets": ["111"]})
+            assert "bot 未连接" in cl.read_status()["error"]
+            await do_bc({
+                "kind": "changelog", "ref": {"entry_index": 0},
+                "targets": [{"channel": "official", "id": "OID_A"}]})
+            assert "官方 bot 未连接" in cl.read_status()["error"]
+
+    # ── WebUI data_reader 公告 API（§16.3.2/§16.5.2）──────────────
+
+    def test_webui_announcement_api(self):
+        from pathlib import Path as _Path
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from webui import data_reader as dr
+        from webui import config_editor as ce
+        tmp = tempfile.mkdtemp(prefix="webui_ann_")
+        try:
+            t = _Path(tmp)
+            with patch.object(dr, "ANNOUNCEMENTS_FILE",
+                              t / "announcements.json"), \
+                    patch.object(dr, "CHANGELOG_FILE", t / "changelog.json"), \
+                    patch.object(dr, "PENDING_FILE",
+                                 t / "pending_broadcast.json"), \
+                    patch.object(dr, "KNOWN_GROUPS_FILE",
+                                 t / "known_groups.json"), \
+                    patch.object(dr, "STATUS_FILE",
+                                 t / "broadcast_status.json"), \
+                    patch.object(ce, "BACKUPS", t / "backups"):
+                # targets 归一化：all/dict/裸字符串 + 各非法形态
+                assert dr._norm_broadcast_targets(["all"]) == ["all"]
+                assert dr._norm_broadcast_targets(
+                    ["123", {"channel": "official", "id": "OID_1"}]) == [
+                    {"channel": "onebot", "id": "123"},
+                    {"channel": "official", "id": "OID_1"}]
+                assert "error" in dr._norm_broadcast_targets([])
+                assert "error" in dr._norm_broadcast_targets("111")
+                assert "error" in dr._norm_broadcast_targets(["abc"])
+                assert "error" in dr._norm_broadcast_targets(
+                    [{"channel": "telegram", "id": "x"}])
+                assert "error" in dr._norm_broadcast_targets(
+                    [{"channel": "official", "id": "has space"}])
+                # save 校验链
+                assert "error" in dr.announcement_save("not-a-list")
+                assert "标题" in dr.announcement_save(
+                    [{"title": "", "body": "b"}])["error"]
+                assert "error" in dr.announcement_save(
+                    [{"title": "t" * 61, "body": "b"}])
+                assert "正文" in dr.announcement_save(
+                    [{"title": "t", "body": "  "}])["error"]
+                assert "error" in dr.announcement_save(
+                    [{"title": "t", "body": "b" * 2001}])
+                assert "format" in dr.announcement_save(
+                    [{"title": "t", "body": "b", "format": "html"}])["error"]
+                # 非法 id 重新生成；合法 id/created_at 保留
+                r = dr.announcement_save([
+                    {"id": "hack!id", "title": "A1", "body": "b1"},
+                    {"id": "ann_20261001_abcdef", "title": "A2", "body": "b2",
+                     "format": "markdown", "created_at": 55.0}])
+                assert r.get("ok"), r
+                ents = r["entries"]
+                assert ents[0]["id"].startswith("ann_")
+                assert re.fullmatch(r"ann_\d{8}_[0-9a-f]{6}", ents[0]["id"])
+                assert ents[1]["id"] == "ann_20261001_abcdef"
+                assert ents[1]["created_at"] == 55.0
+                assert ents[1]["format"] == "markdown"
+                # id 重复 → 拒绝
+                r = dr.announcement_save([
+                    {"id": "ann_20261001_abcdef", "title": "X", "body": "y"},
+                    {"id": "ann_20261001_abcdef", "title": "Z", "body": "w"}])
+                assert "重复" in r.get("error", "")
+                # bot 回写的 sent_at/last_targets 在面板重保存时保留
+                a1, a2 = ents
+                raw = json.loads((t / "announcements.json").read_text("utf-8"))
+                for e in raw["entries"]:
+                    if e["id"] == a1["id"]:
+                        e["sent_at"] = 999.0
+                        e["last_targets"] = ["all"]
+                (t / "announcements.json").write_text(
+                    json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+                a1_mod = dict(a1, body="b1-改")
+                r = dr.announcement_save([a1_mod, a2])
+                assert r.get("ok")
+                saved = {e["id"]: e for e in dr.announcement_list()["entries"]}
+                assert saved[a1["id"]]["sent_at"] == 999.0
+                assert saved[a1["id"]]["last_targets"] == ["all"]
+                assert saved[a1["id"]]["body"] == "b1-改"
+                assert saved[a1["id"]]["updated_at"] > a1["updated_at"]
+                # 内容不变 → updated_at 不动
+                before = saved[a1["id"]]["updated_at"]
+                r = dr.announcement_save(
+                    list(dr.announcement_list()["entries"]))
+                assert {e["id"]: e
+                        for e in r["entries"]}[a1["id"]]["updated_at"] == before
+                # broadcast 入队：不存在 → error；存在 → 新格式 pending
+                r = dr.announcement_broadcast("ann_nope", ["all"])
+                assert "不存在" in r["error"]
+                r = dr.announcement_broadcast(a1["id"], ["all"])
+                assert r.get("ok")
+                payload = json.loads((t / "pending_broadcast.json")
+                                     .read_text("utf-8"))
+                assert payload["kind"] == "announcement"
+                assert payload["ref"] == {"announcement_id": a1["id"]}
+                assert payload["targets"] == ["all"] and payload["queued_at"]
+                # 未认领前拒绝再次入队
+                r2 = dr.announcement_broadcast(a1["id"], ["all"])
+                assert "待处理" in r2.get("error", "")
+                (t / "pending_broadcast.json").unlink()
+                # changelog_broadcast：越界拒绝
+                r = dr.changelog_broadcast(5, ["111"])
+                assert "越界" in r["error"]
+                # changelog_groups：双渠道统一结构 + sendable/reason
+                (t / "known_groups.json").write_text(json.dumps({
+                    "groups": {"111": {"name": "群A", "member_count": 9}},
+                    "official_groups": {
+                        "OID_OK": {"status": "active",
+                                   "active_enabled": True,
+                                   "last_seen_at": 7.0},
+                        "OID_OFF": {"status": "active",
+                                    "active_enabled": False},
+                        "OID_LEFT": {"status": "left",
+                                     "active_enabled": True},
+                    },
+                    "updated_at": 123.0}), encoding="utf-8")
+                g = dr.changelog_groups()
+                by_id = {x["id"]: x for x in g["groups"]}
+                assert by_id["111"]["channel"] == "onebot"
+                assert by_id["111"]["sendable"] is True
+                assert by_id["OID_OK"]["sendable"] is True
+                assert by_id["OID_OK"]["name"].startswith("官方群")
+                assert by_id["OID_OFF"]["sendable"] is False
+                assert by_id["OID_OFF"]["reason"] == "已关闭通知"
+                assert by_id["OID_LEFT"]["reason"] == "已退群"
+                assert g["updated_at"] == 123.0
+                assert g["groups"][0]["channel"] == "onebot"   # OneBot 排前
+            print_pass("§16.3/§16.5 WebUI：targets 归一化/公告保存校验+id/入队/群列表")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -12435,6 +13572,8 @@ def main():
         ("QQ Official Stream (stream_messages, c2c)", TestOfficialStream()),
         ("Session Compression (/压缩会话)", TestSessionCompression()),
         ("Proactive Mail (角色信箱 v1)", TestProactiveMail()),
+        ("Mail Admin (WebUI 邮件管理 §16.2/§16.4)", TestMailAdmin()),
+        ("Announcement Broadcast (公告群发 §16.3/§16.5)", TestAnnouncementBroadcast()),
     ]
 
     passed = 0

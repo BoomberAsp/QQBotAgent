@@ -37,6 +37,7 @@ import os
 import random
 import re
 import time
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -79,6 +80,33 @@ from tools.social_tools import build_image_prompt, enforce_asset_quota
 
 official_router = on_message(priority=1, block=False)
 official_notice_router = on_notice(priority=1, block=False)
+
+
+# ── 入站事件去重（docs §22 :2154 / §17 :2152）──────────────────────
+# 平台明确写着「相同 msg_id 可能多次推送，请结合 msg_seq 去重」：一次重推
+# 就是一次完整 turn → 两条一模一样的答复（与流式无关的 B 类重复）。这里按
+# 事件锚点做 60s 窗口去重，只挡"同一个被动回复锚点被处理两遍"。
+_SEEN_EVENT_TTL = 60.0
+_SEEN_EVENT_MAX = 512
+_seen_events: "OrderedDict[str, float]" = OrderedDict()
+
+
+def _is_duplicate_event(anchor: str) -> bool:
+    """True = 这个 msg_id/event_id 刚处理过（重推），本回合跳过。"""
+    if not anchor:
+        return False
+    now = time.time()
+    # 过期清理 + 容量上限（OrderedDict 头部最旧）
+    while _seen_events:
+        oldest = next(iter(_seen_events))
+        ts = _seen_events[oldest]
+        if now - ts <= _SEEN_EVENT_TTL and len(_seen_events) < _SEEN_EVENT_MAX:
+            break
+        _seen_events.pop(oldest, None)
+    if anchor in _seen_events:
+        return True
+    _seen_events[anchor] = now
+    return False
 
 
 # ── Status heartbeat file (panel reads, never writes) ─────────────
@@ -1147,6 +1175,13 @@ async def handle_official_message(bot: QQBot, event: QQMessageEvent):
     intent config actually delivers.
     """
     if not isinstance(event, HANDLED_EVENTS):
+        return
+    _anchor = str(getattr(event, "id", "") or "")
+    if _is_duplicate_event(_anchor):
+        # 平台重推同一被动回复锚点（文档 §22 :2154）：再跑一遍就是两条
+        # 一模一样的答复，直接跳过并留痕。
+        logger.warning(
+            f"[qq_official] duplicate inbound event ignored: {_anchor}")
         return
     _note_message()
 

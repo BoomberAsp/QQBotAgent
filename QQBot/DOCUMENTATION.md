@@ -99,7 +99,7 @@ QQBotAgent/
     │   ├── onebot.py           #   OneBot V11：事件→InboundMessage、附件下载、OneBotSender
     │   ├── qq_official.py      #   QQ 官方：build_view、附件解析、QQOfficialSender（缓冲+合并+配额+流式能力位）、主动消息（含 markdown+按钮信封阶梯降级）
     │   ├── qq_official_buttons.py  # 官方键盘 wire 格式 + 回调编解码 + 交互回执发送器 + 点击遥测
-    │   └── qq_official_stream.py   # 官方 c2c 流式消息：MessageStreamer 双流传输 + 熔断器 + stream_snapshot
+    │   └── qq_official_stream.py   # 官方 c2c 流式消息：MessageStreamer 双流传输（replace 累计正文）+ 断流强制收尾 + 熔断器 + stream_snapshot
     │
     ├── plugins/                # NoneBot 插件
     │   ├── agent_router.py     #   OneBot 入口 + 配置看门狗 + 更新公告群发/群列表导出
@@ -263,7 +263,7 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 | 官方入口 | `plugins/qq_official.py` + `adapters/qq_official.py` | 只处理 `C2CMessageCreateEvent` / `GroupAtMessageCreateEvent`；附件是公网 URL，直接下载；引用消息按 `msg_elements` + `ref_msg_idx` 解析 |
 | 出站契约 | `agent/outbound.py::Sender` | `send_text / send_markdown / send_keyboard / send_image / send_audio / send_progress / open_stream`；`OutImage` / `OutAudio` / `OutMarkdown` / `OutKeyboard` / `OutProgress` 描述语义，平台细节在适配器；`supports_markdown` / `supports_keyboard` / `supports_stream` 能力位是渠道隔离唯一判据（官方 True / OneBot False）。`OutKeyboard(markdown, rows)` 的 rows 是 `lib/button_spec.py` 的平台无关按钮 DSL（`Btn`/`Rows`/`validate`/`to_text`）；不支持键盘的渠道 `send_keyboard` 自动降级为 `send_text(markdown + to_text(rows))`。回调链：官方渠道 INTERACTION_CREATE → `plugins/qq_official_buttons.py`（幂等+限频+审计）→ `agent/button_actions.py`（scene/role 复核 + 2.5s 预算）→ `agent/session_render.py`（共享键盘页渲染），毫秒级本地状态变更走回调按钮（type=1），需 LLM/>3s 的一律指令按钮（type=2，替用户打字复用命令链）。`supports_stream`/`open_stream()`（仅官方 c2c）返回 `MessageStreamer` 承载流式进度+回答，`None` 即回退缓冲路径 |
 | OneBot 出站 | `OneBotSender` | 文本原样发、300 字符分块由内核负责；图片 `MessageSegment.image(Path)`；`send_markdown` 降级纯文本；`supports_stream=False`、`open_stream()` 恒 `None` |
-| 官方出站 | `QQOfficialSender` | 缓冲 + 合并 + 配额（单聊 4 次/60min、群 5 次/5min）；图片/语音 base64 上传（本地文件不可直读）；语音被拒降级文件卡；markdown（msg_type=2）单独成组、按区块 ≤2000 字切分，被拒（40034011 等）同内容纯文本重发 + 连续 3 拒熔断 10 分钟，`QQ_OFFICIAL_MARKDOWN=off` 一键禁用（热读）；配额不足丢弃优先级 正文 > 免责 > 图片；进度行默认吞掉，仅「正在思考…」即时发送；**流式消息**（`adapters/qq_official_stream.py`，仅 c2c）走 `POST /v2/users/{openid}/stream_messages`：双流同锚点（进度流 `msg_seq` 基 900、回答流基 1800），工具进度「⏳ …」与 LLM 回答逐字上屏，免责声明随回答流末片（`input_state=10`）；开流失败/中途断裂自动回退缓冲路径（内容不丢；`remain_msg_len` 实测为挂起长度遥测值而非预算，不参与门控），熔断器（3 连拒 600s / ApiNotAvailable 长熔断）+ `QQ_OFFICIAL_STREAM=off` 热读逃生门；split 人格与群聊不流式 |
+| 官方出站 | `QQOfficialSender` | 缓冲 + 合并 + 配额（单聊 4 次/60min、群 5 次/5min）；图片/语音 base64 上传（本地文件不可直读）；语音被拒降级文件卡；markdown（msg_type=2）单独成组、按区块 ≤2000 字切分，被拒（40034011 等）同内容纯文本重发 + 连续 3 拒熔断 10 分钟，`QQ_OFFICIAL_MARKDOWN=off` 一键禁用（热读）；配额不足丢弃优先级 正文 > 免责 > 图片；进度行默认吞掉，仅「正在思考…」即时发送；**流式消息**（`adapters/qq_official_stream.py`，仅 c2c）走 `POST /v2/users/{openid}/stream_messages`：双流同锚点（进度流 `msg_seq` 基 900、回答流基 1800），工具进度「⏳ …」与 LLM 回答逐字上屏，免责声明随回答流末片（`input_state=10`）；**回退只补未上屏尾巴**（`_delivered_prefix_len` 容忍开场白/进度行污染；一次没开成才整篇重发，断流也补 `state=10` 收尾片；`input_mode=replace` 累计正文使分片重试幂等；`remain_msg_len` 实测为挂起长度遥测值而非预算，不参与门控），熔断器（3 连拒 600s / ApiNotAvailable 长熔断）+ `QQ_OFFICIAL_STREAM=off` 热读逃生门；split 人格与群聊不流式 |
 | 失败语义 | `SendFailed` | 只有它是可重试错误；其它异常记日志后丢弃 |
 
 ### 1.4 双平面路由（`split` 人格）
@@ -2254,6 +2254,39 @@ v2.29 基础上增加:
 - **命令**：`/邮件`（列表分页/`下一页`/`p<N>`/`MM-DD`/编号看全文并标记已读，仅官方单聊，零 token 不带免责尾）；`/免责声明 [关|开]`（免责尾追加开关，三级用户均可，`data/user_prefs/disclaimer.json` 按渠道独立、mtime 热读，bot 单写者；信件/信封本就不带免责尾）。
 - **配置**：`bond_settings.json` 新增 `mail_*` 组（`mail_enabled` 为总回滚开关——关掉即回旧 `_greeting_loop`）；新增 `TestProactiveMail`（16 用例，离线）。
 - WebUI 邮件管理页、群公告通道（P1）、`check_mail` 工具与信件编辑（v2）不在本版。
+
+#### 2026-10-30（晚）— 官方流式「重复输出 / 重复发送」修复（P0–P5）
+
+线上现象：官方 c2c 流式回合里，同一条答案偶尔出现两遍（A 形态：流式消息里一遍 + 一条完整普通消息）。
+根因是回退树把「已上屏文本不是最终回复的严格前缀」当成"内容缺失"直接整篇重发；而工具轮开场白
+（SSE 在工具碎片出现前照发 content）或并进回答流的「⏳ …」进度行一混入，这个前缀判定必然失败 →
+必然整篇重发，且该分支**不打任何日志**（所以表现为"偶现、无痕"）。同日另有一次 404/405 被误判成
+"接口不存在"，把流式熔断了 24h（日志 `streaming disabled for 24h`，靠重启才恢复）。
+
+- **P0 回退树重写**（`agent/turn.py`）：新增 `_delivered_prefix_len()`（取「已上屏文本后缀 ==
+  response 前缀」最长解，容忍开场白/进度行污染）+ `_plan_stream_delivery()` 纯决策函数：
+  `buffered_full`（一次没开成才允许整篇）/ `stream_only`（正文已全覆盖，一条不补）/ `remainder`
+  （断流只补未上屏尾巴）。**铁律：回答流上过屏就绝不整篇重发。**
+- **P1 断流也收尾**（`adapters/qq_official_stream.py`）：`close()` 对断流补发 `state=10` 收尾片
+  （只重复平台已接受的文本），修掉"流卡在生成中 + 平台把整条消息回滚到首包"；`_flush_slot` 被取消
+  时按"已送出"记账，避免取消 in-flight 请求后重发造成同段重复。
+- **P2 404 不再误熔断**：`HTTP 404/405 = 未找到 API`（docs :510）是路由级错误。只有**开流首片**
+  连续 2 次 404/405 才判能力缺失（长熔断默认 24h→1h，冷却后半开重探）；续片 404/405 只断当前流
+  （`shard_404_total` 遥测），能力位不动。`/流式探测` 先 `stream_force_probation()` 再实测。
+- **P3 append → replace（幂等）**：分片改 `input_mode=replace` + 累计全文（与 docs §20 示例、
+  腾讯 dsh-qqbot StreamingWriter 一致）。重试/超时/取消后重发同一份累计正文是幂等的；`40007`
+  （前缀不可修改）在本实现里不可能由自己触发。顺带修好免责尾分隔（旧版 buffer 已空时拼成「正文免责句」）。
+- **P4 可观测性**：每轮一条 `[stream] turn done user= ans_open= broken= sent= resp= decision=
+  remainder= shards=/ retries= last_err=` INFO；`stream_snapshot()` 增 `api_rejects` /
+  `shard_404_total` / `retry_total` / `delivery{stream_only,remainder,buffered_full}`（面板
+  `official_status.json` 的 `stream=` 段直接可见）。
+- **P5 入站事件去重**（`plugins/qq_official.py`）：按事件锚点（msg_id）60s 窗口 + 512 上限 LRU
+  去重，挡平台重推同一被动回复锚点造成的两条相同答复（docs :2154「相同 msg_id 可能多次推送」）。
+- **测试**：`TestOfficialStream` 17 → 23 用例（replace 累计语义 / 续片重试幂等 / 断流强制收尾 /
+  续片 404 不动能力位 / 锚点过期码才 is_wakeup / 交付决策三态 / 事件去重）；`test_agent.py` 59 套全绿。
+- **配置**：`QQ_OFFICIAL_STREAM_CIRCUIT_HOURS` 默认 24→1（热读）；`QQ_OFFICIAL_STREAM=off` 仍是总闸。
+- 已知残余：若某片在服务端已生效而客户端判定失败（平台无读回接口），最多重复该片一次；replace 语义下
+  下一片或收尾片会整体覆盖，最终正文不会重复。
 
 #### 设计稿 — QQ 官方渠道消息按钮
 
