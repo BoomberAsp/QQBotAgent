@@ -17,8 +17,8 @@
 - **特殊会话**: 每用户持久化会话（按角色：管理员 10 / 会员 3 / 普通 1），快照+增量存储，读时分层截断适配模型窗口，`/压缩会话` 可将早期历史浓缩为摘要（保留最近 10 条原文）；**人格绑定在会话上**（`metadata.persona_key`），切换会话自动切换人格（解析链：剧情钉住 > 会话绑定 > 个人设置 > 群默认 > 全局默认）
 - **用户工作区**: 每用户独立文件空间，配额管理（2GB/500MB/100MB），跨会话隔离，80% 预警 + 超限清理协议
 - **三层记忆引擎**: `TieredMemory`（SHORT/MEDIUM/LONG），LLM judge 归类 + 频次晋升/年龄降级状态机；LONG 支持索引注入与 `recall_memory` 召回
-- **Web 管理面板**: FastAPI 独立服务（`webui/`，93 个 API + 18 个页面），进程管理、配置热编辑、记忆/画像/别名管理、**角色管理**（用户自创角色卡的浏览/编辑/体检/版本回滚/立绘）、Token 看板、反馈处理、更新记录编辑与群发、Playground、官方路由状态卡
-- **更新记录**: 结构化更新日志（版本/日期/分类变更条目），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询，管理员在面板编辑并群发更新公告；QQ 端以图片卡片呈现，并同步脱敏快照到公开站点 `bot.oneweblog.cn`
+- **Web 管理面板**: FastAPI 独立服务（`webui/`，102 个 API + 18 个页面），进程管理、配置热编辑、记忆/画像/别名管理、**角色管理**（用户自创角色卡的浏览/编辑/体检/版本回滚/立绘）、Token 看板、反馈处理、更新记录/公告编辑与双渠道群发、**邮件管理**（信箱只读 + 系统邮件/撤回队列）、Playground、官方路由状态卡
+- **更新记录与公告**: 结构化更新日志（版本/日期/分类变更条目）+ 自由公告（标题/正文/markdown），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询，管理员在面板编辑并**双渠道群发**（OneBot 群 + QQ 官方群，可按渠道勾选或全选）；QQ 端以图片卡片/markdown 呈现，并同步脱敏快照到公开站点 `bot.oneweblog.cn`
 - **部署方式**: Docker Compose（searxng + qqbot；vLLM 由 `vllm-start.sh` 可选单独拉起）或手动部署
 
 ---
@@ -46,11 +46,11 @@ QQBotAgent/
 │   ├── character_admin.py      #   角色管理：UGC 卡读写/体检/备份版本/修复/立绘（写路径经 CharacterRegistry.update_character）
 │   ├── card_parser.py          #   card.md 结构化解析与「偏移切片」编辑（纯函数，零 IO）
 │   ├── model_probe.py          #   模型 API 可用性探测（最小真实调用 + 分级判定）
-│   ├── data_reader.py          #   记忆/画像/会话/Wiki 别名/兑换码/更新记录 数据读写
+│   ├── data_reader.py          #   记忆/画像/会话/Wiki 别名/兑换码/更新记录/公告群发/邮件管理 数据读写
 │   ├── log_viewer.py / audit.py / hardware_monitor.py / playground.py / napcat_login.py
 │   ├── official_status.py      #   QQ 官方路由状态（只读 official_status.json，mtime 判新鲜度）
 │   ├── config.py               #   面板配置（从 QQBot/.env 读 USER_DATA_ROOT 等）
-│   ├── templates/ static/      #   20 个页面模板与静态资源
+│   ├── templates/ static/      #   21 个页面模板与静态资源
 │   └── data/                   #   面板运行时数据（webui.pid / logs / watchdog_state.json / backups）
 │
 ├── public_site/                # ★ 公开使用站点（bot.oneweblog.cn，纯静态只读）
@@ -102,8 +102,8 @@ QQBotAgent/
     │   └── qq_official_stream.py   # 官方 c2c 流式消息：MessageStreamer 双流传输（replace 累计正文）+ 断流强制收尾 + 熔断器 + stream_snapshot
     │
     ├── plugins/                # NoneBot 插件
-    │   ├── agent_router.py     #   OneBot 入口 + 配置看门狗 + 更新公告群发/群列表导出
-    │   ├── qq_official.py      #   官方入口 + 每日主动循环（角色信箱信封 + 主动发媒体，双向互斥）+ 拒收/恢复事件 + 状态心跳
+    │   ├── agent_router.py     #   OneBot 入口 + 配置看门狗 + 更新记录/公告双渠道群发 + 群列表导出（OneBot+官方）
+    │   ├── qq_official.py      #   官方入口 + 每日主动循环（角色信箱信封 + 主动发媒体，双向互斥）+ 拒收/恢复事件 + 状态心跳 + 邮件管理队列 worker（面板删信/系统邮件，§16.2）
     │   ├── qq_official_buttons.py  # 官方 INTERACTION_CREATE 回调入口（幂等+限频+审计）
     │   ├── pullingMonitor.py / check_redeem_code.py / ruyipage_fetch.py / offline_logger.py
     │   └── group.py / speed.py / photos.py / test.py / utils.py（旧插件，仅保留个别工具函数）
@@ -119,7 +119,7 @@ QQBotAgent/
     │   ├── battle_parser.py / ocr_name_matcher.py
     │   ├── ag_skill_index.py / ag_trigger_engine.py / ag_llm_resolver.py / buff_vocab_dump.py
     │   ├── wiki_scraper.py / wiki_glossary.py / name_resolver.py
-    │   └── changelog.py        #   更新记录读写/格式化/群发队列（纯 IO）
+    │   └── changelog.py        #   更新记录 + 公告读写/格式化/群发队列/群列表快照（纯 IO）
     │
     ├── lib/                    # 自定义库
     │   ├── deepseek_client.py / model_router.py / multimodal_client.py
@@ -169,9 +169,12 @@ QQBotAgent/
         ├── name_index/         #   角色名索引缓存
         ├── wiki_cache/         #   Wiki 爬取缓存与卡片图
         ├── redeem_code/        #   兑换码缓存
-        ├── mailboxes/          #   角色信箱（每用户信件/摘要 JSON，28 天保留）
+        ├── mailboxes/          #   角色信箱（每用户信件/摘要 JSON，28 天保留；bot 单写、面板只读）
+        ├── mail_admin/         #   面板邮件管理队列（queue/processing/status；面板写、bot 认领执行回写）
+        ├── changelog/          #   更新记录 + 公告 + 群发/群列表文件队列（按需创建）
         ├── user_prefs/         #   用户偏好（disclaimer.json 免责尾开关，按渠道 user_id）
         ├── personality_config.json / personality_settings.json / group_personality.json
+        ├── bond_greet_targets.json  # c2c 联系人登记表（每个私聊回合落库；面板邮件页用户列表并集来源）
         ├── group_registry.json #   官方群登记表（GROUP_AT 入站记账，v1）
         └── official_status.json #  官方路由状态（面板仪表盘读取；按需生成）
 ```
@@ -686,7 +689,7 @@ turn.py / 入口插件
 |---|---|
 | OneBot 匹配器 | `agent_router`（priority=1，手工判群 @，不依赖 NapCat `to_me`）、`continuous_router`（priority=2，连续对话窗口）、`poke_router`（priority=5，戳一戳通知） |
 | 事件转换 | `adapters/onebot.py::build_view` → `agent.inbound.InboundMessage` → `run_agent_turn()` |
-| 后台任务 | 配置看门狗（三组 mtime）、更新公告群发轮询器、群列表导出（`known_groups.json`） |
+| 后台任务 | 配置看门狗（三组 mtime）、更新记录/公告双渠道群发轮询器（`pending_broadcast.json` 认领制）、群列表导出（OneBot `get_group_list` + 官方群登记表合并 → `known_groups.json`） |
 | Sender 槽位 | 导入时把 `OneBotSender` 写入 `turn.default_sender / continuous_sender / poke_sender`，内核据此发送 |
 
 #### 消息处理
@@ -703,7 +706,7 @@ turn.py / 入口插件
 |---|---|
 | 会话 | `/新会话`、`/会话列表`（`/会话`）、`/切换会话`、`/重命名会话`、`/删除会话`（回复「确认删除 <名称>」）、`/压缩会话`（回复「确认压缩会话」；仅私聊，剧情/创作会话不支持）、`/结束会话`（`/临时会话`/`/退出会话`/`/退出特殊会话`）、`/保存为会话`、`/clear`（`清除上下文`/`新对话`）、`/帮助`（`/help`/`/命令`）、`/status` |
 | 人格 | `/personality`、`/人格切换`（均支持带名称；无 `#` 变体；特殊会话内只写会话绑定，`--全局` 后缀改写用户默认） |
-| 养成 | `/好感度`（`#好感度`/`/bond`）、`/剧情`、`/设好感 <1-10>`、`/创建角色`、`/删除角色`（回复「确认删除角色 <名称>」）、`/设形象`、`/形象`（`/查看形象`）、`/清除形象`（`/删形象`）、`/邮件`（角色信箱，仅官方单聊：列表/`下一页`/`p<N>`/`MM-DD`/信件编号看全文并标记已读） |
+| 养成 | `/好感度`（`#好感度`/`/bond`）、`/剧情`、`/设好感 <1-10>`、`/创建角色`、`/删除角色`（回复「确认删除角色 <名称>」）、`/设形象`、`/形象`（`/查看形象`）、`/清除形象`（`/删形象`）、`/邮件`（角色信箱，仅官方单聊：列表/`下一页`/`p<N>`/`MM-DD`/信件编号看全文并标记已读；系统邮件带【系统】前缀，面板删除过的信件显示「已被撤回」） |
 | 游戏 | `/兑换码`（`/redeem-code`）、`/长期兑换码`、`/角色详情 <名>`、`/羁绊详情 <名>`、`/刷新角色数据`（仅 admin） |
 | 群管理 | `/toggle`、`/toggle <gacha\|image\|voice> <on\|off>`、`/toggle personality [名称\|默认]`（仅群聊 + admin） |
 | 其他 | `/功能`（`/features`）、`/更新日志 [d]`（多个别名）、`/管理工作区`（落入 agent）、`/取消`（`#取消`/`/结束`/`#结束`，连续对话窗口内）、`/免责声明`（`#免责声明`；查看/`关`/`开` 免责尾追加，三级用户均可，按渠道独立） |
@@ -883,7 +886,8 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 - `delegation.py`：`SOCIAL_TOOLS` 白名单、`run_delegated_task`（中立 Roxy、`persist=False`、权限过滤、单层嵌套、默认 240s 超时）、`revoice_task_result`（角色开场白 + 正文透传，群聊用固定模板）、`repatch_last_assistant`（把持久化历史改写成角色口吻）。
 - `greeting.py`：官方 c2c 主动消息簿记（纯函数、可注入 rng/now）。候选索引 `data/bond_greet_targets.json` 只由 **c2c 入站**写入（群 member_openid 不能用于 c2c 主动消息）；配额 `data/official_active_quota.json` 按自然日/月滚动，文本与媒体**分账**（日配额各自独立；信箱信封走 `monthly_cap=10**9` 免月配额——平台已无主动消息月限额）。旧问候选靶四门（等级 ≥5、冷却 7 天、概率 0.25、批量 ≤5）保留为 `mail_enabled=false` 时的回滚路径。
 - **角色信箱（proactive-mail-design.md v0.5，v1）**：`plugins/qq_official.py::_daily_active_loop` 每日 `mail_hour`（默认 10 点，+0–600s 抖动）先跑 mail pass 再跑 media pass，启动时若在 10–22 点窗口内做减半补发。mail pass 三段式：A 收集候选（串行本地读，`_mail_candidates` 过滤链：非 assistant、`split` 模式、Lv≥5、有消息、在 known_personas、沉默 ≥24h、人格 7 天冷却，按等级降序）→ B 生成（跨用户 `Semaphore(4)`，用户内串行，角色面 flash 写 ≤60 字留言，失败即丢弃**无模板兜底**，pass 预算 20 分钟）→ C 发送（串行，令牌桶 10 qps + 2–6s 随机间隔，`send_active_c2c_markdown` 信封 = markdown 摘要 + 「展开」按钮，共享 md/kb 熔断器逐档降级纯文本）。发送成功才记账：`record_digest`（同日幂等）+ 配额（kind=text）+ bond 事件（信件全文）。与媒体 pass **双向互斥**（同日只发一类）。`C2C_MSG_REJECT`/`RECEIVE` 事件（`on_notice`）翻 `active_enabled`，拒收即停发。
-- `mailbox.py`：信箱存储（纯同步、可单测）。每用户一 JSON（`data/mailboxes/{openid}.json`，原子写、损坏降级空箱）；信件 28 天保留 + 200 封上限裁剪；`letters`（id `L-YYYYMMDD-<4hex>`、preview、read）与 `digests`（id `D-…`，1 digest = 1 次主动调用）；`make_preview`（首行去舞台指示、20 字 + …）、`escape_md_text`（全角转义）为纯函数。`/邮件` 命令（turn.py 直连层）读侧再过滤保留期。
+- `mailbox.py`：信箱存储（纯同步、可单测）。每用户一 JSON（`data/mailboxes/{openid}.json`，原子写、损坏降级空箱）；信件 28 天保留 + 200 封上限裁剪；`letters`（id `L-YYYYMMDD-<4hex>`、preview、read）与 `digests`（id `D-…`，1 digest = 1 次主动调用）；`make_preview`（首行去舞台指示、20 字 + …）、`escape_md_text`（全角转义）为纯函数。`/邮件` 命令（turn.py 直连层）读侧再过滤保留期。面板邮件管理追加三个写入口：`delete_letter`（**撤回**：从 letters[] 移除但信封 letter_ids 保留该 id → `is_withdrawn()` 成立，`/邮件 <id>` 显示「这封信已被撤回。」）、`write_system_letter`（系统信：persona=`__system__`、`system=true`，不写 personas/known_personas、不动信封记账）、`set_active_enabled`。
+- **邮件管理队列（§16.2，面板→bot 文件 IPC）**：`plugins/qq_official.py::_mail_admin_worker` 每 3–5s 扫 `data/mail_admin/queue/`，`os.replace` 改名到 `processing/` 原子认领，执行后回写 `status/`（操作 id `mailop_YYYYMMDD_<4hex>` 幂等；状态保留 7 天由 bot 清理）；操作类型白名单 `delete_letter` / `send_system`。系统邮件经 `send_active_c2c_markdown` 真实主动发送（markdown 信封样式 `## 系统邮件 · {title}`，共享熔断降级纯文本），**成功才** `write_system_letter` 入账；用户已拒收（`active_enabled=false`）→ 发送失败不入账。启动时 `_mail_admin_recover` 把上次进程中断的残留认领标记 `failed: bot restarted`。worker 不受 `mail_enabled` 开关影响（撤回/系统邮件独立于每日信封）。
 - `rate_limit.py`：`TokenBucket`/`ChannelLimiter`（c2c 10/s、group 1/s，按渠道懒建复用，可注入 monotonic）。
 - `group_registry.py`：官方群登记表 `data/group_registry.json`（v1 纯记账）：`GROUP_AT_MESSAGE_CREATE` 入站 upsert（60s 粒度节流防文件 churn），status `active/left/unknown` 状态机 + `active_enabled` 开关，为 P1 群主动消息预铺。
 
@@ -1094,17 +1098,19 @@ Agent 必须在以下情况拒绝 (礼貌):
 - **技能分类与触发推断**：`tools/ag_skill_index.py`（Skill 类 + 阵营触发方式分类）、`tools/ag_trigger_engine.py`（行动值效果触发链推断）、`tools/ag_llm_resolver.py`（嵌套子技能条件的 L4 窄 LLM 回退）。
 - 团战/镜像匹配时同一角色可能同时出现在我方和敌方（同名不同阵营），属正常情况。
 
-### 5.8 `tools/changelog.py` — 更新记录 (纯 IO/格式化)
+### 5.8 `tools/changelog.py` — 更新记录 + 公告 (纯 IO/格式化)
 
-面向用户的「更新记录」读写与格式化模块，无 nonebot 依赖，被三处共用：`/更新日志` 命令拦截、`get_changelog` LLM 工具、群发轮询器。数据存 `data/changelog/changelog.json`（结构 `{entries: [{version, date, changes: [{type, text}], created_at, broadcast_at}]}`，数组新→旧）。
+面向用户的「更新记录」与「公告」读写与格式化模块，无 nonebot 依赖，被多处共用：`/更新日志` 命令拦截、`get_changelog` LLM 工具、群发轮询器。两类数据分文件存于 `data/changelog/`：
+- **更新记录** `changelog.json`（`{entries: [{version, date, changes: [{type, text}], created_at, broadcast_at}]}`，数组新→旧）——结构化变更条目。
+- **公告** `announcements.json`（`{entries: [{id, title, body, format, created_at, updated_at, sent_at?, last_targets?}]}`，按服务端生成的 `id` 定位）——自由标题/正文/markdown，§16.3。
 
 - **变更类型** `CHANGE_TYPES = ["新增", "修复", "优化", "调整", "移除"]`；面板下拉选择。
-- **读取**：`load_entries()` / `get_recent(d=3)`（clamp 1..20，按 `created_at` 降序，不足返回全部）。
-- **格式化**：`format_for_qq(entries, requested, site_url=None)` 生成 QQ 结构化纯文本（`【版本】 日期` 标题 + `  • 类型：内容` 条目，不含 markdown）；`format_announcement(entry, site_url=None)` 用于群发（加 `📢 更新公告` 头）。两者 `site_url` 非空时在末尾追加一行公开站点指路（`📖 使用说明与演示：<url>`，纯文本）。空数据返回「暂无更新记录」提示行。
+- **读取**：`load_entries()` / `get_recent(d=3)`（clamp 1..20，按 `created_at` 降序）；`load_announcements()` / `get_announcement(id)` / `mark_announcement_sent(id, targets)`。
+- **格式化**：`format_for_qq(entries, requested, site_url=None)` 生成 QQ 结构化纯文本（`【版本】 日期` 标题 + `  • 类型：内容` 条目，不含 markdown）；`format_announcement(entry, site_url=None)` 用于更新记录群发（加 `📢 更新公告` 头）；`format_announcement_text(ann)` 用于自由公告群发（`📢 公告\n{title}\n\n{body}`）。`site_url` 非空时在末尾追加一行公开站点指路（`📖 使用说明与演示：<url>`，纯文本）。空数据返回「暂无更新记录」提示行。
 - **图片卡片**：`card_renderer.render_changelog_card(entries, out_path=None, title="更新记录", site_url=None)` 复用 help/feature 卡骨架渲染暗色 PNG（版本 pill 循环色 + 变更类型 badge 色 + 像素宽换行），命令/群发在文本后 best-effort 追加发送；`entries` 空返回 `None`。
-- **面板↔bot 通信**：`write_known_groups`/`read_known_groups`（群列表）、`claim_pending`（原子改名认领群发请求）/`finish_pending_claim`/`recover_stale_claim`（启动清理崩溃残留的 `.processing`）、`write_status`/`read_status`（群发结果回写）、`mark_broadcast`（仅当至少成功发出一群时回写 `broadcast_at`）。
+- **面板↔bot 通信**：`write_known_groups`/`read_known_groups`（群列表：OneBot `groups` + 官方 `official_groups` 双段）、`claim_pending`（原子改名认领群发请求 `{kind: changelog|announcement, ref, targets}`）/`finish_pending_claim`/`recover_stale_claim`（启动清理崩溃残留的 `.processing`）、`write_status`/`read_status`（群发结果回写，含 `kind`/`ref`/`skipped`/`by_channel`）、`mark_broadcast`（更新记录：仅当至少成功发出一群时回写 `broadcast_at`）。
 - **原子写** `_atomic_write_json`（tmp + `os.replace`）贯穿所有写操作。
-- 详细的面板/后台任务/文件队列设计见 §十二「更新记录 / 群发」。
+- 详细的面板/后台任务/文件队列/双渠道分流设计见 §十二「更新记录 / 公告群发」。
 
 
 ### 5.9 `tools/social_tools.py` / `tools/creation_tools.py` — 养成与创作工具
@@ -1645,25 +1651,44 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | `/config` 配置热管理 | 提示词 `*.md`、人格、`.env`、模型（结构化表单 + API 探测，§11.6） |
 | `/playground` Playground | 面板内直接对话调试（进程内构造 client，无需 nonebot driver） |
 | `/wiki` Wiki 缓存 | 角色/羁绊数据浏览、**别名字典编辑**（`character_dic.json` / `bonds_search_dic.json`） |
-| `/changelog` 更新日志 | 编辑更新记录（版本/日期/分类变更条目，`data/changelog/changelog.json`）、勾选群聊**群发更新公告** |
+| `/changelog` 更新日志与公告 | 编辑**更新记录**（版本/日期/分类变更条目，`changelog.json`）与**自由公告**（标题/正文/markdown，`announcements.json`），按渠道勾选**双渠道群发**（OneBot 群 + 官方群） |
+| `/mail` 邮件管理 | 用户信箱只读查看（列表 = 信箱建档 ∪ c2c 联系人登记表，openid 脱敏 W4）、勾选发送**系统邮件**（text/markdown）、**撤回**信件；经 `data/mail_admin/` 文件队列由 bot 执行并回写状态（§16.2/§16.4） |
 | `/redeem` 兑换码管理 | 限时/长期兑换码人工维护（权威源，`_source=panel`），支持导入/清理与自动抓取联动 |
 
-### 更新记录 / 群发（`data/changelog/`）
+### 更新记录 / 公告群发（`data/changelog/`，双渠道）
 
-面向用户的「更新记录」以结构化 JSON 存储，与开发者向的 `docs/更新日志.md`（git 提交整理）分开维护，面板是唯一编辑入口。面板与 bot 是两个进程，通过 `QQBot/data/changelog/` 下的共享文件通信（沿用 `redeem_code` 的文件队列范式）：
+面向用户的「更新记录」（结构化变更）与「公告」（自由标题/正文）以 JSON 存储，与开发者向的 `docs/更新日志.md`（git 提交整理）分开维护，面板是唯一编辑入口。面板与 bot 是两个进程，通过 `QQBot/data/changelog/` 下的共享文件通信（沿用 `redeem_code` 的文件队列范式）：
 
 | 文件 | 写入方 | 读取方 | 用途 |
 |------|--------|--------|------|
 | `changelog.json` | 面板 | bot + 面板 | 更新记录主数据（唯一真源，数组新→旧） |
-| `known_groups.json` | bot 后台任务 | 面板 | 群列表（群号+群名+成员数），供勾选 |
-| `pending_broadcast.json` | 面板 | bot 轮询器 | 群发请求队列（entry_index + targets） |
-| `broadcast_status.json` | bot 轮询器 | 面板 | 群发结果回写（供面板轮询显示进度） |
+| `announcements.json` | 面板 | bot + 面板 | 公告主数据（按 `id` 定位；`sent_at`/`last_targets` 由 bot 回写） |
+| `known_groups.json` | bot 后台任务 | 面板 | 群列表：OneBot `groups`（群号+群名+成员数）+ 官方 `official_groups`（openid+status+active_enabled），供分渠道勾选 |
+| `pending_broadcast.json` | 面板 | bot 轮询器 | 群发请求队列（`{kind: changelog\|announcement, ref, targets}`；旧裸 entry_index 格式仍兼容） |
+| `broadcast_status.json` | bot 轮询器 | 面板 | 群发结果回写（`kind`/`ref`/`sent`/`skipped`/`by_channel`，供面板轮询显示进度） |
 
-- **读写工具** `tools/changelog.py`（纯 IO/格式化，无 nonebot 依赖）：`load_entries`/`save_entries`/`get_recent(d)`（默认 3，clamp 1..20）/`format_for_qq`/`format_announcement`/`mark_broadcast`，命令拦截、`get_changelog` 工具、群发轮询器三方共用。
-- **bot 后台任务**（`agent_router.py` `_start_changelog_tasks()`，`@get_driver().on_startup`）：① 群列表导出——启动 15s 后 + 每 600s 调 `bot.get_group_list()` 写 `known_groups.json`；② 群发轮询器——启动先 `recover_stale_claim()` 清理崩溃残留并把卡住的 `sending` 改写为中断；随后每 5s `claim_pending()`（原子改名为 `.processing` 认领）→ 解析 targets（`all` 现场枚举 / 指定群号）→ `_split_text` 分段 + `bot.send_group_msg` 逐群发送（群间 1s 限速）→ 回写 `broadcast_status.json`；仅当至少成功发出一群时才 `mark_broadcast`（全失败则状态置 `error`，不误标"已群发"）。
-- **面板端点**：`GET/PUT /api/changelog`、`GET /api/changelog/groups`、`POST /api/changelog/broadcast`、`GET /api/changelog/broadcast/status`（`data_reader.changelog_*`，保存经 `config_editor.json_config_write` 原子写）。
+- **读写工具** `tools/changelog.py`（纯 IO/格式化，无 nonebot 依赖）：更新记录 `load_entries`/`save_entries`/`get_recent(d)`/`format_for_qq`/`format_announcement`/`mark_broadcast`；公告 `load_announcements`/`save_announcements`/`get_announcement(id)`/`mark_announcement_sent(id, targets)`/`format_announcement_text`；群列表 `write_known_groups(groups, official_groups)`/`read_known_groups`；队列 `claim_pending`/`finish_pending_claim`/`recover_stale_claim`/`write_status`/`read_status`。命令拦截、`get_changelog` 工具、群发轮询器共用。
+- **bot 后台任务**（`agent_router.py` `_start_changelog_tasks()`，`@get_driver().on_startup`）：
+  - ① **群列表导出** `_group_exporter`——启动 15s 后 + 每 600s：OneBot `bot.get_group_list()` + 官方群登记表（`group_registry`）合并写 `known_groups.json`（拉取失败时**保留上一版快照**，不清空）。
+  - ② **群发轮询器** `_broadcast_poller`——启动先 `recover_stale_claim()` 清理崩溃残留并把卡住的 `sending` 改写为中断；随后每 5s `claim_pending()`（原子改名为 `.processing` 认领）→ `_do_broadcast` 按 `kind` 分流（更新记录渲染卡片 + `format_announcement`；公告用 `format_announcement_text` + 可选 markdown）→ targets 归一化（`{channel, id}` / `all` 现场枚举，OneBot 枚举失败回落 known_groups 快照）→ **OneBot 渠道** `_split_text` 分段 + `send_group_msg`（群间 1s 限速，先发卡片图再发文本）；**官方渠道**先按 `group_registry` 预检（`status=active` 且 `active_enabled` 否则计入 `skipped`），`send_active_group` 发送（markdown 拒绝码降级纯文本 + 熔断器；`left` 码 → `mark_left`）→ 回写 `broadcast_status.json`（`by_channel` 分渠道计数）；仅当**至少成功发出一群**时才回写 `broadcast_at`/`sent_at`（全失败置 `error`，不误标"已群发"）。
+- **`send_active_group`**（`adapters/qq_official.py`）：官方群主动消息统一出口，返回 `"ok"|"left"|"failed"`；`_GROUP_LEFT_CODES`（40034101/40034105）判退群，markdown 命中 `_MD_REJECT_CODES` 降级纯文本重试一次，共享熔断器（连续 3 次拒绝开 10 分钟），`NetworkError`/`RateLimitException` 每档重试一次。
+- **面板端点**：`GET/PUT /api/changelog`、`GET /api/changelog/groups`、`POST /api/changelog/broadcast`、`GET /api/changelog/broadcast/status`、`GET/PUT /api/changelog/announcements`、`POST /api/changelog/announcements/broadcast`（`data_reader.changelog_*` / `announcement_*`；公告保存校验 id 唯一、非法 id 自动重生成为 `ann_YYYYMMDD_<6hex>`，保留 `created_at`/`sent_at`/`last_targets`；保存经 `config_editor.json_config_write` 原子写）。
 - **公开站点同步**（`public_site/` → `bot.oneweblog.cn`）：面板每次保存成功（`changelog_save` 的 `result.ok` 分支）调 `data_reader._export_public_changelog(entries)`，把**脱敏**快照（仅 version/date/changes；剔除 created_at/broadcast_at/_class，绝不含群列表/用户数据）原子写 `<PUBLIC_SITE_DIR>/changelog.json`；nginx root 指向该目录即发布（示例见 `docs/bot-site-nginx.md`）。导出失败静默，不阻断保存。站点为纯静态只读单页（index.html/style.css/app.js），`app.js` fetch `./changelog.json` 渲染「更新记录」区，缺失/404 优雅降级显示「暂无更新记录」。
-- **QQ 图片卡片 + 指路短链**：命令 `/更新日志` 与群发 `_do_broadcast` 在文本后 best-effort 追加 `render_changelog_card` 渲染的 PNG（群发在循环外渲染一次、逐群先发图再发文本；发卡失败降级为仅文本、不计入 failed）。指路短链 `_PUBLIC_SITE_URL`（env `BOT_PUBLIC_SITE_URL`，默认 `https://bot.oneweblog.cn`）经 `format_for_qq`/`format_announcement` 的 `site_url` 参数附到文本尾行，降低 /命令 使用门槛。
+- **QQ 图片卡片 + 指路短链**：命令 `/更新日志` 与更新记录群发 `_do_broadcast` 在文本后 best-effort 追加 `render_changelog_card` 渲染的 PNG（群发在循环外渲染一次、逐群先发图再发文本；发卡失败降级为仅文本、不计入 failed）。指路短链 `_PUBLIC_SITE_URL`（env `BOT_PUBLIC_SITE_URL`，默认 `https://bot.oneweblog.cn`）经 `format_for_qq`/`format_announcement` 的 `site_url` 参数附到文本尾行，降低 /命令 使用门槛。
+
+### 邮件管理（`data/mail_admin/`，面板 → bot 文件队列）
+
+面板对 `data/mailboxes/*.json`（bot 单写）**只读**；删除信件 / 发送系统邮件经 `data/mail_admin/` 文件队列下发给 bot 执行，回写 `status/` 供面板轮询（沿用群发/兑换码的文件队列范式，§16.2/§16.4）：
+
+| 目录 | 写入方 | 读取方 | 用途 |
+|------|--------|--------|------|
+| `queue/` | 面板 | bot worker | 待处理操作（`{id, type, openid, ...}`；type ∈ `delete_letter`/`send_system`） |
+| `processing/` | bot worker | bot worker | `os.replace` 改名认领（原子，避免重复处理） |
+| `status/` | bot worker | 面板 | 结果回写（`state` ∈ `done`/`failed` + `error`；保留 7 天由 bot 清理） |
+
+- **用户列表并集**（W4 脱敏）：`mail_users()`/`mail_overview()` 取 **信箱建档用户 ∪ `bond_greet_targets.json`（c2c 联系人登记表）**——只扫描信箱目录会漏掉「聊过天但还没收到过信」的用户（信箱文件惰性建档），而他们正是系统邮件的合法发送目标（`_mail_openid_known` 承认登记表 openid）。仅登记未建档者以空信箱行出现（`has_mailbox=false`、`active_enabled` 视为开启——拒收状态只存信箱文件里），排序键 `max(last_digest_at, last_seen)` 保证活跃联系人不沉底；列表展示 openid 一律脱敏（`abcd…wxyz`），完整值仅详情页。
+- **面板端点**：`GET /api/mail/overview`、`GET /api/mail/users`、`GET /api/mail/user`、`POST /api/mail/letters/delete`、`POST /api/mail/send`、`GET /api/mail/queue`（`data_reader.mail_*`）。入队**幂等去重**（delete 按 type+openid+letter_id；send 按 type+openid+title，同标题待处理时拒绝重复入队）。
+- **bot worker**：见 §2.16「邮件管理队列」——`plugins/qq_official.py::_mail_admin_worker` 认领执行、系统邮件经 `send_active_c2c_markdown` 真实发送后 `write_system_letter` 入账、撤回经 `delete_letter`（保留信封 id → `/邮件 <id>` 显示「已被撤回」）。
 
 ### 面板 ↔ bot 跨进程一致性
 
@@ -1677,7 +1702,8 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | MemorySystem `.md` | 无缓存 | 每次操作直接读盘，天然一致 |
 | 群功能开关 / 人格 JSON | 无常驻缓存 | 查询/toggle 前 `refresh()`；人格 set_* 均读盘→改→写 |
 | 提示词 `*.md` / `.env` / `models_settings.json` / 别名字典 | bot 只读 | 配置看门狗 mtime 热重载（§2.8），保存即生效 |
-| 更新记录 `changelog.json` | 无缓存 | bot 每次查询直接读盘，面板保存后下一条 `/更新日志` 即生效；群发经文件队列（`pending_broadcast.json` 原子改名认领）解耦 |
+| 更新记录 `changelog.json` / 公告 `announcements.json` | 无缓存 | bot 每次查询直接读盘，面板保存后下一条 `/更新日志` 即生效；群发经文件队列（`pending_broadcast.json` 原子改名认领）解耦 |
+| 信箱 `mailboxes/*.json` | 无缓存 | **面板只读**；写操作（删信/系统邮件）经 `mail_admin/` 文件队列下发 bot 执行，bot 是单写者——不存在双写竞争 |
 | 特殊会话 | 无缓存 | 每次操作直接读盘 |
 
 面板写操作普遍**写前备份**（`.bak` / `BACKUP_DIR`）+ 原子写（tmp + replace），并记录面板侧审计日志。
@@ -2253,7 +2279,16 @@ v2.29 基础上增加:
 - **事件**：`C2C_MSG_REJECT`/`C2C_MSG_RECEIVE`（`on_notice`）翻 mailbox `active_enabled`，拒收即停发、恢复即续。
 - **命令**：`/邮件`（列表分页/`下一页`/`p<N>`/`MM-DD`/编号看全文并标记已读，仅官方单聊，零 token 不带免责尾）；`/免责声明 [关|开]`（免责尾追加开关，三级用户均可，`data/user_prefs/disclaimer.json` 按渠道独立、mtime 热读，bot 单写者；信件/信封本就不带免责尾）。
 - **配置**：`bond_settings.json` 新增 `mail_*` 组（`mail_enabled` 为总回滚开关——关掉即回旧 `_greeting_loop`）；新增 `TestProactiveMail`（16 用例，离线）。
-- WebUI 邮件管理页、群公告通道（P1）、`check_mail` 工具与信件编辑（v2）不在本版。
+- WebUI 邮件管理页、群公告通道（P1）、`check_mail` 工具与信件编辑（v2）不在本版（次日补齐 WebUI 邮件管理 + 公告群发，见下条）。
+
+#### 2026-10-30（续）— WebUI 邮件管理 + 公告双渠道群发（proactive-mail-design.md §16）
+
+- **公告存储（§16.3）**：`tools/changelog.py` 新增 `announcements.json`（自由标题/正文/markdown，按服务端生成 `id` 定位）——`load/save_announcements`、`get_announcement(id)`、`mark_announcement_sent`、`format_announcement_text`（`📢 公告\n{title}\n\n{body}`）。面板保存校验 id 唯一、非法 id 自动重生成为 `ann_YYYYMMDD_<6hex>`，保留 `created_at`/`sent_at`/`last_targets`。
+- **双渠道群发（§16.5）**：`pending_broadcast.json` 升级为 `{kind: changelog|announcement, ref, targets}`（旧裸格式兼容）；targets 归一化为 `{channel, id}` / `all`。`agent_router._do_broadcast` 按 kind 分流，**OneBot 渠道**分段 + 卡片图，**官方渠道**先按 `group_registry` 预检（`status=active && active_enabled` 否则 `skipped`）再 `adapters/qq_official.send_active_group`（返回 ok/left/failed，markdown 拒绝码降级纯文本 + 熔断，`left` 码 `mark_left`）；回写 `broadcast_status.json` 带 `by_channel` 分渠道计数，仅 ≥1 群成功才回写 `broadcast_at`/`sent_at`。`_group_exporter` 合并 OneBot `get_group_list` + 官方登记表写 `known_groups.json`（双段）。
+- **WebUI 邮件管理（§16.2/§16.4）**：新增 `/mail` 页——信箱**只读**查看（列表 = 信箱建档 ∪ `bond_greet_targets.json` c2c 登记表，openid 脱敏 W4）、勾选发送系统邮件（text/markdown）、撤回信件；经 `data/mail_admin/{queue,processing,status}/` 文件队列下发 bot。bot 侧 `plugins/qq_official.py::_mail_admin_worker` 原子认领执行：`delete_letter`（撤回，保留信封 id → `/邮件 <id>` 显示「已被撤回」）、`send_system`（`send_active_c2c_markdown` 真实发送，成功才 `write_system_letter` 入账，拒收用户失败不入账），启动 `recover` 清残留。`mailbox.py` 增 `write_system_letter`/`delete_letter`/`is_withdrawn`。
+- **面板端点**：`GET/PUT /api/changelog/announcements`、`POST /api/changelog/announcements/broadcast`、`/api/mail/{overview,users,user,letters/delete,send,queue}`（`data_reader.announcement_*` / `mail_*`；入队幂等去重）。
+- **修复**：邮件页用户列表最初只扫 `mailboxes/` → 漏掉「聊过天但还没收过信」的用户（信箱惰性建档），改为并集 `bond_greet_targets.json` 登记表后名单完整、可勾选发送。
+- **测试**：新增 `TestMailAdmin`（§16.2/§16.4：系统信/撤回/worker/WebUI API）与 `TestAnnouncementBroadcast`（§16.3/§16.5：公告存储/send_active_group 分类/_do_broadcast 分流/WebUI 公告 API），离线共 59 套件全绿。
 
 #### 2026-10-30（晚）— 官方流式「重复输出 / 重复发送」修复（P0–P5）
 
