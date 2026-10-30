@@ -1621,6 +1621,21 @@ def _mail_boxes() -> list:
     return out
 
 
+def _greet_targets() -> dict:
+    """``data/bond_greet_targets.json`` → {openid: entry}。
+
+    这是 **c2c 联系人全量登记表**（bot 每个 c2c 入站回合都会
+    ``note_c2c_contact`` 落库），而信箱文件只在首次写信/系统邮件时才建档。
+    用户列表必须取两者并集，否则没收到过信的用户在面板上不可见、
+    无法勾选发送系统邮件（尽管 ``_mail_openid_known`` 一直允许发给他们）。
+    """
+    data = _load_json_file(GREET_TARGETS_FILE)
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): v for k, v in data.items()
+            if str(k or "").strip() and isinstance(v, dict)}
+
+
 def _mail_openid_known(openid: str) -> bool:
     """§16.4.2 校验：openid 必须存在于 mailboxes/ 或 bond_greet_targets.json。"""
     openid = str(openid or "").strip()
@@ -1628,14 +1643,18 @@ def _mail_openid_known(openid: str) -> bool:
         return False
     if (MAILBOX_DIR / _safe_openid_file(openid)).exists():
         return True
-    data = _load_json_file(GREET_TARGETS_FILE)
-    return isinstance(data, dict) and openid in data
+    return openid in _greet_targets()
 
 
 def mail_overview() -> dict:
-    """统计卡：用户数 / 信件总数 / 未读 / 系统邮件 / 关闭主动消息 / 队列待处理。"""
+    """统计卡：用户数 / 信件总数 / 未读 / 系统邮件 / 关闭主动消息 / 队列待处理。
+
+    用户数 = 信箱建档用户 ∪ c2c 联系人登记表（与 ``mail_users`` 同口径）。
+    """
     users = letters = unread = system_letters = disabled = 0
-    for _openid, box in _mail_boxes():
+    boxed = set()
+    for openid, box in _mail_boxes():
+        boxed.add(openid)
         users += 1
         ls = [l for l in (box.get("letters") or []) if isinstance(l, dict)]
         letters += len(ls)
@@ -1643,6 +1662,7 @@ def mail_overview() -> dict:
         system_letters += sum(1 for l in ls if l.get("system"))
         if not box.get("active_enabled", True):
             disabled += 1
+    users += sum(1 for k in _greet_targets() if k not in boxed)
     pending = 0
     for d in (MAIL_QUEUE_DIR, MAIL_PROC_DIR):
         try:
@@ -1657,12 +1677,19 @@ def mail_overview() -> dict:
 def mail_users(query: str = "", page: int = 1, page_size: int = 20) -> dict:
     """用户列表（分页 + 搜索：openid 片段/信件 id/人格名）。
 
+    名单 = 信箱建档用户 ∪ ``bond_greet_targets.json``（c2c 联系人全量
+    登记表）。仅登记、还没信箱文件的用户以空信箱行出现（``has_mailbox``
+    =False，active_enabled 视为开启——拒收状态只存在信箱文件里），排序用
+    ``max(last_digest_at, last_seen)`` 保证活跃联系人不被压底。
+
     行内 openid 供前端取详情用，**展示必须用 openid_masked**（W4 脱敏是
     展示纪律；接口本身在登录中间件之后，面板即管理员）。
     """
     q = str(query or "").strip().lower()
     rows = []
+    boxed = set()
     for openid, box in _mail_boxes():
+        boxed.add(openid)
         letters = [l for l in (box.get("letters") or []) if isinstance(l, dict)]
         personas = box.get("personas") if isinstance(box.get("personas"), dict) else {}
         known = box.get("known_personas") \
@@ -1684,8 +1711,34 @@ def mail_users(query: str = "", page: int = 1, page_size: int = 20) -> dict:
             "last_digest_date": str(box.get("last_digest_date") or ""),
             "last_digest_at": box.get("last_digest_at", 0),
             "active_enabled": bool(box.get("active_enabled", True)),
+            "has_mailbox": True,
+            "last_seen": 0,
         })
-    rows.sort(key=lambda r: float(r.get("last_digest_at") or 0), reverse=True)
+    # c2c 登记表里还没建档的联系人（发系统邮件的合法目标，必须可勾选）
+    for openid, entry in _greet_targets().items():
+        if openid in boxed:
+            continue
+        if q and q not in openid.lower():
+            continue
+        try:
+            last_seen = float(entry.get("last_seen") or 0)
+        except (TypeError, ValueError):
+            last_seen = 0
+        rows.append({
+            "openid": openid,
+            "openid_masked": _mask_openid(openid),
+            "personas": 0,
+            "letters": 0,
+            "unread": 0,
+            "system": 0,
+            "last_digest_date": "",
+            "last_digest_at": 0,
+            "active_enabled": True,
+            "has_mailbox": False,
+            "last_seen": last_seen,
+        })
+    rows.sort(key=lambda r: max(float(r.get("last_digest_at") or 0),
+                                float(r.get("last_seen") or 0)), reverse=True)
     return _paginate(rows, page, page_size)
 
 

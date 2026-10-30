@@ -52,7 +52,7 @@ function renderUsers() {
   const box = $('ml-user-table');
   const items = usersPage.items || [];
   if (!items.length) {
-    box.innerHTML = `<p class="muted">（${curQuery ? '没有匹配的用户' : '还没有用户信箱 — 角色信箱随每日邮件 pass 自动建档'}）</p>`;
+    box.innerHTML = `<p class="muted">（${curQuery ? '没有匹配的用户' : '还没有用户 — c2c 联系人随对话自动登记，信箱随每日邮件 pass 建档'}）</p>`;
   } else {
     box.innerHTML = `
       <table class="data-table">
@@ -65,11 +65,13 @@ function renderUsers() {
             <td><input type="checkbox" class="ml-pick" value="${esc(u.openid)}"
                        data-masked="${esc(u.openid_masked)}"
                        data-active="${u.active_enabled ? '1' : '0'}"></td>
-            <td class="mono">${esc(u.openid_masked)}</td>
+            <td class="mono">${esc(u.openid_masked)}${u.has_mailbox === false
+              ? ' <span class="muted">(未建档)</span>' : ''}</td>
             <td>${u.personas}</td>
             <td>${u.letters}${u.system ? ` <span class="muted">(系统 ${u.system})</span>` : ''}</td>
             <td>${u.unread ? `<b>${u.unread}</b>` : 0}</td>
-            <td>${esc(u.last_digest_date || '—')}</td>
+            <td>${u.last_digest_date ? esc(u.last_digest_date)
+              : (u.last_seen ? `<span class="muted" title="最近活跃（尚无信封）">${fmtTime(u.last_seen)}</span>` : '—')}</td>
             <td>${u.active_enabled
               ? '<span class="pill badge-ok">开启</span>'
               : '<span class="pill badge-err">已拒收</span>'}</td>

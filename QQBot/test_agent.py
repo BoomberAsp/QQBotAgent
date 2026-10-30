@@ -12898,9 +12898,10 @@ class TestMailAdmin:
         mb2.record_digest("DDDD1234", [{"persona": "roxy", "name": "罗克西",
                                         "text": "hi"}], now=now - 100)
         lid_d = mb2.load_user("DDDD1234")["letters"][0]["id"]
-        # 仅登记过主动发送、还没有信箱文件的用户
-        (tmp / "greet.json").write_text(json.dumps({"EEEE9999": {}}),
-                                        encoding="utf-8")
+        # 仅登记过主动发送、还没有信箱文件的用户（c2c 联系人登记表）
+        (tmp / "greet.json").write_text(
+            json.dumps({"EEEE9999": {"last_seen": now - 50}}),
+            encoding="utf-8")
         with patch.object(dr, "MAILBOX_DIR", tmp / "mailboxes"), \
                 patch.object(dr, "MAIL_QUEUE_DIR", tmp / "queue"), \
                 patch.object(dr, "MAIL_PROC_DIR", tmp / "proc"), \
@@ -12910,22 +12911,30 @@ class TestMailAdmin:
             assert dr._mask_openid(oa) == "AAAA…CCCC"
             assert dr._mask_openid("short") == "sh…"
             assert dr._mask_openid("") == ""
-            # 统计卡
+            # 统计卡（用户数 = 信箱建档 ∪ greet 登记表）
             ov = dr.mail_overview()
-            assert ov == {"users": 2, "letters": 3, "unread": 3,
+            assert ov == {"users": 3, "letters": 3, "unread": 3,
                           "system_letters": 1, "disabled_users": 1,
                           "queue_pending": 0}, ov
-            # 用户列表：排序（最近信封在前）+ 脱敏 + 搜索
+            # 用户列表：并集名单 + 混合排序（max(last_digest_at, last_seen)）
+            # + 脱敏 + 搜索；仅登记未建档的用户也必须出现（可勾选发送）
             page = dr.mail_users()
-            assert page["total"] == 2
+            assert page["total"] == 3
             rows = page["items"]
-            assert rows[0]["openid"] == oa and rows[0]["openid_masked"] == "AAAA…CCCC"
+            assert [r["openid"] for r in rows] == [oa, "EEEE9999", "DDDD1234"], rows
+            assert rows[0]["openid_masked"] == "AAAA…CCCC"
             assert rows[0]["active_enabled"] is False and rows[0]["system"] == 1
             assert rows[0]["letters"] == 2 and rows[0]["unread"] == 2
+            assert rows[0]["has_mailbox"] is True
+            assert rows[1]["has_mailbox"] is False and rows[1]["letters"] == 0
+            assert rows[1]["active_enabled"] is True
+            assert rows[1]["last_seen"] == now - 50
             hit = dr.mail_users(query="roxy")
             assert hit["total"] == 1 and hit["items"][0]["openid"] == "DDDD1234"
             hit = dr.mail_users(query=lid_a)
             assert hit["total"] == 1 and hit["items"][0]["openid"] == oa
+            hit = dr.mail_users(query="EEEE")
+            assert hit["total"] == 1 and hit["items"][0]["openid"] == "EEEE9999"
             assert dr.mail_users(query="查无此人")["total"] == 0
             # 详情：全文 openid + 倒序信件 + digest letter_states
             d = dr.mail_user(oa)
