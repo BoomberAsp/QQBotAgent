@@ -359,13 +359,15 @@ class StoryHit:
 # ── Text helpers ───────────────────────────────────────────────────
 
 def _source_label(hit) -> str:
-    """命中片段的来源标注 —— 让模型分清「游戏原文」与「wiki 英文原文/中文摘要」。
+    """命中片段的来源标注 —— 告诉模型这段是哪个库、什么语种/授权范围。
 
-    混合数据源后这点很关键：主线/活动/羁绊（客户端）是**中文原文**，可以直接按
-    措辞转述；wiki 来源是英文原文 + LLM 中文摘要，只能转述、不能当原话引用。
+    混合数据源后这点很关键：gamedata 库是**中文原文**（客户端解包），wiki 库是
+    **英文原文 + LLM 中文摘要**（wiki 本身也是解英文版得到的）。语种不同会影响
+    "能不能按原话引用"，所以必须逐段标注。
     """
     title = getattr(hit, "page_title", "") or ""
     work = getattr(hit, "work", "") or ""
+    src_db = getattr(hit, "source_db", "") or ""
     if work == "bond":
         return "〔来源：羁绊剧情·游戏原文〕"
     if "（活动·客户端原文）" in title:
@@ -374,10 +376,14 @@ def _source_label(hit) -> str:
         return "〔来源：主线剧情·游戏原文〕"
     if "（场景目录）" in title:
         return "〔来源：章节场景索引〕"
+    if src_db == "gamedata" and work == "event":
+        return "〔来源：活动剧情·游戏原文〕"
     if work == "event":
-        return "〔来源：活动剧情·wiki〕"
+        return "〔来源：活动剧情·wiki·英文原文〕"
     if work in ("main", "hard", "prologue"):
-        return "〔来源：主线剧情·wiki〕"
+        return "〔来源：主线剧情·wiki·英文原文〕"
+    if src_db == "gamedata":
+        return "〔来源：游戏数据〕"
     return "〔来源：wiki〕"
 
 
@@ -983,16 +989,36 @@ _story_kb: Optional[StoryKB] = None
 _singleton_lock = threading.Lock()
 
 
-def get_story_kb(db_path: Optional[str] = None) -> StoryKB:
-    """Get (or lazily create) the process-wide StoryKB instance."""
+def get_story_kb(db_path: Optional[str] = None):
+    """Get (or lazily create) the process-wide story source.
+
+    * ``db_path`` 明确给出 → 直接返回该库的 :class:`StoryKB`（测试/脚本用）。
+    * 否则：若发现**多个**库（gamedata + wiki），返回融合门面
+      :class:`lib.story_sources.StorySources`（接口与 StoryKB 兼容：search /
+      render_block / format_injection / entity_hit / stats），调用方无需改动。
+    """
     global _story_kb
     if db_path is not None:
         return StoryKB(db_path)
     if _story_kb is None:
         with _singleton_lock:
             if _story_kb is None:
-                _story_kb = StoryKB()
+                _story_kb = _open_default_source()
     return _story_kb
+
+
+def _open_default_source():
+    """有多个库时用融合门面，否则退回单库（保持旧行为）。"""
+    try:
+        from .story_sources import StorySources, discover_dbs
+        dbs = discover_dbs()
+        if len(dbs) > 1:
+            src = StorySources(dbs)
+            if src.available:
+                return src
+    except Exception as exc:  # noqa: BLE001
+        print(f"[story_kb] 多库融合不可用，退回单库：{type(exc).__name__}: {exc}")
+    return StoryKB()
 
 
 # ── Persona → character id resolution ─────────────────────────────
