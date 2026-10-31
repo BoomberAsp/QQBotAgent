@@ -35,11 +35,17 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 **Note**: The separate `check_weather` tool has been removed. Weather queries are handled through the dedicated `get_weather` tool (Amap API) or this unified search tool as a fallback.
 
+**Archive**: Every successful search is archived in full (7-day retention). The return text ends with a `[存档] id: xxx` line — keep that id in mind (or put it in `finalize_subtask`'s `refs`). If earlier search results were folded/compressed away and you need their URLs or details again, call `recall_search_result` with that id instead of re-searching.
+
 ---
 
 ## Tool: web_fetch
 
 **Description**: Fetch and extract text content from a specified URL. Only HTTPS is allowed. HTML pages are automatically converted to plain text. When SearXNG can't find results for a specific URL, this tool can fetch the page directly.
+
+Anti-bot handling is a two-tier ladder:
+- **Tier 1 (always on)**: requests carry a real Chrome TLS fingerprint (curl_cffi `chrome131` impersonation), so most anti-bot / WAF blocks based on TLS fingerprinting are bypassed transparently.
+- **Tier 2 (opt-in)**: if Tier 1 still hits a full Cloudflare JS challenge ("Just a moment…", 403/429/503), and the administrator has enabled `WEB_FETCH_BROWSER`, the page is re-fetched through a headless Firefox that solves the challenge. When the browser engine is off (the default) or also fails, the result reports that the page was blocked rather than returning the challenge page.
 
 **When to use**:
 - SearXNG search returns no results for a known URL
@@ -65,8 +71,10 @@ This document defines all tools available to the agent. Each tool has a name, de
 - Protocol: HTTPS only (HTTP, FTP, etc. are rejected)
 - Max response size: 2 MB (larger responses are truncated)
 - Max text output: 8000 characters
-- Timeout: 30 seconds
+- Timeout: 30 seconds (Tier 1 HTTP). The optional Tier 2 browser fallback adds up to `WEB_FETCH_BROWSER_TIMEOUT` (default 45s) and only runs when Tier 1 is blocked.
 - Content types: HTML (converted to text), plain text, JSON. Other types return metadata only.
+
+**Archive**: Fetched page text is archived in full (7-day retention) with a `[存档] id: xxx` footer line. To re-read a page whose content was folded/compressed out of context, call `recall_search_result` with that id instead of fetching again.
 
 ---
 
@@ -210,7 +218,7 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: execute_code
 
-**Description**: Execute Python code in a sandboxed environment and return the output. Supports basic Python operations, calculations, and scripts.
+**Description**: Execute Python code in a sandboxed environment and return the output. Supports basic Python operations, calculations, and scripts. Output is capped at 16KB — when dealing with large data, aggregate/filter inside the code and print conclusions, not raw dumps.
 
 **When to use**: When the user asks you to write and run code, perform calculations that require execution, or test a code snippet.
 
@@ -237,7 +245,7 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: shell_exec
 
-**Description**: Execute read-only shell commands in the server workspace. Supports pipes (`|`) for chaining. Every command is validated against a whitelist before execution. 40+ commands available.
+**Description**: Execute read-only shell commands in the server workspace. Supports pipes (`|`) for chaining. Every command is validated against a whitelist before execution. 40+ commands available. Output is capped at 16KB (stderr 8KB) — use `head` / `tail` / `grep` / `wc` to narrow results instead of dumping whole files.
 
 **When to use**: When you need quick system info (disk, memory), file metadata, text processing via shell pipes, directory exploration, or git repo inspection. Not for tasks that Python can handle more clearly.
 
@@ -295,20 +303,29 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: redeem_code
 
-**Description**: Query currently valid game redeem/exchange codes. Returns code strings, reward descriptions, and expiry dates. Codes are automatically scraped and cached daily; expired codes (>7 days) are cleaned up automatically.
+**Description**: Query game redeem/exchange codes. Codes are maintained manually by the admin through the WebUI 兑换码管理 page (authoritative, source=panel), supplemented by a daily auto-scrape of ucngame.com when it is reachable (ucngame sits behind a Cloudflare JS challenge; the optional ruyiPage browser engine — `REDEEM_CODE_BROWSER=ruyipage`, see scripts/install_redeem_browser.sh — clears it so ucngame auto-refreshes again; without it the scrape is CF-blocked and panel maintenance is the only source); scraped codes expired >7 days are cleaned up automatically, panel entries never are. Expiry semantics: a code's `valid` date means it expires at **08:00 (UTC+8)** that morning (UTC midnight), matching official announcements ("兌換期限至 2026-10-14 08:00(UTC+8)"). Two categories: **time-limited** codes (have an expiry date, or were first listed within the last 30 days — fresh event codes) and **long-term** codes (no known expiry and not recently listed; mixes permanent codes with old unverified ones). Default scope returns currently-valid time-limited codes plus time-limited codes that expired within the last 7 days. When no time-limited codes remain and the scraper is failing, the tool says the data awaits an admin update and notifies the WebUI panel.
 
-**When to use**: When the user asks about redeem codes, exchange codes, or 兑换码. Keywords: 兑换码, redeem code, CDK, 礼包码, CDKey.
+**When to use**: When the user asks about redeem codes, exchange codes, or 兑换码. Keywords: 兑换码, redeem code, CDK, 礼包码, CDKey. Use scope=long_term when the user explicitly asks for 长期兑换码/永久码.
 
 **Parameters**:
 ```json
 {
   "type": "object",
-  "properties": {},
+  "properties": {
+    "scope": {
+      "type": "string",
+      "enum": ["time_limited", "long_term", "all"],
+      "description": "time_limited=限时兑换码（默认）；long_term=长期兑换码；all=全部",
+      "default": "time_limited"
+    }
+  },
   "required": []
 }
 ```
 
-**Note**: The `/兑换码` and `/redeem-code` slash commands also trigger this feature directly without going through the agent. The tool is for natural-language requests like "有什么兑换码吗".
+**Note**: The `/兑换码` and `/redeem-code` slash commands (time-limited) and `/长期兑换码` (long-term) also trigger this feature directly without going through the agent. The tool is for natural-language requests like "有什么兑换码吗".
+
+**Note**: With the default scope, after returning the list the tool automatically sends each active time-limited code to the user as a separate standalone message (for easy copying). Do NOT repeat the full code list character-by-character in your reply — a brief summary (e.g. how many codes are available and the freshest ones) is enough. For long_term/all scopes no per-code messages are sent; summarize the important codes in your reply.
 
 ---
 
@@ -346,7 +363,7 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 **Workflow rules**:
 
-1. **First gacha request in conversation**: Ask "要先看抽卡动画还是直接看结果？", then call this tool after the user replies.
+1. **First gacha request in conversation**: Call `begin_task` (goal: 抽卡), then ask "要先看抽卡动画还是直接看结果？", call this tool after the user replies, and call `finalize_subtask` after presenting the result.
 2. **Follow-up "再来一次" / "再抽" / "继续抽"**: Call this tool **immediately** with the same pool_type and up_character as the previous call. Do NOT ask about animation again.
 3. **NEVER fabricate gacha results**. Every pull result MUST come from this tool. If you output star ratings, character names, or gacha results without calling this tool, you are hallucinating.
 
@@ -514,7 +531,7 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 **Description**: 解析 Ark Re:Code 战斗截图：每张图一次 qwen3.5-ocr 调用提取角色名与行动值，横幅颜色带扫描判定阵营（我方/敌方），字形匹配纠偏角色名。接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON（含自动判定的 `phase`：全员行动值≤5% 为 pre，否则 post；双图模式会**自动把两张图排成跑条前→跑条后**，另有 `screenshot_phases`、跑条前有效性 `pre_valid`）和 calculate_speed 兼容的文本格式。**支持两种模式（`mode` 参数）：`light`（轻量，仅提取角色名与行动值，约10秒，跳过技能解析与行动值修正）与 `full`（全量，完整流程：技能解析+行动值修正，约90秒，默认）。**
 
-**When to use**: 当用户上传**或引用**战斗截图并要求测速/分析行动值时，调用此工具提取数据。截图路径会以 `[用户引用了文件 ... 文件路径: xxx]` 或 `[用户上传了图片，已保存至: xxx]` 的形式出现在上下文中——**直接取该路径调用，不要改用 read_file**（read_file 无法做战斗 OCR，会产生无关内容污染上下文）。**调用前先告知用户两种模式的区别（流程与预计用时：轻量约10秒、全量约90秒），按用户选择传入 `mode`。**提取后需展示结果给用户确认，询问我方角色速度值，再调用 calculate_speed。
+**When to use**: 当用户上传**或引用**战斗截图并要求测速/分析行动值时，调用此工具提取数据。截图路径会以 `[用户引用了文件 ... 文件路径: xxx]` 或 `[用户上传了图片，已保存至: xxx]` 的形式出现在上下文中——**直接取该路径调用，不要改用 read_file**（read_file 无法做战斗 OCR，会产生无关内容污染上下文）。**即使你已能直接看到截图（Direct Vision），行动值/角色名也必须以本工具的 OCR 提取结果为准（确定性识别+字形纠偏），不要凭视觉自行读数。**调用前先告知用户两种模式的区别（流程与预计用时：轻量约10秒、全量约90秒），按用户选择传入 `mode`。**提取后需展示结果给用户确认，询问我方角色速度值，再调用 calculate_speed。
 
 **重要说明**：
 - **同名角色可出现在双方**：团战/镜像匹配时，同一角色可能同时站在我方和敌方（同名不同阵营），这是正常情况，不要当作「两边阵容对不上」的错误。
@@ -647,7 +664,7 @@ This document defines all tools available to the agent. Each tool has a name, de
 
 ## Tool: read_file
 
-**Description**: Read and analyze files that users upload in QQ messages. Supports text files (code, logs, configs, etc. — returns full content), PDF files (returns extracted text), image files (returns metadata + AI analysis if multimodal LLM configured), and audio files (returns metadata + AI transcription/emotion/context analysis if audio model configured).
+**Description**: Read and analyze files that users upload in QQ messages. Supports text files (code, logs, configs, etc. — returns content; large files are segmented via `offset`), PDF files (returns extracted text), image files (returns metadata + AI analysis if multimodal LLM configured), and audio files (returns metadata + AI transcription/emotion/context analysis if audio model configured).
 
 **When to use**: When a user has uploaded a file, image, or voice message in the current message, and you need to read its contents. The file path is auto-generated and provided in the message context (e.g. `[用户上传了文件 report.pdf，已保存至: data/workspace/uploads/xxx-report.pdf]`).
 
@@ -659,6 +676,10 @@ This document defines all tools available to the agent. Each tool has a name, de
     "file_path": {
       "type": "string",
       "description": "The saved file path from the message context. Must be within the workspace."
+    },
+    "offset": {
+      "type": "integer",
+      "description": "(Optional) Character offset for segmented reading of large text files. When a read is truncated, the notice gives the offset to pass for the next segment. Text files only; ignored for PDF/image/audio."
     }
   },
   "required": ["file_path"]
@@ -666,9 +687,176 @@ This document defines all tools available to the agent. Each tool has a name, de
 ```
 
 **File type support**:
-- Text: `.txt`, `.md`, `.py`, `.json`, `.csv`, `.log`, `.yml`, `.yaml`, `.toml`, `.xml`, `.html`, `.css`, `.js`, `.ts`, `.sh`, `.bat`, `.c`, `.cpp`, `.h`, `.java`, `.go`, `.rs`, `.sql`, and more — returned as plain text (capped at 50KB)
+- Text: `.txt`, `.md`, `.py`, `.json`, `.csv`, `.log`, `.yml`, `.yaml`, `.toml`, `.xml`, `.html`, `.css`, `.js`, `.ts`, `.sh`, `.bat`, `.c`, `.cpp`, `.h`, `.java`, `.go`, `.rs`, `.sql`, and more — returned as plain text (capped at 50K chars per read; pass `offset` from the truncation notice to continue with the next segment)
 - PDF: `.pdf` — text extracted via PyPDF2 (capped at 8KB)
 - Image: `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp` — returns dimensions/format/size metadata, plus AI visual analysis (if multimodal LLM configured in `QQBot/config/models_settings.json` MULTIMODAL_MODEL section)
 - Audio: `.amr`, `.silk`, `.wav`, `.mp3`, `.ogg`, `.m4a`, `.aac`, `.flac`, `.opus` — returns duration/codec/sample-rate metadata, plus AI transcription + emotion + background analysis (if audio model configured in `QQBot/config/models_settings.json` AUDIO_MODEL section; falls back to MULTIMODAL_MODEL if that model supports audio)
 
 **Note**: If the multimodal LLM is not configured, image/audio analysis falls back to metadata-only mode with setup instructions. Text and PDF files work without any additional configuration.
+
+**Direct Vision**: 当主模型在 models_settings.json 中开启了 `supports_vision`，用户**本轮**上传/引用的图片会直接附在消息里——你已经能看到它们，无需再对同一路径调用 read_file。read_file 的图片懒分析仅用于：历史轮次的图片（当时未直传、或本轮未附图的会话）、主模型未开视觉、或需要 MULTIMODAL_MODEL 专门分析的场景。战斗截图测速仍应使用 parse_battle_screenshots（确定性 OCR，数值更可靠）。
+
+---
+
+## Tool: begin_task
+
+**Description**: Mark the start of a multi-turn tool-based subtask (gacha, battle speed-check) and open a fold window. The setup/clarification turns that follow will be folded into one compact structured record when the task is finalized, instead of piling up verbatim in the conversation context.
+
+**When to use**: Exactly once, at the beginning of a tool task that REQUIRES a setup/clarifying question before execution (e.g. first gacha request → ask 动画 or 直接看结果; speed-check → ask 轻量 or 全量模式). Do NOT call it for tasks that need no clarification, and do NOT call it on follow-up repetitions ("再来一次" — the window is already closed).
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "goal": {
+      "type": "string",
+      "description": "子任务目标的简短描述，如「十连抽卡」「战斗截图测速」"
+    }
+  },
+  "required": ["goal"]
+}
+```
+
+**Workflow**:
+1. Call `begin_task` → 2. Ask the setup question → 3. On the user's reply, run the real tools → 4. Present the result → 5. Call `finalize_subtask`.
+
+---
+
+## Tool: finalize_subtask
+
+**Description**: Close a subtask opened by `begin_task` and submit its structured result. The whole flow is folded into one compact record line in the conversation context; the full detail (goal, result, params, refs, status, follow-ups, tool calls) is archived to the per-user task log for later traceability.
+
+**When to use**: MANDATORY after completing a multi-turn tool task — once the final result has been presented to the user (gacha results shown, speed value computed via `calculate_speed`, ...). Fill `result` with a 1-3 sentence summary of the final outcome (the user already saw the full detail in chat), `params` with the key parameters actually used (卡池/次数/测速模式…), and `follow_ups` with any unfinished items or suggestions.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "goal": {"type": "string", "description": "子任务目标"},
+    "result": {"type": "string", "description": "最终结果的精炼概括（1-3 句）"},
+    "tool": {"type": "string", "description": "主要使用的工具名，如 gacha_pull / parse_battle_screenshots"},
+    "params": {"type": "object", "description": "关键参数/约束，如 {pool_type, count, mode}"},
+    "refs": {"type": "array", "items": {"type": "string"}, "description": "引用的角色名/文件路径/会话名等"},
+    "status": {"type": "string", "enum": ["success", "partial", "failed"], "default": "success"},
+    "failure": {"type": "string", "description": "失败类型（仅 status=failed 时填写）"},
+    "follow_ups": {"type": "array", "items": {"type": "string"}, "description": "未完成事项或后续建议"}
+  },
+  "required": ["goal", "result"]
+}
+```
+
+**Note**: Even without a prior `begin_task` (or if its 15-minute window expired), calling this tool still archives the record and folds the current turn — only the setup-turn removal is skipped. For tool-heavy turns where you forgot to call it, the system auto-compresses long results into a degraded record anyway, but explicit finalization always produces the better record.
+
+---
+
+## Tool: recall_search_result
+
+**Description**: Retrieve the complete archived result of a previous `search_web` or `web_fetch` call by its archive id. Archives are kept for 7 days and are strictly per-user — you can only recall archives created by the current user's own tool calls.
+
+**When to use**:
+- Earlier search/fetch results were folded or compressed out of context, and you need their URLs, snippets or page text again
+- A `finalize_subtask` record's `refs` contain an archive id you now need to expand
+- Prefer this over re-searching when the archived content is what you already triaged; re-search instead when freshness matters (the recall output shows the archive age)
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "archive_id": {
+      "type": "string",
+      "description": "存档 id（12位十六进制，来自 search_web/web_fetch 返回末尾的 [存档] 行）"
+    }
+  },
+  "required": ["archive_id"]
+}
+```
+
+**Note**: The output header carries the archive timestamp and age in hours. For time-sensitive topics (news, prices, weather), weigh the age before reusing archived content — when in doubt, run a fresh `search_web`. If the id is invalid, expired, or belongs to another user, the tool says so; fall back to re-searching.
+
+---
+
+## Tool: recall_memory
+
+**Description**: Retrieve the full content of the current user's high-confidence long-term memories (长期记忆) by id or keyword. The system prompt only carries a compact index of these memories (`[id] 标题（时间）`); this tool expands an index entry into its full summary plus the archived conversation snapshot. Strictly per-user — you can only recall the current user's own memories.
+
+**When to use**:
+- The long-term memory index in the system prompt lists an entry relevant to the conversation, and you need its details (full summary or original conversation snapshot)
+- The user references a past event/agreement with "还记得…吗 / 之前说过…" and the index shows a matching title
+- Prefer this over asking the user to repeat themselves when a plausible index entry exists
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "记忆 id（可只写前缀，如 L3f2a）或标题/摘要关键词"
+    }
+  },
+  "required": ["query"]
+}
+```
+
+**Note**: Returns up to 3 matches, newest first, each with a snapshot timestamp — weigh the age before treating the content as current (the user may have changed since). Long snapshots are truncated. If nothing matches, say so honestly and fall back to asking the user; never fabricate memory content.
+
+---
+
+## Tool: story_search
+
+**Description**: Search the 《星陨计划 (Ark Re:Code)》 original-story knowledge base — every dialogue line of the main story (序章 / Part I–III, including the S-rank stages) and all limited-time event stories. Returns, for each hit: the scene's source label (chapter/event + scene title), the unit-level Chinese synopsis, the scene-level Chinese gist, and an excerpt of the **original English dialogue** with speaker names.
+
+**When to use**:
+- The user asks about game plot, character backstory or world events: 剧情, 故事, 主线, 活动剧情, 谁是谁, 发生了什么, 后来怎么样了, 第一次方舟战争, 使徒, 三大方舟, 露比/伊娥丝/挪亚的过去…
+- A `## 剧情记忆（原作剧情检索命中）` block already appeared but you need more scenes than the two it carries
+- You are about to state something canon about Ark Re:Code and want to verify it instead of guessing
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "检索关键词：角色名、事件名、章节号或情节描述（中文优先）"
+    },
+    "limit": {
+      "type": "integer",
+      "description": "返回片段数，1-8，默认 4"
+    }
+  },
+  "required": ["query"]
+}
+```
+
+**Availability**: Gated by persona — only the personas listed in `config/story_personas.json` (default `rubi` + `assistant`) see this tool and receive the per-turn `## 剧情记忆` injection. Other personas (user-created characters, 角色 Roxy) get neither; edit that JSON to change it (takes effect on the next turn).
+
+**Note**: The corpus is English; always translate quoted dialogue into Chinese when answering. If a search returns nothing, retry once with a different phrasing (character name instead of a plot description) and then admit you don't have that part of the story — never invent plot details. The database is built offline by `python scripts/build_story_kb.py --all`; if the tool reports it is missing, tell the user to rebuild it.
+
+---
+
+## Tool: get_changelog
+
+**Description**: Query the bot's own update records / changelog (更新记录 / 更新日志). Returns the most recent `count` entries (default 3, max 20) as structured plain text — each entry has a version, a date, and a list of typed change items (新增/修复/优化/调整/移除). The data is maintained by the admin through the WebUI 更新日志 page and read fresh from disk on every call, so it is always current. This is the bot's OWN changelog — not a game's or any third-party software's release notes.
+
+**When to use**: When the user asks what the bot itself has updated recently. Keywords: 更新日志, 更新记录, 最近有什么更新, 有哪些新功能, 这版更新了什么, 机器人升级了什么, changelog, what's new. Do NOT use it for game/third-party version questions — use `search_web` for those.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "count": {
+      "type": "integer",
+      "description": "返回最近多少条更新记录，默认3，最多20",
+      "default": 3
+    }
+  },
+  "required": []
+}
+```
+
+**Note**: The `/更新日志 [d]`, `/update record [d]` and `/changelog [d]` slash commands also trigger this feature directly without going through the agent (zero token cost). The tool is for natural-language requests like "最近有什么更新". Summarize the returned entries in your reply; the text is already user-ready plain text.

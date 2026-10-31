@@ -14,20 +14,113 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .tool_registry import ToolRegistry
 from .session import Session, SessionManager
-from .memory import MemorySystem, MemoryEntry
+from .memory import MemorySystem, TieredMemory
 from .profile import ProfileManager
 from .hardware import HardwareDetector, HardwareProfile
 from .workspace import UserWorkspaceManager
-from .special_session import SpecialSessionManager, SpecialSession
+from .special_session import (
+    SpecialSessionManager, SpecialSession,
+    COMPRESSION_SUMMARY_PREFIX,
+    estimate_context_tokens, estimate_text_tokens,
+)
+from .task_record import build_auto_record, build_compact_line, append_task_log
 
 
-# Long-term memory write policy. Only interactions whose combined
-# user+assistant length exceeds MIN_REMEMBER_LEN are persisted, and each user
-# is capped at MAX_MEMORIES_PER_USER entries (oldest pruned first). This keeps
-# the memory store bounded and prevents low-value/hallucinated replies from
-# accumulating and later re-entering the prompt via keyword search.
-MIN_REMEMBER_LEN = 800
-MAX_MEMORIES_PER_USER = 20
+# P1: long-term memory is now the three-tier engine (TieredMemory), driven
+# entirely through ProfileManager extraction. The old _maybe_remember raw-dump
+# path (MIN_REMEMBER_LEN / MAX_MEMORIES_PER_USER) is removed.
+
+# TaskRecord auto-compression: a turn that used one of the known multi-turn task
+# tools and whose final response exceeds AUTO_COMPRESS_MIN_LEN is folded into a
+# degraded TaskRecord (unless finalize_subtask already produced an explicit
+# record). Scoped to these tools so ordinary long answers (search, character
+# lookup, …) are left intact. Full detail stays in the task log.
+AUTO_COMPRESS_MIN_LEN = 600
+_AUTO_COMPRESS_TOOLS = {"gacha_pull", "parse_battle_screenshots", "calculate_speed"}
+
+# A task fold may remove at most this many trailing messages (the setup/result
+# turns of one short flow). If the recorded boundary would remove more, it is
+# treated as stale/abandoned and the fold is skipped — a guard against an old
+# begin_task window wiping unrelated history on a later finalize_subtask.
+MAX_FOLD_MESSAGES = 8
+
+# ── Context-load thresholds for special sessions (PLAN.md Idea 4 Phase B) ──
+# 85%: L4 volatile-tail hint asking the agent to suggest /压缩会话 IN ITS OWN
+#      PERSONA VOICE (volatile tail → zero prefix-cache impact).
+# 95%: read-time emergency truncation so the request can never exceed the
+#      model input window (last-resort defense against API 400s; storage is
+#      NOT touched — the durable fix remains a user-confirmed /压缩会话).
+CONTEXT_HINT_RATIO = 0.85
+CONTEXT_HARD_RATIO = 0.95
+CONTEXT_HARD_BUDGET_RATIO = 0.90
+# Re-hint at most once per this many new session messages (≈5 turns).
+COMPRESS_HINT_INTERVAL = 10
+# session_id → total_messages when the 85% hint last fired (in-memory only;
+# a restart just re-arms the hint, which is harmless).
+_compress_hint_last: Dict[str, int] = {}
+
+
+def _scene_archive_enabled() -> bool:
+    """剧情封档开关（scene-session-archive-design.md D8，热读）。
+
+    单一真源定义在这里（agent.py 是底层），turn.py 直接 import 复用。
+    关闭时：is_scene 退回仅看 kind、封档会话仍注入场景指令、配额统计退回
+    全量；数据保留，重新开启即恢复。
+    """
+    return os.environ.get("SCENE_ARCHIVE_ENABLED", "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+# UGC 角色创作访谈指令（Bond-System-Design.md §5.1, P1）。注入在 L4 易变尾部，
+# 仅当特殊会话 metadata.kind == "char_creation" 时生效；create_character 工具
+# 由 agent_router 在该类会话中通过 allowed_tools 下发。逐项收集、一次一问、
+# 支持「跳过」/「随机」，收齐后调用 create_character 落盘。
+_CHAR_CREATION_INTERVIEW_INSTRUCTIONS = (
+    "## 角色创作访谈（进行中）\n"
+    "用户正在创建一个自定义角色（自创人格）。你的任务是**逐项访谈**收集设定，"
+    "全部收齐后调用 `create_character` 工具一次性落盘。规则：\n"
+    "1. **一次只问一项**，等用户回答后再问下一项；语气友好、简洁，可适当举例启发。\n"
+    "2. 需要收集的字段（按顺序）：\n"
+    "   - `name` 角色名（必填）\n"
+    "   - `gender` 性别（可跳过）\n"
+    "   - `personality` 性格关键词与描述（必填）\n"
+    "   - `worldview` 世界观背景（可跳过，默认现代日常）\n"
+    "   - `relationship` 角色与用户的关系设定（可跳过）\n"
+    "   - `greeting` 对用户的初始称呼/开场白（可跳过）\n"
+    "   - `speech_style` 说话风格 + 一两句示例台词（必填）\n"
+    "   - `appearance` 外观锚点：发型/发色/瞳色/服饰等固定特征（必填）\n"
+    "   - `gift_loved` / `gift_normal` / `gift_disliked` 喜爱/普通/讨厌的礼物（可跳过）\n"
+    "   - `bond_levels` 各羁绊等级的态度变化或解锁档案（可跳过）\n"
+    "   - `initial_bond_level` 你与角色的初始羁绊等级（可跳过，默认 Lv1 陌生；"
+    "最高 Lv5 密友——这是「你们故事的起点」，等级越高开场越亲近。填 1-5 的整数）\n"
+    "3. 用户说「跳过」→ 该字段留空继续（`initial_bond_level` 跳过视为 1）；"
+    "说「随机」→ 你代为拟定一个合理值并简短告知，然后继续。\n"
+    "4. 允许用户随时修改已回答的字段（以最新值为准）。\n"
+    "5. 全部收集/确认后，调用 `create_character`，把各字段原样填入对应参数"
+    "（礼物偏好填字符串数组）。工具会做安全审查与配额校验。\n"
+    "6. 若工具返回以 `[Error]` 开头的结果，向用户说明原因并协助调整后重试；"
+    "成功则把工具返回的提示转达给用户，并建议用 `/人格切换 <角色名>` 开始相处。\n"
+    "7. 访谈期间不要处理与创角无关的任务请求；如用户想退出，提示 `/结束会话`。"
+)
+
+
+# 剧情场景演绎指令（Bond-System-Design.md §4.4 形态3，P3）。注入在 L4 易变尾部，
+# 仅当特殊会话 metadata.kind == "bond_scene" 时生效；complete_scene 工具由
+# turn.py 在该类会话中通过 allowed_tools 下发。脚本正文另由 metadata["script"]
+# 紧随其后注入。全程 in-character，按分幕推进，结局调 complete_scene 收尾。
+_BOND_SCENE_INSTRUCTIONS = (
+    "## 剧情场景（进行中）\n"
+    "你正与用户共同经历一段专属剧情场景。规则：\n"
+    "1. **全程保持角色**：用你自己的口吻、称呼与性格演绎，不要跳出人设、不要以助手身份说话。\n"
+    "2. 按下方「本场剧情脚本」的分幕自然推进：根据用户的回应即兴发挥，但保持脚本的走向与"
+    "氛围；一幕收束后自然过渡到下一幕，不要生硬报幕。\n"
+    "3. 多描写场景感（环境、动作、神态、语气），让对话有画面感；接住用户在场景中的选择与情绪。\n"
+    "4. 当剧情走到**结局**（脚本最后一幕完成、或你们自然地抵达终点）时，调用 `complete_scene` "
+    "工具收尾，可用 `memento` 参数以你的口吻写一句纪念语（≤40 字）镌刻在纪念卡上；"
+    "调用后请再说一段温柔的收尾白，为这段经历画上句点。\n"
+    "5. 不要主动报好感数值或工具细节；系统会在本轮结束后送出纪念卡片。\n"
+    "6. 若用户想提前退出，提示 /结束会话（提前退出不会获得完成奖励与纪念卡）。"
+)
 
 
 def _display_tool_name(tool_call: dict) -> str:
@@ -57,6 +150,7 @@ class Agent:
     - AGENTS.md: Orchestration and reasoning rules
     - BOOTSTRAP.md: Startup sequence
     - SESSION.md: Session configuration
+    - MEMORY.md: Three-tier long-term memory rules (injected into the prompt)
     """
 
     # ── Construction ──────────────────────────────────────────────
@@ -68,10 +162,12 @@ class Agent:
         config_dir: str,
         session_manager: Optional[SessionManager] = None,
         memory_system: Optional[MemorySystem] = None,
+        tiered_memory: Optional[TieredMemory] = None,
         profile_manager: Optional[ProfileManager] = None,
         hardware_detector: Optional[HardwareDetector] = None,
         workspace_manager: Optional[UserWorkspaceManager] = None,
         special_session_manager: Optional[SpecialSessionManager] = None,
+        asset_memory=None,
         max_tool_iterations: int = 5,
         thinking_timeout: float = 180.0,
     ):
@@ -80,6 +176,8 @@ class Agent:
         self.config_dir = config_dir
         self.sessions = session_manager or SessionManager()
         self.memory = memory_system
+        self.tiered_memory = tiered_memory  # P1 three-tier engine (MEDIUM injection)
+        self.asset_memory = asset_memory    # P5 multimodal asset cards (L4 injection)
         self.profiles = profile_manager
         self.hardware_detector = hardware_detector
         self.hardware: Optional[HardwareProfile] = None
@@ -110,6 +208,7 @@ class Agent:
             "AGENTS.md",
             "BOOTSTRAP.md",
             "SESSION.md",
+            "MEMORY.md",
         ]
         for filename in config_files:
             filepath = os.path.join(self.config_dir, filename)
@@ -138,8 +237,16 @@ class Agent:
         if "agents" in self._configs:
             parts.append("# Orchestration Rules\n\n" + self._configs["agents"])
 
-        # Current time context
-        parts.append(f"\n## Current Context\n\nCurrent time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        # MEMORY: three-tier long-term memory rules (P1, Decision K — wired in)
+        if "memory" in self._configs:
+            parts.append(self._configs["memory"])
+
+        # NOTE (Cache-Hit-Rate-Plan.md Phase 3, B6): the "Current time" block
+        # used to live here — but this prompt is cached in _system_prompt, so
+        # the timestamp froze at first build (startup time) and went stale.
+        # The real per-turn time now lives in the L4 volatile tail message
+        # built by _build_messages(), AFTER the conversation history, where it
+        # cannot invalidate the provider-side prefix cache.
 
         # Hardware context (dynamically detected, replaces hardcoded WORKSPACE.md §4)
         if self.hardware:
@@ -166,6 +273,9 @@ class Agent:
         session_type: str = "temporary",
         allowed_tools: Optional[set] = None,
         user_role: Optional[str] = None,
+        persist: bool = True,
+        images: Optional[List[str]] = None,
+        content_callback: Optional[Callable[[str], Any]] = None,
     ) -> str:
         """Process a user message through the agent loop.
 
@@ -177,21 +287,51 @@ class Agent:
             progress_callback: Optional async/sync callback to report
                                progress before each tool execution round.
             session_type: "temporary", "special", or "continuous".
+            persist: When False, runs in isolated mode (used by the
+                     delegate_task task plane, Bond-System-Design.md §3.5):
+                     a detached in-memory session with empty context — the
+                     run neither reads the user's conversation history nor
+                     writes back to it, and profile extraction is skipped.
+            images: Optional local image paths for Direct Vision — attached
+                     to the current-turn user message as image_url content
+                     parts when the chosen model supports vision. Ephemeral:
+                     they live only in this run's in-memory message list
+                     (across its tool iterations) and are NEVER persisted
+                     to session history — the text placeholder lines in
+                     user_message remain the durable reference. Callers
+                     gate on ``client.supports_vision`` before passing.
+            content_callback: Optional async/sync callback receiving raw
+                     LLM answer-text deltas as they arrive (QQ official
+                     c2c streaming, buttons-design §6.10.11.2). When set
+                     AND the client exposes chat_completion_with_tools_-
+                     stream, every agent-loop LLM call goes through the
+                     SSE variant: tool-call rounds never fire the callback
+                     (fragments suppress forwarding), so deltas only flow
+                     for the final-answer round. Transport-only — session
+                     persistence still stores the full assembled text.
 
         Returns:
             The agent's final response string.
         """
         # Determine which session to use
-        if session_type == "special" and self.special_sessions:
+        if persist and session_type == "special" and self.special_sessions:
             special_session = self.special_sessions.get_active(user_id)
         else:
             special_session = None
 
-        # Get or create temporary session (always — used as fallback)
-        session = self.sessions.get_or_create(user_id)
+        if persist:
+            # Get or create temporary session (always — used as fallback)
+            session = self.sessions.get_or_create(user_id)
+        else:
+            # Isolated run: detached in-memory session, never registered with
+            # the SessionManager, never persisted.
+            session = Session(user_id=user_id)
 
         # Build messages: system prompt + history + current message
-        messages = self._build_messages(session, user_message, special_session, role_hint=user_role)
+        messages = self._build_messages(
+            session, user_message, special_session,
+            role_hint=user_role, images=images,
+        )
 
         # Track tool names for deduplication across iterations
         _last_reported_tools: Optional[frozenset] = None
@@ -199,6 +339,15 @@ class Agent:
         # Track repeated tool failures to break infinite retry loops.
         # Key: (tool_name, hash(arguments_json)) -> failure_count
         _recent_tool_failures: dict = {}
+
+        # Collect this turn's tool calls (name/args/success/snippet). Used by the
+        # TaskRecord auto-compression fallback to build a degraded record when the
+        # agent did not call finalize_subtask explicitly.
+        _turn_tool_calls: list = []
+
+        # Reset the task-fold directive; finalize_subtask may set it during this run.
+        from agent.context import _pending_task_fold
+        _pending_task_fold.set(None)
 
         # Agent loop
         for iteration in range(self.max_tool_iterations):
@@ -208,11 +357,57 @@ class Agent:
                 if allowed_tools
                 else self.tools.get_schemas()
             )
-            response = await llm_client.chat_completion_with_tools(
-                messages=messages,
-                tools=schemas,
-                timeout=self.thinking_timeout,
+            # Streaming variant when a content_callback is wired AND the
+            # client supports it (getattr probe keeps every existing mock
+            # on the non-streaming path). Tool-call rounds suppress the
+            # callback internally — deltas only surface on the final
+            # answer round. Return shape is identical, so the rest of
+            # the loop is streaming-agnostic.
+            stream_fn = (
+                getattr(llm_client, "chat_completion_with_tools_stream", None)
+                if content_callback is not None else None
             )
+            if stream_fn is not None:
+                response = await stream_fn(
+                    messages=messages,
+                    tools=schemas,
+                    timeout=self.thinking_timeout,
+                    purpose="agent_loop",
+                    content_callback=content_callback,
+                )
+            else:
+                response = await llm_client.chat_completion_with_tools(
+                    messages=messages,
+                    tools=schemas,
+                    timeout=self.thinking_timeout,
+                    purpose="agent_loop",
+                )
+
+            # ── Direct Vision 400 self-heal (misconfigured supports_vision):
+            # provider rejected the request outright on the first iteration
+            # while image parts were attached → strip the images, retry once
+            # with the text-only message (read_file lazy analysis remains as
+            # the model's fallback). A second 400 is NOT retried (images is
+            # already None), so the error surfaces normally.
+            if (
+                images
+                and iteration == 0
+                and not response.get("tool_calls")
+                and str(response.get("content") or "").startswith("API HTTP错误 (400)")
+            ):
+                print("[VISION] image parts rejected with HTTP 400 — "
+                      "retrying text-only (check supports_vision in "
+                      "models_settings.json)")
+                images = None
+                last = messages[-1]
+                if isinstance(last.get("content"), list):
+                    text_only = "".join(
+                        p.get("text", "")
+                        for p in last["content"]
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                    messages[-1] = {"role": "user", "content": text_only}
+                continue
 
             if response.get("tool_calls"):
                 # ── Report progress (with deduplication) ────────────
@@ -237,6 +432,30 @@ class Agent:
                     response["tool_calls"], session, user_id, allowed_tools
                 )
 
+                # ── Collect this turn's tool calls (TaskRecord auto-fallback) ──
+                _res_by_id = {
+                    tr.get("tool_call_id"): tr.get("content", "") for tr in tool_results
+                }
+                for tc in response["tool_calls"]:
+                    _tn = tc["function"]["name"]
+                    try:
+                        _args = json.loads(tc["function"].get("arguments", "{}") or "{}")
+                    except Exception:
+                        _args = {}
+                    _res = _res_by_id.get(tc.get("id", f"call_{_tn}"), "")
+                    _is_err = _res.startswith("[") and any(
+                        _res.startswith(p) for p in (
+                            "[Git Error]", "[Search", "[WebFetch", "[Code Error",
+                            "[Shell", "[Security", "[SSRF", "[PDF Error]",
+                        )
+                    )
+                    _turn_tool_calls.append({
+                        "name": _tn,
+                        "args": _args,
+                        "success": not _is_err,
+                        "snippet": _res[:200].replace("\n", " "),
+                    })
+
                 assistant_msg = {
                     "role": "assistant",
                     "content": response.get("content"),
@@ -250,9 +469,12 @@ class Agent:
                     messages.append(tr)
 
                 # ── Detect repeated tool failures (anti-infinite-loop) ──
+                # "[Error]" covers registry-level failures (bad arguments,
+                # ToolError, unregistered tool) sanitized in tool_registry.
                 _error_prefixes = (
-                    "[Git Error]", "[Search", "[WebFetch", "[Code Error",
-                    "[Shell", "[Security", "[SSRF", "[PDF Error",
+                    "[Error]", "[Git Error]", "[Search", "[WebFetch",
+                    "[Code Error", "[Shell", "[Security", "[SSRF",
+                    "[PDF Error",
                 )
                 for tc in response["tool_calls"]:
                     tn = tc["function"]["name"]
@@ -297,22 +519,73 @@ class Agent:
                 final_content = response.get("content", "")
                 reasoning = response.get("reasoning_content")
 
-                # ── Persist to session ───────────────────────────
-                if special_session:
-                    self.special_sessions.add_message(user_id, "user", user_message)
-                    self.special_sessions.add_message(
-                        user_id, "assistant", final_content, reasoning,
-                    )
+                # Isolated run (delegate_task task plane): no session write,
+                # no TaskRecord folding, no profile extraction — the caller
+                # owns how the result is used and re-voiced.
+                if not persist:
+                    return final_content
+
+                # ── Persist to session (TaskRecord-aware) ────────
+                # Three modes:
+                #  1. Explicit finalize_subtask → fold the task's setup turns and
+                #     persist the compact structured record instead of raw content.
+                #  2. Auto-compression fallback → tool-heavy + long response with no
+                #     explicit record; build a degraded record and persist its line.
+                #  3. Normal → persist user message + full final response.
+                fold = _pending_task_fold.get()
+                if fold is not None:
+                    line = fold.get("line", "")
+                    boundary = fold.get("boundary")
+                    if special_session:
+                        # Snapshot storage: skip setup-turn removal, fold this turn only.
+                        self.special_sessions.add_message(user_id, "user", user_message)
+                        self.special_sessions.add_message(user_id, "assistant", line)
+                    else:
+                        if boundary is not None:
+                            b = max(0, min(int(boundary), len(session.context)))
+                            # Stale-window guard: a fold may only remove up to
+                            # MAX_FOLD_MESSAGES trailing messages. If the recorded
+                            # boundary would wipe more (e.g. an abandoned begin_task
+                            # finalized much later), skip setup-turn removal and just
+                            # append the record — better to keep redundant setup turns
+                            # than to destroy unrelated history.
+                            if (len(session.context) - b) <= MAX_FOLD_MESSAGES:
+                                session.context = session.context[:b]
+                        session.add_message("user", user_message)
+                        session.add_message("assistant", line)
+                        session.trim(self.sessions.max_context_messages)
+                        self.sessions.update(user_id, session)
+                elif (
+                    any(tc.get("name") in _AUTO_COMPRESS_TOOLS for tc in _turn_tool_calls)
+                    and len(final_content) > AUTO_COMPRESS_MIN_LEN
+                ):
+                    record = build_auto_record(user_message, final_content, _turn_tool_calls)
+                    append_task_log(user_id, record)
+                    line = build_compact_line(record)
+                    if special_session:
+                        self.special_sessions.add_message(user_id, "user", user_message)
+                        self.special_sessions.add_message(user_id, "assistant", line)
+                    else:
+                        session.add_message("user", user_message)
+                        session.add_message("assistant", line)
+                        session.trim(self.sessions.max_context_messages)
+                        self.sessions.update(user_id, session)
                 else:
-                    session.add_message("user", user_message)
-                    session.add_message("assistant", final_content, reasoning_content=reasoning)
-                    session.trim(self.sessions.max_context_messages)
-                    self.sessions.update(user_id, session)
+                    if special_session:
+                        self.special_sessions.add_message(user_id, "user", user_message)
+                        self.special_sessions.add_message(
+                            user_id, "assistant", final_content, reasoning,
+                        )
+                    else:
+                        session.add_message("user", user_message)
+                        session.add_message("assistant", final_content, reasoning_content=reasoning)
+                        session.trim(self.sessions.max_context_messages)
+                        self.sessions.update(user_id, session)
 
-                # Save substantive interactions to long-term memory
-                await self._maybe_remember(user_id, user_message, final_content)
-
-                # Fire background task: extract user facts → update profile
+                # Fire background task: extract user facts + judge memory → profile.
+                # P1: the three-tier memory engine is driven entirely through
+                # ProfileManager.observe_turn (merged extract+judge). The old
+                # _maybe_remember raw-dump path is removed.
                 self._schedule_profile_update(user_id, user_message, final_content)
 
                 return final_content
@@ -328,47 +601,53 @@ class Agent:
         user_message: str,
         special_session: Optional[SpecialSession] = None,
         role_hint: Optional[str] = None,
+        images: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Build the full message list for the LLM.
 
-        Structure:
-        1. Global system prompt (SOUL + IDENTITY + AGENTS)
-        2. Session type marker (special/temporary/continuous)
-        3. User profile context (from ProfileManager)
-        4. Workspace quota context (if in special session)
-        5. Permission role context (if not admin)
-        6. Relevant long-term memories (from MemorySystem)
-        7. Conversation history (from Session or SpecialSession)
-        8. Current user message
+        Cache-friendly four-layer layout (Cache-Hit-Rate-Plan.md Phase 3) —
+        ordered by volatility so the provider-side prefix cache survives
+        across turns; everything that can change per-turn sits AFTER the
+        history in an L4 tail system message:
+
+        messages[0] (system):
+          L1 全局静态   SOUL + IDENTITY + AGENTS + MEMORY + 硬件（所有用户共享）
+          L2 人格/群    personality 块 + 群功能限制（同人格/同群共享）
+          L3 用户级稳定 工作区路径 + 权限说明（同用户跨轮稳定）
+        然后:  会话历史（append-only，Phase 4 迟滞修剪/阶梯压缩）
+        然后:  L4 易变尾部（system）— 真实当前时间、特殊会话标记、quota 用量、
+               profile 注入、MEDIUM 记忆注入、人格过渡提示
+        最后:  当前用户消息
         """
-        messages = []
+        from agent.context import (
+            _current_personality, _personality_transition, _current_group_context,
+            _current_bond_context, _current_story_context, _current_render_context,
+        )
+        from agent.character_registry import get_character_registry
 
-        # 1. Global system prompt
-        system_content = self.build_system_prompt()
-
-        # 1.5. Personality prompt (injected at the very top)
-        from agent.context import _current_personality
-        from agent.personality import get_personality_manager
-        persona_name = _current_personality.get()
-        if persona_name:
-            pm = get_personality_manager()
-            persona_content = pm.load(persona_name)
-            if persona_content:
-                system_content = persona_content + "\n\n---\n\n" + system_content
         user_id = special_session.user_id if special_session else session.user_id
 
-        # 2. Session type marker
-        if special_session:
-            system_content += (
-                f"\n\n## 特殊会话模式\n"
-                f"当前会话名称: {special_session.name}\n"
-                f"会话消息数: {special_session.total_messages}\n"
-                f"会话创建于: {time.strftime('%Y-%m-%d %H:%M', time.localtime(special_session.created_at))}\n"
-                f"你处于特殊会话模式，拥有完整的对话上下文记忆。"
-                f"如果任务已完成，可以建议用户使用 /结束会话 退出特殊会话模式。"
-            )
+        # ── L1: global static system prompt (identical for every user) ──
+        system_content = self.build_system_prompt()
 
-        # Workspace context — always injected for all session types
+        # ── L2: personality (stable per user/group). Appended AFTER L1 —
+        # used to be prepended before it, which split the ~10k-token config
+        # block into per-personality prefixes (B5). ──
+        persona_name = _current_personality.get()
+        if persona_name:
+            # CharacterRegistry: builtin personalities + user-owned UGC
+            # characters (Bond-System-Design.md §5, P1)
+            pm = get_character_registry()
+            persona_content = pm.load(persona_name)
+            if persona_content:
+                system_content += "\n\n---\n\n" + persona_content
+
+        # ── L2: group feature restrictions (stable per group) ──
+        group_ctx = _current_group_context.get()
+        if group_ctx:
+            system_content += group_ctx
+
+        # ── L3: workspace path (stable per user) ──
         if self.workspaces:
             workspace_path = self.workspaces.get_workspace(user_id)
             system_content += (
@@ -377,22 +656,10 @@ class Agent:
                 f"用户可以在工作区内存放持久化文件、代码和输出。"
                 f"子目录: code/（代码执行）、uploads/（上传文件）、output/（生成输出）、projects/（项目文件）。"
             )
-            quota_ctx = self.workspaces.get_quota_context(user_id)
-            if quota_ctx:
-                system_content += f"\n{quota_ctx}"
 
-        messages.append({"role": "system", "content": system_content})
-
-        # 3. User profile context
-        if self.profiles:
-            profile = self.profiles.get(user_id)
-            profile_context = profile.to_prompt_context()
-            if profile_context:
-                messages[0]["content"] += "\n\n" + profile_context
-
-        # 4. Permission role context (for non-admin users)
+        # ── L3: permission role context (stable per user; non-admin only) ──
         if role_hint and role_hint != "admin":
-            messages[0]["content"] += (
+            system_content += (
                 f"\n\n## 当前会话权限\n"
                 f"你的工具列表已由系统根据当前用户身份自动过滤。"
                 f"你只能看到和使用当前可用的工具。"
@@ -400,73 +667,309 @@ class Agent:
                 f"请礼貌地说明当前权限不支持此操作，并建议用户联系管理员获取更高权限。"
             )
 
-        # 4.5. Group feature restrictions
-        from agent.context import _current_group_context
-        group_ctx = _current_group_context.get()
-        if group_ctx:
-            messages[0]["content"] += group_ctx
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_content},
+        ]
 
-        # 5. Relevant long-term memories (scoped to user_id)
-        if self.memory:
-            memories = self.memory.search(user_message, user_id=user_id)
-            if memories:
-                mem_lines = ["\n## Relevant Past Interactions"]
-                for m in memories[:3]:
-                    snippet = m.content[:200].replace("\n", " ")
-                    mem_lines.append(f"- {m.description}: {snippet}")
-                messages[0]["content"] += "\n".join(mem_lines)
-
-        # 5. Conversation history
+        # ── Conversation history (append-only cached prefix) ──
+        # Context-load awareness (PLAN.md Idea 4 Phase B): estimate the
+        # special session's token load against the effective model input
+        # window. ≥95% → read-time emergency truncation (never touch storage
+        # here); the 85%/truncation states are re-used in the L4 tail below.
+        _ctx_window = 0
+        _ctx_est = 0
+        _ctx_truncated = False
         if special_session:
-            # Special session: full untrimmed context with layered compression
-            context = self._compress_context(special_session.context)
-            messages.extend(context)
+            if self.special_sessions is not None:
+                try:
+                    _ctx_window = self.special_sessions.get_context_window()
+                except Exception:  # noqa: BLE001 — awareness is best-effort
+                    _ctx_window = 0
+            if _ctx_window:
+                _ctx_est = estimate_context_tokens(special_session.context)
+            if _ctx_window and _ctx_est >= _ctx_window * CONTEXT_HARD_RATIO:
+                _ctx_truncated = True
+                messages.extend(self._emergency_truncate(
+                    special_session.context,
+                    int(_ctx_window * CONTEXT_HARD_BUDGET_RATIO),
+                ))
+            else:
+                # Special session: full untrimmed context with layered compression
+                messages.extend(self._compress_context(special_session.context))
         else:
             # Temporary session: trimmed context
             messages.extend(session.context)
 
-        # 6. Current user message
+        # ── L4: volatile tail, rebuilt every turn. Lives AFTER the history
+        # so changes here (time / session marker / quota / profile / memory)
+        # never invalidate the cached system+history prefix (B1/B2/B6). ──
+        volatile: List[str] = [
+            f"## 当前轮次上下文\n\nCurrent time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        ]
+
+        # Personality transition notice (switch without clearing history)
+        transition_note = _personality_transition.get()
+        if transition_note:
+            volatile.append(transition_note)
+
+        # Render-capability declaration (buttons-design §6.10.6): present
+        # only when this turn renders as QQ official markdown (unified
+        # persona + supports_markdown channel). SOUL #8 defaults to plain
+        # text unless this declaration says otherwise — volatile tail, so
+        # the cached prefix is untouched either way.
+        render_ctx = _current_render_context.get()
+        if render_ctx:
+            volatile.append(render_ctx)
+
+        # Character-plane bond state (level/title/mood/companionship stats).
+        # Split personalities only, rebuilt per turn by agent_router — lives
+        # in the L4 volatile tail, never in the cached L0-L2 prefix
+        # (Bond-System-Design.md §6).
+        bond_ctx = _current_bond_context.get()
+        if bond_ctx:
+            volatile.append(bond_ctx)
+
+        # Original-story memory (Story KB): retrieved per turn by
+        # agent/turn.py when a character persona is on stage — the character
+        # recalls "her own" canon scenes without calling a tool. Volatile:
+        # rebuilt every turn, never touches the cached prefix.
+        story_ctx = _current_story_context.get()
+        if story_ctx:
+            volatile.append(story_ctx)
+
+        # Multimodal asset memories (P5, Bond-System-Design.md §8): recent
+        # images/voices shared with the current character, so the character
+        # can refer back to them ("再发一次那张图" → recall_asset). Lives in
+        # the L4 volatile tail — evictions/rewrites never poison the prefix
+        # cache. Best-effort: any failure just skips the block.
+        if self.asset_memory and persona_name:
+            try:
+                disp = get_character_registry().get_display_name(persona_name)
+                asset_block = self.asset_memory.build_asset_injection(
+                    user_id, persona_name, display_name=disp or persona_name)
+            except Exception:  # noqa: BLE001
+                asset_block = ""
+            if asset_block:
+                volatile.append(asset_block)
+
+        # Special session marker (message count changes every turn)
+        if special_session:
+            volatile.append(
+                f"## 特殊会话模式\n"
+                f"当前会话名称: {special_session.name}\n"
+                f"会话消息数: {special_session.total_messages}\n"
+                f"会话创建于: {time.strftime('%Y-%m-%d %H:%M', time.localtime(special_session.created_at))}\n"
+                f"你处于特殊会话模式，拥有完整的对话上下文记忆。"
+                f"如果任务已完成，可以建议用户使用 /结束会话 退出特殊会话模式。"
+            )
+            # 85% context-load hint: persona-consistent nudge (user-facing
+            # wording is the agent's job — we only set the intent and forbid
+            # system-error tone / raw numbers). Rate-limited per session.
+            if _ctx_window and _ctx_est >= _ctx_window * CONTEXT_HINT_RATIO:
+                _sid = special_session.session_id
+                _last_hint = _compress_hint_last.get(_sid)
+                if (_last_hint is None
+                        or special_session.total_messages - _last_hint
+                        >= COMPRESS_HINT_INTERVAL
+                        or special_session.total_messages < _last_hint):
+                    _compress_hint_last[_sid] = special_session.total_messages
+                    volatile.append(
+                        "## 记忆负荷提醒\n"
+                        "当前特殊会话的记忆已接近你的容量上限，快要装不下了。"
+                        "请在本轮回复的结尾用你自己的人格口吻、自然地告诉用户："
+                        "你要记的东西太多啦，脑子快装不下了，建议发送 /压缩会话 "
+                        "让你休息整理一下脑子（早期细节会浓缩成一段摘要，"
+                        "最近的对话原样保留）。示例语气：「我要记的东西太多啦，"
+                        "用 /压缩会话 让我休息整理一下脑子吧～」——请按当前人格"
+                        "改写。不要以系统报错的口吻播报，也不要提及 token 数字。"
+                    )
+            if _ctx_truncated:
+                volatile.append(
+                    "## ⚠️ 上下文溢出保护\n"
+                    "本轮请求的会话历史已被系统紧急截断（超出模型输入窗口保护线，"
+                    "仅载入了摘要与最近的对话）。请用你自己的口吻提醒用户：记忆"
+                    "已经超载，本轮只能想起最近的事情，强烈建议尽快发送 /压缩会话 "
+                    "整理记忆。"
+                )
+            # UGC character interview session (Bond-System-Design.md §5.1, P1):
+            # creation sessions carry metadata {"kind": "char_creation"} and
+            # get create_character in allowed_tools (agent_router).
+            if (special_session.metadata or {}).get("kind") == "char_creation":
+                volatile.append(_CHAR_CREATION_INTERVIEW_INSTRUCTIONS)
+            # Bond story-scene session (Bond-System-Design.md §4.4 形态3, P3):
+            # scene sessions carry metadata {"kind": "bond_scene", ...} and get
+            # complete_scene in allowed_tools (turn.py). The script body follows.
+            # 已封档（completed=true）的剧情按普通特殊会话运行：不再注入场景
+            # 指令与剧本（scene-session-archive-design.md D3/清单 #5b），否则
+            # 模型会反复尝试 complete_scene 并被 turn.py 守卫弹回。
+            elif (special_session.metadata or {}).get("kind") == "bond_scene" \
+                    and not (_scene_archive_enabled()
+                             and (special_session.metadata or {}).get("completed")):
+                volatile.append(_BOND_SCENE_INSTRUCTIONS)
+                script = (special_session.metadata or {}).get("script") or ""
+                if script:
+                    volatile.append(f"## 本场剧情脚本\n{script}")
+
+        # Workspace quota usage (changes whenever the user writes files)
+        if self.workspaces:
+            quota_ctx = self.workspaces.get_quota_context(user_id)
+            if quota_ctx:
+                volatile.append(quota_ctx)
+
+        # User profile context (changes after each extraction batch)
+        if self.profiles:
+            profile = self.profiles.get(user_id)
+            profile_context = profile.to_prompt_context()
+            if profile_context:
+                volatile.append(profile_context)
+
+        # MEDIUM-tier memory injection (P1 three-tier engine; changes as
+        # memories are reinforced/updated). NOTE: legacy shared knowledge/
+        # system memories are no longer injected here (out of P1 scope,
+        # Decision 8 — audit prod knowledge/ + system/ before deploy).
+        # LONG-tier: one-line index (P2-lite, Memory-Optimization-Plan ①) —
+        # byte-stable across turns; full text via the recall_memory tool.
+        if self.tiered_memory:
+            medium_block = self.tiered_memory.build_medium_injection(user_id)
+            if medium_block:
+                volatile.append(medium_block)
+            long_index = self.tiered_memory.build_long_index(user_id)
+            if long_index:
+                volatile.append(long_index)
+
+        messages.append({"role": "system", "content": "\n\n".join(volatile)})
+
+        # ── Current user message ──
+        # Direct Vision: when image paths are provided (caller gated on
+        # client.supports_vision), attach them as image_url content parts
+        # AFTER the text. Parts live only in this request's message list —
+        # session history persists the text string, and the parts sit in
+        # the final message (after the volatile L4 tail), so the provider
+        # prefix cache is untouched. Without images the message stays a
+        # plain string — byte-identical to the historical behaviour.
+        if images:
+            try:
+                from lib.image_parts import build_image_parts
+                image_parts = build_image_parts(images)
+            except Exception:  # noqa: BLE001 — vision is best-effort
+                image_parts = []
+            if image_parts:
+                content: Any = [{"type": "text", "text": user_message}]
+                content.extend(image_parts)
+                messages.append({"role": "user", "content": content})
+                return messages
         messages.append({"role": "user", "content": user_message})
 
         return messages
 
     # ── Context Compression ────────────────────────────────────────
 
-    @staticmethod
-    def _compress_context(context: List[Dict], recent_full: int = 20) -> List[Dict]:
+    # Compression boundary advances in steps of this many messages
+    # (Cache-Hit-Rate-Plan.md Phase 4, B4): re-deciding the boundary every
+    # turn moves the divergence point through the history each time and
+    # kills the provider prefix cache. Stepping keeps the compressed head
+    # byte-identical for COMPRESS_STEP consecutive turns.
+    COMPRESS_STEP = 4
+
+    @classmethod
+    def _compress_context(cls, context: List[Dict], recent_full: int = 20) -> List[Dict]:
         """Compress older tool results in context to save tokens.
 
-        Layer 1 (last `recent_full` messages): keep full original.
-        Layer 2 (before that): compress tool results to first line only.
-        Layer 3: Progressive summary not yet implemented — all messages
-                before Layer 1 are kept but with compressed tool results.
+        Layer 1 (tail window): keep full original.
+        Layer 2 (head): compress tool results to first line only.
+        Layer 3 (progressive summary) is intentionally NOT done here at read
+        time — deep compression is a write-side, user-confirmed operation:
+        ``/压缩会话`` (turn.py) rolls the head into a persisted summary
+        message via ``SpecialSessionManager.apply_compression``. Read-time
+        window protection lives in ``_emergency_truncate`` (≥95% of the
+        model input window) plus the L4 85% persona hint (PLAN.md Idea 4).
 
-        This preserves the full conversation flow while reducing token
-        consumption from verbose tool outputs.
+        Cache-friendly stepping: the number of compressed head messages is
+        ``floor((len - recent_full) / COMPRESS_STEP) * COMPRESS_STEP`` — the
+        boundary only advances once every COMPRESS_STEP new messages, so the
+        compressed prefix stays byte-stable between steps (the tail window
+        temporarily holds up to recent_full + COMPRESS_STEP - 1 full messages,
+        which are billed at cache-hit price).
         """
-        if len(context) <= recent_full:
+        n_compress = (
+            (len(context) - recent_full) // cls.COMPRESS_STEP * cls.COMPRESS_STEP
+        )
+        if n_compress <= 0:
             return list(context)
 
         compressed = []
         for i, msg in enumerate(context):
-            idx_from_end = len(context) - i
-            if idx_from_end <= recent_full:
+            if i >= n_compress:
                 # Layer 1: keep as-is
                 compressed.append(msg)
-            else:
+            elif msg.get("role") == "tool":
                 # Layer 2: compress tool results
-                if msg.get("role") == "tool":
-                    content = msg.get("content", "")
-                    first_line = content.split("\n")[0][:200]
-                    compressed.append({
-                        "role": "tool",
-                        "tool_call_id": msg.get("tool_call_id", ""),
-                        "content": first_line + ("..." if len(content) > 200 else ""),
-                    })
-                else:
-                    compressed.append(msg)
+                content = msg.get("content", "")
+                first_line = content.split("\n")[0][:200]
+                compressed.append({
+                    "role": "tool",
+                    "tool_call_id": msg.get("tool_call_id", ""),
+                    "content": first_line + ("..." if len(content) > 200 else ""),
+                })
+            else:
+                compressed.append(msg)
 
         return compressed
+
+    @classmethod
+    def _emergency_truncate(
+        cls, context: List[Dict], budget_tokens: int
+    ) -> List[Dict]:
+        """Last-resort read-time truncation at ≥95% of the model input window.
+
+        Keeps: leading ``[会话摘要]`` system messages (the persisted
+        /压缩会话 output) + a system note + as many trailing messages as fit
+        the budget. Storage is never touched — this only guarantees the
+        outgoing request stays under the window so the API can't 400; the
+        durable fix is a user-confirmed /压缩会话.
+        """
+        head: List[Dict] = []
+        for msg in context:
+            if (msg.get("role") == "system"
+                    and str(msg.get("content") or "").startswith(
+                        COMPRESSION_SUMMARY_PREFIX)):
+                head.append(msg)
+            else:
+                break
+        used = sum(
+            estimate_text_tokens(str(m.get("content") or "")) for m in head
+        )
+
+        note_reserve = 60  # tokens reserved for the truncation note below
+        tail: List[Dict] = []
+        for msg in reversed(context[len(head):]):
+            cost = estimate_text_tokens(str(msg.get("content") or "")) + 4
+            if used + cost > budget_tokens - note_reserve:
+                break
+            tail.append(msg)
+            used += cost
+        tail.reverse()
+
+        if not tail and context:
+            # Pathological: even one message exceeds the budget — keep the
+            # last message, hard-clipped, so the turn still has an anchor.
+            last = dict(context[-1])
+            content = last.get("content")
+            if isinstance(content, str):
+                last["content"] = content[-4000:]
+            tail = [last]
+
+        dropped = len(context) - len(head) - len(tail)
+        if dropped > 0:
+            note = {
+                "role": "system",
+                "content": (
+                    f"[系统] 上下文溢出保护：中间 {dropped} 条历史本轮未载入。"
+                    "请提醒用户尽快 /压缩会话 整理会话记忆。"
+                ),
+            }
+            return head + [note] + tail
+        return head + tail
 
     # ── Tool Execution ────────────────────────────────────────────
 
@@ -546,58 +1049,25 @@ class Agent:
         except Exception:
             pass  # Audit logging must never break the main flow
 
-    # ── Memory ────────────────────────────────────────────────────
-
-    async def _maybe_remember(
-        self, user_id: str, user_message: str, agent_response: str
-    ):
-        """Conditionally save important interactions to long-term memory.
-
-        Only substantive interactions (combined length above MIN_REMEMBER_LEN)
-        are persisted. After saving, the per-user memory list is capped at
-        MAX_MEMORIES_PER_USER, pruning the oldest entries first.
-        """
-        if not self.memory:
-            return
-
-        combined_len = len(user_message) + len(agent_response)
-        if combined_len <= MIN_REMEMBER_LEN:
-            return
-
-        summary = user_message[:100] + ("..." if len(user_message) > 100 else "")
-        entry = MemoryEntry(
-            name=f"interaction_{user_id}_{int(time.time())}",
-            description=f"Conversation with {user_id}: {summary}",
-            type="user",
-            user_id=user_id,
-            content=f"## User Message\n{user_message}\n\n## Agent Response\n{agent_response[:500]}",
-        )
-        self.memory.save(entry)
-
-        # Retention: prune oldest entries beyond the per-user cap.
-        try:
-            all_user = self.memory.list_all("user", user_id=user_id)
-            if len(all_user) > MAX_MEMORIES_PER_USER:
-                all_user.sort(key=lambda m: m.created_at)
-                for old in all_user[: len(all_user) - MAX_MEMORIES_PER_USER]:
-                    self.memory.forget(old.name, "user", user_id=user_id)
-        except Exception:
-            pass  # Retention must never break the main flow
-
     # ── Profile Update ──────────────────────────────────────────────
 
     def _schedule_profile_update(
         self, user_id: str, user_message: str, agent_response: str
     ):
-        """Schedule a background task to extract user facts and update profile."""
+        """Observe one turn for profile extraction (Layer 3 batching, §7.1).
+
+        observe_turn is SYNCHRONOUS: it buffers the turn in memory and, once the
+        per-user buffer reaches PROFILE_BATCH_K, schedules a single-flight
+        background extract_batch (flash model). There is no per-turn LLM call
+        any more (that was the old extract_and_update path). Never raises into
+        the response path.
+        """
         if not self.profiles:
             return
         try:
-            asyncio.create_task(
-                self.profiles.extract_and_update(user_id, user_message, agent_response)
-            )
-        except RuntimeError:
-            pass  # No running event loop (e.g., in tests)
+            self.profiles.observe_turn(user_id, user_message, agent_response)
+        except Exception:
+            pass  # Profile extraction must never break the response path
 
     # ── Bootstrap ─────────────────────────────────────────────────
 
@@ -661,6 +1131,7 @@ class Agent:
             "tool_names": self.tools.list_tools(),
             "config_dir": self.config_dir,
             "has_memory": self.memory is not None,
+            "has_tiered_memory": self.tiered_memory is not None,
             "has_profile_manager": self.profiles is not None,
         }
 

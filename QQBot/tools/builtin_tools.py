@@ -99,7 +99,10 @@ _ALLOWED_IMPORTS_HINT = (
     "decimal, fractions, hashlib, base64, textwrap, heapq, bisect, copy"
 )
 
-MAX_OUTPUT_SIZE = 102400  # 100 KB
+# Cache-Plan Phase6-B1: tool results are paid at full price on the next
+# in-run iteration; 100KB (~25-50K tokens) was far beyond what the model can
+# digest. 16KB matches the web_fetch cap (_MAX_FETCH_OUTPUT ~8K chars).
+MAX_OUTPUT_SIZE = 16384  # 16 KB
 MAX_RUNTIME = 60  # seconds
 
 
@@ -132,6 +135,49 @@ def _notify_file_created(abs_path: str) -> None:
     cb = _on_file_created.get()
     if cb:
         cb(abs_path)
+
+
+def _archive_tool_result(tool: str, query: str, content: str, raw=None) -> str:
+    """Archive a full search_web/web_fetch result for later recall.
+
+    Persists the complete formatted result via agent.search_archive and
+    returns a footer line (carrying the archive id) to append to the tool
+    output. Returns an empty string when there is no user context (e.g.
+    direct unit-test calls) or archiving fails — archiving must never
+    break the tool main flow.
+
+    The footer rides the append-only tool message, so the id stays visible
+    in conversation context without touching the cached system prompt.
+    """
+    try:
+        from agent.context import _current_user_id
+    except ImportError:
+        try:
+            from QQBot.agent.context import _current_user_id
+        except ImportError:
+            return ""
+    try:
+        from agent.search_archive import get_default_archive
+    except ImportError:
+        try:
+            from QQBot.agent.search_archive import get_default_archive
+        except ImportError:
+            return ""
+    try:
+        user_id = _current_user_id.get()
+        if not user_id:
+            return ""
+        archive_id = get_default_archive().save(
+            user_id, tool, query, content, raw=raw
+        )
+        if not archive_id:
+            return ""
+        return (
+            f"\n\n[存档] id: {archive_id} — 完整结果已存档（7天内有效），"
+            "可调用 recall_search_result 工具取回全文"
+        )
+    except Exception:
+        return ""
 
 
 def _validate_path(file_path: str, must_exist: bool = True) -> tuple[str | None, str | None]:
@@ -294,7 +340,11 @@ def search_web(query: str, num_results: int = 5) -> str:
                 f"   来源: {engine} | URL: {url_str}"
             )
 
-        return "\n\n".join(lines)
+        formatted = "\n\n".join(lines)
+        return formatted + _archive_tool_result(
+            "search_web", query, formatted,
+            raw=results[:num_results],
+        )
 
     except urllib.request.HTTPError as e:
         return (
@@ -387,6 +437,47 @@ def _check_ssrf(url: str) -> str | None:
         return f"[SSRF] 安全检查失败: {type(e).__name__}: {e}"
 
 
+# Common Chinese charset aliases — gb18030 is a superset of gbk/gb2312
+_CHARSET_ALIASES = {"gb2312": "gb18030", "gbk": "gb18030", "gb-2312": "gb18030", "gb_2312": "gb18030"}
+
+
+def _sniff_charset(content: bytes, content_type: str) -> str | None:
+    """Detect charset from the HTTP Content-Type header, then HTML meta tags."""
+    # 1) HTTP header: content-type: text/html; charset=gb2312
+    m = re.search(r"charset=[\"']?([a-zA-Z0-9_\-]+)", content_type)
+    if m:
+        return m.group(1).lower()
+    # 2) HTML meta tags in the first 4KB (decoded leniently as ASCII)
+    head = content[:4096].decode("ascii", errors="ignore")
+    m = re.search(r"<meta[^>]+charset=[\"']?([a-zA-Z0-9_\-]+)", head, re.I)
+    if m:
+        return m.group(1).lower()
+    m = re.search(r"<meta[^>]+content=[\"'][^\"']*charset=([a-zA-Z0-9_\-]+)", head, re.I)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def _decode_content(content: bytes, content_type: str) -> str:
+    """Decode response bytes using declared/sniffed charset with fallbacks.
+
+    Order: declared charset (header or meta) -> utf-8 strict -> gb18030.
+    Fixes mojibake on GBK/GB2312 pages (e.g. pvp.qq.com) that were
+    previously force-decoded as UTF-8.
+    """
+    candidates: list[str] = []
+    charset = _sniff_charset(content, content_type)
+    if charset:
+        candidates.append(_CHARSET_ALIASES.get(charset, charset))
+    candidates.extend(["utf-8", "gb18030"])
+    for enc in candidates:
+        try:
+            return content.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
 def _html_to_text(html: str) -> str:
     """Strip HTML tags and extract readable text."""
     from html.parser import HTMLParser
@@ -418,17 +509,153 @@ def _html_to_text(html: str) -> str:
     return text.strip()
 
 
+# ── Anti-bot fetch helpers ─────────────────────────────────────────
+# Tier 1: curl_cffi TLS-fingerprint impersonation (chrome131). Plain httpx
+# with a bot UA trips JA3/WAF fingerprinting on many sites; impersonating a
+# real Chrome defeats most of that with no extra process. Tier 2 (optional,
+# WEB_FETCH_BROWSER) adds a ruyiPage headless-Firefox fallback for full
+# Cloudflare JS challenges — wired separately.
+_FETCH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# Substrings that betray an anti-bot interstitial instead of real content.
+_BLOCK_MARKERS = (
+    "cf-mitigated", "challenge-platform", "just a moment",
+    "checking your browser", "cf_chl", "turnstile",
+    "cf-browser-verification", "attention required",
+    "verify you are human", "verify you are a human",
+    "access denied", "please turn javascript on",
+    "enable javascript and cookies",
+)
+
+
+def _looks_blocked(status: int, text_sample: str) -> bool:
+    """Heuristic: did we hit an anti-bot wall rather than real content?"""
+    if status in (403, 429, 503):
+        return True
+    low = (text_sample or "")[:4096].lower()
+    return any(m in low for m in _BLOCK_MARKERS)
+
+
+async def _fetch_raw(url: str):
+    """Transport-level fetch.
+
+    Returns ``(content_bytes, status, content_type, final_url, full_len)``
+    on any HTTP response, or an error-message string on transport failure.
+    Prefers curl_cffi (chrome131 impersonation); falls back to httpx when
+    curl_cffi is unavailable. Never raises.
+    """
+    loop = asyncio.get_running_loop()
+    headers = {
+        "User-Agent": _FETCH_UA,
+        "Accept": "text/html,text/plain,application/json,*/*",
+        "Accept-Language": "zh-CN,en;q=0.9",
+    }
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        cffi_requests = None
+
+    if cffi_requests is not None:
+        def _run():
+            try:
+                resp = cffi_requests.get(
+                    url, impersonate="chrome131", timeout=_FETCH_TIMEOUT,
+                    allow_redirects=True, headers=headers,
+                )
+                content = resp.content or b""
+                ctype = (resp.headers.get("content-type", "") or "").lower()
+                return (content[:_MAX_FETCH_SIZE], resp.status_code,
+                        ctype, str(resp.url), len(content))
+            except Exception as e:  # noqa: BLE001
+                return f"[WebFetch] 抓取失败: {type(e).__name__}: {e}"
+        return await loop.run_in_executor(None, _run)
+
+    # httpx fallback (curl_cffi not installed)
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=headers,
+                                    timeout=_FETCH_TIMEOUT, follow_redirects=True)
+            content = resp.content or b""
+            ctype = (resp.headers.get("content-type", "") or "").lower()
+            return (content[:_MAX_FETCH_SIZE], resp.status_code,
+                    ctype, str(resp.url), len(content))
+    except httpx.ConnectTimeout:
+        return f"[WebFetch] 连接超时 ({_FETCH_TIMEOUT}秒): {url}"
+    except httpx.ReadTimeout:
+        return f"[WebFetch] 读取超时 ({_FETCH_TIMEOUT}秒): {url}"
+    except httpx.InvalidURL:
+        return f"[WebFetch] 无效的 URL: {url}"
+    except Exception as e:  # noqa: BLE001
+        return f"[WebFetch] 抓取失败: {type(e).__name__}: {e}"
+
+
+def _web_fetch_browser_timeout() -> int:
+    """Tier 2 per-fetch timeout (seconds). Shorter than the redeem-code
+    engine so a browser fallback can't stall the agent loop for long."""
+    try:
+        return int(os.environ.get("WEB_FETCH_BROWSER_TIMEOUT", "45"))
+    except ValueError:
+        return 45
+
+
+async def _try_browser_fetch(url: str):
+    """Tier 2: ruyiPage headless-Firefox fallback for full Cloudflare JS
+    challenges that curl_cffi can't clear.
+
+    Gated by WEB_FETCH_BROWSER=ruyipage (dormant by default → returns None,
+    so web_fetch behaves exactly like pure Tier 1). Shares the browser runner
+    and its process-wide concurrency cap with the redeem-code scraper.
+    Re-checks SSRF on the post-redirect final URL. Returns rendered HTML or
+    None — never raises.
+    """
+    try:
+        from lib import browser_fetch as bf
+    except ImportError:
+        try:
+            from QQBot.lib import browser_fetch as bf
+        except ImportError:
+            return None
+    if not bf.engine_enabled("WEB_FETCH_BROWSER"):
+        return None
+    return await bf.fetch_via_browser(
+        url,
+        enable_flag_env="WEB_FETCH_BROWSER",
+        timeout=_web_fetch_browser_timeout(),
+        min_content=1500,          # generic pages, not ucngame's big table
+        require_table=False,       # no <table>/data-code marker required
+        log_prefix="[WebFetch]",
+        ssrf_recheck=_check_ssrf,  # re-validate the final URL post-redirect
+    )
+
+
+def _finalize_web_text(text: str, url: str) -> str:
+    """Shared tail: clamp to the output limit and archive the result."""
+    if len(text) > _MAX_FETCH_OUTPUT:
+        text = text[:_MAX_FETCH_OUTPUT] + f"\n\n... (输出已截断至 {_MAX_FETCH_OUTPUT} 字符)"
+    result_text = text or "(页面内容为空)"
+    return result_text + _archive_tool_result("web_fetch", url, result_text)
+
+
 async def web_fetch(url: str) -> str:
     """Fetch content from a URL and return the extracted text.
 
     Only HTTPS URLs are accepted. HTML pages are parsed and converted
     to plain text. Non-HTML content is returned as-is (truncated).
 
+    Anti-bot ladder:
+      * Tier 1 (always on): curl_cffi chrome131 TLS impersonation defeats
+        JA3/WAF fingerprint blocks (httpx used only if curl_cffi missing).
+      * Tier 2 (opt-in via WEB_FETCH_BROWSER=ruyipage): when Tier 1 still
+        hits a Cloudflare JS challenge, fall back to a shared headless
+        Firefox subprocess. Dormant unless the admin enables it.
+
     Args:
         url: The URL to fetch (HTTPS only).
     """
-    import httpx
-
     url = url.strip()
     if not url:
         return "[WebFetch] 请提供 URL。"
@@ -448,49 +675,45 @@ async def web_fetch(url: str) -> str:
     if ssrf_error:
         return ssrf_error
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url,
-                headers={
-                    "User-Agent": "QQBot-Agent/2.0",
-                    "Accept": "text/html,text/plain,application/json,*/*",
-                    "Accept-Language": "zh-CN,en;q=0.9",
-                },
-                timeout=_FETCH_TIMEOUT,
-                follow_redirects=True,
-            )
-            response.raise_for_status()
+    res = await _fetch_raw(url)
+    if isinstance(res, str):
+        return res  # transport-level error message
+    content, status, content_type, final_url, full_len = res
 
-            content_type = response.headers.get("content-type", "").lower()
-            content = response.content[:_MAX_FETCH_SIZE]
-            truncated = len(response.content) > _MAX_FETCH_SIZE
+    # Re-validate SSRF on the post-redirect final URL: a public URL may 30x
+    # to an internal address (curl_cffi/httpx follow redirects transparently).
+    if final_url and final_url != url:
+        redirect_ssrf = _check_ssrf(final_url)
+        if redirect_ssrf:
+            return redirect_ssrf
 
-            if "text/html" in content_type:
-                text = _html_to_text(content.decode("utf-8", errors="replace"))
-            elif "text/plain" in content_type or "application/json" in content_type:
-                text = content.decode("utf-8", errors="replace")
-            else:
-                text = f"(非文本内容: {content_type}, 大小: {len(content)} 字节)"
+    # Detect anti-bot interstitials from a small decoded preview.
+    preview = _decode_content(content[:4096], content_type) if content else ""
+    if _looks_blocked(status, preview):
+        # Tier 2: if the admin opted into the browser engine, try to pierce
+        # the challenge with a headless Firefox before giving up.
+        html = await _try_browser_fetch(url)
+        if html:
+            text = _html_to_text(html)
+            return _finalize_web_text(
+                text + "\n\n（注：本页经无头浏览器绕过反爬获取）", url)
+        head = (f"[WebFetch] HTTP 错误 ({status}): {url}" if status >= 400
+                else f"[WebFetch] 未能获取真实内容: {url}")
+        return head + "（疑似被反爬拦截）"
+    if status >= 400:
+        return f"[WebFetch] HTTP 错误 ({status}): {url}"
 
-            if truncated:
-                text += f"\n\n... (内容已截断，原大小 {len(response.content)} 字节，限制 {_MAX_FETCH_SIZE} 字节)"
+    truncated = full_len > _MAX_FETCH_SIZE
+    if "text/html" in content_type:
+        text = _html_to_text(_decode_content(content, content_type))
+    elif "text/plain" in content_type or "application/json" in content_type:
+        text = _decode_content(content, content_type)
+    else:
+        text = f"(非文本内容: {content_type}, 大小: {len(content)} 字节)"
 
-            if len(text) > _MAX_FETCH_OUTPUT:
-                text = text[:_MAX_FETCH_OUTPUT] + f"\n\n... (输出已截断至 {_MAX_FETCH_OUTPUT} 字符)"
-
-            return text or "(页面内容为空)"
-
-    except httpx.ConnectTimeout:
-        return f"[WebFetch] 连接超时 ({_FETCH_TIMEOUT}秒): {url}"
-    except httpx.ReadTimeout:
-        return f"[WebFetch] 读取超时 ({_FETCH_TIMEOUT}秒): {url}"
-    except httpx.HTTPStatusError as e:
-        return f"[WebFetch] HTTP 错误 ({e.response.status_code}): {url}"
-    except httpx.InvalidURL:
-        return f"[WebFetch] 无效的 URL: {url}"
-    except Exception as e:
-        return f"[WebFetch] 抓取失败: {type(e).__name__}: {e}"
+    if truncated:
+        text += f"\n\n... (内容已截断，原大小 {full_len} 字节，限制 {_MAX_FETCH_SIZE} 字节)"
+    return _finalize_web_text(text, url)
 
 
 # ── Code Execution ───────────────────────────────────────────────
@@ -672,7 +895,7 @@ async def execute_code(code: str, timeout: int = 30) -> str:
     - Blocks dangerous patterns (shell, network, file write, dynamic exec)
     - Clean environment variables
     - Strict timeout (max 60s)
-    - Output size limit (100KB)
+    - Output size limit (16KB)
 
     Args:
         code: Python source code to execute.
@@ -745,16 +968,21 @@ async def execute_code(code: str, timeout: int = 30) -> str:
             cwd=work_dir,
             env=clean_env,
         )
+        _trunc_hint = (
+            f"\n... (输出过长，已截断至 {max_output // 1024}KB。"
+            "如需处理更多数据，请修改代码：在代码内聚合/统计/筛选后只打印结论，"
+            "不要打印原始大数据；沙箱禁止写文件，无法落盘后分段回读)"
+        )
         output = ""
         if result.stdout:
             stdout = result.stdout[:max_output]
             if len(result.stdout) > max_output:
-                stdout += "\n... (输出过长，已截断)"
+                stdout += _trunc_hint
             output += f"标准输出:\n{stdout}\n"
         if result.stderr:
             stderr = result.stderr[:max_output]
             if len(result.stderr) > max_output:
-                stderr += "\n... (错误输出过长，已截断)"
+                stderr += "\n... (错误输出过长，已截断；请检查报错开头部分定位问题)"
             output += f"标准错误:\n{stderr}\n"
         if not output:
             output = "(代码执行完成，无输出)"
@@ -778,14 +1006,14 @@ async def execute_code(code: str, timeout: int = 30) -> str:
         # ── Send images to QQ chat if context variable is set ─────
         if saved_images:
             try:
-                from agent.context import _send_msg
-                from nonebot.adapters.onebot.v11 import MessageSegment
+                from agent.context import _current_sender
+                from agent.outbound import OutImage
 
-                send = _send_msg.get()
-                if send is not None:
+                sender = _current_sender.get()
+                if sender is not None:
                     for img_path in saved_images:
                         try:
-                            await send(MessageSegment.image(f"file://{img_path}"))
+                            await sender.send_image(OutImage(path=img_path, label="chart"))
                             await asyncio.sleep(0.3)  # Small delay between images
                         except Exception:
                             pass  # Image send failed, continue with other images
@@ -1037,7 +1265,7 @@ _REDIRECT_RE = re.compile(
 )
 
 # Max output for shell commands
-_MAX_SHELL_OUTPUT = 102400  # 100 KB
+_MAX_SHELL_OUTPUT = 16384  # 16 KB (Cache-Plan Phase6-B1, was 100KB)
 _MAX_SHELL_TIMEOUT = 30  # seconds
 
 
@@ -1222,12 +1450,16 @@ async def shell_exec(command: str, timeout: int = 15) -> str:
         if result.stdout:
             stdout = result.stdout[:_MAX_SHELL_OUTPUT]
             if len(result.stdout) > _MAX_SHELL_OUTPUT:
-                stdout += "\n... (输出过长，已截断)"
+                stdout += (
+                    f"\n... (输出过长，已截断至 {_MAX_SHELL_OUTPUT // 1024}KB。"
+                    "如需查看更多，请用 head / tail / grep / wc 缩小范围后重新执行；"
+                    "本工具禁止重定向，无法落盘回读)"
+                )
             output += stdout
         if result.stderr:
             stderr = result.stderr[:_MAX_SHELL_OUTPUT // 2]
             if len(result.stderr) > _MAX_SHELL_OUTPUT // 2:
-                stderr += "\n... (错误输出过长，已截断)"
+                stderr += "\n... (错误输出过长，已截断；请检查报错开头部分定位问题)"
             if output:
                 output += f"\n--- stderr ---\n{stderr}"
             else:

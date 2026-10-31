@@ -1,0 +1,19 @@
+{
+  "id": "injection_stability",
+  "title": "Q3 注入块逐轮字节搅动率：20 条 MEDIUM 轮转强化 40 周期，probe 记录 churn（⑥ 的基线数字）",
+  "kind": "metric",
+  "user": "bench_churn",
+  "steps": [
+    {"loop": {"var": "n", "from": 1, "to": 20, "body": [
+      {"ingest": [["稳定记忆事实{n}号内容", "new", null]], "repeat": 3, "tick": 0}
+    ]}},
+    {"probe": true},
+    {"loop": {"var": "n", "from": 1, "to": 40, "body": [
+      {"ingest": [["稳定记忆事实{(n-1)%20+1}号内容", "new", null]]},
+      {"probe": true}
+    ]}},
+    {"checkpoint": {"desc": "注入行数 ≤15", "injection_shape": {"max_lines": 15, "max_body_chars": 600}}},
+    {"checkpoint": {"desc": "20 条 MEDIUM 全部保留（无降级：age 每轮被强化重置）", "medium_count": 20}},
+    {"checkpoint": {"desc": "强化不产生 LONG（count 最高 5，阈值 >10）", "long_count": 0}}
+  ]
+}

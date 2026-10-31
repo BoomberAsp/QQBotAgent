@@ -67,6 +67,12 @@ _PUBLIC_TOOLS: Set[str] = {
     "bond_detail",
     "parse_battle_screenshots",
     "redeem_code",
+    "get_changelog",         # 机器人自身的更新记录，所有用户可查
+    "begin_task",
+    "finalize_subtask",
+    "recall_search_result",  # Reads own search archives only (user_id-scoped)
+    "recall_memory",         # Reads own LONG-tier memories only (user_id-scoped)
+    "story_search",          # Original-story KB (read-only, no user data)
 }
 
 # Additional tools for VIP users (on top of _PUBLIC_TOOLS)
@@ -105,9 +111,12 @@ class PermissionManager:
         }
 
         # execute_code limits per role
+        # max_output capped at 16KB for all roles (Cache-Plan Phase6-B1):
+        # oversized stdout is re-paid at full price every in-run iteration
+        # and the model cannot digest 25K+ tokens of raw output anyway.
         self._code_limits: Dict[UserRole, CodeLimits] = {
-            UserRole.ADMIN: CodeLimits(max_timeout=60, max_output=100 * 1024, max_memory_mb=256),
-            UserRole.VIP: CodeLimits(max_timeout=15, max_output=50 * 1024, max_memory_mb=128),
+            UserRole.ADMIN: CodeLimits(max_timeout=60, max_output=16 * 1024, max_memory_mb=256),
+            UserRole.VIP: CodeLimits(max_timeout=15, max_output=16 * 1024, max_memory_mb=128),
         }
 
         # Resource quotas per role
@@ -124,11 +133,34 @@ class PermissionManager:
             UserRole.REGULAR: 1,
         }
 
+        # UGC character creation quota per role (Bond-System-Design.md §5.2)
+        self._max_characters: Dict[UserRole, int] = {
+            UserRole.ADMIN: 10,
+            UserRole.VIP: 3,
+            UserRole.REGULAR: 1,
+        }
+
     # Resolve the project .env path at module load time
     # permissions.py is at QQBot/agent/permissions.py, so parent.parent = QQBot/
     _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
     # ── Identity Resolution ───────────────────────────────────────
+
+    @staticmethod
+    def _parse_id_list(raw: str) -> Set[str]:
+        """Parse a comma-separated id list WITHOUT the digit-only filter.
+
+        Official-route identities are openids (alphanumeric, opaque) —
+        _parse_qq_list's isdigit() check would reject every one of them.
+        Same JSON-bracket/quote stripping otherwise.
+        """
+        if not raw or not raw.strip():
+            return set()
+        raw = raw.strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1]
+        raw = raw.replace('"', '').replace("'", "")
+        return {part.strip() for part in raw.split(",") if part.strip()}
 
     @staticmethod
     def _parse_qq_list(raw: str) -> Set[str]:
@@ -188,11 +220,25 @@ class PermissionManager:
 
         Reads .env file directly on every call — NoneBot2 may not expose
         .env values through os.environ.
+
+        Stage 4 (§7.7): identity tables are per-platform. The qq_official
+        route identifies users by opaque openids, so it consults
+        QQ_OFFICIAL_SUPERUSERS / QQ_OFFICIAL_VIP_USERS; onebot keeps
+        SUPERUSERS / VIP_USERS (QQ numbers). The platform comes from the
+        _current_platform contextvar set per turn by agent.turn (default
+        "onebot" — every non-turn caller, e.g. webui, keeps old behavior).
         """
-        admins = self._parse_qq_list(self._read_env("SUPERUSERS"))
+        from agent.context import _current_platform
+        official = _current_platform.get() == "qq_official"
+        # openids are alphanumeric — the digit-only _parse_qq_list would
+        # reject every one of them, so the official route uses _parse_id_list.
+        parse = self._parse_id_list if official else self._parse_qq_list
+        admin_key = "QQ_OFFICIAL_SUPERUSERS" if official else "SUPERUSERS"
+        vip_key = "QQ_OFFICIAL_VIP_USERS" if official else "VIP_USERS"
+        admins = parse(self._read_env(admin_key))
         if user_id in admins:
             return UserRole.ADMIN
-        vips = self._parse_qq_list(self._read_env("VIP_USERS"))
+        vips = parse(self._read_env(vip_key))
         if user_id in vips:
             return UserRole.VIP
         return UserRole.REGULAR
@@ -224,3 +270,7 @@ class PermissionManager:
     def get_max_special_sessions(self, role: UserRole) -> int:
         """Return max special sessions for the given role."""
         return self._max_sessions.get(role, 1)
+
+    def get_max_characters(self, role: UserRole) -> int:
+        """Return max UGC characters the role may own."""
+        return self._max_characters.get(role, 1)

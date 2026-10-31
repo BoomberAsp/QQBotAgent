@@ -1,0 +1,6731 @@
+"""
+Turn logic — the platform-independent core of the QQBot message pipeline.
+
+Stage-1 of the QQ-official worktree plan (feature/qq-official): moved
+verbatim out of plugins/agent_router.py so a second entry adapter (QQ
+official bot API) can share one kernel.
+
+Stage-2: the inbound side is now platform-agnostic — the entry points
+consume agent.inbound.InboundMessage views built by adapters/onebot.py,
+which also absorbed _build_reply_context / _download_voice /
+_download_and_save_file / _get_uploads_dir (all OneBot/NapCat-specific).
+
+Stage-3: the outbound side is now platform-agnostic — _safe_send()
+dispatches on the agent.outbound contract (str → send_text, OutImage →
+send_image) and retries only on SendFailed. Each entry adapter supplies
+a Sender implementation (adapters/onebot.py::OneBotSender now; stage 4
+adds QQOfficialSender, which turns OutImage.path into a base64 upload).
+
+Temporary OneBot couplings still living here (escape hatches):
+  - _forced_refresh_wiki_data() grabs a Bot via nonebot.get_bots()
+
+Outbound sending goes through sender slots (default_sender /
+continuous_sender / poke_sender) assigned by the entry plugin at
+import time — this keeps turn.py free of plugin imports (no cycle).
+"""
+
+# ── Load .env into os.environ BEFORE any module-level reads ──────
+# Same bootstrap as plugins/agent_router.py (load_dotenv is idempotent).
+# Must stay at the very top: the singletons below read USER_DATA_ROOT,
+# quotas and session limits from os.environ at import time.
+from pathlib import Path
+from dotenv import load_dotenv as _load_dotenv
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+_load_dotenv(_ENV_FILE)
+
+import asyncio
+import json
+import os
+import random
+import re
+import sys
+import time
+import uuid
+from datetime import datetime
+
+import httpx
+
+from agent.agent import Agent, _scene_archive_enabled
+from agent.inbound import InboundMessage
+from agent.outbound import (
+    OutAudio, OutImage, OutKeyboard, OutMarkdown, OutProgress, SendFailed,
+)
+from agent.continuous_session import ContinuousSessionManager
+from agent.context import (
+    _current_sender, _turn_sender, _current_platform,
+    _current_user_workspace,
+    _current_user_role, _current_code_limits,
+    _current_user_id, _current_group_id,
+    _current_group_context, _current_personality,
+    _personality_transition, _on_file_created, _current_quota_bytes,
+    _pending_task_fold, _current_bond_context, _delegate_depth,
+    _current_story_context, _current_story_char_id, _current_render_context,
+    _turn_keyboard,
+)
+from lib.button_spec import Btn, Rows, to_text as _buttons_to_text
+from lib.button_spec import validate as _validate_buttons
+from lib.button_spec import fit_label as _fit_label
+from lib.button_spec import sanitize_markdown_text as _sanitize_md_text
+from agent import session_render as _session_render
+from agent.bond import BondManager
+from agent.mailbox import MailboxManager
+from agent import bond_content
+from agent.delegation import (
+    SOCIAL_TOOLS, run_delegated_task, revoice_task_result, repatch_last_assistant,
+    _LLM_ERROR_PREFIXES,
+)
+from agent.task_record import build_record, build_compact_line, append_task_log
+from agent.search_archive import get_default_archive
+from agent.group_features import get_group_features
+from agent.permissions import PermissionManager, UserRole
+from agent.character_registry import get_character_registry
+from agent.hardware import HardwareDetector
+from agent.special_session import (
+    SpecialSessionManager,
+    estimate_context_tokens, estimate_text_tokens,
+)
+from agent.tool_registry import ToolRegistry
+from agent.session import SessionManager
+from agent.memory import MemorySystem, TieredMemory
+from agent.profile import ProfileManager
+from agent.workspace import UserWorkspaceManager
+from agent.workspace_snapshot import build_tree, rel_to_root, fmt_bytes
+from agent.quota_cleanup import (
+    list_candidates,
+    execute_cleanup,
+    format_cleanup_prompt,
+    resolve_targets,
+)
+from lib.errors import log_exception
+from lib.model_router import ModelRouter
+from lib.token_ledger import set_usage_context
+from tools.builtin_tools import (
+    execute_code,
+    get_system_load,
+    get_time,
+    search_web,
+    web_fetch,
+    download_repo,
+    shell_exec,
+    summarize_pdf,
+    delete_workspace_file,
+    _ensure_workspace_dirs,
+)
+from tools.file_tools import read_file
+from tools.map_tools import (
+    geocode,
+    reverse_geocode,
+    get_weather as map_get_weather,
+    search_poi,
+    plan_route,
+)
+from tools.legacy_tools import (
+    calculate_speed,
+    compare_speed_probability,
+    explain_code_tool,
+    gacha_pull,
+    play_gacha_animation,
+    translate_text,
+)
+from tools.character_detail import character_detail, character_detail_with_card
+from tools.bond_detail import bond_detail, bond_detail_with_card
+from tools.battle_parser import parse_battle_screenshots
+from tools.card_renderer import (
+    render_help_card, render_feature_card, render_changelog_card, render_scene_card,
+)
+from tools.creation_tools import create_character as _create_character_impl
+from tools.social_tools import (
+    give_gift as _give_gift_impl,
+    complete_scene as _complete_scene_impl,
+    create_image as _create_image_impl,
+    send_voice as _send_voice_impl,
+    recall_asset as _recall_asset_impl,
+    enforce_asset_quota as _enforce_asset_quota,
+    COMPLETE_SCENE_SCHEMA,
+    CREATE_IMAGE_SCHEMA,
+    SEND_VOICE_SCHEMA,
+    RECALL_ASSET_SCHEMA,
+)
+from agent.asset_memory import (
+    ASSET_UPLOAD, AssetCard, AssetMemory, make_asset_id,
+)
+from agent.portrait import describe_size, normalize_reference_image
+
+# ── Sender slots (assigned by the entry plugin at import time) ─────
+# _safe_send() and the continuous/poke paths send through
+# agent.outbound.Sender implementations; the entry plugin wraps its
+# platform matchers in them (adapters/onebot.py::OneBotSender now).
+# The plugin assigns these right after creating its matchers; keeping
+# them as module vars avoids a turn -> plugin circular import.
+default_sender = None       # agent_router      (priority=1 on_message)
+continuous_sender = None    # continuous_router (priority=2 on_message)
+poke_sender = None          # poke_router       (on_notice)
+
+
+class _ToolSender:
+    """Bridge exposed to tools via the _current_sender contextvar.
+
+    Tools expect an agent.outbound.Sender, but pre-stage-3 they sent
+    through _safe_send (retry + backoff + non-retryable-error logging).
+    Routing tool sends back through _safe_send keeps that behavior
+    identical; the platform Sender in the slot does the actual
+    translation. sender=None → _safe_send falls back to default_sender.
+    """
+
+    platform = "kernel"
+    max_messages_per_turn = 100
+
+    def __init__(self, sender=None):
+        self._sender = sender
+
+    @property
+    def supports_markdown(self) -> bool:
+        # Delegate to the platform sender this bridge resolves to (same
+        # chain as _safe_send): tools/render layer querying the contextvar
+        # sender see the real channel capability, never a kernel default.
+        s = self._sender or _turn_sender.get() or default_sender
+        return bool(getattr(s, "supports_markdown", False))
+
+    @property
+    def supports_keyboard(self) -> bool:
+        # Same delegation as supports_markdown — getattr-tolerant so
+        # pre-keyboard senders report False instead of exploding.
+        s = self._sender or _turn_sender.get() or default_sender
+        return bool(getattr(s, "supports_keyboard", False))
+
+    @property
+    def supports_stream(self) -> bool:
+        # Same delegation — getattr-tolerant so pre-stream stubs and
+        # OneBot report False and the kernel keeps the buffered path.
+        s = self._sender or _turn_sender.get() or default_sender
+        return bool(getattr(s, "supports_stream", False))
+
+    async def open_stream(self, first_text: str = ""):
+        """Bridge to the platform sender's stream factory (None = no stream)."""
+        s = self._sender or _turn_sender.get() or default_sender
+        opener = getattr(s, "open_stream", None)
+        if opener is None:
+            return None
+        return await opener(first_text)
+
+    async def send_text(self, text: str) -> None:
+        await _safe_send(text, sender=self._sender)
+
+    async def send_image(self, img: OutImage) -> None:
+        await _safe_send(img, sender=self._sender)
+
+    async def send_audio(self, audio: OutAudio) -> None:
+        await _safe_send(audio, sender=self._sender)
+
+    async def send_markdown(self, text: str) -> None:
+        await _safe_send(OutMarkdown(text), sender=self._sender)
+
+    async def send_keyboard(self, msg: OutKeyboard) -> None:
+        await _safe_send(msg, sender=self._sender)
+
+    async def send_progress(self, text: str, *, immediate: bool = False) -> None:
+        await _safe_send(OutProgress(text, immediate=immediate),
+                          sender=self._sender)
+
+
+# ── Configuration Paths ───────────────────────────────────────────
+
+_AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_CONFIG_DIR = os.path.join(_AGENT_DIR, "agent", "config")
+_DATA_DIR = os.path.join(_AGENT_DIR, "data")
+_USER_DATA_ROOT = os.environ.get("USER_DATA_ROOT", os.path.join(_AGENT_DIR, "data", "users_store"))
+# 用户产生的不可替代状态（UGC 角色 / 好感 / 长期记忆 / 多模态资产）支持
+# env 单独指定——生产部署指向数据盘，与 USER_DATA_ROOT（画像/特殊会话/
+# 工作区）同盘，备份单树化；开发机不设 env 时回落 QQBot/data/*，行为不变。
+# 缓存类（wiki_cache/search_cache）、临时会话（sessions/）与全局配置
+# JSON 留在 QQBot/data/ 系统盘，可丢可重建。
+_CHARACTERS_DIR = os.environ.get("CHARACTERS_DIR") or os.path.join(_DATA_DIR, "characters")
+_BONDS_DIR = os.environ.get("BONDS_DIR") or os.path.join(_DATA_DIR, "bonds")
+_MAILBOX_DIR = os.environ.get("MAILBOX_DIR") or os.path.join(_DATA_DIR, "mailboxes")
+_MEMORY_DIR = os.environ.get("MEMORY_DIR") or os.path.join(_DATA_DIR, "memory")
+_ASSETS_DIR = os.environ.get("ASSETS_DIR") or os.path.join(_DATA_DIR, "assets")
+_HELP_MD_PATH = os.path.join(_CONFIG_DIR, "HELP.md")
+# 公开使用站点（bot.oneweblog.cn）短链，随更新公告文本/卡片指路。可经 .env 覆盖。
+_PUBLIC_SITE_URL = os.environ.get("BOT_PUBLIC_SITE_URL", "https://bot.oneweblog.cn")
+
+
+# ── File logging (launcher-independent) ──────────────────────────
+# Production runs the bot via `cd QQBot && nb run`, which never executes
+# bot.py, so the loguru file sink must be installed here (this plugin is
+# always imported under nb run). Mirrors all loguru output — including
+# NoneBot's own logger — to QQBot/logs/bot_YYYY-MM-DD.log so the WebUI
+# panel's log viewer has a stable file to read regardless of how the bot
+# was launched. Idempotent: added once per process, never raises.
+def _setup_file_logging():
+    try:
+        from loguru import logger as _logger
+        log_dir = os.path.join(_AGENT_DIR, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        _logger.add(
+            os.path.join(log_dir, "bot_{time:YYYY-MM-DD}.log"),
+            rotation="10 MB",
+            retention="7 days",
+            encoding="utf-8",
+            enqueue=True,
+            level="INFO",
+        )
+    except Exception:
+        pass  # 日志文件化失败绝不影响机器人运行
+
+
+_setup_file_logging()
+
+
+# ── Workspace Initialization ─────────────────────────────────────
+
+def _init_workspace():
+    """Create workspace directories if they don't exist."""
+    from tools.builtin_tools import _ensure_workspace_dirs
+    _ensure_workspace_dirs()
+
+_init_workspace()
+
+
+# ── File Download Helpers ──────────────────────────────────────────
+# Stage 2: _get_uploads_dir / _download_voice / _download_and_save_file
+# moved to adapters/onebot.py (OneBot/NapCat-specific by nature). The
+# turn kernel consumes them through view.load_attachments().
+
+
+
+# ── Build Tool Registry ──────────────────────────────────────────
+
+def _build_tool_registry() -> ToolRegistry:
+    """Register all available tools."""
+    registry = ToolRegistry()
+
+    # Built-in tools
+    registry.register(
+        "get_time", get_time,
+        "获取当前日期和时间",
+        {"type": "object", "properties": {}, "required": []},
+    )
+    registry.register(
+        "search_web", search_web,
+        "搜索互联网获取信息（天气、新闻、百科等），通过SearXNG聚合多引擎结果",
+        {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词。支持中文和英文。查天气请包含'天气'+城市名"},
+                "num_results": {"type": "integer", "description": "返回结果数量，默认5条", "default": 5},
+            },
+            "required": ["query"],
+        },
+    )
+    registry.register(
+        "web_fetch", web_fetch,
+        "抓取指定网页URL的内容并提取纯文本。仅支持HTTPS。当搜索无结果或需要完整页面内容时使用。",
+        {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "要抓取的网页URL（必须是HTTPS链接）"},
+            },
+            "required": ["url"],
+        },
+    )
+    registry.register(
+        "execute_code", execute_code,
+        "执行Python代码并返回输出结果",
+        {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "要执行的Python代码"},
+                "timeout": {"type": "integer", "description": "超时秒数，默认30", "default": 30},
+            },
+            "required": ["code"],
+        },
+    )
+    registry.register(
+        "shell_exec", shell_exec,
+        "在服务器上执行只读 shell 命令。支持管道 (|) 串联多个命令，每个命令必须属于白名单。"
+        "允许的命令包括: ls/find/cat/head/tail/grep/wc/sort/uniq/du/df/free/file/stat/python3 -c 等。"
+        "禁止: 重定向 (>/>>/<)、命令替换 ($()/``)、后台运行 (&)、链接执行 (;/&&/||)、sed -i。"
+        "适合: 查看目录结构、统计文件行数、检查磁盘内存、快速文本处理、git log/status。",
+        {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要执行的 shell 命令。支持管道，如 'ls -la | wc -l'"},
+                "timeout": {"type": "integer", "description": "超时秒数，默认15", "default": 15},
+            },
+            "required": ["command"],
+        },
+    )
+    registry.register(
+        "download_repo", download_repo,
+        "下载(Git Clone)一个代码仓库到服务器",
+        {
+            "type": "object",
+            "properties": {"repo_url": {"type": "string", "description": "Git仓库URL"}},
+            "required": ["repo_url"],
+        },
+    )
+    registry.register(
+        "summarize_pdf", summarize_pdf,
+        "提取并总结PDF文件内容",
+        {
+            "type": "object",
+            "properties": {"file_path": {"type": "string", "description": "服务器上的PDF文件路径"}},
+            "required": ["file_path"],
+        },
+    )
+    registry.register(
+        "read_file", read_file,
+        "读取用户上传的文件内容。支持文本文件（代码、日志、配置等）、PDF文件、图片和语音/音频消息。"
+        "文本和PDF返回文字内容，图片返回基础信息+AI分析，音频返回元数据+AI转录和情绪分析（需配置音频模型）。"
+        "大文本文件单次最多返回 50K 字符，截断时会提示下一段的 offset，可分段续读。",
+        {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "文件路径。用户上传的文件会自动保存到 data/workspace/uploads/ 目录。",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "（可选）分段读取的字符偏移量，仅对文本文件生效。上次读取被截断时，按截断提示传入对应 offset 继续读下一段；不传默认从头读。",
+                },
+            },
+            "required": ["file_path"],
+        },
+    )
+    registry.register(
+        "delete_workspace_file", delete_workspace_file,
+        "删除当前用户工作区内的指定文件或空目录，释放磁盘空间。"
+        "参数 path 为相对于工作区根目录的路径，如 'uploads/abc.png' 或 'repos/my-repo'。"
+        "只能删除空目录；非空目录会拒绝删除。禁止删除隐藏文件。"
+        "当用户表达删除工作区文件/仓库的意图时使用此工具，删除前先调用 get_user_info 获取快照确认目标。",
+        {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "相对于工作区根目录的路径，如 'uploads/abc.png' 或 'repos/my-repo'"},
+            },
+            "required": ["path"],
+        },
+    )
+
+    # Map / location tools (Amap API)
+    registry.register(
+        "geocode", geocode,
+        "将地址转换为经纬度坐标。输入地址（如'深圳南山科技园'）返回坐标和规范化地址。",
+        {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "要查询的地址或地名"},
+                "city": {"type": "string", "description": "可选城市名，用于缩小搜索范围"},
+            },
+            "required": ["address"],
+        },
+    )
+    registry.register(
+        "reverse_geocode", reverse_geocode,
+        "将经纬度坐标转换为地址。输入坐标（格式'经度,纬度'）返回详细地址、周边POI和行政区划。",
+        {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "经纬度坐标，格式'经度,纬度'，如'113.952,22.542'"},
+            },
+            "required": ["location"],
+        },
+    )
+    registry.register(
+        "get_weather", map_get_weather,
+        "查询指定城市的天气。支持实时天气和4天预报。比搜索更精准。",
+        {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "城市名称或行政区划代码，如'深圳'、'北京'"},
+                "forecast": {"type": "boolean", "description": "是否查询预报。false=实时天气，true=4天预报", "default": False},
+            },
+            "required": ["city"],
+        },
+    )
+    registry.register(
+        "search_poi", search_poi,
+        "搜索地点/Poi。查找餐厅、地铁站、银行、商场、景点等。",
+        {
+            "type": "object",
+            "properties": {
+                "keywords": {"type": "string", "description": "搜索关键词，如'餐厅'、'地铁站'、'北京大学'"},
+                "city": {"type": "string", "description": "可选城市名，用于限定搜索范围"},
+                "num_results": {"type": "integer", "description": "返回结果数量，默认5条", "default": 5},
+            },
+            "required": ["keywords"],
+        },
+    )
+    registry.register(
+        "plan_route", plan_route,
+        "规划两点之间的出行路线。支持驾车、步行、公交三种方式。返回距离、时间和步骤。",
+        {
+            "type": "object",
+            "properties": {
+                "origin": {"type": "string", "description": "起点。可以是坐标（'113.95,22.54'）或地址"},
+                "destination": {"type": "string", "description": "终点。格式同起点"},
+                "mode": {
+                    "type": "string",
+                    "description": "出行方式",
+                    "enum": ["driving", "walking", "transit"],
+                    "default": "driving",
+                },
+            },
+            "required": ["origin", "destination"],
+        },
+    )
+
+    # Legacy tools (game features)
+    registry.register(
+        "gacha_pull", gacha_pull,
+        "执行游戏抽卡（单抽/十连，四种卡池）。这是唯一能产生真实抽卡结果的工具——绝对禁止编造抽卡结果。"
+        "首次抽卡：先调用 begin_task 记录任务，再询问用户'要先看抽卡动画还是直接看结果？'，"
+        "得到回复后调此工具，给出结果后务必调用 finalize_subtask 收尾。"
+        "用户说「再来一次」「再抽」「继续抽」等：直接调用此工具（用与上次相同的参数，不再询问动画），"
+        "给出结果后同样调用 finalize_subtask 收尾。",
+        {
+            "type": "object",
+            "properties": {
+                "pool_type": {
+                    "type": "string",
+                    "description": "卡池类型",
+                    "enum": ["常规招募", "几率up招募", "神秘招募", "银河招募"],
+                },
+                "count": {"type": "integer", "description": "抽卡次数: 1=单抽, 10=十连", "enum": [1, 10], "default": 1},
+                "up_character": {"type": "string", "description": "UP角色名(几率up招募和神秘招募需要)", "default": None},
+            },
+            "required": ["pool_type", "count"],
+        },
+    )
+    registry.register(
+        "play_gacha_animation", play_gacha_animation,
+        "播放抽卡动画。传入最高星级（3=蓝色, 4=紫色, 5=金色, 6=红色）和是否为单抽。"
+        "动画会直接发送到QQ聊天窗口。应该在给出文字抽卡结果之前调用此工具。"
+        "可以通过 interval 参数控制帧间隔（默认 0.75 秒）。",
+        {
+            "type": "object",
+            "properties": {
+                "star_level": {"type": "integer", "description": "最高星级。3=蓝色, 4=紫色, 5=金色, 6=红色", "enum": [3, 4, 5, 6]},
+                "is_single": {"type": "boolean", "description": "是否为单抽。true=单抽, false=十连", "default": False},
+                "interval": {"type": "number", "description": "帧间隔秒数（默认 0.75）", "default": 0.75},
+            },
+            "required": ["star_level", "is_single"],
+        },
+    )
+    registry.register(
+        "calculate_speed", calculate_speed,
+        "根据战斗行动值数据计算敌方速度。输入可为「模版文本」或 parse_battle_screenshots 的返回结果。"
+        "当用户没有截图、或不愿上传截图时，引导用户按以下模版文本格式粘贴战斗数据：\n"
+        "我方\n角色名1 初始行动值 结束行动值 速度\n角色名2 初始行动值 结束行动值 速度\n"
+        "（至少一名我方角色需提供速度）\n"
+        "敌方\n敌方名1 初始行动值 结束行动值\n敌方名2 初始行动值 结束行动值\n"
+        "⚠️ 速度填0表示未知。示例：\n"
+        "我方\n兔子 0 100 220\n盖儿 3 56 0\n敌方\n金人司阍 0 88\n丰饶灵兽 0 77",
+        {
+            "type": "object",
+            "properties": {"battle_data": {"type": "string", "description": "战斗数据(含我方/敌方行动值)，模版文本或 parse_battle_screenshots 输出"}},
+            "required": ["battle_data"],
+        },
+    )
+    registry.register(
+        "compare_speed_probability", compare_speed_probability,
+        "计算两个速度值之间的乱速概率",
+        {
+            "type": "object",
+            "properties": {
+                "speed_1": {"type": "integer", "description": "速度值1"},
+                "speed_2": {"type": "integer", "description": "速度值2"},
+            },
+            "required": ["speed_1", "speed_2"],
+        },
+    )
+    registry.register(
+        "explain_code", explain_code_tool,
+        "用中文详细解释一段代码的功能和原理",
+        {
+            "type": "object",
+            "properties": {"code": {"type": "string", "description": "要解释的代码"}},
+            "required": ["code"],
+        },
+    )
+    registry.register(
+        "translate_text", translate_text,
+        "在不同语言之间翻译文本",
+        {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "要翻译的文本"},
+                "target_language": {"type": "string", "description": "目标语言，默认中文", "default": "Chinese"},
+            },
+            "required": ["text"],
+        },
+    )
+    registry.register(
+        "character_detail", character_detail,
+        "查询 Ark Re:Code 角色的详细资料（面板成长系数、技能、倍率、属性、天赋、潜能）。"
+        "当用户只发送一个角色名/别名（如「夏妮」「狼团长」「Shani」「瞎泥」）而没有其他请求时，"
+        "调用此工具返回该角色详情。",
+        {
+            "type": "object",
+            "properties": {
+                "character_name": {"type": "string", "description": "角色名或别名"},
+            },
+            "required": ["character_name"],
+        },
+    )
+    registry.register(
+        "bond_detail", bond_detail,
+        "查询 Ark Re:Code 羁绊（Bond/神器）的详细资料（类别、星级、攻击/生命、羁绊技能、"
+        "获取方式、出售价格、经验值、上线时间）。"
+        "当用户只发送一个羁绊名/别名（如「驰骋的快感」「复活甲」「Pleasure of Exploration」）"
+        "而没有其他请求时，调用此工具返回该羁绊详情。",
+        {
+            "type": "object",
+            "properties": {
+                "bond_name": {"type": "string", "description": "羁绊名或别名"},
+            },
+            "required": ["bond_name"],
+        },
+    )
+    registry.register(
+        "parse_battle_screenshots", parse_battle_screenshots,
+        "解析 Ark Re:Code 战斗截图，用 OCR 提取角色名、行动值、阵营（我方/敌方）。"
+        "接收 1-2 张截图路径（跑条前 + 跑条后），返回结构化 JSON 和 calculate_speed 兼容格式。"
+        "支持两种模式（mode 参数）：light=轻量（仅提取角色名与行动值，约10秒，跳过技能解析与行动值修正）；"
+        "full=全量（完整流程：技能解析+行动值修正，约90秒）。默认 full。"
+        "当用户上传/引用战斗截图并要求测速或分析行动值时，先调用 begin_task 记录任务，"
+        "再告知用户两种模式的区别（流程与预计用时），按用户选择传入 mode 调用，不要擅自替用户决定。"
+        "得出速度结果（通常经 calculate_speed）后，务必调用 finalize_subtask 收尾。"
+        "截图路径会以「[用户引用了文件 ... 文件路径: xxx]」的形式出现在上下文中，"
+        "直接取该路径调用，不要改用 read_file（read_file 无法做战斗 OCR）。"
+        "团战/镜像匹配时，同一角色可能同时出现在我方和敌方（同名不同阵营），属正常情况，勿视为错误。"
+        "本工具专用于 Ark Re:Code，不要根据「战意/爆裂/气魄」等术语误判为其他游戏。",
+        {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "截图文件路径列表（1-2 张，跑条前+跑条后）",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["light", "full"],
+                    "description": "解析模式。light=轻量（仅提取角色名与行动值，约10秒）；full=全量（完整流程：技能解析+行动值修正，约90秒）。默认 full",
+                    "default": "full",
+                },
+            },
+            "required": ["paths"],
+        },
+    )
+
+    # ── Redeem Code ────────────────────────────────────────────
+
+    async def _redeem_code_tool(scope: str = "time_limited") -> str:
+        """Agent-facing tool: query redeem codes by scope."""
+        from plugins.check_redeem_code import (
+            get_time_limited_codes, get_long_term_codes, check_and_refresh,
+            get_cache_info, format_expiry_display, _write_admin_alert,
+            is_refresh_in_flight,
+        )
+
+        await check_and_refresh()
+
+        # Cap list size to protect the LLM context window
+        MAX_TOOL_CODES = 30
+        tl = get_time_limited_codes() if scope in ("time_limited", "all") else []
+        lt = get_long_term_codes() if scope in ("long_term", "all") else []
+        active = [c for c in tl if not c.get("recently_expired")]
+        recent_expired = [c for c in tl if c.get("recently_expired")]
+
+        if scope == "time_limited" and not tl:
+            # A browser-engine refresh may still be running in the background
+            # (check_and_refresh returns immediately). Don't report failure or
+            # raise an alert for a scrape that hasn't finished yet.
+            if is_refresh_in_flight():
+                return ("兑换码正在后台更新中，请稍等片刻再试。"
+                        "如需长期兑换码，请以 scope=long_term 重新调用。")
+            # No time-limited codes AND scraper failing → ping the admin
+            # via the WebUI panel alert banner.
+            if get_cache_info().get("stale"):
+                _write_admin_alert("no_valid_codes")
+                return ("当前兑换码均已过期，网页爬取失败，等待管理员添加。"
+                        "如需长期兑换码，请以 scope=long_term 重新调用。")
+            return ("当前没有有效的限时兑换码（7 天内也没有刚过期的）。"
+                    "如需长期兑换码，请以 scope=long_term 重新调用。")
+        if scope == "long_term" and not lt:
+            return "还没有收录长期有效的兑换码。"
+
+        lines = []
+        if scope in ("time_limited", "all"):
+            shown_active = active[:MAX_TOOL_CODES]
+            lines.append(f"【限时兑换码】当前有效 {len(active)} 条:")
+            for entry in shown_active:
+                line = f"  {entry.get('code', '')}"
+                if entry.get("content"):
+                    line += f" — 兑换内容: {entry['content']}"
+                if entry.get("valid"):
+                    line += f" (有效期至: {format_expiry_display(entry['valid'])})"
+                else:
+                    line += " (过期时间未知，尽快兑换)"
+                lines.append(line)
+            if len(active) > MAX_TOOL_CODES:
+                lines.append(f"  …另有 {len(active) - MAX_TOOL_CODES} 条未列出")
+            if recent_expired:
+                lines.append(f"  （另有 {len(recent_expired)} 条限时码已于 7 天内过期："
+                             + "、".join(e.get("code", "") for e in recent_expired[:10])
+                             + ("…" if len(recent_expired) > 10 else "") + "）")
+        if scope in ("long_term", "all"):
+            lines.append(f"【长期兑换码】无过期时间，共 {len(lt)} 条:")
+            for entry in lt[:MAX_TOOL_CODES]:
+                line = f"  {entry.get('code', '')}"
+                if entry.get("content"):
+                    line += f" — 兑换内容: {entry['content']}"
+                lines.append(line)
+            if len(lt) > MAX_TOOL_CODES:
+                lines.append(f"  …另有 {len(lt) - MAX_TOOL_CODES} 条未列出")
+
+        # Send each active time-limited code as a standalone message so users
+        # can copy it directly. Skipped for long_term/all — those lists can be
+        # huge; the user gets them as copyable list text instead. Also skipped
+        # on markdown-capable channels (official route): sends there are
+        # buffered+merged anyway, and the agent's markdown reply lists every
+        # code in one message (§6.10.8 rule 4 — per-code flood is OneBot-only).
+        if (scope == "time_limited" and active[:MAX_TOOL_CODES]
+                and not _channel_supports_markdown()):
+            try:
+                from agent.context import _current_sender
+                sender = _current_sender.get()
+                if sender is not None:
+                    await sender.send_text("以下逐条发送兑换码，方便复制：")
+                    for entry in active[:MAX_TOOL_CODES]:
+                        await asyncio.sleep(1.0)  # QQ rate limiting
+                        await sender.send_text(entry["code"])
+                    lines.append("（限时兑换码已逐条单独发送给用户，方便复制；"
+                                 "你的回复中不必再逐字罗列它们）")
+            except Exception as e:
+                import sys
+                print(f"[redeem_code] per-code send failed: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+
+        return "\n".join(lines)
+
+    registry.register(
+        "redeem_code", _redeem_code_tool,
+        "查询游戏兑换码。默认返回当前有效的限时兑换码（含兑换内容与有效期）"
+        "及 7 天内刚过期的限时码；scope=long_term 返回长期有效（无过期时间）"
+        "的兑换码；scope=all 返回两类。当用户询问兑换码相关问题时使用此工具，"
+        "用户明确提到「长期兑换码」「永久码」时用 scope=long_term。",
+        {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["time_limited", "long_term", "all"],
+                    "description": "time_limited=限时兑换码（默认）；long_term=长期兑换码；all=全部",
+                    "default": "time_limited",
+                },
+            },
+            "required": [],
+        },
+    )
+
+    # ── System Load ─────────────────────────────────────────────
+    registry.register(
+        "get_system_load", get_system_load,
+        "获取服务器实时负载信息（CPU/内存/磁盘使用率）。"
+        "在执行高负载任务之前调用此工具，判断服务器是否有足够资源。"
+        "返回 CPU 负载、内存使用量、磁盘剩余空间及负载评估。",
+        {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    )
+
+    # ── Changelog（更新记录）──────────────────────────────────────
+    async def _get_changelog_tool(count: int = 3) -> str:
+        """Agent-facing tool: 返回机器人自身最近 count 条更新记录（纯文本）。"""
+        from tools.changelog import get_recent, format_for_qq
+        entries = get_recent(count)
+        return "\n".join(format_for_qq(entries, requested=count))
+
+    registry.register(
+        "get_changelog", _get_changelog_tool,
+        "查询机器人自身的更新记录/更新日志/版本变更。当用户询问"
+        "「最近有什么更新」「更新日志」「有哪些新功能」「这版更新了什么」"
+        "「机器人最近升级了什么」等关于本机器人版本变更的问题时使用此工具。"
+        "注意：这是机器人自己的更新记录，不是游戏或第三方软件的更新。",
+        {
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "description": "返回最近多少条更新记录，默认3，最多20",
+                    "default": 3,
+                },
+            },
+            "required": [],
+        },
+    )
+
+    # ── 双平面路由: 角色面兜底委托工具（Bond-System-Design.md §3.3）──
+    # 只在角色面（split 人格 + social 平面）的 allowed_tools 中出现；
+    # 任务面/统一人格的 allowed_tools 不含它 —— schema 过滤 + agent 内
+    # _execute_tool_calls 硬拒绝 + delegation 内 _delegate_depth 守卫，
+    # 三层防线确保单层嵌套、任务面无法再委派。
+    async def _delegate_task_tool(task: str) -> str:
+        user_id = _current_user_id.get()
+        group_id = _current_group_id.get()
+        disabled: set = set()
+        if group_id:
+            try:
+                gf = get_group_features()
+                gf.refresh()
+                disabled = gf.get_disabled_tools(group_id)
+            except Exception:
+                disabled = set()
+
+        async def _inner_progress(msg: str):
+            sender = _current_sender.get()
+            if sender is not None:
+                await sender.send_progress(msg)
+
+        return await run_delegated_task(
+            task,
+            agent=agent,
+            model_router=_model_router,
+            perm_manager=_perm_manager,
+            user_id=user_id,
+            group_id=group_id,
+            disabled_tools=disabled,
+            progress_callback=_inner_progress,
+        )
+
+    registry.register(
+        "delegate_task", _delegate_task_tool,
+        "把需要工具能力的任务（搜索实时信息、抓取网页、执行代码、读写文件、"
+        "查询数据、翻译等）委托给任务智能体执行，并返回其结果。"
+        "凡用户请求涉及实时信息、计算、代码、文件操作，必须调用此工具获取结果，"
+        "再以你自己的口吻转达给用户；绝不能凭记忆编造此类内容。"
+        "注意：任务智能体看不到你们的对话历史，task 描述必须自包含全部必要上下文"
+        "（用户原话、相关文件路径、前情摘要等）。",
+        {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "交给任务智能体的完整任务描述，必须自包含所有必要上下文",
+                },
+            },
+            "required": ["task"],
+        },
+    )
+
+    # ── UGC 角色创作工具（Bond-System-Design.md §5.1, P1）──
+    # 仅在「创建角色」访谈特殊会话（metadata.kind == char_creation）中，由路由
+    # 层通过 allowed_tools 下发；其它场景 schema 过滤掉、_execute_tool_calls 硬
+    # 拒绝。user_id / registry / 审查用 flash client 全部在调用时经模块全局解析。
+    async def _create_character_tool(
+        name: str,
+        personality: str,
+        speech_style: str,
+        appearance: str,
+        gender: str = "",
+        worldview: str = "",
+        relationship: str = "",
+        greeting: str = "",
+        gift_loved: list = None,
+        gift_normal: list = None,
+        gift_disliked: list = None,
+        bond_levels: str = "",
+    ) -> str:
+        fields = {
+            "name": name, "personality": personality,
+            "speech_style": speech_style, "appearance": appearance,
+            "gender": gender, "worldview": worldview,
+            "relationship": relationship, "greeting": greeting,
+            "gift_loved": gift_loved or [], "gift_normal": gift_normal or [],
+            "gift_disliked": gift_disliked or [], "bond_levels": bond_levels,
+        }
+        uid = _current_user_id.get()
+        result = await _create_character_impl(
+            user_id=uid,
+            fields=fields,
+            registry=get_character_registry(),
+            perm_manager=_perm_manager,
+            review_client=_model_router.flash_client,
+        )
+        # Flag success so the handler auto-closes the interview session post-run.
+        if uid and not result.startswith("[Error]"):
+            _pending_char_creation_done[uid] = True
+        return result
+
+    registry.register(
+        "create_character", _create_character_tool,
+        "创建用户自创角色（UGC 人格）。仅在角色创作访谈会话中、收集齐角色设定后调用一次，"
+        "把访谈得到的各字段原样填入。工具会做安全审查与配额校验，成功后角色即可用 "
+        "/人格切换 选用。必填：name（角色名）、personality（性格）、speech_style（说话风格与示例台词）、"
+        "appearance（外观锚点）；其余字段用户未提供可留空或省略。",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "角色名（≤24字符）"},
+                "gender": {"type": "string", "description": "性别（可选）"},
+                "personality": {"type": "string", "description": "性格关键词与描述（必填）"},
+                "worldview": {"type": "string", "description": "世界观背景（可选，默认现代日常）"},
+                "relationship": {"type": "string", "description": "角色与用户的关系设定（可选）"},
+                "greeting": {"type": "string", "description": "对用户的初始称呼/开场白（可选）"},
+                "speech_style": {"type": "string", "description": "说话风格描述与示例台词（必填）"},
+                "appearance": {"type": "string", "description": "外观锚点：发型/发色/瞳色/服饰等固定特征（必填）"},
+                "gift_loved": {"type": "array", "items": {"type": "string"}, "description": "喜爱的礼物（≤10项，可选）"},
+                "gift_normal": {"type": "array", "items": {"type": "string"}, "description": "普通的礼物（可选）"},
+                "gift_disliked": {"type": "array", "items": {"type": "string"}, "description": "讨厌的礼物（可选）"},
+                "bond_levels": {"type": "string", "description": "各羁绊等级的态度变化/解锁档案描述（可选）"},
+            },
+            "required": ["name", "personality", "speech_style", "appearance"],
+        },
+    )
+
+    # ── 角色面社交工具：送礼（Bond-System-Design.md §4.4, P2）──
+    # 只在角色面（split + social）allowed_tools 中出现（SOCIAL_TOOLS）。当前
+    # 角色 persona_key 从 _current_personality 取；角色卡经 registry.load 取，
+    # 用于礼物偏好匹配；好感结算走全局 _bond_manager。
+    async def _give_gift_tool(gift_name: str) -> str:
+        user_id = _current_user_id.get()
+        persona_key = _current_personality.get()
+        card = ""
+        try:
+            card = get_character_registry().load(persona_key) or ""
+        except Exception:
+            card = ""
+        return await _give_gift_impl(
+            user_id=user_id,
+            gift_name=gift_name,
+            char_id=persona_key,
+            card_content=card,
+            bond_manager=_bond_manager,
+        )
+
+    registry.register(
+        "give_gift", _give_gift_tool,
+        "当用户在对话中送给你礼物（例如「送你一朵花」「给你买了蛋糕」）时调用此工具，"
+        "把礼物名填入 gift_name。工具会根据你对该礼物的喜好结算好感与心情，并返回结果，"
+        "你再以角色口吻自然回应。仅凭对话中的真实送礼意图调用，不要臆造。",
+        {
+            "type": "object",
+            "properties": {
+                "gift_name": {
+                    "type": "string",
+                    "description": "用户送出的礼物名称（从用户消息里提炼，如「一朵花」「草莓蛋糕」）",
+                },
+            },
+            "required": ["gift_name"],
+        },
+    )
+
+    # ── 角色面社交工具：画图 / 语音（Bond-System-Design.md §7, P4）──
+    # 门控/生成/资产记账全在 social_tools.create_image / send_voice（依赖
+    # 注入、可独立单测）；闭包只取 contextvar 上下文并桥接出站通道：
+    # 桥接语走 send_progress(immediate=True)（官方途径绕缓冲秒达），媒体
+    # 本体走 Sender 缓冲、回合末随正文 flush。经 SOCIAL_TOOLS 下发，不进
+    # 全局 TOOLS.md / permissions——同 give_gift 隔离决策。
+    def _media_callbacks():
+        """(send_progress, send_media) 桥到当前回合的 sender 通道。"""
+        s = _current_sender.get()
+
+        async def _progress(text: str):
+            if s is not None:
+                await s.send_progress(text, immediate=True)
+            else:
+                await _safe_send(OutProgress(text, immediate=True))
+
+        async def _media(item):
+            if s is not None:
+                if isinstance(item, OutAudio):
+                    await s.send_audio(item)
+                else:
+                    await s.send_image(item)
+            else:
+                await _safe_send(item)
+
+        return _progress, _media
+
+    async def _create_image_tool(description: str) -> str:
+        user_id = _current_user_id.get()
+        persona_key = _current_personality.get()
+        role = _current_user_role.get() or "regular"
+        registry = get_character_registry()
+        try:
+            card = registry.load(persona_key) or ""
+        except Exception:
+            card = ""
+        display = registry.get_display_name(persona_key)
+        _progress, _media = _media_callbacks()
+        return await _create_image_impl(
+            user_id=user_id, char_id=persona_key, role=role,
+            description=description, card_content=card, display_name=display,
+            bond_manager=_bond_manager, registry=registry,
+            asset_memory=_asset_memory,
+            review_client=_model_router.flash_client,
+            send_progress=_progress, send_image=_media,
+        )
+
+    registry.register(
+        "create_image", _create_image_tool,
+        "当用户向你要一张图（例如「画张自拍给我」「画一下我们在海边的样子」）时调用，"
+        "生成并发送一张你（角色本人形象）的图片。description 填用户想要的画面内容"
+        "（场景/动作/表情/服装；无需描述你自己的长相——系统会自动保持你的外观一致）。"
+        "好感等级、每日次数与内容安全校验由工具自动完成；未通过时会返回中立原因，"
+        "你需以角色口吻婉拒。生成需要一点时间，工具会先替你发一句等待提示；"
+        "图片发送成功后你只需以角色口吻自然地配一句话。",
+        CREATE_IMAGE_SCHEMA,
+    )
+
+    async def _send_voice_tool(text: str) -> str:
+        user_id = _current_user_id.get()
+        persona_key = _current_personality.get()
+        role = _current_user_role.get() or "regular"
+        _progress, _media = _media_callbacks()
+        return await _send_voice_impl(
+            user_id=user_id, char_id=persona_key, role=role, text=text,
+            bond_manager=_bond_manager, registry=get_character_registry(),
+            asset_memory=_asset_memory,
+            review_client=_model_router.flash_client,
+            send_progress=_progress, send_audio=_media,
+        )
+
+    registry.register(
+        "send_voice", _send_voice_tool,
+        "当用户想听你的声音（例如「用语音跟我说晚安」「发条语音来听听」）时调用。"
+        "text 填你要说出的完整台词（用你自己的口吻写好，≤300字），系统会以你固定的"
+        "音色合成语音发给用户。等级/次数/安全校验自动完成；语音发送成功后你只需"
+        "自然地补一句话，不要整段重复语音内容。",
+        SEND_VOICE_SCHEMA,
+    )
+
+    # ── 角色面社交工具：找回影音记忆（Bond-System-Design.md §8.2, P5）──
+    # 检索 asset_memory 的文本卡（关键词 + 歧义时 flash 重排），命中且二进制
+    # 在盘 → 重发；已淘汰 → 角色凭文本卡描述；无命中 → 自然回应。
+    async def _recall_asset_tool(query: str) -> str:
+        user_id = _current_user_id.get()
+        persona_key = _current_personality.get()
+        _progress, _media = _media_callbacks()
+        return await _recall_asset_impl(
+            user_id=user_id, char_id=persona_key, query=query,
+            asset_memory=_asset_memory,
+            rerank_client=_model_router.flash_client,
+            send_media=_media,
+        )
+
+    registry.register(
+        "recall_asset", _recall_asset_tool,
+        "当用户想再看/再听你们之间以前的图片或语音（例如「再发一次那张图」"
+        "「我想再听那段晚安语音」「上次你给我看的照片呢」）时调用。query 填用户"
+        "想找的那段记忆的关键词。找到后系统会替你重新发送，你只需自然地补一句话；"
+        "若原件已不在，工具会把记忆的文字内容给你，由你向用户描述这份回忆。",
+        RECALL_ASSET_SCHEMA,
+    )
+
+    # ── 剧情场景收尾（Bond-System-Design.md §4.4 形态3, P3）──
+    # 仅经 bond_scene 特殊会话的 allowed_tools 下发（不在 SOCIAL_TOOLS / 全局
+    # 工具集）。场景名/角色 id 从当前活跃 bond_scene 会话 metadata 读取（LLM 不
+    # 传）；结算（+scene_exp/mark/事件日志）在 social_tools.complete_scene 内完成，
+    # 成功后把 result 记进 _pending_bond_scene_done，post-run 钩子据此发升级通知 +
+    # 纪念卡片并 end_active。
+    async def _complete_scene_tool(memento: str = "") -> str:
+        user_id = _current_user_id.get()
+        persona_key = _current_personality.get()
+        char_id = persona_key
+        scene_title = ""
+        active = None
+        md = {}
+        try:
+            active = _special_sessions.get_active(user_id)
+            md = (active.metadata or {}) if active else {}
+            scene_title = str(md.get("scene_title") or "")
+            char_id = str(md.get("char_id") or persona_key)
+        except Exception:
+            pass
+        # 第三层防御（§5.4）：schema 过滤（is_scene）已挡住归档会话，这里兜住
+        # 强行调用——无活跃剧情会话、非 bond_scene、或已封档时拒绝收尾。
+        # 开关关闭时退回旧行为（不看 completed）。
+        if (not active or md.get("kind") != SCENE_KIND
+                or (_scene_archive_enabled() and md.get("completed"))):
+            return "[Error] 当前没有进行中的剧情场景，无法收尾。"
+        out = await _complete_scene_impl(
+            user_id=user_id,
+            char_id=char_id,
+            scene_title=scene_title,
+            bond_manager=_bond_manager,
+            memento=memento,
+        )
+        result = out.get("result") or {}
+        if out.get("ok") and result.get("accepted"):
+            _pending_bond_scene_done[user_id] = result
+        return out.get("observation", "")
+
+    registry.register(
+        "complete_scene", _complete_scene_tool,
+        "当你与用户共同经历的剧情场景走到**结局**（脚本最后一幕完成、或你们自然抵达"
+        "终点）时调用此工具收尾。可用 memento 参数以你的口吻写一句纪念语（≤40 字）"
+        "镌刻在纪念卡片上。调用后请再说一段温柔的收尾白。仅在场景结局调用一次，"
+        "场景中途不要调用。",
+        COMPLETE_SCENE_SCHEMA,
+    )
+
+    return registry
+
+
+# ── Global Agent Instance ────────────────────────────────────────
+
+_tool_registry = _build_tool_registry()
+
+_session_manager = SessionManager(
+    max_context_messages=20,
+    session_timeout=1800.0,
+    persistence_dir=os.path.join(_DATA_DIR, "sessions"),
+)
+
+_memory_system = MemorySystem(
+    base_dir=_MEMORY_DIR,
+)
+
+# Model router is built first so downstream components use the JSON-configured
+# reasoning model (models_settings.json) with a fallback to the .env DeepSeek
+# config — instead of the .env-only global client.
+_model_router = ModelRouter()
+
+_profile_manager = ProfileManager(
+    base_dir=_USER_DATA_ROOT,
+)
+# Layer 3 (Plan §7.1/§7.9): profile extraction is a batched, low-stakes
+# classification task → use the FLASH model, not the reasoning model.
+_profile_manager.set_client(_model_router.flash_client)
+
+# P1 three-tier memory engine (Profile-Fact-Extraction-Plan §7). Shares the
+# {data}/memory base dir with the legacy MemorySystem but owns a separate tiers/
+# subdir → no collision, trivial rollback (delete tiers/). load_all() pre-warms
+# the per-user cache at startup; set_memory wires it into the merged extract+judge
+# call so ProfileManager routes memory_candidates into SHORT/MEDIUM/LONG.
+_tiered_memory = TieredMemory(base_dir=_MEMORY_DIR)
+_tiered_memory.load_all()
+_profile_manager.set_memory(_tiered_memory)
+
+_hardware_detector = HardwareDetector(cache_dir=_USER_DATA_ROOT)
+
+_user_workspace_quota_mb = int(os.environ.get("USER_WORKSPACE_QUOTA_MB", "500"))
+_workspace_manager = UserWorkspaceManager(
+    user_data_root=_USER_DATA_ROOT,
+    quota_mb=_user_workspace_quota_mb,
+)
+
+_max_special_sessions = int(os.environ.get("MAX_SPECIAL_SESSIONS", "3"))
+_special_sessions = SpecialSessionManager(
+    user_data_root=_USER_DATA_ROOT,
+    max_per_user=_max_special_sessions,
+    llm_client=_model_router.reasoning_client,
+)
+# 上下文窗口感知（PLAN.md Idea 4 Phase B）：压缩阈值（85% 提示 / 95% 紧急
+# 截断）需要 min(REASONING, FLASH) 的输入窗口。lambda 间接寻址 → 面板热保存
+# 触发 ModelRouter.reload() 后无需重新接线。
+_special_sessions.set_context_window_provider(
+    lambda: _model_router.effective_context_window)
+
+# 会话人格绑定：把活跃特殊会话查询入口注入 CharacterRegistry，使
+# resolve_effective_personality 自动获得「剧情钉住 > 会话绑定」两层
+# （单点解析——turn.py 15+ 调用点与连续会话路径零改动保持一致）。
+# 注释掉本行即整体回滚到旧解析链（provider=None → 会话层跳过）。
+# lambda 间接寻址模块全局：测试替换 turn._special_sessions 后自动跟随。
+get_character_registry().set_session_provider(
+    lambda uid: _special_sessions.get_active(uid))
+
+# Track sessions pending LLM auto-naming: user_id -> True
+_pending_naming: dict = {}
+
+# Track pending deletion confirmations: user_id -> (session_name, expiry_timestamp)
+_pending_delete_confirm: dict = {}
+
+# Track pending UGC character deletion: user_id -> (char_id, expiry_timestamp)
+_pending_char_delete_confirm: dict = {}
+
+# Track pending /压缩会话 confirmations: user_id -> (session_name, expiry_ts)
+_pending_compress_confirm: dict = {}
+
+# Set by the create_character tool closure on success; the message handler
+# pops it after the run to auto-close the interview special session.
+_pending_char_creation_done: dict = {}
+
+# Set by the complete_scene tool closure on success (value = settlement result
+# dict: level_ups/exp/scene_title/char_id/memento); the post-run hook pops it to
+# send the level-up notice + commemorative card and end_active the scene session.
+_pending_bond_scene_done: dict = {}
+
+# Track pending personality-switch choice: user_id -> (old_display, new_display)
+# Set by /人格切换, resolved on the user's next message: "清空" clears context,
+# anything else keeps history and injects a one-line transition notice.
+_pending_personality_switch: dict = {}
+
+# Persistent transition notice per user (injected until context is cleared or
+# personality changes again): user_id -> notice string.
+# Persisted to data/personality_markers.json — the notice MUST survive process
+# restarts (panel restart / watchdog). Prod incident 2026-10-22: a restart
+# between the switch and the user's next message wiped this dict, so the L4
+# transition note never reached the model and the persona-styled history of a
+# special session dragged the reply back into the OLD personality's voice.
+_MARKERS_FILE = os.path.join(_DATA_DIR, "personality_markers.json")
+
+
+def _load_personality_markers() -> dict:
+    try:
+        with open(_MARKERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items()
+                    if isinstance(k, str) and isinstance(v, str)}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_personality_markers() -> None:
+    """Atomically persist the marker dict (tmp + os.replace)."""
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        tmp = _MARKERS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_personality_switch_marker, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _MARKERS_FILE)
+    except OSError as e:
+        from loguru import logger
+        logger.warning("[personality] marker 持久化失败: {}", e)
+
+
+_personality_switch_marker: dict = _load_personality_markers()
+
+
+def _inject_personality_transition_into_history(user_id: str) -> None:
+    """Write the transition notice INTO the conversation history (belt to the
+    L4-tail note's braces). The volatile-tail note sits far below a long
+    persona-styled history; an inline system message right next to the
+    offending messages suppresses style drift much more reliably.
+
+    Injected once, when the user confirms 「保留」 (or simply keeps talking
+    after the switch prompt). Targets whichever store is actually in use:
+    the active special session's delta, or the non-empty temp session.
+    """
+    note = _personality_switch_marker.get(user_id)
+    if not note:
+        return
+    msg = (f"[系统提示] {note}"
+           f"请严格遵守：从本条之后的所有回复都使用当前人格的语气、自称与用词，"
+           f"不得模仿上方历史消息中旧人格的说话风格。")
+    try:
+        if _special_sessions.get_active(user_id) is not None:
+            _special_sessions.add_message(user_id, "system", msg)
+        else:
+            session = _session_manager.get_or_create(user_id)
+            if session.context:
+                session.add_message("system", msg)
+                _session_manager.update(user_id, session)
+    except Exception as e:
+        from loguru import logger
+        logger.warning("[personality] 历史注入失败 user={}: {}", user_id, e)
+
+# Active subtask window for multi-turn tool flows (gacha / speed-check):
+#   user_id -> {task_id, goal, boundary, opened_at}
+# Opened by the ``begin_task`` tool before the agent asks a setup/clarifying
+# question; ``boundary`` is the session message count at that moment so the
+# setup turns can be folded away when ``finalize_subtask`` closes the window.
+_active_task: dict = {}
+# Task windows older than this are treated as abandoned and ignored on finalize.
+_TASK_WINDOW_TTL = 15 * 60
+
+# 多模态资产记忆层（P4/P5）：文本卡 data/assets/{user}/cards/，二进制
+# data/assets/{user}/{char}/，prompt_hash 去重 + audit.log 计费审计。
+# P5: Agent 持有它做 L4「影音记忆」注入 → 必须先于 Agent 实例化。
+_asset_memory = AssetMemory(base_dir=_ASSETS_DIR)
+
+agent = Agent(
+    deepseek_client=_model_router.reasoning_client,
+    tool_registry=_tool_registry,
+    config_dir=_CONFIG_DIR,
+    session_manager=_session_manager,
+    memory_system=_memory_system,
+    tiered_memory=_tiered_memory,
+    profile_manager=_profile_manager,
+    hardware_detector=_hardware_detector,
+    workspace_manager=_workspace_manager,
+    special_session_manager=_special_sessions,
+    asset_memory=_asset_memory,
+    max_tool_iterations=20,
+    thinking_timeout=180.0,
+)
+
+_continuous_sessions = ContinuousSessionManager(timeout_minutes=1.5)
+
+_perm_manager = PermissionManager()
+
+# ── Bond System（Bond-System-Design.md §4，P0）─────────────────────
+# 好感/心情/陪伴统计核心。data/bonds/{user_id}.json 持久化，
+# mtime 校验缓存（外部写入优先，同 ProfileManager 纪律）。
+# 结算钩子在回复成功发送后调用；仅 split 模式人格参与。
+# characters_dir：UGC 卡 meta.json 的 initial_bond_level 在 bond 状态
+# 首次创建时播种初始羁绊（仅作者本人，与 CharacterRegistry 默认目录同源）。
+# events_dir 未显式传入 → BondManager 自动取 bonds 同级的 bond_events/，
+# 随 BONDS_DIR 一起落数据盘。
+_bond_manager = BondManager(
+    base_dir=_BONDS_DIR,
+    characters_dir=_CHARACTERS_DIR,
+)
+
+# 主动消息「角色信箱」存储（proactive-mail-design.md v0.5 §7）：
+# data/mailboxes/{safe_openid}.json 每用户一文件；/邮件 命令直连层与
+# plugins/qq_official.py 的每日 mail pass 共用这一个实例（bot 单写者）。
+_mailbox_manager = MailboxManager(base_dir=_MAILBOX_DIR)
+
+
+# Per-user busy flag — prevents concurrent message processing for the
+# same user. When a user's message is being processed, subsequent
+# messages from that user are rejected with a brief "busy" reply.
+_user_busy: set = set()
+
+# Recent file tracking — maps message_id to downloaded file info so that
+# when a user replies to a file message we can resolve which file they mean.
+_MAX_RECENT_FILES = 200
+_recent_files: dict[str, list[dict]] = {}
+
+# Temporary-session file provenance — tracks workspace-relative paths uploaded
+# while no special session is active, so /保存为会话 can migrate ownership.
+_temp_session_files: dict[str, set[str]] = {}
+
+# Idea 3 — suggest upgrading a long temporary session to a special session.
+UPGRADE_HINT_THRESHOLD = 15   # message count at which to start suggesting
+UPGRADE_HINT_INTERVAL = 10    # re-suggest at most every N messages
+_upgrade_hint_last: dict[str, int] = {}  # user_id -> message count at last hint
+
+# ── 剧情会话封档与配额豁免（scene-session-archive-design.md §2.4）──────
+# 单一真源：kind 为 bond_scene / char_creation 的会话不计普通特殊会话配额。
+# 所有配额判断与数字展示必须走 _quota_sessions()/_quota_used()，禁止再直接
+# len(list_sessions())。回滚开关 _scene_archive_enabled() 定义在 agent.py
+#（热读；关闭时配额统计退回全量、is_scene 退回仅看 kind）。
+SCENE_KIND = "bond_scene"
+CREATION_KIND = "char_creation"
+NON_QUOTA_KINDS = frozenset({SCENE_KIND, CREATION_KIND})
+
+# ── /压缩会话（PLAN.md Idea 4 Phase A）────────────────────────────────
+# 用户触发的一次性深度压缩：头部历史 → flash 模型滚动摘要 → apply_compression
+# 写回（摘要 system 消息 + 尾部原文）。剧情归档/角色创作会话豁免（历史是回看
+# 真相源，压缩即销毁）。读时防线（85% 提示 / 95% 紧急截断）在 agent.py。
+COMPRESS_MIN_MESSAGES = 30       # 少于该消息数拒绝压缩（还不值得压）
+COMPRESS_KEEP_RECENT = 10        # 尾部保留原文的消息数
+COMPRESS_SUMMARY_BATCH_TOKENS = 24000   # 滚动摘要每批的估算 token 预算
+COMPRESS_MSG_RENDER_LIMIT = 1200        # 摘要输入中单条消息的截断长度
+
+
+def _max_scene_archives() -> int:
+    """剧情会话总量上限（D5；计数含进行中与已完结；热读可调）。"""
+    try:
+        return max(1, int(os.environ.get("MAX_SCENE_ARCHIVES", "20")))
+    except (TypeError, ValueError):
+        return 20
+
+
+# ── P5 (§8.3): 用户上传图/语音的后台文本化（对称通路）────────────────
+# split 人格下附件落盘后起后台任务：多模态 LLM 一句话描述/转录 → 写
+# user_upload 资产卡（文本记忆不褪色；二进制留在工作区，归工作区配额管，
+# 资产 LRU 不碰）→ 小额好感 EXP（每日 upload_exp_daily_cap 次封顶，防刷）。
+# 全程 best-effort 静默失败，不影响当轮回复；现有「路径文本注入 +
+# read_file 懒分析」通路保持不动——这里是额外的记忆入库，不是分析替换。
+_upload_tasks: set = set()
+
+_UPLOAD_IMAGE_PROMPT = "请用一句话客观描述这张图片的内容（不超过60字），不要推测用户意图。"
+_UPLOAD_VOICE_PROMPT = "请转录这段语音的文字内容，并用一句话概括语气与内容（不超过80字）。"
+# multimodal_client 失败时返回错误说明文本（非异常）——识别前缀后放弃入库
+_TEXTUALIZE_ERROR_PREFIXES = ("[多模态]", "[音频", "分析失败", "转录失败")
+
+
+def _clean_textualization(desc: str, limit: int = 200) -> str:
+    """把多模态返回的原始文本清洗成适合入库的一句话摘要。
+
+    防御性处理（即便 multimodal_client 已默认不内联思考，也兜住旧行为/
+    其它模型的意外输出）：
+    1) 若含 `[回复]` 脚手架，只取其后正文（丢弃 `[思考]` 段）；
+    2) 仍以 `[思考]`/`[DEBUG]` 开头的串视为无有效正文 → 返回空（放弃入库）；
+    3) 压平空白；
+    4) 截到 limit 字，但优先在最后一个句末标点处收口，避免出现半句话。
+    """
+    text = desc or ""
+    if "[回复]" in text:
+        text = text.split("[回复]", 1)[1]
+    text = text.strip()
+    if not text or text.startswith(("[思考]", "[DEBUG]")):
+        return ""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    # 在窗口内找最后一个句末标点，从句尾收口（保留标点）
+    cut = max(window.rfind(p) for p in "。！？!?.；;")
+    if cut >= limit // 2:  # 句末标点太靠前就不强收，直接按长度截
+        return window[: cut + 1]
+    return window.rstrip() + "…"
+
+
+async def _textualize_upload(user_id: str, char_id: str, kind: str, path: str):
+    """图片→一句话描述 / 语音→转录，落 user_upload 资产卡 + 小额好感。"""
+    try:
+        from lib.multimodal_client import multimodal_client
+        if kind == "image":
+            if not multimodal_client.is_available():
+                return
+            desc = await multimodal_client.analyze_image(path, _UPLOAD_IMAGE_PROMPT)
+        elif kind == "voice":
+            if not multimodal_client.is_audio_available():
+                return
+            desc = await multimodal_client.analyze_audio(path, _UPLOAD_VOICE_PROMPT)
+        else:
+            return
+        desc = _clean_textualization(desc)
+        if not desc or desc.startswith(_TEXTUALIZE_ERROR_PREFIXES):
+            return
+        card = AssetCard(
+            id=make_asset_id(), type=ASSET_UPLOAD, char_id=char_id,
+            user_id=user_id, path=path,
+            prompt=desc, transcript=desc,
+            tags=["uploaded", kind],
+        )
+        _asset_memory.write_card(card)
+        try:
+            role = _perm_manager.get_role(user_id).value
+        except Exception:  # noqa: BLE001
+            role = "regular"
+        _enforce_asset_quota(user_id=user_id, role=role,
+                             bond_manager=_bond_manager,
+                             asset_memory=_asset_memory)
+        granted = _bond_manager.record_upload_exp(user_id, char_id)
+        _asset_memory.append_audit(
+            user_id, char_id, "upload", "", "",
+            "textualized" if granted else "textualized_capped")
+    except Exception as e:  # noqa: BLE001
+        log_exception("upload textualization failed", e)
+
+
+def _spawn_textualize_upload(user_id: str, char_id: str, kind: str, path: str):
+    """Fire-and-forget wrapper（持引用防 GC；无事件循环时静默跳过）。"""
+    if not (user_id and char_id and path):
+        return
+    try:
+        task = asyncio.create_task(
+            _textualize_upload(user_id, char_id, kind, path))
+        _upload_tasks.add(task)
+        task.add_done_callback(_upload_tasks.discard)
+    except RuntimeError:
+        pass
+
+
+def _record_file(message_id: str, name: str, path: str = "", error: str = ""):
+    """Record a downloaded file (or failed download) against its source
+    message for reply resolution."""
+    if message_id not in _recent_files:
+        _recent_files[message_id] = []
+    _recent_files[message_id].append(
+        {"name": name, "path": path, "error": error}
+    )
+    # Prune oldest entries if cache grows too large
+    while len(_recent_files) > _MAX_RECENT_FILES:
+        oldest = next(iter(_recent_files))
+        del _recent_files[oldest]
+
+
+def _attachment_label(att) -> str:
+    """Human label for an attachment inside a prompt line."""
+    if att.kind == "file":
+        return f"文件 {att.name}"
+    return {"image": "图片", "voice": "语音消息"}.get(att.kind, "文件")
+
+
+def _attachment_saved_line(att) -> str:
+    """Prompt line for a downloaded attachment (quoted vs uploaded now)."""
+    if att.quoted:
+        return f"[用户引用了{_attachment_label(att)}，已保存至: {att.path}]"
+    if att.kind == "image":
+        return f"[用户上传了图片，已保存至: {att.path}]"
+    if att.kind == "file":
+        return f"[用户上传了文件 {att.name}，已保存至: {att.path}]"
+    return f"[用户发送了语音消息，已保存至: {att.path}]"
+
+
+def _attachment_error_line(att) -> str:
+    """Prompt line for an attachment whose download failed."""
+    if att.quoted:
+        return f"[用户引用的{_attachment_label(att)}下载失败: {att.error}]"
+    if att.kind == "image":
+        return f"[用户上传了图片，但下载失败: {att.error}]"
+    if att.kind == "file":
+        return f"[用户上传了文件 {att.name}，但下载失败: {att.error}]"
+    return f"[用户发送了语音消息，但下载失败: {att.error}]"
+
+
+def _any_vision_client() -> bool:
+    """True when either main chat tier opted into Direct Vision.
+
+    Used BEFORE plane/complexity routing picks the actual client — e.g. to
+    decide whether a bare-image turn enters the agent (vision on) or gets
+    the legacy「已收到图片」ack (vision off). The per-call attachment at the
+    agent.run sites re-checks the *chosen* client's own flag, so a mismatch
+    (any=True but chosen client False) merely degrades to the text
+    placeholder + read_file lazy-analysis path.
+    """
+    try:
+        return bool(
+            getattr(_model_router.flash_client, "supports_vision", False)
+            or getattr(_model_router.reasoning_client, "supports_vision", False)
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _record_session_file(user_id: str, abs_path: str) -> None:
+    """Attribute a newly written workspace file to the active special session.
+
+    When no special session is active, the file is recorded into
+    ``_temp_session_files`` so ``/保存为会话`` can migrate the provenance
+    later. ``abs_path`` is converted to a workspace-relative path; paths
+    outside the user's workspace are ignored.
+    """
+    ws = _workspace_manager.get_workspace(user_id)
+    try:
+        rel = os.path.relpath(abs_path, ws)
+    except ValueError:
+        return
+    if rel.startswith("..") or os.path.isabs(rel):
+        return
+
+    active = _special_sessions.get_active(user_id)
+    if active is not None:
+        _special_sessions.add_file(user_id, active.name, rel)
+    else:
+        _temp_session_files.setdefault(user_id, set()).add(rel)
+
+
+def _format_delete_summary(result: dict) -> str:
+    """Render the file-cleanup portion of a session-deletion notification."""
+    lines = []
+    if result.get("deleted"):
+        lines.append(
+            f"已清理 {len(result['deleted'])} 个文件"
+            f"（释放 {fmt_bytes(result['freed_bytes'])}）："
+        )
+        lines.extend(f"  - {rel}" for rel in result["deleted"])
+    if result.get("kept_repos"):
+        lines.append("以下仓库予以保留（工作区内仍可用）：")
+        lines.extend(f"  - {rel}" for rel in result["kept_repos"])
+    return "\n".join(lines)
+
+
+def _quota_warning(user_id: str) -> str:
+    """Return a quota warning if workspace usage >= 80% of the role quota.
+
+    Uses the same usage metric (``_workspace_manager.get_size``) and per-role
+    quota (``_perm_manager.get_workspace_quota_mb``) as ``_get_user_info`` and
+    ``_handle_cleanup_flow``. Returns "" below the 80% threshold.
+    """
+    role = _perm_manager.get_role(user_id)
+    quota_mb = _perm_manager.get_workspace_quota_mb(role)
+    quota_bytes = quota_mb * 1024 * 1024
+    used = _workspace_manager.get_size(user_id)
+    if used >= quota_bytes * 0.8:
+        pct = used / quota_bytes * 100
+        used_mb = used / (1024 * 1024)
+        return (
+            f"⚠️ 工作区容量已使用 {pct:.0f}%（{used_mb:.1f} MB / {quota_mb} MB）。"
+            f"建议发送 /管理工作区 查看详情并清理不需要的文件，"
+            f"或直接告诉我「帮我清理工作区」。"
+        )
+    return ""
+
+
+# ── 剧情封档：配额豁免辅助函数（scene-session-archive-design.md §2.4/§6）──
+# 单一真源。回滚开关关闭时 _quota_sessions 退回全量统计（§7）。
+
+def _quota_sessions(user_id: str) -> list:
+    """计入特殊会话配额的会话（普通特殊会话）。
+
+    开关关闭时退回全量（把剧情/创作会话也算进去），实现 §7 的回滚语义。
+    """
+    sessions = _special_sessions.list_sessions(user_id)
+    if not _scene_archive_enabled():
+        return sessions
+    return [
+        s for s in sessions
+        if (s.get("metadata") or {}).get("kind") not in NON_QUOTA_KINDS
+    ]
+
+
+def _quota_used(user_id: str) -> int:
+    """已用的普通特殊会话配额数（展示与判断统一走这里）。"""
+    return len(_quota_sessions(user_id))
+
+
+def _scene_archives(user_id: str) -> list:
+    """全部剧情会话（含进行中与已完结）——D5 上限口径。"""
+    return [
+        s for s in _special_sessions.list_sessions(user_id)
+        if (s.get("metadata") or {}).get("kind") == SCENE_KIND
+    ]
+
+
+def _scene_completed(entry: dict) -> bool:
+    """剧情会话是否已封档（completed==true）。开关关闭时恒为 False（退回旧行为）。"""
+    if not _scene_archive_enabled():
+        return False
+    return bool((entry.get("metadata") or {}).get("completed"))
+
+
+def _backfill_completed(user_id: str, entry) -> None:
+    """懒回填热点（D7）：存量 bond_scene 缺 completed 字段时按 has_done_scene 判定回写。
+
+    仅两个热点调用：run_agent_turn 评估 is_scene 时、_find_scene_session 命中时。
+    禁止在 list_sessions() 读路径回填（写放大 + mtime 抖动）。无法判定（羁绊状态
+    缺失）时保持未完成，避免误封档。completed_at 用回填时间（非真实完成时间）。
+
+    entry 可为 index dict（list_sessions 的元素）或 SpecialSession 对象（get_active）。
+    两者都用同一 metadata dict 引用，故 md.update 后调用方立即可见新值。
+    """
+    if isinstance(entry, dict):
+        md = entry.get("metadata")
+        name = entry.get("name")
+    else:
+        md = getattr(entry, "metadata", None)
+        name = getattr(entry, "name", None)
+    if not isinstance(md, dict) or md.get("kind") != SCENE_KIND:
+        return
+    if "completed" in md:
+        return  # 已有字段（True/False 均视为已定），不回填
+    char_id = str(md.get("char_id") or "")
+    title = str(md.get("scene_title") or "")
+    if not char_id or not title or not name:
+        return
+    try:
+        if _bond_manager.has_done_scene(user_id, char_id, title):
+            updates = {"completed": True, "completed_at": time.time()}
+            _special_sessions.update_metadata(user_id, name, updates)
+            md.update(updates)  # 同步内存 entry，本轮调用方立即可见
+            from nonebot import logger
+            logger.info(
+                f"[scene-archive] backfill completed user={user_id} "
+                f"char={char_id} title={title}")
+    except Exception as e:
+        log_exception("scene completed backfill failed", e)
+
+
+def _find_scene_session(user_id: str, char_id: str, title: str):
+    """按去重键 (char_id, scene_title) 查已有剧情会话（懒回填热点之二）。
+
+    存量重复项取最新创建的那个；其余保留给用户手动 /删除会话。
+    """
+    matches = []
+    for s in _scene_archives(user_id):
+        md = s.get("metadata") or {}
+        if (str(md.get("char_id") or "") == str(char_id)
+                and str(md.get("scene_title") or "") == str(title)):
+            _backfill_completed(user_id, s)  # 命中即回填（写回 index）
+            matches.append(s)
+    return max(matches, key=lambda s: s.get("created_at") or 0, default=None)
+
+
+def _delete_quota_tail(user_id: str, deleted_kind: str) -> str:
+    """删除会话后的配额提示尾行（scene-session-archive-design.md §4.2/B6）。
+
+    deleted_kind 是被删会话的 metadata.kind（删除前捕获）。删普通会话 → 显示
+    n/max；删剧情/创作会话 → 强调普通配额不变（它们本就不计配额）。开关关闭时
+    退回统一口径（_quota_used 已退回全量）。
+    """
+    role = _perm_manager.get_role(user_id)
+    max_sess = _perm_manager.get_max_special_sessions(role)
+    used = _quota_used(user_id)
+    if not _scene_archive_enabled():
+        return f"\n当前特殊会话: {used}/{max_sess}"
+    if deleted_kind == SCENE_KIND:
+        k = len(_scene_archives(user_id))
+        return f"\n普通会话配额不变（当前 {used}/{max_sess}），剧情归档剩 {k} 个。"
+    if deleted_kind == CREATION_KIND:
+        return f"\n普通会话配额不变（当前 {used}/{max_sess}）。"
+    return f"\n当前普通会话: {used}/{max_sess}"
+
+
+# ── Quota Cleanup Protocol (Feature 2) ───────────────────────────
+# Elastic-quota cleanup: when a user exceeds their workspace quota, the next
+# message triggers a cleanup protocol. The agent lists the earliest-mtime
+# candidates, the user may customize (but not skip), and after 10 minutes the
+# agent deletes autonomously without approval.
+
+CLEANUP_TIMEOUT = 600  # seconds (10 minutes)
+
+# user_id -> {"candidates": list[CleanupCandidate], "deadline": float}
+_cleanup_plans: dict = {}
+
+
+async def _handle_cleanup_flow(user_id: str, text_content: str) -> bool:
+    """Intercept messages during the quota-cleanup protocol.
+
+    Returns True when the message was fully consumed (caller should return
+    without running the agent).
+    """
+    plan = _cleanup_plans.get(user_id)
+    if plan is not None:
+        if time.time() >= plan["deadline"]:
+            await _execute_cleanup_plan(user_id, plan, plan["candidates"], 0.8)
+        else:
+            await _handle_cleanup_response(user_id, text_content, plan)
+        return True
+
+    # No active plan — trigger if over quota.
+    quota_mb = _perm_manager.get_workspace_quota_mb(_perm_manager.get_role(user_id))
+    quota_bytes = quota_mb * 1024 * 1024
+    if _workspace_manager.get_size(user_id) < quota_bytes:
+        return False
+
+    candidates = list_candidates(_workspace_manager.get_workspace(user_id))
+    if not candidates:
+        return False
+
+    deadline = time.time() + CLEANUP_TIMEOUT
+    _cleanup_plans[user_id] = {"candidates": candidates, "deadline": deadline}
+    await _send_cleanup_prompt(user_id, candidates)
+    asyncio.create_task(_auto_cleanup_after(user_id, deadline))
+    return True
+
+
+async def _handle_cleanup_response(user_id: str, text_content: str, plan: dict) -> None:
+    """Interpret a user message while a cleanup plan is active."""
+    decision = resolve_targets(text_content, plan["candidates"])
+
+    if decision.mode == "skip":
+        await _safe_send(
+            "⚠️ 无法跳过清理。工作区已超出配额，必须清理后才能继续使用。\n"
+            "你可以：\n"
+            "1. 回复「删吧」确认删除上列文件\n"
+            "2. 回复「保留 X」指定要保留的文件（其余删除）\n"
+            "3. 指定要删除的文件路径或编号\n"
+            "⏳ 10 分钟内未回复将自动删除上列候选文件。"
+        )
+        return
+
+    if decision.mode == "confirm":
+        await _execute_cleanup_plan(user_id, plan, plan["candidates"], 0.8)
+        return
+
+    if decision.mode in ("keep", "explicit"):
+        # Explicit user choice — delete exactly the selected targets.
+        await _execute_cleanup_plan(user_id, plan, decision.targets, 0.0)
+        return
+
+    await _safe_send(
+        "请明确你的清理指令：\n"
+        "1. 回复「删吧」删除上列所有文件\n"
+        "2. 回复「保留 X」保留指定文件\n"
+        "3. 回复要删除的文件路径或编号\n"
+        "⏳ 10 分钟内未回复将自动删除上列候选文件。"
+    )
+
+
+async def _send_cleanup_prompt(user_id: str, candidates) -> None:
+    quota_mb = _perm_manager.get_workspace_quota_mb(_perm_manager.get_role(user_id))
+    usage_mb = _workspace_manager.get_size(user_id) / (1024 * 1024)
+    await _safe_send(format_cleanup_prompt(candidates, usage_mb, quota_mb))
+
+
+async def _execute_cleanup_plan(user_id: str, plan: dict, targets, target_ratio: float) -> None:
+    """Delete the given candidates (mtime asc) and report the result."""
+    _cleanup_plans.pop(user_id, None)
+    quota_mb = _perm_manager.get_workspace_quota_mb(_perm_manager.get_role(user_id))
+    quota_bytes = quota_mb * 1024 * 1024
+    ws = _workspace_manager.get_workspace(user_id)
+    result = execute_cleanup(ws, quota_bytes, candidates=targets, target_ratio=target_ratio)
+    deleted = result["deleted"]
+
+    if deleted:
+        lines = [f"✅ 已清理工作区，删除 {len(deleted)} 项，释放 {fmt_bytes(result['freed_bytes'])}："]
+        for c in deleted:
+            lines.append(f"  - {c.rel_path}")
+        usage_mb = _workspace_manager.get_size(user_id) / (1024 * 1024)
+        if usage_mb * 1024 * 1024 < quota_bytes:
+            lines.append(f"当前占用 {usage_mb:.1f} MB / {quota_mb} MB，已回到配额内。")
+        else:
+            lines.append(f"当前占用 {usage_mb:.1f} MB / {quota_mb} MB，仍超出配额，请继续清理。")
+        await _safe_send("\n".join(lines))
+    else:
+        await _safe_send("未删除任何文件。请手动检查工作区，或发送「帮我清理工作区」重新发起。")
+
+    _workspace_manager.clear_quota_flag(user_id)
+
+
+async def _auto_cleanup_after(user_id: str, deadline: float) -> None:
+    """Autonomous deletion fallback after the 10-minute timeout."""
+    await asyncio.sleep(CLEANUP_TIMEOUT)
+    plan = _cleanup_plans.get(user_id)
+    if plan is None or plan["deadline"] != deadline:
+        return  # already resolved (or superseded)
+    await _execute_cleanup_plan(user_id, plan, plan["candidates"], 0.8)
+
+
+# Stage 2: _build_reply_context moved to adapters/onebot.py as
+# build_reply_context() — reply-segment / [CQ:reply] parsing is
+# OneBot-specific. The entry plugin pre-computes it into
+# view.reply_context.
+
+
+
+# ── User Info Tool ─────────────────────────────────────────────────
+
+def _get_user_info() -> str:
+    """返回当前用户的系统信息快照（权限、会话、工作区），零推理 token 消耗。
+
+    适用场景：用户询问「我的设置」「我有什么权限」「我的工作区」「我的会话」等。
+
+    此工具直接读取系统状态，无需 LLM 推理即可返回结构化信息。
+    """
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "无法获取用户信息：当前请求未设置用户上下文。"
+
+    role = _perm_manager.get_role(user_id)
+    role_label = {"admin": "管理员", "vip": "会员", "regular": "普通用户"}[role.value]
+
+    lines = [f"用户信息快照", f"", f"用户 ID: {user_id}", f"权限级别: {role_label} ({role.value})"]
+
+    # ── 特殊会话（scene-session-archive-design.md §4.2：普通/归档分开计数）──
+    sessions = _special_sessions.list_sessions(user_id)
+    active = _special_sessions.get_active(user_id)
+    max_sessions = _perm_manager.get_max_special_sessions(role)
+    lines.append(f"")
+    if not _scene_archive_enabled():
+        # 回滚态：统一视图（与改造前一致；此时 _quota_sessions 退回全量）
+        lines.append(f"特殊会话 ({len(sessions)}/{max_sessions}):")
+        if sessions:
+            for s in sessions:
+                marker = " ★ 当前" if active and s["name"] == active.name else ""
+                lines.append(f"  · {s['name']}{marker} — {s['total_messages']} 条消息")
+        else:
+            lines.append(f"  (无特殊会话)")
+    else:
+        quota_sessions = _quota_sessions(user_id)
+        scene_sessions = _scene_archives(user_id)
+        creation_sessions = [
+            s for s in sessions
+            if (s.get("metadata") or {}).get("kind") == CREATION_KIND
+        ]
+        lines.append(f"普通会话 ({len(quota_sessions)}/{max_sessions}):")
+        if quota_sessions:
+            for s in quota_sessions:
+                marker = " ★ 当前" if active and s["name"] == active.name else ""
+                lines.append(f"  · {s['name']}{marker} — {s['total_messages']} 条消息")
+        else:
+            lines.append(f"  (无普通特殊会话)")
+        if scene_sessions:
+            lines.append(f"剧情归档 {len(scene_sessions)}（不计配额）:")
+            for s in scene_sessions:
+                marker = " ★ 当前" if active and s["name"] == active.name else ""
+                done = "已完结" if _scene_completed(s) else "进行中"
+                lines.append(
+                    f"  · {s['name']}{marker} — {done} · {s['total_messages']} 条消息")
+        for s in creation_sessions:
+            marker = " ★ 当前" if active and s["name"] == active.name else ""
+            lines.append(
+                f"角色创作{marker}（进行中 · 不计配额）— {s['total_messages']} 条消息")
+
+    # ── 工作区 ──
+    ws_path = _workspace_manager.get_workspace(user_id)
+    ws_size = _workspace_manager.get_size(user_id)
+    ws_quota_mb = _perm_manager.get_workspace_quota_mb(role)
+    ws_usage_mb = ws_size / (1024 * 1024)
+    pct = (ws_size / (ws_quota_mb * 1024 * 1024)) * 100 if ws_quota_mb > 0 else 0
+    # Hide the absolute data-root prefix; show paths relative to USER_DATA_ROOT.
+    rel_ws = rel_to_root(ws_path, _workspace_manager.user_data_root)
+    lines.append(f"")
+    lines.append(f"工作区:")
+    lines.append(f"  路径: {rel_ws}/")
+    lines.append(f"  用量: {ws_usage_mb:.1f} MB / {ws_quota_mb} MB ({pct:.1f}%)")
+    if pct >= 80:
+        lines.append(f"  ⚠️ 容量警告：工作区已使用 {pct:.1f}%，接近上限。"
+                     f"建议清理不需要的文件（如「帮我清理工作区」）。")
+
+    # ── 工作区目录快照 ──
+    lines.append(f"")
+    lines.append(f"  目录快照:")
+    lines.extend(build_tree(Path(ws_path), f"{rel_ws}/", indent="  "))
+
+    # ── 权限范围 ──
+    allowed = _perm_manager.get_allowed_tools(role)
+    code_limits = _perm_manager.get_code_limits(role)
+
+    lines.append(f"")
+    lines.append(f"可用工具: {len(allowed)} 个")
+
+    # Categorize tools
+    info_tools = {"search_web", "get_time", "get_weather", "read_file", "summarize_pdf",
+                  "geocode", "reverse_geocode", "search_poi", "plan_route"}
+    dev_tools = {"execute_code", "shell_exec", "web_fetch", "download_repo", "get_system_load"}
+    fun_tools = {"gacha_pull", "play_gacha_animation", "calculate_speed",
+                 "compare_speed_probability", "explain_code", "translate_text",
+                 "character_detail", "bond_detail", "parse_battle_screenshots"}
+    misc = allowed - info_tools - dev_tools - fun_tools
+
+    sections = [
+        ("信息查询", sorted(allowed & info_tools)),
+        ("开发工具", sorted(allowed & dev_tools)),
+        ("娱乐工具", sorted(allowed & fun_tools)),
+    ]
+    if misc:
+        sections.append(("其他", sorted(misc)))
+
+    for label, tools in sections:
+        if tools:
+            lines.append(f"  [{label}] {', '.join(tools)}")
+        else:
+            lines.append(f"  [{label}] (无)")
+
+    if code_limits:
+        lines.append(f"")
+        lines.append(f"代码执行限制:")
+        lines.append(f"  超时: {code_limits.max_timeout}s")
+        lines.append(f"  输出上限: {code_limits.max_output // 1024}KB")
+        lines.append(f"  内存: {code_limits.max_memory_mb}MB")
+
+    return "\n".join(lines)
+
+
+# Register user info tool (must happen after _get_user_info definition and after
+# singletons like _workspace_manager, _special_sessions are initialized)
+_tool_registry.register(
+    "get_user_info", _get_user_info,
+    "获取当前用户的系统信息，包括：权限级别、特殊会话列表、工作区用量与目录快照"
+    "（含 repos 仓库清单、uploads 文件清单）、可用工具范围、代码执行限制（如有）。"
+    "当用户询问「我的设置」「我的权限」「我的工作区」「查看工作区」「工作区里有什么」"
+    "「我的会话」「我能用什么工具」或类似用户自身信息相关问题时，应调用此工具。"
+    "此工具返回结构化系统数据，可避免 LLM 在系统信息类问题上浪费推理 token。",
+    {"type": "object", "properties": {}, "required": []},
+)
+
+
+def _end_continuous_mode() -> str:
+    """结束当前群聊的连续对话窗口（仅连续对话模式下暴露给 LLM）。
+
+    当用户在连续对话中表达「谢谢」「好的」「不用了」「再见」等结束/告别意图，
+    且任务已完成时，调用此工具主动结束连续窗口，之后用户需 @机器人 才能再次触发。
+    """
+    group_id = _current_group_id.get()
+    user_id = _current_user_id.get()
+    if not group_id or not user_id:
+        return "无法结束连续对话：当前不在群聊连续对话上下文中。"
+    _continuous_sessions.end(group_id, user_id)
+    return "已结束连续对话模式，之后需要@我才能触发。"
+
+
+# end_continuous_mode is registered in the registry but NOT in any permission
+# set — it is unioned into ``allowed_tools`` only in the continuous-mode path
+# (_handle_continuous_message_impl), so it's never offered in the @-mention path.
+_tool_registry.register(
+    "end_continuous_mode", _end_continuous_mode,
+    "结束当前群聊的连续对话窗口。当用户表达「谢谢」「好的」「不用了」「再见」"
+    "等结束或告别意图，且当前任务已完成、无需继续追问时，调用此工具主动退出"
+    "连续模式。调用后用户需要 @机器人 才能再次触发对话。",
+    {"type": "object", "properties": {}, "required": []},
+)
+
+
+# ── Subtask encapsulation tools (begin_task / finalize_subtask) ──
+#
+# Multi-turn tool flows (gacha, battle speed-check) pollute context: each setup
+# question and each verbose result gets persisted verbatim. These two tools let
+# the agent demarcate such a flow so it is folded into one compact structured
+# record (goal / result / params / refs / status / follow-ups / traceability)
+# instead of a pile of raw turns. Full detail is kept in data/task_log/.
+
+def _begin_task(goal: str) -> str:
+    """Mark the start of a multi-turn subtask and open a fold window."""
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "[begin_task] 无法开始子任务：当前请求未设置用户上下文。"
+    _active_task[user_id] = {
+        "task_id": uuid.uuid4().hex[:12],
+        "goal": (goal or "").strip(),
+        "boundary": _session_manager.message_count(user_id),
+        "opened_at": time.time(),
+    }
+    return (
+        "[begin_task] 已记录子任务「" + (goal or "").strip() + "」的起点。"
+        "现在请向用户提出必要的设置/澄清问题（如抽卡动画、测速模式），"
+        "得到回答后继续执行相应工具，任务完成时务必调用 finalize_subtask 收尾。"
+    )
+
+
+def _finalize_subtask(
+    goal: str,
+    result: str,
+    tool: str = "",
+    params: dict = None,
+    refs: list = None,
+    status: str = "success",
+    failure: str = "",
+    follow_ups: list = None,
+) -> str:
+    """Finalize a subtask: persist a structured record and fold this flow."""
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "[finalize_subtask] 无法收尾：当前请求未设置用户上下文。"
+
+    task = _active_task.pop(user_id, None)
+    boundary = None
+    if task and (time.time() - task.get("opened_at", 0)) <= _TASK_WINDOW_TTL:
+        boundary = task.get("boundary")
+
+    record = build_record(
+        goal=goal or (task or {}).get("goal", ""),
+        result=result or "",
+        tool=tool or "",
+        params=params,
+        refs=refs,
+        status=status,
+        failure=failure,
+        follow_ups=follow_ups,
+    )
+    append_task_log(user_id, record)
+    line = build_compact_line(record)
+    _pending_task_fold.set({"line": line, "boundary": boundary})
+    return "[finalize_subtask] 子任务结果已结构化记录，本轮交互将被折叠为一条摘要。"
+
+
+_tool_registry.register(
+    "begin_task", _begin_task,
+    "开始一个需要多轮交互的工具型子任务（如抽卡、战斗测速）。当你接下来必须先向"
+    "用户询问设置/澄清问题（例如抽卡是否看动画、测速用轻量还是全量模式）时，"
+    "先调用此工具记录任务起点，再提出该问题。它让后续的问答与结果被折叠成一条"
+    "结构化记录，避免污染上下文。仅在确有澄清环节的工具任务开始时调用一次。",
+    {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "description": "子任务目标的简短描述，如「十连抽卡」「战斗截图测速」"},
+        },
+        "required": ["goal"],
+    },
+)
+
+
+_tool_registry.register(
+    "finalize_subtask", _finalize_subtask,
+    "结束一个工具型子任务并提交结构化结果。在抽卡、战斗测速等多轮工具任务给出"
+    "最终结果后必须调用：它把整个任务折叠成一条精炼记录存入上下文，完整细节归档"
+    "到任务日志以便追溯。result 用 1-3 句话概括最终结果；params 填关键参数（如"
+    "卡池/次数/测速模式）；有未完成事项或建议时写入 follow_ups。",
+    {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "description": "子任务目标"},
+            "result": {"type": "string", "description": "最终结果的精炼概括（1-3 句）"},
+            "tool": {"type": "string", "description": "主要使用的工具名，如 gacha_pull / parse_battle_screenshots"},
+            "params": {"type": "object", "description": "关键参数/约束，如 {pool_type, count, mode}"},
+            "refs": {"type": "array", "items": {"type": "string"}, "description": "引用的角色名/文件路径/会话名等"},
+            "status": {"type": "string", "enum": ["success", "partial", "failed"], "default": "success"},
+            "failure": {"type": "string", "description": "失败类型（仅 status=failed 时填写）"},
+            "follow_ups": {"type": "array", "items": {"type": "string"}, "description": "未完成事项或后续建议"},
+        },
+        "required": ["goal", "result"],
+    },
+)
+
+
+# ── Search result archive recall (recall_search_result) ──
+#
+# search_web / web_fetch archive their full results to data/search_cache/
+# (agent/search_archive.py) and append an archive id line to the tool return
+# text. The id rides the append-only message stream, so after context
+# folding/compression the model can still dereference it via this tool
+# instead of re-searching. Retention: 7 days / 50 per user, scoped by
+# contextvar user_id — never trust the id alone.
+
+def _recall_search_result(archive_id: str) -> str:
+    """Retrieve a full archived search_web/web_fetch result by its id."""
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "[recall] 无法取回：当前请求未设置用户上下文。"
+    record = get_default_archive().recall(user_id, archive_id)
+    if not record:
+        return (
+            "[recall] 未找到该存档：id 无效、已过期（保留期7天）或不属于当前用户。"
+            "建议重新调用 search_web 获取最新结果。"
+        )
+    try:
+        age_hours = max(0.0, (time.time() - float(record.get("ts", 0))) / 3600)
+        age_note = f"（距今约 {age_hours:.1f} 小时，时效敏感内容请酌情重新搜索）"
+    except (TypeError, ValueError):
+        age_note = ""
+    header = (
+        f"[recall] 存档时间: {record.get('iso_time', '未知')}{age_note}\n"
+        f"工具: {record.get('tool', '')} | 查询: {record.get('query', '')}\n\n"
+    )
+    return header + record.get("content", "")
+
+
+_tool_registry.register(
+    "recall_search_result", _recall_search_result,
+    "按存档 id 取回此前 search_web / web_fetch 的完整结果。当上下文中的搜索结果"
+    "已被折叠或压缩、而你需要其中的 URL 或细节时，优先用此工具取回存档而不是"
+    "重新搜索。存档 id 来自工具返回末尾的「[存档] id: xxx」行，保留 7 天，"
+    "仅限取回自己的存档。",
+    {
+        "type": "object",
+        "properties": {
+            "archive_id": {
+                "type": "string",
+                "description": "存档 id（12位十六进制，来自工具返回末尾的 [存档] 行）",
+            },
+        },
+        "required": ["archive_id"],
+    },
+)
+
+
+# ── LONG-tier memory recall (recall_memory) ──
+#
+# P2-lite of the three-tier memory engine (Memory-Optimization-Plan ①).
+# The system prompt carries a one-line index of the user's LONG memories;
+# this tool dereferences an index line into the full entry + the original
+# conversation snapshot. Scoped by contextvar user_id — never trust the id
+# alone. Same pattern as recall_search_result above.
+
+def _recall_memory(query: str) -> str:
+    """Retrieve the current user's own LONG-tier memory by id or keyword."""
+    user_id = _current_user_id.get()
+    if not user_id:
+        return "[recall] 无法取回：当前请求未设置用户上下文。"
+    matches = _tiered_memory.recall_long(user_id, query)
+    if not matches:
+        return (
+            "[recall] 未找到匹配的长期记忆：id 无效或关键词不匹配。"
+            "可换用「用户长期记忆索引」中的其他 id/关键词；仅限取回当前用户自己的记忆。"
+        )
+    parts = []
+    for lo, snapshot_text in matches:
+        when = (
+            time.strftime("%Y-%m-%d", time.localtime(lo.snapshot_time))
+            if lo.snapshot_time else "未知"
+        )
+        parts.append(
+            f"[长期记忆 {lo.id}]（快照时间 {when}）\n"
+            f"{lo.summary}\n"
+            f"对话快照（{len(lo.snapshot_turns)} 轮）:\n{snapshot_text}"
+        )
+    return "\n\n".join(parts)
+
+
+_tool_registry.register(
+    "recall_memory", _recall_memory,
+    "按 id 或关键词取回当前用户的长期记忆全文与对话快照。系统提示词中的"
+    "「用户长期记忆索引」列出了每条记忆的 id 与标题；当索引里的某条记忆与"
+    "当前问题相关、而你需要完整细节或当时的对话原文时，调用此工具。"
+    "仅限取回当前用户自己的长期记忆。",
+    {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "长期记忆 id（来自索引行 [id]），或标题/内容关键词",
+            },
+        },
+        "required": ["query"],
+    },
+)
+
+
+# ── Original-story memory (Story Knowledge Base) ───────────────────
+#
+# The story KB (lib/story_kb.py + data/story_kb/story.db) holds every dialogue
+# line of the main story and the event stories. Two access paths:
+#
+#   1. _build_story_context() — automatic, character plane only. Retrieves the
+#      few most relevant scenes for the user's message and hands them to
+#      agent._build_messages() as an L4 volatile block, so the persona recalls
+#      canon without calling a tool (露比 herself never operates tools).
+#   2. story_search — explicit tool for the task plane (Roxy) when a story
+#      question got routed there; returns deeper excerpts.
+#
+# Both are strictly best-effort: a missing/incompatible DB, a cold query or any
+# exception degrades to "no story memory this turn", never to a failed reply.
+
+# Injection budget: 2 hits / ~1800 chars ≈ 700-900 tokens of L4 context — big
+# enough for one good scene plus a supporting beat, small enough to keep the
+# turn cheap and leave room for the actual conversation.
+_STORY_INJECT_HITS = 2
+_STORY_INJECT_CHARS = 1800
+# Fused RRF score floor: a single-index rank-1 match scores ~0.0164, so 0.0165
+# keeps incidental word overlap out while still admitting a weaker match whose
+# only hit is real.
+_STORY_MIN_SCORE = 0.0165
+
+_STORY_QUERY_STRIP_RE = re.compile(
+    r"\[(?:用户上传了|用户发送了|系统提醒|系统提示)[^\]]*\]"
+)
+
+
+def _story_query_from(text: str, limit: int = 400) -> str:
+    """Reduce a turn's augmented message to the user's actual question."""
+    if not text:
+        return ""
+    text = _STORY_QUERY_STRIP_RE.sub(" ", text)
+    text = re.sub(r"用户说[:：]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # 2-char pings ("在吗" / "ok") are not story questions, but a 3-char
+    # Chinese ask ("这是谁") can be — so the floor is 3.
+    if not text or text.startswith("/") or len(text) < 3:
+        return ""
+    return text[:limit]
+
+
+def _story_log(message: str) -> None:
+    """Emit one line of story-KB diagnostics.
+
+    Goes through loguru so it lands in logs/bot_*.log (the file sink installed by
+    _setup_file_logging); falls back to stderr when loguru is unavailable.
+    """
+    try:
+        from loguru import logger as _logger
+        _logger.info(message)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _story_persona_allowed(persona_key: str) -> bool:
+    """True when this persona may use story memory (config/story_personas.json)."""
+    if not persona_key:
+        return False
+    try:
+        from lib.story_kb import story_personas
+        return persona_key in story_personas()
+    except Exception:  # noqa: BLE001 — never block a turn on config issues
+        return persona_key in ("rubi", "assistant")
+
+
+def _story_neutral_persona(persona_key: str) -> bool:
+    """True when this persona may inject without a story character mapping."""
+    if not persona_key:
+        return False
+    try:
+        from lib.story_kb import story_neutral_personas
+        return persona_key in story_neutral_personas()
+    except Exception:  # noqa: BLE001
+        return persona_key == "assistant"
+
+
+def _story_char_id_for(persona_key: str, pm) -> str:
+    """Resolve the active persona to a story character id (cached lookup)."""
+    try:
+        from lib.story_kb import persona_char_id
+        display = pm.get_display_name(persona_key) if pm else ""
+        return persona_char_id(persona_key, display)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _build_story_context(persona_key: str, query: str, pm) -> tuple:
+    """Return (injection_block, char_id) for the current turn."""
+    try:
+        from lib.story_kb import get_story_kb
+
+        # 逐人格白名单：不在 config/story_personas.json 里的人格完全不注入。
+        if not _story_persona_allowed(persona_key):
+            return "", ""
+        kb = get_story_kb()
+        if not kb.available:
+            return "", ""
+        q = _story_query_from(query)
+        if not q:
+            return "", ""
+        char_id = _story_char_id_for(persona_key, pm)
+        if not char_id and not _story_neutral_persona(persona_key):
+            # 既解析不到剧情角色、又不是中立人格（UGC 自创角色等）。
+            # retrieve() 的 persona_char_id 只做加权/标注、不做过滤——
+            # 空 id 会退化成全库检索，把其他角色的剧情（婚礼/亲密场景）
+            # 注进当前角色的对话，造成跨角色污染。宁可不注入；
+            # 主动查询走 story_search 工具，不受此限。
+            # assistant 例外：它没有角色身份，走中性「资料引用」口径。
+            return "", ""
+        block = kb.format_injection(
+            q,
+            persona_char_id=char_id,
+            persona_name=pm.get_short_name(persona_key) if pm else "",
+            limit=_STORY_INJECT_HITS,
+            max_chars=_STORY_INJECT_CHARS,
+            min_score=_STORY_MIN_SCORE,
+        )
+        if block:
+            _story_log(f"[story-kb] inject {len(block)}c persona={persona_key} "
+                       f"char={char_id or '-'} q={q[:40]!r}")
+        return block or "", char_id
+    except Exception:  # noqa: BLE001 — never break a reply
+        return "", ""
+
+
+def _story_search(query: str = "", limit: int = 4) -> str:
+    """Deep lookup in the original-story knowledge base (task-plane tool)."""
+    try:
+        from lib.story_kb import get_story_kb
+
+        kb = get_story_kb()
+        if not kb.available:
+            return (f"[story_search] 剧情知识库尚未构建（{kb.db_path} 不存在）。"
+                    f"管理员可运行 python scripts/build_story_kb.py --all 生成。")
+        q = (query or "").strip()
+        if not q:
+            return "[story_search] 请提供要查询的关键词（角色名、事件名、章节等）。"
+        try:
+            limit = max(1, min(int(limit), 8))
+        except (TypeError, ValueError):
+            limit = 4
+        out = kb.format_tool_result(
+            q, limit=limit, persona_char_id=_current_story_char_id.get(),
+        )
+        _story_log(f"[story-kb] tool q={q[:40]!r} limit={limit} "
+                   f"-> {len(out)}c{' (miss)' if '没有找到' in out else ''}")
+        return out
+    except Exception as exc:  # noqa: BLE001
+        return f"[story_search] 检索失败：{type(exc).__name__}: {exc}"
+
+
+_tool_registry.register(
+    "story_search", _story_search,
+    "《星陨计划(Ark Re:Code)》原作剧情库检索。当用户询问游戏剧情、角色过往、"
+    "活动故事或世界观事件（如「第一次方舟战争」「谁是指挥官高文」「露比的过去」）时，"
+    "用此工具取回台词原文（英文）与中文梗概。返回内容含场景出处、单元梗概、"
+    "本段梗概与对白摘录；回复时请把英文台词译成中文转述，不要整段照抄。"
+    "查不到时换用角色名/事件名的其他说法重试。",
+    {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "剧情检索关键词：角色名、事件名、章节号或情节描述",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "返回片段数，1-8，默认 4",
+            },
+        },
+        "required": ["query"],
+    },
+)
+
+
+# ── Turn entry points (busy-guard wrappers) ────────────────────────
+# Platform-specific guards (@-mention detection, poke filtering) and
+# event->view conversion live in plugins/agent_router.py +
+# adapters/onebot.py; everything below consumes InboundMessage views.
+
+# ── Streaming delivery accounting (§6.10.11.2, 2026-10-30) ─────────
+
+def _delivered_prefix_len(response: str, streamed: str) -> int:
+    """已上屏文本里，属于最终正文前缀的最长长度（0..len(response)）。
+
+    为什么不能直接 ``response.startswith(streamed)``：回答流里除了正文，还
+    可能混进**非正文**内容——工具轮的开场白（SSE 客户端在工具碎片出现之前
+    照发 content），以及 answer 流已开时被并进去的「⏳ 正在…」进度行
+    （本文件的 _progress）。一旦混入，严格前缀判定必然失败，旧代码于是整篇
+    重发 → 用户在 QQ 里看到同一条答案两遍（2026-10-30 线上 A 形态重复）。
+
+    工具轮永远发生在最终回答轮**之前**，所以正文一定是流里最后一段连续内容
+    → 取「streamed 的后缀 == response 的前缀」的最长解即为已送达长度。
+    """
+    if not response or not streamed:
+        return 0
+    upper = min(len(streamed), len(response))
+    for k in range(upper, 0, -1):
+        if streamed.endswith(response[:k]):
+            return k
+    return 0
+
+
+def _plan_stream_delivery(response, streamer, *, happy: bool):
+    """流式回合的收尾决策（纯函数，便于单测）。
+
+    返回 ``(decision, remainder)``：
+      ``buffered_full``  一次都没开成 → 调用方走 ``_send_response(全文)``，
+                         这是唯一允许整篇发送的情形；
+      ``stream_only``    正文已全部上屏 → 不再发任何消息；
+      ``remainder``      断流且正文未上屏完 → 调用方只发 ``remainder``。
+
+    「已上屏多少」用 :func:`_delivered_prefix_len` 计算（容忍开场白/进度行
+    污染），所以 ``happy=False`` 且正文其实已全覆盖时结论是 ``stream_only``：
+    整篇重发就是用户看到的重复（A 形态）。
+    """
+    if streamer is None or not streamer.answer_opened:
+        return "buffered_full", ""
+    if happy:
+        return "stream_only", ""
+    resp = response if isinstance(response, str) else str(response or "")
+    delivered = _delivered_prefix_len(resp, streamer.answer_sent)
+    remainder = resp[delivered:]
+    if remainder.strip():
+        return "remainder", remainder
+    return "stream_only", ""
+
+
+def _stream_delivery(kind: str) -> None:
+    """流式交付决策计数（面板 status 快照读取；导入失败不影响回退逻辑）。"""
+    try:
+        from adapters.qq_official_stream import record_delivery
+        record_delivery(kind)
+    except Exception:  # noqa: BLE001 — 遥测绝不影响发送
+        pass
+
+
+async def run_agent_turn(view: InboundMessage):
+    """Run one agent turn under the per-user busy guard."""
+    # Platform identity (stage 4, §7.7): PermissionManager.get_role() picks
+    # the openid tables for qq_official, the QQ-number tables for onebot.
+    _current_platform.set(view.platform)
+    # Defensive per-turn reset: a keyboard reservation is strictly
+    # turn-scoped (tools set it, _send_response consumes it once).
+    _turn_keyboard.set(None)
+    user_id = view.user_id
+    # ── Per-user concurrency guard ──
+    if user_id in _user_busy:
+        _pm = get_character_registry()
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, view.group_id))
+        await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~")
+        return
+    _user_busy.add(user_id)
+    try:
+        return await handle_agent_turn(view)
+    finally:
+        _user_busy.discard(user_id)
+
+
+async def handle_agent_turn(view: InboundMessage):
+    """Inner implementation — called under per-user busy guard."""
+    user_id = view.user_id
+
+    # Token-usage attribution: set before triage so every LLM call of this
+    # turn (triage / agent_loop / profile extraction) is tied to this user.
+    _gid = view.group_id
+    set_usage_context(user_id, _gid, "group" if _gid else "private")
+
+    # Set user workspace for tool scoping
+    _workspace_manager.ensure_dirs(user_id)
+    _current_user_workspace.set(_workspace_manager.get_workspace(user_id))
+    _on_file_created.set(lambda p: _record_session_file(user_id, p))
+
+    text_content = view.text
+
+    # ── Handle pending delete confirmation (bare text, no / prefix) ──
+    pending_delete = _pending_delete_confirm.get(user_id)
+    if pending_delete:
+        expected = f"确认删除 {pending_delete[0]}"
+        if text_content == expected or text_content == f"/{expected}":
+            if time.time() < pending_delete[1]:
+                try:
+                    # Capture the session's turn count BEFORE delete, for the
+                    # profile delete-flush (Decision J): a substantive session
+                    # (>K turns) submits its un-extracted profile tail; a
+                    # transient one (≤K turns) drops it.
+                    _del_turns = 0
+                    _del_kind = ""
+                    for _s in _special_sessions.list_sessions(user_id):
+                        if _s.get("name") == pending_delete[0]:
+                            _del_turns = _s.get("total_messages", 0) // 2
+                            _del_kind = str((_s.get("metadata") or {}).get("kind") or "")
+                            break
+                    result = _special_sessions.delete(user_id, pending_delete[0])
+                    _pending_delete_confirm.pop(user_id, None)
+                    try:
+                        _profile_manager.flush_on_session_end(user_id, _del_turns)
+                    except Exception:
+                        pass  # profile flush must never break session deletion
+                    summary = _format_delete_summary(result)
+                    msg = f"已删除特殊会话「{pending_delete[0]}」。"
+                    if summary:
+                        msg += "\n" + summary
+                    msg += _delete_quota_tail(user_id, _del_kind)
+                    await _safe_send(msg)
+                except ValueError as e:
+                    await _safe_send(str(e))
+            else:
+                _pending_delete_confirm.pop(user_id, None)
+                await _safe_send("确认已超时（60秒），请重新发起 /删除会话。")
+            return
+
+    # ── Handle pending UGC character deletion confirmation (bare text) ──
+    pending_char = _pending_char_delete_confirm.get(user_id)
+    if pending_char:
+        expected = f"确认删除角色 {pending_char[0]}"
+        if text_content == expected or text_content == f"/{expected}":
+            _pending_char_delete_confirm.pop(user_id, None)
+            if time.time() < pending_char[1]:
+                registry = get_character_registry()
+                char_id = registry.resolve_name(pending_char[0], user_id=user_id)
+                if (char_id and registry.is_ugc(char_id)
+                        and (registry.get_meta(char_id) or {}).get("author") == user_id):
+                    display = registry.get_display_name(char_id)
+                    registry.delete(char_id)
+                    purged = registry.purge_references(char_id)
+                    note = f"\n（已解除 {purged} 处人格设置引用）" if purged else ""
+                    await _safe_send(f"已删除自创角色「{display}」。{note}")
+                else:
+                    await _safe_send(f"未找到你的自创角色「{pending_char[0]}」。")
+            else:
+                await _safe_send("确认已超时（60秒），请重新发起 /删除角色。")
+            return
+
+    # ── Handle pending session-compression confirmation (bare text) ──
+    pending_compress = _pending_compress_confirm.get(user_id)
+    if pending_compress:
+        if text_content in ("确认压缩会话", "/确认压缩会话"):
+            _pending_compress_confirm.pop(user_id, None)
+            if time.time() < pending_compress[1]:
+                await _run_session_compression(user_id, pending_compress[0])
+            else:
+                await _safe_send("确认已超时（60秒），请重新发起 /压缩会话。")
+            return
+
+    # ── Handle pending personality-switch choice (keep vs clear) ────
+    pending_switch = _pending_personality_switch.pop(user_id, None)
+    if pending_switch:
+        # 3 元组 (old, new, session_scoped)；兼容旧 2 元组
+        _old_display, new_display, *_rest = pending_switch
+        _scoped = bool(_rest[0]) if _rest else False
+        _scope_note = "本会话" if _scoped else ""
+        _reply = text_content.strip()
+        _clear_kw = ("清空", "清除", "清空上下文", "清除上下文", "不保留", "清")
+        _keep_kw = ("保留", "保留历史", "保留记录", "是", "好的", "嗯", "行", "可以", "yes", "keep")
+        if _reply in _clear_kw:
+            agent.clear_user_session(user_id)
+            _special_sessions.clear_context(user_id)
+            _temp_session_files.pop(user_id, None)
+            if _personality_switch_marker.pop(user_id, None) is not None:
+                _save_personality_markers()
+            await _safe_send(f"已清空对话上下文，开始以「{new_display}」人格的新对话~")
+            return
+        if _reply.lower() in _keep_kw:
+            _inject_personality_transition_into_history(user_id)
+            await _safe_send(f"已保留历史对话，后续{_scope_note}回复将遵循「{new_display}」人格。")
+            return
+        # Otherwise: user asked a new question — keep history (marker persists)
+        # and fall through so the agent answers with the transition notice.
+        # Inject the notice into the history now, before this turn's messages
+        # are appended, so it sits directly after the old-persona turns.
+        _inject_personality_transition_into_history(user_id)
+
+    # ── Handle feedback / bug report (before agent, zero token cost) ─
+    if text_content.startswith(("#反馈", "#bug", "#建议")):
+        await _handle_feedback(text_content, user_id)
+        return
+
+    # ── Handle session management commands ──────────────────────────
+    if text_content.startswith("/") or text_content.startswith("#"):
+        # /取消 / #取消 / /结束 / #结束 — end continuous mode (group only).
+        # The continuous_router (priority=2) skips @mentioned messages, so this
+        # must also be handled here when the user @-mentions the bot; otherwise
+        # the command falls through to the agent loop and never ends the window.
+        if view.is_group and text_content in ("/取消", "#取消", "/结束", "#结束"):
+            _continuous_sessions.end(view.group_id, user_id)
+            await _safe_send("已结束连续对话模式，之后需要@我才能触发~")
+            return
+        # /toggle command (group only, superuser only)
+        cmd_handled = await _handle_toggle_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        # /按钮探测 command (qq_official c2c admin-only keyboard probe)
+        cmd_handled = await _handle_button_probe_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        # /流式探测 command (qq_official c2c admin-only stream probe)
+        cmd_handled = await _handle_stream_probe_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        # /兑换码 / /redeem-code command (direct, no agent)
+        cmd_handled = await _handle_redeem_code_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /角色详情 command (direct, no agent, zero token)
+        cmd_handled = await _handle_character_detail_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /羁绊详情 command (direct, no agent, zero token)
+        cmd_handled = await _handle_bond_detail_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /邮件 command (角色信箱, direct, no agent, zero token; 按钮点击
+        # 等价用户发出 /邮件 <id>，必须在会话记录之前拦截，§8)
+        cmd_handled = await _handle_mail_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        # /免责声明 command (免责尾开关, 三级用户均可, direct, zero token)
+        cmd_handled = await _handle_disclaimer_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /刷新角色数据 command (admin-only forced wiki cache refresh)
+        cmd_handled = await _handle_refresh_data_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /功能 / /features command (direct, no agent)
+        cmd_handled = await _handle_features_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /更新日志 [d] / /update record [d] command (direct, no agent, zero token)
+        cmd_handled = await _handle_changelog_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /personality / /人格切换 command
+        cmd_handled = await _handle_personality_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        # /好感度 #好感度 /bond command (direct, no agent, zero token)
+        cmd_handled = await _handle_bond_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        # /设好感 <等级> (self bond level override, direct, zero token)
+        cmd_handled = await _handle_set_bond_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        # /剧情 #剧情 command (bond story scenes, P3; private-chat only)
+        cmd_handled = await _handle_scene_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        cmd_handled = await _handle_session_command(
+            text_content, user_id, group_id=view.group_id)
+        if cmd_handled:
+            return
+        # /设形象 /形象 /清除形象 — 自创角色的参考立绘（直连，零 token）
+        cmd_handled = await _handle_portrait_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+
+    # ── Quota cleanup protocol intercept ───────────────────────────
+    # Runs before file download / agent so that, when the user is over quota,
+    # new space allocations (uploads, code output, clones) are blocked and the
+    # cleanup protocol takes over this turn.
+    if await _handle_cleanup_flow(user_id, text_content):
+        return
+
+    # ── Detect reply/quote context (built by adapters/onebot.py) ───
+    reply_context = view.reply_context
+    if reply_context:
+        import sys; print(f"[REPLY_DIAG] reply_context built ({len(reply_context)} chars): {reply_context[:300]}", file=sys.stderr, flush=True)
+
+    # ── Detect and download file/image attachments ─────────────────
+    # Stage 2: the segment walk + NapCat download calls moved to
+    # adapters/onebot.py (OneBotAttachmentResolver). This loop keeps the
+    # prompt strings and _recent_files bookkeeping byte-identical.
+    file_context_parts = []
+    has_voice = False
+    msg_id = view.message_id
+    # P5 (§8.3): split 人格下，上传的图/语音在后台文本化入资产记忆。
+    # 人格解析是纯本地读（无 LLM），放在附件循环前代价可忽略。
+    _upload_persona = ""
+    try:
+        _pm_up = get_character_registry()
+        _p_up = _pm_up.resolve_effective_personality(user_id, view.group_id)
+        if _pm_up.get_mode(_p_up) == "split":
+            _upload_persona = _p_up
+    except Exception:  # noqa: BLE001
+        _upload_persona = ""
+    has_quoted_attachment = False
+    # Direct Vision: 本轮成功落盘的图片路径（含引用图），当选中 client
+    # supports_vision 时随 user message 以 image_url parts 直传模型。
+    # 占位文本行照旧保留（工具/后续轮次的 read_file 懒分析回退仍靠它）。
+    vision_image_paths: list = []
+    for att in await view.load_attachments():
+        has_quoted_attachment = has_quoted_attachment or att.quoted
+        if att.kind == "image":
+            if att.path:
+                file_context_parts.append(_attachment_saved_line(att))
+                vision_image_paths.append(att.path)
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+                if _upload_persona:
+                    _spawn_textualize_upload(
+                        user_id, _upload_persona, "image", att.path)
+            elif att.error:
+                file_context_parts.append(_attachment_error_line(att))
+                _record_file(msg_id, att.name, error=att.error)
+
+        elif att.kind == "file":
+            if att.path:
+                file_context_parts.append(_attachment_saved_line(att))
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+            elif att.error:
+                file_context_parts.append(_attachment_error_line(att))
+                _record_file(msg_id, att.name, error=att.error)
+
+        elif att.kind == "voice":
+            has_voice = True
+            if att.path:
+                file_context_parts.append(_attachment_saved_line(att))
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+                if _upload_persona:
+                    _spawn_textualize_upload(
+                        user_id, _upload_persona, "voice", att.path)
+            elif att.error:
+                file_context_parts.append(_attachment_error_line(att))
+                _record_file(msg_id, att.name, error=att.error)
+
+    # ── Quota warning after any upload ─────────────────────────────
+    quota_warn = _quota_warning(user_id)
+
+    # ── File-only messages: acknowledge and skip agent ─────────────
+    # Voice messages are exempt: a bare voice message is a conversational
+    # turn (the user expects the LLM to listen and respond), not a file
+    # upload awaiting later analysis. Skipping the agent for voice broke
+    # the pre-existing "语音直达 LLM" behavior (regression from f7e5f4e).
+    has_files = bool(file_context_parts)
+    # A quoted attachment means "look at this", not "here is a new upload":
+    # never swallow that turn behind the file-received acknowledgement.
+    # Direct Vision exemption: a bare-image turn is now conversational too
+    # (like bare voice) — when a vision-capable model is configured, the
+    # agent sees the image directly and responds in character.
+    _vision_on = bool(vision_image_paths) and _any_vision_client()
+    if (has_files and not has_voice and not has_quoted_attachment
+            and not _vision_on
+            and not text_content and not reply_context):
+        names = []
+        for part in file_context_parts:
+            m = re.search(r"文件 (.+?)，", part) or re.search(r"上传了(\w+)，", part)
+            if m:
+                names.append(m.group(1))
+        if names:
+            ack = f"已收到 {'、'.join(names)}，需要分析的话引用这条消息告诉我~"
+        else:
+            ack = "已收到文件，需要分析的话引用这条消息告诉我~"
+        if quota_warn:
+            ack += f"\n\n{quota_warn}"
+        await _safe_send(ack)
+        return
+
+    # ── Build augmented message ────────────────────────────────────
+    if quota_warn:
+        file_context_parts.append(
+            f"[系统提醒] {quota_warn}\n请在回复末尾原样提醒用户这一容量警告。"
+        )
+    context_parts = []
+    if reply_context:
+        context_parts.append(reply_context)
+    if file_context_parts:
+        context_parts.append("\n".join(file_context_parts))
+    context_prefix = "\n".join(context_parts)
+
+    if context_prefix:
+        if text_content:
+            augmented_message = f"{context_prefix}\n用户说: {text_content}"
+        elif has_voice:
+            # Bare voice turn: instruct the agent to listen and respond,
+            # matching the pre-f7e5f4e behavior where 语音直达 LLM.
+            augmented_message = (
+                f"{context_prefix}\n用户发送了语音消息，请使用 read_file 工具"
+                f"分析音频内容，并根据其内容直接回应用户。"
+            )
+        elif _vision_on:
+            # Bare image turn (Direct Vision): the image is attached to the
+            # request when the chosen client supports vision; the read_file
+            # clause covers the tier-mismatch fallback (any-vision true but
+            # this turn's client has no flag → no parts attached).
+            augmented_message = (
+                f"{context_prefix}\n用户发送了一张图片（未附文字）。请直接结合"
+                f"图片内容、以你的身份自然回应用户；若你看不到图片，先用 "
+                f"read_file 工具分析已保存的图片路径再回应。"
+            )
+        else:
+            augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请根据用户意图选择合适的工具查看内容。"
+    else:
+        augmented_message = text_content
+
+    # Guard: nothing to process
+    if not augmented_message:
+        return
+
+    # Handle special commands that bypass the agent
+    if augmented_message in ["/clear", "清除上下文", "新对话", "/status", "/帮助", "#帮助", "/help", "#help"]:
+        await _handle_special_command(augmented_message, user_id)
+        return
+
+    # The thinking indicator moved below persona resolution: the stream
+    # gate needs the render context (split personas never stream), and
+    # when stream #1 opens, its first shard carries the thinking line —
+    # the legacy immediate message is then skipped (saves 1 quota).
+    # `streamer` is function-scoped so the except handlers can close it.
+    streamer = None
+    # 本回合是否真的尝试过开流（只有尝试过的回合计入交付统计）
+    _stream_attempted = False
+
+    try:
+        # ── Dual-plane routing: resolve persona & its mode first ──
+        # split persona → each message is triaged to social (角色面) or task
+        # (任务面) plane; unified persona → single plane (existing behavior).
+        group_id = view.group_id
+        pm = get_character_registry()
+        persona_key = pm.resolve_effective_personality(user_id, group_id)
+        persona_mode = pm.get_mode(persona_key)
+
+        # Render-capability declaration for this turn (L4 volatile tail;
+        # buttons-design §6.10.6). Resolved per turn — session persona
+        # binding makes "一会 markdown、一会纯文本" a legal combination.
+        # Always set ("" clears any inherited value).
+        _current_render_context.set(_build_render_context(persona_mode))
+
+        # ── Thinking indicator OR stream #1 open (§6.10.11.2) ──────
+        # Stream gate: c2c only (stream_messages is a c2c endpoint),
+        # unified persona only (render context non-empty — split answers
+        # get re-voiced, which streaming cannot represent), sender's
+        # stream layer available (env hot-read + breaker + md gate).
+        # On success the first shard carries the thinking line, so the
+        # legacy immediate progress message is skipped entirely.
+        _pm_think = get_character_registry()
+        thinking_text = f"{_pm_think.get_short_name(persona_key)} 正在思考..."
+        _sdr = _turn_sender.get() or default_sender
+        if (not view.is_group and _current_render_context.get()
+                and getattr(_sdr, "supports_stream", False)):
+            _stream_attempted = True
+            try:
+                streamer = await _sdr.open_stream(thinking_text)
+            except Exception:
+                streamer = None
+        if streamer is None:
+            # Legacy path (non-critical, ignore send failures).
+            # immediate=True: on the official route this is the one
+            # progress line worth spending passive-reply quota on — it
+            # must go out standalone right away, not merged into the
+            # final reply.
+            try:
+                await _safe_send(
+                    OutProgress(thinking_text, immediate=True))
+            except Exception:
+                pass
+
+        # Detect session type (also gates the UGC creation interview below)
+        active_special = _special_sessions.get_active(user_id)
+        session_type = "special" if active_special else "temporary"
+        is_creation = bool(active_special) and (
+            (active_special.metadata or {}).get("kind") == "char_creation"
+        )
+        # Bond story-scene session (Bond-System-Design.md §4.4 形态3, P3).
+        # 已封档（completed=true）的剧情按普通特殊会话运行（D3/§5.4）：is_scene=false，
+        # 不注入场景指令、不下发 complete_scene、走正常路由。开关关闭时退回仅看 kind。
+        _md_active = (active_special.metadata or {}) if active_special else {}
+        if (_scene_archive_enabled() and active_special
+                and _md_active.get("kind") == SCENE_KIND):
+            _backfill_completed(user_id, active_special)  # 懒回填热点之一（D7）
+            _md_active = (active_special.metadata or {})  # 回填后重取
+        is_scene = bool(active_special) and (
+            _md_active.get("kind") == SCENE_KIND
+            and not (_scene_archive_enabled() and _md_active.get("completed"))
+        )
+        if is_scene:
+            # 场景钉住已由 CharacterRegistry 会话层统一处理（scene 创建时写
+            # metadata.persona_key=char_id，resolve 单点解析，2418 行的
+            # persona_key 已含钉住结果）。这里只做一致性断言：char_id 与解析
+            # 结果不一致（如 UGC 角色被删后懒校验穿透）时记日志便于排查。
+            _scene_char = str(_md_active.get("char_id") or "")
+            if _scene_char and _scene_char != persona_key:
+                from loguru import logger as _logger
+                _logger.warning(
+                    "[scene] char_id {} 与解析人格 {} 不一致 (user={})，"
+                    "可能角色已删除、已懒校验穿透",
+                    _scene_char, persona_key, user_id,
+                )
+
+        # ── Triage: classify complexity (and plane, for split personas) ──
+        # Creation interviews skip triage entirely: neutral assistant persona,
+        # flash model, only create_character exposed (Bond-System-Design.md §5.1).
+        # Scene sessions skip triage too: full-RP as the character on flash.
+        is_special = augmented_message in ["/clear", "清除上下文", "新对话", "/status"]
+        plane = "task"
+        if is_creation or is_scene:
+            client = _model_router.flash_client
+        elif not is_special:
+            if persona_mode == "split":
+                _cls = await _model_router.classify(augmented_message)
+                plane = _cls.get("plane", "task")
+                complexity = _cls.get("complexity", "complex")
+            else:
+                complexity = await _model_router.classify_complexity(augmented_message)
+            if complexity == "simple":
+                client = _model_router.flash_client
+            else:
+                client = _model_router.reasoning_client
+        else:
+            client = None  # Use default client for special commands
+
+        # Run the agent loop with timeout
+        async def _progress(msg: str):
+            if streamer is not None and not streamer.broken:
+                if streamer.answer_opened:
+                    # Multi-round edge: the answer stream is already open
+                    # and another tool round starts — keep the user
+                    # informed in-stream (stream #1 is already closed).
+                    streamer.append_answer(f"\n\n{msg}\n\n")
+                else:
+                    await streamer.append_progress(msg)
+                return
+            await _safe_send(OutProgress(msg))
+
+        # ── Streaming answer deltas (§6.10.11.2, stream #2) ───────
+        # Lazy open on the first delta. The keyboard check MUST happen
+        # here: reservations are set during tool execution, i.e. right
+        # before the final round's deltas arrive — and buttons cannot
+        # ride stream messages, so a reserved keyboard forces the
+        # buffered md+kb path. open_answer failure sets streamer.broken,
+        # which silences every later delta (answer ships buffered).
+        async def _content_delta(delta: str):
+            if streamer is None or streamer.broken:
+                return
+            if not streamer.answer_opened:
+                if _turn_keyboard.get():
+                    return
+                await streamer.finish_progress()
+                await streamer.open_answer(delta)
+                return
+            streamer.append_answer(delta)
+
+        token = _current_sender.set(_ToolSender())
+
+        # Resolve user permissions
+        role = _perm_manager.get_role(user_id)
+        allowed_tools = _perm_manager.get_allowed_tools(role)
+        code_limits = _perm_manager.get_code_limits(role)
+
+        # Resolve group feature restrictions
+        if group_id:
+            gf = get_group_features()
+            gf.refresh()
+            disabled_tools = gf.get_disabled_tools(group_id)
+            if disabled_tools:
+                allowed_tools = allowed_tools - disabled_tools
+            _current_group_id.set(group_id)
+            _current_group_context.set(gf.get_disabled_context(group_id))
+            # Prepend restriction notice to user message so the LLM
+            # can't miss it (system prompt alone isn't always enough)
+            disabled_features = gf.get_disabled_features(group_id)
+            if disabled_features:
+                names = "、".join(disabled_features.values())
+                augmented_message = (
+                    f"[系统提示] 当前群聊的以下功能已被机器人超级用户关闭：{names}。"
+                    f"如果用户请求这些功能，请直接告知已被限制，不要尝试调用工具或提供替代方案。\n\n"
+                    f"{augmented_message}"
+                )
+        else:
+            _current_group_id.set("")
+            _current_group_context.set("")
+
+        # Set permission contextvars for downstream tools
+        _current_user_id.set(user_id)
+        _current_user_role.set(role.value)
+        _current_quota_bytes.set(
+            _perm_manager.get_workspace_quota_mb(role) * 1024 * 1024
+        )
+        if code_limits:
+            _current_code_limits.set(code_limits.to_dict())
+
+        # ── Plane context (Bond-System-Design.md §3) ──
+        # character_plane: split persona routed to social → L2 = 角色卡,
+        #   tools = SOCIAL_TOOLS only (delegate_task fallback), bond state
+        #   injected into the L4 volatile tail.
+        # Otherwise (split→task plane, or unified persona): L2 = neutral
+        #   "assistant" for split task plane (globally-shared cache prefix),
+        #   or the full persona for unified; no bond injection.
+        character_plane = (
+            persona_mode == "split" and plane == "social"
+            and not is_creation and not is_scene
+        )
+
+        # ── Story memory is opt-in per persona (config/story_personas.json) ──
+        # Personas not on the list get neither the L4 injection nor the
+        # story_search tool, so UGC characters never recite the game's canon.
+        _story_persona_ok = _story_persona_allowed(persona_key)
+        if is_creation:
+            # UGC creation interview: neutral assistant persona (globally-shared
+            # cache prefix), only the create_character tool exposed, no bond.
+            allowed_tools = {"create_character"}
+            _current_bond_context.set("")
+            _current_personality.set("assistant")
+        elif is_scene:
+            # Bond story scene (P3): full-RP as the scene's character on flash;
+            # only complete_scene exposed (pure RP — no delegate_task / dangerous
+            # tools); bond context injected so the scene reflects current bond.
+            client = _model_router.flash_client
+            allowed_tools = {"complete_scene"}
+            _current_personality.set(persona_key)
+            _current_bond_context.set(
+                _build_bond_context(user_id, persona_key, pm)
+            )
+        elif character_plane:
+            client = _model_router.flash_client
+            allowed_tools = set(SOCIAL_TOOLS)
+            _current_personality.set(persona_key)
+            _current_bond_context.set(
+                _build_bond_context(user_id, persona_key, pm)
+            )
+        else:
+            _current_bond_context.set("")
+            _current_personality.set(
+                "assistant" if persona_mode == "split" else persona_key
+            )
+        # story_search only for allowlisted personas (schema filtering; the
+        # executor additionally refuses tools outside allowed_tools).
+        if not _story_persona_ok:
+            allowed_tools = set(allowed_tools) - {"story_search"}
+
+        _delegate_depth.set(0)
+        _personality_transition.set(_personality_switch_marker.get(user_id, ""))
+
+        # ── Original-story memory injection (Story KB) ──
+        # Allowlisted personas only. Where the character herself answers (the
+        # character plane of a split persona, or a unified persona such as
+        # rubi/assistant) the block goes in first-person; the task plane runs as
+        # neutral Roxy and reaches the KB through story_search instead.
+        _story_block, _story_char = "", ""
+        if _story_persona_ok and not is_creation and not is_scene:
+            if character_plane or persona_mode != "split":
+                _story_block, _story_char = _build_story_context(
+                    persona_key, text_content or augmented_message, pm)
+        _current_story_context.set(_story_block)
+        _current_story_char_id.set(_story_char)
+
+        # Idea 3 — suggest upgrading a long temporary session to a special session.
+        if session_type == "temporary":
+            n = _session_manager.message_count(user_id)
+            last = _upgrade_hint_last.get(user_id, -UPGRADE_HINT_INTERVAL)
+            if n >= UPGRADE_HINT_THRESHOLD and (n - last) >= UPGRADE_HINT_INTERVAL:
+                _upgrade_hint_last[user_id] = n
+                augmented_message = (
+                    f"[系统提示] 当前临时会话已累积 {n} 条消息，接近 20 条上限，"
+                    f"超出后早期上下文会丢失。若用户当前话题明确且可能继续，"
+                    f"请在回复末尾用一句话自然建议其发送「/保存为会话 <名称>」"
+                    f"持久化这段对话。\n\n{augmented_message}"
+                )
+
+        try:
+            response = await asyncio.wait_for(
+                agent.run(
+                    augmented_message, user_id,
+                    client=client,
+                    progress_callback=_progress,
+                    session_type=session_type,
+                    allowed_tools=allowed_tools,
+                    user_role=role.value,
+                    # Direct Vision：仅当本轮选中的模型显式开启
+                    # supports_vision 才附图；否则维持占位文本 +
+                    # read_file 懒分析（历史行为不变）。
+                    images=(vision_image_paths
+                            if getattr(client, "supports_vision", False)
+                            else None),
+                    # Official c2c streaming: deltas flow only when a
+                    # streamer opened this turn (None keeps every other
+                    # route on the non-streaming LLM call, byte-identical).
+                    content_callback=(_content_delta
+                                      if streamer is not None else None),
+                ),
+                timeout=300.0,
+            )
+        finally:
+            _current_sender.reset(token)
+
+        # ── Revoicing layer (Bond-System-Design.md §3.3) ──
+        # Only the split persona's *task plane* output needs re-voicing: the
+        # task agent answered as neutral Roxy, so wrap its result in the
+        # character's voice (opening line) while passing the body verbatim.
+        # The social plane already speaks in character; unified personas are
+        # never re-voiced. Creation interviews stay neutral (no revoice).
+        if (persona_mode == "split" and not character_plane
+                and not is_creation and not is_scene):
+            # Restore persona so _send_response's disclaimer is signed by the
+            # character and revoice speaks in the character's voice.
+            _current_personality.set(persona_key)
+            _use_llm_voice = (
+                not group_id and pm.get_task_voice(persona_key) == "character"
+            )
+            raw_response = response
+            response = await revoice_task_result(
+                client=_model_router.flash_client,
+                persona_content=pm.load(persona_key) or "",
+                short_name=pm.get_short_name(persona_key),
+                user_request=text_content or augmented_message,
+                response=response,
+                use_llm=_use_llm_voice,
+            )
+            # Best-effort: rewrite the persisted assistant turn so stored
+            # session history reads in the character's voice (verbatim-match
+            # guard inside skips it if the turn was already folded/compressed).
+            if session_type == "temporary":
+                repatch_last_assistant(_session_manager, user_id, raw_response, response)
+
+        # ── Stream close / fallback tree (§6.10.11.2, 2026-10-30 重写) ──
+        # 铁律：回答流一旦把正文上过屏，就**绝不整篇重发**。旧版只要
+        # 「已上屏文本不是最终回复的严格前缀」就整篇补发，而工具轮开场白
+        # 或并进回答流的进度行一混入，前缀判定必然失败 → 用户在 QQ 里看到
+        # 同一条答案两遍（2026-10-30 线上 A 形态重复）。新决策只看"已送达
+        # 前缀长度"（_plan_stream_delivery）：
+        #   ① 流还活着 → 收尾片把 pending（含尾巴 + 免责）一次送完，不再
+        #      发第二条消息；
+        #   ② 流断过   → 只补 response[delivered:]（_send_response 自带免责）
+        #      delivered==0 时等价于整篇（与旧行为同）；delivered==len 时一条
+        #      都不补（正文早就全在流里，重发就是重复）；
+        #   ③ 一次都没开成（answer_opened=False）→ 缓冲路径整篇，这是唯一
+        #      允许整篇发送的情形。
+        # 前提：close() 现在对断流也补发 state=10 收尾片（平台侧未收尾的流
+        # 会被回滚到首包），否则 ② 的"只补尾巴"会丢内容。
+        sent_via_stream = False
+        _decision = "buffered_full"
+        _remainder = ""
+        if streamer is not None:
+            _pm_disc = get_character_registry()
+            _persona_disc = _current_personality.get() or _pm_disc.get_default()
+            # 用户开关（§6.5）：关闭者 _disc 置空串，finish_answer("") 收尾，
+            # 不发独立尾巴（与 _send_response 的 inline/separate 双分支对齐）。
+            _disc = (f"{_pm_disc.get_short_name(_persona_disc)} "
+                     "的回答并非总是准确无误，请理性判断。")
+            if _disclaimer_off(user_id):
+                _disc = ""
+            # 还活着的流：末片一次送完（尾巴 + 免责），不留第二条消息。
+            if streamer.answer_opened and not streamer.broken:
+                await streamer.finish_answer(_disc)
+            _happy = streamer.answer_opened and not streamer.broken
+            await streamer.close()      # 断流也补 state=10（防平台回滚）
+            _decision, _remainder = _plan_stream_delivery(
+                response, streamer, happy=_happy)
+            if _remainder:
+                await _send_response(_remainder)
+            sent_via_stream = _decision != "buffered_full"
+        if _stream_attempted:
+            _stream_delivery(_decision)
+        if streamer is not None:
+            try:
+                from nonebot import logger as _stream_logger
+                _stream_logger.info(
+                    "[stream] turn done user={} ans_open={} broken={} "
+                    "sent={} resp={} decision={} remainder={} "
+                    "shards={}/{} retries={} last_err={}",
+                    user_id, streamer.answer_opened, streamer.broken,
+                    len(streamer.answer_sent),
+                    len(response) if isinstance(response, str) else -1,
+                    _decision, len(_remainder),
+                    streamer.progress_shards, streamer.answer_shards,
+                    streamer.retry_total, streamer.last_error or "-",
+                )
+            except Exception:  # noqa: BLE001 — 日志绝不影响发送
+                pass
+        if not sent_via_stream:
+            # Send response (split long messages)
+            await _send_response(response)
+
+        # ── Creation session auto-close (scene-session-archive-design.md §5.2/D6):
+        # create_character 本轮成功 → 访谈会话无保留价值（设定已完整落入角色卡），
+        # 直接 delete（而非 end_active），列表立即清爽、配额不变（创作本就豁免）。
+        # delete() 顺带清 active 指针，回到临时会话。创作会话不设 _pending_naming，
+        # 且 auto_name 对删除后 get_active→None 安全，故无命名竞态（清单 #8 注记）。
+        if is_creation and _pending_char_creation_done.pop(user_id, False):
+            try:
+                _ca = _special_sessions.get_active(user_id)
+                if _ca and (_ca.metadata or {}).get("kind") == CREATION_KIND:
+                    _special_sessions.delete(user_id, _ca.name)
+                else:
+                    _special_sessions.end_active(user_id)
+            except Exception:
+                pass
+
+        # ── Scene session completion (P3): complete_scene succeeded this turn
+        # (the tool closure flagged it) → level-up notice + commemorative card,
+        # then leave the scene session. Popped unconditionally so a stale flag
+        # can't survive into a later turn. ──
+        scene_result = _pending_bond_scene_done.pop(user_id, None)
+        if is_scene and scene_result:
+            await _finish_bond_scene(user_id, scene_result)
+
+        # ── Bond settlement hook (both planes accrue 好感度) ──
+        if persona_mode == "split" and not is_creation:
+            await _settle_bond_turn(user_id, persona_key, is_group=bool(view.is_group))
+
+        # Auto-name special session after first interaction
+        if session_type == "special" and _pending_naming.pop(user_id, False):
+            try:
+                first_msg = augmented_message[:200]
+                asyncio.create_task(
+                    _special_sessions.auto_name(user_id, first_msg, response)
+                )
+            except Exception:
+                pass
+
+        # Start continuous session window for group chats (5 min)
+        if view.is_group:
+            _continuous_sessions.start(view.group_id, user_id)
+
+    except asyncio.TimeoutError:
+        if streamer is not None:
+            try:
+                await streamer.close()   # never leave a stream generating
+            except Exception:
+                pass
+        await _safe_send("抱歉，思考超时了。请尝试用更简单的方式提问~")
+    except Exception as e:
+        if streamer is not None:
+            try:
+                await streamer.close()
+            except Exception:
+                pass
+        code = log_exception("agent message handling failed", e)
+        await _safe_send(f"处理消息时出现内部错误（诊断编号 {code}）。请稍后重试；若持续出现请用 #bug 反馈。")
+
+
+async def run_continuous_turn(view: InboundMessage):
+    """Run one continuous-mode turn (active-window check + busy guard)."""
+    _current_platform.set(view.platform)
+    _turn_keyboard.set(None)  # defensive per-turn reset (see run_agent_turn)
+    user_id = view.user_id
+    group_id = view.group_id
+    # Check if user is in continuous mode
+    if not _continuous_sessions.is_active(group_id, user_id):
+        return
+
+    # ── Per-user concurrency guard ──
+    if user_id in _user_busy:
+        _pm = get_character_registry()
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, group_id))
+        await _safe_send(f"{_short} 正在处理你的上一条消息，请稍等~", sender=continuous_sender)
+        return
+    _user_busy.add(user_id)
+    try:
+        return await handle_continuous_turn(view)
+    finally:
+        _user_busy.discard(user_id)
+
+
+async def handle_continuous_turn(view: InboundMessage):
+    """Inner implementation — called under per-user busy guard."""
+    user_id = view.user_id
+    group_id = view.group_id
+
+    # Token-usage attribution (see handle_agent_turn).
+    set_usage_context(user_id, group_id, "group")
+
+    text_content = view.text
+
+    # Cancel detection: slash/hash commands
+    if text_content in ["/取消", "#取消", "/结束", "#结束"]:
+        _continuous_sessions.end(group_id, user_id)
+        await _safe_send("已结束连续对话模式，之后需要@我才能触发~", sender=continuous_sender)
+        return
+
+    # /好感度 #好感度 /bond (direct, no agent, zero token)
+    if await _handle_bond_command(text_content, user_id, view, sender=continuous_sender):
+        return
+
+    # /设好感 <等级> (self bond level override, direct, zero token)
+    if await _handle_set_bond_command(
+        text_content, user_id, view, sender=continuous_sender
+    ):
+        return
+
+    # ── Handle pending delete confirmation (intercept before agent) ──
+    pending_delete = _pending_delete_confirm.get(user_id)
+    if pending_delete:
+        expected = f"确认删除 {pending_delete[0]}"
+        if text_content == expected or text_content == f"/{expected}":
+            if time.time() < pending_delete[1]:
+                try:
+                    # Capture the session's turn count BEFORE delete, for the
+                    # profile delete-flush (Decision J): a substantive session
+                    # (>K turns) submits its un-extracted profile tail; a
+                    # transient one (≤K turns) drops it.
+                    _del_turns = 0
+                    _del_kind = ""
+                    for _s in _special_sessions.list_sessions(user_id):
+                        if _s.get("name") == pending_delete[0]:
+                            _del_turns = _s.get("total_messages", 0) // 2
+                            _del_kind = str((_s.get("metadata") or {}).get("kind") or "")
+                            break
+                    result = _special_sessions.delete(user_id, pending_delete[0])
+                    _pending_delete_confirm.pop(user_id, None)
+                    try:
+                        _profile_manager.flush_on_session_end(user_id, _del_turns)
+                    except Exception:
+                        pass  # profile flush must never break session deletion
+                    summary = _format_delete_summary(result)
+                    msg = f"已删除特殊会话「{pending_delete[0]}」。"
+                    if summary:
+                        msg += "\n" + summary
+                    msg += _delete_quota_tail(user_id, _del_kind)
+                    await _safe_send(msg, sender=continuous_sender)
+                except ValueError as e:
+                    await _safe_send(str(e), sender=continuous_sender)
+            else:
+                _pending_delete_confirm.pop(user_id, None)
+                await _safe_send(
+                    "确认已超时（60秒），请重新发起 /删除会话。",
+                    sender=continuous_sender
+                )
+            return
+
+    # ── Detect reply/quote context and file attachments ────────────
+    # These run BEFORE the text guard so files are always saved and
+    # recorded, even for file-only messages that may be replied to later.
+    reply_context = view.reply_context
+    if reply_context:
+        print(f"[REPLY_DIAG] continuous reply_context built ({len(reply_context)} chars): {reply_context[:300]}")
+
+    # Stage 2: downloads moved to adapters/onebot.py (see handle_agent_turn).
+    file_context_parts = []
+    msg_id = view.message_id
+    # Direct Vision：连续会话窗口内的免@轮次同样收集图片路径（含引用图）。
+    vision_image_paths: list = []
+    for att in await view.load_attachments():
+        if att.kind == "image":
+            if att.path:
+                file_context_parts.append(f"[用户上传了图片，已保存至: {att.path}]")
+                vision_image_paths.append(att.path)
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+            elif att.error:
+                file_context_parts.append(_attachment_error_line(att))
+                _record_file(msg_id, att.name, error=att.error)
+
+        elif att.kind == "file":
+            if att.path:
+                file_context_parts.append(_attachment_saved_line(att))
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+            elif att.error:
+                file_context_parts.append(_attachment_error_line(att))
+                _record_file(msg_id, att.name, error=att.error)
+
+        elif att.kind == "voice":
+            if att.path:
+                file_context_parts.append(_attachment_saved_line(att))
+                _record_file(msg_id, att.name, att.path)
+                _record_session_file(user_id, att.path)
+            elif att.error:
+                file_context_parts.append(_attachment_error_line(att))
+                _record_file(msg_id, att.name, error=att.error)
+
+    # ── Quota warning after any upload this turn ───────────────────
+    if file_context_parts:
+        quota_warn = _quota_warning(user_id)
+        if quota_warn:
+            file_context_parts.append(
+                f"[系统提醒] {quota_warn}\n请在回复末尾原样提醒用户这一容量警告。"
+            )
+
+    # Renew the window on each message
+    _continuous_sessions.touch(group_id, user_id)
+
+    # Guard: nothing to process (no text, no files, no reply)
+    if not text_content and not file_context_parts and not reply_context:
+        return
+
+    # Build augmented message with continuous mode context
+    context_parts = []
+    if reply_context:
+        context_parts.append(reply_context)
+    if file_context_parts:
+        context_parts.append("\n".join(file_context_parts))
+
+    continuous_prefix = (
+        "[连续对话模式] 用户未@你，正在继续之前的任务。"
+        "回复保持简洁。如果用户表达了「谢谢」「好的」「不用了」「再见」等结束或"
+        "告别意图，且任务已完成、无需继续追问，请调用 end_continuous_mode 工具"
+        "主动结束连续模式，而不是建议用户手动发送 /取消。"
+    )
+    # 裸图轮（连续窗口内只发图不带字）：给模型明确的看图指令，
+    # 与私聊路径的 bare-image 分支同款（含 read_file 回退提示）。
+    if not text_content and vision_image_paths:
+        _user_tail = (
+            "用户发送了一张图片（未附文字）。请直接结合图片内容自然回应；"
+            "若你看不到图片，先用 read_file 工具分析已保存的图片路径再回应。"
+        )
+    else:
+        _user_tail = f"用户说: {text_content}"
+    if context_parts:
+        augmented_message = f"{continuous_prefix}\n{'\n'.join(context_parts)}\n{_user_tail}"
+    else:
+        augmented_message = f"{continuous_prefix}\n{_user_tail}"
+
+    try:
+        # ── Dual-plane routing (Bond-System-Design.md §3) ──
+        pm = get_character_registry()
+        persona_key = pm.resolve_effective_personality(user_id, group_id)
+        persona_mode = pm.get_mode(persona_key)
+
+        # Same per-turn render declaration as the main path (the
+        # continuous sender slot resolves the channel capability).
+        _current_render_context.set(
+            _build_render_context(persona_mode, continuous_sender))
+
+        plane = "task"
+        if persona_mode == "split":
+            _cls = await _model_router.classify(augmented_message)
+            plane = _cls.get("plane", "task")
+            complexity = _cls.get("complexity", "complex")
+        else:
+            complexity = await _model_router.classify_complexity(augmented_message)
+        if complexity == "simple":
+            client = _model_router.flash_client
+        else:
+            client = _model_router.reasoning_client
+
+        token = _current_sender.set(_ToolSender(continuous_sender))
+        try:
+            # Resolve user permissions
+            role = _perm_manager.get_role(user_id)
+            allowed_tools = _perm_manager.get_allowed_tools(role)
+            code_limits = _perm_manager.get_code_limits(role)
+            _current_user_id.set(user_id)
+            _current_user_role.set(role.value)
+            _current_quota_bytes.set(
+                _perm_manager.get_workspace_quota_mb(role) * 1024 * 1024
+            )
+            _on_file_created.set(lambda p: _record_session_file(user_id, p))
+            if code_limits:
+                _current_code_limits.set(code_limits.to_dict())
+
+            # Resolve group feature restrictions (BEFORE plane context so the
+            # role-tool subtraction lands on the task plane's allowed set)
+            gf = get_group_features()
+            gf.refresh()
+            disabled_tools = gf.get_disabled_tools(group_id)
+            if disabled_tools:
+                allowed_tools = allowed_tools - disabled_tools
+            # end_continuous_mode is only offered in the continuous path, so the
+            # agent can end the window on a natural-language "thanks/done" signal.
+            allowed_tools = allowed_tools | {"end_continuous_mode"}
+            _current_group_id.set(group_id)
+            _current_group_context.set(gf.get_disabled_context(group_id))
+            # Prepend restriction notice to user message
+            disabled_features = gf.get_disabled_features(group_id)
+            if disabled_features:
+                names = "、".join(disabled_features.values())
+                augmented_message = (
+                    f"[系统提示] 当前群聊的以下功能已被机器人超级用户关闭：{names}。"
+                    f"如果用户请求这些功能，请直接告知已被限制，不要尝试调用工具或提供替代方案。\n\n"
+                    f"{augmented_message}"
+                )
+
+            # ── Plane context ──
+            character_plane = (persona_mode == "split" and plane == "social")
+            _story_persona_ok = _story_persona_allowed(persona_key)
+            if character_plane:
+                client = _model_router.flash_client
+                # Social plane keeps only delegate_task (+ window control).
+                allowed_tools = set(SOCIAL_TOOLS) | {"end_continuous_mode"}
+                _current_personality.set(persona_key)
+                _current_bond_context.set(
+                    _build_bond_context(user_id, persona_key, pm)
+                )
+            else:
+                _current_bond_context.set("")
+                _current_personality.set(
+                    "assistant" if persona_mode == "split" else persona_key
+                )
+            _delegate_depth.set(0)
+            _personality_transition.set(_personality_switch_marker.get(user_id, ""))
+
+            # ── 原作剧情记忆注入（与 handle_agent_turn 同一策略）──
+            # 仅白名单人格；任务面不注入，改由 story_search 工具深挖。
+            if not _story_persona_ok:
+                allowed_tools = set(allowed_tools) - {"story_search"}
+            _story_block, _story_char = "", ""
+            if _story_persona_ok and (character_plane or persona_mode != "split"):
+                _story_block, _story_char = _build_story_context(
+                    persona_key, text_content or augmented_message, pm)
+            _current_story_context.set(_story_block)
+            _current_story_char_id.set(_story_char)
+
+            response = await asyncio.wait_for(
+                agent.run(augmented_message, user_id, client=client,
+                           progress_callback=lambda msg: _safe_send(OutProgress(msg), sender=continuous_sender),
+                           allowed_tools=allowed_tools,
+                           user_role=role.value,
+                           # Direct Vision：与主路径同款门控（选中 client
+                           # 显式开启 supports_vision 才附图）。
+                           images=(vision_image_paths
+                                   if getattr(client, "supports_vision", False)
+                                   else None)),
+                timeout=300.0,
+            )
+        finally:
+            _current_sender.reset(token)
+
+        # ── Revoicing layer (task plane of split persona; group → template) ──
+        if persona_mode == "split" and not character_plane:
+            _current_personality.set(persona_key)
+            raw_response = response
+            response = await revoice_task_result(
+                client=_model_router.flash_client,
+                persona_content=pm.load(persona_key) or "",
+                short_name=pm.get_short_name(persona_key),
+                user_request=text_content or augmented_message,
+                response=response,
+                use_llm=False,
+            )
+            repatch_last_assistant(_session_manager, user_id, raw_response, response)
+
+        await _send_response(response, sender=continuous_sender)
+
+        # ── Bond settlement hook ──
+        if persona_mode == "split":
+            await _settle_bond_turn(user_id, persona_key, sender=continuous_sender,
+                                     is_group=True)
+
+    except asyncio.TimeoutError:
+        _pm = get_character_registry()
+        _short = _pm.get_short_name(_pm.resolve_effective_personality(user_id, group_id))
+        await _safe_send(f"抱歉，{_short}思考时间超过您的配额时长了。请尝试用更简单的方式提问~", sender=continuous_sender)
+    except Exception as e:
+        code = log_exception("continuous agent message handling failed", e)
+        await _safe_send(f"处理消息时出现内部错误（诊断编号 {code}）。请稍后重试；若持续出现请用 #bug 反馈。", sender=continuous_sender)
+
+
+async def _safe_send(message, max_retries: int = 2, sender=None):
+    """Send a message (str, OutImage, OutAudio or OutProgress) with retry.
+
+    Args:
+        message: Message text (str), agent.outbound.OutImage, OutAudio or
+            OutProgress.
+        max_retries: Number of retry attempts on SendFailed.
+        sender: Optional Sender to use. Falls back to the _turn_sender
+            contextvar (QQ official entry binds a per-event sender there)
+            and then to default_sender.
+    """
+    s = sender or _turn_sender.get() or default_sender
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            if isinstance(message, OutImage):
+                await s.send_image(message)
+            elif isinstance(message, OutAudio):
+                await s.send_audio(message)
+            elif isinstance(message, OutKeyboard):
+                # getattr-probe: pre-keyboard Sender stubs (old test
+                # doubles, third-party slots) lack send_keyboard — they
+                # degrade to text body + command list instead of raising.
+                send_kb = getattr(s, "send_keyboard", None)
+                if send_kb is not None:
+                    await send_kb(message)
+                else:
+                    extra = _buttons_to_text(message.rows)
+                    await s.send_text(
+                        f"{message.markdown}\n\n{extra}" if extra
+                        else message.markdown)
+            elif isinstance(message, OutMarkdown):
+                await s.send_markdown(message.text)
+            elif isinstance(message, OutProgress):
+                await s.send_progress(message.text, immediate=message.immediate)
+            else:
+                await s.send_text(message)
+            return
+        except SendFailed as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1.0 * (attempt + 1))  # Exponential backoff
+        except Exception as e:
+            from nonebot import logger
+            logger.warning(f"Send failed with non-retryable error: {e}")
+            return
+    # All retries exhausted — log but don't crash
+    if last_error:
+        from nonebot import logger
+        logger.warning(f"Failed to send message after {max_retries} retries: {last_error.info}")
+
+
+async def _send_text_chunks(lines: list):
+    """Send lines as ≤300-char chunks on line boundaries, 1s apart."""
+    chunks = []
+    current = ""
+    for ln in "\n".join(lines).split("\n"):
+        candidate = f"{current}\n{ln}" if current else ln
+        if len(candidate) <= 300:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = ln
+    if current:
+        chunks.append(current)
+    for i, chunk in enumerate(chunks):
+        await _safe_send(chunk)
+        if i < len(chunks) - 1:
+            await asyncio.sleep(1.0)  # QQ rate limiting
+
+
+async def _send_codes_individually(codes: list):
+    """Send each code as a standalone message so users can copy it directly."""
+    entries = [c for c in codes if c.get("code")]
+    if not entries:
+        return
+    await _safe_send("以下逐条发送兑换码，方便复制：")
+    for entry in entries:
+        await asyncio.sleep(1.0)  # QQ rate limiting
+        await _safe_send(entry["code"])
+
+
+def _channel_supports_markdown(sender=None) -> bool:
+    """True when the current turn's channel renders native markdown
+    (QQ official, env on, breaker closed). Commands consult this to pick
+    their msg_type=2 form; OneBot is always False (buttons-design §6.10.7)."""
+    s = sender or _turn_sender.get() or default_sender
+    return bool(getattr(s, "supports_markdown", False))
+
+
+def _channel_supports_keyboard(sender=None) -> bool:
+    """True when the current turn's channel can attach inline buttons
+    RIGHT NOW (QQ official, permission granted, env≠off, breakers closed,
+    user passes the graylist). Commands gate every button render on this;
+    OneBot and pre-keyboard senders are always False (buttons-design §6.2)."""
+    s = sender or _turn_sender.get() or default_sender
+    return bool(getattr(s, "supports_keyboard", False))
+
+
+async def _safe_send_kb(markdown: str, rows: Rows, *, sender=None,
+                        label: str = "") -> None:
+    """Send a markdown body + buttons, degrading instead of failing.
+
+    The one entry point command handlers use for keyboard messages:
+      - channel can't do buttons → markdown-only (body never lost);
+      - layout invalid per button_spec.validate → WARNING + markdown-only;
+      - otherwise OutKeyboard → the platform sender (which owns the
+        wire-side rejection ladder: kb → md-only → text + command list).
+    """
+    if not _channel_supports_keyboard(sender):
+        await _safe_send(OutMarkdown(markdown), sender=sender)
+        return
+    problems = _validate_buttons(rows or [])
+    if problems:
+        from nonebot import logger
+        logger.warning(
+            f"[turn] keyboard dropped (label={label!r}): {problems[:2]}")
+        await _safe_send(OutMarkdown(markdown), sender=sender)
+        return
+    await _safe_send(OutKeyboard(markdown=markdown, rows=rows, label=label),
+                     sender=sender)
+
+
+async def _send_receipt_kb(text: str, rows: Rows, *, sender=None,
+                           label: str = "") -> None:
+    """Send a plain-text command receipt, riding nav buttons when possible.
+
+    The receipt text is bot-authored plain text (not LLM markdown), so it
+    goes through sanitize_markdown_text before riding a msg_type=2
+    keyboard message — leading #/>/-/* would otherwise render as md
+    syntax. Channels without keyboard support get the text verbatim
+    (byte-identical to the pre-button behavior).
+    """
+    if rows and _channel_supports_keyboard(sender):
+        await _safe_send_kb(_sanitize_md_text(text), rows,
+                            sender=sender, label=label)
+    else:
+        await _safe_send(text, sender=sender)
+
+
+# Shared navigation rows for session-command receipts (buttons P0).
+_NAV_SESSIONS: Rows = [[
+    Btn(label="新建会话", data="/新会话", action="cmd"),
+    Btn(label="会话列表", data="/会话列表", action="cmd"),
+    Btn(label="帮助", data="/帮助", action="cmd"),
+]]
+_NAV_SESSION_ACTIVE: Rows = [[
+    Btn(label="会话列表", data="/会话列表", action="cmd"),
+    Btn(label="结束会话", data="/结束会话", action="cmd"),
+    Btn(label="帮助", data="/帮助", action="cmd"),
+]]
+
+
+def _code_line_md(entry: dict, expiry_disp: str = "", expired: bool = False) -> str:
+    """One code as a markdown list item (§6.10.8: one per line, no bold,
+    no inline code — backticks are not in the official md whitelist and
+    paired decorators around codes with _/* would corrupt them)."""
+    code = entry.get("code", "")
+    parts = [code]
+    if entry.get("content"):
+        parts.append(entry["content"])
+    if expired:
+        parts.append(f"已于 {expiry_disp or '?'} 过期")
+    elif expiry_disp:
+        parts.append(f"有效期至 {expiry_disp}")
+    else:
+        parts.append("过期时间未知（新收录，建议尽快兑换）")
+    return "- " + " · ".join(parts)
+
+
+def _redeem_time_md(active: list, recent_expired: list, hidden: int,
+                    stale_note: str, format_expiry_display) -> str:
+    """/兑换码 as a single markdown body (design §6.10.8: N codes ≈ 9 plain
+    messages blow the 4/5-reply quota; one md message fits them all)."""
+    lines = [f"## 限时兑换码（{len(active)} 条）", ""]
+    for entry in active:
+        lines.append(_code_line_md(
+            entry, format_expiry_display(entry.get("valid", ""))
+            if entry.get("valid") else ""))
+    if recent_expired:
+        lines += ["", f"**已于 7 天内过期（{len(recent_expired)} 条）**", ""]
+        for entry in recent_expired:
+            lines.append(_code_line_md(
+                entry, format_expiry_display(entry.get("valid", "")),
+                expired=True))
+    if hidden > 0:
+        lines += ["", f"另有 {hidden} 条较早的码未显示"]
+    lines += ["", "长期有效的兑换码请发送 /长期兑换码"]
+    if stale_note:
+        lines.append(stale_note)
+    return "\n".join(lines)
+
+
+def _redeem_long_md(lt_codes: list, stale_note: str) -> str:
+    """/长期兑换码 as a single markdown body."""
+    lines = [f"## 长期有效兑换码（{len(lt_codes)} 条）", ""]
+    for entry in lt_codes:
+        line = f"- {entry.get('code', '')}"
+        if entry.get("content"):
+            line += f" · {entry['content']}"
+        lines.append(line)
+    lines += ["", "（长按消息可复制）"]
+    if stale_note:
+        lines.append(stale_note)
+    return "\n".join(lines)
+
+
+async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
+    """Handle /兑换码 (time-limited) and /长期兑换码 commands — direct, no agent.
+
+    /兑换码       → currently-valid time-limited codes + codes expired ≤7 days
+    /长期兑换码   → codes with no known expiry (long-term / permanent)
+
+    Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    time_cmds = ("/兑换码", "/redeem-code", "#兑换码", "#redeem-code")
+    long_cmds = ("/长期兑换码", "#长期兑换码")
+    if cmd not in time_cmds and cmd not in long_cmds:
+        return False
+
+    from plugins.check_redeem_code import (
+        get_time_limited_codes, get_long_term_codes,
+        check_and_refresh, get_cache_info,
+        format_expiry_display, _write_admin_alert, is_refresh_in_flight,
+    )
+
+    # Trigger a refresh if stale, then use cached data. With the browser
+    # engine enabled this returns immediately while the scrape runs in the
+    # background (in_flight True); the HTTP path blocks until done.
+    await check_and_refresh()
+    info = get_cache_info()
+    in_flight = is_refresh_in_flight()
+
+    # Staleness footer: shown when cache is old (scrape failing / in progress)
+    stale_note = ""
+    if info.get("stale"):
+        iso = info.get("scraped_at_iso", "")
+        date_part = iso[:10] if iso else "未知时间"
+        if in_flight:
+            stale_note = f"⚠ 数据截至 {date_part}，正在后台更新中…"
+        else:
+            stale_note = f"⚠ 数据截至 {date_part}（自动更新失败，可能不是最新）"
+
+    # ── /长期兑换码 branch ──────────────────────────────────────
+    if cmd in long_cmds:
+        lt_codes = get_long_term_codes()
+        if not lt_codes:
+            msg = "还没有收录长期有效的兑换码。"
+            if stale_note:
+                msg += f"\n{stale_note}"
+            await _safe_send(msg)
+            return True
+
+        # 官方渠道 markdown 单条（§6.10.8）；OneBot 保持纯文本分块
+        if _channel_supports_markdown():
+            _lt_md = _redeem_long_md(lt_codes, stale_note)
+            # 键盘版（buttons P0）：刷新 / 限时码 / 官网活动页
+            if _channel_supports_keyboard():
+                await _safe_send_kb(_lt_md, [[
+                    Btn(label="刷新", data="/长期兑换码", action="cmd"),
+                    Btn(label="限时码", data="/兑换码", action="cmd"),
+                    Btn(label="活动页", data=_PUBLIC_SITE_URL, action="url"),
+                ]], label="redeem-long")
+                return True
+            await _safe_send(OutMarkdown(_lt_md))
+            return True
+
+        lines = [f"长期有效兑换码（无过期时间，共 {len(lt_codes)} 条）:", ""]
+        for entry in lt_codes:
+            line = f"  {entry.get('code', '')}"
+            if entry.get("content"):
+                line += f"\n  兑换内容: {entry['content']}"
+            lines.append(line)
+        lines.append("")
+        lines.append("（数量较多，不逐条发送；长按上方消息可复制）")
+        if stale_note:
+            lines.append(stale_note)
+        await _send_text_chunks(lines)
+        return True
+
+    # ── /兑换码 branch: time-limited codes ─────────────────────
+    codes = get_time_limited_codes()
+    active = [c for c in codes if not c.get("recently_expired")]
+    recent_expired = [c for c in codes if c.get("recently_expired")]
+
+    if not codes:
+        if in_flight:
+            # Background (browser-engine) refresh still running — don't claim
+            # failure or alert the admin for a scrape that hasn't finished.
+            msg = ("兑换码正在后台更新中，请稍等片刻再试～"
+                   "\n长期有效的兑换码请发送 /长期兑换码 查询。")
+            await _safe_send(msg)
+            return True
+        if info.get("stale"):
+            # No time-limited codes AND scraper failing → tell the user
+            # and raise the WebUI panel alert so the admin adds codes.
+            _write_admin_alert("no_valid_codes")
+            msg = "当前兑换码均已过期，网页爬取失败，等待管理员添加"
+        else:
+            msg = "当前没有有效的限时兑换码哦Σ( ° △ °)"
+        msg += "\n长期有效的兑换码请发送 /长期兑换码 查询。"
+        if stale_note:
+            msg += f"\n{stale_note}"
+        await _safe_send(msg)
+        return True
+
+    # Cap the active list so a bloated cache can never produce an
+    # unsendable message or an endless per-code flood
+    MAX_DISPLAY = 30
+    shown_active = active[:MAX_DISPLAY]
+    hidden = len(active) - len(shown_active)
+
+    # 官方渠道：全部码合并为一条 markdown（现状 N+2 条纯文本必爆 4/5 条
+    # 被动回复配额），并跳过逐条单发（§6.10.8 规则 4：逐条保留给 OneBot）
+    if _channel_supports_markdown():
+        _rt_md = _redeem_time_md(
+            shown_active, recent_expired, hidden, stale_note,
+            format_expiry_display)
+        # 键盘版（buttons P0）：刷新 / 长期码 / 官网活动页（§6.6 M7）
+        if _channel_supports_keyboard():
+            await _safe_send_kb(_rt_md, [[
+                Btn(label="刷新", data="/兑换码", action="cmd"),
+                Btn(label="长期码", data="/长期兑换码", action="cmd"),
+                Btn(label="活动页", data=_PUBLIC_SITE_URL, action="url"),
+            ]], label="redeem-time")
+            return True
+        await _safe_send(OutMarkdown(_rt_md))
+        return True
+
+    lines = [f"当前有效限时兑换码（{len(active)} 条）:", ""]
+    for entry in shown_active:
+        line = f"  {entry.get('code', '')}"
+        if entry.get("content"):
+            line += f"\n  兑换内容: {entry['content']}"
+        if entry.get("valid"):
+            line += f"\n  有效期至: {format_expiry_display(entry['valid'])}"
+        else:
+            line += "\n  过期时间未知（新收录，建议尽快兑换）"
+        lines.append(line)
+
+    if recent_expired:
+        lines.append("")
+        lines.append(f"以下限时码已于 7 天内过期（{len(recent_expired)} 条）：")
+        for entry in recent_expired:
+            line = f"  {entry.get('code', '')}"
+            if entry.get("content"):
+                line += f"\n  兑换内容: {entry['content']}"
+            expired_disp = format_expiry_display(entry.get("valid", "")) or "?"
+            line += f"\n  已于 {expired_disp} 过期"
+            lines.append(line)
+
+    if hidden > 0:
+        lines.append(f"  …另有 {hidden} 条较早的码未显示")
+    lines.append("")
+    lines.append("长期有效的兑换码请发送 /长期兑换码")
+    if stale_note:
+        lines.append(stale_note)
+
+    await _send_text_chunks(lines)
+
+    # Send each active code as a standalone message (expired ones excluded —
+    # single-sending them would invite users to copy dead codes)
+    await _send_codes_individually(shown_active)
+    return True
+
+
+async def _handle_character_detail_command(text: str, user_id: str) -> bool:
+    """Handle /角色详情 command — direct, no agent (zero token).
+
+    Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/角色详情", "#角色详情"):
+        return False
+
+    # Extract the name argument (everything after the command word)
+    rest = text.strip()[len(cmd):].strip()
+    if not rest:
+        await _safe_send("用法: /角色详情 <角色名或别名>\n例如: /角色详情 夏妮")
+        return True
+
+    text_result, card_path = await character_detail_with_card(rest)
+    if card_path:
+        await _safe_send(OutImage(path=card_path, label="character card"))
+    else:
+        await _safe_send(text_result)
+    return True
+
+
+async def _handle_bond_detail_command(text: str, user_id: str) -> bool:
+    """Handle /羁绊详情 command — direct, no agent (zero token).
+
+    Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/羁绊详情", "#羁绊详情"):
+        return False
+
+    rest = text.strip()[len(cmd):].strip()
+    if not rest:
+        await _safe_send("用法: /羁绊详情 <羁绊名或别名>\n例如: /羁绊详情 驰骋的快感")
+        return True
+
+    text_result, card_path = await bond_detail_with_card(rest)
+    if card_path:
+        await _safe_send(OutImage(path=card_path, label="bond card"))
+    else:
+        await _safe_send(text_result)
+    return True
+
+
+# ── /邮件 — 角色信箱（proactive-mail-design.md v0.5 §8）────────────────
+# 命令直连层，零 token；被动回复不占主动配额；输出纯文本 + 分隔线，
+# **不带免责尾**（§6.5）。仅官方 c2c 有意义（信箱只发 c2c）。
+
+_MAIL_PAGE_SIZE = 5
+_NAV_MAILBOX: Rows = [[
+    Btn(label="返回信箱", data="/邮件", action="cmd"),
+]]
+
+
+def _mail_retention_seconds() -> float:
+    try:
+        days = int(_bond_manager.get_config("mail_retention_days", 28))
+    except (TypeError, ValueError):
+        days = 28
+    return max(1, days) * 86400.0
+
+
+def _mail_recent_letters(user_id: str) -> list:
+    """保留期内的信件，倒序（新在前）——读侧也过滤，防未写盘的过期信。"""
+    cutoff = time.time() - _mail_retention_seconds()
+    return [
+        l for l in _mailbox_manager.list_letters(user_id)
+        if float(l.get("created_at", 0) or 0) >= cutoff
+    ]
+
+
+def _mail_fmt_md(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%m-%d")
+
+
+def _mail_fmt_full(ts: float) -> str:
+    dt = datetime.fromtimestamp(ts)
+    return f"{dt.month}月{dt.day}日"
+
+
+def _mail_letter_label(letter: dict) -> str:
+    """列表/日期视图里的发信人名：系统邮件显示【系统】+标题（§16.4.4）。"""
+    if letter.get("system"):
+        return f"【系统】{letter.get('title') or ''}".rstrip()
+    return letter.get("name") or letter.get("persona") or "?"
+
+
+async def _mail_send_list(user_id: str, letters: list, page: int) -> None:
+    """B3 列表：每页 5 封，未读标 ●，编号可见（供 /邮件 <编号> 展开）。"""
+    if not letters:
+        await _safe_send(
+            "【角色信箱】\n\n最近 28 天没有角色来信。\n"
+            "和角色多聊聊、提升羁绊（/好感度），TA 们会主动给你写信的~")
+        return
+    total_pages = max(1, (len(letters) + _MAIL_PAGE_SIZE - 1) // _MAIL_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    chunk = letters[(page - 1) * _MAIL_PAGE_SIZE: page * _MAIL_PAGE_SIZE]
+    unread = sum(1 for l in letters if not l.get("read"))
+    lines = [f"【角色信箱】最近 28 天（未读 {unread} 封）", ""]
+    for letter in chunk:
+        ts = float(letter.get("created_at", 0) or 0)
+        mark = "●" if not letter.get("read") else "　"
+        name = _mail_letter_label(letter)
+        preview = letter.get("preview") or ""
+        lines.append(f"{mark} {_mail_fmt_md(ts)}  {name}：{preview}")
+        lines.append(f"   编号 {letter.get('id', '')}")
+    lines.append("")
+    nav = f"第 {page}/{total_pages} 页 · " if total_pages > 1 else ""
+    lines.append(f"{nav}发送 /邮件 <编号> 查看全文，/邮件 下一页 翻页。")
+    await _safe_send("\n".join(lines))
+
+
+async def _mail_send_detail(user_id: str, letter: dict) -> None:
+    """B4 详情：全文 + 标记已读 + 返回信箱按钮；纯文本，不带免责尾。"""
+    ts = float(letter.get("created_at", 0) or 0)
+    if letter.get("system"):
+        head = (f"【系统邮件 · {letter.get('title') or '通知'}"
+                f" · {_mail_fmt_full(ts)}】")
+    else:
+        head = f"【{letter.get('name') or letter.get('persona') or '?'} · {_mail_fmt_full(ts)}】"
+    body = (f"{head}\n"
+            f"{letter.get('text', '')}\n\n"
+            f"—— 发送 /邮件 返回信箱")
+    _mailbox_manager.mark_read(user_id, letter.get("id", ""))
+    await _send_receipt_kb(body, _NAV_MAILBOX, label="mail-detail")
+
+
+async def _handle_mail_command(text: str, user_id: str,
+                               view: InboundMessage) -> bool:
+    """Handle /邮件 [编号|MM-DD|下一页|pN] — direct, no agent (zero token)."""
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/邮件", "#邮件"):
+        return False
+    # 信箱只发官方 c2c（§4.6）：NapCat/群聊调用一律返回说明
+    if getattr(view, "platform", "") != "qq_official" or view.is_group:
+        await _safe_send("角色信箱仅官方单聊可用~\n"
+                         "在官方 bot 的私聊里发送 /邮件 即可查看角色来信。")
+        return True
+
+    rest = text.strip()[len(cmd):].strip()
+    letters = _mail_recent_letters(user_id)
+
+    if not rest:
+        await _mail_send_list(user_id, letters, 1)
+        return True
+
+    low = rest.lower()
+    if low in ("下一页", "下页", "next"):
+        # 无状态翻页：这里只回第 2 页起点提示——真正的页码由 pN 携带
+        m_page = 2
+        await _mail_send_list(user_id, letters, m_page)
+        return True
+    m = re.fullmatch(r"p(\d{1,3})", low)
+    if m:
+        await _mail_send_list(user_id, letters, int(m.group(1)))
+        return True
+    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})", rest)
+    if m:
+        mmdd = f"{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+        day_letters = [
+            l for l in letters
+            if datetime.fromtimestamp(
+                float(l.get("created_at", 0) or 0)).strftime("%m-%d") == mmdd
+        ]
+        if not day_letters:
+            await _safe_send(f"{mmdd} 没有角色来信。发送 /邮件 查看信箱。")
+            return True
+        lines = [f"【角色信箱 · {mmdd}】", ""]
+        for letter in day_letters:
+            mark = "●" if not letter.get("read") else "　"
+            lines.append(f"{mark} {_mail_letter_label(letter)}："
+                         f"{letter.get('preview', '')}")
+            lines.append(f"   编号 {letter.get('id', '')}")
+        lines += ["", "发送 /邮件 <编号> 查看全文。"]
+        await _safe_send("\n".join(lines))
+        return True
+
+    # 按编号展开详情（按钮点击等价用户发出 /邮件 <id>）
+    raw_id = rest.split()[0]
+    letter_id = raw_id.upper()
+    letter = _mailbox_manager.get_letter(user_id, letter_id)
+    if letter is None and letter_id != raw_id:
+        letter = _mailbox_manager.get_letter(user_id, raw_id)
+    if letter is not None:
+        await _mail_send_detail(user_id, letter)
+        return True
+
+    # digest 仍引用该 id 但信件已不在 → 管理员撤回（§16.4.3），
+    # 与「过了保留期/编号打错」区分开，不装作这封信从未存在
+    if (_mailbox_manager.is_withdrawn(user_id, letter_id)
+            or (letter_id != raw_id
+                and _mailbox_manager.is_withdrawn(user_id, raw_id))):
+        await _safe_send("这封信已被撤回。\n发送 /邮件 返回信箱。")
+        return True
+
+    await _safe_send(
+        "没有找到这封信（可能已过 28 天保留期）。\n"
+        "用法：/邮件 查看列表 · /邮件 <编号> 查看全文 · "
+        "/邮件 <MM-DD> 按日期 · /邮件 下一页 翻页")
+    return True
+
+
+async def _handle_disclaimer_command(text: str, user_id: str) -> bool:
+    """Handle /免责声明 [开|关] — 三级用户均可（§6.5，命令直连层，不进
+    工具表/permissions）。无参数 = 查询状态；回复本身不带免责尾。"""
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/免责声明", "#免责声明"):
+        return False
+    rest = text.strip()[len(cmd):].strip().lower()
+
+    if rest in ("关", "off", "关闭"):
+        if _set_disclaimer_off(user_id, True):
+            await _safe_send(
+                "已关闭：对话回复末尾不再追加免责声明。\n"
+                "发送 /免责声明 开 可随时恢复。")
+        else:
+            await _safe_send("设置保存失败，请稍后再试。")
+        return True
+    if rest in ("开", "on", "开启"):
+        if _set_disclaimer_off(user_id, False):
+            await _safe_send("已恢复：对话回复末尾将追加免责声明。")
+        else:
+            await _safe_send("设置保存失败，请稍后再试。")
+        return True
+    if rest:
+        await _safe_send(
+            "用法：/免责声明 关 停止追加免责尾；/免责声明 开 恢复追加；"
+            "/免责声明 查询当前状态。")
+        return True
+
+    # B7 状态查询
+    if _disclaimer_off(user_id):
+        current = ("当前设置：已关闭——对话回复末尾不追加免责声明。\n"
+                   "发送 /免责声明 开 可恢复追加。")
+    else:
+        current = ("当前设置：对话回复末尾追加免责声明（默认开启）。\n"
+                   "发送 /免责声明 关 可停止追加；/免责声明 开 恢复。")
+    await _safe_send(
+        current + "\n作用域仅限对话回复——角色来信与系统邮件本就不带免责尾。")
+    return True
+
+
+# Guard so repeated /刷新角色数据 presses don't stack concurrent refreshes.
+_forced_refresh_running = False
+
+
+async def _forced_refresh_wiki_data(user_id: str, notify_sender=None) -> None:
+    """Force a full character + bond cache refresh in the background.
+
+    Runs after the triggering handler has returned, so it has no active event
+    context and ``_safe_send`` is NOT usable:
+      - onebot: completion is reported by a direct private message to the
+        requesting admin (get_bots() → send_private_msg, as before);
+      - qq_official: there is no active-message equivalent within quota
+        reason, so the caller passes the triggering turn's bound sender
+        (``_turn_sender`` snapshot). We send into its buffer and flush()
+        explicitly — nobody else will, the turn is long over. Delivery is
+        best-effort by platform semantics: passive replies ride the trigger
+        message's window (group 5min / c2c 60min); a refresh that outlives
+        the window is rejected API-side and _send_once logs + swallows it.
+    """
+    global _forced_refresh_running
+    summary = ""
+    try:
+        from tools.wiki_scraper import WikiScraper
+        from tools import character_detail as _cd
+        from tools import bond_detail as _bd
+        from lib.model_router import model_router
+
+        scraper = WikiScraper(llm_client=model_router.flash_client)
+        chars = await scraper.refresh_characters()
+        if chars:
+            _cd._invalidate()
+        bonds = await scraper.refresh_bonds()
+        if bonds:
+            _bd._invalidate()
+        summary = f"角色/羁绊数据库刷新完成（角色 {len(chars)} 条，羁绊 {len(bonds)} 条），卡片将自动重绘。"
+        print(f"[agent_router] forced wiki refresh done: "
+              f"{len(chars)} characters, {len(bonds)} bonds", file=sys.stderr)
+    except Exception as e:
+        summary = f"刷新失败：{type(e).__name__}，请稍后重试。"
+        print(f"[agent_router] forced wiki refresh failed: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+    finally:
+        _forced_refresh_running = False
+
+    # Best-effort completion notice to the requesting admin (see docstring:
+    # platform-forked delivery, never _safe_send — no live event context here).
+    if summary:
+        if notify_sender is not None and getattr(notify_sender, "platform", "") == "qq_official":
+            try:
+                await notify_sender.send_text(summary)
+                await notify_sender.flush()
+            except Exception as e:
+                print(f"[agent_router] refresh notice send failed (official): "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+        else:
+            try:
+                import nonebot
+                from nonebot.adapters.onebot.v11 import Bot as _Bot
+                bots = nonebot.get_bots()
+                bot = next((b for b in bots.values() if isinstance(b, _Bot)), None)
+                if bot is not None:
+                    await bot.send_private_msg(user_id=int(user_id), message=summary)
+            except Exception as e:
+                print(f"[agent_router] refresh notice send failed: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+
+
+async def _handle_refresh_data_command(text: str, user_id: str) -> bool:
+    """Handle /刷新角色数据 — admin-only forced wiki cache refresh.
+
+    The character/bond caches auto-refresh weekly (Wednesday 20:00 anchor), so
+    scraper fixes deployed between anchors would otherwise wait up to a week.
+    This command forces an immediate background refresh (scrape + translate +
+    image download + card re-render). Returns True if the command was handled.
+    """
+    global _forced_refresh_running
+    if text.strip() not in ("/刷新角色数据", "#刷新角色数据"):
+        return False
+    if _perm_manager.get_role(user_id) != UserRole.ADMIN:
+        await _safe_send("此命令仅限管理员使用。")
+        return True
+    if _forced_refresh_running:
+        await _safe_send("刷新正在进行中，请稍候~")
+        return True
+    _forced_refresh_running = True
+    # Snapshot the triggering turn's bound sender for the completion notice:
+    # on qq_official this is the event-scoped buffering sender (passive-reply
+    # window applies — see _forced_refresh_wiki_data docstring); on onebot it
+    # is None and the notice goes out as a direct private message instead.
+    asyncio.create_task(_forced_refresh_wiki_data(user_id, _turn_sender.get()))
+    _notice_tail = (
+        "完成后会尽力在本会话通知你（群聊里受平台 5 分钟被动回复窗口限制，"
+        "刷新超时则收不到通知，可自行用 /角色详情 验证）。"
+        if _current_platform.get() == "qq_official"
+        else "完成后会自动通知。"
+    )
+    await _safe_send(
+        "已开始后台刷新角色/羁绊数据库（抓取+翻译+图片下载），通常需要几分钟，"
+        + _notice_tail
+    )
+    return True
+
+
+async def _handle_personality_command(text: str, user_id: str, view: InboundMessage) -> bool:
+    """Handle /personality / /人格切换 command for personality switching.
+
+    Returns True if the command was handled.
+    """
+    cmd, _, args = text.partition(" ")
+    if cmd not in ("/personality", "/人格切换"):
+        return False
+
+    pm = get_character_registry()
+    personalities = pm.list_personalities(user_id=user_id)
+    args = args.strip()
+    group_id = view.group_id
+
+    # --全局 逃生门：在特殊会话内修改用户级默认人格（会话绑定不动）
+    global_flag = args.endswith("--全局")
+    if global_flag:
+        args = args[: -len("--全局")].strip()
+
+    # /personality — show current and available
+    if not args:
+        current_key = pm.resolve_effective_personality(user_id, group_id)
+        current_display = pm.get_display_name(current_key)
+        # Annotate where the effective personality comes from
+        # (剧情钉住/会话绑定/个人设置/群默认/全局默认 — registry 同链路判定)
+        source = pm.resolve_effective_source(user_id, group_id)
+        lines = [f"当前人格: {current_display} ({current_key}，{source})", "", "可用人格:"]
+        for p in personalities:
+            marker = " ← 当前" if p["key"] == current_key else ""
+            tag = "　[自创]" if p.get("source") == "ugc" else ""
+            lines.append(f"  {p['display_name']} ({p['key']}){tag}{marker}")
+        lines.append(
+            "\n使用 /人格切换 <名称> 切换，例如: /人格切换 "
+            f"{personalities[0]['display_name']}"
+        )
+        _active_for_hint = _special_sessions.get_active(user_id)
+        if _active_for_hint is not None:
+            lines.append("当前在特殊会话中：切换仅作用于本会话；加 --全局 修改默认人格。")
+        lines.append("用 /创建角色 访谈式创建你自己的角色。")
+        # 键盘版（buttons P0）：每人格一个 [切换] 指令按钮（点击=替用户
+        # 打字 /人格切换 <显示名>，天然复用本命令的切换分支）。行数预算：
+        # 4 行人格（每行 3）+ 1 行导航 = 5 行上限，故容量 12；超过退回
+        # 纯文本列表，内容不丢。
+        if _channel_supports_keyboard() and len(personalities) <= 12:
+            _p_rows: Rows = []
+            _p_row: list = []
+            for p in personalities:
+                is_cur = p["key"] == current_key
+                _p_row.append(Btn(
+                    label=_fit_label(p["display_name"]),
+                    data=f"/人格切换 {p['display_name']}", action="cmd",
+                    style=0 if is_cur else 1,
+                    visited="当前" if is_cur else ""))
+                if len(_p_row) == 3:
+                    _p_rows.append(_p_row)
+                    _p_row = []
+            if _p_row:
+                _p_rows.append(_p_row)
+            _p_rows.append([
+                Btn(label="创建角色", data="/创建角色", action="cmd"),
+                Btn(label="帮助", data="/帮助", action="cmd"),
+            ])
+            await _safe_send_kb("\n".join(lines), _p_rows,
+                                label="personality-list")
+            return True
+        await _safe_send("\n".join(lines))
+        return True
+
+    # /personality <name> — switch
+    # 会话绑定语义：特殊会话内切换只写 metadata.persona_key（用户默认不变）；
+    # 临时会话内切换仍写用户默认；bond_scene/char_creation 会话拒绝切换。
+    active = _special_sessions.get_active(user_id)
+    kind = (active.metadata or {}).get("kind") if active else None
+    if active and not global_flag and kind in ("bond_scene", "char_creation"):
+        label = "剧情场景" if kind == "bond_scene" else "角色创作"
+        await _safe_send(
+            f"{label}会话的人格是固定的，无法在会话内切换。\n"
+            f"结束会话后可正常切换；加 --全局 可修改你的默认人格（不影响本会话）。"
+        )
+        return True
+    session_scoped = bool(active) and not global_flag
+
+    try:
+        old_key = pm.resolve_effective_personality(user_id, group_id)
+        old_display = pm.get_display_name(old_key)
+
+        if global_flag and active is not None:
+            # --全局 在特殊会话内：只改用户默认，会话绑定与本轮人格都不动，
+            # 因此没有「保留/清空」追问，也不写 marker。
+            prev_personal = pm.get_personal_personality(user_id)
+            resolved = pm.set_user_personality(user_id, args)
+            new_display = pm.get_display_name(resolved)
+            same_note = "（原本已是该默认）" if resolved == prev_personal else ""
+            await _safe_send(
+                f"已将默认人格设为「{new_display}」{same_note}。\n"
+                f"当前会话人格不变（仍为「{old_display}」），退出本会话后生效。"
+            )
+            return True
+
+        if session_scoped:
+            resolved = pm._resolve_or_raise(args, user_id=user_id)
+            if resolved == old_key:
+                await _safe_send(f"本会话已是「{pm.get_display_name(resolved)}」人格，无需切换~")
+                return True
+            if not _special_sessions.update_metadata(
+                    user_id, active.name, {"persona_key": resolved}):
+                raise RuntimeError(f"update_metadata failed for session {active.name}")
+        else:
+            # 临时会话（含 --全局）：现有行为，写用户默认
+            resolved = pm.set_user_personality(user_id, args)
+            if resolved == old_key:
+                # Already this personality — no transition prompt/marker needed.
+                await _safe_send(f"当前已是「{pm.get_display_name(resolved)}」人格，无需切换~")
+                return True
+
+        new_display = pm.get_display_name(resolved)
+        _pending_personality_switch[user_id] = (old_display, new_display, session_scoped)
+        _scope_prefix = "本会话" if session_scoped else ""
+        _personality_switch_marker[user_id] = (
+            f"{_scope_prefix}人格已从「{old_display}」切换为「{new_display}」，"
+            f"历史回复风格不代表当前人格。"
+        )
+        _save_personality_markers()
+        # 键盘版追问（buttons P0）：[保留历史]/[清空上下文] 指令按钮，
+        # 点击即替用户发出「保留」/「清空」——正好命中下方 pending
+        # personality-switch 的关键字分支，无需任何新协议。
+        _switch_rows: Rows = [[
+            Btn(label="保留历史", data="保留", action="cmd",
+                style=1, reply=True),
+            Btn(label="清空上下文", data="清空", action="cmd",
+                style=0, reply=True),
+        ]]
+        if session_scoped:
+            await _send_receipt_kb(
+                f"已将本会话切换至「{new_display}」人格"
+                f"（仅当前会话，你的默认人格不变；"
+                f"用 /人格切换 <名称> --全局 可修改默认人格）。\n"
+                f"是否保留历史对话记录？\n"
+                f"回复「保留」保留历史并注入切换提示词；\n"
+                f"回复「清空」清除当前上下文。",
+                _switch_rows, label="personality-switch-ask")
+        else:
+            await _send_receipt_kb(
+                f"已切换至「{new_display}」人格。\n"
+                f"是否保留历史对话记录？\n"
+                f"回复「保留」保留历史并注入切换提示词；\n"
+                f"回复「清空」清除当前上下文。",
+                _switch_rows, label="personality-switch-ask")
+    except ValueError as e:
+        await _safe_send(str(e))
+    except Exception as e:
+        code = log_exception("personality switch failed", e)
+        await _safe_send(f"人格切换失败（诊断编号 {code}），请稍后重试。如果问题持续存在，请使用 #bug 反馈。")
+
+    return True
+
+
+# ── Bond system helpers (Bond-System-Design.md §3-4) ──────────────
+
+def _build_bond_context(user_id: str, persona_key: str, pm) -> str:
+    """Assemble the L4 bond block for the character plane (P2 dynamic layer).
+
+    角色卡解析（已解锁档案/称呼演化）与共同经历日志都汇入
+    build_prompt_context。任何一步失败都降级为「只有基础羁绊状态」，绝不
+    因增益功能抛错阻断角色面回复。
+    """
+    short_name = pm.get_short_name(persona_key)
+    unlocked_text = ""
+    address_line = ""
+    recent = None
+    try:
+        card = pm.load(persona_key) or ""
+        state = _bond_manager.get_state(user_id, persona_key, create=False)
+        level = int((state or {}).get("level", 1))
+        if card:
+            unlocked_text = bond_content.unlocked_tiers_text(card, level)
+            address_line = bond_content.address_directive(level)
+        recent = _bond_manager.recent_events(user_id, persona_key, 3) or None
+    except Exception as e:
+        log_exception("bond dynamic context failed", e)
+    return _bond_manager.build_prompt_context(
+        user_id, persona_key, short_name,
+        unlocked_text=unlocked_text,
+        address_line=address_line,
+        recent=recent,
+    )
+
+
+def _distill_bond_episode(user_id: str, char_id: str, *, title: str,
+                          highlights=None):
+    """P5（§8）：里程碑时刻 → ≤300 字事件文本 → TieredMemory（category=event）。
+
+    素材 = 标题 + highlights + 最近共同经历日志 + 近期影音资产卡（文本化
+    记忆，路径已淘汰的卡也算数）。同步 best-effort——蒸馏失败静默，绝不
+    阻断回合收尾。不改 memory.py：ingest_candidates 本就接受带 category
+    的 4 元组。episode_distill_enabled=False 时整体跳过。
+    """
+    try:
+        if not bool(_bond_manager.get_config("episode_distill_enabled", True)):
+            return
+        recent_cards = _asset_memory.list_cards(user_id, char_id)[:5]
+        hl = [str(h) for h in (highlights or []) if h]
+        try:
+            hl.extend(_bond_manager.recent_events(user_id, char_id, n=2))
+        except Exception:  # noqa: BLE001
+            pass
+        text = _asset_memory.distill_episode(
+            user_id, char_id,
+            asset_ids=[c.id for c in recent_cards],
+            highlights=hl,
+            title=title,
+        )
+        if text:
+            _tiered_memory.ingest_candidates(
+                user_id, [(text, "new", None, "event")])
+    except Exception as e:  # noqa: BLE001
+        log_exception("bond episode distill failed", e)
+
+
+async def _settle_bond_turn(user_id: str, persona_key: str, sender=None,
+                            is_group: bool = False):
+    """好感结算钩子：split 人格每轮对话结束后累计 EXP/心情，升级时发庆祝。
+
+    结算失败必须静默——它是增益功能，绝不能因抛错中断已生成回复的发送。
+    turn_count 用于「长聊奖励」（≥long_session_turns 当日一次性加成）。
+    is_group：群聊不发场景邀请（剧情场景仅私聊体验）。
+    """
+    try:
+        try:
+            turn_count = _session_manager.message_count(user_id) // 2
+        except Exception:
+            turn_count = 0
+        result = _bond_manager.settle_turn(user_id, persona_key, turn_count=turn_count)
+        # P3: 久别重逢 / 纪念日共同经历事件（一次性守卫在 bond.py 内）
+        if result.get("reunion") and _bond_manager.note_reunion(user_id, persona_key):
+            _bond_manager.append_event(user_id, persona_key, "久别重逢")
+        milestone = _bond_manager.note_anniversary(user_id, persona_key)
+        if milestone:
+            _bond_manager.append_event(
+                user_id, persona_key, f"相识第 {milestone} 天纪念日"
+            )
+        ups = result.get("level_ups") or []
+        await _emit_level_ups(user_id, persona_key, ups,
+                              sender=sender, is_group=is_group)
+        # P5: 升级是里程碑时刻 → 蒸馏一条事件记忆（长期可召回）
+        if ups:
+            top = ups[-1]
+            _distill_bond_episode(
+                user_id, persona_key,
+                title=f"与用户的羁绊提升到了 Lv{top.get('level')}"
+                      f"（{top.get('title', '')}）",
+                highlights=[f"用户一路陪伴到 Lv{top.get('level')}"],
+            )
+    except Exception as e:
+        log_exception("bond settlement failed", e)
+
+
+async def _emit_level_ups(user_id, persona_key, level_ups, sender=None,
+                          is_group: bool = False, archive_note: str = ""):
+    """升级庆祝 + 分段解锁（P3 修正）：档案 tier 发解锁提示，场景 tier 发私聊邀请。
+
+    archive_note：剧情完成当轮的封档一行，拼在**首个**升级通知尾部（§5.2 硬性规则）；
+    多级连升时也只并一次，避免重复占用被动回复配额。
+    """
+    level_ups = level_ups or []
+    if not level_ups:
+        return
+    card = ""
+    try:
+        card = get_character_registry().load(persona_key) or ""
+    except Exception:
+        card = ""
+    for i, up in enumerate(level_ups):
+        lv = up.get("level")
+        _bond_manager.append_event(
+            user_id, persona_key,
+            f"羁绊提升到了 Lv{lv}（{up.get('title', '')}）",
+        )
+        await _send_level_up_notice(
+            user_id, persona_key, up, sender=sender,
+            archive_note=archive_note if i == 0 else "",
+        )
+        # 非场景 tier（档案/语气解禁等）：方舟式解锁提示
+        for tier in bond_content.tiers_unlocking_at(card, int(lv)):
+            if bond_content.is_scene_tier(tier):
+                continue  # 场景走下面的邀请
+            title = str(tier.get("title", "")).strip()
+            _bond_manager.append_event(
+                user_id, persona_key, f"解锁了新的羁绊档案「{title}」"
+            )
+            await _safe_send(
+                f"🔓 羁绊档案解锁：Lv{lv} ·《{title}》",
+                sender=sender,
+            )
+        # 场景 tier（P3）：该等级新解锁的场景 → 私聊邀请
+        for sc in bond_content.scenes_unlocking_at(card, int(lv)):
+            await _invite_scene(user_id, persona_key, sc,
+                                is_group=is_group, sender=sender)
+
+
+async def _invite_scene(user_id, persona_key, scene, is_group=False, sender=None):
+    """升级场景邀请（P3）：仅私聊 + 未完成；每级解锁自然一次性。"""
+    if is_group:
+        return
+    title = str(scene.get("title", "")).strip()
+    lv = scene.get("level", "")
+    if not title or _bond_manager.has_done_scene(user_id, persona_key, title):
+        return
+    short = get_character_registry().get_short_name(persona_key)
+    await _safe_send(
+        f"✨ 羁绊到了 Lv{lv}，{short} 好像想和你一起经历新的剧情「{title}」～\n"
+        f"想现在开始的话，私聊发 /剧情 {title} 即可。",
+        sender=sender,
+    )
+
+
+async def _finish_bond_scene(user_id: str, result: dict, sender=None):
+    """场景完成 post-run 收尾 + 封档（P3 / scene-session-archive-design.md §5.2）。
+
+    顺序：会话名快照 → 写 completed/completed_at → end_active → 解析临时人格 →
+    升级通知（有升级则并入封档行）→ 纪念卡 → 事件蒸馏 → 封档提示（仅无升级时独立发）。
+
+    结算（+scene_exp/mark/事件日志）已在 social_tools.complete_scene 完成；这里只做
+    呈现与封档。正文已在 agent.run 期间写入剧情会话，故 end_active 提前是安全的，
+    且能让随后的 resolve 落到临时会话人格（供封档提示展示）。失败静默（增益不阻断）。
+    """
+    try:
+        char_id = str(result.get("char_id") or "")
+        scene_title = str(result.get("scene_title") or "")
+        pm = get_character_registry()
+        level_ups = result.get("level_ups") or []
+
+        # 会话名（/切换会话 回看入口）——须在 end_active 之前取
+        active = _special_sessions.get_active(user_id)
+        session_name = active.name if active else f"剧情·{scene_title}"
+
+        # 封档：先写 completed/completed_at 再 end_active（§5.2 顺序约束）。
+        # 写失败不阻断 end_active（各自 try）。开关关闭时跳过（回滚语义）。
+        if _scene_archive_enabled() and active:
+            try:
+                _special_sessions.update_metadata(user_id, active.name, {
+                    "completed": True,
+                    "completed_at": time.time(),
+                })
+                from nonebot import logger
+                logger.info(
+                    f"[scene-archive] completed user={user_id} "
+                    f"char={char_id} title={scene_title}")
+            except Exception:
+                pass
+
+        # 回临时会话（正文已持久化；提前退出让随后 resolve 落到临时人格）
+        try:
+            _special_sessions.end_active(user_id)
+        except Exception:
+            pass
+
+        # 临时会话模式下的人格（供封档提示展示）
+        try:
+            display = pm.get_display_name(
+                pm.resolve_effective_personality(user_id, None))
+        except Exception:
+            display = ""
+
+        # 封档一行（B1b）：有升级时并入升级文案尾部，省 1 条被动回复（§5.2 硬性规则）
+        archive_note = (
+            f"剧情《{scene_title}》已封档，不占配额，"
+            f"随时 /切换会话 {session_name} 回看。"
+        )
+        await _emit_level_ups(
+            user_id, char_id, level_ups,
+            sender=sender, is_group=False,
+            archive_note=archive_note if level_ups else "",
+        )
+
+        level = int(result.get("level") or 1)
+        entry = {
+            "char_name": pm.get_display_name(char_id) or pm.get_short_name(char_id),
+            "scene_title": scene_title,
+            "level": level,
+            "level_title": _bond_manager.title_for(level),
+            "date": time.strftime("%Y-%m-%d"),
+            "memento": str(result.get("memento") or ""),
+        }
+        path = render_scene_card(entry)
+        if path:
+            await _safe_send(
+                OutImage(path=path, label=f"羁绊纪念 · {scene_title}"),
+                sender=sender,
+            )
+        # P5: 共同走完一段剧情是里程碑 → 蒸馏事件记忆（含纪念语）
+        hl = [f"羁绊 Lv{level}（{entry['level_title']}）"]
+        if entry["memento"]:
+            hl.append(f"纪念语：「{entry['memento']}」")
+        _distill_bond_episode(
+            user_id, char_id,
+            title=f"与用户一起完成了剧情「{scene_title}」",
+            highlights=hl,
+        )
+        # 封档提示：无升级时独立发送（有升级已并入升级通知，不再单发）
+        if not level_ups:
+            tail = f"\n已回到临时会话模式，当前人格：{display}。" if display else ""
+            await _safe_send(
+                f"剧情《{scene_title}》已完结，已为你封档保存。\n"
+                f"它不再占用特殊会话配额，想回看随时发 /切换会话 {session_name}。"
+                f"{tail}",
+                sender=sender,
+            )
+    except Exception as e:
+        log_exception("bond scene finish failed", e)
+
+
+async def _scene_opening_performance(char_id: str, title: str, scene: dict):
+    """LLM（flash）以角色口吻演绎剧情开场。None → 调用方降级到零 LLM 固定文案。
+
+    脚本正文是给模型的舞台指示（分幕梗概），绝不能原文发给用户；这里让模型
+    按第一幕即兴演绎出有画面感的开场白（环境+动作+台词），并留出回应空间。
+    """
+    try:
+        persona_content = get_character_registry().load(char_id) or ""
+        body = str(scene.get("body") or "").strip()
+        if not persona_content or not body:
+            return None
+        system = (
+            persona_content
+            + "\n\n---\n你正在扮演上述角色，即将与用户（对你最重要的人）一对一"
+              "共同演绎下方剧情脚本。现在是剧情开场：请按脚本**第一幕**的设定，"
+              "以角色口吻演绎开场——描写环境与你的动作、神态、语气，说出台词，"
+              "结尾自然留出等待用户回应的空间。\n"
+              "要求：全程保持角色，不要以助手身份说话；舞台指示（【第X幕】等）"
+              "是给你的设定，**不要照搬或复述**；不要提前演绎后续幕的内容；"
+              "不使用 markdown；不报任何数值；只输出剧情正文本身；不超过 180 字。"
+        )
+        prompt = (
+            f"剧情《{title}》脚本如下：\n{body}\n\n"
+            f"请演绎这段剧情第一幕的开场。"
+        )
+        raw = await _model_router.flash_client.chat_completion(
+            message=prompt,
+            history=[{"role": "system", "content": system}],
+            timeout_set=20.0,
+            purpose="bond_scene_opening",
+        )
+        candidate = (raw or "").strip()
+        if (
+            candidate
+            and not candidate.startswith(_LLM_ERROR_PREFIXES)
+            and len(candidate) <= 400
+            and "【" not in candidate
+        ):
+            return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _scene_opening_line(char_id: str, title: str, scene: dict) -> str:
+    """零 LLM 降级开场：通用引导文案。绝不回显脚本原文（那是给模型的舞台指示）。"""
+    short = get_character_registry().get_short_name(char_id)
+    head = f"—— 剧情《{title}》开始 ——"
+    return (f"{head}\n{short} 轻轻拉住你的衣袖，眼里带着期待。"
+            f"「我们出发吧？」\n\n（随时可 /结束会话 退出）")
+
+
+async def _start_bond_scene(user_id: str, char_id: str, scene: dict) -> None:
+    """启动/恢复羁绊剧情特殊会话（仅私聊）。
+
+    剧情会话**不计**普通特殊会话配额（scene-session-archive-design.md §4.1）；
+    同剧情去重恢复（D4）、总量上限 MAX_SCENE_ARCHIVES（D5）。
+    守卫顺序：身份类（等级/已完成）→ 去重恢复 → 活跃会话 → 角色存在性 →
+    总量上限 → 创建。去重先于活跃守卫，且先于存在性校验（允许恢复已删角色的
+    未完成剧情，会话层懒穿透）。
+    """
+    title = str(scene.get("title") or "")
+    try:
+        lv = int(scene.get("level") or 1)
+    except (TypeError, ValueError):
+        lv = 1
+    state = _bond_manager.get_state(user_id, char_id, create=False)
+    level = int((state or {}).get("level", 1))
+    # 1) 身份类守卫
+    if level < lv:
+        await _safe_send(
+            f"「{title}」需要羁绊 Lv{lv} 才能体验（当前 Lv{level}），再相处一阵子吧～"
+        )
+        return
+    if _bond_manager.has_done_scene(user_id, char_id, title):
+        await _safe_send(
+            f"「{title}」你们已经经历过了，回忆已珍藏在纪念卡里～ 试试别的剧情吧。"
+        )
+        return
+    # 2) 同剧情去重恢复（D4）——必须先于活跃会话守卫，否则"已在剧情中再发
+    #    /剧情 同标题"会得到莫名其妙的"先 /结束会话"拒绝。命中即懒回填 completed。
+    existing = _find_scene_session(user_id, char_id, title)
+    if existing:
+        if _scene_completed(existing):
+            await _safe_send(
+                f"「{title}」这段剧情已完结封档，可用 /切换会话 {existing['name']} 回看～"
+            )
+            return
+        active0 = _special_sessions.get_active(user_id)
+        if active0 and active0.name == existing["name"]:
+            await _safe_send(
+                f"你正在这段剧情《{title}》中，继续吧～（/结束会话 可暂时退出）"
+            )
+            return
+        try:
+            _special_sessions.switch_to(user_id, existing["name"])
+        except Exception as e:
+            code = log_exception("bond scene resume switch failed", e)
+            await _safe_send(f"恢复剧情失败（诊断编号 {code}），请稍后重试。")
+            return
+        from nonebot import logger
+        logger.info(f"[scene-archive] resume name={existing['name']} user={user_id}")
+        await _safe_send(
+            f"继续上次未完成的剧情《{title}》——\n"
+            f"（发送 /结束会话 可暂时退出；该会话不占配额）"
+        )
+        return
+    # 3) 活跃会话守卫（走到这里 existing 必为其他会话或无）
+    active = _special_sessions.get_active(user_id)
+    if active:
+        await _safe_send(
+            "你现在还有一个进行中的特殊会话，先 /结束会话 再开始剧情吧～"
+        )
+        return
+    # 4) 钉住人格合法性校验（仅创建路径需要；恢复不受此限）。会话层对失效
+    #    char_id 懒穿透，启动时拦住，避免建出一个「钉不住」的剧情会话。
+    _pm_scene = get_character_registry()
+    if not _pm_scene._exists(char_id, user_id=user_id):
+        await _safe_send("该剧情对应的角色已不存在，无法开始。")
+        return
+    # 5) 总量上限（D5；计数含进行中与已完结的剧情会话）。开关关闭时不设限（回滚）。
+    if _scene_archive_enabled():
+        n_scene = len(_scene_archives(user_id))
+        cap = _max_scene_archives()
+        if n_scene >= cap:
+            from nonebot import logger
+            logger.info(f"[scene-archive] cap-hit user={user_id} n={n_scene}")
+            await _safe_send(
+                f"剧情会话已达上限（{n_scene}，含进行中与已完结）。"
+                f"请用 /删除会话 清理不再回看的剧情，再开始新剧情。"
+            )
+            return
+    # 6) 创建 + 切换 + 开场（与原实现一致；剧情不计普通配额，无槽位检查）
+    try:
+        session = _special_sessions.create(
+            user_id, f"剧情·{title}",
+            metadata={
+                "kind": SCENE_KIND, "char_id": char_id,
+                # 会话人格绑定统一入口：scene 的钉住人格 = char_id，
+                # CharacterRegistry._session_persona 优先按 kind 读 char_id，
+                # 这里冗余写入便于 /会话列表 等展示逻辑统一读 persona_key。
+                "persona_key": char_id,
+                "scene_title": title,
+                "script": str(scene.get("body") or ""),
+                "completed": False,
+            },
+        )
+        _special_sessions.switch_to(user_id, session.name)
+        opening = await _scene_opening_performance(char_id, title, scene)
+        if opening:
+            seed = (f"—— 剧情《{title}》开始 ——\n{opening}\n\n"
+                    f"（随时可 /结束会话 退出）")
+        else:
+            seed = _scene_opening_line(char_id, title, scene)
+        _special_sessions.add_message(user_id, "assistant", seed)
+        await _safe_send(seed)
+    except Exception as e:
+        code = log_exception("bond scene start failed", e)
+        await _safe_send(f"开始剧情失败（诊断编号 {code}），请稍后重试。")
+
+
+async def _handle_scene_command(text: str, user_id: str, view) -> bool:
+    """/剧情 #剧情 — 列出可用场景或启动一个（P3，仅私聊体验）。"""
+    cmd, _, args = text.partition(" ")
+    args = args.strip()
+    if cmd not in ("/剧情", "#剧情"):
+        return False
+    pm = get_character_registry()
+    persona_key = pm.resolve_effective_personality(user_id, view.group_id)
+    try:
+        card = pm.load(persona_key) or ""
+    except Exception:
+        card = ""
+    scenes = bond_content.parse_scenes(card)
+    short = pm.get_short_name(persona_key)
+    if not scenes:
+        await _safe_send(f"和 {short} 还没有准备好的剧情场景哦～")
+        return True
+    state = _bond_manager.get_state(user_id, persona_key, create=False)
+    level = int((state or {}).get("level", 1))
+    if not args:
+        lines = [f"与 {pm.get_display_name(persona_key)} 的剧情场景："]
+        unlocked: list = []
+        for s in scenes:
+            lv = int(s["level"])
+            title = str(s["title"])
+            if lv <= level:
+                done = _bond_manager.has_done_scene(
+                    user_id, persona_key, title)
+                mark = "（已完成）" if done else "（可体验）"
+                lines.append(f"  · Lv{lv} 《{title}》{mark}")
+                if not done:
+                    unlocked.append(title)
+            else:
+                lines.append(f"  · Lv{lv} 《{title}》（羁绊 Lv{lv} 解锁）")
+        lines.append("\n私聊发 /剧情 <标题> 开始一段剧情。")
+        # 键盘版（buttons P0，仅私聊——群里 /剧情 <标题> 本就会被拒绝）：
+        # 可体验场景各给一个 [进入] 指令按钮；行预算 4 场景 + 1 导航行。
+        if not view.is_group and _channel_supports_keyboard():
+            _s_rows: Rows = [
+                [Btn(label=_fit_label(t), data=f"/剧情 {t}", action="cmd")]
+                for t in unlocked[:4]
+            ]
+            _s_rows.append([
+                Btn(label="好感度", data="/好感度", action="cmd"),
+                Btn(label="换人格", data="/人格切换", action="cmd"),
+            ])
+            await _safe_send_kb("\n".join(lines), _s_rows, label="scene-list")
+            return True
+        await _safe_send("\n".join(lines))
+        return True
+    if view.is_group:
+        await _safe_send("剧情场景只能在私聊里体验哦～ 请私聊我再发 /剧情。")
+        return True
+    scene = bond_content.get_scene(card, args)
+    if not scene:
+        await _safe_send(f"没有找到叫「{args}」的剧情，发 /剧情 看看列表吧～")
+        return True
+    await _start_bond_scene(user_id, persona_key, scene)
+    return True
+
+
+async def _send_level_up_notice(user_id: str, persona_key: str, up: dict, sender=None,
+                                archive_note: str = ""):
+    """羁绊升级庆祝：角色口吻一句话（flash）+ 等级提示；LLM 失败降级固定文案。
+
+    archive_note（scene-session-archive-design.md §5.2/B1b）：剧情完成当轮有升级时，
+    封档一行**必须**并入升级文案尾部，而非独立发送——省 1 条被动回复，避免在官方
+    渠道 4 条预算下挤掉纪念卡（media 先丢）。仅拼在正文之后，不影响 LLM 庆祝语。
+    """
+    pm = get_character_registry()
+    short = pm.get_short_name(persona_key)
+    fallback = f"✨ 你与 {short} 的羁绊达到了 Lv{up['level']}（{up['title']}）！"
+    if archive_note:
+        fallback = f"{fallback}\n{archive_note}"
+    opening = None
+    try:
+        persona_content = pm.load(persona_key) or ""
+        if persona_content:
+            system = (
+                persona_content
+                + "\n\n---\n你正在扮演上述角色。你与用户的羁绊刚刚提升到了新的等级，"
+                  "请写一句符合角色性格的简短庆祝/感慨，表达你们的关系更近了一步。"
+            )
+            prompt = (
+                f"羁绊提升到了 Lv{up['level']}（{up['title']}）。"
+                f"请以角色口吻写一句话庆祝。要求：不超过60字；不使用markdown；只输出这句话本身。"
+            )
+            raw = await _model_router.flash_client.chat_completion(
+                message=prompt,
+                history=[{"role": "system", "content": system}],
+                timeout_set=15.0,
+                purpose="bond_levelup",
+            )
+            candidate = (raw or "").strip()
+            if (
+                candidate
+                and not candidate.startswith(_LLM_ERROR_PREFIXES)
+                and len(candidate) <= 120
+                and "\n" not in candidate
+            ):
+                opening = candidate
+    except Exception:
+        opening = None
+    if opening:
+        await _safe_send(f"{opening}\n\n{fallback}", sender=sender)
+    else:
+        await _safe_send(fallback, sender=sender)
+
+
+# LLM 反应失败/群聊默认使用的模板（{name} = 角色短名）
+_POKE_REACTIONS = (
+    "欸？{name}被你戳了一下，回头看了你一眼～",
+    "{name}揉了揉被戳的地方，无奈地笑了笑。",
+    "别戳啦～{name}在呢。",
+    "{name}眨了眨眼：「怎么啦？」",
+)
+
+
+async def _handle_poke(user_id: str, group_id: str, private: bool):
+    pm = get_character_registry()
+    persona_key = pm.resolve_effective_personality(user_id, group_id)
+    if pm.get_mode(persona_key) != "split":
+        return  # 羁绊养成仅 split 人格
+    short = pm.get_short_name(persona_key)
+
+    result = _bond_manager.poke(user_id, persona_key)
+    if not result.get("accepted"):
+        # 每日上限：仅模板轻提示，不调 LLM
+        await _safe_send(
+            f"{short}：「今天已经被你戳够啦，明天再来找我玩～」",
+            sender=poke_sender,
+        )
+        return
+
+    _bond_manager.append_event(user_id, persona_key, "用户戳了戳你，你回应了")
+    for up in result.get("level_ups", []):
+        _bond_manager.append_event(
+            user_id, persona_key,
+            f"羁绊提升到了 Lv{up['level']}（{up['title']}）",
+        )
+
+    # 私聊用角色口吻 LLM 反应；群聊默认模板（省 token，与 revoice 策略一致）
+    reaction = None
+    if private:
+        reaction = await _poke_reaction(persona_key, short)
+    if not reaction:
+        reaction = random.choice(_POKE_REACTIONS).format(name=short)
+    await _safe_send(reaction, sender=poke_sender)
+
+    for up in result.get("level_ups", []):
+        await _send_level_up_notice(user_id, persona_key, up, sender=poke_sender)
+
+
+async def _poke_reaction(persona_key: str, short: str):
+    """In-character one-liner for a poke (flash). None → caller falls back."""
+    try:
+        persona_content = get_character_registry().load(persona_key) or ""
+        if not persona_content:
+            return None
+        system = (
+            persona_content
+            + "\n\n---\n你正在扮演上述角色。用户刚刚「戳了戳」你（QQ 的戳一戳互动，"
+              "类似轻轻碰你一下/摸头），请写一句符合角色性格的简短自然反应。"
+        )
+        prompt = (
+            "用户戳了戳你。请以角色口吻写一句简短反应。"
+            "要求：不超过40字；不使用markdown；不报任何数值；只输出这句话本身。"
+        )
+        raw = await _model_router.flash_client.chat_completion(
+            message=prompt,
+            history=[{"role": "system", "content": system}],
+            timeout_set=15.0,
+            purpose="poke_reaction",
+        )
+        candidate = (raw or "").strip()
+        if (
+            candidate
+            and not candidate.startswith(_LLM_ERROR_PREFIXES)
+            and len(candidate) <= 120
+            and "\n" not in candidate
+        ):
+            return candidate
+    except Exception:
+        pass
+    return None
+
+
+async def _handle_bond_command(
+    text: str, user_id: str, view: InboundMessage, sender=None
+) -> bool:
+    """Handle /好感度 #好感度 /bond — 直接展示当前角色羁绊状态，零 token。"""
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/好感度", "#好感度", "/bond"):
+        return False
+    pm = get_character_registry()
+    group_id = view.group_id
+    persona_key = pm.resolve_effective_personality(user_id, group_id)
+    display = pm.get_display_name(persona_key)
+    if pm.get_mode(persona_key) != "split":
+        await _safe_send(
+            f"当前人格「{display}」未启用羁绊养成。\n"
+            f"用 /人格切换 切换到支持养成的角色后再查询好感度哦~",
+            sender=sender,
+        )
+        return True
+    role_str = _perm_manager.get_role(user_id).value
+    _bond_msg = _bond_manager.format_status(
+        user_id, persona_key, display_name=display, role=role_str
+    )
+    # 键盘版（buttons P0）：养成动作导航。/剧情 仅私聊可用（群聊会拒绝），
+    # 群聊行换成帮助。设好感用 enter=False 预填，让用户补等级数字。
+    _bond_rows: Rows = [[
+        Btn(label="剧情", data="/剧情", action="cmd"),
+        Btn(label="设好感", data="/设好感 ", action="cmd", enter=False),
+        Btn(label="换人格", data="/人格切换", action="cmd"),
+    ]] if not view.is_group else [[
+        Btn(label="设好感", data="/设好感 ", action="cmd", enter=False),
+        Btn(label="换人格", data="/人格切换", action="cmd"),
+        Btn(label="帮助", data="/帮助", action="cmd"),
+    ]]
+    await _send_receipt_kb(_bond_msg, _bond_rows, sender=sender,
+                           label="bond-status")
+    return True
+
+
+async def _handle_set_bond_command(
+    text: str, user_id: str, view: InboundMessage, sender=None
+) -> bool:
+    """Handle /设好感 <等级> — 把自己与当前角色的羁绊直接设到目标等级。
+
+    所有人可用（零 token）：只作用于本人的羁绊状态，允许上调/下调——
+    「只涨不掉」是自然积累的纪律，本人显式重设视为自由存档。
+    跨用户调整不存在：命令永远作用于发送者自己。
+    """
+    parts = text.strip().split()
+    if not parts or parts[0] not in ("/设好感", "#设好感"):
+        return False
+    if len(parts) < 2 or not parts[1].isdigit() or not (1 <= int(parts[1]) <= 10):
+        await _safe_send(
+            "用法：/设好感 <等级1-10>（作用于你与当前角色人格的羁绊）",
+            sender=sender,
+        )
+        return True
+    pm = get_character_registry()
+    persona_key = pm.resolve_effective_personality(user_id, view.group_id)
+    display = pm.get_display_name(persona_key)
+    if pm.get_mode(persona_key) != "split":
+        await _safe_send(
+            f"当前人格「{display}」未启用羁绊养成，先用 /人格切换 切换到角色。",
+            sender=sender,
+        )
+        return True
+    _bond_manager.set_level(user_id, persona_key, int(parts[1]))
+    state = _bond_manager.get_state(user_id, persona_key)
+    role_str = _perm_manager.get_role(user_id).value
+    await _safe_send(
+        f"✅ 已把你与「{display}」的羁绊设为 Lv{state.get('level')}。\n"
+        + _bond_manager.format_status(
+            user_id, persona_key, display_name=display, role=role_str
+        ),
+        sender=sender,
+    )
+    return True
+
+
+def _escape_md_command_hashes(content: str) -> str:
+    """Escape ``#`` that belongs to command text, not to a real heading.
+
+    QQ 官方 markdown（msg_type=2）把行首/列表项内的 ``#`` 一律当标题渲染，
+    于是 HELP.md 的反馈命令 ``#反馈``/``#bug``/``#建议`` 会被误识别成节。
+    判别依据：真标题的 ``#{1,6}`` 之后**必带空格**（``# 一号标题``、``## 反馈``），
+    而命令前缀的 ``#`` 紧跟一个非空白、非 ``#`` 字符（``#反馈``）。故只匹配
+    「``#`` 串的首个 ``#``、其后紧跟 ``[^\\s#]``」并加反斜杠转义（CommonMark 标准
+    转义符）：``(?<![#\\])`` 保证只命中串首且跳过已转义者（幂等），``[^\\s#]``
+    保证 ``## 反馈`` 这类真标题（首 ``#`` 后是 ``#``）不被误伤。设计文档 §line442
+    预期其余 md 命令复用本 helper。
+    """
+    return re.sub(r"(?<![#\\])#(?=[^\s#])", r"\#", content)
+
+
+def _help_markdown() -> str:
+    """HELP.md → official-md-safe body (design §6.10.3: /帮助 as one
+    msg_type=2 message instead of a card image — saves 1 reply quota and
+    stays copyable/searchable).
+
+    Transform keeps whitelisted syntax (#/## headings, - lists, **bold**)
+    and fixes the violations HELP.md contains: inline-code backticks (not in
+    the official whitelist — would render verbatim) are stripped; `---`
+    horizontal rules become `***` (the whitelisted hr form); and the ``#``
+    feedback-command prefixes get backslash-escaped so QQ's renderer doesn't
+    treat them as headings (see _escape_md_command_hashes).
+    "" on read failure → caller falls back to the card image path.
+    """
+    try:
+        with open(_HELP_MD_PATH, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except Exception:  # noqa: BLE001 — help must never crash the turn
+        return ""
+    if not content:
+        return ""
+    content = content.replace("`", "")
+    content = re.sub(r"^\s*-{3,}\s*$", "***", content, flags=re.MULTILINE)
+    return _escape_md_command_hashes(content)
+
+
+async def _send_markdown_doc(path: str, label: str = "文档") -> bool:
+    """Read a markdown doc and send it segmented by ``## `` sections.
+
+    Merges short sections to fit QQ message limits (~500 chars) with a 1s delay
+    between chunks. Returns True if any content was sent.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except FileNotFoundError:
+        await _safe_send(f"{label}不存在，请联系管理员。")
+        return False
+    except Exception as e:
+        await _safe_send(f"读取{label}失败: {e}")
+        return False
+
+    if not content:
+        await _safe_send(f"{label}为空。")
+        return False
+
+    # Segment by ## section headers, keeping each section intact
+    parts = []
+    current = ""
+    for line in content.split("\n"):
+        if line.startswith("## ") and current:
+            parts.append(current.rstrip())
+            current = line + "\n"
+        else:
+            current += line + "\n"
+    if current:
+        parts.append(current.rstrip())
+
+    # Merge short parts to fit QQ message limits (~500 chars)
+    merged = []
+    buf = ""
+    for part in parts:
+        if len(buf) + len(part) < 500:
+            buf += "\n\n" + part if buf else part
+        else:
+            if buf:
+                merged.append(buf)
+            buf = part
+    if buf:
+        merged.append(buf)
+
+    for i, chunk in enumerate(merged):
+        await _safe_send(chunk)
+        if i < len(merged) - 1:
+            await asyncio.sleep(1.0)
+    return True
+
+
+async def _handle_features_command(text: str, user_id: str) -> bool:
+    """Handle /功能 / /features command — direct, no agent.
+
+    Renders FEATURES.md as a feature card image and sends only the image
+    (no text). Returns True if the command was handled.
+    """
+    cmd = text.strip().split()[0] if text.strip() else ""
+    if cmd not in ("/功能", "/features"):
+        return False
+
+    features_path = os.path.join(_CONFIG_DIR, "FEATURES.md")
+
+    try:
+        card_path = await asyncio.to_thread(render_feature_card, features_path)
+        if card_path:
+            await _safe_send(OutImage(path=card_path, label="feature card"))
+            # 键盘版（buttons P0）：卡片是图片，键盘必须骑在 md 消息上，
+            # 故补 1 条轻量导航（官方 c2c 4 条配额下图片+导航=2 条，安全）。
+            if _channel_supports_keyboard():
+                await _safe_send_kb("功能速查导航：", [[
+                    Btn(label="帮助", data="/帮助", action="cmd"),
+                    Btn(label="更新日志", data="/更新日志", action="cmd"),
+                    Btn(label="兑换码", data="/兑换码", action="cmd"),
+                ]], label="features-nav")
+        else:
+            await _safe_send("功能表为空或不存在，请联系管理员。")
+    except Exception:
+        await _safe_send("功能卡片渲染失败，请稍后重试。")
+
+    return True
+
+
+# 匹配 /更新日志 [d] / #更新日志 [d] / /update record [d] / /changelog [d] 等
+_CHANGELOG_CMD_RE = re.compile(
+    r"^\s*[/#](更新日志|更新记录|update\s+record|update\s+log|changelog)\s*(\d+)?\s*$",
+    re.IGNORECASE,
+)
+
+
+async def _handle_changelog_command(text: str, user_id: str) -> bool:
+    """Handle /更新日志 [d] / /update record [d] — direct, no agent, zero token.
+
+    d = 返回最近多少条更新记录（缺省 3，clamp 到 1..20）。数据源为
+    QQBot/data/changelog/changelog.json，由 WebUI 维护。
+    Returns True if the command was handled.
+    """
+    m = _CHANGELOG_CMD_RE.match(text or "")
+    if not m:
+        return False
+
+    from tools.changelog import get_recent, format_for_qq, DEFAULT_COUNT
+
+    d = int(m.group(2)) if m.group(2) else DEFAULT_COUNT
+    entries = get_recent(d)
+    await _send_text_chunks(format_for_qq(entries, requested=d, site_url=_PUBLIC_SITE_URL))
+
+    # 2. Render and send the changelog card (best-effort; text already sent)
+    try:
+        card_path = await asyncio.to_thread(
+            render_changelog_card, entries, site_url=_PUBLIC_SITE_URL)
+        if card_path:
+            await asyncio.sleep(1.0)
+            await _safe_send(OutImage(path=card_path, label="changelog card"))
+    except Exception:
+        pass  # 卡片是锦上添花，渲染/发送失败绝不影响文本回复
+
+    # 3. 键盘版（buttons P0）：更多日志 / 官网 / 反馈预填
+    if _channel_supports_keyboard():
+        await _safe_send_kb("完整更新日志见官网：", [[
+            Btn(label="更多日志", data="/更新日志 10", action="cmd"),
+            Btn(label="官网", data=_PUBLIC_SITE_URL, action="url"),
+            Btn(label="反馈", data="#反馈 ", action="cmd", enter=False),
+        ]], label="changelog-nav")
+    return True
+
+
+async def _handle_toggle_command(text: str, user_id: str, view: InboundMessage) -> bool:
+    """Handle /toggle command for group feature management.
+
+    Only works in group chats, only for superusers.
+    Returns True if the command was handled.
+    """
+    cmd, _, args = text.partition(" ")
+    if cmd not in ("/toggle", "#toggle"):
+        return False
+
+    # Only in group chats
+    if not view.is_group:
+        await _safe_send("此命令仅在群聊中可用。")
+        return True
+
+    group_id = view.group_id
+    gf = get_group_features()
+    gf.refresh()
+
+    # Check superuser
+    if not gf.is_superuser(user_id):
+        await _safe_send("此命令仅限超级用户（代码开发者）使用。")
+        return True
+
+    from agent.group_features import FEATURE_LABELS, FEATURE_ORDER
+
+    args = args.strip().lower()
+
+    # /toggle — show current settings
+    if not args:
+        # 管理员面板键盘版（buttons P1，§C.3）：每功能 [开][关] 回调按钮。
+        # admin_only + wire 层把群聊 cb 按钮锁定到渲染者 openid（他人不可点）。
+        # 文本面板原样保留给 OneBot / 降级路径。
+        if _channel_supports_keyboard():
+            _kb_md, _kb_rows = _session_render.render_toggle_page(
+                group_id, gf=gf, registry=get_character_registry())
+            await _safe_send_kb(_kb_md, _kb_rows, label="toggle-panel")
+            return True
+        features = gf.get_all_features(group_id)
+        lines = ["当前群聊功能状态："]
+        for key in FEATURE_ORDER:
+            label = FEATURE_LABELS[key]
+            state = "开启" if features[key] else "关闭"
+            lines.append(f"  {label}: {state}")
+        pm = get_character_registry()
+        group_key = pm.get_group_personality(group_id)
+        if group_key:
+            lines.append(f"  默认人格: {pm.get_display_name(group_key)} ({group_key})")
+        else:
+            lines.append(f"  默认人格: 未绑定（全局默认 {pm.get_display_name(pm.get_default())}）")
+        lines.append(f"\n用法: /toggle <功能名> <on|off>  例如: /toggle gacha off")
+        lines.append(f"用法: /toggle personality <名称>  设置本群默认人格；/toggle personality 默认 清除")
+        await _safe_send("\n".join(lines))
+        return True
+
+    # /toggle personality [名称|默认] — group default personality
+    if args == "personality" or args.startswith("personality "):
+        pm = get_character_registry()
+        rest = args[len("personality"):].strip()
+        if not rest:
+            group_key = pm.get_group_personality(group_id)
+            global_key = pm.get_default()
+            if group_key:
+                lines = [
+                    f"当前本群默认人格: {pm.get_display_name(group_key)} ({group_key})",
+                    f"全局默认人格: {pm.get_display_name(global_key)} ({global_key})",
+                ]
+            else:
+                lines = [
+                    "当前本群未绑定默认人格（使用全局默认）。",
+                    f"全局默认人格: {pm.get_display_name(global_key)} ({global_key})",
+                ]
+            lines.append("\n用法: /toggle personality <名称> 设置；/toggle personality 默认 清除绑定")
+            await _safe_send("\n".join(lines))
+            return True
+        if rest == "默认":
+            pm.clear_group_personality(group_id)
+            global_key = pm.get_default()
+            await _safe_send(f"已清除本群默认人格，回落到全局默认「{pm.get_display_name(global_key)}」。")
+            return True
+        try:
+            # owner_id=user_id lets a superuser bind their own UGC characters
+            resolved = pm.set_group_personality(group_id, rest, owner_id=user_id)
+            await _safe_send(f"已设置本群默认人格为「{pm.get_display_name(resolved)}」。")
+        except ValueError as e:
+            await _safe_send(str(e))
+        return True
+
+    # /toggle <feature> <on|off>
+    parts = args.split()
+    if len(parts) != 2:
+        await _safe_send("用法: /toggle <功能名> <on|off>\n例如: /toggle gacha off\n\n可用的功能名: " + ", ".join(FEATURE_ORDER))
+        return True
+
+    feature, action = parts
+
+    if action not in ("on", "off"):
+        await _safe_send("第二个参数必须是 on 或 off。\n例如: /toggle gacha off")
+        return True
+
+    try:
+        enabled = (action == "on")
+        gf.set_feature(group_id, feature, enabled)
+        label = FEATURE_LABELS.get(feature, feature)
+        state = "开启" if enabled else "关闭"
+        await _safe_send(f"已在本群{state}「{label}」。")
+    except ValueError as e:
+        await _safe_send(str(e))
+
+    return True
+
+
+# ── /按钮探测 — 官方渠道键盘能力探测（c2c + admin，buttons §6.7）────
+async def _handle_button_probe_command(
+        text: str, user_id: str, view: InboundMessage) -> bool:
+    """Send a minimal 1×1 probe keyboard + report the breaker state.
+
+    qq_official + c2c + admin only: the probe spends passive-reply quota
+    and the callback button needs the interaction intent, so it is a
+    deployment diagnostic, not a user feature.
+    """
+    cmd = text.split(maxsplit=1)[0]
+    if cmd not in ("/按钮探测", "#按钮探测"):
+        return False
+    if _current_platform.get() != "qq_official":
+        await _safe_send("按钮探测仅在 QQ 官方渠道可用（OneBot 渠道不支持键盘）。")
+        return True
+    if view.is_group:
+        await _safe_send("请在私聊中使用 /按钮探测。")
+        return True
+    if _perm_manager.get_role(user_id) != UserRole.ADMIN:
+        await _safe_send("此命令仅限管理员使用。")
+        return True
+    from adapters.qq_official import kb_snapshot
+    snap = kb_snapshot()
+    md = (
+        "**按钮能力探测**\n"
+        f"- 熔断状态: {snap['state']}（env={snap['env']}）\n"
+        f"- 当前可用: {'是' if snap['available'] else '否'}\n"
+        f"- 累计拒绝: {snap['rejected_total']} | "
+        f"最近拒绝码: {snap['last_reject_code'] or '无'}\n"
+        f"- 冷却剩余: {snap['disabled_seconds_left']:.0f}s\n\n"
+        "点击下方按钮验证回调链（需要 interaction intent 已授权）。"
+    )
+    rows = [[Btn(label="探测回调", data="qb1:admin.probe",
+                 action="cb", admin_only=True)]]
+    await _safe_send_kb(md, rows)
+    return True
+
+
+# ── /流式探测 — 官方渠道流式能力探测（c2c + admin，§6.10.11.2）──────
+async def _handle_stream_probe_command(
+        text: str, user_id: str, view: InboundMessage) -> bool:
+    """Report the stream breaker state + send a minimal dual-stream probe.
+
+    qq_official + c2c + admin only (mirrors /按钮探测): streaming rides
+    the passive-reply anchor and burns stream quota, so it is a
+    deployment diagnostic. The live probe verifies the ONE unverified
+    platform assumption end-to-end — whether a single msg_id anchor can
+    host TWO stream messages (progress stream #1 + answer stream #2);
+    if not, the design degrades to a single stream.
+    """
+    cmd = text.split(maxsplit=1)[0]
+    if cmd not in ("/流式探测", "#流式探测"):
+        return False
+    if _current_platform.get() != "qq_official":
+        await _safe_send("流式探测仅在 QQ 官方渠道可用（OneBot 渠道不支持流式消息）。")
+        return True
+    if view.is_group:
+        await _safe_send("请在私聊中使用 /流式探测。")
+        return True
+    if _perm_manager.get_role(user_id) != UserRole.ADMIN:
+        await _safe_send("此命令仅限管理员使用。")
+        return True
+    from adapters.qq_official_stream import stream_snapshot
+    snap = stream_snapshot()
+    lines = [
+        "**流式能力探测**",
+        f"- 熔断状态: {snap['state']}（env={snap['env']}）",
+        f"- 当前可用: {'是' if snap['available'] else '否'}",
+        f"- 累计拒绝: {snap['rejected_total']} | "
+        f"最近错误: {snap['last_error'] or '无'}",
+        f"- 冷却剩余: {snap['disabled_seconds_left']:.0f}s",
+    ]
+    if not snap["available"]:
+        lines.append("\n能力不可用，跳过实发探测（本回合走缓冲路径）。")
+        await _safe_send(OutMarkdown("\n".join(lines)))
+        return True
+    s = _turn_sender.get() or default_sender
+    streamer = None
+    # 探测的意义就是"现在再试一次"：先清掉长熔断，否则上面的 available
+    # 判定会把探测本身挡在门外（2026-10-30：一次 404 后探测无法复验）。
+    from adapters.qq_official_stream import stream_force_probation
+    stream_force_probation()
+    try:
+        opener = getattr(s, "open_stream", None)
+        if opener is not None:
+            streamer = await opener("⏳ 流式探测：进度流首片…")
+    except Exception as e:  # noqa: BLE001 — probe never raises
+        lines.append(f"\n进度流打开异常: {type(e).__name__}: {e}")
+    if streamer is None:
+        lines.append("\n❌ 进度流首片被拒（详见上方熔断状态）。")
+        await _safe_send(OutMarkdown("\n".join(lines)))
+        return True
+    await streamer.append_progress("⏳ 探测第二片…")
+    await streamer.finish_progress()
+    dual = await streamer.open_answer("回答流首片…")
+    if dual:
+        streamer.append_answer("增量片段…")
+        await streamer.finish_answer("探测完成。")
+    await streamer.close()
+    lines.append(f"\n- 进度流(流#1): {'❌ 中途断裂' if streamer.broken else '✅ 全程无拒绝'}")
+    lines.append(
+        f"- 双流同锚点(流#2): "
+        f"{'✅ 双流模型可行' if dual and not streamer.broken else '❌ 平台拒绝，需降级单流'}")
+    lines.append(f"- remain_msg_len 实测: {streamer.remain_msg_len}"
+                 "（平台挂起长度，0=正常，非发送预算）")
+    await _safe_send(OutMarkdown("\n".join(lines)))
+    return True
+
+
+# ── 参考立绘：/设形象 · /形象 · /清除形象（UGC 角色，零 token）──────
+# 参考立绘是角色卡之外的第二条视觉锚：文字锚是卡里的 ## Appearance Anchor，
+# 图片锚是 CHARACTERS_DIR/<char_id>/assets/reference.*（I2I 用）。只在自创
+# 角色上开放——内置角色是公共设定，改了会影响所有用户。
+_PORTRAIT_SET_CMDS = ("/设形象", "#设形象")
+_PORTRAIT_SHOW_CMDS = ("/形象", "#形象", "/查看形象")
+_PORTRAIT_CLEAR_CMDS = ("/清除形象", "#清除形象", "/删形象")
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+
+
+def _owned_ugc(registry, char_id: str, user_id: str) -> bool:
+    """True if ``char_id`` is a UGC character authored by ``user_id``."""
+    return bool(
+        char_id
+        and registry.is_ugc(char_id)
+        and (registry.get_meta(char_id) or {}).get("author") == user_id
+    )
+
+
+def _builtin_portrait_allowed(registry, char_id: str) -> bool:
+    """内置人格能不能有形象：必须是角色面（split），否则根本不画图。"""
+    try:
+        return registry.get_mode(char_id) == "split"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _role_value(user_id: str) -> str:
+    try:
+        return _perm_manager.get_role(user_id).value
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _portrait_target(registry, text: str, user_id: str, view, *, write: bool):
+    """Resolve (char_id, display_name, error_msg, scope) for a portrait command.
+
+    ``scope`` 为 "user"（自创角色，仅作者本人可见/可改）或 "builtin"
+    （内置人格，形象是全局资产）。写操作对内置人格要求管理员，查看不限。
+    """
+    _, _, args = text.partition(" ")
+    args = args.strip()
+    if args:
+        char_id = registry.resolve_name(args, user_id=user_id)
+        if char_id and registry.is_builtin(char_id):
+            scope = "builtin"
+        elif _owned_ugc(registry, char_id, user_id):
+            scope = "user"
+        else:
+            return "", "", (
+                f"没找到你的自创角色「{args}」。参考立绘只能设在自己的自创角色上："
+                "用 /人格切换 查看可用角色，或 /创建角色 新建一个。"), ""
+    else:
+        char_id = registry.resolve_effective_personality(user_id, view.group_id)
+        if char_id and registry.is_builtin(char_id):
+            scope = "builtin"
+        elif _owned_ugc(registry, char_id, user_id):
+            scope = "user"
+        else:
+            name = registry.get_display_name(char_id) if char_id else "当前人格"
+            return "", "", (
+                f"当前人格「{name}」既不是你的自创角色，也不是内置人格，"
+                "设不了参考立绘。\n"
+                "可以先用 /人格切换 切到自己的角色，或直接写 `/设形象 <角色名>`。"), ""
+
+    display = registry.get_display_name(char_id)
+    if scope == "builtin":
+        if not _builtin_portrait_allowed(registry, char_id):
+            return "", "", (
+                f"「{display}」不是角色人格（不生成图片），给它设形象没有意义。"), ""
+        if write and _role_value(user_id) != "admin":
+            return "", "", (
+                f"「{display}」是内置人格，形象是全局设置，只有管理员能改。\n"
+                "你可以用 /创建角色 做一个自己的角色，形象只对你自己可见。"), ""
+    return char_id, display, "", scope
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+async def _portrait_source(view):
+    """Find the image for /设形象 → (path, source_label, error_msg)."""
+    atts = await view.load_attachments()
+    images = [a for a in atts if a.kind == "image"]
+    for att in images:                      # 本条消息新发的优先，其次引用图
+        if att.path:
+            return att.path, ("引用的图" if att.quoted else "这张图"), ""
+    if images:
+        return "", "", (
+            f"图片下载失败了（{images[0].error or '未知原因'}），重新发一次试试")
+    if getattr(view, "platform", "") == "onebot":
+        # OneBot 的引用图不在 segments 里，靠 recent-file 注册表反查
+        try:
+            from adapters.onebot import quoted_file_paths
+            for path in quoted_file_paths(view.raw):
+                if path.lower().endswith(_IMAGE_EXTS) and os.path.isfile(path):
+                    return path, "引用的图", ""
+        except Exception:  # noqa: BLE001 — 反查失败按“没图”处理
+            pass
+    return "", "", (
+        "没看到图片。把图片和命令一起发（图片 + `/设形象`），"
+        "或引用你之前发的那张图再发 `/设形象`。")
+
+
+async def _handle_portrait_command(text: str, user_id: str, view) -> bool:
+    """`/设形象` / `/形象` / `/清除形象` —— 参考立绘（零 token）。
+
+    自创角色：只对作者本人可见/可改。
+    内置人格：形象是全局资产（所有人共用），只有管理员能改，改完立即生效。
+    """
+    cmd = text.partition(" ")[0]
+    if cmd not in (_PORTRAIT_SET_CMDS + _PORTRAIT_SHOW_CMDS + _PORTRAIT_CLEAR_CMDS):
+        return False
+    write = cmd in (_PORTRAIT_SET_CMDS + _PORTRAIT_CLEAR_CMDS)
+    registry = get_character_registry()
+    char_id, display, err, scope = _portrait_target(
+        registry, text, user_id, view, write=write)
+    if err:
+        await _safe_send(err)
+        return True
+    global_note = "（全局生效：所有用户看到的都会变）" if scope == "builtin" else ""
+
+    if cmd in _PORTRAIT_SET_CMDS:
+        path, source, err = await _portrait_source(view)
+        if err:
+            await _safe_send(err)
+            return True
+        try:
+            raw = await asyncio.to_thread(_read_bytes, path)
+            data, width, height = await asyncio.to_thread(
+                normalize_reference_image, raw)
+            await asyncio.to_thread(
+                registry.set_reference_image, char_id, data, "png")
+        except ValueError as e:              # 校验失败：文案可直接回给用户
+            await _safe_send(str(e))
+            return True
+        except Exception as e:               # noqa: BLE001
+            code = log_exception("set reference portrait failed", e)
+            await _safe_send(f"保存参考立绘失败（诊断编号 {code}），稍后再试。")
+            return True
+        if scope == "builtin":
+            from nonebot import logger as _lg
+            _lg.info(f"[portrait] builtin set key={char_id} by={user_id} "
+                     f"size={width}x{height}")
+        await _safe_send(
+            f"✅ 已把{source}设为「{display}」的参考立绘"
+            f"（{describe_size(width, height, len(data))}）{global_note}。\n"
+            "之后向 TA 要画图、以及 TA 主动发图，都会以这张图作为外观基准"
+            "（文字外观设定 + 图片双重锚定），脸更稳。\n"
+            "随时可发 /形象 查看，或 /清除形象 撤掉。")
+        return True
+
+    if cmd in _PORTRAIT_SHOW_CMDS:
+        current = registry.reference_image_path(char_id)
+        if not current:
+            hint = ("内置人格的立绘由管理员统一设置。" if scope == "builtin"
+                    else "把一张图发给 TA 并附上 `/设形象`（或引用那张图再发 `/设形象`）即可设置。")
+            await _safe_send(f"「{display}」还没有参考立绘。\n{hint}")
+            return True
+        await _safe_send(f"「{display}」当前的参考立绘{global_note}：")
+        await _safe_send(OutImage(path=current, label=f"{display} 参考立绘"))
+        return True
+
+    if not registry.clear_reference_image(char_id):      # /清除形象
+        await _safe_send(f"「{display}」本来就没有自定义参考立绘。")
+        return True
+    shipped = (registry.reference_image_path(char_id)
+               if scope == "builtin" else None)
+    if scope == "builtin":
+        tail = ("，已回退到出厂立绘" if shipped else
+                "（该人格暂无出厂立绘，之后按文字外观设定作画）")
+    else:
+        tail = "，之后按文字外观设定作画"
+    await _safe_send(f"已清除「{display}」的参考立绘{tail}{global_note}。")
+    return True
+
+
+def _resolve_session_index(user_id: str, args: str) -> tuple:
+    """Resolve a ``#n`` alias to a session name (buttons P0).
+
+    ``n`` indexes ``list_sessions`` order — the same flat order the
+    keyboard session page numbers its rows, so「切换 3」types
+    ``/切换会话 #3`` and lands on the row the user just saw.
+
+    Returns (name, error): exactly one is None. Non-``#<digits>`` input
+    (including names that merely start with #) passes through unchanged.
+    """
+    if not args.startswith("#") or not args[1:].isdigit():
+        return args, None
+    sessions = _special_sessions.list_sessions(user_id)
+    idx = int(args[1:])
+    if not (1 <= idx <= len(sessions)):
+        return None, (
+            f"序号 {args} 超出范围（当前 1..{len(sessions)}），"
+            f"请先发送 /会话列表 查看。" if sessions else
+            f"你目前没有特殊会话，序号 {args} 无效。"
+        )
+    return sessions[idx - 1]["name"], None
+
+
+# ── /压缩会话 实现（PLAN.md Idea 4 Phase A）───────────────────────────
+
+_COMPRESS_SUMMARY_PROMPT = (
+    "你是对话记录整理员。请把下面的对话历史浓缩为一份结构化摘要，"
+    "它将替代这些消息、作为后续对话的长期记忆。要求覆盖：\n"
+    "1. 关键决策与结论\n"
+    "2. 已完成的任务与产出（保留文件名、链接、数字等具体信息）\n"
+    "3. 未完成 / 待办事项\n"
+    "4. 用户偏好与习惯\n"
+    "用条目式中文输出，不超过 800 字；丢弃寒暄与重复内容，"
+    "不要输出与摘要无关的话。\n\n"
+    "已有摘要（为空则忽略）：\n{previous}\n\n"
+    "新增对话：\n{batch}\n\n"
+    "更新后的完整摘要：")
+
+# DeepSeekClient.chat_completion returns error strings instead of raising —
+# a rolling-summary batch must never fold an error message into the summary.
+_COMPRESS_ERROR_PREFIXES = (
+    "思考超时", "响应超时", "调用DeepSeek API时出错", "[Error]", "[HTTP")
+
+
+def _render_context_for_summary(context: list) -> str:
+    """Render context messages as compact plain text for the summarizer."""
+    lines = []
+    for msg in context:
+        role = msg.get("role", "?")
+        content = msg.get("content")
+        if not isinstance(content, str):
+            content = str(content) if content is not None else ""
+        if role == "tool":
+            content = content.split("\n")[0][:200]  # tool results: first line
+        elif len(content) > COMPRESS_MSG_RENDER_LIMIT:
+            content = content[:COMPRESS_MSG_RENDER_LIMIT] + "…"
+        if content.strip():
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+async def _summarize_in_batches(head: list) -> str:
+    """Rolling LLM summary of ``head``; raises RuntimeError on LLM failure.
+
+    The head may itself approach the model window, so it is folded in
+    batches of ~COMPRESS_SUMMARY_BATCH_TOKENS: each flash-model call merges
+    the previous summary + one batch into the next summary. Uses FLASH (a
+    low-stakes condensation task, same rationale as profile extraction).
+    """
+    client = _model_router.flash_client
+    summary = ""
+    batch: list = []
+    batch_tokens = 0
+
+    async def _fold(b: list) -> str:
+        prompt = _COMPRESS_SUMMARY_PROMPT.format(
+            previous=summary or "（无）",
+            batch=_render_context_for_summary(b))
+        result = await client.chat_completion(
+            prompt, timeout_set=120.0, purpose="session_compress")
+        result = (result or "").strip()
+        if not result or result.startswith(_COMPRESS_ERROR_PREFIXES):
+            raise RuntimeError(f"摘要生成失败: {result[:120] or '空响应'}")
+        return result
+
+    for msg in head:
+        batch.append(msg)
+        batch_tokens += estimate_text_tokens(str(msg.get("content") or ""))
+        if batch_tokens >= COMPRESS_SUMMARY_BATCH_TOKENS:
+            summary = await _fold(batch)
+            batch, batch_tokens = [], 0
+    if batch or not summary:
+        summary = await _fold(batch)
+    return summary
+
+
+async def _run_session_compression(user_id: str, name: str):
+    """Execute a confirmed /压缩会话: rolling summary + storage write-back.
+
+    Any failure (LLM or storage) aborts BEFORE touching the stored context —
+    the session stays exactly as it was.
+    """
+    session = _special_sessions.get_by_name(user_id, name)
+    if session is None:
+        await _safe_send(f"会话「{name}」不存在，已取消压缩。")
+        return
+    if session.total_messages < COMPRESS_MIN_MESSAGES:
+        await _safe_send(
+            f"会话「{name}」当前只有 {session.total_messages} 条消息，"
+            "不满足压缩条件，已取消。")
+        return
+
+    await _safe_send("⏳ 正在整理会话记忆，可能需要一点时间…")
+
+    context = session.context
+    keep = min(COMPRESS_KEEP_RECENT, len(context) - 1)
+    head = context[:-keep] if keep else list(context)
+
+    try:
+        summary = await _summarize_in_batches(head)
+    except Exception as e:  # noqa: BLE001 — any LLM failure aborts cleanly
+        code = log_exception("session compression summary failed", e)
+        await _safe_send(
+            f"压缩失败（诊断编号 {code}），会话保持原样，请稍后重试。")
+        return
+
+    try:
+        stats = _special_sessions.apply_compression(
+            user_id, name, summary, keep_recent=keep)
+    except ValueError as e:
+        await _safe_send(str(e))
+        return
+    except Exception as e:  # noqa: BLE001 — storage failure aborts cleanly
+        code = log_exception("session compression write-back failed", e)
+        await _safe_send(
+            f"压缩写回失败（诊断编号 {code}），会话保持原样，请联系管理员。")
+        return
+
+    await _safe_send(
+        f"呼～整理完毕！会话「{name}」的记忆已压缩：\n"
+        f"  {stats['before_messages']} 条 → 摘要 + 最近 {stats['kept_recent']} 条\n"
+        f"  估算 token: {max(1, stats['before_tokens_est'] // 1000)}k → "
+        f"{max(1, stats['after_tokens_est'] // 1000)}k\n"
+        f"关键结论、产出与待办都收进摘要里了；最近的对话原样保留。")
+
+
+async def _handle_session_command(
+    text: str, user_id: str, group_id: str = None
+) -> bool:
+    """Handle special session management commands.
+
+    ``group_id`` 供会话人格快照/回落解析使用（群默认人格层）。
+
+    Returns True if the command was handled (should skip agent processing).
+    """
+    cmd, _, args = text.partition(" ")
+    args = args.strip()
+
+    # ── /创建角色 ──────────────────────────────────────────────
+    # 访谈式 UGC 角色创作（Bond-System-Design.md §5.1, P1）。占用一个特殊会话
+    # 槽，metadata.kind = char_creation 触发 agent L4 访谈指令 + create_character。
+    if cmd in ("/创建角色", "#创建角色"):
+        registry = get_character_registry()
+        role = _perm_manager.get_role(user_id)
+        # 去重恢复（D6）：查已有 char_creation 会话（活跃与否），命中即恢复现场，
+        # 杜绝重复 /创建角色 产生「角色创作_1」膨胀。创作会话豁免配额（§2.1），
+        # 故不做特殊会话槽检查——豁免会话的创建不该被普通配额闸拦住。
+        existing_creation = next(
+            (s for s in _special_sessions.list_sessions(user_id)
+             if (s.get("metadata") or {}).get("kind") == CREATION_KIND),
+            None,
+        )
+        if existing_creation:
+            active = _special_sessions.get_active(user_id)
+            if active and active.name == existing_creation["name"]:
+                await _safe_send(
+                    "你已经在一个角色创作访谈中了，直接回答我的问题即可；"
+                    "想放弃请用 /结束会话 退出。"
+                )
+                return True
+            try:
+                _special_sessions.switch_to(user_id, existing_creation["name"])
+            except Exception as e:
+                code = log_exception("resume creation session failed", e)
+                await _safe_send(f"恢复角色创作失败（诊断编号 {code}），请稍后重试。")
+                return True
+            await _safe_send(
+                "继续上次未完成的角色创作——把剩下的设定告诉我吧。"
+                "（该会话不占配额；随时可用 /结束会话 放弃）"
+            )
+            return True
+        # Character quota（自创角色数量上限，与会话配额无关）
+        max_chars = _perm_manager.get_max_characters(role)
+        owned = registry.list_ugc(user_id)
+        if len(owned) >= max_chars:
+            names = "、".join(registry.get_display_name(m["char_id"]) for m in owned) or "无"
+            await _safe_send(
+                f"你的自创角色数量已达上限（{len(owned)}/{max_chars}）：{names}。\n"
+                "请先用 /删除角色 <名称> 清理，再创建新角色。"
+            )
+            return True
+        # 创作会话豁免配额（scene-session-archive-design.md §2.1/D6），无槽位检查。
+        try:
+            session = _special_sessions.create(
+                user_id, "角色创作", metadata={"kind": CREATION_KIND}
+            )
+            _special_sessions.switch_to(user_id, session.name)
+            _temp_session_files.pop(user_id, None)
+            seed = (
+                "开始创作你的专属角色吧！我会逐项问你一些设定，"
+                "每项都可以直接回答；也可以说「跳过」用默认值，或「随机」让我替你拟一个。\n\n"
+                f"（当前自创角色 {len(owned)}/{max_chars}；随时可用 /结束会话 放弃创作）\n\n"
+                "第一项：给你的角色起个名字吧（不超过 24 个字）。"
+            )
+            # Record the greeting as the assistant's first interview turn so the
+            # session context stays coherent (zero-LLM seeding).
+            _special_sessions.add_message(user_id, "assistant", seed)
+            await _safe_send(seed)
+        except Exception as e:
+            code = log_exception("create-character session failed", e)
+            await _safe_send(f"启动角色创作失败（诊断编号 {code}），请稍后重试。")
+        return True
+
+    # ── /删除角色 <名称> ───────────────────────────────────────
+    # 删除自己的 UGC 角色（二次确认）。保留 bond 好感数据（重逢仍在）。
+    if cmd in ("/删除角色", "#删除角色"):
+        registry = get_character_registry()
+        if not args:
+            # 键盘版（buttons P1）：每角色一个 [删 n] 回调按钮 + modal 确认，
+            # 免走两步文本协议；文本列表原样保留给 OneBot / 降级路径。
+            if _channel_supports_keyboard():
+                _kb_md, _kb_rows = _session_render.render_character_page(
+                    user_id, registry=registry)
+                await _safe_send_kb(_kb_md, _kb_rows, label="char-list")
+                return True
+            owned = registry.list_ugc(user_id)
+            if not owned:
+                await _safe_send("你还没有自创角色。用 /创建角色 访谈式创建一个吧~")
+                return True
+            lines = ["你的自创角色:"]
+            for m in owned:
+                lines.append(f"  {registry.get_display_name(m['char_id'])} ({m['char_id']})")
+            lines.append("\n用法: /删除角色 <名称>")
+            await _safe_send("\n".join(lines))
+            return True
+
+        confirm_key = f"确认删除角色 {args}"
+        if text == confirm_key:
+            pending = _pending_char_delete_confirm.get(user_id)
+            if pending and time.time() < pending[1] and pending[0] == args:
+                char_id = registry.resolve_name(args, user_id=user_id)
+                _pending_char_delete_confirm.pop(user_id, None)
+                if not (char_id and registry.is_ugc(char_id)
+                        and (registry.get_meta(char_id) or {}).get("author") == user_id):
+                    await _safe_send(f"未找到你的自创角色「{args}」。")
+                    return True
+                display = registry.get_display_name(char_id)
+                registry.delete(char_id)
+                purged = registry.purge_references(char_id)
+                note = f"\n（已解除 {purged} 处人格设置引用）" if purged else ""
+                await _safe_send(
+                    f"已删除自创角色「{display}」。{note}\n"
+                    "该角色的好感度记录已保留，若日后重建同名角色不会自动继承。"
+                )
+                return True
+            _pending_char_delete_confirm.pop(user_id, None)
+            await _safe_send("确认已超时（60秒）或已失效，请重新发起 /删除角色。")
+            return True
+
+        # First call — resolve + request confirmation
+        char_id = registry.resolve_name(args, user_id=user_id)
+        if not (char_id and registry.is_ugc(char_id)
+                and (registry.get_meta(char_id) or {}).get("author") == user_id):
+            await _safe_send(
+                f"未找到你的自创角色「{args}」。\n"
+                "（只能删除你自己创建的角色；内置人格请用 /人格切换 切换。）"
+            )
+            return True
+        display = registry.get_display_name(char_id)
+        _pending_char_delete_confirm[user_id] = (args, time.time() + 60)
+        await _safe_send(
+            f"确认删除自创角色「{display}」？此操作不可撤销（好感度记录会保留）。\n"
+            f"请回复「确认删除角色 {args}」来执行（60秒内有效）。"
+        )
+        return True
+
+    # ── /新会话 [名称] ─────────────────────────────────────────
+    if cmd in ("/新会话", "#新会话"):
+        role = _perm_manager.get_role(user_id)
+        max_sessions = _perm_manager.get_max_special_sessions(role)
+        sessions = _quota_sessions(user_id)
+        if len(sessions) >= max_sessions:
+            names = ", ".join(s["name"] for s in sessions)
+            _label = "特殊" if not _scene_archive_enabled() else "普通"
+            await _safe_send(
+                f"已达到最大{_label}会话数 ({max_sessions})。"
+                f"现有会话: {names}。请先删除一个再创建。"
+            )
+            return True
+        try:
+            name = args if args else None
+            # 会话人格绑定：创建时快照当前生效人格。必须在 create/switch_to
+            # 之前 resolve——切换后 provider 会看到新会话自己（未绑定→穿透），
+            # 快照就丢了当前上下文里的人格。
+            _pm_new = get_character_registry()
+            _snapshot = _pm_new.resolve_effective_personality(user_id, group_id)
+            _snapshot_display = _pm_new.get_display_name(_snapshot)
+            session = _special_sessions.create(
+                user_id, name, metadata={"persona_key": _snapshot})
+            # Activate the session — create() only persists it, doesn't set active_session
+            _special_sessions.switch_to(user_id, session.name)
+            # Starting a fresh special session; drop any pending temp-session file
+            # provenance (the user did not choose /保存为会话 to carry it over).
+            _temp_session_files.pop(user_id, None)
+            quota_warn = _quota_warning(user_id)
+            if args:
+                msg = (
+                    f"已创建特殊会话「{session.name}」。\n"
+                    f"会话人格: {_snapshot_display}（会话内 /人格切换 仅作用于本会话）。\n"
+                    f"当前处于特殊会话模式，上下文将持续保存。\n"
+                    f"使用 /结束会话 退出，/会话列表 查看所有会话。"
+                )
+            else:
+                _pending_naming[user_id] = True
+                msg = (
+                    f"已创建特殊会话「{session.name}」（名称待精炼）。\n"
+                    f"会话人格: {_snapshot_display}（会话内 /人格切换 仅作用于本会话）。\n"
+                    f"首次交互后会自动生成更贴切的名称。\n"
+                    f"当前处于特殊会话模式，上下文将持续保存。"
+                )
+            msg += _delete_quota_tail(user_id, "")
+            if quota_warn:
+                msg += f"\n\n{quota_warn}"
+            await _send_receipt_kb(msg, _NAV_SESSION_ACTIVE,
+                                   label="new-session")
+        except ValueError as e:
+            await _safe_send(str(e))
+        return True
+
+    # ── /会话列表 ──────────────────────────────────────────────
+    if cmd in ("/会话列表", "#会话列表", "/会话", "#会话"):
+        # 官方渠道键盘版（buttons P0/P1）：分页 + 切换/删除按钮。
+        # 群聊 scope 只渲染「请私聊」引导（§9.2 私密数据不落群）。
+        # 文本视图（含剧情归档分组）原样保留给 OneBot / 降级路径。
+        if _channel_supports_keyboard():
+            _kb_md, _kb_rows = _session_render.render_session_page(
+                user_id, 1, "group" if group_id else "c2c",
+                sessions_mgr=_special_sessions, perm=_perm_manager,
+                registry=get_character_registry())
+            await _safe_send_kb(_kb_md, _kb_rows, label="session-list")
+            return True
+        role = _perm_manager.get_role(user_id)
+        max_sessions = _perm_manager.get_max_special_sessions(role)
+        sessions = _special_sessions.list_sessions(user_id)
+        active_name = _special_sessions._load_index(user_id).get("active_session")
+        _pm_list = get_character_registry()
+
+        def _pnote(s: dict) -> str:
+            # 会话人格绑定标注（scene 显示钉住角色；创作会话固定中性；
+            # key 失效/未绑定的存量会话显示跟随默认）
+            meta = s.get("metadata") or {}
+            _kind = meta.get("kind")
+            if _kind == "char_creation":
+                return "人格: 固定（角色创作）"
+            pkey = meta.get("persona_key") or (
+                meta.get("char_id") if _kind == "bond_scene" else None)
+            if pkey and _pm_list._exists(str(pkey), user_id=user_id):
+                return f"人格: {_pm_list.get_display_name(str(pkey))}"
+            if pkey:
+                return "人格: 已失效→跟随默认"
+            return "人格: 跟随默认"
+
+        def _row(s: dict) -> str:
+            marker = " ← 当前" if s["name"] == active_name else ""
+            created = time.strftime("%m/%d %H:%M", time.localtime(s["created_at"]))
+            return (
+                f"  {s['name']}{marker}\n"
+                f"    创建: {created} | 消息数: {s['total_messages']} | {_pnote(s)}"
+            )
+
+        # 回滚开关关闭：退回旧统一视图（scene-session-archive-design.md §7）
+        if not _scene_archive_enabled():
+            if not sessions:
+                await _safe_send(
+                    "你目前没有特殊会话。\n"
+                    f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个）。"
+                )
+                return True
+            lines = ["你的特殊会话:"]
+            for s in sessions:
+                lines.append(_row(s))
+            lines.append(f"\n共 {len(sessions)}/{max_sessions} 个会话")
+            await _safe_send("\n".join(lines))
+            return True
+
+        # 开关开启：普通 / 剧情归档 / 角色创作 三段分组（B5）
+        normal = [s for s in sessions
+                  if (s.get("metadata") or {}).get("kind") not in NON_QUOTA_KINDS]
+        scenes = [s for s in sessions
+                  if (s.get("metadata") or {}).get("kind") == SCENE_KIND]
+        creations = [s for s in sessions
+                     if (s.get("metadata") or {}).get("kind") == CREATION_KIND]
+
+        if not sessions:
+            await _safe_send(
+                "你目前没有特殊会话。\n"
+                f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个普通会话；"
+                f"剧情/创作会话不计配额）。"
+            )
+            return True
+
+        lines = [f"普通会话 ({len(normal)}/{max_sessions}):"]
+        if normal:
+            for s in normal:
+                lines.append(_row(s))
+        else:
+            lines.append("  （无）")
+
+        lines.append(f"\n剧情归档 {len(scenes)}（不计配额）:")
+        if scenes:
+            for s in scenes:
+                state = "已完结" if _scene_completed(s) else "进行中"
+                marker = " ← 当前" if s["name"] == active_name else ""
+                created = time.strftime(
+                    "%m/%d %H:%M", time.localtime(s["created_at"]))
+                lines.append(
+                    f"  {s['name']}{marker} [{state}]\n"
+                    f"    创建: {created} | 消息数: {s['total_messages']} | {_pnote(s)}"
+                )
+        else:
+            lines.append("  （无）")
+
+        if creations:
+            lines.append("\n角色创作（进行中 · 不计配额）:")
+            for s in creations:
+                lines.append(_row(s))
+
+        lines.append(
+            f"\n共 {len(normal)}/{max_sessions} 个普通会话 · "
+            f"{len(scenes)} 个剧情归档（不计配额）"
+        )
+        await _safe_send("\n".join(lines))
+        return True
+
+    # ── /切换会话 <名称|#序号> ─────────────────────────────────
+    if cmd in ("/切换会话", "#切换会话"):
+        if not args:
+            await _safe_send("用法: /切换会话 <会话名称>（或 #序号，见 /会话列表）")
+            return True
+        args, _idx_err = _resolve_session_index(user_id, args)
+        if _idx_err:
+            await _safe_send(_idx_err)
+            return True
+        try:
+            session = _special_sessions.switch_to(user_id, args)
+            # 人格提示：switch_to 后 provider 已看到新会话，resolve 结果即
+            # 该会话的绑定人格（未绑定则回落到 用户>群>全局 链）。
+            # 切会话不注入 personality marker——各会话历史本属于自己的人格。
+            _pm_sw = get_character_registry()
+            _p_key = _pm_sw.resolve_effective_personality(user_id, group_id)
+            _p_disp = _pm_sw.get_display_name(_p_key)
+            await _safe_send(
+                f"已切换到特殊会话「{session.name}」"
+                f"（{session.total_messages} 条消息）。\n"
+                f"当前人格: {_p_disp}"
+            )
+        except ValueError as e:
+            await _safe_send(str(e))
+        return True
+
+    # ── /重命名会话 <旧名> <新名> ──────────────────────────────
+    if cmd in ("/重命名会话", "#重命名会话"):
+        parts = args.split(maxsplit=1)
+        if len(parts) < 2:
+            await _safe_send("用法: /重命名会话 <旧名称> <新名称>")
+            return True
+        try:
+            session = _special_sessions.rename(user_id, parts[0], parts[1])
+            await _safe_send(f"已将会话「{parts[0]}」重命名为「{session.name}」。")
+        except ValueError as e:
+            await _safe_send(str(e))
+        return True
+
+    # ── /删除会话 <名称|#序号> ─────────────────────────────────
+    if cmd in ("/删除会话", "#删除会话"):
+        if not args:
+            await _safe_send("用法: /删除会话 <会话名称>（或 #序号，见 /会话列表）")
+            return True
+        args, _idx_err = _resolve_session_index(user_id, args)
+        if _idx_err:
+            await _safe_send(_idx_err)
+            return True
+
+        # Check for confirmation
+        confirm_key = f"确认删除 {args}"
+        if text == confirm_key:
+            # Check pending confirmation
+            pending = _pending_delete_confirm.get(user_id)
+            if pending and pending[0] == args:
+                if time.time() < pending[1]:
+                    try:
+                        # 与按钮回调 (qb1:session.del) 共用删除语义
+                        # （session_render.do_delete_session，§12.5）：
+                        # kind/turns 删除前捕获、profile flush、配额尾行。
+                        msg = _session_render.do_delete_session(
+                            user_id, args,
+                            sessions_mgr=_special_sessions,
+                            format_summary=_format_delete_summary,
+                            quota_tail=_delete_quota_tail,
+                            on_deleted=lambda turns:
+                                _profile_manager.flush_on_session_end(
+                                    user_id, turns),
+                        )
+                        _pending_delete_confirm.pop(user_id, None)
+                        await _safe_send(msg)
+                    except ValueError as e:
+                        await _safe_send(str(e))
+                    return True
+                else:
+                    _pending_delete_confirm.pop(user_id, None)
+                    await _safe_send("确认已超时（60秒），请重新发起 /删除会话。")
+                    return True
+
+        # First call — request confirmation
+        sessions = _special_sessions.list_sessions(user_id)
+        if not any(s["name"] == args for s in sessions):
+            await _safe_send(f"会话「{args}」不存在。")
+            return True
+
+        _pending_delete_confirm[user_id] = (args, time.time() + 60)
+
+        files = _special_sessions.get_files(user_id, args)
+        deletable = [
+            f for f in files
+            if f != "repos" and not f.startswith("repos" + os.sep)
+        ]
+        kept_repos = [
+            f for f in files
+            if f == "repos" or f.startswith("repos" + os.sep)
+        ]
+
+        msg = f"确认删除特殊会话「{args}」？此操作不可撤销。\n"
+        if deletable:
+            msg += f"删除后将清理 {len(deletable)} 个关联文件：\n"
+            msg += "\n".join(f"  - {rel}" for rel in deletable) + "\n"
+        if kept_repos:
+            msg += "以下仓库予以保留（工作区内仍可用）：\n"
+            msg += "\n".join(f"  - {rel}" for rel in kept_repos) + "\n"
+        msg += f"请回复「确认删除 {args}」来执行（60秒内有效）。"
+        await _safe_send(msg)
+        return True
+
+    # ── /压缩会话 ─────────────────────────────────────────────
+    # PLAN.md Idea 4 Phase A：把当前活跃特殊会话的头部历史浓缩为摘要，
+    # 仅保留最近 COMPRESS_KEEP_RECENT 条原文。破坏性操作 → 60s 两步确认
+    # （确认文本在主消息流拦截，见 _pending_compress_confirm）。
+    if cmd in ("/压缩会话", "#压缩会话"):
+        if group_id:
+            # §9.2 私密数据不落群：会话记忆属私聊范畴
+            await _safe_send("会话记忆属于私密数据，请在私聊中使用 /压缩会话。")
+            return True
+        active = _special_sessions.get_active(user_id)
+        if active is None:
+            await _safe_send(
+                "当前没有活跃的特殊会话。压缩只作用于特殊会话——"
+                "先用 /切换会话 <名称> 激活要压缩的会话（临时会话请用 /clear）。")
+            return True
+        if (active.metadata or {}).get("kind") in NON_QUOTA_KINDS:
+            await _safe_send(
+                "剧情归档与角色创作会话不支持压缩：它们的历史是回看的真相源，"
+                "压缩会不可逆地销毁细节。不再需要时可用 /删除会话 清理。")
+            return True
+        if active.total_messages < COMPRESS_MIN_MESSAGES:
+            await _safe_send(
+                f"会话「{active.name}」目前只有 {active.total_messages} 条消息，"
+                f"还不算长（{COMPRESS_MIN_MESSAGES} 条起压），暂时不需要压缩~")
+            return True
+        est = estimate_context_tokens(active.context)
+        window = _special_sessions.get_context_window()
+        pct = min(100, est * 100 // window) if window else 0
+        keep = min(COMPRESS_KEEP_RECENT, len(active.context) - 1)
+        _pending_compress_confirm[user_id] = (active.name, time.time() + 60)
+        await _safe_send(
+            f"确认压缩特殊会话「{active.name}」？\n"
+            f"当前 {active.total_messages} 条消息（估算约 {max(1, est // 1000)}k "
+            f"token，占上下文窗口约 {pct}%）。\n"
+            f"压缩会把前 {active.total_messages - keep} 条浓缩为一段结构化摘要，"
+            f"仅保留最近 {keep} 条原文；细节将不可恢复"
+            f"（系统仅保留一代压缩前备份）。\n"
+            f"请回复「确认压缩会话」来执行（60秒内有效）。")
+        return True
+
+    # ── /结束会话 ──────────────────────────────────────────────
+    if cmd in ("/结束会话", "#结束会话", "/临时会话", "#临时会话", "/退出特殊会话", "/退出会话"):
+        active = _special_sessions.get_active(user_id)
+        if active:
+            _md_end = active.metadata or {}
+            _kind_end = _md_end.get("kind")
+            _title_end = _md_end.get("scene_title") or active.name
+            _special_sessions.end_active(user_id)
+            # 回落后的人格提示：end_active 后 provider 返回 None，
+            # resolve 走 用户>群>全局 链，即临时会话生效的人格。
+            _pm_end = get_character_registry()
+            _p_disp = _pm_end.get_display_name(
+                _pm_end.resolve_effective_personality(user_id, group_id))
+            if _scene_archive_enabled() and _kind_end == SCENE_KIND:
+                # §5.3 / B2：剧情退出按是否已封档分流文案
+                if _md_end.get("completed"):
+                    await _send_receipt_kb(
+                        f"已退出剧情《{_title_end}》（已完结，已封档）。\n"
+                        f"可随时 /切换会话 {active.name} 回看；它不占特殊会话配额。\n"
+                        f"当前人格：{_p_disp}",
+                        _NAV_SESSIONS, label="end-session")
+                else:
+                    await _send_receipt_kb(
+                        f"已退出剧情《{_title_end}》（未完结），进度已保留。\n"
+                        f"继续体验发 /剧情 {_title_end}——不会新建会话，也不占配额。\n"
+                        f"当前人格：{_p_disp}",
+                        _NAV_SESSIONS, label="end-session")
+            elif _scene_archive_enabled() and _kind_end == CREATION_KIND:
+                await _send_receipt_kb(
+                    f"已退出角色创作「{active.name}」，进度已保留（不占配额）。\n"
+                    f"想继续创作请重新 /创建角色；想放弃可 /删除会话 {active.name}。\n"
+                    f"当前人格：{_p_disp}",
+                    _NAV_SESSIONS, label="end-session")
+            else:
+                await _send_receipt_kb(
+                    f"已退出特殊会话「{active.name}」，回到临时会话模式。\n"
+                    f"当前人格: {_p_disp}\n"
+                    f"特殊会话内容已保存，随时可以用 /切换会话 {active.name} 恢复。",
+                    _NAV_SESSIONS, label="end-session")
+        else:
+            await _safe_send("当前没有活跃的特殊会话。")
+        return True
+
+    # ── /保存为会话 <名称> ─────────────────────────────────────
+    if cmd in ("/保存为会话", "#保存为会话"):
+        active = _special_sessions.get_active(user_id)
+        if active:
+            await _safe_send("你已经在特殊会话中。请先 /结束会话 再使用此命令。")
+            return True
+
+        temp_session = _session_manager.get(user_id)
+        if not temp_session or not temp_session.context:
+            await _safe_send("临时会话中没有可保存的上下文。")
+            return True
+
+        role = _perm_manager.get_role(user_id)
+        max_sessions = _perm_manager.get_max_special_sessions(role)
+        sessions = _quota_sessions(user_id)
+        if len(sessions) >= max_sessions:
+            names = ", ".join(s["name"] for s in sessions)
+            _label = "特殊" if not _scene_archive_enabled() else "普通"
+            await _safe_send(
+                f"已达到最大{_label}会话数 ({max_sessions})。"
+                f"现有会话: {names}。请先删除一个再创建。"
+            )
+            return True
+
+        name = args if args else None
+        # 会话人格绑定：快照当前生效人格（临时会话语境 = 用户>群>全局 链），
+        # 必须在 create/switch_to 之前 resolve。
+        _pm_save = get_character_registry()
+        _snapshot = _pm_save.resolve_effective_personality(user_id, group_id)
+        try:
+            session = _special_sessions.create(
+                user_id, name, metadata={"persona_key": _snapshot})
+            # Activate the session so add_message() calls below actually work
+            _special_sessions.switch_to(user_id, session.name)
+        except ValueError as e:
+            await _safe_send(str(e))
+            return True
+
+        # Copy temporary session context to the new special session
+        for msg in temp_session.context[-20:]:  # Last 20 messages max
+            _special_sessions.add_message(
+                user_id,
+                msg["role"],
+                msg["content"],
+                msg.get("reasoning_content"),
+            )
+
+        # Migrate temporary-session file provenance to the new session
+        for rel in _temp_session_files.pop(user_id, set()):
+            _special_sessions.add_file(user_id, session.name, rel)
+
+        # Force name update (user specified name)
+        if name and session.name == name:
+            pass  # Already named
+        elif not name:
+            _pending_naming[user_id] = True
+
+        quota_warn = _quota_warning(user_id)
+        msg = (
+            f"已将当前临时会话（最近 {min(len(temp_session.context), 20)} 条消息）"
+            f"保存为特殊会话「{session.name}」。\n"
+            f"会话人格: {_pm_save.get_display_name(_snapshot)}"
+            f"（会话内 /人格切换 仅作用于本会话）。\n"
+            f"现在处于特殊会话模式，后续对话将持续保存。"
+        )
+        msg += _delete_quota_tail(user_id, "")
+        if quota_warn:
+            msg += f"\n\n{quota_warn}"
+        await _send_receipt_kb(msg, _NAV_SESSION_ACTIVE, label="save-session")
+        return True
+
+    # ── /帮助 — 命令速查卡片（文本只在渲染失败时兜底）────────────
+    # 2026-10 改版：HELP.md 精简为「一条命令一行」后，卡片与文本内容完全重合；
+    # 而官方途经每轮只有 4 条被动回复（群 5 条/5 分钟），同一份内容发两遍会挤掉
+    # 真正的解释。故默认只发卡片；卡片渲染/发送失败时才回退发文本，保证命令
+    # 始终查得到（文字兜底也顺带覆盖了图片加载不出来的客户端）。
+    if cmd in ("/帮助", "#帮助", "/help", "#help", "/命令", "#命令"):
+        # 官方渠道：HELP.md 直接作为一条 markdown 发送（省掉卡片图的 1 条
+        # 配额，文本可选中复制）；读取/转换失败再走卡片兜底。
+        if _channel_supports_markdown():
+            _help_md = _help_markdown()
+            if _help_md:
+                # 键盘版（buttons P0）：高频命令导航，反馈预填空格让用户补内容
+                if _channel_supports_keyboard():
+                    await _safe_send_kb(_help_md, [
+                        [
+                            Btn(label="会话", data="/会话列表", action="cmd"),
+                            Btn(label="人格", data="/人格切换", action="cmd"),
+                            Btn(label="好感度", data="/好感度", action="cmd"),
+                        ],
+                        [
+                            Btn(label="兑换码", data="/兑换码", action="cmd"),
+                            Btn(label="更新日志", data="/更新日志", action="cmd"),
+                            Btn(label="反馈", data="#反馈 ", action="cmd",
+                                enter=False),
+                        ],
+                    ], label="help")
+                    return True
+                await _safe_send(OutMarkdown(_help_md))
+                return True
+        card_path = None
+        try:
+            card_path = await asyncio.to_thread(render_help_card, _HELP_MD_PATH)
+        except Exception as e:  # noqa: BLE001 — 卡片是增强，不能让它拖垮命令
+            from nonebot import logger as _lg
+            _lg.warning(f"[help] card render failed: {e!r}")
+        if card_path:
+            await _safe_send(OutImage(path=card_path, label="help card"))
+        else:
+            await _send_markdown_doc(_HELP_MD_PATH, label="帮助文档")
+        return True
+
+    # ── /管理工作区 ─────────────────────────────────────────────
+    # Not intercepted: falls through to the agent, which (per AGENTS.md)
+    # calls get_user_info to show the snapshot and guide cleanup.
+    if cmd in ("/管理工作区", "#管理工作区"):
+        return False
+
+    # Not a session command
+    return False
+
+
+async def _handle_feedback(text: str, user_id: str):
+    """Record user feedback / bug report to JSONL with context snapshot.
+
+    Commands: #反馈 <content>, #bug <content>, #建议 <content>
+    Zero LLM token cost — intercepted before agent processing.
+    """
+    # Parse command and content
+    cmd, _, content = text.partition(" ")
+    content = content.strip()
+
+    # 键盘版（buttons P0/M2）：三选一预填按钮，enter=False 只把前缀填进
+    # 输入框，用户补完内容再发送——空内容提示的零输入成本入口。
+    _fb_rows: Rows = [[
+        Btn(label="写反馈", data="#反馈 ", action="cmd", enter=False),
+        Btn(label="报Bug", data="#bug ", action="cmd", enter=False),
+        Btn(label="提建议", data="#建议 ", action="cmd", enter=False),
+    ]]
+    if cmd == "#反馈" and not content:
+        await _send_receipt_kb(
+            "请按格式提交反馈：\n"
+            "#反馈 <你的建议或问题>\n"
+            "例如：#反馈 execute_code 超时后临时文件没有清理",
+            _fb_rows, label="feedback-empty")
+        return
+    if cmd == "#bug" and not content:
+        await _send_receipt_kb(
+            "请按格式提交 Bug 报告：\n"
+            "#bug <Bug 描述>\n"
+            "例如：#bug shell_exec 对大文件处理超时",
+            _fb_rows, label="feedback-empty")
+        return
+    if cmd == "#建议" and not content:
+        await _send_receipt_kb(
+            "请按格式提交改进建议：\n"
+            "#建议 <你的建议>\n"
+            "例如：#建议 get_user_info 增加工作区目录快照",
+            _fb_rows, label="feedback-empty")
+        return
+
+    fb_type = {"#反馈": "feedback", "#bug": "bug", "#建议": "suggestion"}[cmd]
+
+    # ── Build context snapshot ──
+    role = _perm_manager.get_role(user_id)
+    active_special = _special_sessions.get_active(user_id)
+    ws_path = _workspace_manager.get_workspace(user_id)
+    ws_size = _workspace_manager.get_size(user_id)
+    ws_quota_mb = _perm_manager.get_workspace_quota_mb(role)
+
+    ctx = {
+        "role": role.value,
+        "workspace_path": ws_path,
+        "workspace_usage_mb": round(ws_size / (1024 * 1024), 2),
+        "workspace_quota_mb": ws_quota_mb,
+        "active_special_session": active_special.name if active_special else None,
+    }
+
+    entry = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "user_id": user_id,
+        "type": fb_type,
+        "content": content,
+        "context": ctx,
+    }
+
+    # ── Write to JSONL ──
+    feedback_dir = os.path.join(_AGENT_DIR, "data", "feedback")
+    os.makedirs(feedback_dir, exist_ok=True)
+    feedback_file = os.path.join(feedback_dir, f"feedback_{time.strftime('%Y-%m')}.jsonl")
+
+    try:
+        with open(feedback_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        await _safe_send("反馈记录失败，请稍后重试或直接联系管理员。")
+        return
+
+    type_label = {"feedback": "反馈", "bug": "Bug 报告", "suggestion": "改进建议"}[fb_type]
+    await _safe_send(f"已记录你的{type_label}，感谢！")
+
+
+async def _handle_special_command(command: str, user_id: str):
+    """Handle special meta-commands."""
+    if command in ["/clear", "清除上下文", "新对话"]:
+        agent.clear_user_session(user_id)
+        _special_sessions.clear_context(user_id)
+        _temp_session_files.pop(user_id, None)
+        if _personality_switch_marker.pop(user_id, None) is not None:
+            _save_personality_markers()
+        _clear_msg = "已清除对话上下文，开始新对话~"
+        # §5.6：/clear 会销毁归档剧情/创作会话的回看内容，命中时补一句提醒。
+        if _scene_archive_enabled() and (
+                _scene_archives(user_id)
+                or any((s.get("metadata") or {}).get("kind") == CREATION_KIND
+                       for s in _special_sessions.list_sessions(user_id))):
+            _clear_msg += "\n（注意：剧情归档与角色创作会话的历史也已被清除，回看内容不可恢复。）"
+        await _safe_send(_clear_msg)
+    elif command == "/status":
+        status = agent.get_status()
+        tool_list = "\n  ".join(status["tool_names"])
+        _short = get_character_registry().get_short_name(
+            get_character_registry().get_user_personality(user_id)
+        )
+        await _safe_send(
+            f"{_short} 状态:\n"
+            f"  活跃会话: {status['active_sessions']}\n"
+            f"  已注册工具 ({status['tools_registered']}):\n  {tool_list}"
+        )
+
+
+# ── Markdown render layer (buttons-design §6.10) ──────────────────
+# Per-turn decision, never user-cached: session persona binding means the
+# same user can be unified in one session and split in another (§6.10.6).
+
+# L4 volatile-tail declaration injected when this turn renders markdown.
+# The subset mirrors SOUL #8's "declared subset" wording; images are
+# explicitly forbidden here (the model has no public URLs to reference —
+# card/asset images go out as separate msg_type=7 messages).
+_RENDER_MD_DECLARATION = (
+    "## 本轮渲染能力\n"
+    "本回合最终回复将经 QQ 官方 markdown（msg_type=2）渲染。\n"
+    "可用语法：# / ## 标题、**加粗**、_斜体_、~~删除线~~、- 无序列表、"
+    "1. 有序列表、> 引用、*** 分割线、[文字](https://链接)。\n"
+    "禁止：表格、代码块、行内代码（反引号）、HTML 标签、![]() 图片语法"
+    "（图片由系统单独发送，不要编造图片 URL）。\n"
+    "按完整区块结构输出正文，不必压缩到 300 字以内；段落之间空一行。"
+)
+
+# 免责声明 auto 策略（§6.10.5）：正文 ≤200 字内联；长正文独立成条，
+# 紧跟正文之后（先于图片），配额紧张时免责优先于媒体。
+_MD_INLINE_DISCLAIMER_LIMIT = 200
+
+# ── 免责尾用户开关（proactive-mail-design.md v0.5 §6.5）──────────────
+# 对话回复默认追加免责尾；三级用户均可 `/免责声明 开|关` 切换（命令直连
+# 层，不进工具表/permissions）。存储 data/user_prefs/disclaimer.json，
+# key = 按渠道用户标识（OneBot QQ 号 / 官方 openid，两渠道独立）；bot 单
+# 写者，mtime 热读（profile/session 同款模式）。信封/信件详情//邮件/系统
+# 邮件本就不带免责尾，不受开关影响。免责尾是发送后处理，不进 system
+# prompt / 会话历史 → 前缀缓存零影响。
+_USER_PREFS_DIR = os.path.join(_DATA_DIR, "user_prefs")
+_DISCLAIMER_PREFS_FILE = os.path.join(_USER_PREFS_DIR, "disclaimer.json")
+_disclaimer_prefs_cache = None   # dict | None
+_disclaimer_prefs_mtime = None   # int | None
+
+
+def _load_disclaimer_prefs() -> dict:
+    """Hot read with mtime validation; corrupt/missing → {} (= default on)."""
+    global _disclaimer_prefs_cache, _disclaimer_prefs_mtime
+    try:
+        disk_mtime = os.stat(_DISCLAIMER_PREFS_FILE).st_mtime_ns
+    except OSError:
+        disk_mtime = None
+    if _disclaimer_prefs_cache is not None \
+            and disk_mtime == _disclaimer_prefs_mtime:
+        return _disclaimer_prefs_cache
+    data: dict = {}
+    if disk_mtime is not None:
+        try:
+            with open(_DISCLAIMER_PREFS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (json.JSONDecodeError, IOError, OSError):
+            data = {}
+    _disclaimer_prefs_cache = data
+    _disclaimer_prefs_mtime = disk_mtime
+    return data
+
+
+def _disclaimer_off(user_id: str) -> bool:
+    """该用户是否关闭了对话免责尾（默认 False = 维持追加现状）。"""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False
+    rec = _load_disclaimer_prefs().get(uid)
+    return bool(isinstance(rec, dict) and rec.get("off"))
+
+
+def _set_disclaimer_off(user_id: str, off: bool) -> bool:
+    """写入开关；成功 True。off=False 时删除条目（回到默认态）。"""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False
+    global _disclaimer_prefs_cache, _disclaimer_prefs_mtime
+    data = dict(_load_disclaimer_prefs())
+    if off:
+        data[uid] = {"off": True, "ts": int(time.time())}
+    else:
+        data.pop(uid, None)
+    try:
+        os.makedirs(_USER_PREFS_DIR, exist_ok=True)
+        tmp = _DISCLAIMER_PREFS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, _DISCLAIMER_PREFS_FILE)
+    except (IOError, OSError):
+        return False
+    _disclaimer_prefs_cache = None   # 强制下次热读重取 mtime
+    _disclaimer_prefs_mtime = None
+    return True
+
+_MD_FENCE_RE = re.compile(r"^\s*(```|~~~)", re.MULTILINE)
+_MD_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|", re.MULTILINE)
+
+
+def _build_render_context(persona_mode: str, sender=None) -> str:
+    """Build this turn's L4 render declaration ("" = plain-text turn).
+
+    Markdown requires BOTH: a markdown-capable channel sender (QQ
+    official with env switch on and breaker closed) AND the unified
+    persona mode. Split personas stay plain text (人设表达 + revoice
+    转述 + 防 markdown 记号泄漏, §6.10.6).
+    """
+    s = sender or _turn_sender.get() or default_sender
+    if persona_mode == "unified" and getattr(s, "supports_markdown", False):
+        return _RENDER_MD_DECLARATION
+    return ""
+
+
+def _md_violates_whitelist(text: str) -> bool:
+    """True when the body uses syntax outside the official md whitelist
+    (code fences / tables / any backtick). Such a body must not go out
+    as msg_type=2 — degrade to sanitized plain text instead (§6.10.10)."""
+    return bool(_MD_FENCE_RE.search(text)
+                or _MD_TABLE_ROW_RE.search(text)
+                or "`" in text)
+
+
+def _clean_md_markers(text: str) -> str:
+    """Strip markdown decoration for plain-text sending (bottom guard,
+    §6.10.6 #6 — never rely on the prompt alone).
+
+    Conservative + idempotent: only unambiguous decoration is removed
+    (fence lines, heading hashes, paired **/__/~~/***, backticks);
+    content itself — including code inside former fences and list
+    bullets, which read fine as plain text — is preserved.
+    """
+    out = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            continue  # drop the fence, keep the code inside
+        line = re.sub(r"^(\s{0,3})#{1,6}\s+", r"\1", line)   # headings
+        line = re.sub(r"\*\*\*(.+?)\*\*\*", r"\1", line)     # bold-italic
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)         # bold
+        line = re.sub(r"__(.+?)__", r"\1", line)
+        line = re.sub(r"~~(.+?)~~", r"\1", line)             # strikethrough
+        line = line.replace("`", "")                         # inline code
+        out.append(line)
+    return "\n".join(out)
+
+
+async def _send_response(response: str, sender=None):
+    """Send response, splitting long messages into chunks with rate limiting.
+
+    Args:
+        response: The response text to send.
+        sender: Optional Sender to use. Defaults to default_sender.
+
+    Format routing (buttons-design §6.10): on the QQ official route with
+    this turn's markdown declaration set (unified persona + capable
+    channel), the body goes out as one msg_type=2 markdown message — no
+    300-char chunking (the adapter block-splits over-long bodies) — with
+    the disclaimer inline (short body) or as a separate plain message
+    right after it (auto strategy). Illegal syntax (tables/code fences)
+    degrades to the sanitized plain path; on every official-route plain
+    send leaked markdown markers are stripped. OneBot behavior is
+    byte-identical to before.
+    """
+    if not response:
+        _turn_keyboard.set(None)  # reservation must not survive an empty reply
+        return
+
+    # One-shot consumption of the tool-reserved keyboard (buttons P1):
+    # a result-page tool (gacha/speed…) may have set _turn_keyboard this
+    # turn. Whatever render path we end up on, the reservation must not
+    # leak into the next turn — only the official unified-md branch can
+    # actually ride it (a keyboard needs a msg_type=2 carrier).
+    kb_rows = _turn_keyboard.get()
+    _turn_keyboard.set(None)
+
+    # Append disclaimer to every agent response — unless this user turned
+    # it off via /免责声明 (§6.5): inline AND separate-message variants
+    # both skip; empty disclaimer keeps every send path shape-identical.
+    _pm = get_character_registry()
+    _persona = _current_personality.get() or _pm.get_default()
+    _short = _pm.get_short_name(_persona)
+    disclaimer = f"\n\n{_short} 的回答并非总是准确无误，请理性判断。"
+    if _disclaimer_off(_current_user_id.get()):
+        disclaimer = ""
+
+    on_official = _current_platform.get() == "qq_official"
+    if on_official:
+        s = sender or _turn_sender.get() or default_sender
+        if (_current_render_context.get()
+                and getattr(s, "supports_markdown", False)):
+            if not _md_violates_whitelist(response):
+                if kb_rows and _channel_supports_keyboard(s):
+                    # body + buttons in ONE payload (0 extra quota);
+                    # disclaimer keeps the existing inline/separate policy
+                    if len(response) <= _MD_INLINE_DISCLAIMER_LIMIT:
+                        await _safe_send_kb(response + disclaimer, kb_rows,
+                                            sender=sender, label="agent-reply")
+                    else:
+                        await _safe_send_kb(response, kb_rows, sender=sender,
+                                            label="agent-reply")
+                        if disclaimer.strip():
+                            await _safe_send(disclaimer.strip(), sender=sender)
+                    return
+                if len(response) <= _MD_INLINE_DISCLAIMER_LIMIT:
+                    await _safe_send(OutMarkdown(response + disclaimer),
+                                     sender=sender)
+                else:
+                    await _safe_send(OutMarkdown(response), sender=sender)
+                    if disclaimer.strip():
+                        await _safe_send(disclaimer.strip(), sender=sender)
+                return
+            # whitelist violation → sanitize, fall through to plain path
+        # plain send on the official channel: never show raw md markers
+        # (split persona output / degraded unified / breaker open)
+        response = _clean_md_markers(response)
+
+    response += disclaimer
+
+    # Shorter chunks + longer delays to avoid QQ rate limiting
+    max_len = 300
+    if len(response) <= max_len:
+        await _safe_send(response, sender=sender)
+    else:
+        # Split on sentence boundaries when possible
+        chunks = _split_text(response, max_len)
+        for i, chunk in enumerate(chunks):
+            if not chunk.strip():
+                continue
+            await _safe_send(chunk.strip(), sender=sender)
+            if i < len(chunks) - 1:
+                await asyncio.sleep(1.0)  # Longer delay between chunks for QQ rate limit
+
+
+def _split_text(text: str, max_len: int) -> list:
+    """Split text into chunks, preferring sentence boundaries."""
+    if len(text) <= max_len:
+        return [text]
+
+    chunks = []
+    current = ""
+    # Split on sentence boundaries (Chinese + English punctuation)
+    sentences = text.replace("。", "。|").replace("！", "！|").replace("？", "？|") \
+                   .replace(".\n", ". |").replace("!\n", "! |").replace("?\n", "? |") \
+                   .replace("\n\n", "\n\n|").split("|")
+
+    for sentence in sentences:
+        if len(current) + len(sentence) <= max_len:
+            current += sentence
+        else:
+            if current.strip():
+                chunks.append(current.strip())
+            current = sentence
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks

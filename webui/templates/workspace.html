@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+  <h2 class="card-title" style="margin:0">工作区磁盘</h2>
+  <span class="spacer"></span>
+  <span class="muted" id="ws-root">—</span>
+  <button class="btn btn-sm" id="ws-refresh">刷新</button>
+</div>
+
+<div class="card" id="ws-unmounted" style="display:none">
+  <p class="warn">用户数据目录未挂载，无法统计工作区用量。</p>
+</div>
+
+<div class="card" id="ws-card" style="display:none">
+  <table class="data-table" id="tbl-ws">
+    <thead><tr><th>用户</th><th>角色</th><th>已用</th><th>配额</th><th>占用</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p class="muted" style="margin:8px 0 0">合计已用：<span id="ws-total">—</span></p>
+</div>
+
+<div class="card" id="ws-tree-card" style="display:none">
+  <h2 class="card-title">文件树 — <span id="ws-tree-uid" class="mono"></span>（<span id="ws-tree-size">—</span>）</h2>
+  <div id="ws-tree" class="log-box" style="max-height:44vh"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/workspace.js"></script>
+{% endblock %}

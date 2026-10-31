@@ -18,6 +18,8 @@ from typing import Dict, Optional
 
 import httpx
 
+from .token_ledger import extract_usage, token_ledger
+
 
 class MultimodalClient:
     """Async HTTP client for multimodal LLM (image + audio understanding).
@@ -84,6 +86,15 @@ class MultimodalClient:
         section = self._raw_config.get(name)
         return section if isinstance(section, dict) else None
 
+    def reload(self) -> None:
+        """Re-read config from disk.
+
+        All API methods read ``self._config`` / ``self._audio_config`` at
+        call time, so re-running ``_load_config()`` is sufficient for the
+        panel's model-config hot reload.
+        """
+        self._load_config()
+
     # ── Availability Check ──────────────────────────────────────────
 
     def is_available(self) -> bool:
@@ -101,6 +112,7 @@ class MultimodalClient:
         image_path: str,
         prompt: str = None,
         timeout: float = 60.0,
+        include_reasoning: bool = False,
     ) -> str:
         """Analyze an image using the multimodal LLM.
 
@@ -109,6 +121,10 @@ class MultimodalClient:
             prompt: Text prompt to accompany the image.
                     Default: Chinese instruction to describe the image.
             timeout: Request timeout in seconds.
+            include_reasoning: 默认 False——程序性消费方（资产卡文本化、
+                    OCR 名称匹配、read_file 懒分析）只需要正文；思考内联
+                    会污染下游截断/解析（曾在 [思考] 中间截断入库）。
+                    仅人工调试场景显式传 True 才拼接 [思考]/[回复] 脚手架。
 
         Returns:
             Analysis text string, or an error message if unavailable/failed.
@@ -200,12 +216,15 @@ class MultimodalClient:
                 )
                 response.raise_for_status()
                 result = response.json()
+                self._record_usage(result, model, "multimodal_image")
                 message = result["choices"][0]["message"]
                 content = message.get("content", "") or "[多模态] API 返回了空内容。"
 
-                # Include reasoning_content if present (some models return it)
+                # reasoning_content 默认丢弃：思考内联会把下游的定长截断/
+                # 关键词解析全部带偏（asset card 曾在 [思考] 中间被切断）。
+                # 仅 include_reasoning=True（人工调试）时保留脚手架。
                 reasoning = message.get("reasoning_content", "")
-                if reasoning:
+                if include_reasoning and reasoning:
                     content = f"[思考]\n{reasoning}\n\n[回复]\n{content}"
 
                 return content
@@ -364,6 +383,7 @@ class MultimodalClient:
         audio_path: str,
         prompt: str = None,
         timeout: float = 120.0,
+        include_reasoning: bool = False,
     ) -> str:
         """Analyze an audio file using the multimodal LLM.
 
@@ -378,6 +398,7 @@ class MultimodalClient:
             prompt: Custom analysis prompt. Default: comprehensive
                     Chinese instruction for full analysis.
             timeout: Request timeout in seconds (longer for audio).
+            include_reasoning: 同 analyze_image——默认只返回正文。
 
         Returns:
             Analysis text, or error message if unavailable/failed.
@@ -417,28 +438,11 @@ class MultimodalClient:
         try:
             is_dashscope = "dashscope.aliyuncs.com" in api_base
 
-            # DEBUG: file sizes
-            src_size = os.path.getsize(audio_path)
-            wav_size = os.path.getsize(converted_path)
-
             # Read WAV file for data URI (both paths use this now)
             with open(converted_path, "rb") as f:
                 audio_data = f.read()
             encoded = base64.b64encode(audio_data).decode("utf-8")
             data_uri = f"data:audio/wav;base64,{encoded}"
-
-            if is_dashscope:
-                debug_info = (
-                    f"[DEBUG] 源文件: {src_size}B, WAV: {wav_size}B, "
-                    f"data_uri长度: {len(data_uri)}, "
-                    f"前80字符: {data_uri[:80]}"
-                )
-            else:
-                debug_info = (
-                    f"[DEBUG] 源文件: {src_size}B, WAV: {wav_size}B, "
-                    f"data_uri长度: {len(data_uri)}, "
-                    f"前100字符: {data_uri[:100]}"
-                )
 
             # Clean up converted file
             if converted_path != audio_path:
@@ -498,11 +502,11 @@ class MultimodalClient:
                     )
                     response.raise_for_status()
                     result = response.json()
+                    self._record_usage(result, model, "multimodal_audio")
                     output = result.get("output", {})
                     choices = output.get("choices", [])
                     if not choices:
                         return (
-                            f"{debug_info}\n"
                             f"[音频分析] API 返回了空结果: "
                             f"{json.dumps(result, ensure_ascii=False)[:500]}"
                         )
@@ -515,21 +519,21 @@ class MultimodalClient:
                             if isinstance(block, dict) and "text" in block:
                                 text_parts.append(block["text"])
                         if text_parts:
-                            return debug_info + "\n\n" + "\n".join(text_parts)
-                        return f"{debug_info}\n[音频分析] 返回非文本内容: {json.dumps(raw_content, ensure_ascii=False)[:300]}"
+                            return "\n".join(text_parts)
+                        return f"[音频分析] 返回非文本内容: {json.dumps(raw_content, ensure_ascii=False)[:300]}"
                     elif isinstance(raw_content, str) and raw_content:
-                        return debug_info + "\n\n" + raw_content
+                        return raw_content
                     else:
-                        return f"{debug_info}\n[音频分析] 无法识别的格式: {str(raw_content)[:300]}"
+                        return f"[音频分析] 无法识别的格式: {str(raw_content)[:300]}"
 
                 except httpx.ConnectTimeout:
-                    return f"{debug_info}\n[音频分析] 连接超时 ({timeout}秒)"
+                    return f"[音频分析] 连接超时 ({timeout}秒)"
                 except httpx.ReadTimeout:
-                    return f"{debug_info}\n[音频分析] 响应超时 ({timeout}秒)"
+                    return f"[音频分析] 响应超时 ({timeout}秒)"
                 except httpx.HTTPStatusError as e:
-                    return f"{debug_info}\n[音频分析] API HTTP {e.response.status_code}: {e.response.text[:300]}"
+                    return f"[音频分析] API HTTP {e.response.status_code}: {e.response.text[:300]}"
                 except Exception as e:
-                    return f"{debug_info}\n[音频分析] 调用异常: {str(e)}"
+                    return f"[音频分析] 调用异常: {str(e)}"
 
         else:
             # ── Generic OpenAI-compatible API ──────────────────────
@@ -567,25 +571,38 @@ class MultimodalClient:
                     )
                     response.raise_for_status()
                     result = response.json()
+                    self._record_usage(result, model, "multimodal_audio")
                     message = result["choices"][0]["message"]
                     content = message.get("content", "") or "[音频分析] API 返回了空内容。"
 
                     reasoning = message.get("reasoning_content", "")
-                    if reasoning:
+                    if include_reasoning and reasoning:
                         content = f"[思考]\n{reasoning}\n\n[回复]\n{content}"
 
-                    return debug_info + "\n\n" + content
+                    return content
 
                 except httpx.ConnectTimeout:
-                    return f"{debug_info}\n[音频分析] 连接超时 ({timeout}秒)"
+                    return f"[音频分析] 连接超时 ({timeout}秒)"
                 except httpx.ReadTimeout:
-                    return f"{debug_info}\n[音频分析] 响应超时 ({timeout}秒)"
+                    return f"[音频分析] 响应超时 ({timeout}秒)"
                 except httpx.HTTPStatusError as e:
-                    return f"{debug_info}\n[音频分析] API HTTP {e.response.status_code}: {e.response.text[:300]}"
+                    return f"[音频分析] API HTTP {e.response.status_code}: {e.response.text[:300]}"
                 except httpx.InvalidURL:
-                    return f"{debug_info}\n[音频分析] 无效 API 地址: {api_base}"
+                    return f"[音频分析] 无效 API 地址: {api_base}"
                 except Exception as e:
-                    return f"{debug_info}\n[音频分析] 调用异常: {str(e)}"
+                    return f"[音频分析] 调用异常: {str(e)}"
+
+    @staticmethod
+    def _record_usage(result: dict, model: str, purpose: str):
+        """Record token usage to the ledger. Never raises."""
+        if token_ledger is None:
+            return
+        try:
+            token_ledger.record(
+                model=model, purpose=purpose, usage=extract_usage(result),
+            )
+        except Exception:
+            pass
 
     def _build_audio_not_configured(self) -> str:
         """Return setup instructions for audio analysis."""

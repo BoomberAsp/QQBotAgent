@@ -1,0 +1,1700 @@
+"""
+WebUI main application — FastAPI entry point.
+
+Run (from the repo root, panel binds 127.0.0.1 only):
+
+    {venv}/bin/python -m uvicorn webui.main:app --host 127.0.0.1 --port 8090
+
+Access over SSH tunnel:  ssh -L 8090:127.0.0.1:8090 user@server
+"""
+
+import asyncio
+import fcntl
+import json
+import os
+import pty
+import signal
+import struct
+import termios
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+
+from . import (audit, auth, character_admin, config, config_editor, data_reader,
+               hardware_monitor, log_viewer, napcat_login, official_status,
+               playground, process_manager)
+from .config import HOST, PORT
+
+
+# ── App & lifespan ────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    watchdog_task = asyncio.create_task(process_manager.watchdog_loop())
+    yield
+    watchdog_task.cancel()
+
+
+app = FastAPI(title="QQBotAgent WebUI", docs_url=None, redoc_url=None,
+              lifespan=lifespan)
+
+
+class _NoCacheStatic(StaticFiles):
+    """StaticFiles that forces the browser to revalidate on every load.
+
+    The panel is deployed by editing files in place, so a stale cached
+    processes.js/app.css silently hides new features (e.g. the NapCat QR
+    card). Sending ``no-cache`` makes the browser send a conditional
+    request each time → 304 when unchanged, fresh 200 after a deploy.
+    Negligible cost for an admin UI; avoids the whole class of stale-asset
+    bugs without per-file cache-busting query strings.
+    """
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
+
+
+app.mount("/static", _NoCacheStatic(directory=str(config.WEBUI_DIR / "static")), name="static")
+templates = Jinja2Templates(directory=str(config.WEBUI_DIR / "templates"))
+
+# Pages shown in the sidebar: (route, title)
+PAGES = [
+    ("/", "仪表盘"),
+    ("/processes", "进程管理"),
+    ("/logs", "日志查看"),
+    ("/terminal", "Web 终端"),
+    ("/tokens", "Token 消耗"),
+    ("/audit", "工具审计"),
+    ("/feedback", "用户反馈"),
+    ("/sessions", "会话管理"),
+    ("/tasks", "任务日志"),
+    ("/memory", "记忆与画像"),
+    ("/workspace", "工作区磁盘"),
+    ("/characters", "角色管理"),
+    ("/config", "配置热管理"),
+    ("/playground", "Playground"),
+    ("/wiki", "Wiki 缓存"),
+    ("/redeem", "兑换码管理"),
+    ("/changelog", "更新日志与公告"),
+    ("/mail", "邮件管理"),
+]
+
+# Pages fully implemented so far (others render the placeholder template)
+_IMPLEMENTED = {"/", "/processes", "/logs", "/terminal",
+                "/tokens", "/audit", "/feedback", "/sessions",
+                "/tasks", "/workspace", "/config", "/memory", "/wiki",
+                "/playground", "/redeem", "/changelog", "/characters",
+                "/mail"}
+
+_PUBLIC_PREFIXES = ("/static/", "/api/auth/")
+_PUBLIC_PATHS = {"/login", "/favicon.ico"}
+
+
+# ── Auth middleware ───────────────────────────────────────────────
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+
+    if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+        return await call_next(request)
+
+    # Setup mode: no password configured yet — only the login page is served
+    if auth.require_setup() and path != "/":
+        if path.startswith("/api/"):
+            return JSONResponse({"error": "panel_not_configured"}, status_code=403)
+        return RedirectResponse("/", status_code=302)
+
+    # Websockets verify auth inside the endpoint (close before accept),
+    # because an HTTP response cannot answer a WS handshake.
+    if path.startswith("/ws/"):
+        return await call_next(request)
+
+    if not auth.is_authenticated(request):
+        if path.startswith("/api/"):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return RedirectResponse("/login", status_code=302)
+
+    return await call_next(request)
+
+
+# ── Audit middleware (mutating requests only) ─────────────────────
+
+_AUDITED_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+
+
+@app.middleware("http")
+async def audit_middleware(request: Request, call_next):
+    response = await call_next(request)
+    try:
+        if request.method in _AUDITED_METHODS and response.status_code < 400:
+            client_ip = request.client.host if request.client else ""
+            audit.log_action(
+                action=f"{request.method} {request.url.path}",
+                ip=client_ip,
+            )
+    except Exception:
+        pass
+    return response
+
+
+# ── Templates ─────────────────────────────────────────────────────
+
+def _render(request: Request, template: str, **ctx):
+    ctx.setdefault("pages", PAGES)
+    ctx.setdefault("active", request.url.path)
+    ctx.setdefault("now", time.strftime("%Y-%m-%d %H:%M:%S"))
+    return templates.TemplateResponse(request, template, ctx)
+
+
+# ── Auth models & endpoints ───────────────────────────────────────
+
+class PasswordPayload(BaseModel):
+    password: str
+
+
+class ChangePasswordPayload(BaseModel):
+    old_password: str
+    new_password: str
+
+
+@app.get("/api/auth/status")
+async def auth_status():
+    lock = auth.lock_remaining()
+    return {
+        "configured": auth.is_configured(),
+        "locked": lock > 0,
+        "lock_seconds": int(lock),
+    }
+
+
+@app.post("/api/auth/setup")
+async def auth_setup(payload: PasswordPayload, request: Request):
+    if auth.is_configured():
+        return JSONResponse({"error": "already_configured"}, status_code=409)
+    if len(payload.password) < 8:
+        return JSONResponse({"error": "密码至少 8 位"}, status_code=400)
+    ok = auth.setup_password(payload.password)
+    if not ok:
+        return JSONResponse({"error": "setup_failed"}, status_code=500)
+    response = JSONResponse({"ok": True})
+    auth.create_session(response)
+    audit.log_action("auth.setup", "管理员密码首次设置",
+                     request.client.host if request.client else "")
+    return response
+
+
+@app.post("/api/auth/login")
+async def auth_login(payload: PasswordPayload, request: Request):
+    lock = auth.lock_remaining()
+    if lock > 0:
+        return JSONResponse(
+            {"error": f"尝试次数过多，请 {int(lock)} 秒后再试"},
+            status_code=429,
+        )
+    if auth.verify_password(payload.password):
+        response = JSONResponse({"ok": True})
+        auth.create_session(response)
+        audit.log_action("auth.login", "登录成功",
+                         request.client.host if request.client else "")
+        return response
+    locked_for = auth.record_failure()
+    audit.log_action("auth.login_failed", "登录失败" + ("，已锁定" if locked_for else ""),
+                     request.client.host if request.client else "")
+    if locked_for:
+        return JSONResponse(
+            {"error": f"失败次数过多，面板已锁定 {int(locked_for)} 秒"},
+            status_code=429,
+        )
+    return JSONResponse({"error": "密码错误"}, status_code=401)
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    response = JSONResponse({"ok": True})
+    auth.destroy_session(request, response)
+    return response
+
+
+@app.post("/api/auth/change-password")
+async def auth_change(payload: ChangePasswordPayload, request: Request):
+    if len(payload.new_password) < 8:
+        return JSONResponse({"error": "新密码至少 8 位"}, status_code=400)
+    if auth.change_password(payload.old_password, payload.new_password):
+        audit.log_action("auth.change_password", "管理员密码已修改",
+                         request.client.host if request.client else "")
+        return {"ok": True}
+    return JSONResponse({"error": "原密码错误"}, status_code=401)
+
+
+# ── Pages ─────────────────────────────────────────────────────────
+
+@app.get("/login")
+async def page_login(request: Request):
+    if auth.is_authenticated(request):
+        return RedirectResponse("/", status_code=302)
+    return templates.TemplateResponse(request, "login.html", {
+        "setup_mode": auth.require_setup(),
+    })
+
+
+@app.get("/")
+async def page_dashboard(request: Request):
+    if auth.require_setup():
+        return RedirectResponse("/login", status_code=302)
+    return _render(request, "dashboard.html", title="仪表盘")
+
+
+def _make_page(route: str, template: str, title: str):
+    async def _page(request: Request):
+        if route in _IMPLEMENTED:
+            return _render(request, template, title=title)
+        return _render(request, "placeholder.html", title=title, page_title=title)
+    _page.__name__ = f"page_{template.replace('.html', '')}"
+    return _page
+
+
+for _route, _title in PAGES[1:]:
+    app.add_api_route(
+        _route,
+        _make_page(_route, _route.strip("/").replace("/", "_") + ".html", _title),
+        methods=["GET"],
+    )
+
+
+# ── Dashboard API ─────────────────────────────────────────────────
+
+def _fmt_uptime(seconds) -> str:
+    if not seconds or seconds < 0:
+        return ""
+    d, rem = divmod(int(seconds), 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}天{h}时"
+    if h:
+        return f"{h}时{m}分"
+    return f"{m}分钟"
+
+
+@app.get("/api/dashboard")
+async def api_dashboard():
+    procs = await asyncio.to_thread(process_manager.status_all)
+    res = await asyncio.to_thread(hardware_monitor.sample)
+    today = time.strftime("%Y-%m-%d")
+    tok = await asyncio.to_thread(data_reader.tokens_daily, today)
+    bucket = tok.get("bucket", {})
+    # 今日 agent_loop 命中率（全局口径会被 triage/多模态稀释，Phase 1.2）
+    _al = (await asyncio.to_thread(data_reader.tokens_daily_by_purpose, today)).get("agent_loop") or {}
+    _al_inp = _al.get("input_tokens", 0)
+    hit_rate_agent_loop = (_al.get("cached_input_tokens", 0) / _al_inp) if _al_inp else None
+    unread = await asyncio.to_thread(data_reader.feedback_unread_count)
+    official = await official_status.status()
+    for name, info in procs.items():
+        if info.get("state") == "running":
+            sub = f"PID {info.get('pid')}"
+            if info.get("uptime") is not None:
+                sub += " · " + _fmt_uptime(info["uptime"])
+            # 官方路由与 NapCat 路由同进程；连上时在 NoneBot 卡片追加徽章
+            if name == "nonebot" and official.get("state") == "connected":
+                sub += " · 官方路由✓"
+            info["sub"] = sub
+        elif info.get("state") == "unavailable":
+            info["sub"] = "docker 不可用"
+        else:
+            if info.get("last_crash"):
+                info["sub"] = (f"崩溃 {info.get('crash_count', 0)} 次 · "
+                               f"最近 {time.strftime('%m-%d %H:%M', time.localtime(info['last_crash']))}")
+            else:
+                info["sub"] = "已停止"
+    return {
+        "panel": {
+            "host": HOST,
+            "port": PORT,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        "processes": procs,
+        "resources": {
+            "cpu": res.get("cpu"),
+            "mem": res.get("mem_percent"),
+            "disk": res.get("disk_percent"),
+            "mem_used": res.get("mem_used"),
+            "mem_total": res.get("mem_total"),
+            "disk_used": res.get("disk_used"),
+            "disk_total": res.get("disk_total"),
+            "load": res.get("load"),
+            "uptime": res.get("uptime"),
+        },
+        "tokens": {
+            "today_tokens": bucket.get("input_tokens", 0) + bucket.get("output_tokens", 0),
+            "today_input": bucket.get("input_tokens", 0),
+            "today_output": bucket.get("output_tokens", 0),
+            "hit_rate": tok.get("hit_rate"),
+            "hit_rate_agent_loop": hit_rate_agent_loop,
+        },
+        "feedback": {
+            "unread": unread,
+            "total": await asyncio.to_thread(data_reader.feedback_total_count),
+        },
+        "watchdog": {"enabled": process_manager.watchdog_enabled()},
+        "official": official,
+    }
+
+
+# ── Process management API ────────────────────────────────────────
+
+_VALID_ACTIONS = {"start", "stop", "restart"}
+
+
+@app.get("/api/processes")
+async def api_processes():
+    procs = await asyncio.to_thread(process_manager.status_all)
+    return {
+        "watchdog": {
+            "enabled": process_manager.watchdog_enabled(),
+            "poll_seconds": process_manager.POLL_INTERVAL,
+            "rate_limit": f"{process_manager.MAX_RESTARTS} 次 / "
+                          f"{process_manager.RATE_WINDOW // 60} 分钟",
+        },
+        "processes": procs,
+    }
+
+
+@app.post("/api/processes/{name}/{action}")
+async def api_process_action(name: str, action: str, request: Request):
+    if name not in config.PROCESSES:
+        return JSONResponse({"error": f"未知进程: {name}"}, status_code=404)
+    if action not in _VALID_ACTIONS:
+        return JSONResponse({"error": f"未知操作: {action}"}, status_code=400)
+    fn = getattr(process_manager, action)
+    result = await asyncio.to_thread(fn, name)
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=500)
+    audit.log_action(f"process.{action}", f"{action} {name}",
+                     request.client.host if request.client else "")
+    return result
+
+
+class WatchdogPayload(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/processes/watchdog")
+async def api_watchdog(payload: WatchdogPayload, request: Request):
+    process_manager.set_watchdog(payload.enabled)
+    audit.log_action("watchdog.toggle",
+                     "看门狗" + ("开启" if payload.enabled else "关闭"),
+                     request.client.host if request.client else "")
+    return {"ok": True, "enabled": payload.enabled}
+
+
+# ── NapCat 登录二维码 API ─────────────────────────────────────────
+
+@app.get("/api/napcat/qrcode")
+async def api_napcat_qrcode():
+    """登录态 + 二维码文件状态（前端每 3s 轮询）。"""
+    return await napcat_login.status()
+
+
+@app.get("/api/napcat/qrcode.png")
+async def api_napcat_qrcode_png():
+    """二维码图片本体。禁止缓存，前端用 ?t=<mtime> 破缓存。"""
+    path = config.NAPCAT_QRCODE_PATH
+    if not path.exists():
+        return JSONResponse({"error": "no_qrcode"}, status_code=404)
+    return FileResponse(path, media_type="image/png",
+                        headers={"Cache-Control": "no-store"})
+
+
+# ── QQ 官方路由状态 API ───────────────────────────────────────────
+
+@app.get("/api/official/status")
+async def api_official_status():
+    """官方路由心跳文件聚合状态（前端每 5s 轮询，见 official_status.py）。"""
+    return await official_status.status()
+
+
+# ── Log viewer API ────────────────────────────────────────────────
+
+@app.get("/api/logs/{source}")
+async def api_logs(source: str, lines: int = 200, before: int = 0, q: str = ""):
+    result = await asyncio.to_thread(log_viewer.read, source, lines, before, q)
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    return result
+
+
+@app.post("/api/logs/{source}/clear")
+async def api_logs_clear(source: str, request: Request):
+    result = await asyncio.to_thread(log_viewer.clear, source)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("logs.clear", f"清空日志 {source}",
+                     request.client.host if request.client else "")
+    return result
+
+
+@app.websocket("/ws/logs/{source}")
+async def ws_logs(ws: WebSocket, source: str):
+    if not auth.is_authenticated(ws):
+        await ws.close(code=1008)
+        return
+    if source not in config.log_sources():
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    is_docker = config.log_sources()[source].startswith("docker:")
+    offset = 0
+    sent_buf: list[str] = []
+    try:
+        if not is_docker:
+            # Start from end-of-file so we only push *new* lines
+            initial = await asyncio.to_thread(log_viewer.read, source, 1)
+            offset = initial.get("size") or 0
+        while True:
+            if is_docker:
+                data = await asyncio.to_thread(log_viewer.read, source, 500)
+                tail = data.get("lines", [])
+                # find longest suffix of sent_buf that prefixes tail
+                k = 0
+                if sent_buf and tail:
+                    max_k = min(len(sent_buf), len(tail))
+                    for k in range(max_k, 0, -1):
+                        if sent_buf[-k:] == tail[:k]:
+                            break
+                    else:
+                        k = 0
+                new = tail[k:]
+                sent_buf = (sent_buf + new)[-1000:]
+                if new:
+                    await ws.send_text(json.dumps({"lines": new}))
+            else:
+                data = await asyncio.to_thread(log_viewer.read_new, source, offset)
+                offset = data.get("offset", offset)
+                if data.get("lines"):
+                    await ws.send_text(json.dumps({"lines": data["lines"]}))
+            await asyncio.sleep(1.5)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+
+
+# ── Token metering API ────────────────────────────────────────────
+
+@app.get("/api/tokens/summary")
+async def api_tokens_summary(days: int = 7):
+    return await asyncio.to_thread(data_reader.tokens_summary, min(max(days, 1), 90))
+
+
+@app.get("/api/tokens/daily")
+async def api_tokens_daily(date: str = ""):
+    date = date or time.strftime("%Y-%m-%d")
+    return await asyncio.to_thread(data_reader.tokens_daily, date)
+
+
+@app.get("/api/tokens/users")
+async def api_tokens_users(days: int = 7, limit: int = 20):
+    return await asyncio.to_thread(data_reader.tokens_users,
+                                   min(max(days, 1), 90), min(max(limit, 1), 100))
+
+
+# ── Tool audit API ────────────────────────────────────────────────
+
+@app.get("/api/audit/tool-calls")
+async def api_audit_calls(date: str = "", tool: str = "", user: str = "",
+                          page: int = 1, size: int = 50):
+    return await asyncio.to_thread(data_reader.audit_calls, date, tool, user, page, size)
+
+
+@app.get("/api/audit/tool-stats")
+async def api_audit_stats(days: int = 7):
+    return await asyncio.to_thread(data_reader.audit_stats, min(max(days, 1), 90))
+
+
+# ── Feedback API ──────────────────────────────────────────────────
+
+@app.get("/api/feedback")
+async def api_feedback(month: str = "", type: str = Query("", alias="type"),
+                       page: int = 1, size: int = 50):
+    return await asyncio.to_thread(data_reader.feedback_list, month, type, page, size)
+
+
+@app.post("/api/feedback/mark-read")
+async def api_feedback_mark_read():
+    await asyncio.to_thread(data_reader.feedback_mark_read)
+    return {"ok": True}
+
+
+class TagPayload(BaseModel):
+    tag: str
+
+
+@app.post("/api/feedback/{month}/{seq}/tag")
+async def api_feedback_tag(month: str, seq: int, payload: TagPayload,
+                           request: Request):
+    result = await asyncio.to_thread(data_reader.feedback_tag, month, seq, payload.tag)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("feedback.tag", f"反馈 {month}#{seq} 打标签「{payload.tag}」",
+                     request.client.host if request.client else "")
+    return result
+
+
+# ── Session management API ────────────────────────────────────────
+
+@app.get("/api/sessions")
+async def api_sessions():
+    return await asyncio.to_thread(data_reader.sessions_list)
+
+
+@app.get("/api/sessions/{uid}/temp")
+async def api_session_temp(uid: str):
+    result = await asyncio.to_thread(data_reader.session_detail, uid)
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    return result
+
+
+@app.post("/api/sessions/{uid}/clear-temp")
+async def api_session_clear(uid: str, request: Request):
+    result = await asyncio.to_thread(data_reader.session_clear_temp, uid)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("session.clear_temp", f"清除临时会话 {uid}",
+                     request.client.host if request.client else "")
+    return result
+
+
+@app.get("/api/sessions/{uid}/special")
+async def api_session_special(uid: str):
+    return await asyncio.to_thread(data_reader.special_list, uid)
+
+
+@app.delete("/api/sessions/{uid}/special/{name}")
+async def api_session_special_delete(uid: str, name: str, request: Request):
+    result = await asyncio.to_thread(data_reader.special_delete, uid, name)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("session.delete_special",
+                     f"删除特殊会话 {uid}/{name}（释放 {result.get('freed_bytes', 0)} 字节）",
+                     request.client.host if request.client else "")
+    return {"ok": True, **result}
+
+
+# ── Task log API ──────────────────────────────────────────────────
+
+@app.get("/api/tasks")
+async def api_tasks(user_id: str = "", page: int = 1, size: int = 50):
+    return await asyncio.to_thread(data_reader.tasks_list, user_id, page, size)
+
+
+@app.get("/api/tasks/{uid}/{task_id}")
+async def api_task_detail(uid: str, task_id: str):
+    result = await asyncio.to_thread(data_reader.task_detail, uid, task_id)
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    return result
+
+
+# ── Workspace API ─────────────────────────────────────────────────
+
+@app.get("/api/workspace/stats")
+async def api_workspace_stats():
+    return await asyncio.to_thread(data_reader.workspace_stats)
+
+
+@app.get("/api/workspace/{uid}")
+async def api_workspace_user(uid: str):
+    result = await asyncio.to_thread(data_reader.workspace_tree, uid)
+    if "error" in result and not result.get("entries"):
+        return JSONResponse(result, status_code=404)
+    return result
+
+
+# ── Config hot-management API ─────────────────────────────────────
+
+def _ip(request: Request) -> str:
+    return request.client.host if request.client else ""
+
+
+@app.get("/api/config/prompts")
+async def api_config_prompts():
+    return await asyncio.to_thread(config_editor.prompts_list)
+
+
+@app.get("/api/config/prompts/{name:path}")
+async def api_config_prompt_get(name: str):
+    result = await asyncio.to_thread(config_editor.prompt_read, name)
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    return result
+
+
+class PromptPayload(BaseModel):
+    content: str
+
+
+@app.put("/api/config/prompts/{name:path}")
+async def api_config_prompt_put(name: str, payload: PromptPayload, request: Request):
+    result = await asyncio.to_thread(config_editor.prompt_write, name, payload.content)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("config.prompt_write", f"编辑提示词 {name}", _ip(request))
+    return result
+
+
+@app.get("/api/config/permissions")
+async def api_config_permissions():
+    return await asyncio.to_thread(config_editor.permissions_read)
+
+
+class PermissionsPayload(BaseModel):
+    # None = key untouched; "" = table cleared (config_editor semantics).
+    # The panel frontend always submits all four fields.
+    superusers: str | None = None
+    vip_users: str | None = None
+    qq_official_superusers: str | None = None
+    qq_official_vip_users: str | None = None
+
+
+@app.put("/api/config/permissions")
+async def api_config_permissions_put(payload: PermissionsPayload, request: Request):
+    result = await asyncio.to_thread(
+        config_editor.permissions_write,
+        payload.superusers, payload.vip_users,
+        payload.qq_official_superusers, payload.qq_official_vip_users)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("config.permissions_write", "修改权限名单", _ip(request))
+    return result
+
+
+@app.get("/api/config/models")
+async def api_config_models():
+    result = await asyncio.to_thread(config_editor.models_read)
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    return result
+
+
+class RawPayload(BaseModel):
+    content: str
+
+
+@app.put("/api/config/models")
+async def api_config_models_put(payload: RawPayload, request: Request):
+    result = await asyncio.to_thread(config_editor.models_write, payload.content)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("config.models_write", "修改模型配置（原始 JSON）", _ip(request))
+    return result
+
+
+class ModelSectionPayload(BaseModel):
+    section: str
+    config: dict
+
+
+@app.post("/api/config/models/test")
+async def api_config_models_test(payload: ModelSectionPayload, request: Request):
+    """Standalone connectivity probe for one model section (no write).
+
+    Masked api_key placeholders are unmasked against the on-disk value
+    first, so「测试连接」works without re-entering the key.
+    """
+    from .model_probe import probe_model
+    prepared = await asyncio.to_thread(config_editor.models_section_prepare,
+                                       payload.section, payload.config)
+    if "error" in prepared:
+        return JSONResponse(prepared, status_code=400)
+    sec = prepared["section_data"]
+    probe = await probe_model(sec.get("api_key", ""), sec.get("api_base", ""),
+                              sec.get("model", ""), section=payload.section)
+    audit.log_action("config.models_test",
+                     f"测试模型连接 {payload.section}: {probe['status']}",
+                     _ip(request))
+    if not probe["ok"]:
+        return JSONResponse({"error": probe["detail"], "probe": probe},
+                            status_code=400)
+    return {"ok": True, "probe": probe}
+
+
+@app.put("/api/config/models/section")
+async def api_config_models_section_put(payload: ModelSectionPayload,
+                                        request: Request):
+    """Probe-then-write one model section. A failed probe never touches disk."""
+    from .model_probe import probe_model
+    prepared = await asyncio.to_thread(config_editor.models_section_prepare,
+                                       payload.section, payload.config)
+    if "error" in prepared:
+        return JSONResponse(prepared, status_code=400)
+
+    probe = None
+    if prepared["needs_probe"]:
+        sec = prepared["section_data"]
+        probe = await probe_model(sec.get("api_key", ""), sec.get("api_base", ""),
+                                  sec.get("model", ""), section=payload.section)
+        if not probe["ok"]:
+            return JSONResponse(
+                {"error": f"API 验证失败，未保存: {probe['detail']}", "probe": probe},
+                status_code=400)
+
+    result = await asyncio.to_thread(config_editor.models_section_commit,
+                                     prepared["prepared_full"])
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("config.models_section_write",
+                     f"修改模型配置段 {payload.section}"
+                     f"{'（已验证 ' + str(probe['elapsed_ms']) + 'ms）' if probe else '（凭据未变，跳过验证）'}",
+                     _ip(request))
+    return {"ok": True, "probe": probe, "skipped": probe is None}
+
+
+@app.get("/api/config/group-features")
+async def api_config_group_features():
+    return await asyncio.to_thread(config_editor.group_features_read)
+
+
+@app.put("/api/config/group-features")
+async def api_config_group_features_put(payload: RawPayload, request: Request):
+    result = await asyncio.to_thread(config_editor.json_config_write,
+                                     config_editor.GROUP_FEATURES_FILE, payload.content)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    result["note"] = "已保存 — 下条群消息即生效"
+    audit.log_action("config.group_features_write", "修改群功能开关", _ip(request))
+    return result
+
+
+@app.get("/api/config/personality")
+async def api_config_personality():
+    return await asyncio.to_thread(config_editor.personality_read)
+
+
+class PersonalityPayload(BaseModel):
+    personality: str
+    group_personality: str = ""
+
+
+@app.put("/api/config/personality")
+async def api_config_personality_put(payload: PersonalityPayload, request: Request):
+    r1 = await asyncio.to_thread(config_editor.json_config_write,
+                                 config_editor.PERSONALITY_FILE, payload.personality)
+    if "error" in r1:
+        return JSONResponse({"error": f"personality_config: {r1['error']}"}, status_code=400)
+    if payload.group_personality.strip():
+        r2 = await asyncio.to_thread(config_editor.json_config_write,
+                                     config_editor.GROUP_PERSONALITY_FILE,
+                                     payload.group_personality)
+        if "error" in r2:
+            return JSONResponse(
+                {"error": f"group_personality: {r2['error']}（personality_config 已保存）"},
+                status_code=400)
+    audit.log_action("config.personality_write", "修改人格配置", _ip(request))
+    return {"ok": True, "note": "已保存，新消息即生效"}
+
+
+# ── Character management API（角色管理页）────────────────────────
+#
+# 设计：docs/character-admin-ui-design.md。写路径统一走
+# character_admin → CharacterRegistry.update_character()，面板不自己拼文件格式。
+# ⚠️ 静态路径段（stats/authors/voices）必须声明在 /{cid} 之前，否则会被当成 cid。
+
+def _api_error(result: dict, default: int = 400):
+    """把业务层的 {"error", "status"} 映射成 HTTP 错误响应。"""
+    body = {"error": result.get("error", "操作失败")}
+    for key in ("lint", "issues"):
+        if key in result:
+            body[key] = result[key]
+    return JSONResponse(body, status_code=int(result.get("status", default)))
+
+
+@app.get("/api/characters")
+async def api_characters_list(author: str = "", q: str = "", source: str = "ugc",
+                              issue: str = "", page: int = 1, size: int = 50):
+    return await asyncio.to_thread(character_admin.list_characters,
+                                   author, q, source, issue, page, size)
+
+
+@app.get("/api/characters/stats")
+async def api_characters_stats():
+    return await asyncio.to_thread(character_admin.stats)
+
+
+@app.get("/api/characters/authors")
+async def api_characters_authors():
+    return await asyncio.to_thread(character_admin.authors)
+
+
+@app.get("/api/characters/voices")
+async def api_characters_voices():
+    return await asyncio.to_thread(character_admin.voices)
+
+
+class CharCreatePayload(BaseModel):
+    author: str
+    fields: dict
+    allow_quota_bypass: bool = False
+    skip_review: bool = False
+
+
+@app.post("/api/characters")
+async def api_characters_create(payload: CharCreatePayload, request: Request):
+    """管理员代办新建：组卡 → （默认）内容审查 → 落盘。"""
+    prepared = await asyncio.to_thread(
+        lambda: character_admin.prepare_create(
+            payload.author, payload.fields,
+            allow_quota_bypass=payload.allow_quota_bypass))
+    if "error" in prepared:
+        return _api_error(prepared)
+
+    review = None
+    if not payload.skip_review:
+        review = await character_admin.review_text(prepared["card"])
+        if "error" in review:
+            return JSONResponse(
+                {"error": f"内容审查不可用（可勾选「跳过审查」）：{review['error']}"},
+                status_code=400)
+        if not review.get("approved"):
+            return JSONResponse(
+                {"error": f"内容审查未通过：{review.get('reason') or '未说明原因'}"},
+                status_code=400)
+
+    result = await asyncio.to_thread(character_admin.commit_create, prepared)
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.create",
+                     f"{result['char_id']} · 作者 {payload.author}"
+                     f"{' · 已审' if review else ' · 跳过审查'}", _ip(request))
+    result["review"] = review
+    return result
+
+
+@app.get("/api/characters/{cid}")
+async def api_character_detail(cid: str):
+    result = await asyncio.to_thread(character_admin.detail, cid)
+    if "error" in result:
+        return _api_error(result, 404)
+    return result
+
+
+class CharCardPayload(BaseModel):
+    content: str
+    expected_sha256: str = ""
+    force: bool = False
+
+
+@app.put("/api/characters/{cid}/card")
+async def api_character_card_put(cid: str, payload: CharCardPayload,
+                                 request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.save_card(
+            cid, payload.content, expected_sha256=payload.expected_sha256,
+            force=payload.force, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.card_write",
+                     f"{cid} · {result.get('bytes')} B", _ip(request))
+    return result
+
+
+class CharSectionEdit(BaseModel):
+    index: int
+    body: str
+
+
+class CharSectionsPayload(BaseModel):
+    sections: list[CharSectionEdit] = []
+    h1: str | None = None
+    preamble: str | None = None
+    meta: dict | None = None
+    expected_sha256: str = ""
+    force: bool = False
+
+
+@app.put("/api/characters/{cid}/sections")
+async def api_character_sections_put(cid: str, payload: CharSectionsPayload,
+                                     request: Request):
+    edits = [{"index": s.index, "body": s.body} for s in payload.sections]
+    result = await asyncio.to_thread(
+        lambda: character_admin.save_sections(
+            cid, edits, h1=payload.h1, preamble=payload.preamble,
+            meta_values=payload.meta, expected_sha256=payload.expected_sha256,
+            force=payload.force, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    if not result.get("unchanged"):
+        audit.log_action("character.sections_write", f"{cid}", _ip(request))
+    return result
+
+
+class CharMetaPayload(BaseModel):
+    patch: dict
+    expected_sha256: str = ""
+    sync_h1: bool = False
+
+
+@app.put("/api/characters/{cid}/meta")
+async def api_character_meta_put(cid: str, payload: CharMetaPayload,
+                                 request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.save_meta(
+            cid, payload.patch, expected_sha256=payload.expected_sha256,
+            sync_h1=payload.sync_h1, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.meta_write",
+                     f"{cid} · {', '.join(payload.patch)}", _ip(request))
+    return result
+
+
+class CharRepairPayload(BaseModel):
+    action: str
+    payload: dict = {}
+
+
+@app.post("/api/characters/{cid}/repair")
+async def api_character_repair(cid: str, payload: CharRepairPayload,
+                               request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.repair(cid, payload.action, payload.payload,
+                                       actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.repair",
+                     f"{cid} · {payload.action}", _ip(request))
+    return result
+
+
+@app.get("/api/characters/{cid}/portrait")
+async def api_character_portrait(cid: str):
+    info = await asyncio.to_thread(character_admin.portrait_file, cid)
+    if "error" in info:
+        return _api_error(info, 404)
+    # no-cache：换了图必须立刻看到（同 _NoCacheStatic 的教训）
+    return FileResponse(info["path"], media_type=info["mime"],
+                        headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
+class CharPortraitPayload(BaseModel):
+    data_b64: str
+    filename: str = ""
+
+
+@app.post("/api/characters/{cid}/portrait")
+async def api_character_portrait_put(cid: str, payload: CharPortraitPayload,
+                                     request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.save_portrait(cid, payload.data_b64,
+                                              actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.portrait_write",
+                     f"{cid} · {result.get('describe')}", _ip(request))
+    return result
+
+
+@app.delete("/api/characters/{cid}/portrait")
+async def api_character_portrait_delete(cid: str, request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.clear_portrait(cid, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.portrait_clear", cid, _ip(request))
+    return result
+
+
+@app.get("/api/characters/{cid}/preview")
+async def api_character_preview(cid: str):
+    result = await asyncio.to_thread(character_admin.preview, cid)
+    if "error" in result:
+        return _api_error(result)
+    return result
+
+
+@app.get("/api/characters/{cid}/versions")
+async def api_character_versions(cid: str):
+    return await asyncio.to_thread(character_admin.versions, cid)
+
+
+@app.get("/api/characters/{cid}/versions/{ts}")
+async def api_character_version(cid: str, ts: str):
+    result = await asyncio.to_thread(character_admin.version_content, cid, ts)
+    if "error" in result:
+        return _api_error(result, 404)
+    return result
+
+
+class CharRestorePayload(BaseModel):
+    ts: str
+
+
+@app.post("/api/characters/{cid}/restore")
+async def api_character_restore(cid: str, payload: CharRestorePayload,
+                                request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.restore(cid, payload.ts, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.restore", f"{cid} ← {payload.ts}", _ip(request))
+    return result
+
+
+class CharReviewPayload(BaseModel):
+    content: str = ""
+
+
+@app.post("/api/characters/{cid}/review")
+async def api_character_review(cid: str, payload: CharReviewPayload,
+                               request: Request):
+    """可选的内容审查（复用 QQ 创作通道的审查口径）。"""
+    text = payload.content
+    if not text:
+        detail_ = await asyncio.to_thread(character_admin.detail, cid)
+        if "error" in detail_:
+            return _api_error(detail_, 404)
+        text = detail_["card"]["content"]
+    result = await character_admin.review_text(text)
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.review",
+                     f"{cid} · {result.get('verdict')}", _ip(request))
+    return result
+
+
+class CharDeletePayload(BaseModel):
+    confirm_name: str
+
+
+@app.delete("/api/characters/{cid}")
+async def api_character_delete(cid: str, payload: CharDeletePayload,
+                               request: Request):
+    result = await asyncio.to_thread(
+        lambda: character_admin.delete_character(
+            cid, payload.confirm_name, actor_ip=_ip(request)))
+    if "error" in result:
+        return _api_error(result)
+    audit.log_action("character.delete",
+                     f"{cid} · {result.get('display_name')} · purge={result.get('purged')}",
+                     _ip(request))
+    return result
+
+
+# ── Memory & profile API ──────────────────────────────────────────
+
+@app.get("/api/memory")
+async def api_memory(mem_type: str = "", user_id: str = "", q: str = ""):
+    return await asyncio.to_thread(data_reader.memory_list, mem_type, user_id, q)
+
+
+class MemoryPayload(BaseModel):
+    name: str
+    description: str = ""
+    type: str
+    content: str = ""
+    user_id: str = ""
+
+
+@app.put("/api/memory")
+async def api_memory_put(payload: MemoryPayload, request: Request):
+    result = await asyncio.to_thread(data_reader.memory_save, payload.name,
+                                     payload.description, payload.type,
+                                     payload.content, payload.user_id)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("memory.save", f"写入记忆 {payload.type}/{payload.name}", _ip(request))
+    return result
+
+
+@app.delete("/api/memory")
+async def api_memory_delete(name: str, mem_type: str = "", user_id: str = "",
+                            request: Request = None):
+    result = await asyncio.to_thread(data_reader.memory_delete, name, mem_type, user_id)
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    audit.log_action("memory.delete", f"删除记忆 {mem_type or '*'}/{name}", _ip(request))
+    return result
+
+
+@app.get("/api/profiles/{uid}")
+async def api_profile_get(uid: str):
+    result = await asyncio.to_thread(data_reader.profile_get, uid)
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    return result
+
+
+@app.put("/api/profiles/{uid}")
+async def api_profile_put(uid: str, payload: dict, request: Request):
+    result = await asyncio.to_thread(data_reader.profile_save, uid, payload)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("profile.save", f"修改用户画像 {uid}", _ip(request))
+    return result
+
+
+# ── Wiki cache API ────────────────────────────────────────────────
+
+@app.get("/api/wiki/cache-status")
+async def api_wiki_cache():
+    return await asyncio.to_thread(data_reader.wiki_cache_status)
+
+
+@app.get("/api/wiki/aliases")
+async def api_wiki_aliases_get(kind: str = "char"):
+    result = await asyncio.to_thread(data_reader.wiki_aliases_read, kind)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+@app.get("/api/wiki/aliases/missing")
+async def api_wiki_aliases_missing(kind: str = "char"):
+    result = await asyncio.to_thread(data_reader.wiki_aliases_missing, kind)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class AliasPayload(BaseModel):
+    kind: str
+    aliases: dict  # {canonical: [alias...]} 全量快照
+
+
+@app.put("/api/wiki/aliases")
+async def api_wiki_aliases_put(payload: AliasPayload, request: Request):
+    result = await asyncio.to_thread(data_reader.wiki_aliases_save,
+                                     payload.kind, payload.aliases)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("wiki.aliases.save",
+                     f"保存{payload.kind}别名: {result.get('groups')} 组 / "
+                     f"{result.get('aliases')} 条", _ip(request))
+    return result
+
+
+# ── Wiki 翻译术语表 API ───────────────────────────────────────────
+# 存储/校验/原子写在 QQBot/tools/wiki_glossary.py（bot 与面板共用一套规则）；
+# bot 侧全部消费点按 mtime 热读，保存后无需重启即生效。
+
+@app.get("/api/wiki/glossary")
+async def api_wiki_glossary_get():
+    result = await asyncio.to_thread(data_reader.wiki_glossary_read)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+@app.get("/api/wiki/glossary/default")
+async def api_wiki_glossary_default():
+    result = await asyncio.to_thread(data_reader.wiki_glossary_default)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class GlossaryPayload(BaseModel):
+    tables: dict  # {table_name: pairs|map|...} 全量快照
+
+
+@app.put("/api/wiki/glossary")
+async def api_wiki_glossary_put(payload: GlossaryPayload, request: Request):
+    result = await asyncio.to_thread(data_reader.wiki_glossary_save, payload.tables)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("wiki.glossary.save",
+                     f"保存翻译术语表: {result.get('tables')} 张", _ip(request))
+    return result
+
+
+# ── Wiki 详情缓存编辑 / LLM 重翻译 API ────────────────────────────
+
+@app.get("/api/wiki/details")
+async def api_wiki_details_list(kind: str = "char", q: str = ""):
+    result = await asyncio.to_thread(data_reader.wiki_details_list, kind, q)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+@app.get("/api/wiki/details/entry")
+async def api_wiki_details_entry(kind: str = "char", title: str = ""):
+    result = await asyncio.to_thread(data_reader.wiki_details_entry, kind, title)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+# 解包角色（gamedata）只读条目：wiki 未收录的新角色（如 H806 蜜拉贝儿）
+# 没有可编辑的详情缓存条目，面板展示 names/aliases/技能/卡面文案 的只读视图。
+@app.get("/api/wiki/details/gamedata")
+async def api_wiki_details_gamedata(rid: str = ""):
+    result = await asyncio.to_thread(data_reader.wiki_details_gamedata_entry, rid)
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    return result
+
+
+# 角色立绘（wiki_cache/portraits/{rid}.png，含解包同步的图）；rid 白名单
+# 校验在 data_reader.wiki_portrait_path（防路径穿越）。
+@app.get("/api/wiki/portrait")
+async def api_wiki_portrait(rid: str = ""):
+    path = data_reader.wiki_portrait_path(rid)
+    if path is None:
+        return JSONResponse({"error": "立绘不存在"}, status_code=404)
+    return FileResponse(str(path), media_type="image/png",
+                        headers={"Cache-Control": "no-cache"})
+
+
+class DetailFieldsPayload(BaseModel):
+    kind: str
+    title: str
+    fields: dict  # {点分路径: 新值} — 白名单校验在 data_reader
+
+
+@app.put("/api/wiki/details/entry")
+async def api_wiki_details_entry_put(payload: DetailFieldsPayload, request: Request):
+    result = await asyncio.to_thread(data_reader.wiki_details_save_fields,
+                                     payload.kind, payload.title, payload.fields)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("wiki.details.edit",
+                     f"人工修正 {payload.kind}/{payload.title}: "
+                     f"{result.get('applied')} 字段", _ip(request))
+    return result
+
+
+# 重翻译 = 面板进程内的后台任务（playground 同款 raw FLASH 配置 →
+# DeepSeekClient → WikiScraper.force_retranslate），in-flight guard 防并发，
+# 前端 2s 轮询 status。写回前重读磁盘最新副本，仅替换目标 entry。
+
+_retranslate_jobs: dict[str, dict] = {}  # "kind:title" → {state, message, started, elapsed?}
+
+
+async def _run_retranslate(kind: str, title: str):
+    job = _retranslate_jobs[f"{kind}:{title}"]
+    try:
+        block = playground._load_model_block("flash")
+        if "_error" in block:
+            raise RuntimeError(block["_error"])
+        api_key = block.get("api_key")
+        api_base = block.get("api_base")
+        model = block.get("model")
+        if not api_key or not api_base:
+            raise RuntimeError("models_settings.json 缺少 api_key / api_base")
+
+        import copy
+        from lib.deepseek_client import DeepSeekClient
+        from lib.token_ledger import set_usage_context
+        from tools.wiki_scraper import WikiScraper
+
+        client = DeepSeekClient(api_key=api_key, api_base=api_base, model=model)
+        try:
+            set_usage_context("panel", "", "wiki-retranslate")
+        except Exception:
+            pass
+        scraper = WikiScraper(llm_client=client)
+
+        # 从磁盘取最新 entry 副本（不用请求时的快照，避免遮蔽期间的 bot 刷新）
+        fresh = await asyncio.to_thread(data_reader.wiki_details_entry, kind, title)
+        if "error" in fresh:
+            raise RuntimeError(fresh["error"])
+        work = copy.deepcopy(fresh["entry"])
+        work.pop("_manual_fields", None)  # 重翻译后是机翻文本，清除人工修正标记
+
+        result = await scraper.force_retranslate(kind, [work])
+        if result.get("error"):
+            raise RuntimeError(result["error"])
+
+        write = await asyncio.to_thread(
+            data_reader.wiki_details_replace_entry, kind, title, work)
+        if "error" in write:
+            raise RuntimeError(write["error"])
+        job["state"] = "done"
+        job["message"] = f"重翻译完成: {work.get('name_cn') or title}"
+    except Exception as e:
+        job["state"] = "error"
+        job["message"] = f"{type(e).__name__}: {e}"
+    finally:
+        job["elapsed"] = round(time.time() - job["started"], 1)
+
+
+class RetranslatePayload(BaseModel):
+    kind: str
+    title: str
+
+
+@app.post("/api/wiki/details/retranslate")
+async def api_wiki_details_retranslate(payload: RetranslatePayload, request: Request):
+    kind, title = payload.kind, payload.title
+    if kind not in ("char", "bond"):
+        return JSONResponse({"error": f"非法详情类型: {kind}"}, status_code=400)
+    key = f"{kind}:{title}"
+    job = _retranslate_jobs.get(key)
+    if job and job.get("state") == "running":
+        return {"ok": True, "state": "running", "note": "该条目已在重翻译中"}
+    check = await asyncio.to_thread(data_reader.wiki_details_entry, kind, title)
+    if "error" in check:
+        return JSONResponse(check, status_code=400)
+    _retranslate_jobs[key] = {"state": "running", "message": "", "started": time.time()}
+    asyncio.create_task(_run_retranslate(kind, title))
+    audit.log_action("wiki.retranslate", f"发起 LLM 重翻译 {kind}/{title}", _ip(request))
+    return {"ok": True, "state": "running"}
+
+
+@app.get("/api/wiki/details/retranslate/status")
+async def api_wiki_details_retranslate_status(kind: str = "char", title: str = ""):
+    job = _retranslate_jobs.get(f"{kind}:{title}")
+    if not job:
+        return {"state": "idle"}
+    return {
+        "state": job["state"],  # idle|running|done|error
+        "message": job.get("message", ""),
+        "elapsed": job.get("elapsed") or round(time.time() - job["started"], 1),
+    }
+
+
+# ── Redeem code management API ────────────────────────────────────
+
+@app.get("/api/redeem")
+async def api_redeem_list():
+    result = await asyncio.to_thread(data_reader.redeem_list)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class RedeemSavePayload(BaseModel):
+    codes: list  # 全量快照 [{code, content, valid, _added, _source}, ...]
+
+
+@app.put("/api/redeem")
+async def api_redeem_save(payload: RedeemSavePayload, request: Request):
+    result = await asyncio.to_thread(data_reader.redeem_save, payload.codes)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("redeem.save", f"保存兑换码列表: {len(payload.codes)} 条",
+                     _ip(request))
+    result["note"] = "已保存 — bot 每次查询都直接读盘，立即生效"
+    return result
+
+
+class TweetParsePayload(BaseModel):
+    text: str
+
+
+@app.post("/api/redeem/parse-tweet")
+async def api_redeem_parse_tweet(payload: TweetParsePayload):
+    return await asyncio.to_thread(data_reader.redeem_parse_tweet, payload.text)
+
+
+@app.get("/api/redeem/alert")
+async def api_redeem_alert():
+    return await asyncio.to_thread(data_reader.redeem_alert_status)
+
+
+@app.post("/api/redeem/alert/clear")
+async def api_redeem_alert_clear(request: Request):
+    result = await asyncio.to_thread(data_reader.redeem_alert_clear)
+    audit.log_action("redeem.alert_clear", "忽略兑换码管理员提醒", _ip(request))
+    return result
+
+
+# ── 更新日志（changelog）管理 API ─────────────────────────────────
+
+@app.get("/api/changelog")
+async def api_changelog_list():
+    result = await asyncio.to_thread(data_reader.changelog_list)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class ChangelogSavePayload(BaseModel):
+    entries: list  # 全量快照 [{version, date, changes:[{type,text}], created_at?, ...}]
+
+
+@app.put("/api/changelog")
+async def api_changelog_save(payload: ChangelogSavePayload, request: Request):
+    result = await asyncio.to_thread(data_reader.changelog_save, payload.entries)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("changelog.save", f"保存更新记录: {len(payload.entries)} 条",
+                     _ip(request))
+    return result
+
+
+@app.get("/api/changelog/groups")
+async def api_changelog_groups():
+    return await asyncio.to_thread(data_reader.changelog_groups)
+
+
+class ChangelogBroadcastPayload(BaseModel):
+    entry_index: int
+    targets: list  # ["all"] 或 ["<group_id>", ...]
+
+
+@app.post("/api/changelog/broadcast")
+async def api_changelog_broadcast(payload: ChangelogBroadcastPayload, request: Request):
+    result = await asyncio.to_thread(
+        data_reader.changelog_broadcast, payload.entry_index, payload.targets)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("changelog.broadcast",
+                     f"群发更新记录 #{payload.entry_index} 到 "
+                     f"{_describe_targets(payload.targets)}", _ip(request))
+    return result
+
+
+@app.get("/api/changelog/broadcast/status")
+async def api_changelog_broadcast_status():
+    return await asyncio.to_thread(data_reader.changelog_broadcast_status)
+
+
+def _describe_targets(targets) -> str:
+    """审计用目标描述：全部群 / N 个 OneBot 群 + M 个官方群（§16.6）。"""
+    if not isinstance(targets, list):
+        return "?"
+    if "all" in targets:
+        return "全部群"
+    chans: dict = {}
+    for t in targets:
+        ch = t.get("channel", "onebot") if isinstance(t, dict) else "onebot"
+        chans[ch] = chans.get(ch, 0) + 1
+    if not chans:
+        return "0 个群"
+    return " + ".join(
+        f"{n} 个{'官方群' if ch == 'official' else ' OneBot 群'}"
+        for ch, n in sorted(chans.items()))
+
+
+# ── 公告（announcements，更新日志与公告页第二 Tab，§16.3）API ─────────
+
+@app.get("/api/changelog/announcements")
+async def api_announcement_list():
+    return await asyncio.to_thread(data_reader.announcement_list)
+
+
+class AnnouncementSavePayload(BaseModel):
+    entries: list  # [{id?, title, body, format(text|markdown), ...}]
+
+
+@app.put("/api/changelog/announcements")
+async def api_announcement_save(payload: AnnouncementSavePayload, request: Request):
+    result = await asyncio.to_thread(data_reader.announcement_save, payload.entries)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("announcement.save",
+                     f"保存公告: {len(payload.entries)} 条", _ip(request))
+    return result
+
+
+class AnnouncementBroadcastPayload(BaseModel):
+    announcement_id: str
+    targets: list  # ["all"] 或 [{channel,id}…]（裸字符串视为 onebot）
+
+
+@app.post("/api/changelog/announcements/broadcast")
+async def api_announcement_broadcast(payload: AnnouncementBroadcastPayload,
+                                     request: Request):
+    result = await asyncio.to_thread(
+        data_reader.announcement_broadcast,
+        payload.announcement_id, payload.targets)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("announcement.broadcast",
+                     f"群发公告 {payload.announcement_id} 到 "
+                     f"{_describe_targets(payload.targets)}", _ip(request))
+    return result
+
+
+# ── 邮件管理（/mail，§16.4）API ──────────────────────────────────────
+# 信箱面板只读；删除/系统邮件走 data/mail_admin/queue 文件队列由 bot 执行。
+
+@app.get("/api/mail/overview")
+async def api_mail_overview():
+    return await asyncio.to_thread(data_reader.mail_overview)
+
+
+@app.get("/api/mail/users")
+async def api_mail_users(query: str = "", page: int = 1, page_size: int = 20):
+    return await asyncio.to_thread(data_reader.mail_users, query, page, page_size)
+
+
+@app.get("/api/mail/user")
+async def api_mail_user(openid: str = ""):
+    result = await asyncio.to_thread(data_reader.mail_user, openid)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+class MailLetterDeletePayload(BaseModel):
+    openid: str
+    letter_id: str
+
+
+@app.post("/api/mail/letters/delete")
+async def api_mail_letter_delete(payload: MailLetterDeletePayload, request: Request):
+    result = await asyncio.to_thread(
+        data_reader.mail_enqueue_delete, payload.openid, payload.letter_id)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("mail.delete",
+                     f"删除信件 {payload.letter_id}"
+                     f"（用户 {data_reader._mask_openid(payload.openid)}）",
+                     _ip(request))
+    return result
+
+
+class MailSendPayload(BaseModel):
+    openids: list = []   # 批量多选（每个用户一个队列文件）
+    openid: str = ""     # 单用户兼容字段
+    title: str
+    body: str
+    format: str = "text"
+
+
+@app.post("/api/mail/send")
+async def api_mail_send(payload: MailSendPayload, request: Request):
+    targets = payload.openids or ([payload.openid] if payload.openid else [])
+    result = await asyncio.to_thread(
+        data_reader.mail_enqueue_send, targets,
+        payload.title, payload.body, payload.format)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("mail.send_system",
+                     f"发送系统邮件「{payload.title}」到 "
+                     f"{result.get('count', len(targets))} 个用户", _ip(request))
+    return result
+
+
+@app.get("/api/mail/queue")
+async def api_mail_queue():
+    return await asyncio.to_thread(data_reader.mail_queue_status)
+
+
+# ── Playground / system-prompt preview API ────────────────────────
+
+@app.get("/api/playground/options")
+async def api_playground_options():
+    return {
+        "models": await asyncio.to_thread(playground.available_models),
+        # personality_options 带 label/source，含用户自创角色（角色管理页 Phase 3）
+        "personality_options": await asyncio.to_thread(playground.personality_options),
+        # 旧字段保留（纯 key 列表），避免其它调用方被破坏
+        "personalities": await asyncio.to_thread(playground.available_personalities),
+    }
+
+
+class PlaygroundPayload(BaseModel):
+    message: str
+    personality: str = ""
+    tier: str = "reasoning"
+    role: str = "admin"
+    history: list = []
+
+
+@app.post("/api/playground/run")
+async def api_playground_run(payload: PlaygroundPayload, request: Request):
+    result = await playground.run_playground(
+        payload.message, personality=payload.personality, tier=payload.tier,
+        role=payload.role, history=payload.history)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    audit.log_action("playground.run",
+                     f"Playground 对话 tier={payload.tier} personality={payload.personality or '-'}",
+                     _ip(request))
+    return result
+
+
+@app.get("/api/config/system-prompt-preview")
+async def api_system_prompt_preview(personality: str = "", role: str = "admin"):
+    result = await asyncio.to_thread(playground.preview_system_prompt, personality, role)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+# ── Web terminal (pty over websocket) ─────────────────────────────
+
+@app.websocket("/ws/terminal")
+async def ws_terminal(ws: WebSocket):
+    if not auth.is_authenticated(ws):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+
+    shell = os.environ.get("SHELL") or "/bin/bash"
+    try:
+        pid, fd = pty.fork()
+    except OSError as e:
+        await ws.send_text(f"\r\n[无法创建终端: {e}]\r\n")
+        await ws.close()
+        return
+    if pid == 0:  # child — becomes the shell
+        os.environ.setdefault("TERM", "xterm-256color")
+        try:
+            os.execvp(shell, [shell])
+        except OSError:
+            os._exit(127)
+
+    # parent
+    async def _reader():
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                try:
+                    data = await asyncio.to_thread(os.read, fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                await ws.send_text(data.decode("utf-8", errors="replace"))
+        finally:
+            try:
+                await ws.send_text("\r\n[会话结束]\r\n")
+                await ws.close()
+            except Exception:
+                pass
+
+    reader_task = asyncio.create_task(_reader())
+    try:
+        while True:
+            msg = await ws.receive_text()
+            if msg.startswith("{"):
+                try:
+                    ctrl = json.loads(msg)
+                    if ctrl.get("type") == "resize":
+                        winsize = struct.pack("HHHH", int(ctrl.get("rows", 24)),
+                                              int(ctrl.get("cols", 80)), 0, 0)
+                        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+                        continue
+                except (ValueError, OSError):
+                    pass
+            os.write(fd, msg.encode("utf-8"))
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        reader_task.cancel()
+        try:
+            os.kill(pid, signal.SIGHUP)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# ── Entrypoint ────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("webui.main:app", host=HOST, port=PORT)

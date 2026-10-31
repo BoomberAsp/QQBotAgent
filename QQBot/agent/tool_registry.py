@@ -12,6 +12,8 @@ import json
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from lib.errors import ToolError, classify_exception, log_exception
+
 
 class ToolRegistry:
     """Registry for agent tools with OpenAI-compatible schema generation."""
@@ -36,8 +38,14 @@ class ToolRegistry:
             description: Natural language description for the LLM.
             parameters: JSON Schema for the tool's parameters.
         """
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            signature = None  # some builtins/C callables have no signature
+
         self._tools[name] = {
             "function": func,
+            "signature": signature,
             "schema": {
                 "type": "function",
                 "function": {
@@ -89,16 +97,41 @@ class ToolRegistry:
             return f"[Error] Tool '{name}' is not registered. Available: {', '.join(self.list_tools())}"
 
         func = tool["function"]
+
+        # Pre-bind arguments so signature mismatches surface as actionable,
+        # schema-level errors. Parameter names are already public in the
+        # tool's JSON schema, so this text is safe for the model to see.
+        signature = tool.get("signature")
+        if signature is not None:
+            try:
+                signature.bind(**arguments)
+            except TypeError as e:
+                return f"[Error] Invalid arguments for tool '{name}': {e}"
+
         try:
             if inspect.iscoroutinefunction(func):
                 result = await func(**arguments)
             else:
                 result = func(**arguments)
             return str(result) if result is not None else "(tool executed successfully, no output)"
-        except TypeError as e:
-            return f"[Error] Invalid arguments for tool '{name}': {e}"
         except Exception as e:
-            return f"[Error] Tool '{name}' execution failed: {e}"
+            # Never feed raw exception text back to the model: it can carry
+            # server paths, internal URLs, or env details, and the model will
+            # copy it into user-visible replies. The full traceback is logged
+            # under a diagnostic code; only the safe text is returned.
+            code = log_exception(f"tool '{name}' execution failed", e)
+            if isinstance(e, ToolError):
+                msg = e.safe_message
+                return msg if msg.startswith("[Error]") else f"[Error] {msg}"
+            if classify_exception(e) == "unavailable":
+                return (
+                    f"[Error] 工具 '{name}' 暂时不可用（超时或网络错误，诊断编号 {code}）。"
+                    f"请稍后重试或改用其他方式。"
+                )
+            return (
+                f"[Error] 工具 '{name}' 执行失败（诊断编号 {code}）。"
+                f"请勿原样重试同一调用；改用其他方式或向用户说明情况。"
+            )
 
     # ── Bulk registration ─────────────────────────────────────────
 

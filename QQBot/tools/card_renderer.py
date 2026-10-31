@@ -25,9 +25,11 @@ never blocks on network state.
 import hashlib
 import json
 import os
+import re
 import threading
 
 from PIL import Image, ImageDraw, ImageFont
+from lib.paths import wiki_cache_dir
 
 
 # ── Paths ────────────────────────────────────────────────────────
@@ -35,7 +37,8 @@ from PIL import Image, ImageDraw, ImageFont
 _FONT_DIR = os.path.join(os.path.dirname(__file__), "..", "config", "font")
 _FONT_MAIN = os.path.join(_FONT_DIR, "NotoSansSC-SemiBold.ttf")
 
-_CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "wiki_cache")
+# 缓存目录可被 WIKI_CACHE_DIR 覆盖（生产指向数据盘，避免占系统盘）
+_CACHE_DIR = wiki_cache_dir()
 _PORTRAIT_DIR = os.path.join(_CACHE_DIR, "portraits")
 _ICON_DIR = os.path.join(_CACHE_DIR, "icons")
 _SKILL_DIR = os.path.join(_CACHE_DIR, "skill_icons")
@@ -202,7 +205,7 @@ def _portrait_path(entry: dict) -> str:
 
 
 def _icon_path(entry: dict) -> str:
-    return os.path.join(_ICON_DIR, f"{entry.get('title', '')}.png")
+    return os.path.join(_ICON_DIR, f"{entry.get('id', '')}.png")
 
 
 def _skill_icon_path(entry: dict, idx: int) -> str:
@@ -222,7 +225,7 @@ def _character_images_state(entry: dict) -> str:
             "1" if os.path.exists(_skill_icon_path(entry, i)) else "0"
             for i in range(3)
         ))
-    if entry.get("title"):
+    if entry.get("id"):
         parts.append("i=" + ("1" if os.path.exists(_icon_path(entry)) else "0"))
     return "|".join(parts)
 
@@ -238,12 +241,61 @@ def _skill_meta(sk: dict) -> str:
     return " · ".join(parts)
 
 
+# Potential (潜能) stat codes → Chinese. The wiki stores potential as a stat
+# keyword plus numeric growth params (never free text), so this is fully
+# deterministic — no LLM involved.
+_POT_STAT_CN = {
+    "ATK": "攻击力", "DEF": "防御力", "HP": "生命值",
+    "SPD": "速度", "Speed": "速度",
+    "Effect Hit Rate": "效果命中", "Effect Resistance": "效果抵抗",
+    "Crit": "暴击率", "Crit Rate": "暴击率", "Crit DMG": "暴击伤害",
+}
+
+# Potential-break tiers shown by the wiki (icons B / A / S / SS / SSS). Each
+# tier's bonus = Base + Add × k with k = 2..6 (verified against the wiki's
+# rendered table, e.g. Shani DEF Base 0 / Add 1.8 → +3.6% … +10.8%).
+_POT_TIER_LABELS = ("B", "A", "S", "SS", "SSS")
+
+
+def potential_tier_lines(entry: dict) -> list:
+    """Build the per-tier potential detail lines, or [] when data is absent.
+
+    Returns e.g. ``["团队 防御力 +3.6% / +5.4% / …", "自身 生命值 +6% / …"]``
+    (tier order B→A→S→SS→SSS). Old caches that predate the growth params yield
+    ``[]`` so callers fall back to the legacy single-line team/self display.
+    """
+    def fmt(stat_code, rate, base_s, add_s):
+        try:
+            base = float(str(base_s)) if str(base_s).strip() else 0.0
+            add = float(str(add_s)) if str(add_s).strip() else 0.0
+        except (TypeError, ValueError):
+            return None
+        if add == 0 and base == 0:
+            return None
+        code = (stat_code or "").strip()
+        stat = _POT_STAT_CN.get(code, code or "?")
+        vals = " / ".join(f"+{(base + add * (i + 2)):g}{rate}"
+                          for i in range(len(_POT_TIER_LABELS)))
+        return f"{stat} {vals}"
+
+    out = []
+    t = fmt(entry.get("team_pot_en"), entry.get("team_pot_rate"),
+            entry.get("team_pot_base"), entry.get("team_pot_add"))
+    s = fmt(entry.get("self_pot_en"), entry.get("self_pot_rate"),
+            entry.get("self_pot_base"), entry.get("self_pot_add"))
+    if t:
+        out.append("团队 " + t)
+    if s:
+        out.append("自身 " + s)
+    return out
+
+
 # ── Card path / freshness ────────────────────────────────────────
 
 # Bump this when the card layout / rendering code changes to invalidate all
 # cached PNGs. The version is appended to the content hash so that cards are
 # re-rendered even when only the renderer (not the data) has changed.
-_RENDERER_VERSION = "2"
+_RENDERER_VERSION = "3"
 
 _hash_lock = threading.Lock()
 
@@ -404,8 +456,34 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
     discs_raw = entry.get("discs") or []
     discs = [(i + 1, d) for i, d in enumerate(discs_raw) if d]
 
+    # Disc grid: the Lv3 talent ("强化技能: …") carries long mechanic text, so
+    # each cell is wrapped and every row grows to fit its tallest cell. The
+    # column width must stay inside the panel's inner content width (W-4*PAD);
+    # the old (W-2*PAD)//3 was wider than the panel interior and overflowed.
+    disc_col_w = (W - 4 * PAD) // 3
+    disc_cells = [_wrap(probe, f"Lv{lv} {d}", 20, disc_col_w - 12) or [""]
+                  for lv, d in discs]
+    disc_row_hs = [
+        max(len(c) for c in disc_cells[r:r + 3]) * _lh(20) + 8
+        for r in range(0, len(disc_cells), 3)
+    ]
+    discs_h = sum(disc_row_hs)
+
     team_pot = entry.get("team_pot", "")
     self_pot = entry.get("self_pot", "")
+
+    # Potential detail: per-tier (B→SSS) values computed from growth params —
+    # deterministic, no LLM. Old caches lacking the params fall back to the
+    # legacy single-line team/self display.
+    pot_wrapped = []
+    for line in potential_tier_lines(entry):
+        pot_wrapped.extend(_wrap(probe, line, 19, W - 4 * PAD - 10))
+    if pot_wrapped:
+        pot_block_h = (_lh(19) + 6) + len(pot_wrapped) * (_lh(19) + 2)
+    elif team_pot or self_pot:
+        pot_block_h = _lh(20)
+    else:
+        pot_block_h = 0
 
     # skill columns — body is a list of (size, text, color) wrapped lines
     col_gap = GAP
@@ -413,10 +491,23 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
     col_text_w = col_w - 40
     skill_cols = []
     for i, sk in enumerate(skills[:3]):
+        # Name sits beside the skill icon; wrap it and cap at two lines so a
+        # long translated name can never push past the column edge.
+        name_w = col_w - SKILL_ICON - 12 - 40
+        name_lines = _wrap(probe, f"[{i + 1}] {sk.get('name') or sk.get('name_en', '')}",
+                           22, name_w) or [""]
+        if len(name_lines) > 2:
+            cut = name_lines[1]
+            while cut and probe.textlength(cut + "…", font=_font(22)) > name_w:
+                cut = cut[:-1]
+            name_lines = [name_lines[0], cut + "…"]
         body = []
-        for key, size in (("des", 20), ("des2", 20)):
-            for ln in _wrap(probe, sk.get(key, ""), size, col_text_w):
-                body.append((size, ln, _TEXT_DIM))
+        for ln in _wrap(probe, sk.get("des", ""), 20, col_text_w):
+            body.append((20, ln, _TEXT_DIM))
+        if sk.get("des2"):
+            # des2 is the wiki's "†Before Discipline" text (pre-enhancement).
+            for ln in _wrap(probe, f"强化前: {sk['des2']}", 18, col_text_w):
+                body.append((18, ln, _TEXT_FAINT))
         if sk.get("multi"):
             for raw in str(sk["multi"]).splitlines():
                 if raw.strip():
@@ -426,7 +517,7 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
             for ln in _wrap(probe, f"Burst: {sk['burst']}", 18, col_text_w):
                 body.append((18, ln, _BURST))
         skill_cols.append({
-            "name": sk.get("name") or sk.get("name_en", ""),
+            "name_lines": name_lines,
             "meta": _skill_meta(sk),
             "body": body,
         })
@@ -447,19 +538,20 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
     if stats_max:
         band2_inner += _lh(18) + 4               # growth-ratio row
     band2_inner += 12
-    band2_inner += ((len(discs) + 2) // 3) * (_lh(20) + 8)  # discs grid
+    band2_inner += discs_h                            # discs grid (wrapped)
     band2_inner += 6
-    if team_pot or self_pot:
-        band2_inner += _lh(20)
+    band2_inner += pot_block_h                        # potential tiers / legacy
     band2_h = band2_inner + 2 * PAD
 
-    # Skill band
-    skill_name_h = _lh(24)
+    # Skill band — the name lines sit beside the icon; the meta row must clear
+    # whichever is taller (the icon, or a wrapped two-line name).
+    name_lines_max = max((len(c["name_lines"]) for c in skill_cols), default=1)
+    skill_top_h = max(SKILL_ICON + 8, name_lines_max * _lh(22) - 2 + 6)
     skill_meta_h = _lh(18) if any(c["meta"] for c in skill_cols) else 0
     skill_body_h = max(
         (sum(_lh(s) for s, _, _ in c["body"]) for c in skill_cols), default=0
     )
-    skill_inner = SKILL_ICON + 12 + skill_name_h + skill_meta_h + 8 + skill_body_h
+    skill_inner = skill_top_h + skill_meta_h + 4 + skill_body_h
     skill_h = skill_inner + 2 * 20  # 20px vertical padding inside panel
 
     total_h = PAD + top_h + GAP + band2_h + GAP + skill_h + PAD
@@ -527,16 +619,24 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
             stat_x += stat_col_w
         py += _lh(18) + _lh(26) + 16
 
-    disc_col_w = (W - 2 * PAD) // 3
-    disc_rows = (len(discs) + 2) // 3
-    for n, (lv, d) in enumerate(discs):
-        row, col = divmod(n, 3)
-        draw.text((px + col * disc_col_w, py + row * (_lh(20) + 8)),
-                  f"Lv{lv} {d}", font=_font(20), fill=_TEXT_DIM)
-    py += disc_rows * (_lh(20) + 8)
+    for row_idx, row_h in enumerate(disc_row_hs):
+        for c_i, cell in enumerate(disc_cells[row_idx * 3: row_idx * 3 + 3]):
+            cy = py
+            for ln in cell:
+                draw.text((px + c_i * disc_col_w, cy), ln,
+                          font=_font(20), fill=_TEXT_DIM)
+                cy += _lh(20)
+        py += row_h
     py += 6
 
-    if team_pot or self_pot:
+    if pot_wrapped:
+        draw.text((px, py), "潜能 (" + " / ".join(_POT_TIER_LABELS) + ")",
+                  font=_font(19), fill=_TEXT_FAINT)
+        py += _lh(19) + 6
+        for ln in pot_wrapped:
+            draw.text((px + 10, py), ln, font=_font(19), fill=_TEXT_DIM)
+            py += _lh(19) + 2
+    elif team_pot or self_pot:
         pot_parts = []
         if team_pot:
             pot_parts.append(f"团队 {team_pot}")
@@ -553,9 +653,11 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
                                radius=16, fill=_PANEL_2 + (255,))
         ix, iy = cx + 20, y + 20
         canvas.paste(skill_icons[i], (ix, iy), skill_icons[i])
-        draw.text((ix + SKILL_ICON + 12, iy - 2), f"[{i + 1}] {col['name']}",
-                  font=_font(22), fill=_TEXT)
-        iy += SKILL_ICON + 8
+        ny = iy - 2
+        for ln in col["name_lines"]:
+            draw.text((ix + SKILL_ICON + 12, ny), ln, font=_font(22), fill=_TEXT)
+            ny += _lh(22)
+        iy = max(iy + SKILL_ICON + 8, ny + 6)
         if col["meta"]:
             draw.text((ix, iy), col["meta"], font=_font(18), fill=_TEXT_FAINT)
             iy += _lh(18)
@@ -565,7 +667,7 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
             iy += _lh(size)
 
     # footer
-    draw.text((PAD, total_h - PAD + 8), "数据来源: Ark Re:Code Wiki",
+    draw.text((PAD, total_h - PAD + 8), "数据来源：游戏解包 + Ark Re:Code Wiki",
               font=_font(16), fill=_TEXT_FAINT)
 
     if out_path is None:
@@ -744,7 +846,7 @@ def render_bond_card(entry: dict, out_path: str | None = None) -> str:
             draw.text((vx, py), ln, font=_font(20), fill=_TEXT_DIM)
             py += _lh(20)
 
-    draw.text((PAD, total_h - PAD + 8), "数据来源: Ark Re:Code Wiki",
+    draw.text((PAD, total_h - PAD + 8), "数据来源：游戏解包 + Ark Re:Code Wiki",
               font=_font(16), fill=_TEXT_FAINT)
 
     if out_path is None:
@@ -795,38 +897,76 @@ def _parse_help_md(md_path: str) -> list:
             body = line[2:].strip().replace("`", "")
             if "—" in body:
                 cmd, _, desc = body.partition("—")
-                current[1].append((cmd.strip(), desc.strip()))
+                # 卡片是纯图：去掉 ** 记号，否则会原样画出星号
+                current[1].append((cmd.strip().replace("**", ""),
+                                   desc.strip().replace("**", "")))
             else:
-                current[1].append((body, ""))
+                current[1].append((body.replace("**", ""), ""))
     return sections
 
 
 def render_help_card(md_path: str, out_path: str | None = None) -> str | None:
     """Render HELP.md as a dark-theme help/command cheat-sheet card.
 
-    The card is derived from the markdown (``## `` sections + ``- `` command
-    rows), so it stays in sync with the doc ``/帮助`` sends as text. Returns
-    the PNG path, or ``None`` when the doc has no parseable sections.
+    The card is derived from the markdown (``## `` sections + ``- `` rows), so
+    it stays in sync with the doc ``/帮助`` sends as text. Long descriptions
+    are wrapped to the canvas: the previous one-line-per-command layout drew
+    straight past 1080px and silently clipped everything after it.
     """
     sections = _parse_help_md(md_path)
     if not sections:
         return None
 
     probe = ImageDraw.Draw(Image.new("RGBA", (W, 10)))
-
     title = "帮助 · 命令速查"
     subtitle = "以下命令直接由系统处理 · 发送 /功能 查看完整功能一览"
 
     title_h = _lh(52)
     sub_h = _lh(22)
     pill_h = _lh(24) + 20
-    cmd_h = _lh(24)
+    line_h = _lh(24)
     row_gap = 8
+    indent = 24                       # 续行缩进（相对命令起始列）
+
+    def _layout_rows(commands):
+        """Each row → [(x, line_offset, text)], wrapped to the canvas width."""
+        rows = []
+        for cmd, desc in commands:
+            if not desc:
+                # 没有「—」的说明行：整段按画布宽度折行（首行顶格）
+                wrapped = _wrap(probe, cmd, 24, W - PAD - indent * 2) or [""]
+                rows.append(
+                    [(PAD + 10, 0, wrapped[0])]
+                    + [(PAD + 10 + indent, k, ln)
+                       for k, ln in enumerate(wrapped[1:], 1)])
+                continue
+
+            cmd_w = _tw(probe, cmd, 24)
+            desc_x = PAD + 10 + cmd_w + 18
+            avail = W - PAD - desc_x
+            if _tw(probe, desc, 24) <= avail:
+                rows.append([(PAD + 10, 0, cmd), (desc_x, 0, desc)])
+                continue
+
+            cells = [(PAD + 10, 0, cmd)]
+            if avail < 260:            # 命令本身太长：说明另起一行
+                desc_x = PAD + 10 + indent
+                avail = W - PAD - desc_x
+                offset = 1
+            else:
+                offset = 0
+            for k, ln in enumerate(_wrap(probe, desc, 24, avail)):
+                cells.append((desc_x, offset + k, ln))
+            rows.append(cells)
+        return rows
+
+    layout = [(name, _layout_rows(commands)) for name, commands in sections]
 
     total_h = PAD + title_h + sub_h + GAP
-    for _name, commands in sections:
+    for _name, rows in layout:
         total_h += pill_h + GAP // 2
-        total_h += len(commands) * (cmd_h + row_gap)
+        for cells in rows:
+            total_h += line_h * (max(o for _x, o, _t in cells) + 1) + row_gap
         total_h += GAP
     total_h += PAD
 
@@ -839,7 +979,7 @@ def render_help_card(md_path: str, out_path: str | None = None) -> str | None:
     draw.text((PAD, y), subtitle, font=_font(22), fill=_TEXT_FAINT)
     y += sub_h + GAP
 
-    for idx, (name, commands) in enumerate(sections):
+    for idx, (name, rows) in enumerate(layout):
         color = _HELP_SECTION_COLORS[idx % len(_HELP_SECTION_COLORS)]
 
         # section pill header
@@ -850,14 +990,12 @@ def render_help_card(md_path: str, out_path: str | None = None) -> str | None:
                   name, font=_font(24), fill=(255, 255, 255, 255))
         y += pill_h + GAP // 2
 
-        # command rows
-        for cmd, desc in commands:
-            draw.text((PAD + 10, y), cmd, font=_font(24), fill=_TEXT)
-            cmd_w = _tw(draw, cmd, 24)
-            if desc:
-                draw.text((PAD + 10 + cmd_w + 18, y), desc,
-                          font=_font(24), fill=_TEXT_DIM)
-            y += cmd_h + row_gap
+        for cells in rows:
+            for x, offset, txt in cells:
+                primary = (offset == 0 and x == PAD + 10)
+                draw.text((x, y + offset * line_h), txt,
+                          font=_font(24), fill=_TEXT if primary else _TEXT_DIM)
+            y += line_h * (max(o for _x, o, _t in cells) + 1) + row_gap
 
         y += GAP
 
@@ -915,9 +1053,9 @@ def _parse_features_md(md_path: str) -> list:
                 continue  # separator row (|---|)
             if cells[0] in ("功能", "命令", "级别", "类别"):
                 continue  # header row
-            name = cells[0]
-            desc = cells[1] if len(cells) > 1 else ""
-            tag = cells[2] if len(cells) > 2 else ""
+            name = cells[0].replace("**", "")
+            desc = (cells[1] if len(cells) > 1 else "").replace("**", "")
+            tag = (cells[2] if len(cells) > 2 else "").replace("**", "")
             if name:
                 current[1].append((name, desc, tag))
     return sections
@@ -1007,6 +1145,322 @@ def render_feature_card(md_path: str, out_path: str | None = None) -> str | None
 
     if out_path is None:
         out_path = _FEATURE_CARD_PATH
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.convert("RGB").save(out_path, "PNG")
+    return out_path
+
+
+# ── Changelog card ────────────────────────────────────────────────
+
+_CHANGELOG_CARD_PATH = os.path.join(_CACHE_DIR, "changelog_card.png")
+
+# 变更类型 → badge 颜色（与面板下拉/CHANGE_TYPES 一致）
+_CHANGELOG_TYPE_COLORS = {
+    "新增": (76, 175, 80),    # green
+    "修复": (232, 80, 58),    # red
+    "优化": (58, 140, 232),   # blue
+    "调整": (232, 181, 58),   # gold
+    "移除": (110, 116, 132),  # gray
+}
+
+
+def _changelog_head(entry: dict) -> str:
+    """版本 pill 文案：【version】 date（缺失字段优雅降级）。"""
+    version = str(entry.get("version") or "").strip()
+    date = str(entry.get("date") or "").strip()
+    if version and date:
+        return f"【{version}】 {date}"
+    if version:
+        return f"【{version}】"
+    if date:
+        return f"【{date}】"
+    return "【更新】"
+
+
+def _changelog_entry_items(entry: dict) -> list:
+    """把单条更新记录拆成 [(type, text), ...]（跳过空文本）。
+
+    无结构化 changes 时回退到 note/text 字段（与 tools/changelog.py 的
+    _format_entry_lines 保持一致的容错）。
+    """
+    items = []
+    changes = entry.get("changes")
+    if isinstance(changes, list) and changes:
+        for ch in changes:
+            if isinstance(ch, dict):
+                ctype = str(ch.get("type") or "").strip()
+                text = str(ch.get("text") or "").strip()
+            else:
+                ctype, text = "", str(ch).strip()
+            if text:
+                items.append((ctype, text))
+    else:
+        note = str(entry.get("note") or entry.get("text") or "").strip()
+        for ln in note.splitlines():
+            if ln.strip():
+                items.append(("", ln.strip()))
+    return items
+
+
+def render_changelog_card(entries: list, out_path: str | None = None,
+                          title: str = "更新记录",
+                          site_url: str | None = None) -> str | None:
+    """把更新记录渲染成暗色主题卡片图（复用 help/feature 卡的风格）。
+
+    每条记录一个版本 pill + 若干带类型 badge 的变更行；badge 颜色按变更类型
+    （新增/修复/优化/调整/移除）区分，变更文本按像素宽自动换行。返回 PNG 路径；
+    entries 为空时返回 ``None``。``site_url`` 非空时作为副标题（公开站点短链）。
+    """
+    if not entries:
+        return None
+
+    probe = ImageDraw.Draw(Image.new("RGBA", (W, 10)))
+
+    subtitle = site_url or "发送 /更新日志 查看历史更新"
+
+    title_h = _lh(52)
+    sub_h = _lh(22)
+    pill_h = _lh(26) + 20
+    row_font = 24
+    badge_font = 20
+    row_gap = 10
+    line_h = _lh(row_font)
+
+    badge_x = PAD + 10
+    right_edge = W - PAD
+
+    # measure + prepare wrapped rows
+    render = []
+    total_h = PAD + title_h + sub_h + GAP
+    for idx, entry in enumerate(entries):
+        head = _changelog_head(entry)
+        color = _HELP_SECTION_COLORS[idx % len(_HELP_SECTION_COLORS)]
+        total_h += pill_h + GAP // 2
+        prepared = []
+        for ctype, text in _changelog_entry_items(entry):
+            if ctype:
+                badge_w = _tw(probe, ctype, badge_font) + 24
+                badge_color = _CHANGELOG_TYPE_COLORS.get(ctype, _DEFAULT_ELEMENT_COLOR)
+                text_x = badge_x + badge_w + 14
+            else:
+                badge_w, badge_color, text_x = 0, None, badge_x
+            lines = _wrap(probe, text, row_font, max(right_edge - text_x, 40)) or [""]
+            prepared.append((ctype, badge_w, badge_color, text_x, lines))
+            total_h += len(lines) * line_h + row_gap
+        render.append((color, head, prepared))
+        total_h += GAP
+    total_h += PAD
+
+    canvas = Image.new("RGBA", (W, total_h), _BG + (255,))
+    draw = ImageDraw.Draw(canvas)
+
+    y = PAD
+    draw.text((PAD, y), title, font=_font(52), fill=_TEXT)
+    y += title_h
+    draw.text((PAD, y), subtitle, font=_font(22), fill=_TEXT_FAINT)
+    y += sub_h + GAP
+
+    for color, head, prepared in render:
+        # version pill header
+        pill_w = _tw(draw, head, 26) + 44
+        draw.rounded_rectangle((PAD, y, PAD + pill_w, y + pill_h),
+                               radius=pill_h // 2, fill=color + (255,))
+        draw.text((PAD + 22, y + (pill_h - _lh(26)) // 2),
+                  head, font=_font(26), fill=(255, 255, 255, 255))
+        y += pill_h + GAP // 2
+
+        for ctype, badge_w, badge_color, text_x, lines in prepared:
+            if ctype and badge_color:
+                badge_h = _lh(badge_font) + 8
+                badge_y = y + (line_h - badge_h) // 2
+                draw.rounded_rectangle(
+                    (badge_x, badge_y, badge_x + badge_w, badge_y + badge_h),
+                    radius=badge_h // 2, fill=badge_color + (255,))
+                draw.text((badge_x + 12, badge_y + (badge_h - _lh(badge_font)) // 2),
+                          ctype, font=_font(badge_font), fill=(255, 255, 255, 255))
+            for i, ln in enumerate(lines):
+                draw.text((text_x, y + i * line_h), ln,
+                          font=_font(row_font), fill=_TEXT_DIM)
+            y += len(lines) * line_h + row_gap
+
+        y += GAP
+
+    if out_path is None:
+        out_path = _CHANGELOG_CARD_PATH
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.convert("RGB").save(out_path, "PNG")
+    return out_path
+
+
+# ── Bond 剧情场景纪念卡（P3）───────────────────────────────────────
+#
+# 一次性纪念卡：完成一个剧情场景后渲染并发送（Bond-System-Design.md §4.4）。
+# 与 wiki 数据卡不同，它不做 hash 缓存（每个场景一生只完成一次，scenes_done
+# 已防重复），直接落盘到 scene_cards/。暖玫瑰金主题，区别于元素色 wiki 卡。
+
+_SCENE_CARD_DIR = os.path.join(_CACHE_DIR, "scene_cards")
+
+_SCENE_ROSE = (236, 100, 130)       # 主玫瑰红
+_SCENE_ROSE_DIM = (150, 62, 88)     # 暗玫瑰（描边/阴影）
+_SCENE_GOLD = (240, 205, 130)       # 暖金（装饰/日期）
+_SCENE_BG = (33, 26, 33)            # 暖调深色背景
+_SCENE_PANEL = (44, 34, 43)         # 内嵌面板
+
+
+def _draw_heart(draw: ImageDraw.ImageDraw, cx: float, cy: float,
+                size: float, color: tuple, outline: tuple | None = None):
+    """Draw a heart centred near (cx, cy) within a ``size``-wide box."""
+    r = size / 4.0
+    draw.ellipse((cx - 2 * r, cy - 1.4 * r, cx, cy + 0.6 * r), fill=color)
+    draw.ellipse((cx, cy - 1.4 * r, cx + 2 * r, cy + 0.6 * r), fill=color)
+    draw.polygon(
+        [(cx - 2 * r + 1, cy - 0.1 * r), (cx + 2 * r - 1, cy - 0.1 * r),
+         (cx, cy + 2.1 * r)],
+        fill=color,
+    )
+    if outline:
+        draw.ellipse((cx - 2 * r, cy - 1.4 * r, cx, cy + 0.6 * r), outline=outline, width=2)
+        draw.ellipse((cx, cy - 1.4 * r, cx + 2 * r, cy + 0.6 * r), outline=outline, width=2)
+
+
+def scene_card_path(entry: dict) -> str:
+    """Stable-ish output path for a scene commemorative card."""
+    char_name = str(entry.get("char_name") or "char").strip()
+    scene_title = str(entry.get("scene_title") or "scene").strip()
+    slug = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", f"{char_name}_{scene_title}")[:80]
+    return os.path.join(_SCENE_CARD_DIR, f"{slug or 'scene'}.png")
+
+
+def render_scene_card(entry: dict, out_path: str | None = None) -> str | None:
+    """Render a bond-scene commemorative card (P3, dark rose-gold theme).
+
+    ``entry`` keys (all optional, degrade gracefully):
+        char_name    角色名（大标题）
+        scene_title  场景标题（如「雨夜谈心」）
+        level        达成时的好感等级（数字）
+        level_title  等级称号（如「朋友」）
+        date         完成日期（如「2026-10-23」）
+        memento      纪念文案（可多行，自动按像素宽换行）
+
+    Returns the PNG path. Never raises on missing fields.
+    """
+    char_name = str(entry.get("char_name") or "TA").strip()
+    scene_title = str(entry.get("scene_title") or "共同的经历").strip()
+    level = entry.get("level")
+    level_title = str(entry.get("level_title") or "").strip()
+    date = str(entry.get("date") or "").strip()
+    memento = str(entry.get("memento") or "").strip()
+
+    probe = ImageDraw.Draw(Image.new("RGBA", (W, 10)))
+
+    # ── font sizes ──
+    title_font = 26
+    name_font = 54
+    sub_font = 22
+    scene_font = 38
+    meta_font = 22
+    body_font = 26
+
+    # ── measure wrapped blocks ──
+    memo_pad = 26
+    inner_w = W - 2 * PAD - 2 * memo_pad
+    memento_lines = _wrap(probe, memento, body_font, inner_w) if memento else []
+    scene_max = W - 2 * PAD - 40
+    scene_lines = _wrap(probe, scene_title, scene_font, scene_max) or [scene_title]
+
+    # level pill text
+    try:
+        lv_txt = f"Lv{int(level)}" if level not in (None, "") else ""
+    except (TypeError, ValueError):
+        lv_txt = str(level).strip()
+    pill_txt = f"{lv_txt} · {level_title}" if lv_txt and level_title else (lv_txt or level_title)
+
+    heart_h = 80
+    title_h = _lh(title_font)
+    name_h = _lh(name_font)
+    sub_h = _lh(sub_font)
+    scene_line_h = _lh(scene_font)
+    pill_h = _lh(meta_font) + 18
+    date_h = _lh(meta_font)
+    memo_line_h = _lh(body_font)
+
+    # ── total height ──
+    total_h = PAD
+    total_h += heart_h + 6
+    total_h += title_h + 14
+    total_h += name_h + 6
+    total_h += sub_h + GAP
+    total_h += len(scene_lines) * scene_line_h + 18
+    if pill_txt:
+        total_h += pill_h + 14
+    if date:
+        total_h += date_h + GAP
+    if memento_lines:
+        total_h += 2 * memo_pad + len(memento_lines) * memo_line_h + GAP
+    total_h += PAD
+
+    canvas = Image.new("RGBA", (W, total_h), _SCENE_BG + (255,))
+    draw = ImageDraw.Draw(canvas)
+
+    # outer decorative border
+    draw.rounded_rectangle((10, 10, W - 11, total_h - 11), radius=26,
+                           outline=_SCENE_ROSE_DIM + (255,), width=3)
+
+    def center_text(y: float, text: str, size: int, fill: tuple) -> float:
+        x = (W - _tw(draw, text, size)) / 2
+        draw.text((x, y), text, font=_font(size), fill=fill + (255,))
+        return y + _lh(size)
+
+    y = PAD + 4
+    # heart ornament (centred)
+    _draw_heart(draw, W / 2, y + heart_h / 2 - 6, 64, _SCENE_ROSE + (255,))
+    y += heart_h + 6
+
+    y = center_text(y, "羁 绊 纪 念 卡", title_font, _SCENE_GOLD)
+    y += 14
+    y = center_text(y, char_name, name_font, _TEXT)
+    y += 6
+    y = center_text(y, "与你共同走过的一段时光", sub_font, _TEXT_FAINT)
+    y += GAP
+
+    # scene title (large, rose; wraps if long)
+    for ln in scene_lines:
+        x = (W - _tw(draw, ln, scene_font)) / 2
+        draw.text((x, y), ln, font=_font(scene_font), fill=_SCENE_ROSE + (255,))
+        y += scene_line_h
+    y += 18
+
+    # level pill
+    if pill_txt:
+        pill_w = _tw(draw, pill_txt, meta_font) + 44
+        px = (W - pill_w) / 2
+        draw.rounded_rectangle((px, y, px + pill_w, y + pill_h), radius=pill_h // 2,
+                               fill=_SCENE_ROSE_DIM + (255,))
+        draw.text((px + 22, y + (pill_h - _lh(meta_font)) // 2),
+                  pill_txt, font=_font(meta_font), fill=_SCENE_GOLD + (255,))
+        y += pill_h + 14
+
+    # date
+    if date:
+        y = center_text(y, f"— {date} —", meta_font, _TEXT_FAINT)
+        y += GAP
+
+    # memento panel
+    if memento_lines:
+        panel_x = PAD
+        panel_w = W - 2 * PAD
+        panel_h = 2 * memo_pad + len(memento_lines) * memo_line_h
+        draw.rounded_rectangle((panel_x, y, panel_x + panel_w, y + panel_h),
+                               radius=16, fill=_SCENE_PANEL + (255,))
+        ty = y + memo_pad
+        for ln in memento_lines:
+            draw.text((panel_x + memo_pad, ty), ln, font=_font(body_font),
+                      fill=_TEXT_DIM + (255,))
+            ty += memo_line_h
+        y += panel_h + GAP
+
+    if out_path is None:
+        out_path = scene_card_path(entry)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     canvas.convert("RGB").save(out_path, "PNG")
     return out_path

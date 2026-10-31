@@ -57,6 +57,20 @@ async def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -
 
     results = [drawing_cards(pool_type, actual_up) for _ in range(count)]
     text_segment, _ = format_result(results, count)
+
+    # buttons P1：结果页按钮预约——_send_response 的官方 md 路径一次性消费
+    # （键盘只能骑 msg_type=2 代理回复），OneBot/split 路径忽略并清空。
+    # data 用自然语言：点击=替用户打字，经 agent 循环天然复用本工具。
+    try:
+        from agent.context import _turn_keyboard
+        from lib.button_spec import Btn
+        _turn_keyboard.set([[
+            Btn(label="再抽一次", data="再抽一次", action="cmd"),
+            Btn(label="再来十连", data="再来一次十连抽", action="cmd"),
+            Btn(label="看动画", data="播放抽卡动画", action="cmd"),
+        ]])
+    except Exception:  # noqa: BLE001 — 按钮是增强，绝不影响抽卡结果
+        pass
     return resolved_note + str(text_segment)
 
 
@@ -64,14 +78,14 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
     """Play gacha pull animation frames in QQ chat.
 
     Reads animation images and sends them sequentially with configurable intervals.
-    Uses the _send_msg context variable set by agent_router to send images.
+    Uses the _current_sender contextvar (agent.outbound.Sender) to send images.
 
     Args:
         star_level: Highest star level (3=blue, 4=purple, 5=gold, 6=red).
         is_single: True for single pull, False for ten-pull.
         interval: Delay between animation frames in seconds (default 0.75).
     """
-    from agent.context import _current_group_id, _send_msg
+    from agent.context import _current_group_id, _current_sender
     from plugins.pullingMonitor import (
         pull_1, blue_end, blue_middle, blue_or_purple_spaceship_close,
         blue_spaceship_open, gold_spaceship_close, gold_spaceship_open,
@@ -79,10 +93,10 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
         red_end, red_spaceship_close, red_spaceship_open,
         single_pull_start, ten_pull_start,
     )
-    from nonebot.adapters.onebot.v11 import MessageSegment
+    from agent.outbound import OutImage
 
-    send = _send_msg.get()
-    if send is None:
+    sender = _current_sender.get()
+    if sender is None:
         return "[Gacha] 当前环境不支持发送图片（非QQ聊天上下文）。"
 
     # ── Group feature toggle check ────────────────────────────────
@@ -129,7 +143,17 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
         if frame is None:
             continue  # Image file missing, skip silently
         try:
-            await send(frame)
+            # pullingMonitor frames are MessageSegment.image("file://...")
+            # objects; extract the local path so the send goes through
+            # the platform-agnostic OutImage contract (pullingMonitor
+            # itself stays untouched — its legacy pulling_anime path
+            # still consumes the frames as segments).
+            frame_file = frame.data.get("file", "")
+            if frame_file.startswith("file://"):
+                frame_file = frame_file[len("file://"):]
+            if not frame_file:
+                continue
+            await sender.send_image(OutImage(path=frame_file, label="gacha frame"))
             sent_count += 1
             await asyncio.sleep(interval)
         except Exception:
@@ -176,6 +200,16 @@ def calculate_speed(battle_data: str) -> str:
     if warning:
         lines.append("\n注意: 某一敌方测算的平均速度与最大速度相差过大，请检查数据是否输入错误！")
 
+    # buttons P1：结果页按钮预约（消费规则同 gacha_pull）
+    try:
+        from agent.context import _turn_keyboard
+        from lib.button_spec import Btn
+        _turn_keyboard.set([[
+            Btn(label="再算一组", data="再帮我算一组测速", action="cmd"),
+            Btn(label="乱速概率", data="帮我算乱速概率", action="cmd"),
+        ]])
+    except Exception:  # noqa: BLE001 — 按钮是增强，绝不影响测速结果
+        pass
     return "\n".join(lines)
 
 

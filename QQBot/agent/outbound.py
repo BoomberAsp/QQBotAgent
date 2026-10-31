@@ -1,0 +1,161 @@
+"""
+Platform-agnostic outbound contract — stage 3 of the QQ-official plan.
+
+The turn kernel (agent/turn.py) and the tool layer never construct
+platform message objects anymore: they hold a ``Sender`` (via argument
+or the ``agent.context._current_sender`` contextvar) and express sends
+semantically — text, progress line, local image, markdown. Each entry
+adapter provides
+the implementation (adapters/onebot.py::OneBotSender now; stage 4 adds
+QQOfficialSender, which turns OutImage.path into base64 + file_image()
+because the official API cannot read local files).
+
+Retry policy stays in the kernel (_safe_send): SendFailed is the only
+retryable failure, mirroring the pre-stage-3 behavior where OneBot
+ActionFailed was retried with backoff and everything else was logged
+and dropped.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+
+@dataclass
+class OutImage:
+    """An image to send, described platform-agnostically.
+
+    OneBot: ``path`` → MessageSegment.image(Path(path)); ``url`` is used
+    as-is when there is no local path. Official (stage 4): ``path`` →
+    base64 upload via file_image(); ``url`` can be passed through.
+    """
+    path: str | None = None      # local absolute path
+    url: str | None = None       # public URL (or file:// URI)
+    label: str = ""              # for logs / fallback text
+
+
+@dataclass
+class OutAudio:
+    """An audio/voice message to send, described platform-agnostically (P4).
+
+    OneBot: ``path`` → MessageSegment.record(Path(path)); ``url`` used
+    as-is when there is no local path. Official: ``path`` → bytes upload
+    via MessageSegment.file_audio() (msg_type=3 rich media); ``url`` →
+    MessageSegment.audio(url). Generated TTS always carries a local path
+    (media_gen downloads the 24h-expiring provider URL immediately).
+    """
+    path: str | None = None      # local absolute path (mp3/wav/silk…)
+    url: str | None = None       # public URL
+    label: str = ""              # for logs / fallback text
+
+
+@dataclass
+class OutMarkdown:
+    """A markdown-formatted body (buttons-design §6.10).
+
+    OneBot: rendered as plain text (channel has no markdown; the render
+    layer normally never emits this there — supports_markdown=False).
+    QQ official: msg_type=2 custom markdown (open to all bots since
+    2026/04), buffered and block-merged by QQOfficialSender with a
+    plain-text degradation chain on reject codes.
+    """
+    text: str
+
+
+@dataclass
+class OutKeyboard:
+    """A markdown body + button rows (buttons-design §6.2, P0+P1).
+
+    ``markdown`` is the message the keyboard rides on — the official
+    API only attaches keyboards to msg_type=2, so a keyboard ALWAYS
+    carries its own body text (never glued onto a foreign payload).
+    ``rows`` is a lib.button_spec.Rows (list[list[Btn]]), validated by
+    every send path before the wire.
+
+    OneBot: degrades to send_text(markdown + to_text(rows)) — the
+    render layer gates on supports_keyboard, so this is a safety net
+    only. Official: QQOfficialSender buffers it and merges with the
+    adjacent markdown run at flush() (0 extra quota), with the
+    kb→md-only→plain-text rejection ladder in _send_payload().
+    """
+    markdown: str
+    rows: list                 # lib.button_spec.Rows — kept untyped here
+    label: str = ""            # for logs / fallback text
+
+
+@dataclass
+class OutProgress:
+    """An intermediate progress line ("正在思考…" and friends).
+
+    OneBot: sent verbatim, like any text (pre-stage-4 behavior).
+    QQ official: swallowed by QQOfficialSender — every passive reply
+    eats the limited quota (group 5/5min, c2c 4/60min) and progress
+    lines land mid-turn, where end-of-turn merging cannot reclaim them
+    (plan v2 supplement ③).
+
+    ``immediate=True`` marks the one line worth spending quota on even
+    on the official route (the turn-start "正在思考…" indicator):
+    QQOfficialSender sends it right away as a standalone message
+    instead of buffering it into the end-of-turn merge, so the user
+    gets prompt feedback rather than seeing it glued onto the final
+    reply. Tool-call progress lines keep the default (swallowed on
+    official, verbatim on OneBot). OneBot ignores the flag — every
+    send there is already immediate.
+    """
+    text: str
+    immediate: bool = False
+
+
+class SendFailed(Exception):
+    """Platform-agnostic retryable send failure (replaces ActionFailed).
+
+    ``info`` carries the platform-specific failure payload for logging
+    (OneBot: the ActionFailed.info dict), so kernel log messages keep
+    their pre-stage-3 shape.
+    """
+
+    def __init__(self, message: str = "", info: Any = None):
+        super().__init__(message)
+        self.info = info if info is not None else message
+
+
+class Sender(Protocol):
+    """Platform-agnostic sender.
+
+    Implementations translate semantics into platform API calls and
+    must raise SendFailed for retryable failures.
+    """
+
+    platform: str
+    # Optional: the official route's passive-reply quota is limited, so
+    # an implementation may declare how many messages one turn may emit.
+    max_messages_per_turn: int
+    # Channel capability flag (buttons-design §6.10.7): True only when the
+    # platform renders native markdown (QQ official msg_type=2, open to
+    # all bots since 2026-04). The kernel's render layer reads this to
+    # decide the per-turn format; OneBot stays False — never build
+    # markdown on that route. send_markdown() must still accept text on
+    # every implementation (degrading to plain text when False).
+    supports_markdown: bool
+    # Keyboard capability (buttons-design §6.2): True only when the
+    # platform can attach inline buttons right now — official route:
+    # custom-button permission granted + markdown available + circuit
+    # breaker closed + graylist allows this user. OneBot is always
+    # False. The kernel probes this (getattr-tolerant, so pre-keyboard
+    # test stubs degrade to markdown/text) before rendering buttons.
+    supports_keyboard: bool
+    # Streaming capability (buttons-design §6.10.11.2): True only on the
+    # official c2c route when the stream_messages layer is available
+    # (env hot-read + circuit breaker + markdown gate). The kernel
+    # probes this (getattr-tolerant, so pre-stream test stubs keep the
+    # buffered path) and calls open_stream() to get a MessageStreamer
+    # for the turn — None means fall back to buffered sends unchanged.
+    supports_stream: bool
+
+    async def send_text(self, text: str) -> None: ...
+    async def send_image(self, img: OutImage) -> None: ...
+    async def send_audio(self, audio: OutAudio) -> None: ...
+    async def send_markdown(self, text: str) -> None: ...
+    async def send_keyboard(self, msg: OutKeyboard) -> None: ...
+    async def send_progress(self, text: str, *, immediate: bool = False) -> None: ...
+    async def open_stream(self, first_text: str = ""): ...

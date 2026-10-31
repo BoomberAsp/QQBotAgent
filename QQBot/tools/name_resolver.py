@@ -17,6 +17,7 @@ import os
 import re
 
 from pypinyin import Style, pinyin
+from lib.paths import wiki_cache_dir
 
 
 # ── Paths ────────────────────────────────────────────────────────
@@ -27,7 +28,7 @@ _BOND_DIC_PATH = os.path.join(_CHAR_DIR, "bonds_search_dic.json")
 _PINYIN_CACHE_PATH = os.path.join(_CHAR_DIR, "pinyin_choices.json")
 # QQBotAgent's own translation mapping (supplements OpenRubi)
 _NAME_MAPPING_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "data", "wiki_cache", "name_mapping.json"
+    wiki_cache_dir(), "name_mapping.json"
 )
 
 # Cached index on disk (built once, loaded at startup)
@@ -195,6 +196,16 @@ class NameResolver:
     """
 
     def __init__(self):
+        self.reload()
+
+    def reload(self) -> None:
+        """(Re)load alias dictionaries and pinyin indices from disk.
+
+        Called at init and again by the agent_router config watcher when
+        character_dic.json / bonds_search_dic.json change on disk (WebUI
+        alias-management panel saves), so alias edits take effect without
+        restarting the bot.
+        """
         self._choices = _load_pinyin_choices()
 
         # Load pre-built indices, or build on first use
@@ -220,6 +231,15 @@ class NameResolver:
                     self._bond_alias[alias.strip().lower()] = name
 
     # ── Public API ────────────────────────────────────────────────
+
+    def character_alias_map(self) -> dict:
+        """Return the lowercase-alias → canonical-name character dictionary.
+
+        Used by character_detail to index cached entries under their canonical
+        openrubi names, keeping alias lookup working even when a cache entry's
+        ``name_cn`` drifted from the canonical value.
+        """
+        return dict(self._char_alias)
 
     def resolve_character(self, query: str) -> str | None:
         """Resolve a fuzzy character name to its canonical Chinese name.

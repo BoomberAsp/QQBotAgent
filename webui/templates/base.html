@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ title }} · Roxy 管理面板</title>
+<link rel="icon" href="/static/img/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/app.css">
+{% block head %}{% endblock %}
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <div>
+        <div class="brand-name">Roxy 面板</div>
+        <div class="brand-sub">QQBotAgent</div>
+      </div>
+    </div>
+    <nav class="nav">
+      {% for route, name in pages %}
+      <a class="nav-item{% if active == route %} active{% endif %}" href="{{ route }}">{{ name }}</a>
+      {% endfor %}
+    </nav>
+    <div class="sidebar-foot">
+      <button id="btn-logout" class="btn btn-ghost btn-sm">退出登录</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <h1 class="page-title">{{ title }}</h1>
+      <div class="topbar-right">
+        <span id="clock" class="clock"></span>
+      </div>
+    </header>
+    <div class="content">
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+</div>
+<div id="toast-root"></div>
+<script src="/static/js/app.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

@@ -18,14 +18,19 @@ import os
 import sys
 
 from tools.name_resolver import get_resolver
+from lib.paths import wiki_cache_dir
 
 
 _CACHE_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "data", "wiki_cache", "bond_details.json"
+    wiki_cache_dir(), "bond_details.json"
 )
 
-# Module-level lazy index (rebuilt only once per process)
+# Module-level lazy index, rebuilt when the cache file's mtime changes — the
+# panel writes bond_details.json directly (manual corrections / LLM
+# re-translation), and a stale in-memory copy would shadow those edits (same
+# revalidation pattern as profile/session, commit f9c36c7).
 _data: dict | None = None
+_data_mtime: float | None = None
 _by_cn_name: dict = {}
 _by_title: dict = {}
 _by_id: dict = {}
@@ -36,9 +41,14 @@ _refreshing = False
 
 def _load() -> dict:
     """Lazily load bond_details.json and rebuild lookup indexes."""
-    global _data, _by_cn_name, _by_title, _by_id
-    if _data is not None:
+    global _data, _data_mtime, _by_cn_name, _by_title, _by_id
+    try:
+        mtime = os.path.getmtime(_CACHE_PATH)
+    except OSError:
+        mtime = None
+    if _data is not None and mtime == _data_mtime:
         return _data
+    _data_mtime = mtime
 
     _data = {}
     if os.path.exists(_CACHE_PATH):
@@ -163,7 +173,7 @@ def format_bond(entry: dict) -> str:
 async def bond_detail(bond_name: str) -> str:
     """Agent tool: return the detailed bond card for a name/alias.
 
-    Renders a PNG card and sends it directly to the chat (via the ``_send_msg``
+    Renders a PNG card and sends it directly to the chat (via the ``_current_sender``
     contextvar, only available inside the agent loop), while still returning the
     text detail so the LLM can reason over it.
 
@@ -210,21 +220,20 @@ def render_card(entry: dict) -> str | None:
 
 
 async def _send_card_image(card_path: str) -> bool:
-    """Send a card image to QQ via the ``_send_msg`` contextvar (tool context).
+    """Send a card image to QQ via the ``_current_sender`` contextvar (tool context).
 
     Returns True on success, False if the contextvar is missing or the send
     fails (logged for diagnosability).
     """
     try:
-        from agent.context import _send_msg
-        from nonebot.adapters.onebot.v11 import MessageSegment
-        from pathlib import Path
-        send = _send_msg.get()
-        if send is None:
-            print("[bond_detail] _send_msg contextvar not set; image not sent",
+        from agent.context import _current_sender
+        from agent.outbound import OutImage
+        sender = _current_sender.get()
+        if sender is None:
+            print("[bond_detail] _current_sender contextvar not set; image not sent",
                   file=sys.stderr)
             return False
-        await send(MessageSegment.image(Path(card_path)))
+        await sender.send_image(OutImage(path=card_path, label="bond card"))
         return True
     except Exception as e:
         print(f"[bond_detail] card image send failed: {type(e).__name__}: {e}",

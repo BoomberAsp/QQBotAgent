@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="tab-bar" id="cfg-tabs">
+  <div class="tab active" data-tab="prompts">提示词 / 人格文件</div>
+  <div class="tab" data-tab="permissions">权限名单</div>
+  <div class="tab" data-tab="models">模型配置</div>
+  <div class="tab" data-tab="group">群功能开关</div>
+  <div class="tab" data-tab="personality">人格切换配置</div>
+</div>
+
+<!-- 提示词 -->
+<div class="cfg-pane" id="pane-prompts">
+  <div class="row" style="align-items:flex-start;gap:14px">
+    <div class="card" style="width:230px;flex-shrink:0">
+      <h2 class="card-title">配置文件</h2>
+      <div id="prompt-list" class="muted">加载中…</div>
+    </div>
+    <div class="card" style="flex:1;min-width:0">
+      <div class="row" style="margin-bottom:8px">
+        <h2 class="card-title" style="margin:0" id="prompt-name">未选择文件</h2>
+        <span class="spacer"></span>
+        <span class="muted" id="prompt-meta"></span>
+        <button class="btn btn-sm btn-primary" id="prompt-save" disabled>保存</button>
+      </div>
+      <textarea id="prompt-editor" class="code-editor" rows="26" style="width:100%"
+                placeholder="← 选择左侧文件进行编辑" disabled></textarea>
+      <p class="muted" style="margin:8px 0 0">
+        保存前自动备份到面板备份目录；bot 侧 watcher 会在 5 秒内热重载，无需重启。
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- 权限 -->
+<div class="cfg-pane" id="pane-permissions" style="display:none">
+  <div class="card" style="max-width:640px">
+    <h2 class="card-title">权限名单（.env）</h2>
+    <p class="muted" style="margin:0 0 12px">
+      两条消息路由各自匹配独立名单：OneBot（NapCat）按 QQ 号，QQ 官方机器人按 openid。
+      同一个人走两条路由需要分别录入。
+    </p>
+    <h3 style="margin:0 0 8px;font-size:13px">OneBot 路由（QQ 号）</h3>
+    <label class="field"><span>SUPERUSERS（管理员，逗号分隔 QQ 号）</span>
+      <input id="perm-super" type="text" placeholder="123456,789012"></label>
+    <label class="field"><span>VIP_USERS（VIP 用户）</span>
+      <input id="perm-vip" type="text" placeholder="123456,789012"></label>
+    <h3 style="margin:16px 0 8px;font-size:13px">QQ 官方路由（openid）</h3>
+    <label class="field"><span>QQ_OFFICIAL_SUPERUSERS（管理员，逗号分隔 openid）</span>
+      <input id="perm-official-super" type="text" placeholder="5F0E9A3B...,7C11D2..."></label>
+    <label class="field"><span>QQ_OFFICIAL_VIP_USERS（VIP 用户，openid）</span>
+      <input id="perm-official-vip" type="text" placeholder="5F0E9A3B...,7C11D2..."></label>
+    <button class="btn btn-primary" id="perm-save" style="margin-top:12px">保存</button>
+    <p class="muted" style="margin:10px 0 0" id="perm-note"></p>
+    <p class="muted" style="margin:10px 0 0;font-size:12px">
+      openid 获取：官方路由每条入站消息都会在 bot 日志打印
+      <code>[qq_official] … openid=…</code>（见「日志查看」），让对方给机器人发一条消息即可采集。
+      官方机器人凭据（QQ_BOTS，含 secret）不在此页维护——它仅在启动时读取，
+      修改 .env 后需到「进程管理」重启 NoneBot。
+    </p>
+  </div>
+</div>
+
+<!-- 模型 -->
+<div class="cfg-pane" id="pane-models" style="display:none">
+  <div class="row" style="margin-bottom:4px">
+    <h2 style="margin:0;font-size:15px">模型配置（models_settings.json）</h2>
+    <span class="spacer"></span>
+    <button class="btn btn-sm" id="models-reload">重新加载</button>
+  </div>
+  <p class="muted" style="margin:0 0 14px">
+    保存前自动验证 API 可用性，仅写入验证通过的配置；api_key 留空表示维持原值。
+    对话类模型做最小 chat 调用；图像生成 / 语音合成段（DashScope 原生端点，按量计费）
+    用空参数探测验证凭据，不产生生成费用。保存后约 10 秒 bot 自动热重载
+    （媒体段为每次调用即时读取；仅 max_concurrency 改动需重启 NoneBot）。
+  </p>
+  <div id="model-cards" style="display:flex;flex-direction:column;gap:14px">
+    <p class="muted">加载中…</p>
+  </div>
+  <details style="margin-top:20px">
+    <summary class="muted" style="cursor:pointer;font-size:13px">
+      高级：原始 JSON 编辑（task_routing 等，保存不做 API 验证）
+    </summary>
+    <div class="card" style="margin-top:10px;max-width:760px">
+      <div class="row" style="margin-bottom:8px">
+        <h2 class="card-title" style="margin:0">原始 JSON</h2>
+        <span class="spacer"></span>
+        <button class="btn btn-sm btn-primary" id="models-save">保存原始 JSON</button>
+      </div>
+      <textarea id="models-editor" class="code-editor" rows="24" style="width:100%"></textarea>
+      <p class="warn" style="margin:8px 0 0" id="models-note"></p>
+    </div>
+  </details>
+</div>
+
+<!-- 群功能 -->
+<div class="cfg-pane" id="pane-group" style="display:none">
+  <div class="card" style="max-width:760px">
+    <div class="row" style="margin-bottom:8px">
+      <h2 class="card-title" style="margin:0">群功能开关（group_features.json）</h2>
+      <span class="spacer"></span>
+      <button class="btn btn-sm btn-primary" id="group-save">保存</button>
+    </div>
+    <textarea id="group-editor" class="code-editor" rows="20" style="width:100%"></textarea>
+    <p class="muted" style="margin:8px 0 0" id="group-note"></p>
+  </div>
+</div>
+
+<!-- 人格 -->
+<div class="cfg-pane" id="pane-personality" style="display:none">
+  <div class="card" style="max-width:760px">
+    <h2 class="card-title">人格切换配置</h2>
+    <p class="muted">可用人格文件：<span id="pers-available" class="mono">—</span></p>
+    <label class="field"><span>personality_config.json（全局默认人格）</span>
+      <textarea id="pers-editor" class="code-editor" rows="6"></textarea></label>
+    <label class="field"><span>group_personality.json（按群覆盖）</span>
+      <textarea id="pers-group-editor" class="code-editor" rows="10"></textarea></label>
+    <button class="btn btn-primary" id="pers-save">保存</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/config.js"></script>
+{% endblock %}

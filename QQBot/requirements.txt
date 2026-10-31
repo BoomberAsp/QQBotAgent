@@ -2,15 +2,20 @@
 # Install: pip install -r requirements.txt
 
 # ── NoneBot2 Core ────────────────────────────────────────────────
-nonebot2>=2.4.0
+nonebot2>=2.5.0
 nonebot-adapter-onebot>=2.4.0
-nonebot2[fastapi]
+# QQ 官方机器人适配器（阶段四）；会把 cryptography 升到 ≥43
+nonebot-adapter-qq>=1.7.3
+# websockets 必需：QQ 官方适配器走 WS 网关（DRIVER=~fastapi+~httpx+~websockets）
+nonebot2[fastapi,websockets]
 nb-cli>=0.7.0
 
 # ── HTTP & WebSocket ─────────────────────────────────────────────
 httpx
 aiohttp
 websockets
+# TLS-fingerprint impersonation for web_fetch anti-bot bypass (Tier 1)
+curl_cffi>=0.16
 
 # ── Data Processing ─────────────────────────────────────────────
 pandas
@@ -40,3 +45,12 @@ pytest>=7.0.0
 # vllm>=0.6.0
 # transformers>=4.40.0
 # accelerate>=0.27.0
+
+# ── Optional: Redeem-code browser engine (ruyiPage) ──────────────
+# ruyiPage is intentionally NOT listed here. It drives a fingerprinted
+# Firefox to pierce ucngame's Cloudflare challenge and is installed into a
+# DEDICATED venv (~/.virtualenvs/ruyipage) so a browser crash can never
+# take down the bot and its heavy deps stay out of production.
+#   deps:    scripts/requirements-browser.txt
+#   install: bash scripts/install_redeem_browser.sh   (setup.sh offers this)
+#   enable:  REDEEM_CODE_BROWSER=ruyipage in QQBot/.env, then restart

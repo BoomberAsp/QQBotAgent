@@ -1,0 +1,14 @@
+# ── Redeem-code browser engine (ruyiPage) ───────────────────────────
+# Installed into a DEDICATED venv (~/.virtualenvs/ruyipage) by
+# scripts/install_redeem_browser.sh — deliberately NOT the production bot
+# venv (~/.virtualenvs/QQBotAgent). This isolation guarantees a Firefox
+# crash can never take down the bot, and ruyiPage's heavy dependency tree
+# stays out of production. The engine runs as a subprocess under
+# `xvfb-run -a`, invoked by check_redeem_code._fetch_url_browser().
+#
+# ruyiPage drives a fingerprinted Firefox (WebDriver BiDi) to pierce
+# ucngame's Cloudflare JS challenge, which plain HTTP clients cannot pass.
+#
+# Install / update:  bash scripts/install_redeem_browser.sh
+ruyiPage
+requests        # soft-dep used by ruyiPage's fingerprint/geo helpers

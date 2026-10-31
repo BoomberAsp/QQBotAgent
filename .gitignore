@@ -4,6 +4,8 @@
 /data
 /logs
 con.env
+# WebUI 面板运行时数据（密码哈希、session、审计、PID、日志、备份）
+webui/data/
 
 # ── 虚拟环境 ─────────────────────────────────────
 myenv
@@ -21,6 +23,9 @@ QQBot/data/wiki_cache/status_icons/
 !QQBot/data/redeem_code/
 !QQBot/data/personality_config.json
 !QQBot/data/group_personality.json
+# 原作剧情知识库（wiki 快照 + LLM 中文增强 + SQLite，全部为可再生产物）
+# 重建：cd QQBot && python scripts/build_story_kb.py --all
+QQBot/data/story_kb/
 QQBot/logs
 QQBot/.env
 QQBot/.env.prod
@@ -50,10 +55,22 @@ __pycache__/
 /Assignment4_QQ_Agent_Requirements_Simplified(1).md
 /docs/
 QQBot/docs/
+/docs/next_step_for_deepscientist.md
+/Cache-Hit-Rate-Plan.md
+/Profile-Fact-Extraction-Plan.md
+/Web-UI-Plan.md
+/P1-Deployment-Acceptance-Plan.md
+/Story-Knowledge-Base-Design.md
+/Voice-System-Design.md
+/wiki-battle-mechanism.html
+/wiki_char.html
+/chat-export-1790847059200.json
+
 
 # ── 本地验证数据与脚本（Idea 8 测速）────────────
 # test/ 下的校验脚本、GT、缓存、接触片均为开发产物
 /test/
+
 # cal-speed-data 里的战斗截图（49 张验证集）不入库，
 # 但 *图标.png 是 BuffDetector 的运行时模板，必须保留。
 QQBot/images/cal-speed-data/*
@@ -62,3 +79,41 @@ QQBot/images/cal-speed-data/*
 # ── 退役组件（仅本地留档）────────────────────────
 # easyOCR 时代的逐数字模板，qwen3.5-ocr 切换后已无代码引用
 QQBot/config/ocr_digit_templates/
+# 运行时 LLM 翻译缓存（各机器独立再生，勿跟踪）
+QQBot/data/wiki_cache/name_mapping.json
+
+# 可被管理员在服务器上修改的别名映射文件
+QQBot/config/characters/character_dic.json
+# ── QQ 官方机器人凭据（AppSecret，绝不入库）────────────
+bot-secret/
+# ── 解包产物 / 运行时缓存（体积大，生产用 WIKI_CACHE_DIR 指到数据盘）──
+# 卡面、立绘、技能图标由 scripts/render_skill_cards.py 与 batch_render 生成，
+# 不入库；换机后重跑脚本或用面板上传即可再生。
+QQBot/data/wiki_cache/cards/*
+QQBot/data/wiki_cache/portraits/*.png
+QQBot/data/wiki_cache/skill_icons/*.png
+QQBot/data/wiki_cache/bond_cards/
+QQBot/data/wiki_cache/bond_icons/
+QQBot/data/wiki_cache/icons/
+QQBot/data/wiki_cache/character_details.json*
+QQBot/data/wiki_cache/bond_details.json
+QQBot/data/wiki_cache/feature_card.png
+QQBot/data/wiki_cache/*.bak*
+QQBot/data/wiki_cache/cards/
+# SFTP 上传临时文件（原子替换的中间态）
+*.uploading
+# 各类 .bak 快照（部署/迁移时产生）
+*.bak_*
+*.bak-pre-*
+QQBot/tools/card_renderer.py.bak-wikicache
+
+# 服务器运维产物
+QQBot/data/group_personality.json
+QQBot/data/personality_config.json
+QQBot/data/personality_settings.json
+QQBot/data/wiki_cache/changelog_card.png
+QQBot/data/redeem_code/*
+QQBot/data/wiki_cache/help_card.png
+
+# 展示网页部分原始资源
+public_site/examples/mkv/*

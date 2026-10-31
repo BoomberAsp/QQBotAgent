@@ -3,7 +3,9 @@ Personality Manager — Load and manage agent personality profiles.
 
 Each personality is a markdown file in config/personalities/.
 The first # heading in the file is used as the display name.
-Content is injected at the top of the system prompt.
+Content is injected into the system prompt after the shared config block
+(L2 layer — Cache-Hit-Rate-Plan.md Phase 3; it used to be prepended before
+the block, which split the shared prefix per personality).
 
 Follows OpenRubi's philosophy: personality switching is just
 swapping a simple prompt string — no complex state machines.
@@ -38,7 +40,8 @@ class PersonalityManager:
 
     def __init__(self, personalities_dir: str = None):
         self._dir = personalities_dir or _PERSONALITIES_DIR
-        self._cache: Dict[str, str] = {}  # name → raw markdown content
+        # name → (mtime, raw markdown content)
+        self._cache: Dict[str, tuple] = {}
 
     # ── Discovery ─────────────────────────────────────────────────
 
@@ -57,14 +60,21 @@ class PersonalityManager:
     def load(self, name: str) -> Optional[str]:
         """Load a personality's raw markdown content.
 
-        Caches in memory after first load. Returns None if not found.
+        Cached by file mtime (same rule CharacterRegistry already uses for UGC
+        cards), so editing a card takes effect on the next turn instead of
+        requiring a bot restart. Returns None if not found.
         """
-        if name in self._cache:
-            return self._cache[name]
-
         path = os.path.join(self._dir, f"{name}.md")
         if not os.path.isfile(path):
             return None
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+
+        cached = self._cache.get(name)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == mtime:
+            return cached[1]
 
         with open(path, "r", encoding="utf-8") as f:
             content = f.read().strip()
@@ -72,7 +82,7 @@ class PersonalityManager:
         if not content:
             return None
 
-        self._cache[name] = content
+        self._cache[name] = (mtime, content)
         return content
 
     def get_display_name(self, name: str) -> str:
@@ -87,6 +97,56 @@ class PersonalityManager:
                 if line.startswith("# ") and not line.startswith("## "):
                     return line[2:].strip()
         return name
+
+    # ── Card metadata (Bond-System-Design.md §3.4) ────────────────
+    #
+    # 元数据以 HTML 注释形式内嵌在卡片任意位置，例如:
+    #     <!-- mode: split | task_voice: character -->
+    # 注释对 L2 注入的 LLM 语义无干扰；无元数据的卡片一律按默认值处理
+    # （mode=unified，即现有单平面行为，零迁移成本）。
+
+    _MODE_RE = re.compile(r"\bmode\s*[:=]\s*(unified|split)\b", re.IGNORECASE)
+    _TASK_VOICE_RE = re.compile(
+        r"\btask_voice\s*[:=]\s*(character|template)\b", re.IGNORECASE
+    )
+    # P4 声纹一致性：卡片元数据注释里的固定音色 ID，例如
+    #     <!-- mode: split | task_voice: character | voice_id: longxiaochun_v3.6 -->
+    # 取值允许字母/数字/下划线/点/连字符（系统音色与复刻 voice_id 均兼容）。
+    _VOICE_ID_RE = re.compile(
+        r"\bvoice_id\s*[:=]\s*([A-Za-z0-9_.\-]+)", re.IGNORECASE
+    )
+
+    def get_mode(self, name: str) -> str:
+        """Return the personality's operating mode: "unified" or "split".
+
+        split = 双平面角色（Bond-System-Design.md §3）：社交消息走角色面，
+        工具任务路由到任务面（Roxy）。unified = 现有单平面行为。
+        """
+        content = self.load(name) or ""
+        m = self._MODE_RE.search(content)
+        if m and m.group(1).lower() == "split":
+            return "split"
+        return "unified"
+
+    def get_task_voice(self, name: str) -> str:
+        """Return how task results are re-voiced: "character" (LLM) or "template"."""
+        content = self.load(name) or ""
+        m = self._TASK_VOICE_RE.search(content)
+        if m and m.group(1).lower() == "template":
+            return "template"
+        return "character"
+
+    def get_voice_id(self, name: str) -> Optional[str]:
+        """Return the card's fixed TTS voice ID (P4 声纹一致性), or None.
+
+        内置卡走这里的元数据注释；UGC 卡由 CharacterRegistry 覆写为
+        meta.json.voice_id 优先（注册时确定性分配，见 registry）。
+        """
+        content = self.load(name) or ""
+        m = self._VOICE_ID_RE.search(content)
+        if m:
+            return m.group(1)
+        return None
 
     def get_short_name(self, name: str) -> str:
         """Extract a short name from the display name for use in messages.

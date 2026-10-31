@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+  <div class="row">
+    <h2 class="card-title" style="margin:0">看门狗</h2>
+    <span id="wd-state" class="pill">—</span>
+    <span class="spacer"></span>
+    <span class="muted" id="wd-limit"></span>
+    <button class="btn btn-sm" id="wd-toggle">切换</button>
+  </div>
+  <p class="muted" style="margin:8px 0 0">
+    开启后每 <span id="wd-poll">30</span> 秒巡检一次，自动拉起应处于运行状态却退出的进程；
+    限速 <span id="wd-rate"></span>，防止崩溃风暴。通过面板「停止」的进程不会被自动拉起。
+  </p>
+</div>
+
+<div class="card">
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>进程</th><th>状态</th><th>PID</th><th>运行时长</th>
+        <th>崩溃计数</th><th style="text-align:right">操作</th>
+      </tr>
+    </thead>
+    <tbody id="proc-body">
+      <tr><td colspan="6" class="muted">加载中…</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card" id="napcat-qr-card" hidden>
+  <div class="row">
+    <h2 class="card-title" style="margin:0">NapCat 登录</h2>
+    <span id="qr-state" class="pill">—</span>
+  </div>
+  <div class="qr-wrap" id="qr-wrap">
+    <img id="qr-img" alt="QQ 登录二维码" />
+    <div class="qr-overlay" id="qr-overlay"><span>已成功登录</span></div>
+  </div>
+  <p class="muted" id="qr-hint" style="margin:0">使用手机 QQ 扫码登录</p>
+</div>
+
+<div class="card" id="official-status-card" hidden>
+  <div class="row">
+    <h2 class="card-title" style="margin:0">QQ 官方路由</h2>
+    <span id="of-state" class="pill">—</span>
+  </div>
+  <table class="data-table" style="margin-top:8px">
+    <tbody>
+      <tr><td class="muted">AppID</td><td class="mono" id="of-appid">—</td></tr>
+      <tr><td class="muted">连接时长</td><td id="of-uptime">—</td></tr>
+      <tr><td class="muted">消息总数</td><td id="of-msgs">—</td></tr>
+      <tr><td class="muted">最近消息</td><td id="of-last">—</td></tr>
+      <tr><td class="muted">最后心跳</td><td id="of-hb">—</td></tr>
+    </tbody>
+  </table>
+  <p class="muted" style="margin:8px 0 0">与 NoneBot 同进程；状态来自 bot 写入的心跳文件（60s 周期）</p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/processes.js"></script>
+{% endblock %}

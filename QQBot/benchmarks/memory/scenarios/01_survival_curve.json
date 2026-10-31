@@ -1,0 +1,21 @@
+{
+  "id": "survival_curve",
+  "title": "Q1 低频关键事实存活曲线：晋升→老化降级→SHORT 淘汰全链路",
+  "kind": "metric",
+  "user": "bench_survival",
+  "steps": [
+    {"track": "跑步"},
+    {"ingest": [["用户每周跑步三次", "new", null]], "repeat": 3},
+    {"checkpoint": {"desc": "3 次强化后晋升 MEDIUM", "tier_of": {"find": "跑步", "equals": "medium"}}},
+    {"tick": 10},
+    {"ingest": [["老化期填充1号", "new", null]]},
+    {"checkpoint": {"desc": "age≈11 仍为 MEDIUM（阈值 30）", "tier_of": {"find": "跑步", "equals": "medium"}}},
+    {"tick": 20},
+    {"ingest": [["老化期填充2号", "new", null]]},
+    {"checkpoint": {"desc": "age>30 的下次 ingest 清扫降级回 SHORT", "tier_of": {"find": "跑步", "equals": "short"}}},
+    {"loop": {"var": "n", "from": 1, "to": 60, "body": [
+      {"ingest": [["存活曲线填充{n}号", "new", null]]}
+    ]}},
+    {"checkpoint": {"desc": "SHORT 容量压力淘汰后彻底消失（Q1 曲线终点）", "tier_of": {"find": "跑步", "equals": "gone"}}}
+  ]
+}

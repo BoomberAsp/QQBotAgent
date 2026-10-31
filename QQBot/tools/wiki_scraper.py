@@ -12,6 +12,7 @@ Data sources:
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -24,6 +25,8 @@ from urllib.parse import urlencode
 from curl_cffi import requests as cffi_requests
 
 from lib.status_icons import STATUS_ICON_CN, STATUS_ICON_DIR
+from tools.wiki_glossary import build_prompt_glossary, load_glossary
+from lib.paths import wiki_cache_dir
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -38,7 +41,7 @@ STATIC_CONFIG = os.path.join(
     os.path.dirname(__file__), "..", "config", "gacha_data.json"
 )
 CACHE_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "data", "wiki_cache"
+    wiki_cache_dir()
 )
 CACHE_FILE = os.path.join(CACHE_DIR, "gacha.json")
 TRANSLATION_CACHE = os.path.join(CACHE_DIR, "name_mapping.json")
@@ -68,166 +71,33 @@ OPENRUBI_CHAR_DIC = os.path.join(OPENRUBI_CHAR_DIR, "character_dic.json")
 OPENRUBI_MEMBERS_INFO = os.path.join(OPENRUBI_CHAR_DIR, "members_info.json")
 OPENRUBI_BONDS_INFO = os.path.join(OPENRUBI_CHAR_DIR, "bonds_info.json")
 
-# Status-effect / game-term → Chinese (deterministic, applied before LLM translation).
-# Longer phrases first so "ATK Down" is replaced before "ATK" would match inside it.
-_STATUS_TERM_CN = [
-    ("Effect Resistance", "效果抵抗"),
-    ("Effect Hit Rate", "效果命中"),
-    ("SPD Down", "速度下降"),
-    ("ATK Down", "攻击力下降"),
-    ("DEF Down", "防御力下降"),
-    ("SPD Up", "速度提升"),
-    ("ATK Up", "攻击力提升"),
-    ("DEF Up", "防御力提升"),
-    ("Provoke", "嘲讽"),
-    ("Immunity", "免疫"),
-    ("Shield", "护盾"),
-    ("Stun", "眩晕"),
-    ("Silence", "沉默"),
-    ("Poison", "中毒"),
-    ("Burn", "灼烧"),
-    ("Bleed", "流血"),
-    ("Recovery", "持续恢复"),
-    ("Speed", "速度"),
-    ("ATK", "攻击力"),
-    ("DEF", "防御力"),
-    ("HP", "生命值"),
-    ("Additional damage", "追加伤害"),
-    ("Upon hit", "技能命中时"),
-    ("ACC", "（基础）命中率"),
-    ("Lock On", "锁定"),
-    ("Foresight", "看破"),
-    ("Ignore Effect RES", "无视效果抵抗"),
-    ("Astrogen", "星源力"),
-    ("Flanking", "追加攻击"),
-    ("Extra Turn", "额外回合"),
-    ("Stealth", "潜伏"),
-    ("Penetrate", "贯穿（一定防御力）"),
-    ("Extinction", "灭绝"),
-    ("Increase the Action Gauge", "行动值提升"),
-    ("damage distribution effects", "伤害分配（分摊）效果"),
-    ("ACC Up", "（基础）命中率提升"),
-    ("Morale", "战意"),
-    ("Injury", "创伤"),
-    ("restore HP", "回复生命值"),
-    ("Vigor", "气魄"),
-    ("Hits", "命中的攻击"),
-    ("Crit", "暴击"),
-    ("Unbuffable", "无法强化"),
-    ("Immortal", "不屈"),
-    ("Revived", "复活"),
-    ("fatal blow", "致命伤害"),
-    ("removing all buffs", "驱散所有正向状态"),
-    ("Seal/Passiveless", "被动无效"),
-    ("ACC Down", "（基础）命中率下降"),
-    ("damage taken is reduced", "伤害量下降"),
-    ("Counter", "反击"),
-    ("Evasion Up", "闪避率提升"),
-    ("reduce the Cooldown", "冷却减少"),
-    ("At the start of the battle", "进入战斗时"),
-    ("Invincible", "无敌"),
-    ("stealing (one/two/etc.) buff(s)", "窃取（一个/两个/等）正向状态"),
-    ("Blink", "瞬动"),
-    ("Bomb", "炸弹"),
-    ("lower their Action Gauge", "造成行动值降低"),
-    ("Ignite (the burn and bomb)", "激发"),
-    ("DMG RED effect", "伤害量下降效果"),
-    ("Curse", "诅咒"),
-    ("Unhealable", "禁疗"),
-    ("Resurgence", "回生"),
-    ("Unremovable", "不可解除"),
-    ("Lifesteal", "吸血"),
-    ("increase their Skill Cooldowns", "技能冷却时间延长"),
-    ("Sleep", "沉睡"),
-    ("Confusion", "迷乱"),
-    ("Focus", "集中力"),
-    ("Crit RES Up", "暴击抵抗"),
-    ("Defiant", "遇强则强"),
-    ("Hinder", "妨碍"),
-    ("Skill Nullifier", "技能免疫"),
-    ("Restrict", "拘禁"),
-    ("Frostburn", "冰灼"),
-    ("Stellar Sigil", "星链标记"),
-    ("Flanking Boost", "追击强化"),
-    ("Flanking", "追击"),
-    ("decreasing the duration of their buffs", "减少正向状态时间"),
-    ("Guard", "守护"),
-    ("fixed damage", "固定伤害"),
-    ("copy buffs", "复制正向状态"),
-    ("Random Buff", "随机正向状态"),
-    ("extending the duration of all debuffs", "负向状态延长"),
-    ("Immobilizing Debuffs", "无法行动类型负向状态"),
-    ("Pain Threshold", "受伤上限"),
-    ("Hibiscus Morning Dew", "扶桑晓露"),
-    ("Crit DMG Up", "暴击伤害提升"),
-    ("Performance Mode", "公演模式"),
-    ("Arrogant Bullying", "自视甚高的欺侮"),
-    ("Flow State", "心流状态"),
-    ("Active", "主动技"),
-    ("Passive", "被动技"),
-    ("Resuscitate", "复苏"),
-    ("ADD DMG RED", "追加伤害下降"),
-    ("Shield Conversion", "护盾转换"),
-    ("Cluster", "凝聚"),
-    ("reducing the debuffs", "负向状态时间减少"),
-    ("Jumpy Pumpkins", "鬼跳南瓜"),
-    ("FXXK YXU", "FXXK YXU"),
-    ("Targeted Taunt", "指定嘲讽"),
-    ("Transfer", "转移"),
-    ("rebound", "反弹"),
-    ("favorable attribute", "有利属性"),
-    ("attribute counter", "不利属性")
-]
+# Translation term tables (status terms, element/class/constellation maps,
+# discipline stats, bond economy values, stat multipliers, LLM prompt
+# glossaries) live in tools/wiki_glossary.py — loaded from
+# config/translation_glossary.json (panel-editable) with built-in defaults.
 
-# Wiki stat multipliers: the wiki's {{Member}} template computes level-60 stats
-# from growth ratios with these constants (verified against all 198 openrubi
-# characters — zero mismatches across 792 stat values).
-#   ATK:   round(ATK_ratio * 608)
-#   HP:    round(HP_ratio  * 4960)
-#   DEF:   round(DEF_ratio * 617)
-#   SPD:   round(SPD_ratio * 100)
-_STAT_MULTIPLIERS = {"ATK": 608, "HP": 4960, "DEF": 617, "SPD": 100}
+# Potential growth params are deterministic (never LLM-translated), so they are
+# excluded from the re-translation source hash. Otherwise introducing them would
+# invalidate every stored ``_src_hash`` and force a full re-translation of all
+# ~208 characters. They are backfilled onto unchanged entries during refresh and
+# are still part of ``_entry_card_hash``, so cards re-render when they change.
+_POT_DETAIL_FIELDS = (
+    "team_pot_rate", "team_pot_base", "team_pot_add",
+    "self_pot_rate", "self_pot_base", "self_pot_add",
+)
 
-# Deterministic element/class translation maps (user-confirmed)
-ELEMENT_CN = {"Flame": "火", "Water": "水", "Nature": "木", "Light": "光", "Dark": "暗"}
-CLASS_CN = {
-    "Warrior": "战士",
-    "Caster": "术士",
-    "Defender": "重装",
-    "Medic": "医疗",
-    "Sniper": "狙击",
-    "Vanguard": "先锋",
+# Whitelist of panel-editable field paths (WebUI 人工修正). Must stay in sync
+# with webui/data_reader.py (_DETAIL_TOP_FIELDS / _DETAIL_SKILL_FIELDS): the
+# panel records edited dotted paths in entry["_manual_fields"] (e.g. "desc",
+# "skills.1.des"), and the refresh pipeline treats those fields as
+# authoritative human text — restored onto rebuilt entries after
+# re-translation, skipped by name healing and by the LLM merge guard.
+_MANUAL_TOP_FIELDS = {
+    "char": ("name_cn", "desc", "discs"),
+    "bond": ("name_cn", "desc", "effect", "notes", "obtain"),
 }
-
-# Western zodiac constellation names (identity field)
-CONSTELLATION_CN = {
-    "Aries": "白羊座", "Taurus": "金牛座", "Gemini": "双子座",
-    "Cancer": "巨蟹座", "Leo": "狮子座", "Virgo": "处女座",
-    "Libra": "天秤座", "Scorpio": "天蝎座", "Scorpius": "天蝎座",
-    "Sagittarius": "射手座", "Capricorn": "摩羯座", "Capricornus": "摩羯座",
-    "Aquarius": "水瓶座", "Pisces": "双鱼座",
-}
-
-# openrubi Discipline stat keys → (Chinese label, is_percentage).
-# Used to render openrubi's numeric Discipline dict into Chinese talent text
-# for seeded entries (no LLM), closing the discs gap openrubi leaves English.
-DISCIPLINE_STAT_CN = {
-    "ATK%": ("攻击力", True),
-    "HP%": ("生命值", True),
-    "DEF%": ("防御力", True),
-    "Speed": ("速度", False),
-    "Effect_Hit_Rate": ("效果命中", True),
-    "Effect_RES": ("效果抵抗", True),
-    "Crit_Rate": ("暴击率", True),
-    "Crit_DMG": ("暴击伤害", True),
-}
-
-# Bond economy values are deterministic by star count (from Template:Bond's
-# {{#switch: {{{Stars}}}} markup). No wiki field stores them — they are
-# computed at render time, so we reproduce the mapping here.
-BOND_SELL_GOLD = {"5": "12500", "4": "4200", "3": "2100"}
-BOND_SELL_FRAGMENT = {"5": "30", "4": "8", "3": "1"}
-BOND_XP_VALUE = {"5": "1030", "4": "850", "3": "680"}
+_MANUAL_SKILL_FIELDS = ("name", "des", "des2", "burst")
+_MANUAL_SKILL_PATH = re.compile(r"skills\.(\d+)\.(\w+)")
 
 
 # ── WikiScraper ──────────────────────────────────────────────────
@@ -600,9 +470,10 @@ class WikiScraper:
         """Download portrait / head icon / skill icons for one character.
 
         Idempotent: skips files already on disk. Filenames follow the wiki
-        convention the user confirmed:
+        convention (``Template:Member`` renders the head icon as
+        ``Icon_Head_S_{{{ID}}}.png``):
           - portrait : ``{ID}_90_Emo1_normal_LV1.png``
-          - icon     : ``Icon_{title}.png``
+          - icon     : ``Icon_Head_S_{ID}.png``
           - skills   : ``Icon_Skill_{ID}_{001|002|003}.png``
         """
         cid = str(entry.get("id", "")).strip()
@@ -616,9 +487,10 @@ class WikiScraper:
                 (f"{cid}_90_Emo1_normal_LV1.png",
                  os.path.join(PORTRAIT_DIR, f"{cid}.png"), 600)
             )
-        if title:
+        if cid:
             targets.append(
-                (f"Icon_{title}.png", os.path.join(ICON_DIR, f"{title}.png"), None)
+                (f"Icon_Head_S_{cid}.png",
+                 os.path.join(ICON_DIR, f"{cid}.png"), None)
             )
         for n in range(1, 4):
             targets.append(
@@ -633,6 +505,47 @@ class WikiScraper:
                 url = await self._resolve_image_url(filename, width)
                 if url:
                     await self._download_image(url, dest)
+
+    @staticmethod
+    def _character_art_missing(entry: dict) -> bool:
+        """True if any expected character image file is absent on disk."""
+        cid = str(entry.get("id", "")).strip()
+        if not cid:
+            return False
+        expected = [os.path.join(PORTRAIT_DIR, f"{cid}.png"),
+                    os.path.join(ICON_DIR, f"{cid}.png")]
+        expected.extend(
+            os.path.join(SKILL_ICON_DIR, f"{cid}_{n}.png") for n in range(1, 4)
+        )
+        return any(not os.path.exists(p) for p in expected)
+
+    async def ensure_character_images(self) -> int:
+        """Backfill missing character art without re-scraping or re-translating.
+
+        Image downloads normally only run during the weekly cache refresh, so a
+        filename-convention fix (or an interrupted download batch) leaves cards
+        stuck on placeholder tiles until the next anchor. This method is
+        idempotent and cheap (existence checks only) and downloads just the
+        missing files, then re-renders the affected cards. Returns the number
+        of characters that needed backfill.
+        """
+        existing = self._load_character_cache()
+        if not existing:
+            return 0
+        missing = [
+            e for e in existing.values()
+            if isinstance(e, dict) and self._character_art_missing(e)
+        ]
+        if not missing:
+            return 0
+        print(f"[WikiScraper] backfilling art for {len(missing)} characters",
+              file=sys.stderr)
+        sem = asyncio.Semaphore(4)
+        tasks = [self._download_character_images(e, sem) for e in missing]
+        await self._background_download_then_render(
+            tasks, "character art backfill", missing, "character"
+        )
+        return len(missing)
 
     async def _fetch_template_pages(self, template_name: str) -> list[tuple[str, str]]:
         """Fetch wikitext for all pages embedding a given template.
@@ -848,7 +761,7 @@ class WikiScraper:
         # Deterministic game-term → Chinese (word-boundary match, longest first).
         # Runs here so both the English fallback and the LLM input see Chinese
         # terms, preventing mixed-language descriptions.
-        for en, cn in _STATUS_TERM_CN:
+        for en, cn in load_glossary()["status_terms"]:
             text = re.sub(r"\b" + re.escape(en) + r"\b", cn, text)
         # {{Example}} → 示例
         text = text.replace("{{Example}}", "示例")
@@ -919,6 +832,16 @@ class WikiScraper:
             "discs_en": [self._clean_markup(p(f"Disc{i}") or "") for i in range(1, 7)],
             "team_pot_en": self._clean_markup(p("TeamPot") or ""),
             "self_pot_en": self._clean_markup(p("SelfPot") or ""),
+            # Potential growth params — deterministic (no LLM). The wiki renders
+            # 5 tiers (B/A/S/SS/SSS) per side as Base + Add×k with k=2..6
+            # (verified against Shani's rendered page: DEF +3.6% … +10.8% from
+            # Base=0/Add=1.8).
+            "team_pot_rate": (p("TeamPotRate") or "").strip(),
+            "team_pot_base": (p("TeamPotBase") or "").strip(),
+            "team_pot_add": (p("TeamPotAdd") or "").strip(),
+            "self_pot_rate": (p("SelfPotRate") or "").strip(),
+            "self_pot_base": (p("SelfPotBase") or "").strip(),
+            "self_pot_add": (p("SelfPotAdd") or "").strip(),
             "skills": [],
         }
 
@@ -971,9 +894,23 @@ class WikiScraper:
         # on incremental refreshes the existing translations are authoritative.
         seed_index = self._openrubi_seed_index() if not existing else None
 
+        # Canonical Chinese names (openrubi dictionaries + own translation map).
+        # Used to heal drifted name_cn values in cached entries: alias lookup
+        # (character_dic → canonical name → _by_cn_name) only works when the
+        # cached name_cn equals the canonical name the alias dictionary uses.
+        canonical_names = self._openrubi_name_lookup()
+        try:
+            canonical_names.update({
+                str(k).strip().lower(): v
+                for k, v in self._load_translation_map().items() if v
+            })
+        except Exception:
+            pass
+
         to_translate = []
         result = {}
-        unchanged = seeded = changed = 0
+        manual_old = {}  # title → cached entry with panel corrections
+        unchanged = seeded = changed = healed = 0
 
         for entry in scraped:
             title = entry["title"]
@@ -982,6 +919,20 @@ class WikiScraper:
 
             # Unchanged → reuse existing (already translated) entry as-is.
             if old is not None and old.get("_src_hash") == h:
+                if self._heal_name_cn(old, canonical_names):
+                    healed += 1
+                # Early cache builds left seeded entries with untranslated
+                # free text (desc/des2/burst still English). Queue those for
+                # gap-translation so mixed English/Chinese cards self-heal.
+                if self._has_untranslated_freetext(old):
+                    to_translate.append(old)
+                # Deterministic potential params are excluded from _source_hash
+                # (no translation needed), so copy the fresh values onto the
+                # reused entry — keeps them current without re-translation and
+                # changes _card_hash so the card re-renders.
+                for k in _POT_DETAIL_FIELDS:
+                    if entry.get(k):
+                        old[k] = entry[k]
                 result[title] = old
                 unchanged += 1
                 continue
@@ -992,20 +943,42 @@ class WikiScraper:
                 self._apply_deterministic_maps(entry)
                 self._default_cn_fields(entry)
                 entry = self._merge_seed(entry, seed)
+                self._heal_name_cn(entry, canonical_names)
                 entry["_src_hash"] = h
                 result[title] = entry
                 seeded += 1
+                # openrubi has no bio/enhanced skill descriptions — gap-fill
+                # the leftover English fields via LLM translation.
+                if self._has_untranslated_freetext(entry):
+                    to_translate.append(entry)
             else:
                 entry["_src_hash"] = h
                 to_translate.append(entry)
                 result[title] = entry
                 changed += 1
+                if old is not None and old.get("_manual_fields"):
+                    manual_old[title] = old
 
-        print(f"[WikiScraper] {unchanged} unchanged, {seeded} seeded from openrubi, "
-              f"{changed} to translate", file=sys.stderr)
+        print(f"[WikiScraper] {unchanged} unchanged ({healed} names healed), "
+              f"{seeded} seeded from openrubi, "
+              f"{changed} changed/new, {len(to_translate)} to translate",
+              file=sys.stderr)
 
         if to_translate:
             await self._translate_character_details(to_translate)
+
+        # Panel corrections (_manual_fields) are authoritative human text: the
+        # rebuild above re-translated changed entries from English, so copy the
+        # manually-edited whitelisted fields back from the cached entry. Done
+        # BEFORE _card_hash stamping so cards render the restored text.
+        restored = 0
+        for title, old in manual_old.items():
+            entry = result.get(title)
+            if entry is not None and entry is not old:
+                restored += self._restore_manual_fields(entry, old, "char")
+        if restored:
+            print(f"[WikiScraper] restored {restored} manually-edited field(s) "
+                  f"across {len(manual_old)} changed entries", file=sys.stderr)
 
         # Stamp each entry with its content hash so the card renderer can skip
         # re-drawing unchanged cards.
@@ -1050,9 +1023,12 @@ class WikiScraper:
 
         Changes to any source field (skills, stats, desc, discs, personal,
         element/class, id/stars) invalidate the stored translation, so the
-        entry is re-translated on the next refresh.
+        entry is re-translated on the next refresh. Deterministic potential
+        growth params are excluded — they need no translation and are
+        backfilled onto unchanged entries instead.
         """
-        payload = {k: v for k, v in entry.items() if k != "_src_hash"}
+        payload = {k: v for k, v in entry.items()
+                   if k != "_src_hash" and k not in _POT_DETAIL_FIELDS}
         s = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -1072,11 +1048,12 @@ class WikiScraper:
     @staticmethod
     def _apply_deterministic_maps(entry: dict):
         """Fill element/class/constellation/stats_max via fixed maps (no LLM)."""
-        entry["element"] = ELEMENT_CN.get(entry.get("element_en", ""), entry.get("element_en", ""))
-        entry["class_cn"] = CLASS_CN.get(entry.get("class_en", ""), entry.get("class_en", ""))
+        g = load_glossary()
+        entry["element"] = g["element"].get(entry.get("element_en", ""), entry.get("element_en", ""))
+        entry["class_cn"] = g["class"].get(entry.get("class_en", ""), entry.get("class_en", ""))
         const = entry.get("constellation", "").strip()
         if const:
-            entry["constellation"] = CONSTELLATION_CN.get(
+            entry["constellation"] = g["constellation"].get(
                 const[:1].upper() + const[1:], const
             )
         # Compute level-60 max stats from wiki growth ratios
@@ -1093,7 +1070,7 @@ class WikiScraper:
         """
         stats = entry.get("stats") or {}
         stats_max = {}
-        for key, mult in _STAT_MULTIPLIERS.items():
+        for key, mult in load_glossary()["stat_multipliers"].items():
             raw = stats.get(key, "")
             if raw:
                 try:
@@ -1120,6 +1097,88 @@ class WikiScraper:
             s.setdefault("des", s.get("des_en", ""))
             s.setdefault("des2", s.get("des2_en", ""))
             s.setdefault("burst", s.get("burst_en", ""))
+
+    @staticmethod
+    def _has_untranslated_freetext(entry: dict) -> bool:
+        """True if any display free-text field still equals its English source.
+
+        Detects leftovers from early builds where seeded entries never went
+        through LLM translation (openrubi has no bio/enhanced descriptions, so
+        ``desc``/``des2``/``burst`` kept their English fallback) — the source
+        of cards mixing English and Chinese text for the same content.
+        """
+        desc_en = (entry.get("desc_en") or "").strip()
+        if desc_en and (entry.get("desc") or "") == entry.get("desc_en"):
+            return True
+        for s in entry.get("skills", []) or []:
+            for key in ("des", "des2", "burst"):
+                en = (s.get(key + "_en") or "").strip()
+                if en and s.get(key, "") == s.get(key + "_en"):
+                    return True
+        return False
+
+    @staticmethod
+    def _heal_name_cn(entry: dict, canonical_names: dict) -> bool:
+        """Align ``name_cn`` with the canonical openrubi/translation-map name.
+
+        Alias resolution depends on ``name_cn`` matching the canonical name in
+        ``character_dic.json``; caches built before that alignment drift and
+        make alias lookups fail. Returns True when the entry was changed.
+
+        A panel-corrected name (``name_cn`` listed in ``_manual_fields``) is
+        authoritative human text and is never healed back to the canonical.
+        """
+        title = str(entry.get("title", "")).strip()
+        canonical = canonical_names.get(title.strip().lower()) if title else None
+        if not canonical:
+            return False
+        if "name_cn" in (entry.get("_manual_fields") or []):
+            return False
+        if entry.get("name_cn") == canonical:
+            return False
+        entry["name_cn"] = canonical
+        return True
+
+    @staticmethod
+    def _restore_manual_fields(entry: dict, old: dict, kind: str) -> int:
+        """Backfill manually-edited whitelisted fields from ``old`` onto ``entry``.
+
+        A wiki change (or a parser fix invalidating ``_src_hash``) rebuilds the
+        entry from English and re-runs LLM translation, which would silently
+        discard panel corrections recorded in ``old["_manual_fields"]``. This
+        restores them afterwards so human text stays authoritative. The marker
+        is carried over onto ``entry``, narrowed to the paths actually restored
+        (e.g. a ``skills.{i}.*`` path whose index no longer exists is dropped).
+        Returns the number of restored field paths.
+        """
+        manual = old.get("_manual_fields")
+        if not isinstance(manual, list) or not manual:
+            return 0
+        top = _MANUAL_TOP_FIELDS.get(kind, ())
+        restored = []
+        for path in manual:
+            path = str(path).strip()
+            if path in top:
+                if path in old:
+                    entry[path] = copy.deepcopy(old[path])
+                    restored.append(path)
+                continue
+            m = _MANUAL_SKILL_PATH.fullmatch(path)
+            if not m:
+                continue
+            idx, key = int(m.group(1)), m.group(2)
+            old_skills = old.get("skills") or []
+            new_skills = entry.get("skills") or []
+            if (key in _MANUAL_SKILL_FIELDS
+                    and idx < len(old_skills) and idx < len(new_skills)
+                    and isinstance(old_skills[idx], dict)
+                    and isinstance(new_skills[idx], dict)
+                    and key in old_skills[idx]):
+                new_skills[idx][key] = old_skills[idx][key]
+                restored.append(path)
+        if restored:
+            entry["_manual_fields"] = sorted(set(restored))
+        return len(restored)
 
     def _load_character_cache(self) -> dict:
         """Load existing {title: entry} from character_details.json."""
@@ -1185,7 +1244,7 @@ class WikiScraper:
             if idx < 0 or idx >= 6 or not isinstance(stats, dict):
                 continue
             for key, val in stats.items():
-                label, is_pct = DISCIPLINE_STAT_CN.get(key, (key, False))
+                label, is_pct = load_glossary()["discipline_stat"].get(key, [key, False])
                 suffix = "%" if is_pct else ""
                 discs[idx] = f"{label} +{val}{suffix}"
                 break  # single-stat nodes; keep the first if ever multiple
@@ -1229,6 +1288,49 @@ class WikiScraper:
 
     # ── Character Detail Translation ──────────────────────────────
 
+    async def force_retranslate(self, kind: str, entries: list[dict]) -> dict:
+        """Force a full re-translation of already-cached entries (panel-driven).
+
+        The normal refresh pipeline skips fields that already hold Chinese
+        text (the merge guard only backfills fields still equal to their
+        English source), so a plain re-run cannot upgrade an existing
+        translation. This resets the LLM-translated fields back to their
+        English source and re-runs the standard pipeline, which means:
+
+          - the current glossary (config/translation_glossary.json) is applied;
+          - names go through the openrubi → name_mapping → LLM lookup chain
+            again (cached mappings win — consistency over novelty);
+          - ``_src_hash`` is untouched (the English source does not change).
+
+        Manual corrections on the entry ARE overwritten — callers should
+        confirm with the user first. Mutates entries in place; the caller is
+        responsible for validating the result (e.g. LLM failure leaves fields
+        at their English source) and persisting them. Requires
+        ``self.llm_client``.
+        """
+        if kind not in ("char", "bond"):
+            return {"error": f"非法重翻译类型: {kind}"}
+        if not self.llm_client:
+            return {"error": "未配置 LLM 客户端，无法重翻译"}
+        if kind == "char":
+            for c in entries:
+                # Intentional overwrite: drop the manual-edit marker so the
+                # merge guard does not protect fields the panel asked to redo.
+                c.pop("_manual_fields", None)
+                c["name_cn"] = c.get("title", "")
+                c["desc"] = c.get("desc_en", "")
+                c["discs"] = list(c.get("discs_en", []))
+                for s in c.get("skills", []) or []:
+                    for key in ("name", "des", "des2", "burst"):
+                        s[key] = s.get(key + "_en", "")
+            await self._translate_character_details(entries)
+        else:
+            for b in entries:
+                b.pop("_manual_fields", None)
+                b["name_cn"] = b.get("title", "")
+            await self._translate_bond_details(entries)
+        return {"entries": len(entries)}
+
     async def _translate_character_details(self, chars: list[dict]):
         """Translate English character entries to Chinese (name + free-text).
 
@@ -1246,6 +1348,11 @@ class WikiScraper:
         name_map = self._load_translation_map()
         unmapped = []
         for c in chars:
+            # Entries gap-filled from a seeded cache may already carry the
+            # canonical openrubi name — never overwrite a real Chinese name.
+            existing_cn = (c.get("name_cn") or "").strip()
+            if existing_cn and existing_cn != c.get("title"):
+                continue
             cn = openrubi_map.get(c["title"].strip().lower()) or name_map.get(c["title"])
             if cn:
                 c["name_cn"] = cn
@@ -1319,28 +1426,52 @@ class WikiScraper:
                 pass
         return "\n\n".join(examples)
 
+    async def _translate_batch_once(self, prompt: str, batch: list[dict],
+                                    attempt: int, attempts: int) -> dict:
+        """Run one translation batch; return parsed JSON ({} on failure).
+
+        ``chat_completion`` converts timeouts/API errors into Chinese error
+        *strings* instead of raising, so an unparseable reply is the failure
+        signal. Log it (with the reply head) rather than dropping the batch
+        silently — silent drops are how English text survived earlier cache
+        builds (a real 8-char batch measures ~47s, right at the old 60s cap).
+        """
+        try:
+            result = await self.llm_client.chat_completion(prompt,
+                                                           timeout_set=180.0)
+        except Exception as e:
+            print(f"[WikiScraper] translation batch raised "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            return {}
+        translated = self._parse_translation_json(result)
+        if not translated:
+            head = (result or "").strip().replace("\n", " ")[:120]
+            print(f"[WikiScraper] translation batch {attempt}/{attempts} got no "
+                  f"JSON ({len(batch)} chars, first={batch[0]['title']}); "
+                  f"reply head: {head!r}", file=sys.stderr)
+        return translated
+
     async def _llm_translate_details(self, chars: list[dict]):
         """Batch-translate desc/skill names+descriptions/discs via LLM.
 
-        Sends characters in batches of 8, each with English fields; expects a
+        Sends characters in batches of 4, each with English fields; expects a
         JSON object keyed by title with translated fields. openrubi few-shot +
-        a status-term glossary keep terminology consistent.
+        a status-term glossary keep terminology consistent. A batch whose
+        reply carries no JSON (timeout / API error string) is retried once.
         """
         if not self.llm_client:
             return
 
         fewshot = self._build_fewshot()
-        glossary = (
-            "术语参考：ATK=攻击力，DEF=防御力，HP=生命值，Speed=速度，"
-            "ATK Down=攻击力下降，DEF Down=防御力下降，SPD Down=速度下降，"
-            "ATK Up=攻击力提升，DEF Up=防御力提升，SPD Up=速度提升，"
-            "Provoke=嘲讽，Immunity=免疫，Shield=护盾，Stun=眩晕，Silence=沉默，"
-            "Poison=中毒，Burn=灼烧，Bleed=流血，Barrier=屏障，Recovery=恢复，"
-            "Effect Hit Rate=效果命中，Effect Resistance=效果抵抗。"
-        )
+        glossary = build_prompt_glossary("char")
 
-        for i in range(0, len(chars), 8):
-            batch = chars[i : i + 8]
+        total = len(chars)
+        for i in range(0, total, 4):
+            batch = chars[i : i + 4]
+            # Progress heartbeat: this phase runs 20+ sequential LLM calls and
+            # is otherwise completely silent, which looks like a hang in logs.
+            print(f"[WikiScraper] translating details {i + 1}-{i + len(batch)}/{total}",
+                  file=sys.stderr)
             payload = []
             for c in batch:
                 payload.append({
@@ -1370,32 +1501,42 @@ class WikiScraper:
                 '{"<title>": {"name_cn": "...", "desc": "...", "skills": [{"name":"...","des":"...","des2":"...","burst":"..."}], "discs": ["..."]}}'
             )
 
-            try:
-                result = await self.llm_client.chat_completion(prompt, timeout_set=60.0)
-                translated = self._parse_translation_json(result)
-            except Exception:
-                translated = {}
+            translated = {}
+            for attempt in (1, 2):
+                translated = await self._translate_batch_once(prompt, batch,
+                                                              attempt, 2)
+                if translated:
+                    break
 
             for c in batch:
                 t = translated.get(c["title"])
                 if not isinstance(t, dict):
                     continue
-                if t.get("name_cn"):
+                # Merge guard: only fill fields that still equal their English
+                # source (i.e. untranslated). Authoritative Chinese values
+                # (openrubi-seeded names/descriptions) are never overwritten —
+                # this is what lets seeded entries be gap-filled safely.
+                # Panel-corrected fields (_manual_fields) are skipped too: a
+                # human edit that happens to equal the English source (or is
+                # deliberately left English) must not be re-translated.
+                manual = c.get("_manual_fields") or []
+                if (t.get("name_cn") and c.get("name_cn") == c.get("title")
+                        and "name_cn" not in manual):
                     c["name_cn"] = t["name_cn"]
-                if t.get("desc"):
+                if (t.get("desc") and (c.get("desc") or "") == c.get("desc_en")
+                        and "desc" not in manual):
                     c["desc"] = t["desc"]
                 for idx, sk in enumerate(c.get("skills", [])):
                     ts = t.get("skills", [])
                     if isinstance(ts, list) and idx < len(ts) and isinstance(ts[idx], dict):
-                        if ts[idx].get("name"):
-                            sk["name"] = ts[idx]["name"]
-                        if ts[idx].get("des"):
-                            sk["des"] = ts[idx]["des"]
-                        if ts[idx].get("des2"):
-                            sk["des2"] = ts[idx]["des2"]
-                        if ts[idx].get("burst"):
-                            sk["burst"] = ts[idx]["burst"]
-                if isinstance(t.get("discs"), list):
+                        for key in ("name", "des", "des2", "burst"):
+                            val = ts[idx].get(key)
+                            if (val and (sk.get(key) or "") == sk.get(key + "_en")
+                                    and f"skills.{idx}.{key}" not in manual):
+                                sk[key] = val
+                if (isinstance(t.get("discs"), list)
+                        and c.get("discs") == c.get("discs_en")
+                        and "discs" not in manual):
                     c["discs"] = t["discs"]
 
     @staticmethod
@@ -1540,6 +1681,7 @@ class WikiScraper:
 
         to_translate = []
         result = {}
+        manual_old = {}  # title → cached entry with panel corrections
         unchanged = seeded = changed = 0
 
         for entry in scraped:
@@ -1564,12 +1706,28 @@ class WikiScraper:
                 to_translate.append(entry)
                 result[title] = entry
                 changed += 1
+                if old is not None and old.get("_manual_fields"):
+                    manual_old[title] = old
 
         print(f"[WikiScraper] bonds: {unchanged} unchanged, {seeded} seeded, "
               f"{changed} to translate", file=sys.stderr)
 
         if to_translate:
             await self._translate_bond_details(to_translate)
+
+        # Panel corrections (_manual_fields) are authoritative human text.
+        # Bond LLM translation overwrites desc/effect/notes/obtain with no
+        # merge guard, so restore them from the cached entry afterwards —
+        # BEFORE _card_hash stamping so cards render the restored text.
+        restored = 0
+        for title, old in manual_old.items():
+            entry = result.get(title)
+            if entry is not None and entry is not old:
+                restored += self._restore_manual_fields(entry, old, "bond")
+        if restored:
+            print(f"[WikiScraper] bonds: restored {restored} manually-edited "
+                  f"field(s) across {len(manual_old)} changed entries",
+                  file=sys.stderr)
 
         # Stamp each entry with its content hash for card-render dedup.
         for entry in result.values():
@@ -1649,11 +1807,12 @@ class WikiScraper:
     @staticmethod
     def _apply_bond_deterministic(entry: dict, release_map: dict | None = None):
         """Fill class CN + deterministic sell/XP + release date (no LLM)."""
-        entry["class_cn"] = CLASS_CN.get(entry.get("class_en", ""), entry.get("class_en", ""))
+        g = load_glossary()
+        entry["class_cn"] = g["class"].get(entry.get("class_en", ""), entry.get("class_en", ""))
         stars = str(entry.get("stars", ""))
-        entry["sell_gold"] = BOND_SELL_GOLD.get(stars, "")
-        entry["sell_fragment"] = BOND_SELL_FRAGMENT.get(stars, "")
-        entry["xp_value"] = BOND_XP_VALUE.get(stars, "")
+        entry["sell_gold"] = g["bond_sell_gold"].get(stars, "")
+        entry["sell_fragment"] = g["bond_sell_fragment"].get(stars, "")
+        entry["xp_value"] = g["bond_xp_value"].get(stars, "")
         if release_map:
             entry["release"] = WikiScraper._normalize_release_date(
                 release_map.get(entry.get("title", ""), "")
@@ -1734,13 +1893,12 @@ class WikiScraper:
         """Batch-translate desc/effect/notes/obtain (+ unmapped name) via LLM."""
         if not self.llm_client:
             return
-        glossary = (
-            "术语参考：ATK=攻击力，DEF=防御力，HP=生命值，Shield=护盾，"
-            "Immune=免疫，Provoke=嘲讽，Stun=眩晕，Bleed=流血，Burn=灼烧，"
-            "Poison=中毒，Revive=复活，Barrier=屏障，Recovery=恢复。"
-        )
-        for i in range(0, len(bonds), 8):
-            batch = bonds[i : i + 8]
+        glossary = build_prompt_glossary("bond")
+        total = len(bonds)
+        for i in range(0, total, 4):
+            batch = bonds[i : i + 4]
+            print(f"[WikiScraper] translating bonds {i + 1}-{i + len(batch)}/{total}",
+                  file=sys.stderr)
             payload = []
             for b in batch:
                 payload.append({
@@ -1759,11 +1917,12 @@ class WikiScraper:
                 + "\n\n返回 ONLY JSON（无 markdown 代码块、无解释），结构相同但字段翻译为中文：\n"
                 '{"<title>": {"name_cn": "...", "desc": "...", "effect": "...", "notes": "...", "obtain": "..."}}'
             )
-            try:
-                result = await self.llm_client.chat_completion(prompt, timeout_set=60.0)
-                translated = self._parse_translation_json(result)
-            except Exception:
-                translated = {}
+            translated = {}
+            for attempt in (1, 2):
+                translated = await self._translate_batch_once(prompt, batch,
+                                                              attempt, 2)
+                if translated:
+                    break
             for b in batch:
                 t = translated.get(b["title"])
                 if not isinstance(t, dict):
@@ -2062,7 +2221,7 @@ class WikiScraper:
     def _strip_wiki_markup(text: str) -> str:
         """Remove wiki/HTML markup → plain text, keeping English.
 
-        Like ``_clean_markup`` but without the ``_STATUS_TERM_CN`` translation,
+        Like ``_clean_markup`` but without the status-terms glossary translation,
         so Battle_Mechanics effect text is stored in English (groundwork) and
         translated later.
         """

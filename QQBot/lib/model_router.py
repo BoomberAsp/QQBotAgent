@@ -12,9 +12,17 @@ or missing, all clients fall back to the default .env DeepSeek config.
 
 import json
 import os
+import re
 from typing import Dict, Optional
 
 from .deepseek_client import DeepSeekClient
+
+
+# Fallback input window when a chat-tier section lacks `context_window`.
+# NOTE: `max_tokens` in models_settings.json is the OUTPUT cap — the input
+# window is a separate field consumed only by effective_context_window
+# (special-session compression thresholds, PLAN.md Idea 4 Phase B).
+DEFAULT_CONTEXT_WINDOW = 131072  # 128k
 
 
 class ModelRouter:
@@ -67,9 +75,33 @@ class ModelRouter:
             return None  # Caller will fall back
 
         try:
-            return DeepSeekClient(api_key=api_key, api_base=api_base, model=model)
+            client = DeepSeekClient(api_key=api_key, api_base=api_base, model=model)
+            # Direct Vision gate: explicit opt-in per model section. When
+            # true, turn.py attaches user-uploaded images as image_url
+            # content parts to requests made with this client (see
+            # lib/image_parts.py). Absent/false → text-only behaviour.
+            client.supports_vision = bool(model_config.get("supports_vision", False))
+            return client
         except Exception:
             return None
+
+    def reload(self) -> None:
+        """Re-read models_settings.json and rebuild all clients in place.
+
+        Called by the agent_router config watcher when the panel saves a
+        new model configuration, so changes take effect without a restart.
+        Property accessors read these attributes per call, and client
+        objects are pure config carriers (the httpx client is created per
+        request), so swapping them mid-flight is safe.
+        """
+        self._load_config()
+        self._reasoning_client = self._create_client(self._config.get("REASONING_MODEL", {}))
+        self._flash_client = self._create_client(self._config.get("FLASH_MODEL", {}))
+        self._multimodal_client = self._create_client(self._config.get("MULTIMODAL_MODEL", {}))
+        self._task_routing = self._config.get("task_routing", {})
+        # Drop the cached .env fallback so it is rebuilt on next access
+        if hasattr(self, "_default"):
+            del self._default
 
     # ── Client Access ─────────────────────────────────────────────────
 
@@ -102,6 +134,32 @@ class ModelRouter:
             except Exception:
                 self._default = DeepSeekClient()
         return self._default
+
+    # ── Context Window (PLAN.md Idea 4, Phase B) ─────────────────────
+
+    def _section_window(self, section: str) -> int:
+        """Read `context_window` from a config section (fallback 128k).
+
+        Computed per call from self._config so reload() (panel hot-save)
+        takes effect immediately without extra wiring.
+        """
+        try:
+            window = int((self._config.get(section) or {}).get("context_window", 0))
+            return window if window > 0 else DEFAULT_CONTEXT_WINDOW
+        except (TypeError, ValueError):
+            return DEFAULT_CONTEXT_WINDOW
+
+    @property
+    def effective_context_window(self) -> int:
+        """Input-window ceiling a special session's context must respect.
+
+        Special sessions run on either chat tier depending on triage, so the
+        binding constraint is the SMALLER of the two windows.
+        """
+        return min(
+            self._section_window("REASONING_MODEL"),
+            self._section_window("FLASH_MODEL"),
+        )
 
     # ── Routing ───────────────────────────────────────────────────────
 
@@ -153,6 +211,7 @@ class ModelRouter:
             result = await client.chat_completion(
                 message=prompt,
                 timeout_set=30.0,
+                purpose="triage",
             )
             # Extract the classification word
             result = result.strip().lower()
@@ -166,6 +225,65 @@ class ModelRouter:
         except Exception:
             # Any error → complex (safety first)
             return "complex"
+
+    # ── Plane + Complexity Classification (Bond-System-Design.md §3.3) ──
+
+    async def classify(self, user_message: str) -> Dict[str, str]:
+        """Classify a message on two axes in ONE triage call.
+
+        Returns {"plane": "social"|"task", "complexity": "simple"|"complex"}:
+        - plane:      social = 闲聊/角色扮演/情感交流（角色面独立回答）;
+                      task   = 需要工具执行的任务（路由到任务面）
+        - complexity: 与 classify_complexity 相同语义
+
+        Used by the dual-plane router for split-mode personalities. Any error
+        or unparsable result falls back to {"task", "complex"} — the existing
+        full-capability path, so a triage failure never degrades task handling.
+        """
+        classify_prompt = self._task_routing.get(
+            "classify_prompt",
+            "请对下面的用户消息做两个判断，只回复一行，格式为 \"plane=xxx complexity=xxx\"。\n\n"
+            "1. plane（对话平面）:\n"
+            "- social: 闲聊、角色扮演、情感交流、问候感谢、关于你自身设定或状态的问题\n"
+            "- task: 需要搜索实时信息、执行代码、读写文件、查询数据、翻译文档等工具任务，"
+            "或需要多步推理的复杂问题\n"
+            "2. complexity（复杂度）:\n"
+            "- simple: 直接回答即可\n"
+            "- complex: 需要深度推理或多步工具调用\n\n"
+            "用户消息: {user_message}\n\n判断:",
+        )
+        prompt = classify_prompt.replace("{user_message}", user_message)
+        fallback = {"plane": "task", "complexity": "complex"}
+
+        try:
+            client = self.get_client("triage")
+            result = await client.chat_completion(
+                message=prompt,
+                timeout_set=30.0,
+                purpose="triage",
+            )
+            text = (result or "").strip().lower()
+
+            plane_m = re.search(r"plane\s*[=:：]\s*(social|task)", text)
+            comp_m = re.search(r"complexity\s*[=:：]\s*(simple|complex)", text)
+
+            if plane_m:
+                out = {
+                    "plane": plane_m.group(1),
+                    "complexity": comp_m.group(1) if comp_m else "complex",
+                }
+                return out
+
+            # 未解析出 plane —— 兼容旧式单轴回复（triage_prompt 被面板覆盖时）：
+            # complex → 任务面；simple → 角色面（误判由 delegate_task 兜底）。
+            # 词边界匹配，避免 "complexity" 误中 "complex"。
+            if re.search(r"\bcomplex\b", text):
+                return {"plane": "task", "complexity": "complex"}
+            if re.search(r"\bsimple\b", text):
+                return {"plane": "social", "complexity": "simple"}
+            return dict(fallback)
+        except Exception:
+            return dict(fallback)
 
     # ── Status ─────────────────────────────────────────────────────────
 

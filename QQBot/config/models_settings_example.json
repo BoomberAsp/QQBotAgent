@@ -3,21 +3,23 @@
   "_instructions": "Each model section requires: api_key (API key), api_base (endpoint URL), model (model name). Leave any field blank to fall back to the default DeepSeek config in .env.",
 
   "REASONING_MODEL": {
-    "_comment": "Primary reasoning model for complex tasks — multi-step reasoning, tool calling, code generation, search synthesis.",
+    "_comment": "Primary reasoning model for complex tasks — multi-step reasoning, tool calling, code generation, search synthesis. supports_vision (Direct Vision): set true ONLY when this model accepts OpenAI image_url content parts inline — user-uploaded images are then attached to the current-turn message so the model sees them directly (no tool round-trip); false/absent keeps the text-placeholder + read_file lazy-analysis path. A 400 rejection with images attached self-heals by retrying the turn text-only.",
     "api_key": "",
     "api_base": "",
     "model": "",
     "max_tokens": 409600,
-    "temperature": 0.7
+    "temperature": 0.7,
+    "supports_vision": false
   },
 
   "FLASH_MODEL": {
-    "_comment": "Lightweight fast model for triage classification and simple conversations (greetings, small talk, /status). Low max_tokens to save cost.",
+    "_comment": "Lightweight fast model for triage classification and simple conversations (greetings, small talk, /status). Low max_tokens to save cost. supports_vision: see REASONING_MODEL — when true, bare-image messages also enter the agent directly (character responds to the image instead of the legacy 已收到图片 ack).",
     "api_key": "",
     "api_base": "",
     "model": "",
     "max_tokens": 102400,
-    "temperature": 0.7
+    "temperature": 0.7,
+    "supports_vision": false
   },
 
   "MULTIMODAL_MODEL": {
@@ -45,6 +47,30 @@
     "model": "qwen3.5-ocr",
     "max_tokens": 2048,
     "temperature": 0.0
+  },
+
+  "IMAGE_GEN_MODEL": {
+    "_comment": "Image generation (Bond P4, lib/media_gen.py). DashScope-native synchronous endpoint — api_base is the FULL endpoint URL, NOT a /chat/completions base. Billed per image; the section is fresh-read on every call (hot), except max_concurrency which latches at first use and needs a bot restart. Text-to-image and reference-image editing share this endpoint. Leave api_key/api_base/model empty to disable image generation.",
+    "api_key": "",
+    "api_base": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+    "model": "qwen-image-3.0",
+    "timeout": 60,
+    "max_retries": 1,
+    "max_concurrency": 2
+  },
+
+  "TTS_MODEL": {
+    "_comment": "Speech synthesis (Bond P4, lib/media_gen.py). DashScope-native non-realtime endpoint — api_base is the FULL endpoint URL. Billed per character. Voices cannot be mixed across TTS models; pick voice IDs from the Bailian 'Qwen-Audio-TTS voice list' (the placeholders below are examples). output.audio.url expires after 24h — media_gen downloads it immediately. default_voice is used when a character has no assigned voice; voice_pool feeds deterministic per-character voice assignment. Same hot-reload semantics as IMAGE_GEN_MODEL.",
+    "api_key": "",
+    "api_base": "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer",
+    "model": "qwen-audio-3.1-tts-plus",
+    "format": "mp3",
+    "sample_rate": 22050,
+    "timeout": 30,
+    "max_retries": 1,
+    "max_concurrency": 2,
+    "default_voice": "longanhuan_v3.6",
+    "voice_pool": ["longanhuan_v3.6", "longxiaochun_v3.6", "longxiaoxia_v3.6", "longanrou_v3.6"]
   },
 
   "task_routing": {

@@ -14,6 +14,17 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from loguru import logger
+
+
+# Trim hysteresis (Cache-Hit-Rate-Plan.md Phase 4, B3): trimming the history
+# head EVERY turn once the session is full invalidates the provider-side
+# prefix cache for the whole history. Let the context grow this many messages
+# past max before snapping back to max in one cut — the head then changes
+# once every few turns instead of every turn. The extra messages are billed
+# at cache-hit price (~1/10), so this is a net win.
+TRIM_HYSTERESIS = 4
+
 
 @dataclass
 class Session:
@@ -47,8 +58,13 @@ class Session:
         return (time.time() - self.last_active) > timeout
 
     def trim(self, max_messages: int):
-        """Trim context to the most recent max_messages entries."""
-        if len(self.context) > max_messages:
+        """Trim context to the most recent max_messages entries (lazy).
+
+        Hysteresis: the cut only happens once the context exceeds
+        ``max_messages + TRIM_HYSTERESIS`` — see the constant's comment for
+        the prefix-cache rationale.
+        """
+        if len(self.context) > max_messages + TRIM_HYSTERESIS:
             self.context = self.context[-max_messages:]
 
     def clear(self):
@@ -90,22 +106,51 @@ class SessionManager:
         self.session_timeout = session_timeout
         self.persistence_dir = persistence_dir
         self._sessions: Dict[str, Session] = {}
+        # user_id → st_mtime_ns of the session file as last seen by this
+        # process (load or own save). get_or_create() revalidates the cache
+        # against it so external deletions (WebUI "清除临时会话") are not
+        # resurrected with stale context on the next message.
+        self._disk_mtime: Dict[str, Optional[int]] = {}
 
         if persistence_dir:
             os.makedirs(persistence_dir, exist_ok=True)
 
     # ── CRUD ──────────────────────────────────────────────────────
 
+    def _stat_mtime(self, user_id: str) -> Optional[int]:
+        """st_mtime_ns of the user's session file, or None when absent."""
+        if not self.persistence_dir:
+            return None
+        try:
+            return os.stat(self._get_path(user_id)).st_mtime_ns
+        except OSError:
+            return None
+
     def get_or_create(self, user_id: str) -> Session:
-        """Get an existing session or create a new one."""
+        """Get an existing session or create a new one.
+
+        The in-memory cache is revalidated against the session file's mtime:
+        an external delete/edit (WebUI panel) wins over the cached copy, so a
+        cleared session cannot be resurrected with its old context. Without
+        persistence_dir this degrades to the old pure-cache behavior.
+        """
         session = self._sessions.get(user_id)
 
+        if session is not None and self._stat_mtime(user_id) != self._disk_mtime.get(user_id):
+            # File deleted or rewritten behind our back → drop the stale cache
+            session = None
+            self._sessions.pop(user_id, None)
+
         if session is None:
+            # Stat BEFORE loading: if the file changes during the read, the
+            # recorded mtime is stale and the next call revalidates again.
+            disk_mtime = self._stat_mtime(user_id)
             # Try loading from disk
             session = self._load_from_disk(user_id)
             if session is None:
                 session = Session(user_id=user_id)
             self._sessions[user_id] = session
+            self._disk_mtime[user_id] = disk_mtime
 
         # Check timeout
         if session.is_expired(self.session_timeout):
@@ -135,6 +180,7 @@ class SessionManager:
     def delete(self, user_id: str):
         """Delete a session."""
         self._sessions.pop(user_id, None)
+        self._disk_mtime.pop(user_id, None)
         if self.persistence_dir:
             path = self._get_path(user_id)
             if os.path.exists(path):
@@ -169,12 +215,23 @@ class SessionManager:
     def _save_to_disk(self, user_id: str, session: Session):
         if not self.persistence_dir:
             return
+        path = self._get_path(user_id)
+        # External delete that arrived mid-request (between get_or_create and
+        # this save): honor it instead of resurrecting the file with the stale
+        # in-flight context. The cache entry is dropped so the next message
+        # starts a genuinely fresh session.
+        if self._disk_mtime.get(user_id) is not None and not os.path.exists(path):
+            self._sessions.pop(user_id, None)
+            self._disk_mtime.pop(user_id, None)
+            logger.info("[session] {} 会话文件已被外部删除，跳过写回", user_id)
+            return
         try:
-            path = self._get_path(user_id)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(session.to_dict(), f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass  # Persistence failure is non-fatal
+            self._disk_mtime[user_id] = self._stat_mtime(user_id)
+        except Exception as e:
+            # Persistence failure is non-fatal, but no longer silent.
+            logger.warning("[session] persist failed user={}: {}", user_id, e)
 
     def _load_from_disk(self, user_id: str) -> Optional[Session]:
         if not self.persistence_dir:
