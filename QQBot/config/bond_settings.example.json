@@ -1,0 +1,23 @@
+{
+  "_comment": "复制为 bond_settings.json 后按需修改；缺省键走 agent/bond.py::_DEFAULTS（启动时合并覆盖）。本示例只列「角色信箱」mail_* 组（proactive-mail-design.md §11）。",
+  "mail_enabled": true,
+  "mail_hour": 10,
+  "mail_daily_cap": 1,
+  "mail_min_gap_hours": 20,
+  "mail_inactive_hours": 24,
+  "mail_persona_cooldown_days": 7,
+  "mail_min_level": 5,
+  "mail_max_letters": 5,
+  "mail_max_previews": 5,
+  "mail_max_chars": 800,
+  "mail_retention_days": 28,
+  "mail_gen_concurrency": 4,
+  "mail_pass_budget_minutes": 20,
+  "mail_review_enabled": false,
+  "mail_full_when_single": true,
+  "mail_group_enabled": false,
+  "mail_group_announcement": "",
+  "mail_rate_c2c_per_sec": 10,
+  "mail_rate_group_per_min": 60,
+  "mail_rate_group_per_relation_qpm": 20
+}
