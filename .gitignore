@@ -59,6 +59,13 @@ QQBot/docs/
 /Cache-Hit-Rate-Plan.md
 /Profile-Fact-Extraction-Plan.md
 /Web-UI-Plan.md
+/P1-Deployment-Acceptance-Plan.md
+/Story-Knowledge-Base-Design.md
+/Voice-System-Design.md
+/wiki-battle-mechanism.html
+/wiki_char.html
+/chat-export-1790847059200.json
+
 
 # ── 本地验证数据与脚本（Idea 8 测速）────────────
 # test/ 下的校验脚本、GT、缓存、接触片均为开发产物
@@ -98,3 +105,6 @@ QQBot/data/wiki_cache/cards/
 # 各类 .bak 快照（部署/迁移时产生）
 *.bak_*
 *.bak-pre-*
+
+# 服务器运维产物
+
