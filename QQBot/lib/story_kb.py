@@ -989,6 +989,26 @@ _story_kb: Optional[StoryKB] = None
 _singleton_lock = threading.Lock()
 
 
+_KB_STAMP: dict = {"sig": None}
+
+
+def _kb_signature() -> tuple:
+    """所有可发现剧情库的 (名字, mtime, size) 指纹。"""
+    try:
+        from .story_sources import discover_dbs
+        dbs = discover_dbs()
+    except Exception:  # noqa: BLE001
+        dbs = []
+    sig = []
+    for name, path in dbs:
+        try:
+            st = os.stat(path)
+            sig.append((name, st.st_mtime, st.st_size))
+        except OSError:
+            sig.append((name, None, None))
+    return tuple(sig)
+
+
 def get_story_kb(db_path: Optional[str] = None):
     """Get (or lazily create) the process-wide story source.
 
@@ -1000,10 +1020,17 @@ def get_story_kb(db_path: Optional[str] = None):
     global _story_kb
     if db_path is not None:
         return StoryKB(db_path)
+    sig = _kb_signature()
+    if _story_kb is not None and _KB_STAMP["sig"] not in (None, sig):
+        # 库文件被替换（上传新 story_gd.db / 重建 wiki 库）→ 丢弃旧单例
+        with _singleton_lock:
+            _story_kb = None
+        print(f"[story_kb] 检测到剧情库变更，重新加载 {sig}")
     if _story_kb is None:
         with _singleton_lock:
             if _story_kb is None:
                 _story_kb = _open_default_source()
+                _KB_STAMP["sig"] = sig
     return _story_kb
 
 

@@ -236,11 +236,22 @@ class GameData:
         return self.roles.get(role_code)
 
     def resolve_role(self, text: str) -> str | None:
+        """角色名 → 角色 ID。
+
+        优先级：角色 ID → **面板维护的 character_dic.json**（管理员覆盖层）→
+        产物内置别名（ENG/简繁/旧标签）。character_dic 改动按 mtime 自动生效。
+        """
         if not text:
             return None
-        if text in self.roles:
-            return text
-        return self._role_alias.get(_norm(text))
+        t = text.strip()
+        if t in self.roles:
+            return t
+        canon = _dic_lookup(t)
+        if canon:
+            hit = self._role_alias.get(_norm(canon))
+            if hit:
+                return hit
+        return self._role_alias.get(_norm(t))
 
     def role_display_name(self, role_code: str, lang: str = "zh_hans") -> str:
         names = (self.roles.get(role_code) or {}).get("names") or {}
@@ -445,12 +456,30 @@ def default_dir() -> str:
     return os.path.join(here, "..", "data", "gamedata")
 
 
+_SOURCE_STAMP: dict = {"stamp": None}
+
+
+def _source_stamp() -> tuple:
+    """产物版本指纹（manifest.json 的 mtime + size）。"""
+    try:
+        st = os.stat(os.path.join(os.path.abspath(default_dir()), "manifest.json"))
+        return (st.st_mtime, st.st_size)
+    except OSError:
+        return (None, None)
+
+
 def get_source(refresh: bool = False) -> GameData:
-    """进程级单例。产物缺失时返回 ``available=False`` 的空源（不抛异常）。"""
+    """进程级单例；``manifest.json`` 变了就自动重建（上传后无需重启）。
+
+    产物缺失时返回 ``available=False`` 的空源（不抛异常）。
+    """
     global _source
     with _lock:
-        if _source is None or refresh:
+        stamp = _source_stamp()
+        stale = _SOURCE_STAMP["stamp"] not in (None, stamp)
+        if _source is None or refresh or stale:
             _source = GameData(os.path.abspath(default_dir()))
+            _SOURCE_STAMP["stamp"] = stamp
         return _source
 
 
@@ -460,3 +489,39 @@ def status_id(label_or_id: str) -> str | None:
 
 def is_available() -> bool:
     return get_source().available
+
+
+# ── 面板维护的别名映射（character_dic.json，管理员覆盖层）──────────
+_CHAR_DIC: dict = {"mtime": None, "map": {}}
+
+
+def _char_dic_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "config", "characters", "character_dic.json")
+
+
+def _char_dic() -> dict:
+    """别名 → 规范中文名；文件变了自动重载（面板保存后无需重启）。"""
+    path = _char_dic_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if _CHAR_DIC["mtime"] == mtime:
+        return _CHAR_DIC["map"]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f) or {}
+        mapping = {str(k).strip(): str(v).strip() for k, v in raw.items() if k and v}
+    except Exception:
+        mapping = {}
+    _CHAR_DIC.update({"mtime": mtime, "map": mapping})
+    return mapping
+
+
+def _dic_lookup(text: str) -> str | None:
+    """在面板别名表里查规范名（先原样、再归一化）。"""
+    m = _char_dic()
+    if not m:
+        return None
+    return m.get(text) or m.get(_norm(text))

@@ -312,6 +312,14 @@ async def character_detail_with_card(character_name: str) -> tuple[str, str | No
     await _maybe_refresh_characters()
 
     entry = lookup_character(character_name)
+    # 游戏数据优先：wiki 未收录（如 H806 蜜拉贝儿）或 wiki 文案过旧时，用解包产物组装
+    try:
+        from lib.character_entry import build_entry as _gd_entry
+        gd_entry = _gd_entry(character_name)
+    except Exception:  # noqa: BLE001
+        gd_entry = None
+    if gd_entry:
+        entry = {**(entry or {}), **gd_entry}
     if not entry:
         return (
             f"未找到角色「{character_name}」的详情。\n"

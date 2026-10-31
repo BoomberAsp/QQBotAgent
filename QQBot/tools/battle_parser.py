@@ -990,6 +990,38 @@ async def _parse_single(path: str) -> dict:
 # ── 数据源驱动的行级模板过滤（P2）────────────────────────────────────
 
 
+# ── 规则1 生效模式（A3）─────────────────────────────────────────
+#   on     : 缺失 blocking 状态 → 判 pre 无效（最终目标形态）
+#   shadow : 只记录 + 提示，不否决（默认；先积累线上样本再启用）
+#   off    : 完全不检查 blocking
+_RULE1_ENV = "SPEEDCHECK_BLOCKING"
+
+
+def _rule1_mode() -> str:
+    v = (os.environ.get(_RULE1_ENV) or "shadow").strip().lower()
+    return v if v in ("on", "shadow", "off") else "shadow"
+
+
+def _log_rule1_shadow(entry: dict) -> None:
+    """把"本会拦截"的样本落到日志，供后续评估误报率。"""
+    import json as _json
+    import time as _time
+    base = (os.environ.get("USER_DATA_ROOT") or "").strip()
+    log_dir = os.path.join(base, "logs") if base else os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "logs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "rule1_shadow.jsonl")
+        if os.path.isfile(path) and os.path.getsize(path) > 8 * 1024 * 1024:
+            os.replace(path, path + ".1")
+        entry = dict(entry)
+        entry["ts"] = _time.strftime("%Y-%m-%dT%H:%M:%S")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def _gamedata():
     """解包数据源；不可用时返回 None（调用方回落到 wiki 逻辑）。"""
     try:
@@ -1314,7 +1346,8 @@ def _validate_pre_screenshot(
                 return row_buffs[i]
         return {}
 
-    # ── Rule 1a: 数据源驱动（P2）──    # blocking = 早于乱速即应可见的进战状态（role_grants.pre_grants）；
+    # ── Rule 1a: 数据源驱动（P2）──
+    # blocking = 早于乱速即应可见的进战状态（role_grants.pre_grants）；
     # advisory = 觉醒源 / PostStartBattle（时序在乱速之后），只提示不否决。
     rule1_ok = True
     src = _gamedata()
@@ -1339,6 +1372,14 @@ def _validate_pre_screenshot(
                              if g["id"] in missing and g.get("entry")), None)
                 if trig:
                     warn += f"；触发时机={trig}"
+                mode = _rule1_mode()
+                if mode == "off":
+                    continue
+                _log_rule1_shadow({"role": code, "name": name, "missing": missing,
+                                   "trigger": trig, "mode": mode})
+                if mode == "shadow":
+                    warnings.append("[shadow] " + warn + "（仅记录，不判无效）")
+                    continue
                 warnings.append(warn)
                 rule1_ok = False
 
