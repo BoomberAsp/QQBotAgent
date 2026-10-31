@@ -107,4 +107,8 @@ QQBot/data/wiki_cache/cards/
 *.bak-pre-*
 
 # 服务器运维产物
+QQBot/data/group_personality.json
+QQBot/data/personality_config.json
+QQBot/data/personality_settings.json
+QQBot/data/wiki_cache/changelog_card.png
 
