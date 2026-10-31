@@ -34,9 +34,10 @@ import os
 from difflib import SequenceMatcher
 
 from lib.ocr_engine import render_glyph_mask, stroke_iou
+from lib.paths import wiki_cache_dir
 
 _CHAR_DETAIL_CACHE = os.path.join(
-    os.path.dirname(__file__), "..", "data", "wiki_cache",
+    wiki_cache_dir(),
     "character_details.json",
 )
 _CHAR_DIC_PATH = os.path.join(

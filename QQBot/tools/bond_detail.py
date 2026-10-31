@@ -18,10 +18,11 @@ import os
 import sys
 
 from tools.name_resolver import get_resolver
+from lib.paths import wiki_cache_dir
 
 
 _CACHE_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "data", "wiki_cache", "bond_details.json"
+    wiki_cache_dir(), "bond_details.json"
 )
 
 # Module-level lazy index, rebuilt when the cache file's mtime changes — the

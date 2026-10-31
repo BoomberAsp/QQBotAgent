@@ -29,13 +29,14 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from lib.paths import wiki_cache_dir
 
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_CHAR_CACHE = os.path.join(
-    _PROJECT_DIR, "data", "wiki_cache", "character_details.json"
+    wiki_cache_dir(), "character_details.json"
 )
 _DEFAULT_OUT = os.path.join(
-    _PROJECT_DIR, "data", "wiki_cache", "ag_skill_index.json"
+    wiki_cache_dir(), "ag_skill_index.json"
 )
 
 _PULL_VERBS = ("提升", "增加", "提高", "上升")

@@ -26,6 +26,7 @@ from curl_cffi import requests as cffi_requests
 
 from lib.status_icons import STATUS_ICON_CN, STATUS_ICON_DIR
 from tools.wiki_glossary import build_prompt_glossary, load_glossary
+from lib.paths import wiki_cache_dir
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -40,7 +41,7 @@ STATIC_CONFIG = os.path.join(
     os.path.dirname(__file__), "..", "config", "gacha_data.json"
 )
 CACHE_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "data", "wiki_cache"
+    wiki_cache_dir()
 )
 CACHE_FILE = os.path.join(CACHE_DIR, "gacha.json")
 TRANSLATION_CACHE = os.path.join(CACHE_DIR, "name_mapping.json")

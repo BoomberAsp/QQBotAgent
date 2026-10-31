@@ -19,11 +19,12 @@ import hashlib
 import json
 import os
 import sys
+from lib.paths import wiki_cache_dir
 
 QQBOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, QQBOT)
 
-CACHE = os.path.join(QQBOT, "data", "wiki_cache")
+CACHE = wiki_cache_dir()
 DETAILS = os.path.join(CACHE, "character_details.json")
 
 # 元素/职业/星座：英文枚举 → 中文（由 wiki 与 gamedata 的 join 反推，不硬编码）

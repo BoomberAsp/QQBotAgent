@@ -17,6 +17,7 @@ import os
 import re
 
 from pypinyin import Style, pinyin
+from lib.paths import wiki_cache_dir
 
 
 # ── Paths ────────────────────────────────────────────────────────
@@ -27,7 +28,7 @@ _BOND_DIC_PATH = os.path.join(_CHAR_DIR, "bonds_search_dic.json")
 _PINYIN_CACHE_PATH = os.path.join(_CHAR_DIR, "pinyin_choices.json")
 # QQBotAgent's own translation mapping (supplements OpenRubi)
 _NAME_MAPPING_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "data", "wiki_cache", "name_mapping.json"
+    wiki_cache_dir(), "name_mapping.json"
 )
 
 # Cached index on disk (built once, loaded at startup)

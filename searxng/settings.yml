@@ -36,14 +36,19 @@ engines:
   - name: bing
     engine: bing
     shortcut: bi
-    disabled: false
+    # 2026-09-22 disabled: via proxy bing serves bot-flagged garbage (results
+    # unrelated to query); via direct cn.bing.com the adapter parses 0 results.
+    disabled: true
     timeout: 10.0
+    proxies: {}
 
   - name: bing news
     engine: bing_news
     shortcut: bin
-    disabled: false
+    # 2026-09-22 disabled: same bot-flagged degradation as bing
+    disabled: true
     timeout: 10.0
+    proxies: {}
 
   - name: duckduckgo
     engine: duckduckgo
@@ -56,6 +61,26 @@ engines:
     shortcut: mw
     disabled: false
     timeout: 5.0
+
+  # --- CN-reachable engines added 2026-09-22 ---
+  # Direct connection (proxies: {} overrides the global sing-box proxy):
+  # baidu/sogou/quark are reachable from mainland CN and serve as fallback
+  # when bing degrades / duckduckgo hits CAPTCHA.
+  - name: baidu
+    disabled: false
+    timeout: 8.0
+    proxies: {}
+
+  - name: sogou
+    disabled: false
+    timeout: 8.0
+    proxies: {}
+
+  - name: quark
+    # 2026-09-22: returns 0 results from this host even for simple queries; disabled
+    disabled: true
+    timeout: 8.0
+    proxies: {}
 
 outgoing:
   request_timeout: 10.0

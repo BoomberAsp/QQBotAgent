@@ -19,10 +19,11 @@ else is an *additional* status the wiki documents but that has no manual icon.
 """
 
 import os
+from lib.paths import wiki_cache_dir
 
 # Wiki status icons are downloaded here (regenerable; git-ignored).
 STATUS_ICON_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "data", "wiki_cache", "status_icons"
+    wiki_cache_dir(), "status_icons"
 )
 
 # wiki file name (with .png) → Chinese label.
