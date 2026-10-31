@@ -64,6 +64,21 @@ for _key, _path in (("CHARACTERS_DIR", CHARACTERS_DIR),
                     ("ASSETS_DIR", ASSETS_DIR)):
     os.environ.setdefault(_key, str(_path))
 
+# gamedata（解包产物）目录：与 lib/gamedata_source.default_dir() 同源的解析
+# 优先级 —— QQBot/.env 的 GAMEDATA_DIR，其次 USER_DATA_ROOT/gamedata。面板
+# 进程不 load_dotenv，而 gamedata_source 读的是 os.environ：不注入的话，
+# wiki 页的「解包」合并/待补录增强会静默回落到仓库内空目录（表现为
+# H806 蜜拉贝儿这类 wiki 未收录角色在面板上不可见）。两处 .env 都没配时
+# 不注入，保留 gamedata_source 自己的仓库内回落（开发机行为不变）。
+_GAMEDATA_ENV = bot_env("GAMEDATA_DIR", "")
+if not _GAMEDATA_ENV:
+    _UDR = bot_env("USER_DATA_ROOT", "")
+    if _UDR:
+        _GAMEDATA_ENV = str(Path(_UDR) / "gamedata")
+if _GAMEDATA_ENV:
+    os.environ.setdefault("GAMEDATA_DIR", _GAMEDATA_ENV)
+GAMEDATA_DIR = Path(_GAMEDATA_ENV) if _GAMEDATA_ENV else None
+
 # 角色卡版本快照根目录（每次保存前全量备份，见 webui/character_admin.py）
 CHARACTER_BACKUP_DIR = BACKUP_DIR / "characters"
 

@@ -1076,7 +1076,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 
 ### 5.6 `tools/character_detail.py` / `tools/bond_detail.py` — 角色 / 羁绊查询
 
-数据来源于 Wiki 爬虫 (`tools/wiki_scraper.py`) 缓存的 `data/wiki_cache/character_details.json`，通过 `tools/name_resolver.py` 做角色别名模糊匹配，`tools/card_renderer.py` 渲染卡片图片。
+数据来源于 Wiki 爬虫 (`tools/wiki_scraper.py`) 缓存的 `data/wiki_cache/character_details.json`，通过 `tools/name_resolver.py` 做角色别名模糊匹配，`tools/card_renderer.py` 渲染卡片图片。角色侧叠加**解包数据优先**合并（`lib/character_entry.py` 读 `GAMEDATA_DIR` 产物，`lib/gamedata_source.py` 为只读查询层）：wiki 未收录的新角色（如 H806 蜜拉贝儿）或文案过旧时以解包产物组装卡面；面板「Wiki 缓存」页同源展示这批角色（只读）。
 
 | 函数 | 说明 |
 |------|------|
@@ -1650,7 +1650,7 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | `/workspace` 工作区磁盘 | 按用户配额/占用展示（角色感知） |
 | `/config` 配置热管理 | 提示词 `*.md`、人格、`.env`、模型（结构化表单 + API 探测，§11.6） |
 | `/playground` Playground | 面板内直接对话调试（进程内构造 client，无需 nonebot driver） |
-| `/wiki` Wiki 缓存 | 角色/羁绊数据浏览、**别名字典编辑**（`character_dic.json` / `bonds_search_dic.json`） |
+| `/wiki` Wiki 缓存 | 角色/羁绊数据浏览（详情列表**合并解包 gamedata 中 wiki 未收录的新角色**，`解包` 徽标只读视图：立绘/星阶/技能/卡面文案）、**别名字典编辑**（`character_dic.json` / `bonds_search_dic.json`）、待补录（wiki + 解包双来源；**官方名被旧分组占用**时置顶冲突项，可一键「拆分为新组」） |
 | `/changelog` 更新日志与公告 | 编辑**更新记录**（版本/日期/分类变更条目，`changelog.json`）与**自由公告**（标题/正文/markdown，`announcements.json`），按渠道勾选**双渠道群发**（OneBot 群 + 官方群） |
 | `/mail` 邮件管理 | 用户信箱只读查看（列表 = 信箱建档 ∪ c2c 联系人登记表，openid 脱敏 W4）、勾选发送**系统邮件**（text/markdown）、**撤回**信件；经 `data/mail_admin/` 文件队列由 bot 执行并回写状态（§16.2/§16.4） |
 | `/redeem` 兑换码管理 | 限时/长期兑换码人工维护（权威源，`_source=panel`），支持导入/清理与自动抓取联动 |

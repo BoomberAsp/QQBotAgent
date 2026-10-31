@@ -141,19 +141,57 @@
       return;
     }
     const what = aliasKind === 'char' ? '角色' : '羁绊';
+    const nConflict = missingItems.filter(it => it.conflict_owner).length;
     box.innerHTML = `<div class="alias-group" style="margin-top:10px">
       <div class="row">
-        <strong>待补录（${missingItems.length}）</strong>
-        <span class="muted">已从 wiki 爬取、但字典中尚无别名分组的${what}。
-          按译名一键创建分组（预填自别名 + 英文标题）；若译名用字不妥，创建后可在下方卡片中改名。</span>
+        <strong>待补录（${missingItems.length}${nConflict ? `，含 ${nConflict} 条占用冲突` : ''}）</strong>
+        <span class="muted">已从 wiki 爬取或解包数据（<span class="pill badge-warn">解包</span>）发现、但字典中尚无别名分组的${what}。
+          一键创建分组（解包条目预填 官方中文名 + 英文名 + 角色 ID）；若名称用字不妥，创建后可在下方卡片中改名。
+          「官方名被占用」= 该名称目前是别的分组的别名（历史遗留），拆分把它挪到新组。</span>
       </div>
-      ${missingItems.map((it, i) => `<div class="row" style="margin-top:6px">
-        <span class="mono muted">${esc(it.title_en)}</span>
-        <span>→ ${esc(it.canonical)}</span>
-        <span class="spacer"></span>
-        <button class="btn btn-sm missing-create" data-i="${i}">补录为分组</button>
-      </div>`).join('')}
+      ${missingItems.map((it, i) => {
+        const gd = it.source === 'gamedata';
+        const badge = gd ? ' <span class="pill badge-warn" title="来自解包数据（wiki 未收录）">解包</span>' : '';
+        const idTag = `<span class="mono muted">${esc(gd && it.role_id ? it.role_id + ' · ' + it.title_en : it.title_en)}</span>`;
+        if (it.conflict_owner) {
+          return `<div class="row" style="margin-top:6px">
+            ${idTag}${badge}
+            <span>→ ${esc(it.canonical)}</span>
+            <span class="pill badge-err" title="官方名当前是「${attr(it.conflict_owner)}」分组的别名">官方名被「${esc(it.conflict_owner)}」占用</span>
+            <span class="spacer"></span>
+            <button class="btn btn-sm missing-split" data-i="${i}">拆分为新组</button>
+          </div>`;
+        }
+        return `<div class="row" style="margin-top:6px">
+          ${idTag}${badge}
+          <span>→ ${esc(it.canonical)}</span>
+          <span class="spacer"></span>
+          <button class="btn btn-sm missing-create" data-i="${i}">${gd ? '创建分组' : '补录为分组'}</button>
+        </div>`;
+      }).join('')}
     </div>`;
+  }
+
+  /* 冲突拆分：官方名从旧分组挪出 + 以官方名建新组（单次全量 PUT） */
+  async function splitConflictGroup(it) {
+    const canon = String(it.canonical || '').trim();
+    if (!canon) return;
+    const hints = (it.aliases_hint || []).filter(Boolean);
+    if (!confirm(`「${canon}」当前是「${it.conflict_owner}」分组的别名。\n拆分为独立新组（预填别名：${hints.join('、')}）？\n拆分后「${canon}」将解析到新组，不再指向「${it.conflict_owner}」。`)) return;
+    await loadAliases();   // 以磁盘最新快照为基准，避免陈旧快照全量覆盖
+    const next = cloneSnapshot();
+    if (Object.prototype.hasOwnProperty.call(next, canon)) {
+      toast(`「${canon}」组已存在`, 'error', 5000);
+      return;
+    }
+    const owner = next[it.conflict_owner];
+    if (Array.isArray(owner)) {
+      next[it.conflict_owner] = owner.filter(a => a !== canon);
+    }
+    const aliases = [...new Set(hints.map(a => String(a).trim()).filter(Boolean))];
+    if (!aliases.includes(canon)) aliases.unshift(canon);
+    next[canon] = aliases;
+    await putAliases(next, `已创建分组「${canon}」，并将别名从「${it.conflict_owner}」迁出`);
   }
 
   /* 创建新分组：先以磁盘最新快照为基准刷新，避免陈旧快照全量覆盖 */
@@ -175,6 +213,12 @@
   }
 
   document.getElementById('wk-alias-missing').addEventListener('click', async (ev) => {
+    const split = ev.target.closest('.missing-split');
+    if (split) {
+      const it = missingItems[Number(split.dataset.i)];
+      if (it) await splitConflictGroup(it);
+      return;
+    }
     const btn = ev.target.closest('.missing-create');
     if (!btn) return;
     const it = missingItems[Number(btn.dataset.i)];
@@ -492,6 +536,8 @@
   let dtItems = [];
   let dtQuery = '';
   let dtSelected = '';
+  let dtSelectedGd = '';   // 选中的解包角色 rid（只读视图）
+  let dtGdTotal = 0;       // 列表里解包来源的总行数（未过滤）
   let dtEntry = null;
   let dtPollTimer = null;
 
@@ -501,6 +547,7 @@
     try {
       const d = await api(`/api/wiki/details?kind=${dtKind}&q=${encodeURIComponent(dtQuery)}`);
       dtItems = (d && d.items) || [];
+      dtGdTotal = (d && d.gamedata_total) || 0;
       if (d && d.note && !dtItems.length) {
         list.innerHTML = `<div class="muted">${esc(d.note)}</div>`;
         return;
@@ -515,15 +562,20 @@
     const list = document.getElementById('wk-dt-list');
     document.getElementById('wk-dt-status').textContent =
       `共 ${total != null ? total : dtItems.length} 条` +
+      (dtGdTotal ? `（含解包 ${dtGdTotal} 条，wiki 未收录，只读）` : '') +
       (dtQuery ? `，过滤「${dtQuery}」后 ${dtItems.length} 条` : '');
     if (!dtItems.length) {
       list.innerHTML = '<div class="muted">无匹配条目</div>';
       return;
     }
-    list.innerHTML = dtItems.map(it => `<div class="dt-item${it.title === dtSelected ? ' active' : ''}" data-title="${attr(it.title)}">
-      <div><strong>${esc(it.name_cn || '(未翻译)')}</strong>${it.manual ? ' <span class="pill manual-pill" title="含人工修正字段">人工</span>' : ''}${it.has_cn ? '' : ' <span class="pill badge-warn" title="中文字段仍是英文原文">英</span>'}</div>
+    list.innerHTML = dtItems.map(it => {
+      const gd = it.source === 'gamedata';
+      const active = gd ? (it.id === dtSelectedGd) : (it.title === dtSelected);
+      return `<div class="dt-item${active ? ' active' : ''}" data-title="${attr(it.title)}" data-source="${attr(it.source || 'wiki')}" data-id="${attr(it.id || '')}">
+      <div><strong>${esc(it.name_cn || '(未翻译)')}</strong>${gd ? ' <span class="pill badge-warn" title="来自解包数据（wiki 未收录），只读展示">解包</span>' : ''}${it.manual ? ' <span class="pill manual-pill" title="含人工修正字段">人工</span>' : ''}${it.has_cn ? '' : ' <span class="pill badge-warn" title="中文字段仍是英文原文">英</span>'}</div>
       <div class="t2 mono muted">${esc(it.title)}${it.id ? ' · ' + esc(it.id) : ''}${it.stars ? ' · ' + '★'.repeat(it.stars) : ''}</div>
-    </div>`).join('');
+    </div>`;
+    }).join('');
   }
 
   function manualSet() { return new Set((dtEntry && dtEntry._manual_fields) || []); }
@@ -576,6 +628,7 @@
 
   async function selectEntry(title) {
     dtSelected = title;
+    dtSelectedGd = '';
     renderDtList();
     const ed = document.getElementById('wk-dt-editor');
     ed.innerHTML = '<div class="muted">加载中…</div>';
@@ -587,6 +640,63 @@
       dtEntry = null;
       ed.innerHTML = `<div class="err">${esc(e.message)}</div>`;
     }
+  }
+
+  /* ── 解包角色只读视图（wiki 未收录，无缓存条目可编辑）────────── */
+
+  async function selectGamedataEntry(rid) {
+    dtSelected = '';
+    dtSelectedGd = rid;
+    dtEntry = null;
+    renderDtList();
+    const ed = document.getElementById('wk-dt-editor');
+    ed.innerHTML = '<div class="muted">加载中…</div>';
+    try {
+      const d = await api('/api/wiki/details/gamedata?rid=' + encodeURIComponent(rid));
+      renderGdEditor(d.entry || {});
+    } catch (e) {
+      ed.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    }
+  }
+
+  function gdRow(label, value) {
+    if (value == null || value === '') return '';
+    return `<tr><td>${esc(label)}</td><td>${esc(String(value))}</td></tr>`;
+  }
+
+  function renderGdEditor(e) {
+    const ed = document.getElementById('wk-dt-editor');
+    const zh = (e.names && (e.names.zh_hans || e.names.zh_hant)) || '';
+    const star = e.star ? '★'.repeat(e.star) : '';
+    const portrait = e.portrait
+      ? `<img src="/api/wiki/portrait?rid=${encodeURIComponent(e.id)}" alt="立绘"
+           style="max-width:160px;max-height:220px;border-radius:8px;float:right;margin:0 0 8px 12px"
+           onerror="this.remove()">` : '';
+    const skills = (e.skills || []).map(s =>
+      `<li><strong>${esc(s.name_cn || s.name_en || s.id)}</strong>` +
+      (s.name_en && s.name_cn ? ` <span class="muted">${esc(s.name_en)}</span>` : '') +
+      ` <span class="mono muted">${esc(s.id)}</span></li>`).join('');
+    ed.innerHTML = `
+      <div class="row">
+        <strong>${esc(zh || e.id)}</strong>
+        <span class="mono muted">${esc((e.names && e.names.en) || '')}${e.id ? ' · ' + esc(e.id) : ''}</span>
+        <span class="pill badge-warn" title="数据来自解包产物（GAMEDATA_DIR），由 ArkReCodeMiner 同步维护">解包 · 只读</span>
+      </div>
+      ${portrait}
+      <table class="kv-table" style="margin-top:8px">
+        ${gdRow('星级', star)}
+        ${gdRow('元素 / 职业', [e.element, e.job].filter(Boolean).join(' / '))}
+        ${gdRow('星座', e.constellation)}
+        ${gdRow('别名', (e.aliases || []).join('、'))}
+        ${gdRow('生日', e.card && e.card.birthday)}
+        ${gdRow('身高 / 体重', [e.card && e.card.height, e.card && e.card.weight].filter(Boolean).join(' / '))}
+        ${gdRow('游戏版本', e.build)}
+      </table>
+      ${e.card && e.card.signature ? `<div class="dt-field"><label>签名</label><div class="muted">${esc(e.card.signature)}</div></div>` : ''}
+      ${e.card && e.card.quote ? `<div class="dt-field"><label>台词</label><div class="muted">${esc(e.card.quote)}</div></div>` : ''}
+      ${skills ? `<div class="dt-field"><label>技能</label><ul style="margin:4px 0 0;padding-left:18px">${skills}</ul></div>` : ''}
+      <p class="muted" style="margin-top:10px">解包数据没有可编辑的翻译字段（中文名即官方简中文案）。
+        bot 运行时（/角色详情）已优先使用该数据源；wiki 收录该角色后，此处自动让位给可编辑的 wiki 缓存条目。</p>`;
   }
 
   function getByPath(obj, path) {
@@ -682,7 +792,9 @@
 
   document.getElementById('wk-dt-list').addEventListener('click', ev => {
     const item = ev.target.closest('.dt-item');
-    if (item) selectEntry(item.dataset.title);
+    if (!item) return;
+    if (item.dataset.source === 'gamedata') selectGamedataEntry(item.dataset.id);
+    else selectEntry(item.dataset.title);
   });
 
   document.getElementById('wk-dt-editor').addEventListener('click', async ev => {
@@ -715,6 +827,7 @@
       document.querySelectorAll('.wk-dt-kind').forEach(b =>
         b.classList.toggle('active', b === btn));
       dtSelected = '';
+      dtSelectedGd = '';
       dtEntry = null;
       if (dtPollTimer) { clearInterval(dtPollTimer); dtPollTimer = null; }
       document.getElementById('wk-dt-status').textContent = '';

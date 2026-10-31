@@ -786,41 +786,150 @@ _ALIAS_DETAILS_FILES = {
 }
 
 
+# ── gamedata（解包产物）只读接入 ─────────────────────────────────
+# owner 是 bot 侧 lib/gamedata_source.py（GameData 单例，manifest.json 的
+# mtime+size 变化自动重建，产物重新同步后无需重启面板）。GAMEDATA_DIR 由
+# config.py 从 QQBot/.env 解析并注入 os.environ（面板进程不 load_dotenv）。
+# 面板只做只读展示：wiki 未收录的新角色（如 H806 蜜拉贝儿）合并进详情
+# 列表、别名「待补录」报告解包侧缺失/官方名被旧分组占用的冲突。
+# 与 bot 运行时同源：tools/character_detail.py 的 gd_entry 合并逻辑。
+
+def _gamedata_source():
+    """GameData 单例；产物缺失/导入失败返回 None（面板功能静默降级）。"""
+    try:
+        from lib.gamedata_source import get_source
+        src = get_source()
+        return src if src.available else None
+    except Exception:
+        return None
+
+
+def _gamedata_roles() -> dict:
+    src = _gamedata_source()
+    return (src.roles or {}) if src is not None else {}
+
+
+def _gd_role_names(role: dict, rid: str = "") -> tuple[str, str]:
+    """(官方简中名, 官方英文名)；缺繁中回落。
+
+    名字等于角色 ID 的是本地化占位符（如未实装角色 H169 的 en/zh 都是
+    "H169"），按缺失处理 —— 调用方对「双占位」角色整行跳过，避免面板出现
+    噪音行 / 建议创建无意义的「H169」别名组。
+    """
+    names = role.get("names") or {}
+    zh = str(names.get("zh_hans") or names.get("zh_hant") or "").strip()
+    en = str(names.get("en") or "").strip()
+    if rid and zh == rid:
+        zh = ""
+    if rid and en == rid:
+        en = ""
+    return zh, en
+
+
+_RID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def wiki_portrait_path(rid: str) -> Path | None:
+    """角色立绘 PNG 路径（wiki_cache/portraits/{rid}.png）；不存在返回 None。
+
+    rid 做白名单校验（字母数字_-），防止路径穿越。
+    """
+    rid = (rid or "").strip()
+    if not rid or not _RID_RE.match(rid):
+        return None
+    p = WIKI_CACHE_DIR / "portraits" / f"{rid}.png"
+    return p if p.is_file() else None
+
+
+def wiki_details_gamedata_entry(rid: str) -> dict:
+    """解包角色的只读条目视图（wiki 未收录 → 无可编辑的详情缓存条目）。"""
+    rid = (rid or "").strip()
+    roles = _gamedata_roles()
+    if not roles:
+        return {"error": "gamedata 解包产物不可用（GAMEDATA_DIR 未配置或 roles.json 为空）"}
+    role = roles.get(rid)
+    if not isinstance(role, dict):
+        return {"error": f"gamedata 无此角色: {rid}"}
+    names = role.get("names") or {}
+    card = role.get("card") or {}
+    skills = [{"id": str(s.get("id") or ""),
+               "slot": s.get("slot"),
+               "name_cn": str((s.get("name") or {}).get("zh_hans") or ""),
+               "name_en": str((s.get("name") or {}).get("en") or "")}
+              for s in (role.get("skills") or []) if isinstance(s, dict)]
+    src = _gamedata_source()
+    return {"kind": "gamedata_char", "rid": rid, "entry": {
+        "id": rid,
+        "names": {k: str(v) for k, v in names.items() if v},
+        "aliases": [str(a) for a in (role.get("aliases") or []) if a],
+        "star": role.get("star"),
+        "element": role.get("element") or "",
+        "job": role.get("job") or "",
+        "constellation": role.get("constellation") or "",
+        "card": {k: str(card[k]) for k in
+                 ("signature", "quote", "birthday", "height", "weight")
+                 if card.get(k)},
+        "skills": skills,
+        "variants": [str(v) for v in (role.get("variants") or []) if v],
+        "build": str(((src.manifest if src else {}) or {}).get("game_build") or ""),
+        "portrait": wiki_portrait_path(rid) is not None,
+        "source": "gamedata",
+    }}
+
+
 def wiki_aliases_missing(kind: str) -> dict:
-    """List scraped entries that have no group in the alias dictionary yet.
+    """List entries that have no group in the alias dictionary yet.
 
-    Matching is by **English title** (the details-cache key) against the dic's
-    alias set — deterministic, and immune to LLM Chinese-translation variance
-    in ``name_cn`` (a character whose group already exists is never reported,
-    even if the cached translation uses different hanzi than the canonical).
-    Falls back to skipping entries whose ``name_cn`` already is a known
-    canonical. A missing/corrupt details cache yields an empty list + note
-    (bond_details.json is not present on every machine).
+    Two sources (``item["source"]``):
 
-    Returns ``{"items": [{canonical, title_en, aliases_hint}], "note"?}``
-    or ``{"error": ...}``.
+    * ``wiki`` — scraped details-cache entries, matched by **English title**
+      (the cache key) against the dic's alias set — deterministic, and immune
+      to LLM Chinese-translation variance in ``name_cn`` (a character whose
+      group already exists is never reported, even if the cached translation
+      uses different hanzi than the canonical).
+    * ``gamedata`` — 解包角色（仅 char；产物不可用时静默跳过）：wiki 尚未
+      收录、字典也没有分组的新角色（如 H806 蜜拉贝儿）。两种形态：
+        - 普通缺失：建议按官方简中名建组（aliases_hint 预填 中文名/英文名/ID）；
+        - ``conflict_owner``：官方名已被别的分组占用为别名（历史遗留，如
+          「蜜拉贝儿」→「圣诞的蜜拉贝儿」）——前端提供「拆分为新组」。
+
+    解包角色「已有分组」判定按无歧义键优先：角色 ID 在字典中 → 已收录；
+    官方中文名/英文名本身是规范名或已在字典 → 已收录；wiki 详情缓存中同
+    ID 的英文标题已收录 → 跳过（避免与 wiki 侧重复上报）。
+
+    A missing/corrupt details cache yields a note（bond_details.json is not
+    present on every machine），gamedata 侧仍会照常上报。
+
+    Returns ``{"items": [{canonical, title_en, aliases_hint, source,
+    role_id?, conflict_owner?}], "note"?}`` or ``{"error": ...}``.
     """
     if kind not in _ALIAS_FILES:
         return {"error": f"非法别名类型: {kind}"}
     details_path = _ALIAS_DETAILS_FILES[kind]
+    data: dict = {}
+    note = None
     if not details_path.exists():
-        return {"items": [], "note": f"详情缓存不存在: {details_path.name}（尚未爬取）"}
-    try:
-        blob = json.loads(details_path.read_text(encoding="utf-8"))
-        data = blob.get("data", {}) if isinstance(blob, dict) else {}
-    except Exception as e:
-        return {"items": [], "note": f"详情缓存读取失败: {e}"}
+        note = f"详情缓存不存在: {details_path.name}（尚未爬取）"
+    else:
+        try:
+            blob = json.loads(details_path.read_text(encoding="utf-8"))
+            data = blob.get("data", {}) if isinstance(blob, dict) else {}
+        except Exception as e:
+            note = f"详情缓存读取失败: {e}"
 
     # 已有别名 + 规范名集合（英文标题在字典中即以别名形式收录）
-    known: set[str] = set()
+    flat: dict = {}
     dic_path = _ALIAS_FILES[kind]
     if dic_path.exists():
         try:
-            flat = json.loads(dic_path.read_text(encoding="utf-8"))
-            known = {str(a) for a in flat} | {str(c) for c in flat.values()}
+            loaded = json.loads(dic_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                flat = loaded
         except Exception:
-            known = set()
+            flat = {}
+    known = {str(a) for a in flat} | {str(c) for c in flat.values()}
     known_low = {k.lower() for k in known}
+    canonicals = {str(c) for c in flat.values()}
 
     items, seen = [], set()
     for title, entry in data.items():
@@ -834,9 +943,51 @@ def wiki_aliases_missing(kind: str) -> dict:
             continue
         seen.add(canon)
         hint = [canon] + ([title] if title != canon else [])
-        items.append({"canonical": canon, "title_en": title, "aliases_hint": hint})
-    items.sort(key=lambda x: x["canonical"])
-    return {"items": items}
+        items.append({"canonical": canon, "title_en": title,
+                      "aliases_hint": hint, "source": "wiki"})
+
+    # ── 解包侧增强（仅 char）──
+    if kind == "char":
+        wiki_title_by_id = {str(e.get("id")): str(t) for t, e in data.items()
+                            if isinstance(e, dict) and e.get("id")}
+        gd_seen: set = set()
+        for rid, role in _gamedata_roles().items():
+            if not isinstance(role, dict):
+                continue
+            rid = str(rid)
+            zh, en = _gd_role_names(role, rid)
+            if not zh and not en:
+                continue        # 本地化占位角色（无可读名字）
+            # 已收录判定：角色 ID（无歧义）→ 官方名 → wiki 同 ID 标题
+            if rid in known or zh in canonicals or (en and en in known):
+                continue
+            wt = wiki_title_by_id.get(rid)
+            if wt and (wt in known or wt.lower() in known_low or wt in seen):
+                continue
+            canon = zh or en or rid
+            if not canon or canon in seen or canon in gd_seen:
+                continue
+            gd_seen.add(canon)
+            hint = [x for x in dict.fromkeys([zh, en, rid]) if x]
+            # 官方名被别的分组占用为别名 → 冲突（前端可一键拆组）
+            owner = None
+            for alias in (zh, en):
+                if alias and alias in flat and str(flat[alias]) != alias:
+                    owner = str(flat[alias])
+                    break
+            item = {"canonical": canon, "title_en": en or rid,
+                    "aliases_hint": hint, "source": "gamedata", "role_id": rid}
+            if owner:
+                item["conflict_owner"] = owner
+            items.append(item)
+
+    # 冲突项置顶（可操作告警），其余按名称排序
+    items.sort(key=lambda x: (0 if x.get("conflict_owner") else 1,
+                              x["canonical"]))
+    result = {"items": items}
+    if note:
+        result["note"] = note
+    return result
 
 
 # ── Wiki 翻译术语表（glossary）─────────────────────────────────────
@@ -931,30 +1082,72 @@ def wiki_details_list(kind: str, q: str = "") -> dict:
 
     ``q`` filters title/name_cn case-insensitively. A missing cache yields an
     empty list + note (bond_details.json is not present on every machine).
+
+    char 侧额外合并 **gamedata 解包角色**（``source: "gamedata"``）：wiki
+    尚未收录的新角色（如 H806 蜜拉贝儿）以只读行出现在列表里（bot 运行时
+    同源，见 tools/character_detail.py 的 gd_entry 合并）。wiki 行带
+    ``source: "wiki"``。q 对解包行同时匹配 中文名/英文名/角色 ID。
     """
     path, blob, err = _details_load(kind)
-    if err:
-        if path is not None and not path.exists():
-            return {"items": [], "note": err}
-        return {"error": err}
+    if err and not (path is not None and not path.exists()):
+        return {"error": err}       # 非法 kind / 缓存损坏
+    data = (blob or {}).get("data") or {}
     q = (q or "").strip().lower()
     items = []
-    for title, entry in blob["data"].items():
+    wiki_ids: set = set()
+    for title, entry in data.items():
         if not isinstance(entry, dict):
             continue
         name_cn = str(entry.get("name_cn") or "")
+        eid = str(entry.get("id") or "")
+        if eid:
+            wiki_ids.add(eid)
         if q and q not in str(title).lower() and q not in name_cn.lower():
             continue
         items.append({
             "title": str(title),
             "name_cn": name_cn,
-            "id": str(entry.get("id") or ""),
+            "id": eid,
             "stars": int(entry.get("stars") or 0),
             "has_cn": bool(name_cn and name_cn != title),
             "manual": bool(entry.get("_manual_fields")),
+            "source": "wiki",
         })
+
+    # ── 合并解包角色（wiki 未收录的；仅 char，产物不可用时静默跳过）──
+    gd_total = 0
+    if kind == "char":
+        for rid, role in _gamedata_roles().items():
+            if not isinstance(role, dict) or str(rid) in wiki_ids:
+                continue
+            rid = str(rid)
+            zh, en = _gd_role_names(role, rid)
+            if not zh and not en:
+                continue        # 本地化占位角色（如 H169）不进面板列表
+            gd_total += 1
+            title = en or rid
+            if (q and q not in title.lower() and q not in zh.lower()
+                    and q not in rid.lower()):
+                continue
+            items.append({
+                "title": title,
+                "name_cn": zh,
+                "id": rid,
+                "stars": int(role.get("star") or 0),
+                "has_cn": bool(zh),
+                "manual": False,
+                "source": "gamedata",
+            })
+
     items.sort(key=lambda x: x["title"])
-    return {"items": items, "total": len(blob["data"])}
+    result = {"items": items, "total": len(data) + gd_total}
+    if gd_total:
+        result["gamedata_total"] = gd_total
+    if err and not data and gd_total:
+        result["note"] = err        # wiki 缓存缺失但解包行可用
+    elif err and not data:
+        return {"items": [], "note": err}
+    return result
 
 
 def wiki_details_entry(kind: str, title: str) -> dict:
