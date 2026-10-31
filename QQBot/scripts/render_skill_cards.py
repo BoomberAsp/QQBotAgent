@@ -164,6 +164,7 @@ def build_entry(rid: str, g: dict, wiki: dict | None, gd: dict) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true", help="忽略指纹强制重画（换了立绘时用）")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--gamedata", default="")
     args = ap.parse_args(argv)
@@ -208,7 +209,10 @@ def main(argv=None) -> int:
             continue
         try:
             before = os.path.isfile(out)
-            cr.render_character_card_if_stale(et)
+            if args.force:
+                cr.render_character_card(et)
+            else:
+                cr.render_character_card_if_stale(et)
             if os.path.isfile(out) and (not before or os.path.getmtime(out) > 0):
                 renders += 1
             else:
