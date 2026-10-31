@@ -36,7 +36,9 @@ from PIL import Image, ImageDraw, ImageFont
 _FONT_DIR = os.path.join(os.path.dirname(__file__), "..", "config", "font")
 _FONT_MAIN = os.path.join(_FONT_DIR, "NotoSansSC-SemiBold.ttf")
 
-_CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "wiki_cache")
+# 缓存目录可被 WIKI_CACHE_DIR 覆盖（生产指向数据盘，避免占系统盘）
+_CACHE_DIR = os.environ.get("WIKI_CACHE_DIR") or os.path.join(
+    os.path.dirname(__file__), "..", "data", "wiki_cache")
 _PORTRAIT_DIR = os.path.join(_CACHE_DIR, "portraits")
 _ICON_DIR = os.path.join(_CACHE_DIR, "icons")
 _SKILL_DIR = os.path.join(_CACHE_DIR, "skill_icons")
@@ -665,7 +667,7 @@ def render_character_card(entry: dict, out_path: str | None = None) -> str:
             iy += _lh(size)
 
     # footer
-    draw.text((PAD, total_h - PAD + 8), "数据来源: Ark Re:Code Wiki",
+    draw.text((PAD, total_h - PAD + 8), "数据来源：游戏解包 + Ark Re:Code Wiki",
               font=_font(16), fill=_TEXT_FAINT)
 
     if out_path is None:
@@ -844,7 +846,7 @@ def render_bond_card(entry: dict, out_path: str | None = None) -> str:
             draw.text((vx, py), ln, font=_font(20), fill=_TEXT_DIM)
             py += _lh(20)
 
-    draw.text((PAD, total_h - PAD + 8), "数据来源: Ark Re:Code Wiki",
+    draw.text((PAD, total_h - PAD + 8), "数据来源：游戏解包 + Ark Re:Code Wiki",
               font=_font(16), fill=_TEXT_FAINT)
 
     if out_path is None:
