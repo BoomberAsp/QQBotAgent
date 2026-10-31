@@ -79,3 +79,21 @@ QQBot/data/wiki_cache/name_mapping.json
 QQBot/config/characters/character_dic.json
 # ── QQ 官方机器人凭据（AppSecret，绝不入库）────────────
 bot-secret/
+# ── 解包产物 / 运行时缓存（体积大，生产用 WIKI_CACHE_DIR 指到数据盘）──
+# 卡面、立绘、技能图标由 scripts/render_skill_cards.py 与 batch_render 生成，
+# 不入库；换机后重跑脚本或用面板上传即可再生。
+QQBot/data/wiki_cache/cards/*.png
+QQBot/data/wiki_cache/portraits/*.png
+QQBot/data/wiki_cache/skill_icons/*.png
+QQBot/data/wiki_cache/bond_cards/
+QQBot/data/wiki_cache/bond_icons/
+QQBot/data/wiki_cache/icons/
+QQBot/data/wiki_cache/character_details.json*
+QQBot/data/wiki_cache/bond_details.json
+QQBot/data/wiki_cache/feature_card.png
+QQBot/data/wiki_cache/*.bak*
+# SFTP 上传临时文件（原子替换的中间态）
+*.uploading
+# 各类 .bak 快照（部署/迁移时产生）
+*.bak_*
+*.bak-pre-*
