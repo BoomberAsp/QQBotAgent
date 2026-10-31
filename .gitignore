@@ -97,3 +97,6 @@ QQBot/data/wiki_cache/*.bak*
 # 各类 .bak 快照（部署/迁移时产生）
 *.bak_*
 *.bak-pre-*
+
+# 该目录在服务器上是指向数据盘的符号链接（WIKI_CACHE_DIR）
+QQBot/data/wiki_cache
