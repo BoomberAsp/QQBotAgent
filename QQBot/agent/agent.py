@@ -1051,6 +1051,28 @@ class Agent:
 
     # ── Profile Update ──────────────────────────────────────────────
 
+    def _resolve_persona_label(self) -> str:
+        """Short display name of the ACTIVE persona, for memory-snapshot labels.
+
+        Reads the same _current_personality contextvar the L2 prompt block uses
+        (set per-turn by agent_router/turn.py) and resolves it through
+        CharacterRegistry.get_short_name so builtin + UGC characters both map to
+        a clean label (助手 Roxy→Roxy, 露比 (Rubi)→露比). Falls back to 'Roxy'
+        when unset/unresolvable, so a snapshot's assistant label is never empty
+        and the legacy default is preserved byte-for-byte.
+        """
+        try:
+            from agent.context import _current_personality
+            from agent.character_registry import get_character_registry
+            key = _current_personality.get()
+            if key:
+                name = get_character_registry().get_short_name(key)
+                if name:
+                    return name
+        except Exception:
+            pass
+        return "Roxy"
+
     def _schedule_profile_update(
         self, user_id: str, user_message: str, agent_response: str
     ):
@@ -1061,11 +1083,18 @@ class Agent:
         background extract_batch (flash model). There is no per-turn LLM call
         any more (that was the old extract_and_update path). Never raises into
         the response path.
+
+        The active persona label is captured HERE (the _current_personality
+        contextvar is still set inside run()) and threaded onto the buffered
+        turn, so a LONG snapshot persisted from this batch labels the assistant
+        with the persona that actually spoke instead of a hardcoded default.
         """
         if not self.profiles:
             return
         try:
-            self.profiles.observe_turn(user_id, user_message, agent_response)
+            self.profiles.observe_turn(
+                user_id, user_message, agent_response, self._resolve_persona_label()
+            )
         except Exception:
             pass  # Profile extraction must never break the response path
 

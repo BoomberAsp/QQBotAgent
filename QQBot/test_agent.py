@@ -1257,6 +1257,7 @@ class TestProfileExtraction:
         asyncio.run(self.test_single_flight())
         asyncio.run(self.test_delete_flush())
         asyncio.run(self.test_buffer_crash_recovery())
+        asyncio.run(self.test_buffer_persona_roundtrip())
 
     # ── Layer 2 ──────────────────────────────────────────────────
 
@@ -1579,6 +1580,35 @@ class TestProfileExtraction:
             m4.observe_turn("u", "fresh", "r")
             assert m4._pending_n["u"] == 1 and len(m4._recent["u"]) == 1
             print_pass("Layer3 ⑦: buffer survives restarts, flush-once, corrupt-tolerant")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_buffer_persona_roundtrip(self):
+        """Per-turn persona mirrors to buffer.json and restores verbatim, so a
+        LONG snapshot built after a restart still labels the assistant
+        in-character (not the hardcoded default)."""
+        tmpdir = tempfile.mkdtemp()
+        buf = os.path.join(tmpdir, "u", "buffer.json")
+        try:
+            from agent.profile import ProfileManager
+            c1 = _GatedProfileClient("{}")
+            m1 = ProfileManager(base_dir=tmpdir, llm_client=c1)
+            # < K turns so nothing flushes; one carries a persona, one is legacy
+            m1.observe_turn("u", "m0", "r0", "露比")
+            m1.observe_turn("u", "m1", "r1")           # 3-arg legacy call → ""
+            await asyncio.sleep(0)
+            with open(buf, encoding="utf-8") as f:
+                blob = json.load(f)
+            assert blob["turns"][0] == ["m0", "r0", "露比"], blob["turns"]
+            assert blob["turns"][1] == ["m1", "r1", ""], blob["turns"]
+            # a fresh manager restores the persona verbatim on first observe
+            c2 = _GatedProfileClient("{}")
+            m2 = ProfileManager(base_dir=tmpdir, llm_client=c2)
+            m2.observe_turn("u", "m2", "r2", "触发恢复")
+            dq = list(m2._recent["u"])
+            assert dq[0] == ("m0", "r0", "露比"), dq
+            assert dq[1] == ("m1", "r1", ""), dq
+            print_pass("Layer3: per-turn persona mirrors to buffer.json + restores")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -2417,6 +2447,7 @@ class TestTieredMemory:
         self.test_medium_max_safety_net()
         self.test_long_creation_twin_kept_idempotent()
         self.test_long_snapshot_turns_from_batch()
+        self.test_long_snapshot_persona_label()
         self.test_judge_list_composition()
         self.test_injection_empty_returns_blank()
         self.test_injection_low_confidence_label()
@@ -2664,6 +2695,42 @@ class TestTieredMemory:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_long_snapshot_persona_label(self):
+        """Per-turn persona: a LONG snapshot writes/renders/reloads the session
+        persona instead of the old hardcoded 助手(Roxy); legacy 2-tuple turns
+        still fall back to Roxy."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory, MediumItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m1", content="事实", count=10, entry_extraction_index=0))
+            # one turn carries a character persona (露比); one is a legacy 2-tuple
+            turns = [("今天练腿", "好的呀", "露比"), ("旧格式轮", "旧回复")]
+            tm.ingest_candidates("u", [("事实", "keep", "m1")], snapshot_turns=turns)
+            lo = st.long[0]
+            # snapshot_turns stored verbatim → per-turn persona preserved
+            assert lo.snapshot_turns == turns, lo.snapshot_turns
+            # recall rendering uses each turn's OWN persona; legacy turn → Roxy
+            text = tm._format_snapshot_text(lo)
+            assert "助手(露比): 好的呀" in text, text
+            assert "助手(Roxy): 旧回复" in text, text
+            # persist → the md file on disk carries the persona label
+            tm.save_user("u")
+            with open(os.path.join(tm._long_user_dir("u"), lo.id + ".md"),
+                      encoding="utf-8") as f:
+                md = f.read()
+            assert "助手(露比): 好的呀" in md, md
+            # reload → persona recovered from the label; legacy turn read back as Roxy
+            tm2 = TieredMemory(base_dir=tmp)
+            tm2.load_all()
+            lo2 = tm2._get_state("u").long[0]
+            assert lo2.snapshot_turns[0] == ("今天练腿", "好的呀", "露比"), lo2.snapshot_turns
+            assert lo2.snapshot_turns[1] == ("旧格式轮", "旧回复", "Roxy"), lo2.snapshot_turns
+            print_pass("LONG snapshot: per-turn persona label writes/renders/reloads (legacy→Roxy)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     # ── judge list ───────────────────────────────────────────────
 
     def test_judge_list_composition(self):
@@ -2868,7 +2935,9 @@ class TestTieredMemory:
             assert st2.short[0].content == "短期事实" and st2.short[0].count == 2
             assert st2.medium[0].content == "中期事实" and st2.medium[0].entry_extraction_index == 3
             assert st2.long[0].linked_medium_id == "m1"
-            assert st2.long[0].snapshot_turns == [("玩原神", "好玩")], "LONG snapshot md round-trips"
+            # legacy 2-tuple snapshot writes as 助手(Roxy) and reads back as a
+            # 3-tuple with the persona recovered from the speaker label
+            assert st2.long[0].snapshot_turns == [("玩原神", "好玩", "Roxy")], "LONG snapshot md round-trips"
             print_pass("persistence: save_user/load round-trips all tiers + clock + LONG md")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

@@ -383,12 +383,19 @@ class ProfileManager:
 
     # ── Layer 3: batched observation + extraction (§7.1, P0) ──────
 
-    def observe_turn(self, user_id: str, user_message: str, agent_response: str):
+    def observe_turn(self, user_id: str, user_message: str, agent_response: str,
+                     persona_name: str = ""):
         """Per-turn hook (SYNC, no await): buffer the turn + touch the profile.
 
         Called from agent._schedule_profile_update on every turn. When the
         buffer reaches PROFILE_BATCH_K and no extraction is in flight for this
         user, a single-flight extract_batch is scheduled over the recent window.
+
+        persona_name: the active persona's short display label for THIS turn
+        (captured by the caller from _current_personality). Stored on the
+        buffered turn so a LONG snapshot persisted from this batch labels the
+        assistant with the persona that actually spoke, not a hardcoded default.
+        Empty → snapshots fall back to 助手(Roxy).
 
         Concurrency model (§12.1): no explicit locks. This method only does
         synchronous in-memory appends; the LLM work happens in a background
@@ -412,7 +419,7 @@ class ProfileManager:
         if dq is None:
             dq = deque(maxlen=EXTRACT_WINDOW_N)
             self._recent[user_id] = dq
-        dq.append((user_message or "", agent_response or ""))
+        dq.append((user_message or "", agent_response or "", persona_name or ""))
 
         self._pending_n[user_id] = self._pending_n.get(user_id, 0) + 1
         self._save_buffer(user_id)
@@ -527,7 +534,8 @@ class ProfileManager:
             self._memory.touch_extraction_count(user_id)
             self._memory.save_user(user_id)
 
-    async def extract_and_update(self, user_id: str, user_message: str, agent_response: str):
+    async def extract_and_update(self, user_id: str, user_message: str, agent_response: str,
+                                 persona_name: str = ""):
         """Single-turn convenience wrapper over extract_batch (backward-compat).
 
         The runtime path now uses observe_turn() (buffered batching, Layer 3).
@@ -538,7 +546,8 @@ class ProfileManager:
             return
         profile = self.get(user_id)
         profile.touch()
-        await self.extract_batch(user_id, [(user_message or "", agent_response or "")])
+        await self.extract_batch(
+            user_id, [(user_message or "", agent_response or "", persona_name or "")])
 
     def _apply_extraction(self, profile: UserProfile, user_id: str, extracted: dict,
                           snapshot_turns: Optional[list] = None) -> bool:
@@ -679,9 +688,17 @@ class ProfileManager:
         pieces: List[str] = []
         total = len(open_tag) + len(close_tag)
         # accumulate newest-first so dropping happens at the oldest end
-        for um, ar in reversed(list(turns)):
+        for turn in reversed(list(turns)):
+            um = turn[0] if len(turn) > 0 else ""
+            ar = turn[1] if len(turn) > 1 else ""
             u = (um or "")[:EXTRACT_USER_MSG_CAP]
             a = (ar or "")[:EXTRACT_AGENT_RESP_CAP]
+            # NOTE: the extraction prompt keeps a FIXED 助手(Roxy) third-person
+            # label on purpose — its hard rules and few-shot examples are keyed
+            # to that literal, and it is only a user/assistant disambiguation
+            # device for the extractor. The per-turn persona affects persisted
+            # LONG snapshots (memory.py), NOT this prompt label. Turns may be
+            # 3-tuples (user, agent, persona); the persona is ignored here.
             piece = f"用户: {u}\n助手(Roxy): {a}"
             add = len(piece) + (1 if pieces else 0)  # +1 for the joining newline
             if total + add > EXTRACT_TOTAL_CHAR_CAP:
@@ -825,7 +842,10 @@ class ProfileManager:
         """
         dq = self._recent.get(user_id)
         payload = {
-            "turns": [[m, r] for m, r in (dq or ())],
+            # 3-tuple (user_msg, agent_resp, persona_name) — persona survives a
+            # restart so a recovered buffer still snapshots in-character. The
+            # len guard tolerates any legacy 2-tuple still in the deque.
+            "turns": [[t[0], t[1], (t[2] if len(t) > 2 else "")] for t in (dq or ())],
             "pending_n": int(self._pending_n.get(user_id, 0)),
         }
         path = self._buffer_path(user_id)
@@ -858,8 +878,12 @@ class ProfileManager:
             return
         dq = deque(maxlen=EXTRACT_WINDOW_N)
         for t in turns[-EXTRACT_WINDOW_N:]:
-            if isinstance(t, (list, tuple)) and len(t) == 2:
-                dq.append((str(t[0]), str(t[1])))
+            # Accept legacy 2-element turns (persona → "") and new 3-element
+            # ones so a buffer.json written before the persona field still
+            # restores instead of being discarded.
+            if isinstance(t, (list, tuple)) and len(t) >= 2:
+                persona = str(t[2]) if len(t) >= 3 else ""
+                dq.append((str(t[0]), str(t[1]), persona))
         try:
             pending_n = max(0, int(data.get("pending_n") or 0))
         except (TypeError, ValueError):

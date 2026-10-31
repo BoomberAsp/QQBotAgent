@@ -322,7 +322,7 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 | `_compress_context(context, recent_full=20)` | 特殊会话读时压缩（Layer 1+2）: 最近 20 条保留完整，更早的 tool result 压缩为摘要首行；压缩边界按 `COMPRESS_STEP=4` 步进（相邻 4 轮字节级稳定，保护前缀缓存）。Layer 3 深度压缩不在读时做——由写侧 `/压缩会话`（turn.py）+ `_emergency_truncate` + L4 记忆负荷提示承担 |
 | `_emergency_truncate(context, budget_tokens)` | classmethod。上下文估算 token ≥95% 窗口时的读时兜底: 保留头部 `[会话摘要]` system 消息，插入「中间 N 条历史本轮未载入」系统注记，从尾部倒序回填至预算内；病态场景（单条超预算）退化为仅保留最后一条并截尾 4000 字 |
 | `_execute_tool_calls(tool_calls, session)` | 通过 ToolRegistry 执行 LLM 返回的工具调用；抽卡/测速类工具回复超 600 字自动折叠为降级记录 (`task_record`) |
-| `_schedule_profile_update(user_id, msg, response)` | 调用 `ProfileManager.observe_turn()`（同步缓冲，达 5 轮后台批量 extract+judge），不阻塞回复。旧 `_maybe_remember` 原始转储路径已移除——长期记忆完全由画像提取流水线驱动 |
+| `_schedule_profile_update(user_id, msg, response)` | 调用 `ProfileManager.observe_turn()`（同步缓冲，达 5 轮后台批量 extract+judge），不阻塞回复。在 `run()` 内读取 `_current_personality` 解析出当前人格短名（`_resolve_persona_label`，回退 `Roxy`）一并传入，使 LONG 快照按实际会话人格标注助手。旧 `_maybe_remember` 原始转储路径已移除——长期记忆完全由画像提取流水线驱动 |
 | `bootstrap()` | 启动健康检查 (API 连通性、工具数量、配置状态) |
 | `get_status()` | 返回 Agent 状态 (活跃会话、工具列表等) |
 | `clear_user_session(user_id)` | 清除指定用户的会话上下文 |
@@ -461,7 +461,7 @@ Markdown 文件 + frontmatter 存储，`MEMORY.md` 索引。**无内存缓存**�
 |---|---|---|
 | `ShortItem` | `id, content, count` | count 为 1 或 2，达 3 晋升 MEDIUM |
 | `MediumItem` | `id, content, count, entry_extraction_index` | count≥3；age = 逻辑时钟 − entry_extraction_index |
-| `LongObject` | `id, title, summary, snapshot_turns, snapshot_time, query_count, query_log, linked_medium_id` | 长期对象；晋升时保留 MEDIUM 孪生条目（Decision G），创建幂等 |
+| `LongObject` | `id, title, summary, snapshot_turns, snapshot_time, query_count, query_log, linked_medium_id` | 长期对象；晋升时保留 MEDIUM 孪生条目（Decision G），创建幂等。`snapshot_turns` 每轮为 `(用户消息, 助手回复, 人格名)` 三元组——落盘/回显/回读均按该轮实际人格渲染 `助手(<人格>)` 标签（旧二元组回退 `助手(Roxy)`） |
 | `UserTierState` | `user_id, extraction_count, short, medium, long` | 每用户容器 + 逻辑时钟 |
 
 **常量**（`memory.py:324-337`）：
@@ -499,7 +499,7 @@ EARDUP_MERGE_DICE` | 0.6 | 近重复合并阈值（引擎级去重） |
 data/memory/
 ├── tiers/
 │   ├── {uid}.json           # UserTierState 全量（原子写: tmp + replace）
-│   └── long/{uid}/{id}.md   # LONG 对象快照（write-once，含 snapshot_turns）
+│   └── long/{uid}/{id}.md   # LONG 对象快照（write-once，含 snapshot_turns；助手行按每轮人格标注 助手(<人格>)）
 └── *.md                     # 旧版 MemorySystem 文件（knowledge/system 类仍在使用）
 ```
 
@@ -540,10 +540,10 @@ data/memory/
 | `get(user_id)` | 获取或创建用户画像。**mtime 重校验**（commit f9c36c7）：缓存命中时对比 `profile.json` 的 `st_mtime_ns`，面板外部编辑优先于内存缓存，不会被 bot 下次保存静默回滚 |
 | `save(profile)` | 持久化画像到 `{USER_DATA_ROOT}/{safe_id}/profile.json` 并刷新 mtime 记录；失败记录 warning（不再静默） |
 | `set_client(client)` / `set_memory(memory)` | 设置 flash LLM 客户端 / `TieredMemory` 实例（懒初始化） |
-| `observe_turn(user_id, msg, response)` | 运行时主路径：缓冲一轮对话，达 K 轮后台触发 `_flush` |
+| `observe_turn(user_id, msg, response, persona_name="")` | 运行时主路径：缓冲一轮对话（含该轮人格名，供 LONG 快照按实际人格标注助手），达 K 轮后台触发 `_flush` |
 | `flush_on_session_end(user_id, turn_count)` | delete-flush（Decision J）：会话被删除时，实质会话（>`DELETE_FLUSH_MIN_TURNS=5` 轮）强制冲刷尾批，短暂会话丢弃未提取的尾部 |
 | `extract_batch(user_id, turns)` | 单次合并的 extract+judge flash 调用；解析失败跳过时钟，空 `{}` 仍推进 `extraction_count`（Decision 4）；**LLM await 之后重新 `get()`** 以拾取调用期间落盘的面板编辑，再同步原子应用（`_apply_extraction` → `save` → `TieredMemory.ingest_candidates`/`touch_extraction_count`/`save_user`） |
-| `extract_and_update(user_id, msg, response)` | 单轮便捷包装（向后兼容/测试用）；运行时路径为 `observe_turn` 批量调度 |
+| `extract_and_update(user_id, msg, response, persona_name="")` | 单轮便捷包装（向后兼容/测试用）；运行时路径为 `observe_turn` 批量调度 |
 | `_route_memory_candidates(...)` | 将提取结果中记忆类候选路由给 `TieredMemory`，画像类字段留给 `UserProfile` |
 
 **提取规则**:
@@ -1432,14 +1432,14 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 | 2 | `TestSessionManager` | 7 | 创建/超时/裁剪/清空/删除/持久化/**外部删除生效**（面板清除临时会话不被缓存复活，含请求中途删除跳过写回） |
 | 3 | `TestMemorySystem` | 4 | 保存/读取/遗忘/搜索/列出 |
 | 4 | `TestUserProfile` | 7 | 创建/保存/空上下文/完整上下文/去重/持久化/**外部编辑优先**（面板改画像后 bot 缓存按 mtime 重读） |
-| 5 | `TestProfileExtraction` | 11 | Layer 2 确定性过滤（复合词/正则/结构规则）/提示词约束/对话窗口格式化/批量调度（observe_turn 达 K 冲刷、单飞、delete-flush） |
+| 5 | `TestProfileExtraction` | 12 | Layer 2 确定性过滤（复合词/正则/结构规则）/提示词约束/对话窗口格式化/批量调度（observe_turn 达 K 冲刷、单飞、delete-flush）/每轮人格缓冲往返（buffer.json 存/恢复 persona） |
 | 6 | `TestAgentCore` | 11 | 启动/提示词构建/纯文本/工具循环/会话持久化/清空/最大迭代/压缩回退/任务折叠/画像注入/MEDIUM 记忆注入 |
 | 7 | `TestDeepSeekClientParsing` | 3 | 解析纯文本/工具调用/混合响应 |
 | 8 | `TestBuiltinTools` | 4 | get_time/execute_code(成功/错误)/search_web |
 | 9 | `TestSearchArchive` | 7 | 存档 round-trip/用户隔离/路径穿越拒绝/TTL 过期（recall 拒绝+惰性清扫）/每用户上限/无上下文降级/helper 全链路（footer 携带可召回 id） |
 | 10 | `TestPersonality` | 4 | 人格优先级链/群人格模糊匹配/清除回退/歧义拒绝 |
 | 11 | `TestTokenLedger` | 7 | usage 解析（DeepSeek/DashScope 格式、缺失、缓存钳制）/记账/按日聚合/摘要格式化 |
-| 12 | `TestTieredMemory` | 20 | 三层状态机（入队/去重/强化前移/晋升/溢出淘汰/降级/安全网）/LONG 创建幂等+快照/judge 清单构成/注入规则（空态/低置信/top-N+最近晋升/字符上限）/逻辑时钟/持久化往返/全量加载 |
+| 12 | `TestTieredMemory` | 21 | 三层状态机（入队/去重/强化前移/晋升/溢出淘汰/降级/安全网）/LONG 创建幂等+快照/judge 清单构成/注入规则（空态/低置信/top-N+最近晋升/字符上限）/逻辑时钟/持久化往返/全量加载/LONG 快照按每轮人格标注助手（写盘·回显·回读，旧二元组回退 Roxy） |
 | 13 | `TestMergedExtraction` | 5 | 合并 extract+judge 单次调用（候选路由/L2 过滤/judge 清单嵌入提示词/时钟推进/reinforce 晋升） |
 | 14 | `TestMemoryMigration` | 2 | 旧记忆 → 三层结构迁移（seed+归档、散落 legacy dump 归档） |
 | 15 | `TestCacheStability` | 6 | 前缀缓存稳定性（提示词头部用户不变量/易变内容置尾/画像变化头部字节稳定/历史头部迟滞修剪/压缩边界步进/无时间戳） |
