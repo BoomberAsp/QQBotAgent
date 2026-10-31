@@ -31,8 +31,9 @@ sys.path.insert(0, _PROJECT)
 
 from lib.status_icons import STATUS_ICON_CN  # noqa: E402  (filename -> CN label)
 from tools.wiki_glossary import load_glossary  # noqa: E402  (status_terms table)
+from lib.paths import wiki_cache_dir
 
-_DEFAULT_CACHE = os.path.join(_PROJECT, "data", "wiki_cache", "character_details.json")
+_DEFAULT_CACHE = os.path.join(wiki_cache_dir(), "character_details.json")
 
 
 # ── Duration markers ─────────────────────────────────────────────────

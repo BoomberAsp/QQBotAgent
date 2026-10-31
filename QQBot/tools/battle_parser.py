@@ -35,13 +35,14 @@ from PIL import Image
 
 from lib.buff_alias import extract_skill_buff_labels
 from lib.errors import ToolError
+from lib.paths import wiki_cache_dir
 
 
 # ── Character Skill Index ───────────────────────────────────────────
 
 # Path to the character detail cache (produced by wiki_scraper.refresh_characters).
 _CHAR_DETAIL_CACHE = os.path.join(
-    os.path.dirname(__file__), "..", "data", "wiki_cache", "character_details.json"
+    wiki_cache_dir(), "character_details.json"
 )
 
 # Lazily built index: {name_cn: {has_entry_buff, has_immunity_skill, ...}}

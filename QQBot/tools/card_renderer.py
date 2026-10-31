@@ -29,6 +29,7 @@ import re
 import threading
 
 from PIL import Image, ImageDraw, ImageFont
+from lib.paths import wiki_cache_dir
 
 
 # ── Paths ────────────────────────────────────────────────────────
@@ -37,8 +38,7 @@ _FONT_DIR = os.path.join(os.path.dirname(__file__), "..", "config", "font")
 _FONT_MAIN = os.path.join(_FONT_DIR, "NotoSansSC-SemiBold.ttf")
 
 # 缓存目录可被 WIKI_CACHE_DIR 覆盖（生产指向数据盘，避免占系统盘）
-_CACHE_DIR = os.environ.get("WIKI_CACHE_DIR") or os.path.join(
-    os.path.dirname(__file__), "..", "data", "wiki_cache")
+_CACHE_DIR = wiki_cache_dir()
 _PORTRAIT_DIR = os.path.join(_CACHE_DIR, "portraits")
 _ICON_DIR = os.path.join(_CACHE_DIR, "icons")
 _SKILL_DIR = os.path.join(_CACHE_DIR, "skill_icons")
