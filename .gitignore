@@ -105,10 +105,12 @@ QQBot/data/wiki_cache/cards/
 # 各类 .bak 快照（部署/迁移时产生）
 *.bak_*
 *.bak-pre-*
+QQBot/tools/card_renderer.py.bak-wikicache
 
 # 服务器运维产物
 QQBot/data/group_personality.json
 QQBot/data/personality_config.json
 QQBot/data/personality_settings.json
 QQBot/data/wiki_cache/changelog_card.png
-
+QQBot/data/redeem_code/*
+QQBot/data/wiki_cache/help_card.png
