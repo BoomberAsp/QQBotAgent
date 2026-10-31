@@ -114,3 +114,6 @@ QQBot/data/personality_settings.json
 QQBot/data/wiki_cache/changelog_card.png
 QQBot/data/redeem_code/*
 QQBot/data/wiki_cache/help_card.png
+
+# 展示网页部分原始资源
+public_site/examples/mkv/*
