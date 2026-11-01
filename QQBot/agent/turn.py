@@ -1585,11 +1585,23 @@ def _scene_completed(entry: dict) -> bool:
 
 
 def _backfill_completed(user_id: str, entry) -> None:
-    """懒回填热点（D7）：存量 bond_scene 缺 completed 字段时按 has_done_scene 判定回写。
+    """懒回填热点（D7）：存量 bond_scene 的封档状态未定时，按 bond 事实回写。
 
     仅两个热点调用：run_agent_turn 评估 is_scene 时、_find_scene_session 命中时。
     禁止在 list_sessions() 读路径回填（写放大 + mtime 抖动）。无法判定（羁绊状态
-    缺失）时保持未完成，避免误封档。completed_at 用回填时间（非真实完成时间）。
+    缺失）时保持未完成，避免误封档。
+
+    completed 语义：``True`` = 已封档；``False`` 是建会话时的初值，**不代表"确认未
+    完成"**——2026-10-29 封档写入上线之前完成的场景就停在 False（bond 有完成记录、
+    纪念卡也发了，只是没写封档），故 False 同样按"未判定"处理。
+
+    策略 A（同名重复 / 删了重建）：只有「bond 记录的那次完成时刻落在本会话生命周期
+    内（created_at ≤ done_ts ≤ last_active）」才回填。于是：
+      * 真身会话 → 补封档；
+      * 同名旧残留（建了没玩，早于那次完成）→ 不动；
+      * 删了重建的新会话（晚于那次完成）→ 不动。
+
+    completed_at 用 bond 记录的真实完成时间（不再用回填时间）。
 
     entry 可为 index dict（list_sessions 的元素）或 SpecialSession 对象（get_active）。
     两者都用同一 metadata dict 引用，故 md.update 后调用方立即可见新值。
@@ -1597,26 +1609,41 @@ def _backfill_completed(user_id: str, entry) -> None:
     if isinstance(entry, dict):
         md = entry.get("metadata")
         name = entry.get("name")
+        created = entry.get("created_at")
+        last = entry.get("last_active")
     else:
         md = getattr(entry, "metadata", None)
         name = getattr(entry, "name", None)
+        created = getattr(entry, "created_at", None)
+        last = getattr(entry, "last_active", None)
     if not isinstance(md, dict) or md.get("kind") != SCENE_KIND:
         return
-    if "completed" in md:
-        return  # 已有字段（True/False 均视为已定），不回填
+    if md.get("completed") is True:
+        return  # 已封档
     char_id = str(md.get("char_id") or "")
     title = str(md.get("scene_title") or "")
     if not char_id or not title or not name:
         return
     try:
-        if _bond_manager.has_done_scene(user_id, char_id, title):
-            updates = {"completed": True, "completed_at": time.time()}
-            _special_sessions.update_metadata(user_id, name, updates)
-            md.update(updates)  # 同步内存 entry，本轮调用方立即可见
-            from nonebot import logger
-            logger.info(
-                f"[scene-archive] backfill completed user={user_id} "
-                f"char={char_id} title={title}")
+        done_ts = float(
+            (_bond_manager.scenes_done(user_id, char_id) or {}).get(title) or 0.0)
+        if not done_ts:
+            return  # bond 没有完成记录：保持未完成
+        try:
+            created_f = float(created or 0.0)
+            last_f = float(last or 0.0)
+        except (TypeError, ValueError):
+            return
+        if not (created_f and last_f and created_f <= done_ts <= last_f):
+            return  # 策略 A：这次完成不属于本会话
+        updates = {"completed": True, "completed_at": done_ts}
+        if not _special_sessions.update_metadata(user_id, name, updates):
+            return
+        md.update(updates)  # 同步内存 entry，本轮调用方立即可见
+        from nonebot import logger
+        logger.info(
+            f"[scene-archive] backfill completed user={user_id} "
+            f"char={char_id} title={title} done_at={done_ts:.0f}")
     except Exception as e:
         log_exception("scene completed backfill failed", e)
 

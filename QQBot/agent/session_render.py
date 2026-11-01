@@ -122,13 +122,15 @@ def render_session_page(
         kind_note = ""
         if archive_on and kind == _t.SCENE_KIND:
             state = "已完结" if _t._scene_completed(s) else "进行中"
-            kind_note = f" [{state}] · 不计配额"
+            kind_note = f" · [{state}] · 不计配额"
         elif archive_on and kind == _t.CREATION_KIND:
-            kind_note = " [角色创作] · 不计配额"
+            kind_note = " · [角色创作] · 不计配额"
         created = time.strftime("%m/%d %H:%M", time.localtime(s["created_at"]))
         p_note = _persona_note(meta, registry, user_id)
+        # 序号必须裹在粗体里：行首 "4. " 会被 QQ 的 markdown 当成有序列表，
+        # 分页后一律从 1 重排（第 2 页显示 1/2/3，与按钮「切换 4」对不上）。
         lines.append(
-            f"{i}. **{s['name']}**{marker}{kind_note}\n"
+            f"**{i}. {s['name']}**{marker}{kind_note}\n"
             f"   创建: {created} | 消息数: {s['total_messages']} | {p_note}"
         )
         rows.append([

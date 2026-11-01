@@ -6120,6 +6120,7 @@ class TestSceneArchive:
         print_header("32b. Scene-Session Archive & Quota Exemption")
         self.turn = _import_turn_for_tests()
         self.test_quota_helpers()
+        self.test_backfill_legacy_false()
         self.test_rollback_switch()
         asyncio.run(self.test_start_dedup_resume())
         asyncio.run(self.test_start_cap())
@@ -6219,9 +6220,12 @@ class TestSceneArchive:
             assert "配额不变" in t_scene and "剧情会话剩 1" in t_scene, t_scene
             t_create = turn._delete_quota_tail(uid, "char_creation")
             assert "配额不变" in t_create, t_create
-            # T12：懒回填（无 completed 字段 + has_done_scene=True → 写回）
+            # T12：懒回填（completed 未定 + has_done_scene=True → 写回）
             self._mk_scene(mgr, uid, "星空之约")  # 无 completed 字段
             ctx["bond"].mark_scene_done(uid, "rubi", "星空之约")
+            # 完成时刻必须落在会话生命周期内：模拟完成回合同样写了消息
+            mgr.switch_to(uid, "剧情·星空之约")
+            mgr.add_message(uid, "assistant", "（收尾白）")
             e = self._entry(mgr, uid, "剧情·星空之约")
             assert "completed" not in (e.get("metadata") or {})
             turn._backfill_completed(uid, e)
@@ -6239,6 +6243,55 @@ class TestSceneArchive:
             assert found and found["name"] == "剧情·星空之约"
             assert turn._find_scene_session(uid, "rubi", "不存在") is None
             print_pass("quota helpers: 剧情/创作豁免 + B6 尾行 + 懒回填 (T1/T3/T12/T13)")
+        finally:
+            self._restore(ctx)
+
+    def test_backfill_legacy_false(self):
+        """2026-10-29 封档上线前完成的场景：completed 停在 False 时也能补封档。
+
+        策略 A：只有「bond 记录的那次完成发生在该会话生命周期内」才回填 ——
+        同名旧残留（建了没玩）与删了重建的新会话都不误封。
+        """
+        turn = self.turn
+        ctx = self._setup(role="regular", max_sessions=3)
+        try:
+            mgr, uid, bond = ctx["mgr"], "u1", ctx["bond"]
+            # ① 同名旧残留：建了没玩，时间退回 1 小时前
+            self._mk_scene(mgr, uid, "雨夜谈心", completed=False)
+            idx = mgr._load_index(uid)
+            for e in idx["sessions"]:
+                if e["name"] == "剧情·雨夜谈心":
+                    e["created_at"] -= 3600
+                    e["last_active"] -= 3600
+            mgr._save_index(uid, idx)
+            # ② 真身会话（后建，名字自动 _1）
+            s2 = self._mk_scene(mgr, uid, "雨夜谈心", completed=False)
+            assert s2.name == "剧情·雨夜谈心_1", s2.name
+            # 完成时刻 → 落在 ② 生命周期内（先记账，再写收尾消息）
+            bond.mark_scene_done(uid, "rubi", "雨夜谈心")
+            done_ts = bond.scenes_done(uid, "rubi")["雨夜谈心"]
+            mgr.switch_to(uid, s2.name)
+            mgr.add_message(uid, "assistant", "（收尾白）")
+            # 旧残留不动
+            old = self._entry(mgr, uid, "剧情·雨夜谈心")
+            turn._backfill_completed(uid, old)
+            assert old["metadata"].get("completed") is False, old["metadata"]
+            # 真身补封档，completed_at 用 bond 记录的真实完成时刻
+            new = self._entry(mgr, uid, s2.name)
+            turn._backfill_completed(uid, new)
+            assert new["metadata"]["completed"] is True, new["metadata"]
+            assert abs(float(new["metadata"]["completed_at"]) - done_ts) < 1e-6
+            # 落盘可见
+            assert self._entry(mgr, uid, s2.name)["metadata"]["completed"] is True
+            # 已封档的不重复写
+            turn._backfill_completed(uid, self._entry(mgr, uid, s2.name))
+            # ③ 删了重建：完成早于创建 → 不封
+            bond.mark_scene_done(uid, "rubi", "旧梦")
+            self._mk_scene(mgr, uid, "旧梦", completed=False)
+            e4 = self._entry(mgr, uid, "剧情·旧梦")
+            turn._backfill_completed(uid, e4)
+            assert not (e4["metadata"] or {}).get("completed"), e4["metadata"]
+            print_pass("legacy completed=False 回填（真实完成时刻）+ 策略 A 不误封")
         finally:
             self._restore(ctx)
 
@@ -10076,6 +10129,7 @@ class TestOfficialButtons:
         asyncio.run(self.test_u8_idempotency_and_rate())
         asyncio.run(self.test_u9_admin_role_gate())
         asyncio.run(self.test_u10_group_session_privacy())
+        asyncio.run(self.test_u11_session_page_numbering())
         asyncio.run(self.test_onebot_keyboard_degrades())
         asyncio.run(self.test_send_response_one_shot_keyboard())
         asyncio.run(self.test_session_index_alias())
@@ -10526,6 +10580,44 @@ class TestOfficialButtons:
         assert all(b.action == "cmd" for b in flat)
         assert not any("私密剧情" in (b.data or "") for b in flat)
         print_pass("U10 群会话列表：不泄露会话名，引导私聊（§9.2）")
+
+    # ── U11: 会话列表分页序号不被 markdown 重排 ─────────────────
+    async def test_u11_session_page_numbering(self):
+        """第 2 页的序号必须是字面量 4/5/6，不能触发 Markdown 有序列表重排。"""
+        import re
+
+        from agent import session_render
+
+        class _Mgr:
+            def list_sessions(self, user):
+                return [{"name": f"会话{i}", "created_at": 1793091032 + i,
+                         "total_messages": i, "metadata": {}} for i in range(1, 7)]
+
+            def _load_index(self, user):
+                return {"active_session": "会话1"}
+
+        class _Perm:
+            def get_role(self, user):
+                return "regular"
+
+            def get_max_special_sessions(self, role):
+                return 10
+
+        class _Reg:
+            def _exists(self, key, user_id=None):
+                return False
+
+            def get_display_name(self, key):
+                return key
+
+        md, rows = session_render.render_session_page(
+            "u", 2, "c2c", sessions_mgr=_Mgr(), perm=_Perm(), registry=_Reg())
+        assert "**4. 会话4**" in md, md
+        # 行首 "数字. " 会被 QQ markdown 当成有序列表并从 1 重排
+        assert not re.search(r"(?m)^\s*\d+\.\s", md), md
+        labels = [b.label for r in rows for b in r]
+        assert "切换 4" in labels and "删 4" in labels, labels
+        print_pass("U11 会话列表第 2 页：序号 4/5/6 为字面文本，不触发有序列表重排")
 
     # ── 附加：OneBot send_keyboard 文本降级 ──────────────────────
     async def test_onebot_keyboard_degrades(self):
