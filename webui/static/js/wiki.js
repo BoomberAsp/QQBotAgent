@@ -1,5 +1,38 @@
 /* Wiki cache status page + alias manager */
 (function () {
+  // Same tab layout as configuration management; keep mounted editors so
+  // switching sections preserves unsaved inputs and the selected entry.
+  const sectionTabs = [...document.querySelectorAll('#wk-tabs [data-tab]')];
+  function selectSection(name, updateHash = true) {
+    const selected = sectionTabs.find(t => t.dataset.tab === name) || sectionTabs[0];
+    sectionTabs.forEach(tab => {
+      const active = tab === selected;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', String(active));
+      tab.tabIndex = active ? 0 : -1;
+    });
+    document.querySelectorAll('.wk-pane').forEach(pane => {
+      pane.style.display = pane.dataset.pane === selected.dataset.tab ? '' : 'none';
+    });
+    if (updateHash) history.replaceState(null, '', '#' + selected.dataset.tab);
+  }
+  sectionTabs.forEach((tab, index) => {
+    tab.addEventListener('click', () => selectSection(tab.dataset.tab));
+    tab.addEventListener('keydown', event => {
+      let next;
+      if (event.key === 'ArrowRight') next = (index + 1) % sectionTabs.length;
+      if (event.key === 'ArrowLeft') next = (index + sectionTabs.length - 1) % sectionTabs.length;
+      if (event.key === 'Home') next = 0;
+      if (event.key === 'End') next = sectionTabs.length - 1;
+      if (next === undefined) return;
+      event.preventDefault();
+      selectSection(sectionTabs[next].dataset.tab);
+      sectionTabs[next].focus();
+    });
+  });
+  window.addEventListener('hashchange', () => selectSection(location.hash.slice(1), false));
+  selectSection(location.hash.slice(1), false);
+
   function esc(s) {
     const d = document.createElement('div');
     d.textContent = s == null ? '' : String(s);
