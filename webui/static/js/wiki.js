@@ -562,7 +562,7 @@
     const list = document.getElementById('wk-dt-list');
     document.getElementById('wk-dt-status').textContent =
       `共 ${total != null ? total : dtItems.length} 条` +
-      (dtGdTotal ? `（含解包 ${dtGdTotal} 条，wiki 未收录，只读）` : '') +
+      (dtGdTotal ? `（含解包 ${dtGdTotal} 条，只读；同一羁绊可有 Wiki 与解包两种来源）` : '') +
       (dtQuery ? `，过滤「${dtQuery}」后 ${dtItems.length} 条` : '');
     if (!dtItems.length) {
       list.innerHTML = '<div class="muted">无匹配条目</div>';
@@ -572,7 +572,7 @@
       const gd = it.source === 'gamedata';
       const active = gd ? (it.id === dtSelectedGd) : (it.title === dtSelected);
       return `<div class="dt-item${active ? ' active' : ''}" data-title="${attr(it.title)}" data-source="${attr(it.source || 'wiki')}" data-id="${attr(it.id || '')}">
-      <div><strong>${esc(it.name_cn || '(未翻译)')}</strong>${gd ? ' <span class="pill badge-warn" title="来自解包数据（wiki 未收录），只读展示">解包</span>' : ''}${it.manual ? ' <span class="pill manual-pill" title="含人工修正字段">人工</span>' : ''}${it.has_cn ? '' : ' <span class="pill badge-warn" title="中文字段仍是英文原文">英</span>'}</div>
+      <div><strong>${esc(it.name_cn || '(未翻译)')}</strong>${gd ? ' <span class="pill badge-warn" title="来自游戏解包数据，只读展示">解包</span>' : ''}${it.manual ? ' <span class="pill manual-pill" title="含人工修正字段">人工</span>' : ''}${it.has_cn ? '' : ' <span class="pill badge-warn" title="中文字段仍是英文原文">英</span>'}</div>
       <div class="t2 mono muted">${esc(it.title)}${it.id ? ' · ' + esc(it.id) : ''}${it.stars ? ' · ' + '★'.repeat(it.stars) : ''}</div>
     </div>`;
     }).join('');
@@ -652,7 +652,7 @@
     const ed = document.getElementById('wk-dt-editor');
     ed.innerHTML = '<div class="muted">加载中…</div>';
     try {
-      const d = await api('/api/wiki/details/gamedata?rid=' + encodeURIComponent(rid));
+      const d = await api('/api/wiki/details/gamedata?rid=' + encodeURIComponent(rid) + '&kind=' + encodeURIComponent(dtKind));
       renderGdEditor(d.entry || {});
     } catch (e) {
       ed.innerHTML = `<div class="err">${esc(e.message)}</div>`;
@@ -665,6 +665,25 @@
   }
 
   function renderGdEditor(e) {
+    if (dtKind === 'bond') {
+      const local = values => values && (values.zh_hans || values.zh_hant || values.en) || '';
+      const stat = stage => e.stats && e.stats[stage] || {};
+      document.getElementById('wk-dt-editor').innerHTML = `
+        <div class="row"><strong>${esc(local(e.names) || e.id)}</strong>
+        <span class="mono muted">${esc(e.id)}</span><span class="pill badge-warn">解包 · 只读</span></div>
+        <table class="kv-table">
+          ${gdRow('英文名', e.names && e.names.en)}
+          ${gdRow('星级 / 职业', [e.star, e.job].filter(Boolean).join(' / '))}
+          ${gdRow('初始攻击 / 生命', [stat('base').atk, stat('base').hp].join(' / '))}
+          ${gdRow('最大攻击 / 生命', [stat('max').atk, stat('max').hp].join(' / '))}
+          ${gdRow('别名', (e.aliases || []).join('、'))}
+        </table>
+        <h4>官方说明</h4><div style="white-space:pre-wrap">${esc(local(e.description))}</div>
+        <h4>官方效果模板</h4><div style="white-space:pre-wrap">${esc(local(e.effect))}</div>
+        <p class="muted">效果占位符保留游戏原始参数，不代表已经计算的满级数值。解包条目可能包含活动专用或未上线数据；Wiki 翻译条目仍可单独编辑。</p>
+        <details><summary>原始效果参数</summary><pre style="white-space:pre-wrap">${esc(JSON.stringify(e.parameters || {}, null, 2))}</pre></details>`;
+      return;
+    }
     const ed = document.getElementById('wk-dt-editor');
     const zh = (e.names && (e.names.zh_hans || e.names.zh_hant)) || '';
     const star = e.star ? '★'.repeat(e.star) : '';

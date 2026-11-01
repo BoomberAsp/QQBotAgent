@@ -1234,8 +1234,8 @@ async def api_wiki_details_entry(kind: str = "char", title: str = ""):
 # 解包角色（gamedata）只读条目：wiki 未收录的新角色（如 H806 蜜拉贝儿）
 # 没有可编辑的详情缓存条目，面板展示 names/aliases/技能/卡面文案 的只读视图。
 @app.get("/api/wiki/details/gamedata")
-async def api_wiki_details_gamedata(rid: str = ""):
-    result = await asyncio.to_thread(data_reader.wiki_details_gamedata_entry, rid)
+async def api_wiki_details_gamedata(rid: str = "", kind: str = "char"):
+    result = await asyncio.to_thread(data_reader.wiki_details_gamedata_entry, rid, kind)
     if "error" in result:
         return JSONResponse(result, status_code=404)
     return result

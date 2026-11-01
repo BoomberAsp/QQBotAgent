@@ -809,6 +809,23 @@ def _gamedata_roles() -> dict:
     return (src.roles or {}) if src is not None else {}
 
 
+def _gamedata_artifacts() -> dict:
+    """每次读取独立羁绊产物；原子上传后下一次请求立即生效。"""
+    directory = config.GAMEDATA_DIR
+    if directory is None:
+        return {}
+    try:
+        blob = json.loads((Path(directory) / "artifacts.json").read_text(encoding="utf-8"))
+        data = blob.get("artifacts", {})
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _gamedata_entries(kind: str) -> dict:
+    return _gamedata_artifacts() if kind == "bond" else _gamedata_roles()
+
+
 def _gd_role_names(role: dict, rid: str = "") -> tuple[str, str]:
     """(官方简中名, 官方英文名)；缺繁中回落。
 
@@ -841,9 +858,17 @@ def wiki_portrait_path(rid: str) -> Path | None:
     return p if p.is_file() else None
 
 
-def wiki_details_gamedata_entry(rid: str) -> dict:
+def wiki_details_gamedata_entry(rid: str, kind: str = "char") -> dict:
     """解包角色的只读条目视图（wiki 未收录 → 无可编辑的详情缓存条目）。"""
+    if kind not in ("char", "bond"):
+        return {"error": f"非法详情类型: {kind}"}
     rid = (rid or "").strip()
+    if kind == "bond":
+        entry = _gamedata_artifacts().get(rid)
+        if not isinstance(entry, dict):
+            return {"error": f"gamedata 无此羁绊: {rid}"}
+        return {"kind": "gamedata_bond", "rid": rid,
+                "entry": {**entry, "source": "gamedata"}}
     roles = _gamedata_roles()
     if not roles:
         return {"error": "gamedata 解包产物不可用（GAMEDATA_DIR 未配置或 roles.json 为空）"}
@@ -931,6 +956,8 @@ def wiki_aliases_missing(kind: str) -> dict:
     known_low = {k.lower() for k in known}
     canonicals = {str(c) for c in flat.values()}
 
+    gd_entries = _gamedata_entries(kind)
+    reported_ids = set()
     items, seen = [], set()
     for title, entry in data.items():
         if not isinstance(entry, dict):
@@ -938,23 +965,31 @@ def wiki_aliases_missing(kind: str) -> dict:
         title = str(title)
         if title in known or title.lower() in known_low:
             continue
-        canon = str(entry.get("name_cn") or "").strip() or title
+        eid = str(entry.get("id") or "")
+        official = gd_entries.get(eid, {}) if kind == "bond" else {}
+        zh, en = _gd_role_names(official, eid)
+        if eid in known or (zh and zh in known) or (en and en.lower() in known_low):
+            continue
+        canon = str(entry.get("name_cn") or "").strip() or zh or title
         if canon in known or canon in seen:
             continue
         seen.add(canon)
-        hint = [canon] + ([title] if title != canon else [])
+        reported_ids.add(eid)
+        hint = list(dict.fromkeys(x for x in [canon, title, zh, en, eid] if x))
         items.append({"canonical": canon, "title_en": title,
                       "aliases_hint": hint, "source": "wiki"})
 
     # ── 解包侧增强（仅 char）──
-    if kind == "char":
+    if kind in ("char", "bond"):
         wiki_title_by_id = {str(e.get("id")): str(t) for t, e in data.items()
                             if isinstance(e, dict) and e.get("id")}
         gd_seen: set = set()
-        for rid, role in _gamedata_roles().items():
+        for rid, role in gd_entries.items():
             if not isinstance(role, dict):
                 continue
             rid = str(rid)
+            if rid in reported_ids:
+                continue
             zh, en = _gd_role_names(role, rid)
             if not zh and not en:
                 continue        # 本地化占位角色（无可读名字）
@@ -1116,13 +1151,13 @@ def wiki_details_list(kind: str, q: str = "") -> dict:
 
     # ── 合并解包角色（wiki 未收录的；仅 char，产物不可用时静默跳过）──
     gd_total = 0
-    if kind == "char":
-        for rid, role in _gamedata_roles().items():
-            if not isinstance(role, dict) or str(rid) in wiki_ids:
+    if kind in ("char", "bond"):
+        for rid, role in _gamedata_entries(kind).items():
+            if not isinstance(role, dict) or (kind == "char" and str(rid) in wiki_ids):
                 continue
             rid = str(rid)
             zh, en = _gd_role_names(role, rid)
-            if not zh and not en:
+            if not zh and not en and kind == "char":
                 continue        # 本地化占位角色（如 H169）不进面板列表
             gd_total += 1
             title = en or rid
