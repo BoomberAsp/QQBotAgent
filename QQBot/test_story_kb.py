@@ -35,6 +35,7 @@ from lib.story_kb import (  # noqa: E402
     persona_char_id,
     zh_query_bigrams,
 )
+from lib.story_sources import StorySources  # noqa: E402
 
 
 def _load_builder():
@@ -321,6 +322,65 @@ class BuilderAndRetrievalTests(unittest.TestCase):
     def test_tool_result_empty_path(self):
         out = self.kb.format_tool_result("zzzz qqqq xxxx")
         self.assertIn("没有找到", out)
+
+
+class StorySourcesTests(unittest.TestCase):
+    """多库融合门面（wiki + gamedata）的接口兼容性。
+
+    回归 2026-11-01：门面把门面级关键字整包转发给 StoryKB，而两边签名不同 ——
+    ``format_tool_result(query, hits, **kwargs)`` 里 hits 顶掉了 ``limit``（重复传参），
+    ``render_block(hits, **kwargs)`` 又不认 ``limit`` / ``min_score``。
+    线上表现：story_search 每次检索返回 TypeError 文本，自动注入被静默吞掉。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix="storysrc_test_")
+        wiki_db = os.path.join(cls.tmpdir, "wiki.db")
+        gd_db = os.path.join(cls.tmpdir, "gamedata.db")
+        bsk.build_index(
+            [_unit_main("Main Story/Episode 1/Chapter 1/Stage 1-5", 1,
+                        "Resonant Awakening")],
+            ZH_FIXTURE, wiki_db, source_note="wiki")
+        bsk.build_index(
+            [_unit_event("Event Story/A Budding Heart", "A Budding Heart")],
+            ZH_FIXTURE, gd_db, source_note="gamedata")
+        cls.sources = StorySources([("wiki", wiki_db), ("gamedata", gd_db)])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_both_dbs_are_loaded(self):
+        self.assertTrue(self.sources.available)
+        self.assertEqual(len(self.sources.sources), 2)
+
+    def test_tool_result_accepts_limit_kwarg(self):
+        """回归：hits 必须按关键字传，不能顶掉第二个位置参数 limit。"""
+        out = self.sources.format_tool_result("unconscious ass", limit=2,
+                                              persona_char_id="H016")
+        self.assertIn("[story_search]", out)
+        self.assertIn("对白：", out)
+
+    def test_tool_result_ignores_unknown_kwargs(self):
+        out = self.sources.format_tool_result("unconscious ass", limit=1, bogus=1)
+        self.assertIn("[story_search]", out)
+
+    def test_injection_accepts_limit_max_chars_min_score(self):
+        """回归：render_block 不认 limit/min_score，门面必须先过滤。"""
+        block = self.sources.format_injection(
+            "露比 雨夜", limit=2, max_chars=1200, min_score=0.0,
+            persona_char_id="H076", persona_name="露比")
+        self.assertTrue(block)
+        self.assertIn("剧情记忆", block)
+
+    def test_injection_empty_when_nothing_matches(self):
+        self.assertEqual(self.sources.format_injection("zzzz qqqq xxxx"), "")
+
+    def test_fused_search_marks_source_db(self):
+        hits = self.sources.search("unconscious ass", limit=3)
+        self.assertTrue(hits)
+        self.assertTrue(all(getattr(h, "source_db", "") for h in hits))
 
 
 class MissingDatabaseTests(unittest.TestCase):
