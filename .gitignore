@@ -69,7 +69,9 @@ QQBot/docs/
 
 # ── 本地验证数据与脚本（Idea 8 测速）────────────
 # test/ 下的校验脚本、GT、缓存、接触片均为开发产物
-/test/
+/test/*
+!/test/test_bond_names.py
+!/test/test_webui_artifacts.py
 
 # cal-speed-data 里的战斗截图（49 张验证集）不入库，
 # 但 *图标.png 是 BuffDetector 的运行时模板，必须保留。
@@ -117,3 +119,5 @@ QQBot/data/wiki_cache/help_card.png
 
 # 展示网页部分原始资源
 public_site/examples/mkv/*
+
+!/test/test_role_names.py
