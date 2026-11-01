@@ -397,7 +397,7 @@ def _special_manager():
     return SpecialSessionManager(user_data_root=str(config.USER_DATA_ROOT))
 
 
-# 剧情/创作会话不计普通特殊会话配额（scene-session-archive-design.md §2.1）
+# 剧情/创作会话不计通用会话配额（scene-session-archive-design.md §2.1）
 _NON_QUOTA_KINDS = {"bond_scene", "char_creation"}
 
 
@@ -418,7 +418,7 @@ def special_list(uid: str) -> dict:
             item["completed"] = bool(meta.get("completed"))
             item["counts_quota"] = kind not in _NON_QUOTA_KINDS
             sessions.append(item)
-        # 配额摘要：普通会话计配额；剧情/创作不计（与 turn.py 口径一致）
+        # 配额摘要：通用会话计配额；剧情/创作不计（与 turn.py 口径一致）
         try:
             quota_max = _permissions.get_max_special_sessions(
                 _permissions.get_role(uid))

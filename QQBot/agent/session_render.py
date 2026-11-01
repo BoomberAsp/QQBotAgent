@@ -94,7 +94,7 @@ def render_session_page(
     sessions = sessions_mgr.list_sessions(user_id)
     archive_on = _t._scene_archive_enabled()
     if not sessions:
-        hint = (f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个普通会话；"
+        hint = (f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个通用会话；"
                 f"剧情/创作会话不计配额）。" if archive_on else
                 f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个）。")
         return (
@@ -160,8 +160,10 @@ def render_session_page(
     if archive_on:
         used = _t._quota_used(user_id)
         n_scene = len(_t._scene_archives(user_id))
-        lines.append(f"\n普通会话 {used}/{max_sessions} · "
-                     f"剧情归档 {n_scene}（不计配额）")
+        # 术语：临时会话 / 特殊会话（上位）；特殊会话分三类——通用会话
+        # （计配额）、剧情会话、创作会话（后两者不计配额）。
+        lines.append(f"\n通用会话 {used}/{max_sessions} · "
+                     f"剧情会话 {n_scene}（不计配额）")
     else:
         lines.append(f"\n共 {len(sessions)}/{max_sessions} 个会话")
     return "\n".join(lines), rows

@@ -86,11 +86,11 @@
         detail.textContent = d.error || '该用户没有特殊会话';
         return;
       }
-      // 配额摘要：普通会话计配额，剧情/创作不计（scene-session-archive §5.5/T15）
+      // 配额摘要：通用会话计配额，剧情/创作不计（scene-session-archive §5.5/T15）
       const summary = (d.quota_max != null)
         ? `<div class="row muted" style="margin-bottom:8px">
-             普通会话 ${d.quota_used}/${d.quota_max} ·
-             剧情归档 ${d.scene_archives}（已完结 ${d.scene_done}）· 不计配额
+             通用会话 ${d.quota_used}/${d.quota_max} ·
+             剧情会话 ${d.scene_archives}（已完结 ${d.scene_done}）· 不计配额
            </div>`
         : '';
       const badge = (s) => {

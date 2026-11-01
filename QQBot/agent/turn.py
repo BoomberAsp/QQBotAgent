@@ -1306,7 +1306,7 @@ UPGRADE_HINT_INTERVAL = 10    # re-suggest at most every N messages
 _upgrade_hint_last: dict[str, int] = {}  # user_id -> message count at last hint
 
 # ── 剧情会话封档与配额豁免（scene-session-archive-design.md §2.4）──────
-# 单一真源：kind 为 bond_scene / char_creation 的会话不计普通特殊会话配额。
+# 单一真源：kind 为 bond_scene / char_creation 的会话不计特殊会话配额。
 # 所有配额判断与数字展示必须走 _quota_sessions()/_quota_used()，禁止再直接
 # len(list_sessions())。回滚开关 _scene_archive_enabled() 定义在 agent.py
 #（热读；关闭时配额统计退回全量、is_scene 退回仅看 kind）。
@@ -1316,7 +1316,7 @@ NON_QUOTA_KINDS = frozenset({SCENE_KIND, CREATION_KIND})
 
 # ── /压缩会话（PLAN.md Idea 4 Phase A）────────────────────────────────
 # 用户触发的一次性深度压缩：头部历史 → flash 模型滚动摘要 → apply_compression
-# 写回（摘要 system 消息 + 尾部原文）。剧情归档/角色创作会话豁免（历史是回看
+# 写回（摘要 system 消息 + 尾部原文）。剧情会话/角色创作会话豁免（历史是回看
 # 真相源，压缩即销毁）。读时防线（85% 提示 / 95% 紧急截断）在 agent.py。
 COMPRESS_MIN_MESSAGES = 30       # 少于该消息数拒绝压缩（还不值得压）
 COMPRESS_KEEP_RECENT = 10        # 尾部保留原文的消息数
@@ -1551,7 +1551,7 @@ def _quota_warning(user_id: str) -> str:
 # 单一真源。回滚开关关闭时 _quota_sessions 退回全量统计（§7）。
 
 def _quota_sessions(user_id: str) -> list:
-    """计入特殊会话配额的会话（普通特殊会话）。
+    """计入配额的通用会话。
 
     开关关闭时退回全量（把剧情/创作会话也算进去），实现 §7 的回滚语义。
     """
@@ -1565,7 +1565,7 @@ def _quota_sessions(user_id: str) -> list:
 
 
 def _quota_used(user_id: str) -> int:
-    """已用的普通特殊会话配额数（展示与判断统一走这里）。"""
+    """已用的通用会话配额数（展示与判断统一走这里）。"""
     return len(_quota_sessions(user_id))
 
 
@@ -1639,8 +1639,8 @@ def _find_scene_session(user_id: str, char_id: str, title: str):
 def _delete_quota_tail(user_id: str, deleted_kind: str) -> str:
     """删除会话后的配额提示尾行（scene-session-archive-design.md §4.2/B6）。
 
-    deleted_kind 是被删会话的 metadata.kind（删除前捕获）。删普通会话 → 显示
-    n/max；删剧情/创作会话 → 强调普通配额不变（它们本就不计配额）。开关关闭时
+    deleted_kind 是被删会话的 metadata.kind（删除前捕获）。删通用会话 → 显示
+    n/max；删剧情/创作会话 → 强调通用会话配额不变（它们本就不计配额）。开关关闭时
     退回统一口径（_quota_used 已退回全量）。
     """
     role = _perm_manager.get_role(user_id)
@@ -1650,10 +1650,10 @@ def _delete_quota_tail(user_id: str, deleted_kind: str) -> str:
         return f"\n当前特殊会话: {used}/{max_sess}"
     if deleted_kind == SCENE_KIND:
         k = len(_scene_archives(user_id))
-        return f"\n普通会话配额不变（当前 {used}/{max_sess}），剧情归档剩 {k} 个。"
+        return f"\n通用会话配额不变（当前 {used}/{max_sess}），剧情会话剩 {k} 个。"
     if deleted_kind == CREATION_KIND:
-        return f"\n普通会话配额不变（当前 {used}/{max_sess}）。"
-    return f"\n当前普通会话: {used}/{max_sess}"
+        return f"\n通用会话配额不变（当前 {used}/{max_sess}）。"
+    return f"\n当前通用会话: {used}/{max_sess}"
 
 
 # ── Quota Cleanup Protocol (Feature 2) ───────────────────────────
@@ -1797,7 +1797,7 @@ def _get_user_info() -> str:
 
     lines = [f"用户信息快照", f"", f"用户 ID: {user_id}", f"权限级别: {role_label} ({role.value})"]
 
-    # ── 特殊会话（scene-session-archive-design.md §4.2：普通/归档分开计数）──
+    # ── 特殊会话 · 通用/剧情分开计数（scene-session-archive-design §4.2）──
     sessions = _special_sessions.list_sessions(user_id)
     active = _special_sessions.get_active(user_id)
     max_sessions = _perm_manager.get_max_special_sessions(role)
@@ -1818,15 +1818,15 @@ def _get_user_info() -> str:
             s for s in sessions
             if (s.get("metadata") or {}).get("kind") == CREATION_KIND
         ]
-        lines.append(f"普通会话 ({len(quota_sessions)}/{max_sessions}):")
+        lines.append(f"通用会话 ({len(quota_sessions)}/{max_sessions}):")
         if quota_sessions:
             for s in quota_sessions:
                 marker = " ★ 当前" if active and s["name"] == active.name else ""
                 lines.append(f"  · {s['name']}{marker} — {s['total_messages']} 条消息")
         else:
-            lines.append(f"  (无普通特殊会话)")
+            lines.append(f"  (无通用会话)")
         if scene_sessions:
-            lines.append(f"剧情归档 {len(scene_sessions)}（不计配额）:")
+            lines.append(f"剧情会话 {len(scene_sessions)}（不计配额）:")
             for s in scene_sessions:
                 marker = " ★ 当前" if active and s["name"] == active.name else ""
                 done = "已完结" if _scene_completed(s) else "进行中"
@@ -2816,7 +2816,7 @@ async def handle_agent_turn(view: InboundMessage):
             (active_special.metadata or {}).get("kind") == "char_creation"
         )
         # Bond story-scene session (Bond-System-Design.md §4.4 形态3, P3).
-        # 已封档（completed=true）的剧情按普通特殊会话运行（D3/§5.4）：is_scene=false，
+        # 已封档（completed=true）的剧情按通用会话行为运行（D3/§5.4）：is_scene=false，
         # 不注入场景指令、不下发 complete_scene、走正常路由。开关关闭时退回仅看 kind。
         _md_active = (active_special.metadata or {}) if active_special else {}
         if (_scene_archive_enabled() and active_special
@@ -4671,7 +4671,7 @@ def _scene_opening_line(char_id: str, title: str, scene: dict) -> str:
 async def _start_bond_scene(user_id: str, char_id: str, scene: dict) -> None:
     """启动/恢复羁绊剧情特殊会话（仅私聊）。
 
-    剧情会话**不计**普通特殊会话配额（scene-session-archive-design.md §4.1）；
+    剧情会话**不计**特殊会话配额（scene-session-archive-design.md §4.1）；
     同剧情去重恢复（D4）、总量上限 MAX_SCENE_ARCHIVES（D5）。
     守卫顺序：身份类（等级/已完成）→ 去重恢复 → 活跃会话 → 角色存在性 →
     总量上限 → 创建。去重先于活跃守卫，且先于存在性校验（允许恢复已删角色的
@@ -5953,7 +5953,7 @@ async def _handle_session_command(
     if cmd in ("/会话列表", "#会话列表", "/会话", "#会话"):
         # 官方渠道键盘版（buttons P0/P1）：分页 + 切换/删除按钮。
         # 群聊 scope 只渲染「请私聊」引导（§9.2 私密数据不落群）。
-        # 文本视图（含剧情归档分组）原样保留给 OneBot / 降级路径。
+        # 文本视图（含剧情会话分组）原样保留给 OneBot / 降级路径。
         if _channel_supports_keyboard():
             _kb_md, _kb_rows = _session_render.render_session_page(
                 user_id, 1, "group" if group_id else "c2c",
@@ -6005,7 +6005,7 @@ async def _handle_session_command(
             await _safe_send("\n".join(lines))
             return True
 
-        # 开关开启：普通 / 剧情归档 / 角色创作 三段分组（B5）
+        # 开关开启：通用 / 剧情会话 / 角色创作 三段分组（B5）
         normal = [s for s in sessions
                   if (s.get("metadata") or {}).get("kind") not in NON_QUOTA_KINDS]
         scenes = [s for s in sessions
@@ -6016,19 +6016,19 @@ async def _handle_session_command(
         if not sessions:
             await _safe_send(
                 "你目前没有特殊会话。\n"
-                f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个普通会话；"
+                f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个通用会话；"
                 f"剧情/创作会话不计配额）。"
             )
             return True
 
-        lines = [f"普通会话 ({len(normal)}/{max_sessions}):"]
+        lines = [f"通用会话 ({len(normal)}/{max_sessions}):"]
         if normal:
             for s in normal:
                 lines.append(_row(s))
         else:
             lines.append("  （无）")
 
-        lines.append(f"\n剧情归档 {len(scenes)}（不计配额）:")
+        lines.append(f"\n剧情会话 {len(scenes)}（不计配额）:")
         if scenes:
             for s in scenes:
                 state = "已完结" if _scene_completed(s) else "进行中"
@@ -6048,8 +6048,8 @@ async def _handle_session_command(
                 lines.append(_row(s))
 
         lines.append(
-            f"\n共 {len(normal)}/{max_sessions} 个普通会话 · "
-            f"{len(scenes)} 个剧情归档（不计配额）"
+            f"\n共 {len(normal)}/{max_sessions} 个通用会话 · "
+            f"{len(scenes)} 个剧情会话（不计配额）"
         )
         await _safe_send("\n".join(lines))
         return True
@@ -6179,7 +6179,7 @@ async def _handle_session_command(
             return True
         if (active.metadata or {}).get("kind") in NON_QUOTA_KINDS:
             await _safe_send(
-                "剧情归档与角色创作会话不支持压缩：它们的历史是回看的真相源，"
+                "剧情会话与角色创作会话不支持压缩：它们的历史是回看的真相源，"
                 "压缩会不可逆地销毁细节。不再需要时可用 /删除会话 清理。")
             return True
         if active.total_messages < COMPRESS_MIN_MESSAGES:
@@ -6461,7 +6461,7 @@ async def _handle_special_command(command: str, user_id: str):
                 _scene_archives(user_id)
                 or any((s.get("metadata") or {}).get("kind") == CREATION_KIND
                        for s in _special_sessions.list_sessions(user_id))):
-            _clear_msg += "\n（注意：剧情归档与角色创作会话的历史也已被清除，回看内容不可恢复。）"
+            _clear_msg += "\n（注意：剧情会话与角色创作会话的历史也已被清除，回看内容不可恢复。）"
         await _safe_send(_clear_msg)
     elif command == "/status":
         status = agent.get_status()

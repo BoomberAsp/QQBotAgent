@@ -6214,9 +6214,9 @@ class TestSceneArchive:
             assert len(turn._quota_sessions(uid)) == 1  # 仅普通A
             # B6 删除尾行：普通 vs 剧情
             t_norm = turn._delete_quota_tail(uid, "")
-            assert "普通会话" in t_norm and "1/1" in t_norm, t_norm
+            assert "通用会话" in t_norm and "1/1" in t_norm, t_norm
             t_scene = turn._delete_quota_tail(uid, "bond_scene")
-            assert "配额不变" in t_scene and "剧情归档剩 1" in t_scene, t_scene
+            assert "配额不变" in t_scene and "剧情会话剩 1" in t_scene, t_scene
             t_create = turn._delete_quota_tail(uid, "char_creation")
             assert "配额不变" in t_create, t_create
             # T12：懒回填（无 completed 字段 + has_done_scene=True → 写回）

@@ -412,7 +412,7 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 
 模块级还提供启发式 token 估算 `estimate_text_tokens()` / `estimate_context_tokens()`（CJK≈1 token/字、其余≈4 字/token，正则计数、无 tiktoken 依赖），供压缩阈值与 `/压缩会话` 展示口径使用。
 
-**剧情归档与配额豁免**（详见 `docs/scene-session-archive-design.md`）：`metadata.kind` 为 `bond_scene`（剧情）/`char_creation`（角色创作）的会话**不计入**按角色的数量配额（10/3/1 只约束普通特殊会话）。剧情走到结局由 `agent/turn.py::_finish_bond_scene` 经 `update_metadata` 写入 `completed=true` + `completed_at`（封档真源），随后 `end_active`——会话保留，可 `/切换会话` 回看，回看时 `is_scene=false`（不再注入剧情指令/剧本、工具集无 `complete_scene`）。`completed` 缺失的存量会话按“未完结”处理，并在 `/剧情` 去重与 `is_scene` 判定两个热点懒回填。剧情会话总量上限由 `MAX_SCENE_ARCHIVES`（默认 20，含进行中与已完结）在 `turn.py` 层强制；`SCENE_ARCHIVE_ENABLED=0`（热读）为紧急回滚开关，退回统一配额语义。`create()` 本身仍不检查任何配额——普通配额与剧情上限都在 `turn.py` 命令层强制。
+**剧情会话与配额豁免**（详见 `docs/scene-session-archive-design.md`）：`metadata.kind` 为 `bond_scene`（剧情）/`char_creation`（角色创作）的会话**不计入**按角色的数量配额（10/3/1 只约束通用会话）。剧情走到结局由 `agent/turn.py::_finish_bond_scene` 经 `update_metadata` 写入 `completed=true` + `completed_at`（封档真源），随后 `end_active`——会话保留，可 `/切换会话` 回看，回看时 `is_scene=false`（不再注入剧情指令/剧本、工具集无 `complete_scene`）。`completed` 缺失的存量会话按“未完结”处理，并在 `/剧情` 去重与 `is_scene` 判定两个热点懒回填。剧情会话总量上限由 `MAX_SCENE_ARCHIVES`（默认 20，含进行中与已完结）在 `turn.py` 层强制；`SCENE_ARCHIVE_ENABLED=0`（热读）为紧急回滚开关，退回统一配额语义。`create()` 本身仍不检查任何配额——通用会话配额与剧情上限都在 `turn.py` 命令层强制。
 
 **存储结构**:
 ```
@@ -1644,7 +1644,7 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | `/tokens` Token 消耗 | `lib/token_ledger.py` 数据源；缓存命中率分口径观测（按提供商/模型分离） |
 | `/audit` 工具审计 | `data/audit/` JSONL 审计日志 + 面板自身操作审计（`audit.py`） |
 | `/feedback` 用户反馈 | `#反馈`/`#bug`/`#建议` 提交的处理流 |
-| `/sessions` 会话管理 | 临时会话查看/清除（写前备份到 `BACKUP_DIR/sessions`）、特殊会话查看（剧情/已完结/角色创作徽标 + 普通配额摘要 `q/max · 剧情归档 k`；`special_list` 展平 `kind`/`completed`/`counts_quota`） |
+| `/sessions` 会话管理 | 临时会话查看/清除（写前备份到 `BACKUP_DIR/sessions`）、特殊会话查看（剧情/已完结/角色创作徽标 + 通用会话配额摘要 `q/max · 剧情会话 k`；`special_list` 展平 `kind`/`completed`/`counts_quota`） |
 | `/tasks` 任务日志 | `data/task_log/{uid}.jsonl` 子任务记录浏览 |
 | `/memory` 记忆与画像 | MemorySystem Markdown 编辑、三层记忆查看、画像 JSON 编辑 |
 | `/workspace` 工作区磁盘 | 按用户配额/占用展示（角色感知） |

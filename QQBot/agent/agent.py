@@ -799,7 +799,7 @@ class Agent:
             # Bond story-scene session (Bond-System-Design.md §4.4 形态3, P3):
             # scene sessions carry metadata {"kind": "bond_scene", ...} and get
             # complete_scene in allowed_tools (turn.py). The script body follows.
-            # 已封档（completed=true）的剧情按普通特殊会话运行：不再注入场景
+            # 已封档（completed=true）的剧情按特殊会话运行：不再注入场景
             # 指令与剧本（scene-session-archive-design.md D3/清单 #5b），否则
             # 模型会反复尝试 complete_scene 并被 turn.py 守卫弹回。
             elif (special_session.metadata or {}).get("kind") == "bond_scene" \
