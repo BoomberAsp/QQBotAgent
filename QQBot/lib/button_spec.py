@@ -53,6 +53,7 @@ _CMD_DATA_LIMIT = 60      # 指令按钮 data 保守上限（含 @bot 前缀余�
 _CB_DATA_LIMIT = 64       # 回调 data 上限（平台 64 字符）
 _URL_LIMIT = 200
 _LABEL_WIDTH = 10         # 显示宽度（1 汉字 = 2）
+_MODAL_MAX_CHARS = 30     # modal.content 上限（超长平台回 40011021，整条消息被拒）
 
 
 @dataclass
@@ -186,6 +187,11 @@ def validate(rows: Rows, *, max_rows_: int | None = None,
                         f"{where}: cb payload malformed: {btn.data[:40]!r}")
                 elif len(btn.data) > _CB_DATA_LIMIT:
                     problems.append(f"{where}: cb data too long")
+                if btn.modal and len(btn.modal) > _MODAL_MAX_CHARS:
+                    problems.append(
+                        f"{where}: modal too long "
+                        f"({len(btn.modal)} > {_MODAL_MAX_CHARS}): "
+                        f"{btn.modal[:40]!r}")
             elif btn.action == "url":
                 if not (btn.data or "").startswith("https://"):
                     problems.append(f"{where}: url button needs https://")

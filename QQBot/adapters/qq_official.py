@@ -160,8 +160,11 @@ def _md_record_success() -> None:
 #   40034029 内联键盘行/列超限、304062 按钮数量上限 → 先裁剪重试一次
 # 其余连续被拒走短熔断（3 次/600s），任何键盘失败都不丢正文：
 # kb → md-only（L1）→ 纯文本+命令清单（L2）。
+# 40011021 = 请求参数 rows.buttons.action.modal.content 无效（弹窗文案超长/
+# 非法）。平台按**整条消息**拒绝，不降级等于把正文也丢了。
 _KB_REJECT_CODES = frozenset({
     304037, 304038, 304039, 304040, 305007, 40034029, 304062,
+    40011021,
 })
 _KB_CLIP_CODES = frozenset({40034029, 304062})
 _KB_BUG_CODES = frozenset({304038, 304039, 304040, 305007})
@@ -810,9 +813,12 @@ class QQOfficialSender:
                 return
             except ActionFailed as e:
                 code = getattr(e, "code", None)
-                # 1) keyboard rejected → clip retry / strip to md-only
+                # 1) keyboard rejected → clip retry / strip to md-only.
+                #    判据是「载荷里有没有键盘」而不是错误码白名单：平台新加的
+                #    键盘校验码（如 40011021 modal.content）以前会落到最后的
+                #    log-and-drop，把正文一起静默丢掉（2026-11-01 线上事故）。
                 if (kb is not None and not kb_dropped
-                        and code in _KB_REJECT_CODES):
+                        and code not in _MD_REJECT_CODES):
                     if code in _KB_CLIP_CODES and not clipped:
                         clipped = True
                         rows = clip_rows(kb.rows)
@@ -823,7 +829,12 @@ class QQOfficialSender:
                         message = self._kb_message(md_text, rows)
                         continue
                     kb_dropped = True
-                    _kb_record_reject(code)
+                    if code in _KB_REJECT_CODES:
+                        _kb_record_reject(code)
+                    else:
+                        logger.warning(
+                            f"[qq_official] keyboard rejected with unknown "
+                            f"code={code}; treating as keyboard fault")
                     logger.warning(
                         f"[qq_official] keyboard rejected (code={code}); "
                         f"retrying markdown-only")
@@ -1145,13 +1156,6 @@ async def send_active_c2c_markdown(bot: QQBot, openid: str, md_text: str,
                         f"[qq_official] envelope keyboard over-limit "
                         f"(code={code}); clipped, retrying")
                     continue
-                if code in _KB_REJECT_CODES:
-                    _kb_record_reject(code)
-                    logger.warning(
-                        f"[qq_official] envelope keyboard rejected "
-                        f"(code={code}); retrying markdown-only")
-                    tier = "md" if md_on else "plain"
-                    continue
                 if code in _MD_REJECT_CODES:
                     _md_record_reject()
                     _kb_record_reject(code)  # md dead ⇒ kb dead: converge
@@ -1160,6 +1164,18 @@ async def send_active_c2c_markdown(bot: QQBot, openid: str, md_text: str,
                         f"({e!r}); retrying plain text")
                     tier = "plain"
                     continue
+                # 其余一律按键盘问题降级（含平台新增的未归类错误码）
+                if code in _KB_REJECT_CODES:
+                    _kb_record_reject(code)
+                else:
+                    logger.warning(
+                        f"[qq_official] envelope keyboard rejected with "
+                        f"unknown code={code}; treating as keyboard fault")
+                logger.warning(
+                    f"[qq_official] envelope keyboard rejected "
+                    f"(code={code}); retrying markdown-only")
+                tier = "md" if md_on else "plain"
+                continue
             elif tier == "md":
                 if code in _MD_REJECT_CODES:
                     _md_record_reject()

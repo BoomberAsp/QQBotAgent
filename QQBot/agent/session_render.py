@@ -27,6 +27,17 @@ from lib.button_spec import Btn, Rows, stamp
 
 SESSION_PAGE_SIZE = 3   # 3 session rows + nav row + footer row ≤ 5 rows
 
+# 官方平台对 action.modal.content 有长度限制：超长时**整条**键盘消息被拒
+# （40011021「请求参数 rows.buttons.action.modal.content 无效」），连正文一起丢。
+# 所以弹窗文案统一压缩，名字超过 MODAL_NAME_MAX 字折叠省略。
+MODAL_NAME_MAX = 10
+
+
+def _fold_name(name: str, limit: int = MODAL_NAME_MAX) -> str:
+    """超过 limit 的名字折叠成「前 limit 字…」（供 modal 文案控长）。"""
+    name = str(name or "")
+    return name if len(name) <= limit else name[:limit] + "…"
+
 
 def _persona_note(meta: dict, registry, user_id: str) -> str:
     """Mirror of turn.py /会话列表's persona annotation (keep in sync)."""
@@ -125,7 +136,7 @@ def render_session_page(
                 style=0 if is_cur else 1, visited="当前" if is_cur else ""),
             Btn(label=f"删 {i}", data=f"qb1:session.del:{i}:{ver}",
                 action="cb", style=1, admin_only=False,
-                modal=f"确认删除会话「{s['name']}」？关联文件会一并清理，此操作不可撤销。"),
+                modal=f"删除会话「{_fold_name(s['name'])}」及其文件？不可撤销。"),
         ])
 
     if total_pages > 1:
@@ -189,7 +200,7 @@ def render_character_page(user_id: str, *, registry) -> tuple[str, Rows]:
             rows.append([Btn(
                 label=f"删 {i}", data=f"qb1:char.del:{i}:{ver}",
                 action="cb", style=1,
-                modal=f"确认删除角色「{display}」？好感度记录会保留，此操作不可撤销。")])
+                modal=f"删除角色「{_fold_name(display)}」？好感度保留，不可撤销。")])
     if len(metas) > CHAR_PAGE_SIZE:
         lines.append("（更多角色请用 /删除角色 <名称> 删除）")
     lines.append("\n好感度记录在删除后保留；重建同名角色不会自动继承。")
