@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import config
+from lib.bond_names import reconcile as reconcile_bond_name
 
 DATA = config.QQBOT_DIR / "data"
 TOKEN_DIR = DATA / "token_usage"
@@ -957,6 +958,11 @@ def wiki_aliases_missing(kind: str) -> dict:
     canonicals = {str(c) for c in flat.values()}
 
     gd_entries = _gamedata_entries(kind)
+    if kind in ("char", "bond"):
+        for title, entry in data.items():
+            if isinstance(entry, dict):
+                entry.setdefault("title", title)
+                reconcile_bond_name(entry, gd_entries)
     reported_ids = set()
     items, seen = [], set()
     for title, entry in data.items():
@@ -975,7 +981,7 @@ def wiki_aliases_missing(kind: str) -> dict:
             continue
         seen.add(canon)
         reported_ids.add(eid)
-        hint = list(dict.fromkeys(x for x in [canon, title, zh, en, eid] if x))
+        hint = list(dict.fromkeys(x for x in [canon, title, zh, en, eid, *entry.get("name_aliases", [])] if x))
         items.append({"canonical": canon, "title_en": title,
                       "aliases_hint": hint, "source": "wiki"})
 
@@ -1093,6 +1099,12 @@ def _details_load(kind: str) -> tuple[Path | None, dict | None, str | None]:
         blob = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(blob, dict) or not isinstance(blob.get("data"), dict):
             return path, None, "详情缓存格式异常（缺少 data 对象）"
+        if kind in ("char", "bond"):
+            artifacts = _gamedata_entries(kind)
+            for title, entry in blob["data"].items():
+                if isinstance(entry, dict):
+                    entry.setdefault("title", title)
+                    reconcile_bond_name(entry, artifacts)
         return path, blob, None
     except Exception as e:
         return path, None, f"详情缓存读取失败: {e}"
@@ -1246,6 +1258,8 @@ def wiki_details_save_fields(kind: str, title: str, fields: dict) -> dict:
             else:
                 if not isinstance(value, str):
                     return {"error": f"{key}: 值必须是字符串"}
+                if kind in ("char", "bond") and parts[0] == "name_cn" and entry.get("name_cn") != value:
+                    entry["name_aliases"] = list(dict.fromkeys([*entry.get("name_aliases", []), entry.get("name_cn", "")]))
                 entry[parts[0]] = value
         else:
             return {"error": f"字段不在白名单内: {key}"}

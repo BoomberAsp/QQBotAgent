@@ -95,7 +95,9 @@ def build_entry(rid: str, g: dict, wiki: dict | None, gd: dict) -> dict:
     entry = dict(wiki or {})                      # 以 wiki 为骨架（保留 multi/discs/pot）
     entry["id"] = rid
     entry["title"] = names.get("en") or (wiki or {}).get("title") or rid
-    entry["name_cn"] = names.get("zh_hans") or (wiki or {}).get("name_cn") or rid
+    from lib.game_names import reconcile
+    reconcile(entry, {rid: g})
+    entry.pop("_card_hash", None)  # recompute from the complete merged card
     entry["stars"] = g.get("star") or (wiki or {}).get("stars")
     entry["element"] = ELEMENT_MAP_HINT.get(g.get("element") or "", (wiki or {}).get("element"))
     entry["element_en"] = g.get("element") or (wiki or {}).get("element_en")

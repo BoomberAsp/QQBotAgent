@@ -18,6 +18,7 @@ import os
 import sys
 
 from tools.name_resolver import get_resolver
+from lib.bond_names import artifact_path, load_artifacts, reconcile as reconcile_bond_name
 from lib.paths import wiki_cache_dir
 
 
@@ -46,6 +47,12 @@ def _load() -> dict:
         mtime = os.path.getmtime(_CACHE_PATH)
     except OSError:
         mtime = None
+    try:
+        stat = artifact_path().stat()
+        artifact_stamp = (stat.st_mtime_ns, stat.st_size)
+    except (OSError, AttributeError):
+        artifact_stamp = None
+    mtime = (mtime, artifact_stamp)
     if _data is not None and mtime == _data_mtime:
         return _data
     _data_mtime = mtime
@@ -62,9 +69,12 @@ def _load() -> dict:
     _by_cn_name = {}
     _by_title = {}
     _by_id = {}
-    for entry in _data.values():
+    artifacts = load_artifacts()
+    for title, entry in _data.items():
         if not isinstance(entry, dict):
             continue
+        entry.setdefault("title", title)
+        reconcile_bond_name(entry, artifacts)
         cn = entry.get("name_cn")
         if cn:
             _by_cn_name[cn] = entry
@@ -74,6 +84,11 @@ def _load() -> dict:
         cid = entry.get("id")
         if cid:
             _by_id[str(cid).strip().upper()] = entry
+
+    for entry in _data.values():
+        if isinstance(entry, dict):
+            for alias in entry.get("name_aliases", []):
+                _by_cn_name.setdefault(alias, entry)
 
     return _data
 

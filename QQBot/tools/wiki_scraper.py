@@ -11,6 +11,8 @@ Data sources:
   - Static config/gacha_data.json → banner probability weights (merged)
 """
 
+from lib.bond_names import load_artifacts, reconcile as reconcile_bond_name
+from lib.game_names import load_roles, reconcile as reconcile_character_name
 import asyncio
 import copy
 import hashlib
@@ -980,6 +982,10 @@ class WikiScraper:
             print(f"[WikiScraper] restored {restored} manually-edited field(s) "
                   f"across {len(manual_old)} changed entries", file=sys.stderr)
 
+        roles = load_roles()
+        for title, entry in result.items():
+            reconcile_character_name(entry, roles, existing.get(title))
+
         # Stamp each entry with its content hash so the card renderer can skip
         # re-drawing unchanged cards.
         for entry in result.values():
@@ -1136,6 +1142,9 @@ class WikiScraper:
             return False
         if entry.get("name_cn") == canonical:
             return False
+        old_name = entry.get("name_cn")
+        if old_name:
+            entry["name_aliases"] = list(dict.fromkeys([*entry.get("name_aliases", []), old_name]))
         entry["name_cn"] = canonical
         return True
 
@@ -1314,6 +1323,8 @@ class WikiScraper:
             return {"error": "未配置 LLM 客户端，无法重翻译"}
         if kind == "char":
             for c in entries:
+                if c.get("name_cn"):
+                    c["name_aliases"] = list(dict.fromkeys([*c.get("name_aliases", []), c["name_cn"]]))
                 # Intentional overwrite: drop the manual-edit marker so the
                 # merge guard does not protect fields the panel asked to redo.
                 c.pop("_manual_fields", None)
@@ -1324,8 +1335,13 @@ class WikiScraper:
                     for key in ("name", "des", "des2", "burst"):
                         s[key] = s.get(key + "_en", "")
             await self._translate_character_details(entries)
+            roles = load_roles()
+            for entry in entries:
+                reconcile_character_name(entry, roles)
         else:
             for b in entries:
+                if b.get("name_cn"):
+                    b["name_aliases"] = list(dict.fromkeys([*b.get("name_aliases", []), b["name_cn"]]))
                 b.pop("_manual_fields", None)
                 b["name_cn"] = b.get("title", "")
             await self._translate_bond_details(entries)
@@ -1729,6 +1745,11 @@ class WikiScraper:
                   f"field(s) across {len(manual_old)} changed entries",
                   file=sys.stderr)
 
+        # Also heal unchanged cached entries; retain historical names from changed rows.
+        artifacts = load_artifacts()
+        for title, entry in result.items():
+            reconcile_bond_name(entry, artifacts, existing.get(title))
+
         # Stamp each entry with its content hash for card-render dedup.
         for entry in result.values():
             entry["_card_hash"] = self._entry_card_hash(entry)
@@ -1888,6 +1909,9 @@ class WikiScraper:
 
         if self.llm_client:
             await self._llm_translate_bond_details(bonds)
+        artifacts = load_artifacts()
+        for entry in bonds:
+            reconcile_bond_name(entry, artifacts)
 
     async def _llm_translate_bond_details(self, bonds: list[dict]):
         """Batch-translate desc/effect/notes/obtain (+ unmapped name) via LLM."""
