@@ -27,7 +27,7 @@ fi
 echo -e "${GREEN}[INFO]${NC} 运行所有测试..."
 echo ""
 
-python -m unittest test_context_memory_phase1 test_reliability_p1 test_cognition_p23 test_mail_buttons -v
+python -m unittest test_context_memory_phase1 test_reliability_p1 test_cognition_p23 test_experience_p4 test_legacy_migration test_mail_buttons -v
 COGNITION_EXIT=$?
 
 python test_agent.py

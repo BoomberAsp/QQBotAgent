@@ -2031,6 +2031,7 @@ def _finalize_subtask(
         status=status,
         failure=failure,
         follow_ups=follow_ups,
+        task_id=(task or {}).get("task_id", ""),
     )
     append_task_log(user_id, record)
     from agent.cognitive_state import current_scope, current_generation
@@ -6917,5 +6918,8 @@ try:
     from nonebot import get_driver as _recovery_driver
     _recovery_driver().on_startup(_profile_manager.start_recovery)
     _recovery_driver().on_shutdown(_profile_manager.stop_recovery)
+    if agent.experience:
+        _recovery_driver().on_startup(agent.experience.start_recovery)
+        _recovery_driver().on_shutdown(agent.experience.stop_recovery)
 except ValueError:
     pass  # offline tests may import without a running driver

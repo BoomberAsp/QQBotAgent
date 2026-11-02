@@ -144,6 +144,8 @@ class CognitiveState:
             # projections in this scope rather than leaving stale derived text.
             db.execute("DELETE FROM fragments WHERE owner=? AND scope=?",(owner,scope))
             db.execute("DELETE FROM tasks WHERE owner=? AND scope=?",(owner,scope))
+            from .experience_store import invalidate_attached
+            invalidate_attached(db,self.path,owner,scope)
     def forget(self, owner, scope, fid=None):
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -158,6 +160,8 @@ class CognitiveState:
             db.execute("UPDATE scopes SET generation=generation+1 WHERE owner=? AND scope=?",(owner,scope))
             db.execute("DELETE FROM fragments WHERE owner=? AND scope=?",(owner,scope))
             db.execute("DELETE FROM tasks WHERE owner=? AND scope=?",(owner,scope))
+            from .experience_store import invalidate_attached
+            invalidate_attached(db,self.path,owner,scope)
     def clear_context(self, owner, scope):
         """Invalidate working context without deleting durable facts."""
         with self.db() as db:
@@ -166,6 +170,8 @@ class CognitiveState:
             db.execute("UPDATE scopes SET generation=generation+1 WHERE owner=? AND scope=?",(owner,scope))
             db.execute("DELETE FROM fragments WHERE owner=? AND scope=?",(owner,scope))
             db.execute("DELETE FROM tasks WHERE owner=? AND scope=?",(owner,scope))
+            from .experience_store import invalidate_attached
+            invalidate_attached(db,self.path,owner,scope)
 
     def versions(self, owner, scope, fid):
         with self.db() as db:
@@ -175,6 +181,8 @@ class CognitiveState:
         with self.db() as db:
             self._scope(db,owner,scope)
             db.execute("UPDATE scopes SET paused=?,generation=generation+1 WHERE owner=? AND scope=?",(int(paused),owner,scope))
+            from .experience_store import invalidate_attached
+            invalidate_attached(db,self.path,owner,scope)
     def task(self, owner, scope, update=None, expected_revision=None, expected_generation=None):
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")

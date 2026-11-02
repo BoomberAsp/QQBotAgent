@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "kind": "deterministic_offline_experience_correctness",
+  "date": "2026-11-02",
+  "python": "3.12.3",
+  "git_head": "30669439fefb4a07b9bfea841d072635aaeaaebe",
+  "source_sha256": {
+    "QQBot/agent/experience_store.py": "67e527443b47b79fa99a78ee118bbac67a402a4e9c3127b41ad59cf0df00371e",
+    "QQBot/agent/experience_service.py": "fdcb6ea297dc36f2ef227b978f0348772635b9bcd6f48dce1db090f60b158900",
+    "QQBot/agent/cognitive_state.py": "4a916f2ffe5d5b2ca75d9ababf2357d027c2b133896dc07fcdbe4204135043c6",
+    "QQBot/agent/agent.py": "a27d465ee68721ada42421edb268a11f05905a42940032f929aef2aed6d44bc7",
+    "QQBot/agent/task_record.py": "988ca780adc5a8db19c43ec07545b87675ff78a49a8ee108a3e9bcc519946e0b",
+    "QQBot/agent/turn.py": "d3d0148595e0602053e68e255dbdf148bec069945555118e87df6050189001fd",
+    "QQBot/test_experience_p4.py": "b422d5f9bb2f110f39fcf514594fd7c60df2d579df300d9672f92a025faef5dd",
+    "scripts/experience_admin.py": "dd7400f2e2e41e041b0e6caee693227fe40813383d899b80e29e1f3570045bad",
+    "QQBot/benchmarks/experience/run.py": "25fb607cfb7acea6adb1b55e0eb480f8a0bcc98b0fbb8f11adaadbaacaf4e20f"
+  },
+  "tests": {
+    "run": 25,
+    "failures": 0,
+    "errors": 0,
+    "elapsed_seconds": 2.269
+  },
+  "retrieval_ablation": {
+    "none": {
+      "matched_blocks": [
+        0,
+        0
+      ],
+      "injected_characters": [
+        0,
+        0
+      ],
+      "cross_owner_matches": 0
+    },
+    "success_only": {
+      "matched_blocks": [
+        1,
+        0
+      ],
+      "injected_characters": [
+        169,
+        0
+      ],
+      "cross_owner_matches": 0
+    },
+    "success_and_failure": {
+      "matched_blocks": [
+        2,
+        0
+      ],
+      "injected_characters": [
+        352,
+        0
+      ],
+      "cross_owner_matches": 0
+    }
+  },
+  "limitations": [
+    "Synthetic retrieval fixtures, not model task-success evaluation",
+    "No provider requests or production user data",
+    "Human review is a trusted operator assertion, not automatic proof of general usefulness",
+    "No real power-loss or multi-host filesystem test"
+  ]
+}

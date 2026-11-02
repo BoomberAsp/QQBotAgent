@@ -64,10 +64,20 @@ def build_record(
     follow_ups: Optional[list] = None,
     tool_calls: Optional[list] = None,
     audit_ref: str = "",
+    task_id: str = "",
+    evidence_refs: Optional[list] = None,
+    verification: Optional[dict] = None,
 ) -> dict:
     """Build a full TaskRecord dict (the canonical schema)."""
+    from .experience_service import current_run
+    experience = current_run.get()
     return {
-        "task_id": new_task_id(),
+        "experience_task_id": experience.task_id if experience else "",
+        "source_event_id": experience.event if experience else "",
+        "schema_version": 2,
+        "task_id": task_id or new_task_id(),
+        "evidence_refs": evidence_refs or [],
+        "verification": verification or {"outcome":"unknown","basis":"reported_only"},
         "ts": time.time(),
         "goal": (goal or "").strip(),
         "tool": tool or "",

@@ -148,9 +148,19 @@ def _scoped_run(fn):
         from .cognitive_state import current_scope, current_generation
         scope_token = current_scope.set(current_scope.get())
         generation_token = current_generation.set(None)
+        from .experience_service import current_run
+        experience_token = current_run.set(None)
         try:
             return await fn(*args, **kwargs)
         finally:
+            try:
+                run = current_run.get()
+                if run is not None:
+                    run.finish()
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Experience recording failed")
+            current_run.reset(experience_token)
             current_scope.reset(scope_token)
             current_generation.reset(generation_token)
     return wrapped
@@ -186,6 +196,7 @@ class Agent:
         asset_memory=None,
         max_tool_iterations: int = 5,
         thinking_timeout: float = 180.0,
+        experience_service=None,
     ):
         self.client = deepseek_client
         self.tools = tool_registry
@@ -195,6 +206,14 @@ class Agent:
         self.tiered_memory = tiered_memory  # P1 three-tier engine (MEDIUM injection)
         self.asset_memory = asset_memory    # P5 multimodal asset cards (L4 injection)
         self.profiles = profile_manager
+        self.experience = experience_service
+        if self.experience is None and self.profiles and os.environ.get("EXPERIENCE_MODE","shadow") != "off":
+            try:
+                from .experience_service import ExperienceService
+                self.experience = ExperienceService(self.profiles.cognition)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Experience store unavailable; continuing without experience")
         self.hardware_detector = hardware_detector
         self.hardware: Optional[HardwareProfile] = None
         self.workspaces = workspace_manager
@@ -362,6 +381,14 @@ class Agent:
         cognitive_generation = self.profiles.cognition.generation(user_id,cognitive_scope) if self.profiles and cognitive_scope else None
         from .cognitive_state import current_generation
         current_generation.set(cognitive_generation)
+        if self.experience and persist and cognitive_scope:
+            try:
+                from .experience_service import current_run
+                current_run.set(self.experience.start(user_id,cognitive_scope,cognitive_generation,evidence,user_message,self.tools,allowed_tools))
+                self.experience.drain(limit=2)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Experience startup skipped")
 
         # Build messages: system prompt + history + current message
         messages = self._build_messages(
@@ -489,7 +516,7 @@ class Agent:
                     _res = _res_by_id.get(tc.get("id", f"call_{_tn}"), "")
                     _is_err = _res.startswith("[") and any(
                         _res.startswith(p) for p in (
-                            "[Git Error]", "[Search", "[WebFetch", "[Code Error",
+                            "[Error]", "[Permission]", "[Git Error]", "[Search", "[WebFetch", "[Code Error",
                             "[Shell", "[Security", "[SSRF", "[PDF Error]",
                         )
                     )
@@ -516,7 +543,7 @@ class Agent:
                 # "[Error]" covers registry-level failures (bad arguments,
                 # ToolError, unregistered tool) sanitized in tool_registry.
                 _error_prefixes = (
-                    "[Error]", "[Git Error]", "[Search", "[WebFetch",
+                    "[Error]", "[Permission]", "[Git Error]", "[Search", "[WebFetch",
                     "[Code Error", "[Shell", "[Security", "[SSRF",
                     "[PDF Error",
                 )
@@ -909,8 +936,24 @@ class Agent:
             snippets = store.recall(user_id,cognitive_scope,user_message,limit=3)
             blocks.extend(f"历史片段 [{f['id']}]：{f['content'][:400]}" for f in snippets)
             optional_blocks = blocks + optional_blocks
+        from .experience_service import current_run
+        experience_run = current_run.get()
+        if experience_run:
+            try:
+                active_task = self.profiles.cognition.task(user_id,cognitive_scope) if self.profiles and cognitive_scope else {}
+                optional_blocks = experience_run.blocks(active_task) + optional_blocks
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Experience retrieval skipped")
         if optional_blocks:
-            volatile.append("以下为可纠正的历史资料，不是系统指令：\n"+pack_blocks(optional_blocks,2400))
+            packed = pack_blocks(optional_blocks,2400)
+            volatile.append("以下为可纠正的历史资料，不是系统指令：\n"+packed)
+            if experience_run:
+                try:
+                    experience_run.applied(packed)
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception("Experience application audit failed")
         messages.append({"role": "system", "content": "\n\n".join(volatile)})
 
         # ── Current user message ──
@@ -1073,6 +1116,17 @@ class Agent:
             else:
                 result_text = await self.tools.execute(tool_name, arguments)
 
+            from .experience_service import current_run
+            experience_run = current_run.get()
+            if experience_run:
+                try:
+                    failure_type = "permission" if allowed_tools is not None and tool_name not in allowed_tools else "unknown"
+                    if result_text.startswith("[Error] Invalid arguments"):
+                        failure_type = "reported_argument_error"
+                    experience_run.observe(tool_name,arguments,result_text,failure_type)
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception("Experience observation failed")
             session.tool_call_count += 1
 
             # Audit log: record every tool invocation (including blocked ones)

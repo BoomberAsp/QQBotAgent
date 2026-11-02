@@ -1013,3 +1013,15 @@ docker compose run --rm searxng cat /etc/searxng/settings.yml  # 验证挂载
 新运行时按用户、平台/机器人、群聊、角色及特殊会话隔离记忆；支持 `/记忆 列表`、`历史 <id>`、`修正 <id> <内容>`、`删除 <id>`、`清空 确认`、`暂停/恢复`。纠正与遗忘会使旧抽取和本范围派生上下文失效。`/clear` 清理工作上下文和任务状态，保留长期事实。
 
 新增持久 TaskState、独立分段摘要、相关历史回读和可选资料共享注入预算。旧记忆不自动迁入；删除命令不删除旧档案、影音、任务日志和备份。详细行为、验收命令和上线边界见 `docs/P2-P3实施验收记录.md`（本地文档）；确定性回归入口为 `QQBot/test_cognition_p23.py`。
+
+
+### 旧记忆迁移
+
+提供 `scripts/migrate_legacy_cognition.py`，默认只读预览，`--apply` 才备份并建立新库；必须显式提供用户范围映射。支持 P2/P3 启用前的幂等重跑与补迁，新库被运行时修改后拒绝覆盖。服务器已完成一次全量快照迁移，旧机器人继续运行，正式发布前需停写并再次补迁。操作与实测结果见本地 `docs/旧记忆迁移操作与验收.md`，测试为 `QQBot/test_legacy_migration.py`。
+
+
+### P4 私有任务经验（开发机实现）
+
+新增可信工具观察 → 私有候选 → 操作员复核 → 版本发布 → 受控检索闭环。默认 `EXPERIENCE_MODE=shadow`，只记录和审计，不影响回答；未验证的模型成功声明不会自动发布。经验与用户/角色/会话范围绑定，支持撤回、回滚、到期清理及与遗忘联动。
+
+管理入口为 `scripts/experience_admin.py`，持久数据位于 `{USER_DATA_ROOT}/_experience/`。`mode off` 可关闭运行中已初始化的经验服务；`inject` 需先复核发布，最多注入 2 条、800 字符，并服从共享上下文预算。离线验收入口：`QQBot/test_experience_p4.py` 和 `QQBot/benchmarks/experience/run.py`；详细操作见本地 `docs/P4实施验收记录.md`。本阶段未部署服务器，合成检索成绩不代表真实模型任务效果。
