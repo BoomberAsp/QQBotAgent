@@ -13733,6 +13733,68 @@ class TestAnnouncementBroadcast:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestWebuiWorkspace:
+    """58. WebUI 工作区磁盘（身份/共享目录）。
+
+    回归：官方 openid 曾一律按 OneBot 表解析 → 管理员/VIP 掉成「普通」；
+    USER_DATA_ROOT 下的共享数据目录（memory/gamedata/characters…）曾被
+    当成 0 字节的普通用户列出来。
+    """
+
+    def run(self):
+        print_header("58. WebUI 工作区磁盘（身份/共享目录）")
+        from pathlib import Path as _Path
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from webui import data_reader as dr
+        from agent.permissions import PermissionManager
+
+        tmp = _Path(tempfile.mkdtemp(prefix="webui_ws_"))
+        root = tmp / "users"
+        root.mkdir()
+        qq_admin = "971561405"
+        off_admin = "FE003FAF76C4817251FDC128A16753BB"
+        off_vip = "30584554AA2BF4E72BD3B8F27A70339D"
+        regular = "ABCDEF1234567890ABCDEF1234567890"
+        try:
+            for uid in (qq_admin, off_admin, off_vip, regular):
+                (root / uid / "workspace").mkdir(parents=True)
+                (root / uid / "workspace" / "a.txt").write_text(
+                    "x", encoding="utf-8")
+            for name in ("gamedata", "memory", "characters", "bonds",
+                         "bond_events", "assets", "mailboxes", "story_kb",
+                         "wiki_cache", "_cognition"):
+                (root / name).mkdir()
+            # 保留名即使长出 workspace/ 也不能被当成用户
+            (root / "characters" / "workspace").mkdir()
+            env = tmp / ".env"
+            env.write_text(
+                f'SUPERUSERS=["{qq_admin}"]\n'
+                f'QQ_OFFICIAL_SUPERUSERS=["{off_admin}"]\n'
+                f'QQ_OFFICIAL_VIP_USERS=["{off_vip}"]\n',
+                encoding="utf-8")
+            with patch.object(dr.config, "USER_DATA_ROOT", root), \
+                    patch.object(PermissionManager, "_ENV_FILE", env):
+                stats = dr.workspace_stats()
+                assert dr.workspace_tree("gamedata")["error"] == "工作区不存在"
+            rows = {u["user_id"]: u for u in stats["users"]}
+            assert set(rows) == {qq_admin, off_admin, off_vip, regular}, rows
+            assert rows[qq_admin]["role"] == "admin"
+            assert rows[qq_admin]["platform"] == "onebot"
+            assert rows[off_admin]["role"] == "admin"
+            assert rows[off_admin]["platform"] == "qq_official"
+            assert rows[off_vip]["role"] == "vip"
+            assert rows[regular]["role"] == "regular"
+            assert rows[qq_admin]["quota"] == 2048 * 1024 * 1024
+            assert rows[off_vip]["quota"] == 500 * 1024 * 1024
+            assert rows[regular]["quota"] == 100 * 1024 * 1024
+            assert stats["total_used"] == 4      # 仅 4 个真实用户各 1 字节
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        print_pass("58. 工作区磁盘：官方 openid 按官方身份表解析；共享目录不列为用户")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -13800,6 +13862,7 @@ def main():
         ("Proactive Mail (角色信箱 v1)", TestProactiveMail()),
         ("Mail Admin (WebUI 邮件管理 §16.2/§16.4)", TestMailAdmin()),
         ("Announcement Broadcast (公告群发 §16.3/§16.5)", TestAnnouncementBroadcast()),
+        ("WebUI Workspace Disk (工作区磁盘身份/共享目录)", TestWebuiWorkspace()),
     ]
 
     passed = 0

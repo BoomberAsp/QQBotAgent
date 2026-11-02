@@ -31,13 +31,14 @@
       document.querySelector('#tbl-ws tbody').innerHTML = d.users.length
         ? d.users.map(u => `<tr>
             <td class="mono">${esc(u.user_id)}</td>
+            <td>${u.platform === 'qq_official' ? 'QQ 官方' : 'OneBot'}</td>
             <td>${u.role === 'admin' ? '管理员' : u.role === 'vip' ? 'VIP' : '普通'}</td>
             <td class="mono">${fmtBytes(u.used)}</td>
             <td class="mono">${fmtBytes(u.quota)}</td>
             <td style="min-width:180px">${bar(u.percent)}</td>
             <td><button class="btn btn-sm" data-tree="${esc(u.user_id)}">文件树</button></td>
           </tr>`).join('')
-        : '<tr><td colspan="6" class="muted">没有用户工作区</td></tr>';
+        : '<tr><td colspan="7" class="muted">没有用户工作区</td></tr>';
     } catch (e) {
       toast(e.message, 'error');
     }
