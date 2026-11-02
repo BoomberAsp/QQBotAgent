@@ -700,7 +700,7 @@ Anti-bot handling is a two-tier ladder:
 
 ## Tool: begin_task
 
-**Description**: Mark the start of a multi-turn tool-based subtask (gacha, battle speed-check) and open a fold window. The setup/clarification turns that follow will be folded into one compact structured record when the task is finalized, instead of piling up verbatim in the conversation context.
+**Description**: Mark the start of a multi-turn tool-based subtask (gacha, battle speed-check) and open a fold window. It also persists scoped TaskState (goal, explicit constraints and pending items). Finalization can fold the legacy conversation view; raw scoped history is stored separately. Do not treat the fold as deletion of all source data.
 
 **When to use**: Exactly once, at the beginning of a tool task that REQUIRES a setup/clarifying question before execution (e.g. first gacha request → ask 动画 or 直接看结果; speed-check → ask 轻量 or 全量模式). Do NOT call it for tasks that need no clarification, and do NOT call it on follow-up repetitions ("再来一次" — the window is already closed).
 
@@ -712,7 +712,9 @@ Anti-bot handling is a two-tier ladder:
     "goal": {
       "type": "string",
       "description": "子任务目标的简短描述，如「十连抽卡」「战斗截图测速」"
-    }
+    },
+    "constraints": {"type": "array", "items": {"type": "string"}, "description": "用户明确要求；不能推断授权"},
+    "pending": {"type": "array", "items": {"type": "string"}, "description": "尚未完成的步骤或待澄清问题"}
   },
   "required": ["goal"]
 }
@@ -725,7 +727,7 @@ Anti-bot handling is a two-tier ladder:
 
 ## Tool: finalize_subtask
 
-**Description**: Close a subtask opened by `begin_task` and submit its structured result. The whole flow is folded into one compact record line in the conversation context; the full detail (goal, result, params, refs, status, follow-ups, tool calls) is archived to the per-user task log for later traceability.
+**Description**: Close a subtask opened by `begin_task` and submit its structured result. It updates scoped TaskState and produces a compact legacy-view record. Provided fields are logged; this does not guarantee that every raw tool result is stored in the record. Preserve real source references and unfinished items.
 
 **When to use**: MANDATORY after completing a multi-turn tool task — once the final result has been presented to the user (gacha results shown, speed value computed via `calculate_speed`, ...). Fill `result` with a 1-3 sentence summary of the final outcome (the user already saw the full detail in chat), `params` with the key parameters actually used (卡池/次数/测速模式…), and `follow_ups` with any unfinished items or suggestions.
 
@@ -746,6 +748,8 @@ Anti-bot handling is a two-tier ladder:
   "required": ["goal", "result"]
 }
 ```
+
+**Verification**: `status` reports the task outcome; it does not publish or validate an experience. Use `partial` or `failed` when appropriate and state what remains unknown in result/follow_ups. `reported_complete` is not independent verification. Do not pass invented verification fields or evidence IDs; use only the actual tool schema.
 
 **Note**: Even without a prior `begin_task` (or if its 15-minute window expired), calling this tool still archives the record and folds the current turn — only the setup-turn removal is skipped. For tool-heavy turns where you forgot to call it, the system auto-compresses long results into a degraded record anyway, but explicit finalization always produces the better record.
 
@@ -780,28 +784,48 @@ Anti-bot handling is a two-tier ladder:
 
 ## Tool: recall_memory
 
-**Description**: Retrieve the full content of the current user's high-confidence long-term memories (长期记忆) by id or keyword. The system prompt only carries a compact index of these memories (`[id] 标题（时间）`); this tool expands an index entry into its full summary plus the archived conversation snapshot. Strictly per-user — you can only recall the current user's own memories.
+**Description**: Retrieve facts and historical excerpts in the current trusted user/platform/bot/channel/persona/session scope. A LONG index is not required. This tool is read-only: it does not correct, delete, migrate or publish memories, and it does not retrieve P4 cases.
 
 **When to use**:
-- The long-term memory index in the system prompt lists an entry relevant to the conversation, and you need its details (full summary or original conversation snapshot)
-- The user references a past event/agreement with "还记得…吗 / 之前说过…" and the index shows a matching title
-- Prefer this over asking the user to repeat themselves when a plausible index entry exists
+- The user references an earlier agreement or event and the current context lacks details.
+- A visible memory/fragment ID needs to be expanded, or a more specific topic may recover relevant history.
+- Prefer checking available history before asking the user to repeat it, but do not cross scope boundaries when nothing matches.
 
 **Parameters**:
 ```json
 {
   "type": "object",
   "properties": {
-    "query": {
-      "type": "string",
-      "description": "记忆 id（可只写前缀，如 L3f2a）或标题/摘要关键词"
-    }
+    "query": {"type": "string", "description": "完整记忆/片段 ID，或内容主题关键词"}
   },
   "required": ["query"]
 }
 ```
 
-**Note**: Returns up to 3 matches, newest first, each with a snapshot timestamp — weigh the age before treating the content as current (the user may have changed since). Long snapshots are truncated. If nothing matches, say so honestly and fall back to asking the user; never fabricate memory content.
+**Result limits**: The scoped path returns up to 8 facts and 4 historical fragments; each fragment can be clipped to 2000 characters. Matching uses ID or keywords, not an assurance of semantic completeness. Do not promise ID-prefix lookup or complete raw snapshots. Legacy unscoped compatibility may still return LONG snapshots.
+
+**Interpretation**: Distinguish current fact versions from historical or imported text. Old values, candidate observations and role-play are not automatically current reality. On no match, say “当前范围未找到”; refine the query or ask for missing context. Do not read old database/files to bypass this result.
+
+---
+
+## Tool: recall_asset
+
+**Description**: If available in this turn’s tool list, recall an image/voice memory for the current user and character by keyword. Legacy assets lack group authorization metadata; group calls are refused. A missing original may leave only a text description, so do not promise successful re-sending until the tool reports it.
+
+**Parameters**:
+```json
+{
+  "type": "object",
+  "properties": {"query": {"type": "string", "description": "要找回的图片或语音关键词"}},
+  "required": ["query"]
+}
+```
+
+Asset storage is separate from new fact memory. `/记忆 删除` or `/记忆 清空 确认` does not erase all audiovisual files.
+
+## Task experience boundary
+
+P4 candidates, review, publication, rollback and mode controls are managed by trusted runtime/operator code, not callable model tools. Only use a `历史任务经验 [case_id@revision]` block actually supplied this turn. Its steps are conditional historical guidance; current user constraints, permissions and live schemas prevail. Do not invent a `recall_experience` or publication tool, run an operator CLI, or equate tool success with independent task verification.
 
 ---
 

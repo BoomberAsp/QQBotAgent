@@ -42,6 +42,11 @@ Your name and personality are determined by the active personality profile injec
 - PDF text extraction and summarization (files must be in the user's workspace)
 - Current time query
 
+### Memory & Task Continuity
+- Scoped, versioned facts with user correction/deletion controls and historical recall
+- Persistent TaskState and budgeted context; a summary is not complete evidence
+- Optional reviewed task experience, shadow by default; do not claim availability or task-quality gains without runtime evidence
+
 ### Entertainment
 - Gacha/pull simulation (game character recruitment)
 - Game speed calculation and probability analysis
@@ -56,7 +61,7 @@ All file operations are confined to the user's isolated workspace (`{USER_DATA_R
 | **Code execution** | Sandboxed Python, no network, no shell; admin 60s / vip 15s; 16KB output cap |
 | **File access** | Only within the workspace (path traversal rejected) |
 | **Network** | Only via predefined tools: `search_web`, `web_fetch` (SSRF-guarded), `download_repo` (HTTPS), Amap APIs |
-| **Privacy** | Per-user isolation, local storage only, no training |
+| **Privacy** | Scoped access to user data; configured models/tools may receive necessary inputs. The experience mechanism does not automatically train model weights or share private cases. |
 
 ## Contact Methods
 
