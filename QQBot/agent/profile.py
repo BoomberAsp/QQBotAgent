@@ -288,6 +288,8 @@ class ProfileManager:
             base_dir: Directory for profile JSON files.
             llm_client: DeepSeekClient for fact extraction (optional, can be set later).
         """
+        from .cognitive_state import CognitiveState
+        self.cognition = CognitiveState(os.path.join(base_dir, "_cognition"))
         self.base_dir = base_dir
         self.client = llm_client
         self._memory = None  # P1: TieredMemory engine, wired via set_memory()
@@ -418,7 +420,7 @@ class ProfileManager:
     # ── Layer 3: batched observation + extraction (§7.1, P0) ──────
 
     def observe_turn(self, user_id: str, user_message: str, agent_response: str,
-                     persona_name: str = "", turn_id: Optional[str] = None):
+                     persona_name: str = "", turn_id: Optional[str] = None, expected_generation=None):
         """Per-turn hook (SYNC, no await): buffer the turn + touch the profile.
 
         Called from agent._schedule_profile_update on every turn. When the
@@ -460,7 +462,14 @@ class ProfileManager:
             return
         if not dq:
             self._queued_at[user_id] = time.time()
-        dq.append((user_message or "", agent_response or "", persona_name or "", evidence_id))
+        from .cognitive_state import current_scope
+        scope = current_scope.get()
+        payload = (user_message or "", agent_response or "", persona_name or "", evidence_id)
+        if scope:
+            if self.cognition.seen(user_id,scope,evidence_id):
+                return
+            payload += ({"scope":scope,"generation":self.cognition.generation(user_id,scope) if expected_generation is None else expected_generation},)
+        dq.append(payload)
 
         self._pending_n[user_id] = self._pending_n.get(user_id, 0) + 1
         self._save_buffer(user_id)
@@ -489,11 +498,33 @@ class ProfileManager:
                 user_id, session_turn_count,
             )
 
+    def discard_scope_pending(self, user_id, scope):
+        """Drop raw queued turns after an explicit scope correction/forget.
+
+        In-flight copies are fenced by the generation checked at commit.
+        Other scopes remain queued in their original order.
+        """
+        if user_id not in self._recent:
+            self._restore_buffer(user_id)
+        queue = self._recent.get(user_id, deque())
+        discarded = [t[3] for t in queue if len(t)>4 and t[4].get("scope")==scope]
+        if discarded:
+            self.cognition.ingest(user_id,scope,-1,"discarded",[],discarded)
+        self._recent[user_id] = deque(t for t in queue if not (
+            len(t)>4 and t[4].get("scope")==scope))
+        self._pending_n[user_id] = len(self._recent[user_id])
+        self._batch_sizes.pop(user_id,None)
+        self._save_buffer(user_id)
+
     def _flush(self, user_id: str):
         if user_id in self._inflight or time.time() < self._retry_after.get(user_id, 0):
             return
         size = self._batch_sizes.get(user_id, PROFILE_BATCH_K)
         window = list(self._recent.get(user_id, ()))[:size]
+        if window:
+            scope = window[0][4] if len(window[0]) > 4 else None
+            stop = next((i for i,t in enumerate(window) if (t[4] if len(t)>4 else None) != scope), len(window))
+            window = window[:stop]
         if not window:
             return
         try:
@@ -565,9 +596,16 @@ class ProfileManager:
         # P1: read the judge list BEFORE the await (synchronous read). Per-user
         # single-flight guarantees no concurrent extraction mutates state mid-call.
         judge_list = self._memory.get_judge_list(user_id) if self._memory else []
+        scope_info = turns[0][4] if len(turns[0]) > 4 else None
+        if scope_info:
+            judge_list = [{"id":f["id"],"content":f["content"],"tier":"medium"}
+                          for f in self.cognition.list(user_id,scope_info["scope"],limit=80)]
+            existing = {"nickname":None,"interests":[],"preferences":{}}
         conversation_block = self._format_conversation(turns)
         prompt = self._build_extraction_prompt(conversation_block, existing, judge_list)
 
+        if scope_info:
+            prompt += "\n只抽取用户明确表达的事实，不把虚构设定当现实。每条 memory_candidates 提供 evidence_turn_ids（本批来源消息ID）；可提供单值属性 predicate，例如 current_city。明确纠正用 judge=update 和已有 id。"
         result = await self.client.chat_completion(
             prompt, timeout_set=30.0, purpose="profile",
         )
@@ -578,6 +616,19 @@ class ProfileManager:
         # existing MEDIUM facts age normally (Decision 4: tick on every success).
         if extracted is None:
             return
+        if scope_info:
+            candidates = [c for c in (extracted.get("memory_candidates") or []) if isinstance(c,dict)]
+            from .fact_filter import filter_many
+            kept, _ = filter_many([str(c.get("content") or "") for c in candidates])
+            candidates = [c for c in candidates if c.get("content") in set(kept)]
+            for key,value in {**(extracted.get("new_preferences") or {}), **(extracted.get("updated_preferences") or {})}.items():
+                if value is not None:
+                    candidates.append({"content":f"用户偏好：{key}={value}","predicate":"preference:"+str(key)})
+                else:
+                    candidates.append({"content":f"用户已撤销偏好：{key}（不再按此偏好处理）","predicate":"preference:"+str(key)})
+            self.cognition.ingest(user_id,scope_info["scope"],scope_info["generation"],batch_id,
+                                  candidates,[t[3] for t in turns])
+            return True
 
         # ── synchronous atomic apply (no await between read and write) ──
         # Re-fetch the profile AFTER the LLM await: get() revalidates against
@@ -976,7 +1027,7 @@ class ProfileManager:
             # restores instead of being discarded.
             if isinstance(t, (list, tuple)) and len(t) >= 2:
                 persona = str(t[2]) if len(t) >= 3 else ""
-                dq.append((str(t[0]), str(t[1]), persona, str(t[3]) if len(t) > 3 else uuid.uuid4().hex))
+                dq.append((str(t[0]), str(t[1]), persona, str(t[3]) if len(t) > 3 else uuid.uuid4().hex) + ((t[4],) if len(t)>4 and isinstance(t[4],dict) else ()))
         try:
             pending_n = max(0, int(data.get("pending_n") or 0))
         except (TypeError, ValueError):

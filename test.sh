@@ -27,7 +27,8 @@ fi
 echo -e "${GREEN}[INFO]${NC} 运行所有测试..."
 echo ""
 
-python -m unittest test_context_memory_phase1 test_reliability_p1 test_mail_buttons -v
+python -m unittest test_context_memory_phase1 test_reliability_p1 test_cognition_p23 test_mail_buttons -v
+COGNITION_EXIT=$?
 
 python test_agent.py
 AGENT_EXIT=$?
@@ -75,6 +76,7 @@ EXIT_CODE=0
 if [ $AGENT_EXIT -ne 0 ]; then EXIT_CODE=$AGENT_EXIT; fi
 if [ $WS_EXIT -ne 0 ]; then EXIT_CODE=$WS_EXIT; fi
 if [ $STORYKB_EXIT -ne 0 ]; then EXIT_CODE=$STORYKB_EXIT; fi
+if [ $COGNITION_EXIT -ne 0 ]; then EXIT_CODE=$COGNITION_EXIT; fi
 if [ $MEMBENCH_EXIT -ne 0 ]; then EXIT_CODE=$MEMBENCH_EXIT; fi
 if [ $L1_EXIT -ne 0 ]; then EXIT_CODE=$L1_EXIT; fi
 if [ $ENGINE_EXIT -ne 0 ]; then EXIT_CODE=$ENGINE_EXIT; fi

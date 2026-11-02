@@ -378,6 +378,11 @@ class SpecialSessionManager:
                     except OSError:
                         pass
 
+        archive_dir = os.path.join(session_dir, "history_archive")
+        if os.path.isdir(archive_dir) and not os.path.islink(archive_dir):
+            import shutil
+            shutil.rmtree(archive_dir)
+
         session.context = []
         session.total_messages = 0
         session.last_active = time.time()
@@ -491,6 +496,10 @@ class SpecialSessionManager:
         session_dir = self._session_dir(user_id, name)
         os.makedirs(session_dir, exist_ok=True)
 
+        # Preserve the original generation separately from the model projection.
+        archive_dir = os.path.join(session_dir, "history_archive")
+        os.makedirs(archive_dir, exist_ok=True)
+        self._atomic_context(os.path.join(archive_dir, uuid.uuid4().hex + ".json"), context)
         # Prepare both files before switching the authoritative context. Failure
         # leaves the previous context untouched; legacy snapshots are retained.
         self._atomic_context(os.path.join(session_dir, COMPRESSION_BACKUP_FILE), context)

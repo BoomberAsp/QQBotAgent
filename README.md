@@ -1006,3 +1006,10 @@ docker compose run --rm searxng cat /etc/searxng/settings.yml  # 验证挂载
 - 日常 `bash test.sh` 已包含可靠性测试。离线基线：`cd QQBot && python benchmarks/reliability/run.py /tmp/p01-result.json`；已保存 `benchmarks/reliability/baseline_p01.json`，含源码 SHA-256 和解释器版本。
 - 基线只证明离线正确性与受控场景约束保留，不表示真实模型问答质量改善；现有低频事件 canary 仍待后续阶段。
 - 本实现使用 Linux/WSL 的 fcntl，暂不支持直接在原生 Windows Python 运行；不支持多个 bot 实例同时消费同一用户抽取队列。
+
+
+## 记忆与上下文 P2/P3（2026-11-02）
+
+新运行时按用户、平台/机器人、群聊、角色及特殊会话隔离记忆；支持 `/记忆 列表`、`历史 <id>`、`修正 <id> <内容>`、`删除 <id>`、`清空 确认`、`暂停/恢复`。纠正与遗忘会使旧抽取和本范围派生上下文失效。`/clear` 清理工作上下文和任务状态，保留长期事实。
+
+新增持久 TaskState、独立分段摘要、相关历史回读和可选资料共享注入预算。旧记忆不自动迁入；删除命令不删除旧档案、影音、任务日志和备份。详细行为、验收命令和上线边界见 `docs/P2-P3实施验收记录.md`（本地文档）；确定性回归入口为 `QQBot/test_cognition_p23.py`。
