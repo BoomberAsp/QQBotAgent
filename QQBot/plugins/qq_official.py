@@ -74,6 +74,7 @@ from lib import media_gen
 from lib.button_spec import Btn
 from lib.button_spec import fit_label as _fit_label
 from lib.button_spec import max_per_row as _buttons_max_per_row
+from lib.button_spec import max_rows as _buttons_max_rows
 from lib.button_spec import validate as _validate_buttons
 from lib.status_heartbeat import read_status, write_status
 from tools.social_tools import build_image_prompt, enforce_asset_quota
@@ -517,7 +518,8 @@ def _build_envelope(letters: list, cfg: dict):
     now_dt = datetime.now()
     date_label = f"{now_dt.month}月{now_dt.day}日"
     max_chars = int(cfg.get("mail_max_chars", 800))
-    max_previews = max(1, int(cfg.get("mail_max_previews", 5)))
+    max_previews = min(10, _buttons_max_rows() * _buttons_max_per_row(),
+                       max(1, int(cfg.get("mail_max_previews", 5))))
 
     # ── B2：单封全文 ──
     if (len(letters) == 1 and bool(cfg.get("mail_full_when_single", True))
@@ -588,6 +590,12 @@ def _build_envelope(letters: list, cfg: dict):
         hidden += 1
         note = f"\n\n另有 {hidden} 封，发送 /邮件 查看"
         md = header + "\n" + "\n".join(body) + note + footer
+
+    # Truncation must remove the corresponding buttons as well: every open
+    # button needs a visible preview (especially circled long-name labels).
+    if rows:
+        visible = [b for row in rows for b in row][:len(body)]
+        rows = [visible[i:i + per_row] for i in range(0, len(visible), per_row)]
 
     plain_lines = [f"【今日角色来信 · {date_label}】", f"共 {len(letters)} 封："]
     for letter in letters:

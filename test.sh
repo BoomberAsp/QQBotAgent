@@ -27,6 +27,8 @@ fi
 echo -e "${GREEN}[INFO]${NC} 运行所有测试..."
 echo ""
 
+python -m unittest test_context_memory_phase1 test_reliability_p1 test_mail_buttons -v
+
 python test_agent.py
 AGENT_EXIT=$?
 

@@ -357,6 +357,14 @@ class Agent:
                 if allowed_tools
                 else self.tools.get_schemas()
             )
+            from .request_budget import fit_request, ContextBudgetError
+            window = (self.special_sessions.get_context_window()
+                      if self.special_sessions is not None else 128000)
+            try:
+                messages = fit_request(messages, schemas, getattr(llm_client, "context_window", window),
+                                       getattr(llm_client, "output_reserve", 8192))
+            except ContextBudgetError as exc:
+                return str(exc)
             # Streaming variant when a content_callback is wired AND the
             # client supports it (getattr probe keeps every existing mock
             # on the non-streaming path). Tool-call rounds suppress the
@@ -1092,8 +1100,10 @@ class Agent:
         if not self.profiles:
             return
         try:
+            from .context import _current_evidence_id
             self.profiles.observe_turn(
-                user_id, user_message, agent_response, self._resolve_persona_label()
+                user_id, user_message, agent_response, self._resolve_persona_label(),
+                turn_id=_current_evidence_id.get() or None
             )
         except Exception:
             pass  # Profile extraction must never break the response path

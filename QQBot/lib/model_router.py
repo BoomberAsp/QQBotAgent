@@ -81,6 +81,8 @@ class ModelRouter:
             # content parts to requests made with this client (see
             # lib/image_parts.py). Absent/false → text-only behaviour.
             client.supports_vision = bool(model_config.get("supports_vision", False))
+            client.context_window = int(model_config.get("context_window") or 128000)
+            client.output_reserve = int(model_config.get("output_reserve") or 8192)
             return client
         except Exception:
             return None

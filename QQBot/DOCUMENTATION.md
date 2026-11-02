@@ -886,7 +886,7 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 - `delegation.py`：`SOCIAL_TOOLS` 白名单、`run_delegated_task`（中立 Roxy、`persist=False`、权限过滤、单层嵌套、默认 240s 超时）、`revoice_task_result`（角色开场白 + 正文透传，群聊用固定模板）、`repatch_last_assistant`（把持久化历史改写成角色口吻）。
 - `greeting.py`：官方 c2c 主动消息簿记（纯函数、可注入 rng/now）。候选索引 `data/bond_greet_targets.json` 只由 **c2c 入站**写入（群 member_openid 不能用于 c2c 主动消息）；配额 `data/official_active_quota.json` 按自然日/月滚动，文本与媒体**分账**（日配额各自独立；信箱信封走 `monthly_cap=10**9` 免月配额——平台已无主动消息月限额）。旧问候选靶四门（等级 ≥5、冷却 7 天、概率 0.25、批量 ≤5）保留为 `mail_enabled=false` 时的回滚路径。
 - **角色信箱（proactive-mail-design.md v0.5，v1）**：`plugins/qq_official.py::_daily_active_loop` 每日 `mail_hour`（默认 10 点，+0–600s 抖动）先跑 mail pass 再跑 media pass，启动时若在 10–22 点窗口内做减半补发。mail pass 三段式：A 收集候选（串行本地读，先按**并集**播种 `known_personas`——会话索引 `metadata.persona_key`（`_known_personas_from_sessions`）∪ 羁绊文件中 msgs>0 的角色（`_known_personas_from_bonds`，§4.2 权威源；兜住「靠默认人格攒羁绊、特殊会话没绑 persona_key」的用户，否则他们永远过不了 known 门、信箱永不建档）——再跑 `_mail_candidates` 过滤链：非 assistant、`split` 模式、Lv≥5、有消息、在 known_personas、沉默 ≥24h、人格 7 天冷却，按等级降序）→ B 生成（跨用户 `Semaphore(4)`，用户内串行，角色面 flash 写 ≤60 字留言，失败即丢弃**无模板兜底**，pass 预算 20 分钟）→ C 发送（串行，令牌桶 10 qps + 2–6s 随机间隔，`send_active_c2c_markdown` 信封 = markdown 摘要 + 「展开」按钮，共享 md/kb 熔断器逐档降级纯文本）。发送成功才记账：`record_digest`（同日幂等）+ 配额（kind=text）+ bond 事件（信件全文）。与媒体 pass **双向互斥**（同日只发一类）。`C2C_MSG_REJECT`/`RECEIVE` 事件（`on_notice`）翻 `active_enabled`，拒收即停发。
-- `mailbox.py`：信箱存储（纯同步、可单测）。每用户一 JSON（`data/mailboxes/{openid}.json`，原子写、损坏降级空箱）；信件 28 天保留 + 200 封上限裁剪；`letters`（id `L-YYYYMMDD-<4hex>`、preview、read）与 `digests`（id `D-…`，1 digest = 1 次主动调用）；`make_preview`（首行去舞台指示、20 字 + …）、`escape_md_text`（全角转义）为纯函数。`/邮件` 命令（turn.py 直连层）读侧再过滤保留期。面板邮件管理追加三个写入口：`delete_letter`（**撤回**：从 letters[] 移除但信封 letter_ids 保留该 id → `is_withdrawn()` 成立，`/邮件 <id>` 显示「这封信已被撤回。」）、`write_system_letter`（系统信：persona=`__system__`、`system=true`，不写 personas/known_personas、不动信封记账）、`set_active_enabled`。
+- `mailbox.py`：信箱存储（纯同步、可单测）。每用户一 JSON（`data/mailboxes/{openid}.json`，原子写、损坏降级空箱）；信件 28 天保留 + 200 封上限裁剪；`letters`（id `L-YYYYMMDD-<4hex>`、preview、read）与 `digests`（id `D-…`，1 digest = 1 次主动调用）；`make_preview`（首行去舞台指示、20 字 + …）、`escape_md_text`（全角转义）为纯函数。`/邮件` 命令（turn.py 直连层）列表与详情均过滤保留期；列表每页 5 封，①–⑤ 对应展开按钮，附上一页/下一页/刷新按钮；日期列表同样分页（`/邮件 MM-DD p2`），空态/撤回/无效编号附返回信箱按钮。按钮均为 `type=2`、`enter=true` 指令按钮，经过现有键盘/markdown 熔断与纯文本降级；不支持按钮时保留编号及明确页码命令。文字“下一页/上一页”按用户的最近列表页导航，机器人重启后从第一页起算，按钮始终使用明确页码。面板邮件管理追加三个写入口：`delete_letter`（**撤回**：从 letters[] 移除但信封 letter_ids 保留该 id → `is_withdrawn()` 成立，`/邮件 <id>` 显示「这封信已被撤回。」）、`write_system_letter`（系统信：persona=`__system__`、`system=true`，不写 personas/known_personas、不动信封记账）、`set_active_enabled`。
 - **邮件管理队列（§16.2，面板→bot 文件 IPC）**：`plugins/qq_official.py::_mail_admin_worker` 每 3–5s 扫 `data/mail_admin/queue/`，`os.replace` 改名到 `processing/` 原子认领，执行后回写 `status/`（操作 id `mailop_YYYYMMDD_<4hex>` 幂等；状态保留 7 天由 bot 清理）；操作类型白名单 `delete_letter` / `send_system`。系统邮件经 `send_active_c2c_markdown` 真实主动发送（markdown 信封样式 `## 系统邮件 · {title}`，共享熔断降级纯文本），**成功才** `write_system_letter` 入账；用户已拒收（`active_enabled=false`）→ 发送失败不入账。启动时 `_mail_admin_recover` 把上次进程中断的残留认领标记 `failed: bot restarted`。worker 不受 `mail_enabled` 开关影响（撤回/系统邮件独立于每日信封）。
 - `rate_limit.py`：`TokenBucket`/`ChannelLimiter`（c2c 10/s、group 1/s，按渠道懒建复用，可注入 monotonic）。
 - `group_registry.py`：官方群登记表 `data/group_registry.json`（v1 纯记账）：`GROUP_AT_MESSAGE_CREATE` 入站 upsert（60s 粒度节流防文件 churn），status `active/left/unknown` 状态机 + `active_enabled` 开关，为 P1 群主动消息预铺。
@@ -2336,3 +2336,22 @@ v2.29 基础上增加:
 
 - `docs/qqbot-official-buttons-design.md`：官方 API 按钮的能力边界、39 个可按钮化功能盘点、8 种交互模式、接入架构与降级方案、准入政策与申请材料。
 - 现状：**P0（指令按钮）+ P1（回调按钮）已落地**（见 2026-10-28 条）；自定义回调按钮需平台「内邀开通」，未开通时自动降级为纯 markdown/文本命令清单。流式消息（§6.10.11.2）已于 2026-10-29 落地。
+
+
+### 记忆与上下文可靠性（2026-11-02）
+
+- 特殊会话压缩使用原子 committed_context.json，提交前保留原历史；压缩期间历史变化则取消本次写回。
+- Agent 每次工具循环请求均检查消息、工具定义、输出预留和多模态估算预算；按完整用户轮次缩减历史，无法安全容纳时明确返回提示。
+- 画像抽取保留未确认队列和固定批次边界，成功后才移除；批次 ID 与证据 ID 持久化去重，避免重叠窗口强化。解析失败有限重试；启动恢复扫描无需新消息，失败按持久化退避重试。
+- 用户在抽取期间编辑画像或记忆时丢弃旧结果，避免覆盖修正。
+- 验证入口：`cd QQBot && python -m unittest test_context_memory_phase1 -v`，另运行 `python test_agent.py` 和 `python benchmarks/memory/bench_engine.py`。
+- 当前边界：单个机器人实例拥有抽取队列，支持 WebUI 并发画像编辑；Linux/WSL advisory locks、内容版本检查和恢复日志保护已接入写入口。精确供应商 tokenizer 仍待后续阶段。图片预算为保守估算，不保证所有供应商的精确计数。旧版本回滚前应先导出压缩后的会话，因为旧加载器不认识 committed_context.json。
+
+#### P0/P1 验收与恢复
+
+- 平台来源 ID 由 platform/self_id/group_id/user_id/message_id 组成，贯穿抽取队列；缺少消息 ID 的内部调用使用独立生成 ID。
+- 画像和 tiers 使用预写事务日志；部分提交在重放前恢复，外部非协调编辑冲突则停止恢复并告警，不覆盖新数据。
+- 启动后每 30 秒扫描待处理队列，失败冷却从 60 秒递增到最多 1800 秒；`_profile_recovery_status.json` 记录积压、在途及最老等待时间。
+- 日常 `bash test.sh` 已包含可靠性测试。离线基线：`cd QQBot && python benchmarks/reliability/run.py /tmp/p01-result.json`；已保存 `benchmarks/reliability/baseline_p01.json`，含源码 SHA-256 和解释器版本。
+- 基线只证明离线正确性与受控场景约束保留，不表示真实模型问答质量改善；现有低频事件 canary 仍待后续阶段。
+- 本实现使用 Linux/WSL 的 fcntl，暂不支持直接在原生 Windows Python 运行；不支持多个 bot 实例同时消费同一用户抽取队列。

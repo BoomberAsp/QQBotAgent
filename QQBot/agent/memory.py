@@ -591,6 +591,8 @@ class UserTierState:
     """Per-user container for all three tiers + the logical clock."""
     user_id: str
     extraction_count: int = 0
+    applied_batches: List[str] = field(default_factory=list)
+    applied_evidence: List[str] = field(default_factory=list)
     short: List[ShortItem] = field(default_factory=list)    # index 0 = front, -1 = eviction
     medium: List[MediumItem] = field(default_factory=list)  # plain list, sorted on demand (§12.1: heap is YAGNI)
     long: List[LongObject] = field(default_factory=list)
@@ -610,6 +612,7 @@ class TieredMemory:
         self.long_dir = os.path.join(self.tiers_dir, "long")
         os.makedirs(self.tiers_dir, exist_ok=True)
         self._states: Dict[str, UserTierState] = {}
+        self._disk_revisions = {}
 
     # ── path helpers ──────────────────────────────────────────────
 
@@ -1183,10 +1186,23 @@ class TieredMemory:
             path = os.path.join(self._long_user_dir(user_id), lo.id + ".md")
             if not os.path.exists(path):
                 self._save_long_snapshot(user_id, lo)
+        from .durable import locked, revision
+        path = self._tier_path(user_id)
+        with locked(path):
+            if revision(path) != self._disk_revisions.get(user_id):
+                self.load_user(user_id)
+                raise RuntimeError("memory changed externally; stale write rejected")
+            self._atomic_write_json(path, self.serialize_user(user_id))
+            self._disk_revisions[user_id] = revision(path)
+
+    def serialize_user(self, user_id):
+        st = self._get_state(user_id)
         data = {
             "user_id": st.user_id,
             "extraction_count": st.extraction_count,
             "schema_version": TIER_SCHEMA_VERSION,
+            "applied_batches": st.applied_batches,
+            "applied_evidence": st.applied_evidence,
             "short": [{"id": s.id, "content": s.content, "count": s.count,
                        "category": s.category, "last_confirmed_ts": s.last_confirmed_ts}
                       for s in st.short],
@@ -1199,7 +1215,7 @@ class TieredMemory:
                       "query_log": lo.query_log, "linked_medium_id": lo.linked_medium_id}
                      for lo in st.long],
         }
-        self._atomic_write_json(self._tier_path(user_id), data)
+        return data
 
     def load_user(self, user_id: str) -> UserTierState:
         """Load (or create) one user's tier state from disk and cache it."""
@@ -1211,6 +1227,8 @@ class TieredMemory:
                     data = json.load(f)
                 st.user_id = data.get("user_id") or user_id
                 st.extraction_count = int(data.get("extraction_count", 0))
+                st.applied_batches = data.get("applied_batches", [])
+                st.applied_evidence = data.get("applied_evidence", [])
                 st.short = [
                     ShortItem(id=s.get("id") or _new_id(), content=s.get("content", ""),
                               count=int(s.get("count", 1)),
@@ -1240,6 +1258,8 @@ class TieredMemory:
             except Exception:
                 # corrupt/unreadable file → start fresh rather than crash the bot
                 st = UserTierState(user_id=user_id)
+        from .durable import revision
+        self._disk_revisions[user_id] = revision(path)
         self._states[user_id] = st
         return st
 

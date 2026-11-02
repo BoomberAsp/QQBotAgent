@@ -62,6 +62,7 @@ from agent.context import (
     _current_story_context, _current_story_char_id, _current_render_context,
     _turn_keyboard,
 )
+from lib.button_spec import max_rows as _button_max_rows, max_per_row as _button_max_per_row
 from lib.button_spec import Btn, Rows, to_text as _buttons_to_text
 from lib.button_spec import validate as _validate_buttons
 from lib.button_spec import fit_label as _fit_label
@@ -2417,6 +2418,8 @@ async def run_agent_turn(view: InboundMessage):
     """Run one agent turn under the per-user busy guard."""
     # Platform identity (stage 4, §7.7): PermissionManager.get_role() picks
     # the openid tables for qq_official, the QQ-number tables for onebot.
+    from agent.context import _current_evidence_id
+    _current_evidence_id.set(json.dumps([view.platform, view.self_id, view.group_id, view.user_id, view.message_id], ensure_ascii=False) if view.message_id else "")
     _current_platform.set(view.platform)
     # Defensive per-turn reset: a keyboard reservation is strictly
     # turn-scoped (tools set it, _send_response consumes it once).
@@ -3212,6 +3215,8 @@ async def handle_agent_turn(view: InboundMessage):
 
 async def run_continuous_turn(view: InboundMessage):
     """Run one continuous-mode turn (active-window check + busy guard)."""
+    from agent.context import _current_evidence_id
+    _current_evidence_id.set(json.dumps([view.platform, view.self_id, view.group_id, view.user_id, view.message_id], ensure_ascii=False) if view.message_id else "")
     _current_platform.set(view.platform)
     _turn_keyboard.set(None)  # defensive per-turn reset (see run_agent_turn)
     user_id = view.user_id
@@ -3935,6 +3940,8 @@ async def _handle_bond_detail_command(text: str, user_id: str) -> bool:
 # **不带免责尾**（§6.5）。仅官方 c2c 有意义（信箱只发 c2c）。
 
 _MAIL_PAGE_SIZE = 5
+# Only a navigation cursor; mail content stays on disk, outside session history.
+_MAIL_PAGES: dict[str, int] = {}
 _NAV_MAILBOX: Rows = [[
     Btn(label="返回信箱", data="/邮件", action="cmd"),
 ]]
@@ -3973,29 +3980,65 @@ def _mail_letter_label(letter: dict) -> str:
     return letter.get("name") or letter.get("persona") or "?"
 
 
-async def _mail_send_list(user_id: str, letters: list, page: int) -> None:
-    """B3 列表：每页 5 封，未读标 ●，编号可见（供 /邮件 <编号> 展开）。"""
+def _mail_list_rows(chunk: list, page: int, total_pages: int,
+                    prefix: str = "/邮件") -> Rows:
+    """Numbered open buttons and explicit page commands, within hot-read caps."""
+    nav = []
+    if page > 1:
+        nav.append(Btn(label="上一页", data=f"{prefix} p{page - 1}"))
+    if page < total_pages:
+        nav.append(Btn(label="下一页", data=f"{prefix} p{page + 1}"))
+    nav.append(Btn(label="返回信箱" if prefix != "/邮件" else "刷新信箱",
+                   data="/邮件" if prefix != "/邮件" else f"/邮件 p{page}"))
+    cols = _button_max_per_row()
+    # Reserve navigation space first, including narrow user configurations.
+    nav = nav[:min(cols * _button_max_rows(), 15)]
+    nav_rows = [nav[i:i + cols] for i in range(0, len(nav), cols)]
+    capacity = min((_button_max_rows() - len(nav_rows)) * cols, 15 - len(nav))
+    buttons = [Btn(label=f"展开{'①②③④⑤'[i]}",
+                   data=f"/邮件 {letter['id']}", visited="已展开",
+                   id=f"mail_open_{i}")
+               for i, letter in enumerate(chunk[:capacity])]
+    return [buttons[i:i + cols] for i in range(0, len(buttons), cols)] + nav_rows
+
+
+async def _mail_send_list(user_id: str, letters: list, page: int,
+                          date_filter: str = "") -> None:
+    """Five letters per page; text commands remain usable without buttons."""
     if not letters:
-        await _safe_send(
-            "【角色信箱】\n\n最近 28 天没有角色来信。\n"
-            "和角色多聊聊、提升羁绊（/好感度），TA 们会主动给你写信的~")
+        body = (f"{date_filter} 没有角色来信。发送 /邮件 查看信箱。"
+                if date_filter else
+                "【角色信箱】\n\n最近 28 天没有角色来信。\n"
+                "和角色多聊聊、提升羁绊（/好感度），TA 们会主动给你写信的~")
+        await _send_receipt_kb(body, _NAV_MAILBOX, label="mail-empty")
         return
     total_pages = max(1, (len(letters) + _MAIL_PAGE_SIZE - 1) // _MAIL_PAGE_SIZE)
     page = max(1, min(page, total_pages))
+    if not date_filter:
+        if user_id not in _MAIL_PAGES and len(_MAIL_PAGES) >= 1024:
+            _MAIL_PAGES.pop(next(iter(_MAIL_PAGES)))
+        _MAIL_PAGES[user_id] = page
     chunk = letters[(page - 1) * _MAIL_PAGE_SIZE: page * _MAIL_PAGE_SIZE]
     unread = sum(1 for l in letters if not l.get("read"))
-    lines = [f"【角色信箱】最近 28 天（未读 {unread} 封）", ""]
-    for letter in chunk:
+    title = f"【角色信箱 · {date_filter}】" if date_filter else "【角色信箱】最近 28 天"
+    lines = [f"{title}（未读 {unread} 封）", ""]
+    for i, letter in enumerate(chunk):
         ts = float(letter.get("created_at", 0) or 0)
         mark = "●" if not letter.get("read") else "　"
         name = _mail_letter_label(letter)
         preview = letter.get("preview") or ""
-        lines.append(f"{mark} {_mail_fmt_md(ts)}  {name}：{preview}")
+        lines.append(f"{'①②③④⑤'[i]} {mark} {_mail_fmt_md(ts)}  {name}：{preview}")
         lines.append(f"   编号 {letter.get('id', '')}")
     lines.append("")
-    nav = f"第 {page}/{total_pages} 页 · " if total_pages > 1 else ""
-    lines.append(f"{nav}发送 /邮件 <编号> 查看全文，/邮件 下一页 翻页。")
-    await _safe_send("\n".join(lines))
+    prefix = f"/邮件 {date_filter}" if date_filter else "/邮件"
+    lines.append(f"第 {page}/{total_pages} 页 · 发送 /邮件 <编号> 查看全文。")
+    if page > 1:
+        lines.append(f"上一页：{prefix} p{page - 1}")
+    if page < total_pages:
+        lines.append(f"下一页：{prefix} p{page + 1}")
+    await _send_receipt_kb("\n".join(lines),
+                           _mail_list_rows(chunk, page, total_pages, prefix),
+                           label="mail-list")
 
 
 async def _mail_send_detail(user_id: str, letter: dict) -> None:
@@ -4034,15 +4077,17 @@ async def _handle_mail_command(text: str, user_id: str,
 
     low = rest.lower()
     if low in ("下一页", "下页", "next"):
-        # 无状态翻页：这里只回第 2 页起点提示——真正的页码由 pN 携带
-        m_page = 2
+        m_page = _MAIL_PAGES.get(user_id, 1) + 1
         await _mail_send_list(user_id, letters, m_page)
+        return True
+    if low in ("上一页", "上页", "prev"):
+        await _mail_send_list(user_id, letters, _MAIL_PAGES.get(user_id, 1) - 1)
         return True
     m = re.fullmatch(r"p(\d{1,3})", low)
     if m:
         await _mail_send_list(user_id, letters, int(m.group(1)))
         return True
-    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})", rest)
+    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})(?:\s+p(\d{1,3}))?", low)
     if m:
         mmdd = f"{int(m.group(1)):02d}-{int(m.group(2)):02d}"
         day_letters = [
@@ -4050,25 +4095,15 @@ async def _handle_mail_command(text: str, user_id: str,
             if datetime.fromtimestamp(
                 float(l.get("created_at", 0) or 0)).strftime("%m-%d") == mmdd
         ]
-        if not day_letters:
-            await _safe_send(f"{mmdd} 没有角色来信。发送 /邮件 查看信箱。")
-            return True
-        lines = [f"【角色信箱 · {mmdd}】", ""]
-        for letter in day_letters:
-            mark = "●" if not letter.get("read") else "　"
-            lines.append(f"{mark} {_mail_letter_label(letter)}："
-                         f"{letter.get('preview', '')}")
-            lines.append(f"   编号 {letter.get('id', '')}")
-        lines += ["", "发送 /邮件 <编号> 查看全文。"]
-        await _safe_send("\n".join(lines))
+        await _mail_send_list(user_id, day_letters, int(m.group(3) or 1), mmdd)
         return True
 
     # 按编号展开详情（按钮点击等价用户发出 /邮件 <id>）
     raw_id = rest.split()[0]
     letter_id = raw_id.upper()
-    letter = _mailbox_manager.get_letter(user_id, letter_id)
-    if letter is None and letter_id != raw_id:
-        letter = _mailbox_manager.get_letter(user_id, raw_id)
+    # Apply retention to old envelope buttons too; never expose another user's mail.
+    letter = next((l for l in letters
+                   if str(l.get("id", "")).casefold() == raw_id.casefold()), None)
     if letter is not None:
         await _mail_send_detail(user_id, letter)
         return True
@@ -4078,13 +4113,15 @@ async def _handle_mail_command(text: str, user_id: str,
     if (_mailbox_manager.is_withdrawn(user_id, letter_id)
             or (letter_id != raw_id
                 and _mailbox_manager.is_withdrawn(user_id, raw_id))):
-        await _safe_send("这封信已被撤回。\n发送 /邮件 返回信箱。")
+        await _send_receipt_kb("这封信已被撤回。\n发送 /邮件 返回信箱。",
+                               _NAV_MAILBOX, label="mail-withdrawn")
         return True
 
-    await _safe_send(
+    await _send_receipt_kb(
         "没有找到这封信（可能已过 28 天保留期）。\n"
         "用法：/邮件 查看列表 · /邮件 <编号> 查看全文 · "
-        "/邮件 <MM-DD> 按日期 · /邮件 下一页 翻页")
+        "/邮件 <MM-DD> 按日期 · /邮件 下一页 翻页",
+        _NAV_MAILBOX, label="mail-missing")
     return True
 
 
@@ -5765,7 +5802,7 @@ async def _run_session_compression(user_id: str, name: str):
 
     try:
         stats = _special_sessions.apply_compression(
-            user_id, name, summary, keep_recent=keep)
+            user_id, name, summary, keep_recent=keep, expected_context=context)
     except ValueError as e:
         await _safe_send(str(e))
         return
@@ -6756,3 +6793,12 @@ def _split_text(text: str, max_len: int) -> list:
         chunks.append(current.strip())
 
     return chunks
+
+
+# Durable extraction recovery is shared by both transport adapters.
+try:
+    from nonebot import get_driver as _recovery_driver
+    _recovery_driver().on_startup(_profile_manager.start_recovery)
+    _recovery_driver().on_shutdown(_profile_manager.stop_recovery)
+except ValueError:
+    pass  # offline tests may import without a running driver

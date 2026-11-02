@@ -121,3 +121,6 @@ QQBot/data/wiki_cache/help_card.png
 public_site/examples/mkv/*
 
 !/test/test_role_names.py
+
+# 过时设计与验收文档（仅本地归档）
+/Outdated_docs/
