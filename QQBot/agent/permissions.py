@@ -48,7 +48,7 @@ class CodeLimits:
 _PUBLIC_TOOLS: Set[str] = {
     "get_user_info",
     "delete_workspace_file",
-    "search_web",
+    "search_web", "fetch_image", "discover_images",
     "get_time",
     "get_weather",
     "read_file",           # Only text/PDF for regular; multimodal requires VIP

@@ -78,6 +78,8 @@ PAGES = [
     ("/memory", "记忆与画像"),
     ("/workspace", "工作区磁盘"),
     ("/characters", "角色管理"),
+    ("/knowledge", "知识库管理"),
+    ("/stickers", "人格表情包"),
     ("/config", "配置热管理"),
     ("/playground", "Playground"),
     ("/wiki", "Wiki 缓存"),
@@ -91,7 +93,7 @@ _IMPLEMENTED = {"/", "/processes", "/logs", "/terminal",
                 "/tokens", "/audit", "/feedback", "/sessions",
                 "/tasks", "/workspace", "/config", "/memory", "/wiki",
                 "/playground", "/redeem", "/changelog", "/characters",
-                "/mail"}
+                "/mail", "/knowledge", "/stickers"}
 
 _PUBLIC_PREFIXES = ("/static/", "/api/auth/")
 _PUBLIC_PATHS = {"/login", "/favicon.ico"}
@@ -1698,3 +1700,7 @@ async def ws_terminal(ws: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("webui.main:app", host=HOST, port=PORT)
+
+
+from .resource_routes import router as resource_router
+app.include_router(resource_router)

@@ -26,7 +26,7 @@ FEATURE_LABELS: Dict[str, str] = {
 # Feature key → set of tool names to filter when disabled
 FEATURE_TOOLS: Dict[str, Set[str]] = {
     "gacha": {"gacha_pull", "play_gacha_animation"},
-    "image": {"play_gacha_animation"},
+    "image": {"play_gacha_animation", "group_media", "send_sticker", "fetch_image", "discover_images"},
     "voice": set(),  # Hook for future voice recognition tools
 }
 

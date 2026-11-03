@@ -2331,6 +2331,10 @@ def _build_story_context(persona_key: str, query: str, pm) -> tuple:
 
 def _story_search(query: str = "", limit: int = 4) -> str:
     """Deep lookup in the original-story knowledge base (task-plane tool)."""
+    from .group_runtime import current_group_run
+    if current_group_run.get() is not None:
+        from .group_resources import story_search
+        return story_search(query,limit)
     try:
         from lib.story_kb import get_story_kb
 
@@ -2357,7 +2361,7 @@ def _story_search(query: str = "", limit: int = 4) -> str:
 
 _tool_registry.register(
     "story_search", _story_search,
-    "《星陨计划(Ark Re:Code)》原作剧情库检索。当用户询问游戏剧情、角色过往、"
+    "人格所属知识库检索（群内按人格映射与群剧透进度过滤；私聊兼容原剧情库）。当用户询问游戏剧情、角色过往、"
     "活动故事或世界观事件（如「第一次方舟战争」「谁是指挥官高文」「露比的过去」）时，"
     "用此工具取回台词原文（英文）与中文梗概。返回内容含场景出处、单元梗概、"
     "本段梗概与对白摘录；回复时请把英文台词译成中文转述，不要整段照抄。"
@@ -2443,6 +2447,12 @@ def _stream_delivery(kind: str) -> None:
 
 async def run_agent_turn(view: InboundMessage):
     """Run one agent turn under the per-user busy guard."""
+    if view.is_group:
+        from .group_runtime import run_group_turn
+        return await run_group_turn(view)
+    from .group_runtime import manage_identity
+    if await manage_identity(view, _turn_sender.get() or default_sender):
+        return
     # Platform identity (stage 4, §7.7): PermissionManager.get_role() picks
     # the openid tables for qq_official, the QQ-number tables for onebot.
     from agent.context import _current_evidence_id
@@ -2469,6 +2479,10 @@ async def run_agent_turn(view: InboundMessage):
 
 def _view_scope(view):
     from agent.cognitive_state import scope_key
+    if view.is_group:
+        from .group_runtime import get_store
+        from .group_state import scope_for
+        return scope_for(view)
     persona = get_character_registry().resolve_effective_personality(view.user_id,view.group_id)
     active = _special_sessions.get_active(view.user_id)
     scene = ""
@@ -2521,6 +2535,9 @@ async def _handle_memory_control(view, sender=None):
 
 async def handle_agent_turn(view: InboundMessage):
     """Inner implementation — called under per-user busy guard."""
+    if view.is_group:
+        from .group_runtime import run_group_turn
+        return await run_group_turn(view)
     user_id = view.user_id
 
     # Token-usage attribution: set before triage so every LLM call of this
@@ -3298,6 +3315,9 @@ async def handle_agent_turn(view: InboundMessage):
 
 async def run_continuous_turn(view: InboundMessage):
     """Run one continuous-mode turn (active-window check + busy guard)."""
+    if view.is_group:
+        from .group_runtime import run_group_turn
+        return await run_group_turn(view, sender=_turn_sender.get() or continuous_sender)
     from agent.context import _current_evidence_id
     _current_evidence_id.set(json.dumps([view.platform, view.self_id, view.group_id, view.user_id, view.message_id], ensure_ascii=False) if view.message_id else "")
     _current_platform.set(view.platform)
@@ -3325,6 +3345,9 @@ async def run_continuous_turn(view: InboundMessage):
 
 async def handle_continuous_turn(view: InboundMessage):
     """Inner implementation — called under per-user busy guard."""
+    if view.is_group:
+        from .group_runtime import run_group_turn
+        return await run_group_turn(view, sender=_turn_sender.get() or continuous_sender)
     user_id = view.user_id
     group_id = view.group_id
 
@@ -4587,7 +4610,9 @@ async def _settle_bond_turn(user_id: str, persona_key: str, sender=None,
             turn_count = _session_manager.message_count(user_id) // 2
         except Exception:
             turn_count = 0
-        result = _bond_manager.settle_turn(user_id, persona_key, turn_count=turn_count)
+        from .context import _current_evidence_id
+        result = _bond_manager.settle_turn(user_id, persona_key, turn_count=turn_count,
+                                           event_id=_current_evidence_id.get())
         # P3: 久别重逢 / 纪念日共同经历事件（一次性守卫在 bond.py 内）
         if result.get("reunion") and _bond_manager.note_reunion(user_id, persona_key):
             _bond_manager.append_event(user_id, persona_key, "久别重逢")
@@ -6923,3 +6948,12 @@ try:
         _recovery_driver().on_shutdown(agent.experience.stop_recovery)
 except ValueError:
     pass  # offline tests may import without a running driver
+
+
+from .group_resources import group_media as _group_media
+_tool_registry.register("group_media",_group_media,"群已发布图片/表情包：空ID列出可用资源，指定ID排队发送。",{"type":"object","properties":{"asset_id":{"type":"string"}}})
+
+from .media_tools import send_sticker,fetch_image,discover_images
+_tool_registry.register("send_sticker",send_sticker,"发送当前人格已批准表情包。空参数列目录；显式ID不替换；mood按情绪选择。只有用户明确要求重发才设置repeat。",{"type":"object","properties":{"sticker_id":{"type":"string"},"mood":{"type":"string"},"repeat":{"type":"boolean"}}})
+_tool_registry.register("fetch_image",fetch_image,"抓取已批准域的HTTPS图片直链或当前会话候选ID。新图需审核，不可声称排队图片已发送。",{"type":"object","properties":{"url":{"type":"string"},"candidate_id":{"type":"string"}}})
+_tool_registry.register("discover_images",discover_images,"从已批准的静态网页发现至多6张候选，不自动发送。让用户选择候选后再fetch_image。",{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})

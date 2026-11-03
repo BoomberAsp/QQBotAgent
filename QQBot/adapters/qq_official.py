@@ -530,7 +530,12 @@ def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
         text=_clean_content(event.content),
         message_id=str(event.id),
         self_id=str(bot.self_id),
-        mentioned=True if not is_group else bool(getattr(event, "to_me", True)),
+        mentioned=True if not is_group else (isinstance(event, GroupAtMessageCreateEvent)
+            or any(getattr(m, "is_you", False) for m in (getattr(event, "mentions", None) or []))),
+        received_at=(event.timestamp.timestamp() if hasattr(getattr(event,"timestamp",None),"timestamp") else __import__("time").time()),
+        actor_role=str(getattr(author, "member_role", "member")),
+        author_is_bot=bool(getattr(author, "bot", False)),
+        reply_to_bot=bool(is_group and getattr(getattr(getattr(event, "reply", None), "author", None), "id", None) == str(bot.self_id)),
         reply_context=_quote_context(quoted),
         resolver=QQOfficialAttachmentResolver(event, quoted),
         platform="qq_official",
@@ -738,6 +743,43 @@ class QQOfficialSender:
             await self.send_markdown(msg.markdown)
             return
         self._buffer.append(("kb", msg))
+
+    async def send_media_confirmed(self, img: OutImage) -> str:
+        if self._sent >= self.max_messages_per_turn:
+            return "dropped"
+        try:
+            await self._bot.send(self._event,MessageSegment.file_image(Path(img.path)))
+            self._sent += 1
+            return "sent"
+        except ActionFailed:
+            return "failed"
+        except Exception:
+            return "uncertain"
+
+    async def send_group_image(self, img: OutImage) -> str:
+        if not self._is_group or self._sent >= self.max_messages_per_turn:
+            return "dropped"
+        try:
+            await self._bot.send(self._event,MessageSegment.file_image(Path(img.path)))
+            self._sent += 1
+            return "sent"
+        except ActionFailed:
+            return "failed"
+        except Exception:
+            return "uncertain"
+
+    async def send_group_text(self, text: str) -> str:
+        """Acknowledged group-only reply; never retry an uncertain delivery."""
+        if not self._is_group or self._sent >= self.max_messages_per_turn:
+            return "dropped"
+        try:
+            await self._bot.send(self._event, MessageSegment.text(text))
+            self._sent += 1
+            return "sent"
+        except ActionFailed:
+            return "failed"
+        except Exception:
+            return "uncertain"
 
     async def send_image(self, img: OutImage) -> None:
         self._buffer.append(("image", img))
@@ -1277,4 +1319,7 @@ async def send_active_group(bot: QQBot, group_openid: str, text: str,
 
 # Event types this route handles — the entry plugin's isinstance guard
 # and the intent config (c2c_group_at_messages) must agree on this set.
-HANDLED_EVENTS = (C2CMessageCreateEvent, GroupAtMessageCreateEvent)
+# Some adapter releases define the full-message class without registering it.
+from nonebot.adapters.qq.event import register_event_class
+register_event_class(GroupMessageCreateEvent)
+HANDLED_EVENTS = (C2CMessageCreateEvent, GroupMessageCreateEvent)

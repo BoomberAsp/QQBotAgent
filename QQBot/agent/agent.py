@@ -349,6 +349,11 @@ class Agent:
         Returns:
             The agent's final response string.
         """
+        from .group_runtime import current_group_run
+        group_run = current_group_run.get()
+        if group_run is not None:
+            persist = False
+            allowed_tools = set(group_run.tools) & (set(allowed_tools) if allowed_tools is not None else set(group_run.tools))
         # Determine which session to use
         if persist and session_type == "special" and self.special_sessions:
             special_session = self.special_sessions.get_active(user_id)
@@ -417,7 +422,7 @@ class Agent:
             llm_client = client or self.client
             schemas = (
                 self.tools.get_schemas_for(allowed_tools)
-                if allowed_tools
+                if allowed_tools is not None
                 else self.tools.get_schemas()
             )
             from .request_budget import fit_request, ContextBudgetError
@@ -697,6 +702,10 @@ class Agent:
                profile 注入、MEDIUM 记忆注入、人格过渡提示
         最后:  当前用户消息
         """
+        from .group_runtime import current_group_run
+        group_run = current_group_run.get()
+        if group_run is not None:
+            return group_run.messages(self, user_message)
         from agent.context import (
             _current_personality, _personality_transition, _current_group_context,
             _current_bond_context, _current_story_context, _current_render_context,
@@ -902,6 +911,13 @@ class Agent:
             if quota_ctx:
                 volatile.append(quota_ctx)
 
+        # Explicitly provenance-filtered cross-scene user facts. Legacy private
+        # memory remains on the private path; it is never fed to GroupRun.
+        from .group_runtime import private_memory_block
+        shared_facts = private_memory_block(user_id)
+        if shared_facts:
+            optional_blocks.append("用户共享记忆（本人事实，保留来源边界）：\n" + shared_facts)
+
         # User profile context (changes after each extraction batch)
         if self.profiles and not cognitive_scope:
             profile = self.profiles.get(user_id)
@@ -1099,6 +1115,12 @@ class Agent:
 
         Returns a list of tool result messages to append.
         """
+        from .group_runtime import current_group_run
+        group_run = current_group_run.get()
+        if group_run is not None:
+            allowed_tools = set(group_run.tools) & (set(allowed_tools) if allowed_tools is not None else set(group_run.tools))
+            if not group_run.valid():
+                allowed_tools = set()
         results = []
         for tc in tool_calls:
             tool_name = tc["function"]["name"]
@@ -1108,7 +1130,7 @@ class Agent:
                 arguments = {}
 
             # Hard-reject: defense-in-depth against disallowed tools
-            if allowed_tools is not None and tool_name not in allowed_tools:
+            if (allowed_tools is not None and tool_name not in allowed_tools) or (group_run is not None and not group_run.valid()):
                 result_text = (
                     f"[Permission] 工具 '{tool_name}' 超出当前用户权限范围，"
                     f"此调用已被系统拦截。如果你确实需要此功能，请联系管理员。"
@@ -1117,7 +1139,7 @@ class Agent:
                 result_text = await self.tools.execute(tool_name, arguments)
 
             from .experience_service import current_run
-            experience_run = current_run.get()
+            experience_run = current_run.get() if group_run is None else None
             if experience_run:
                 try:
                     failure_type = "permission" if allowed_tools is not None and tool_name not in allowed_tools else "unknown"
@@ -1173,6 +1195,10 @@ class Agent:
                 "result_summary": result_text[:200].replace("\n", " "),
             }
 
+            from .group_runtime import current_group_run
+            if current_group_run.get() is not None or tool_name in {"fetch_image","discover_images"}:
+                entry["arguments"] = {}
+                entry["result_summary"] = "[group content omitted]"
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:

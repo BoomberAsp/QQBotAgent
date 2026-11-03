@@ -22,6 +22,7 @@ otherwise re-run on every call).
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -67,6 +68,10 @@ class InboundMessage:
     attachments_loaded: bool = field(default=False, repr=False)
     resolver: AttachmentResolver | None = None
     platform: str = "unknown"         # "onebot" | "qq_official"
+    actor_role: str = "member"
+    reply_to_bot: bool = False
+    author_is_bot: bool = False
+    received_at: float = field(default_factory=time.time)
     raw: Any = None                   # original event (escape hatch)
 
     async def load_attachments(self) -> list[Attachment]:

@@ -422,7 +422,7 @@ class BondManager:
 
     # ── EXP settlement ────────────────────────────────────────────
 
-    def settle_turn(self, user_id: str, char_id: str, turn_count: int = 0) -> Dict[str, Any]:
+    def settle_turn(self, user_id: str, char_id: str, turn_count: int = 0, *, event_id: str = "", channel: str = "private") -> Dict[str, Any]:
         """回合结束结算钩子（agent_router 每轮调用，两个平面都结算）。
 
         规则（Bond-System-Design.md §4.3）：
@@ -436,6 +436,9 @@ class BondManager:
         now = time.time()
         today = datetime.now().strftime("%Y-%m-%d")
         state = self.get_state(user_id, char_id)
+        seen = state.setdefault("settled_events", [])
+        if event_id and event_id in seen:
+            return {"exp_gained": 0, "level_ups": [], "reunion": False, "duplicate": True}
         self._roll_daily(state, today)
 
         # 久别重逢检测（基于上一轮 last_seen；事件文案为 P3，这里只打标）
@@ -489,7 +492,15 @@ class BondManager:
         stats["msgs"] = int(stats.get("msgs", 0)) + 1
         if not stats.get("first_met"):
             stats["first_met"] = now
-        stats["last_seen"] = now
+        stats["last_interaction"] = now
+        if channel == "group":
+            stats["last_group_seen"] = now
+        else:
+            stats["last_seen"] = now
+            stats["last_private_seen"] = now
+        if event_id:
+            seen.append(event_id)
+            del seen[:-512]
 
         self._save(user_id)
         return {

@@ -194,3 +194,5 @@ def log_sources() -> dict:
     except OSError:
         pass
     return sources
+
+os.environ.setdefault("MEDIA_DATA_ROOT", bot_env("MEDIA_DATA_ROOT", str(QQBOT_DIR / "data" / "media_runtime")))
