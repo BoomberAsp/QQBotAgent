@@ -183,9 +183,12 @@ async def _on_interaction(bot: QQBot, event: InteractionCreateEvent) -> None:
             return
 
         if scene == "group":
-            await _ack(bot, event.id, 1)
-            sender = QQOfficialInteractionSender(bot,event,scope=scene,openid=user)
-            await sender.send_text("群使用独立共享会话，请 @机器人 发送 /群帮助；个人功能请私聊。")
+            from agent.group_callbacks import handle
+            if _seen_before(str(bot.self_id)+":"+group+":"+str(event.id)):
+                await _ack(bot,event.id,3);return
+            result=await handle(bot,event,user,group,button_data)
+            await _ack(bot,event.id,result.code)
+            await _receipt(bot,event,scene,user,result)
             return
 
         # 3. contextvars for the permission/role layer

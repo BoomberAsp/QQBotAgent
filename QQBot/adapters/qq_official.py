@@ -768,6 +768,32 @@ class QQOfficialSender:
         except Exception:
             return "uncertain"
 
+    async def send_group_markdown(self,text,plain=None):
+        return await self.send_group_keyboard(text,[],plain)
+
+    async def send_group_keyboard(self,text,rows,plain=None):
+        if not self._is_group:return "dropped"
+        plain=plain or text
+        candidates=[]
+        if rows and self.supports_keyboard:
+            validate_buttons(rows)
+            candidates.append(self._kb_message(text,rows))
+        if self.supports_markdown:candidates.append(MessageSegment.markdown(text))
+        candidates.append(MessageSegment.text(plain))
+        for message in candidates:
+            if self._sent>=self.max_messages_per_turn:return "dropped"
+            self._sent+=1
+            try:
+                await self._bot.send(self._event,message)
+                return "sent"
+            except ActionFailed as exc:
+                # Only explicit unsupported-payload errors permit degradation.
+                code=getattr(exc,"code",None)
+                if code not in (_KB_REJECT_CODES | _MD_REJECT_CODES):return "failed"
+            except Exception:
+                return "uncertain"
+        return "failed"
+
     async def send_group_text(self, text: str) -> str:
         """Acknowledged group-only reply; never retry an uncertain delivery."""
         if not self._is_group or self._sent >= self.max_messages_per_turn:

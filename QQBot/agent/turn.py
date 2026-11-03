@@ -782,9 +782,15 @@ def _build_tool_registry() -> ToolRegistry:
         disabled: set = set()
         if group_id:
             try:
-                gf = get_group_features()
-                gf.refresh()
-                disabled = gf.get_disabled_tools(group_id)
+                from .group_runtime import current_group_run,get_store
+                from .group_features import disabled_tools
+                group_run=current_group_run.get()
+                if group_run is not None:
+                    disabled=disabled_tools(get_store().group(group_run.scope)["config"]["features"])
+                else:
+                    gf = get_group_features()
+                    gf.refresh()
+                    disabled = gf.get_disabled_tools(group_id)
             except Exception:
                 disabled = set()
 

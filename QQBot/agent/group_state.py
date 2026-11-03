@@ -31,7 +31,8 @@ def identity_for(view):
 DEFAULTS = dict(persona="assistant", mode="mention", receive_all=False,
                 quiet="", active_enabled=True, status="active",
                 cooldown=180, auto_daily_cap=10, follow_seconds=120,
-                follow_limit=2, scheduled_push_enabled=False)
+                follow_limit=2, scheduled_push_enabled=False, features={"gacha":True,"image":True,"voice":True},
+                memo="",persona_pending=None,platform_full_events="unknown",proactive_stickers=False,story_progress={})
 
 
 class GroupStore:
@@ -40,7 +41,12 @@ class GroupStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "groups.sqlite3"
         with self.db() as db:
+            db.execute("PRAGMA journal_mode=WAL")
             db.executescript('''
+            CREATE TABLE IF NOT EXISTS notices(id INTEGER PRIMARY KEY,scope TEXT,created REAL,text TEXT);
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
+            CREATE TABLE IF NOT EXISTS group_actions(token TEXT PRIMARY KEY,scope TEXT,actor TEXT,revision INTEGER,action TEXT,expires REAL);
+            CREATE TABLE IF NOT EXISTS legacy_migrations(id TEXT PRIMARY KEY,source TEXT,entry TEXT,target TEXT,status TEXT,actor TEXT,created REAL);
             CREATE TABLE IF NOT EXISTS groups(scope TEXT PRIMARY KEY, config TEXT,
               generation INTEGER DEFAULT 0, memory TEXT DEFAULT '[]');
             CREATE TABLE IF NOT EXISTS turns(scope TEXT, generation INTEGER, event TEXT,
@@ -61,6 +67,10 @@ class GroupStore:
             CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY,scope TEXT,
               event TEXT,status TEXT,created REAL);
             ''')
+            db.execute('BEGIN IMMEDIATE')
+            if 'config_revision' not in {r[1] for r in db.execute('PRAGMA table_info(groups)')}:
+                db.execute('ALTER TABLE groups ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0')
+            db.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version','2')")
 
     @contextmanager
     def db(self):
@@ -79,43 +89,52 @@ class GroupStore:
             db.execute("INSERT OR IGNORE INTO groups(scope,config) VALUES (?,?)",
                        (scope, json.dumps(DEFAULTS)))
             row = dict(db.execute("SELECT * FROM groups WHERE scope=?", (scope,)).fetchone())
-        row["config"] = dict(DEFAULTS, **json.loads(row["config"]))
+        row["config"] = {**json.loads(json.dumps(DEFAULTS)), **json.loads(row["config"])}
         row["memory"] = json.loads(row["memory"])
         return row
 
-    def configure(self, scope, **changes):
+    def update_state(self,scope,change,expected=None,invalidate=True):
         self.group(scope)
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT config FROM groups WHERE scope=?", (scope,)).fetchone()
-            config = {**DEFAULTS, **json.loads(row[0]), **changes}
-            db.execute("UPDATE groups SET config=?,generation=generation+1 WHERE scope=?",
-                       (json.dumps(config, ensure_ascii=False), scope))
-            if "persona" in changes:
-                db.execute("DELETE FROM turns WHERE scope=?", (scope,))
+            row=dict(db.execute("SELECT * FROM groups WHERE scope=?",(scope,)).fetchone())
+            if expected is not None and row['config_revision']!=expected:
+                raise Conflict(row['config_revision'])
+            config={**json.loads(json.dumps(DEFAULTS)),**json.loads(row['config'])}
+            memory=json.loads(row['memory'])
+            change(db,config,memory,row)
+            db.execute("UPDATE groups SET config=?,memory=?,generation=generation+?,config_revision=config_revision+1 WHERE scope=?",(json.dumps(config,ensure_ascii=False),json.dumps(memory,ensure_ascii=False),int(invalidate),scope))
+        return self.group(scope)
 
-    def reset(self, scope, *, clear=False):
-        self.group(scope)
-        with self.db() as db:
-            db.execute("UPDATE groups SET generation=generation+1 WHERE scope=?", (scope,))
-            db.execute("DELETE FROM turns WHERE scope=?", (scope,))
-            if clear:
-                db.execute("UPDATE groups SET memory='[]' WHERE scope=?", (scope,))
-                db.execute("UPDATE facts SET status='deleted',revision=revision+1 WHERE scope=?", (scope,))
+    def configure(self,scope,**changes):
+        def apply(db,config,memory,row):config.update(changes)
+        return self.update_state(scope,apply,invalidate=set(changes)!={'memo'})
 
-    def memory(self, scope, text=None, clear=False):
-        self.group(scope)
-        with self.db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            items = json.loads(db.execute("SELECT memory FROM groups WHERE scope=?", (scope,)).fetchone()[0])
+    def reset(self,scope,*,clear=False,expected=None):
+        def apply(db,config,memory,row):
+            db.execute('DELETE FROM turns WHERE scope=?',(scope,))
+            db.execute('DELETE FROM notices WHERE scope=?',(scope,))
+            config['persona_pending']=None
             if clear:
-                items = []
+                memory.clear()
+                self.revoke_facts(db,scope)
+        return self.update_state(scope,apply,expected)
+
+    @staticmethod
+    def revoke_facts(db,scope,fid=None):
+        rows=db.execute("SELECT identity FROM facts WHERE scope=? AND status='active'"+(" AND id=?" if fid else ""),(scope,fid) if fid else (scope,)).fetchall()
+        for r in rows:
+            db.execute('UPDATE identities SET revision=revision+1 WHERE target=(SELECT target FROM identities WHERE identity=?)',(r[0],))
+        db.execute("UPDATE facts SET status='deleted',revision=revision+1 WHERE scope=?"+(" AND id=?" if fid else ""),(scope,fid) if fid else (scope,))
+
+    def memory(self,scope,text=None,clear=False,expected=None):
+        def apply(db,config,memory,row):
+            if clear:memory.clear()
             elif text:
-                items.append(text[:500])
-                items = items[-30:]
-            db.execute("UPDATE groups SET memory=?,generation=generation+1 WHERE scope=?",
-                       (json.dumps(items, ensure_ascii=False), scope))
-        return items
+                if len(text)>500:raise ValueError('群记忆最多500字')
+                if len(memory)>=30:raise ValueError('群记忆最多30条，请先清理')
+                memory.append(text)
+        return self.update_state(scope,apply,expected)['memory']
 
     def claim(self, scope, event):
         if not event:
@@ -127,7 +146,7 @@ class GroupStore:
 
     def history(self, scope, limit=20):
         with self.db() as db:
-            rows = db.execute("SELECT actor,user_text,answer FROM turns WHERE scope=? ORDER BY created DESC LIMIT ?",
+            rows = db.execute("SELECT actor,user_text,answer,created FROM turns WHERE scope=? ORDER BY created DESC LIMIT ?",
                               (scope, limit)).fetchall()
         with self.db() as db:
             older=db.execute("SELECT event,actor,user_text,answer FROM turns WHERE scope=? ORDER BY created DESC LIMIT 20 OFFSET ?",(scope,limit)).fetchall()
@@ -135,7 +154,13 @@ class GroupStore:
         if older:
             digest=[dict(source=r['event'],speaker=r['actor'],topic=r['user_text'][:120],answer_excerpt=r['answer'][:180]) for r in reversed(older)]
             result.append(dict(role="user",content="[较早话题的摘录摘要；不完整，保留发言归属与来源]\n"+json.dumps(digest,ensure_ascii=False)))
-        for row in reversed(rows):
+        with self.db() as db:
+            notices=[dict(n) for n in db.execute('SELECT created,text FROM notices WHERE scope=? ORDER BY created DESC LIMIT 10',(scope,))]
+        timeline=[(r['created'],'turn',r) for r in rows]+[(n['created'],'notice',n) for n in notices]
+        for _,kind,row in sorted(timeline,key=lambda item:item[0]):
+            if kind=='notice':
+                result.append(dict(role="system",content=row['text']))
+                continue
             result.extend([dict(role="user", content=f"成员[{row['actor']}]：{row['user_text']}"),
                            dict(role="assistant", content=row["answer"])])
         return result
@@ -242,6 +267,17 @@ class GroupStore:
             db.execute("UPDATE identities SET revision=revision+1 WHERE target=?", (self.resolve(identity)["canonical"],))
         return True
 
+    def can_auto(self, scope, config, now=None):
+        """Read-only preflight; only actual send attempts reserve automatic quota."""
+        now = time.time() if now is None else now
+        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        with self.db() as db:
+            for k, cap, cooldown in ((scope,config["auto_daily_cap"],config["cooldown"]),("__bot__",100,1)):
+                row=db.execute("SELECT count,last FROM quotas WHERE scope=? AND day=?",(k,day)).fetchone()
+                if row and (row["count"]>=cap or now-row["last"]<cooldown):
+                    return False
+        return True
+
     def reserve_auto(self, scope, config, now=None):
         now = time.time() if now is None else now
         day = time.strftime("%Y-%m-%d", time.localtime(now))
@@ -263,3 +299,9 @@ class GroupStore:
                        (ticket,scope,event,status,time.time()))
             db.execute("DELETE FROM deliveries WHERE created<?", (time.time()-30*86400,))
         return ticket
+
+
+class Conflict(ValueError):
+    def __init__(self,revision):
+        self.revision=revision
+        super().__init__('配置已变化，请刷新后重试')

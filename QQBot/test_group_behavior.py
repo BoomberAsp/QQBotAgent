@@ -32,7 +32,7 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(s.commit(a,gen,'one','A','hello','world'))
         self.assertEqual(s.history(b),[])
         s.configure(a,persona='roxy',receive_all=True)
-        self.assertEqual(s.history(a),[])
+        self.assertEqual(len(s.history(a)),2)
         self.assertFalse(s.commit(a,gen,'old','A','stale','result'))
         self.assertTrue(s.group(a)['config']['receive_all'])
         self.assertEqual(s.group(a)['config']['persona'],'roxy')
@@ -198,7 +198,49 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.group(scope_for(v))['config']['persona'],'assistant')
         v=view(message='o',actor_role='admin'); v.text='/群人格 rubi'
         await runtime.run_group_turn(v,self.sender)
+        self.assertEqual(self.store.group(scope_for(v))['config']['persona'],'assistant')
+        self.fake._perm_manager.get_role=lambda u:NS(value='admin')
+        v=view(message='p');v.text='/群人格 rubi'
+        await runtime.run_group_turn(v,self.sender)
         self.assertEqual(self.store.group(scope_for(v))['config']['persona'],'rubi')
+
+    async def test_natural_agent_decides_without_judge_or_keywords(self):
+        v=view();v.mentioned=False;v.text='哈哈今天这个梗真有意思'
+        self.store.configure(scope_for(v),receive_all=True,mode='natural')
+        await runtime.run_group_turn(v,self.sender)
+        self.assertEqual(len(self.calls),1)
+        self.assertTrue(self.calls[0].autonomous)
+        self.fake._model_router.flash_client.chat_completion.assert_not_awaited()
+        self.sender.send_group_text.assert_awaited_once()
+
+    async def test_silence_does_not_send_commit_or_consume_quota(self):
+        v=view();v.mentioned=False;v.text='普通聊天'
+        scope=scope_for(v);self.store.configure(scope,receive_all=True,mode='natural')
+        async def silent(*a,**k):return '[[GROUP_SILENT]]'
+        self.fake.agent.run=silent
+        await runtime.run_group_turn(v,self.sender)
+        self.sender.send_group_text.assert_not_awaited()
+        self.assertEqual(self.store.history(scope),[])
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM quotas').fetchone()[0],0)
+        self.fake._bond_manager.settle_turn.assert_not_called()
+
+    async def test_autonomous_prompt_offers_reply_and_silence(self):
+        run=runtime.GroupRun('assistant','人格',[],'',set(),lambda:True,autonomous=True)
+        messages=run.messages(None,'普通消息')
+        self.assertIn('[[GROUP_SILENT]]',str(messages))
+        self.assertIn('不要求消息是疑问句',str(messages))
+
+    async def test_external_reset_clears_runtime_buffer(self):
+        v=view();scope=scope_for(v)
+        self.store.configure(scope,receive_all=True)
+        await runtime.run_group_turn(v,self.sender)
+        self.assertTrue(runtime._buffers[scope])
+        self.store.reset(scope)
+        v=view(message='after');v.text='新消息'
+        await runtime.run_group_turn(v,self.sender)
+        self.assertEqual(len(runtime._buffers[scope]),1)
+        self.assertNotIn('你好',self.calls[-1].context)
 
     async def test_unmentioned_default_no_agent(self):
         v=view(); v.mentioned=False

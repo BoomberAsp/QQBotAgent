@@ -176,3 +176,10 @@ def get_group_features() -> GroupFeatureManager:
     if _group_features is None:
         _group_features = GroupFeatureManager()
     return _group_features
+
+
+def disabled_tools(features):
+    result=set()
+    for feature,enabled in features.items():
+        if enabled is False:result.update(FEATURE_TOOLS.get(feature,set()))
+    return result

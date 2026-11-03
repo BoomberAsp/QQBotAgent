@@ -196,3 +196,5 @@ def log_sources() -> dict:
     return sources
 
 os.environ.setdefault("MEDIA_DATA_ROOT", bot_env("MEDIA_DATA_ROOT", str(QQBOT_DIR / "data" / "media_runtime")))
+
+os.environ.setdefault("PERSONA_RESOURCE_REGISTRY",bot_env("PERSONA_RESOURCE_REGISTRY",str(QQBOT_DIR/"data/persona_resources/registry.json")))

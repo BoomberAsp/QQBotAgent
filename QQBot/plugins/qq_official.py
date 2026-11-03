@@ -1206,14 +1206,11 @@ async def handle_official_notice(bot: QQBot, event):
         from agent.group_runtime import get_store
         from agent.group_state import key
         scope = key("qq_official",str(bot.self_id),"group",str(event.group_openid))
-        changes = {}
-        if isinstance(event,GroupDelRobotEvent):
-            changes = dict(status="removed",active_enabled=False)
-        elif isinstance(event,GroupAddRobotEvent):
-            changes = dict(status="active",active_enabled=True)
-        else:
-            changes = dict(active_enabled=isinstance(event,GroupMsgReceiveEvent))
-        get_store().configure(scope,**changes)
+        from agent.group_service import GroupService
+        kind=("removed" if isinstance(event,GroupDelRobotEvent) else "added" if isinstance(event,GroupAddRobotEvent) else "receive" if isinstance(event,GroupMsgReceiveEvent) else "reject")
+        stamp=getattr(event,"timestamp",None)
+        stamp=stamp.timestamp() if hasattr(stamp,"timestamp") else float(stamp or time.time())
+        GroupService(get_store()).observe(scope,kind,stamp,str(getattr(event,"id","")))
         return
     if isinstance(event, C2CMsgRejectEvent):
         openid = str(getattr(event, "openid", "") or "")
@@ -1250,6 +1247,13 @@ async def handle_official_message(bot: QQBot, event: QQMessageEvent):
 
     view = build_view(bot, event)
     scope = "group" if view.is_group else "c2c"
+    if view.is_group:
+        from nonebot.adapters.qq.event import GroupAtMessageCreateEvent
+        if not isinstance(event,GroupAtMessageCreateEvent):
+            from agent.group_service import GroupService
+            from agent.group_runtime import get_store
+            from agent.group_state import scope_for
+            GroupService(get_store()).observe(scope_for(view),"full",view.received_at,view.message_id)
     if not view.is_group:
         # P3b: c2c user_openid is the only identity usable for active
         # c2c pushes → maintain the greeting candidate index from here
