@@ -975,8 +975,8 @@ async def _run_media_pass() -> None:
     img_min = int(cfg.get("media_image_min_level", 4))
     voice_min = int(cfg.get("media_proactive_voice_min_level", 7))
     prob = float(cfg.get("proactive_media_probability", 0.15))
-    media_daily_cap = int(cfg.get("proactive_media_daily_cap", 1))
-    monthly_cap = int(cfg.get("greet_monthly_cap", 4))
+    media_daily_cap = int(cfg.get("proactive_media_daily_cap", 4))
+    monthly_cap = int(cfg.get("greet_monthly_cap", 40))
     max_batch = int(cfg.get("greet_batch_max", 5))
     ttl = float(cfg.get("media_dedupe_ttl_hours", 168))
 
