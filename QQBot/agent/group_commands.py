@@ -4,6 +4,7 @@ from dataclasses import dataclass,replace
 from .group_state import scope_for,identity_for,Conflict
 from .group_service import GroupService
 from .group_reply import GroupReply
+from .public_commands import PUBLIC_COMMANDS, PRIVATE_ONLY, dispatch_public
 
 @dataclass(frozen=True)
 class GroupCommand:
@@ -13,7 +14,7 @@ class GroupCommand:
     aliases:tuple=()
 
 COMMANDS=(
- GroupCommand('/群状态','any','查看本群状态'),GroupCommand('/群帮助','any','查看命令',('/帮助',)),
+ GroupCommand('/群状态','any','查看本群状态',('/status',)),GroupCommand('/群帮助','any','查看命令',('/帮助','/help','/命令')),
  GroupCommand('/群人格','admin','内置名|默认',('/toggle personality',)),
  GroupCommand('/群面板','group_or_bot','打开管理卡片',('/toggle',)),
  GroupCommand('/群功能',usage='gacha|image|voice 开|关'),GroupCommand('/群参与',usage='仅召唤|跟随|自然'),
@@ -21,8 +22,9 @@ COMMANDS=(
  GroupCommand('/群主动贴图',usage='开|关'),GroupCommand('/群剧情进度',usage='知识库ID 章节'),
  GroupCommand('/群记忆',usage='[添加 内容|清空 确认]'),GroupCommand('/群重置',usage='重置历史（确认后执行）'),
  GroupCommand('/群清除数据',usage='清除群历史、记忆和来源事实（确认后执行）'),
- GroupCommand('/取消','any','取消自己的当前任务'),GroupCommand('/群操作','any','操作令牌'),
+ GroupCommand('/取消','any','取消自己的当前任务',('/结束',)),GroupCommand('/群操作','any','操作令牌'),
 )
+COMMANDS += tuple(GroupCommand(c.name,'any',c.usage,c.aliases) for c in PUBLIC_COMMANDS)
 IDENTITY_COMMANDS=('/绑定身份','/绑定群身份','/确认绑定','/解除身份绑定','/个人记忆','/记住','/删除记忆','/公开记忆')
 
 # QQ can leave the mention in event.content even on a genuine group-@ event.
@@ -91,11 +93,27 @@ async def dispatch(view,sender,role,store):
     if not(view.mentioned or view.reply_to_bot):return True
     if text.partition(' ')[0] in IDENTITY_COMMANDS:
         await runtime.manage_identity(replace(view,text=text),sender);return True
+    if text.split()[0].lower() in PRIVATE_ONLY:
+        await GroupReply('此命令请在私聊中使用',['群内可用命令见 /群帮助。']).send(sender)
+        return True
     cmd,rest,alias=parse(text)
     if cmd is None:
         await GroupReply('未知命令',['发送 /群帮助 查看本群可用命令。']).send(sender);return True
     if not authorized(cmd.who,role,view.actor_role):
         await GroupReply('权限不足',['此操作需要机器人管理员权限。' if cmd.who=='admin' else '此操作需要群主、群管理员或机器人管理员权限。']).send(sender);return True
+    public=next((c for c in PUBLIC_COMMANDS if c.name==cmd.name),None)
+    if public is not None:
+        from .context import _turn_sender,_current_group_id
+        token=_turn_sender.set(sender)
+        group_token=_current_group_id.set(view.group_id)
+        try:
+            images=store.group(scope_for(view))['config']['features'].get('image',True)
+            if not await dispatch_public(public,rest,view.user_id,allow_images=images):
+                await GroupReply('命令参数有误',[cmd.name+' '+cmd.usage]).send(sender)
+        finally:
+            _current_group_id.reset(group_token)
+            _turn_sender.reset(token)
+        return True
     service=GroupService(store);scope=scope_for(view);actor=identity_for(view)
     effective='admin' if role=='admin' else 'group_or_bot' if view.actor_role in ('owner','admin') else 'any'
     service.expire_pending(scope);state=store.group(scope);rev=state['config_revision'];name=cmd.name

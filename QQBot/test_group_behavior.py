@@ -315,6 +315,32 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await runtime.run_group_turn(v,self.sender)
         self.assertEqual(len(self.calls),1)
 
+    async def test_public_group_commands_use_system_handlers(self):
+        from agent.context import _turn_sender,_current_group_id
+        from agent.public_commands import PUBLIC_COMMANDS
+        for command in PUBLIC_COMMANDS:
+            for spelling in (command.name,*command.aliases):
+                with self.subTest(command=spelling):
+                    async def handle(text,user,**opts):
+                        self.assertIs(_turn_sender.get(),self.sender)
+                        self.assertEqual(_current_group_id.get(),'g')
+                        self.assertEqual(text,command.name+' 3')
+                        if command.renders_image:self.assertFalse(opts['allow_images'])
+                        return True
+                    mock=AsyncMock(side_effect=handle)
+                    setattr(self.fake,command.handler,mock)
+                    v=view(message=spelling);v.text='<@123> '+spelling+' 3'
+                    self.store.configure(scope_for(v),features={'image':False})
+                    await runtime.run_group_turn(v,self.sender)
+                    mock.assert_awaited_once()
+        self.assertEqual(self.calls,[])
+        self.assertEqual(self.store.history(scope_for(v)),[])
+        for spelling in ('/反馈','/邮件','/清除形象','/刷新角色数据'):
+            v=view(message=spelling);v.text=spelling
+            await runtime.run_group_turn(v,self.sender)
+            self.assertIn('私聊',self.sender.send_group_text.await_args.args[0])
+        self.assertEqual(self.calls,[])
+
     async def test_unmentioned_default_no_agent(self):
         v=view(); v.mentioned=False
         await runtime.run_group_turn(v,self.sender)

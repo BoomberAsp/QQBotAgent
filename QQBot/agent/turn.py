@@ -4006,7 +4006,7 @@ async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
     return True
 
 
-async def _handle_character_detail_command(text: str, user_id: str) -> bool:
+async def _handle_character_detail_command(text: str, user_id: str, *, allow_images: bool = True) -> bool:
     """Handle /角色详情 command — direct, no agent (zero token).
 
     Returns True if the command was handled.
@@ -4021,6 +4021,9 @@ async def _handle_character_detail_command(text: str, user_id: str) -> bool:
         await _safe_send("用法: /角色详情 <角色名或别名>\n例如: /角色详情 夏妮")
         return True
 
+    if not allow_images:
+        await _safe_send(await character_detail(rest))
+        return True
     text_result, card_path = await character_detail_with_card(rest)
     if card_path:
         await _safe_send(OutImage(path=card_path, label="character card"))
@@ -4029,7 +4032,7 @@ async def _handle_character_detail_command(text: str, user_id: str) -> bool:
     return True
 
 
-async def _handle_bond_detail_command(text: str, user_id: str) -> bool:
+async def _handle_bond_detail_command(text: str, user_id: str, *, allow_images: bool = True) -> bool:
     """Handle /羁绊详情 command — direct, no agent (zero token).
 
     Returns True if the command was handled.
@@ -4043,6 +4046,9 @@ async def _handle_bond_detail_command(text: str, user_id: str) -> bool:
         await _safe_send("用法: /羁绊详情 <羁绊名或别名>\n例如: /羁绊详情 驰骋的快感")
         return True
 
+    if not allow_images:
+        await _safe_send(await bond_detail(rest))
+        return True
     text_result, card_path = await bond_detail_with_card(rest)
     if card_path:
         await _safe_send(OutImage(path=card_path, label="bond card"))
@@ -5316,7 +5322,7 @@ async def _send_markdown_doc(path: str, label: str = "文档") -> bool:
     return True
 
 
-async def _handle_features_command(text: str, user_id: str) -> bool:
+async def _handle_features_command(text: str, user_id: str, *, allow_images: bool = True) -> bool:
     """Handle /功能 / /features command — direct, no agent.
 
     Renders FEATURES.md as a feature card image and sends only the image
@@ -5327,6 +5333,12 @@ async def _handle_features_command(text: str, user_id: str) -> bool:
         return False
 
     features_path = os.path.join(_CONFIG_DIR, "FEATURES.md")
+    if not allow_images:
+        with open(features_path,encoding="utf-8") as feature_doc:
+            sections=[line[3:].strip() for line in feature_doc if line.startswith("## ")]
+        await _safe_send("功能一览："+"、".join(sections)+"。群可用命令见 /群帮助。")
+        return True
+
 
     try:
         card_path = await asyncio.to_thread(render_feature_card, features_path)
@@ -5355,7 +5367,7 @@ _CHANGELOG_CMD_RE = re.compile(
 )
 
 
-async def _handle_changelog_command(text: str, user_id: str) -> bool:
+async def _handle_changelog_command(text: str, user_id: str, *, allow_images: bool = True) -> bool:
     """Handle /更新日志 [d] / /update record [d] — direct, no agent, zero token.
 
     d = 返回最近多少条更新记录（缺省 3，clamp 到 1..20）。数据源为
@@ -5371,6 +5383,9 @@ async def _handle_changelog_command(text: str, user_id: str) -> bool:
     d = int(m.group(2)) if m.group(2) else DEFAULT_COUNT
     entries = get_recent(d)
     await _send_text_chunks(format_for_qq(entries, requested=d, site_url=_PUBLIC_SITE_URL))
+
+    if not allow_images:
+        return True
 
     # 2. Render and send the changelog card (best-effort; text already sent)
     try:
