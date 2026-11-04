@@ -341,6 +341,30 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('私聊',self.sender.send_group_text.await_args.args[0])
         self.assertEqual(self.calls,[])
 
+    async def test_group_game_owner_followup_and_direct_calculation(self):
+        from agent.group_games import _pending
+        self.addCleanup(_pending.clear)
+        async def say(user,text,mid,direct=True):
+            v=view(user=user,message=mid);v.text=text;v.mentioned=direct
+            await runtime.run_group_turn(v,self.sender)
+        self.store.configure(scope_for(view()),receive_all=True)
+        await say('a','/luansu','a1')
+        await say('b','190 200','b1',False)
+        self.assertEqual(self.sender.send_group_text.await_count,1)
+        await say('a','<@bot> 190 200','a2')
+        self.assertIn('乱速概率',self.sender.send_group_text.await_args.args[0])
+        await say('a','/测速\n我方\n兔子 0 100 220\n敌方\n目标 0 88','a3')
+        self.assertIn('193.6',self.sender.send_group_text.await_args.args[0])
+        with patch('tools.legacy_tools.gacha_pull',new_callable=AsyncMock,return_value='招募结果') as pull:
+            await say('a','/十连抽','a4')
+            await say('a','几率UP','a5',False)
+            await say('a','UP 夏妮','a6',False)
+            pull.assert_awaited_once_with('几率up招募',10,'夏妮')
+        await say('a','/测速','a7')
+        await say('a','/取消','a8',False)
+        self.assertFalse(_pending)
+        self.assertFalse(self.calls)
+
     async def test_unmentioned_default_no_agent(self):
         v=view(); v.mentioned=False
         await runtime.run_group_turn(v,self.sender)

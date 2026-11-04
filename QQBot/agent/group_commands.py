@@ -14,7 +14,11 @@ class GroupCommand:
     aliases:tuple=()
 
 COMMANDS=(
- GroupCommand('/群状态','any','查看本群状态',('/status',)),GroupCommand('/群帮助','any','查看命令',('/帮助','/help','/命令')),
+ GroupCommand('/抽卡','any','[卡池] [UP角色]，单抽',('/单抽',)),
+ GroupCommand('/十连抽','any','[卡池] [UP角色]'),
+ GroupCommand('/乱速','any','[速度1 速度2]',('/luansu',)),
+ GroupCommand('/测速','any','[行动值模板或两张截图]',('/测个速','/cesu','/compute speed')),
+ GroupCommand('/群状态','any','查看本群状态',('/status','/群信息','/groupinfo','/ginfo')),GroupCommand('/群帮助','any','查看命令',('/帮助','/help','/命令','/介绍','/hello','/Hello','/你是谁')),
  GroupCommand('/群人格','admin','内置名|默认',('/toggle personality',)),
  GroupCommand('/群面板','group_or_bot','打开管理卡片',('/toggle',)),
  GroupCommand('/群功能',usage='gacha|image|voice 开|关'),GroupCommand('/群参与',usage='仅召唤|跟随|自然'),
@@ -48,7 +52,7 @@ def parse(text):
         if len(parts)==3 and parts[1] in ('gacha','image','voice') and parts[2] in ('on','off'):
             return next(c for c in COMMANDS if c.name=='/群功能'),parts[1]+' '+('开' if parts[2]=='on' else '关'),True
     for prefix,command in sorted([(p,c) for c in COMMANDS for p in (c.name,*c.aliases)],key=lambda item:len(item[0]),reverse=True):
-        if text==prefix or text.startswith(prefix+' '):return command,text[len(prefix):].strip(),prefix.startswith('/toggle')
+        if text==prefix or (text.startswith(prefix) and text[len(prefix):len(prefix)+1].isspace()):return command,text[len(prefix):].strip(),prefix.startswith('/toggle')
     return None,'',False
 
 def authorized(who,role,actor_role):return who=='any' or role=='admin' or (who=='group_or_bot' and actor_role in ('owner','admin'))
@@ -88,9 +92,13 @@ def switch_reply(service,scope,actor,state):
 async def dispatch(view,sender,role,store):
     from . import group_runtime as runtime
     text = command_text(view.text)
+    from .group_games import GAMES,dispatch_game
     if text is None:
-        return False
-    if not(view.mentioned or view.reply_to_bot):return True
+        return await dispatch_game(view,sender,store)
+    if not(view.mentioned or view.reply_to_bot):
+        if text=='/取消' and store.group(scope_for(view))['config']['receive_all']:
+            await dispatch_game(view,sender,store,'/取消')
+        return True
     if text.partition(' ')[0] in IDENTITY_COMMANDS:
         await runtime.manage_identity(replace(view,text=text),sender);return True
     if text.split()[0].lower() in PRIVATE_ONLY:
@@ -101,6 +109,9 @@ async def dispatch(view,sender,role,store):
         await GroupReply('未知命令',['发送 /群帮助 查看本群可用命令。']).send(sender);return True
     if not authorized(cmd.who,role,view.actor_role):
         await GroupReply('权限不足',['此操作需要机器人管理员权限。' if cmd.who=='admin' else '此操作需要群主、群管理员或机器人管理员权限。']).send(sender);return True
+    if cmd.name in GAMES or cmd.name=='/取消':
+        if await dispatch_game(view,sender,store,cmd.name,rest):
+            return True
     public=next((c for c in PUBLIC_COMMANDS if c.name==cmd.name),None)
     if public is not None:
         from .context import _turn_sender,_current_group_id
