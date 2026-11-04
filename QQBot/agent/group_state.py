@@ -5,6 +5,7 @@ conversation generations and identity revisions prevent stale background commits
 """
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 import time
@@ -37,7 +38,15 @@ DEFAULTS = dict(persona="assistant", mode="mention", receive_all=False,
 
 class GroupStore:
     def __init__(self, root):
-        self.root = Path(root)
+        self.root = Path(root).resolve()
+        # Production data mount must already exist. Creating it after unmount
+        # would silently put future group data on the OS disk.
+        mount_name = os.environ.get('GROUP_DATA_MOUNT')
+        mount = Path(mount_name).resolve() if mount_name else next(
+            (parent for parent in self.root.parents if parent.name in ('datadisk','datadisk0')), None)
+        if mount and (not self.root.is_relative_to(mount) or not mount.is_dir()
+                      or mount.stat().st_dev == Path('/').stat().st_dev):
+            raise OSError('群数据盘不可用或 GROUP_DATA_ROOT 不在指定数据盘上')
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "groups.sqlite3"
         with self.db() as db:
@@ -68,6 +77,9 @@ class GroupStore:
               event TEXT,status TEXT,created REAL);
             ''')
             db.execute('BEGIN IMMEDIATE')
+            if 'source_persona' not in {r[1] for r in db.execute('PRAGMA table_info(facts)')}:
+                db.execute("ALTER TABLE facts ADD COLUMN source_persona TEXT NOT NULL DEFAULT ''")
+            db.execute("CREATE INDEX IF NOT EXISTS facts_scope_persona ON facts(scope,source_persona,identity)")
             if 'config_revision' not in {r[1] for r in db.execute('PRAGMA table_info(groups)')}:
                 db.execute('ALTER TABLE groups ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0')
             db.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version','2')")
@@ -242,8 +254,10 @@ class GroupStore:
                 if not g or g[0] != generation:
                     return False
             # A deleted id is a tombstone: old extraction cannot recreate it.
-            db.execute("INSERT OR IGNORE INTO facts(id,identity,scope,event,text,visibility,created) VALUES (?,?,?,?,?,?,?)",
-                       (fid,identity,scope,event,text.strip()[:300],visibility,time.time()))
+            persona_row=db.execute("SELECT config FROM groups WHERE scope=?",(scope,)).fetchone()
+            source_persona=json.loads(persona_row[0]).get('persona','assistant') if persona_row else ''
+            db.execute("INSERT OR IGNORE INTO facts(id,identity,scope,event,text,visibility,created,source_persona) VALUES (?,?,?,?,?,?,?,?)",
+                       (fid,identity,scope,event,text.strip()[:300],visibility,time.time(),source_persona))
         return True
 
     def facts(self, identity, audience, scope=""):

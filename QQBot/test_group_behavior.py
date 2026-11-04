@@ -242,6 +242,40 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(runtime._buffers[scope]),1)
         self.assertNotIn('你好',self.calls[-1].context)
 
+    async def test_overheard_picture_then_question_uses_group_workspace_and_pixels(self):
+        from PIL import Image
+        from agent.context import _current_user_workspace
+        from agent.inbound import Attachment
+        v=view();v.text='';v.mentioned=False;v.attachment_kinds=('image',)
+        self.store.configure(scope_for(v),receive_all=True)
+        async def resolve(event):
+            workspace=Path(_current_user_workspace.get())
+            self.assertTrue(workspace.is_relative_to(self.store.root/'workspaces'))
+            path=workspace/'uploads'/'sample.png';path.parent.mkdir(exist_ok=True)
+            Image.new('RGB',(32,32),'green').save(path)
+            return [Attachment(kind='image',path=str(path))]
+        resolver=AsyncMock(side_effect=resolve)
+        v.resolver=NS(resolve=resolver)
+        await runtime.run_group_turn(v,self.sender)
+        resolver.assert_not_awaited()
+        asked=view(message='next');asked.text='刚才那张图是什么颜色？'
+        self.fake._model_router.reasoning_client=NS(supports_vision=True)
+        async def inspect(text,user,**kw):
+            self.assertIs(kw['client'],self.fake._model_router.reasoning_client)
+            parts=runtime.current_group_run.get().messages(None,text,kw['images'])[-1]['content']
+            self.assertEqual(parts[1]['type'],'image_url')
+            self.assertTrue(parts[1]['image_url']['url'].startswith('data:image/'))
+            return '绿色'
+        self.fake.agent.run=inspect
+        await runtime.run_group_turn(asked,self.sender)
+        resolver.assert_awaited_once()
+        self.assertEqual(self.store.history(scope_for(v))[-1]['content'],'绿色')
+
+    async def test_image_without_vision_is_never_an_empty_message(self):
+        v=view();v.text='';v.attachment_kinds=('image',)
+        await runtime.run_group_turn(v,self.sender)
+        self.assertIn('[图片×1]',self.store.history(scope_for(v))[0]['content'])
+
     async def test_unmentioned_default_no_agent(self):
         v=view(); v.mentioned=False
         await runtime.run_group_turn(v,self.sender)

@@ -74,6 +74,12 @@ class InboundMessage:
     received_at: float = field(default_factory=time.time)
     raw: Any = None                   # original event (escape hatch)
 
+    attachment_kinds: tuple[str, ...] = ()
+    def media_summary(self):
+        kinds=self.attachment_kinds or tuple(a.kind for a in self.attachments)
+        labels={'image':'图片','voice':'语音','video':'视频','file':'文件','face':'表情','other':'非文本消息'}
+        return ' '.join(f'[{labels.get(kind,"非文本消息")}×{kinds.count(kind)}]' for kind in dict.fromkeys(kinds))
+
     async def load_attachments(self) -> list[Attachment]:
         if self.attachments_loaded or self.resolver is None:
             return self.attachments

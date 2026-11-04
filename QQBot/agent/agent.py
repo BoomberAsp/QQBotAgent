@@ -705,7 +705,7 @@ class Agent:
         from .group_runtime import current_group_run
         group_run = current_group_run.get()
         if group_run is not None:
-            return group_run.messages(self, user_message)
+            return group_run.messages(self, user_message, images=images)
         from agent.context import (
             _current_personality, _personality_transition, _current_group_context,
             _current_bond_context, _current_story_context, _current_render_context,

@@ -297,7 +297,7 @@ class OneBotAttachmentResolver:
         out: list[Attachment] = []
         message_id = str(self._event.message_id)
         for seg in self._event.message:
-            if seg.type == "image":
+            if seg.type in ("image","mface"):
                 url = seg.data.get("url", "")
                 file_id = seg.data.get("file", "")
                 name = f"image-{file_id}"
@@ -337,6 +337,8 @@ def build_view(bot: Bot, event: MessageEvent) -> InboundMessage:
         reply_context="" if is_group else build_reply_context(event),
         actor_role=str(getattr(getattr(event, "sender", None), "role", "member")),
         reply_to_bot=bool(event.is_tome()) if is_group else False,
+        attachment_kinds=tuple({'record':'voice','mface':'image'}.get(seg.type,seg.type)
+                               for seg in event.message if seg.type not in ('text','at','reply')),
         resolver=OneBotAttachmentResolver(bot, event),
         platform="onebot",
         raw=event,
@@ -381,7 +383,7 @@ async def _download_voice(bot, seg_data: dict, message_id: str = "", max_size_mb
     os.makedirs(uploads_dir, exist_ok=True)
     save_path = os.path.join(
         uploads_dir,
-        f"{uuid.uuid4().hex[:8]}-{file_id}"
+        f"{uuid.uuid4().hex[:8]}-{os.path.basename(str(file_id))[:160]}"
     )
 
     diag = []  # Collect diagnostics for the final error message

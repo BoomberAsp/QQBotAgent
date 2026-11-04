@@ -1349,7 +1349,7 @@ def _max_scene_archives() -> int:
 # read_file 懒分析」通路保持不动——这里是额外的记忆入库，不是分析替换。
 _upload_tasks: set = set()
 
-_UPLOAD_IMAGE_PROMPT = "请用一句话客观描述这张图片的内容（不超过60字），不要推测用户意图。"
+_UPLOAD_IMAGE_PROMPT = "请用客观描述这张图片的内容（不超过160字），不要推测用户意图。"
 _UPLOAD_VOICE_PROMPT = "请转录这段语音的文字内容，并用一句话概括语气与内容（不超过80字）。"
 # multimodal_client 失败时返回错误说明文本（非异常）——识别前缀后放弃入库
 _TEXTUALIZE_ERROR_PREFIXES = ("[多模态]", "[音频", "分析失败", "转录失败")
@@ -3308,7 +3308,7 @@ async def handle_agent_turn(view: InboundMessage):
                 await streamer.close()   # never leave a stream generating
             except Exception:
                 pass
-        await _safe_send("抱歉，思考超时了。请尝试用更简单的方式提问~")
+        await _safe_send("抱歉，超时了。请尝试用更简单的方式提问~")
     except Exception as e:
         if streamer is not None:
             try:

@@ -537,6 +537,8 @@ def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
         author_is_bot=bool(getattr(author, "bot", False)),
         reply_to_bot=bool(is_group and getattr(getattr(getattr(event, "reply", None), "author", None), "id", None) == str(bot.self_id)),
         reply_context=_quote_context(quoted),
+        attachment_kinds=tuple(_classify_attachment(att,att.url or "")[0]
+            for att in [*(event.attachments or []),*(quoted.attachments if quoted else [])]),
         resolver=QQOfficialAttachmentResolver(event, quoted),
         platform="qq_official",
         raw=event,
