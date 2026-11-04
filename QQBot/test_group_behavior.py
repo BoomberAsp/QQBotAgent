@@ -297,6 +297,24 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             if outcome=='sent':self.assertNotIn('好耶',history[-1]['content'])
             if outcome=='uncertain':self.assertEqual(history,[])
 
+    async def test_mention_wrapped_commands_stop_before_agent(self):
+        scope=scope_for(view())
+        self.store.configure(scope,receive_all=True,mode='natural')
+        for i,text in enumerate(('<@opaque-id> /群状态','<@!123> /未知命令','\ufeff<@123>\u200b／群人格 rubi','[CQ:at,qq=123] /群重置','@机器人 /群帮助')):
+            v=view(message=str(i));v.text=text
+            await runtime.run_group_turn(v,self.sender)
+        self.assertEqual(self.calls,[])
+        self.assertEqual(self.store.history(scope),[])
+        self.assertEqual(self.store.group(scope)['config']['persona'],'assistant')
+        self.assertEqual(self.sender.send_group_text.await_count,5)
+        v=view(message='other');v.text='<@another> /群状态';v.mentioned=False
+        await runtime.run_group_turn(v,self.sender)
+        self.assertEqual(self.sender.send_group_text.await_count,5)
+        self.assertEqual(self.calls,[])
+        v=view(message='chat');v.text='<@123> 今天讨论 /群状态 的用法'
+        await runtime.run_group_turn(v,self.sender)
+        self.assertEqual(len(self.calls),1)
+
     async def test_unmentioned_default_no_agent(self):
         v=view(); v.mentioned=False
         await runtime.run_group_turn(v,self.sender)

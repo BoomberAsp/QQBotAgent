@@ -1,4 +1,5 @@
 """Single group command registry, exact aliases and per-command authorization."""
+import re
 from dataclasses import dataclass,replace
 from .group_state import scope_for,identity_for,Conflict
 from .group_service import GroupService
@@ -23,6 +24,19 @@ COMMANDS=(
  GroupCommand('/取消','any','取消自己的当前任务'),GroupCommand('/群操作','any','操作令牌'),
 )
 IDENTITY_COMMANDS=('/绑定身份','/绑定群身份','/确认绑定','/解除身份绑定','/个人记忆','/记住','/删除记忆','/公开记忆')
+
+# QQ can leave the mention in event.content even on a genuine group-@ event.
+# Stripping a textual envelope classifies the message; it never grants permission.
+_COMMAND_START = re.compile(
+    r"^[\s\u200b\ufeff]*(?:(?:<@!?[\w.-]+>|\[CQ:at,[^\]\r\n]+\]|@[^\s/／＃#<>]+(?=\s))"
+    r"[\s\u200b\ufeff]*)*([/／#＃])"
+)
+
+def command_text(text):
+    match = _COMMAND_START.match(text)
+    if match is None:
+        return None
+    return '/' + text[match.end():].strip()
 
 def parse(text):
     text=text.strip()
@@ -71,9 +85,9 @@ def switch_reply(service,scope,actor,state):
 
 async def dispatch(view,sender,role,store):
     from . import group_runtime as runtime
-    text=view.text.strip()
-    if text.startswith('#'):text='/'+text[1:]
-    if not text.startswith('/'):return False
+    text = command_text(view.text)
+    if text is None:
+        return False
     if not(view.mentioned or view.reply_to_bot):return True
     if text.partition(' ')[0] in IDENTITY_COMMANDS:
         await runtime.manage_identity(replace(view,text=text),sender);return True
