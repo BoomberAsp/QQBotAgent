@@ -56,7 +56,7 @@ async def deliver(path,asset,repeat=False):
  if not ticket:return '媒体冷却、重复或额度限制，本次未发送。'
  run=current_group_run.get()
  if run:
-  if run.media:ledger.outcome(ticket,'dropped');return '本轮已有图片。'
+  if asset in run.media_tickets:ledger.outcome(ticket,'dropped');return '本轮已选择这张图片。'
   run.media.append((path,asset));run.media_tickets[asset]=ticket
   return '已排队，尚未确认投递；不要声称已发送。'
  from .context import _turn_sender
@@ -72,6 +72,18 @@ async def deliver(path,asset,repeat=False):
  except Exception:status='uncertain'
  ledger.outcome(ticket,status)
  return {'sent':'图片已由平台确认接受。','uncertain':'发送结果不确定，不自动重试。'}.get(status,'图片未发送。')
+
+def group_sticker_candidates(persona,scope):
+    data,base=registry()
+    eligible=[a for a in data.get('media',[]) if persona in a.get('personas',[]) and
+              (a.get('visibility')=='public' or scope in a.get('scopes',[])) and
+              a.get('review_status')==a.get('rights_status')=='approved']
+    if not eligible:return []
+    with ledger.db() as conn:
+        recent=ledger.recent_assets(conn,scope,persona,ledger.policy(conn)['values']['recent_assets'])
+    return [dict(id=a['id'],description=str(a.get('description',''))[:120],mood=a.get('mood',[])[:8])
+            for a in sorted(eligible,key=lambda a:a['id']) if a['id'] not in recent][:24]
+
 
 async def send_sticker(sticker_id='',mood='',repeat=False):
  try:

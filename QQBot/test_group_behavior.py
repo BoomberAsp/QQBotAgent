@@ -276,6 +276,27 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await runtime.run_group_turn(v,self.sender)
         self.assertIn('[图片×1]',self.store.history(scope_for(v))[0]['content'])
 
+    async def test_sticker_first_delivery_outcomes(self):
+        async def choose(*args,**kwargs):
+            self.assertEqual(runtime.current_group_run.get().sticker_choices,[{'id':'happy'}])
+            return '[[STICKER:happy]]\n好耶'
+        async def enqueue(sticker_id):
+            runtime.current_group_run.get().media.append(('/test.png',sticker_id))
+        self.fake.agent.run=choose
+        for outcome in ('sent','failed','uncertain'):
+            v=view(group=outcome)
+            self.store.configure(scope_for(v),persona='rubi')
+            self.sender.send_group_image=AsyncMock(return_value=outcome)
+            self.sender.send_group_text.reset_mock()
+            with patch('agent.media_tools.group_sticker_candidates',return_value=[{'id':'happy'}]),patch('agent.media_tools.send_sticker',side_effect=enqueue),patch('agent.media_tools.published',return_value=True):
+                await runtime.run_group_turn(v,self.sender)
+            self.sender.send_group_image.assert_awaited_once()
+            if outcome=='failed':self.sender.send_group_text.assert_awaited_once_with('好耶')
+            else:self.sender.send_group_text.assert_not_awaited()
+            history=self.store.history(scope_for(v))
+            if outcome=='sent':self.assertNotIn('好耶',history[-1]['content'])
+            if outcome=='uncertain':self.assertEqual(history,[])
+
     async def test_unmentioned_default_no_agent(self):
         v=view(); v.mentioned=False
         await runtime.run_group_turn(v,self.sender)

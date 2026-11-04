@@ -15,6 +15,11 @@
 <p>功能策略（开启不代表尚未接入的工具已经可用）</p>
 <label><input id="image" type="checkbox">图片</label><label><input id="gacha" type="checkbox">抽卡</label><label><input id="voice" type="checkbox">语音</label>
 <label>剧情进度（JSON，库ID→章节整数）<textarea id="story_progress" rows="3"></textarea></label><p id="kb-list" class="muted"></p>
+<fieldset><legend>本群自动参与配额</legend>
+<label>每日自动发言上限<input type="number" id="auto_daily_cap" min="0" max="100000" required></label>
+<label>自动发言间隔（秒）<input type="number" id="cooldown" min="0" max="86400" required></label>
+<label>跟随窗口（秒）<input type="number" id="follow_seconds" min="0" max="86400" required></label>
+<label>每个窗口最多跟随次数<input type="number" id="follow_limit" min="0" max="1000" required></label></fieldset>
 <button class="btn btn-primary" type="submit">保存配置</button>
 </form>
 <div id="group-detail" hidden>
@@ -25,5 +30,7 @@
 </div></div></div>
 <div class="card"><h3>旧配置迁移</h3><p>选择目标群后再确认迁移。存在歧义不会自动采纳，已有新配置不会覆盖。可逐条忽略。</p><div id="legacy-groups"></div></div>
 <div class="card"><h3>群命令说明</h3><pre id="command-help"></pre></div>
+<div class="card"><h3>全局发言与媒体配额</h3><p>对所有群生效。媒体限额也适用于使用同一媒体服务的私聊。次数上限设为0会禁止相应操作，去重条数和冷却设为0会关闭相应限制。保存不会重置已用额度。</p>
+<form id="quota-form"><div id="quota-fields"></div><button class="btn btn-primary">保存全局配额</button><button type="button" id="quota-refresh">刷新</button><output id="quota-status"></output></form></div>
 <script src="/static/groups.js"></script>
 {% endblock %}

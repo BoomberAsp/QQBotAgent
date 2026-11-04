@@ -20,7 +20,7 @@ class GroupService:
 
     def patch(self,scope,patch,actor,role,expected=None,prompt=False):
         if not isinstance(patch,dict):raise ValueError('配置必须为对象')
-        allowed={'memo','persona','features','mode','receive_all','quiet','proactive_stickers','story_progress','history'}
+        allowed={'memo','persona','features','mode','receive_all','quiet','proactive_stickers','story_progress','history','auto_daily_cap','cooldown','follow_limit','follow_seconds'}
         if set(patch)-allowed:raise ValueError('包含不可写字段')
         if role not in ('admin','group_or_bot'):raise PermissionError('需要群管理员或机器人管理员权限')
         patch=dict(patch)
@@ -29,6 +29,9 @@ class GroupService:
             patch['persona']=self.resolve_persona(patch['persona'])
             if patch.get('history') not in ('keep','clear'):raise ValueError('请选择保留或清空历史')
         elif 'history' in patch:raise ValueError('history仅用于人格切换')
+        for key,maximum in [('auto_daily_cap',100000),('cooldown',86400),('follow_limit',1000),('follow_seconds',86400)]:
+            if key in patch and (type(patch[key]) is not int or not 0<=patch[key]<=maximum):
+                raise ValueError(key+' 超出允许范围')
         for k in ('receive_all','proactive_stickers'):
             if k in patch and type(patch[k]) is not bool:raise ValueError(k+'必须为布尔值')
         if 'memo' in patch and (not isinstance(patch['memo'],str) or len(patch['memo'])>40):raise ValueError('备注最多40字')

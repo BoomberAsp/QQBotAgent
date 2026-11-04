@@ -31,7 +31,7 @@ def identity_for(view):
 
 DEFAULTS = dict(persona="assistant", mode="mention", receive_all=False,
                 quiet="", active_enabled=True, status="active",
-                cooldown=180, auto_daily_cap=10, follow_seconds=120,
+                cooldown=120, auto_daily_cap=100, follow_seconds=120,
                 follow_limit=2, scheduled_push_enabled=False, features={"gacha":True,"image":True,"voice":True},
                 memo="",persona_pending=None,platform_full_events="unknown",proactive_stickers=False,story_progress={})
 
@@ -83,6 +83,16 @@ class GroupStore:
             if 'config_revision' not in {r[1] for r in db.execute('PRAGMA table_info(groups)')}:
                 db.execute('ALTER TABLE groups ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0')
             db.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version','2')")
+            if not db.execute("SELECT 1 FROM meta WHERE key='auto_limits_v2'").fetchone():
+                for scope,raw in db.execute('SELECT scope,config FROM groups').fetchall():
+                    cfg=json.loads(raw)
+                    old=dict(cfg)
+                    if cfg.get('cooldown')==180:cfg['cooldown']=120
+                    if cfg.get('auto_daily_cap')==10:cfg['auto_daily_cap']=100
+                    if old!=cfg:
+                        db.execute('UPDATE groups SET config=?,config_revision=config_revision+1 WHERE scope=?',(json.dumps(cfg),scope))
+                db.execute("INSERT INTO meta VALUES ('auto_limits_v2','1')")
+
 
     @contextmanager
     def db(self):
@@ -281,26 +291,34 @@ class GroupStore:
             db.execute("UPDATE identities SET revision=revision+1 WHERE target=?", (self.resolve(identity)["canonical"],))
         return True
 
-    def can_auto(self, scope, config, now=None):
-        """Read-only preflight; only actual send attempts reserve automatic quota."""
-        now = time.time() if now is None else now
-        day = time.strftime("%Y-%m-%d", time.localtime(now))
-        with self.db() as db:
-            for k, cap, cooldown in ((scope,config["auto_daily_cap"],config["cooldown"]),("__bot__",100,1)):
-                row=db.execute("SELECT count,last FROM quotas WHERE scope=? AND day=?",(k,day)).fetchone()
-                if row and (row["count"]>=cap or now-row["last"]<cooldown):
-                    return False
+    def _auto_available(self, db, scope, config, now, day):
+        from .media_ledger import policy
+        limits = policy()['values']
+        for key, cap, interval in (
+            (scope, config['auto_daily_cap'], config['cooldown']),
+            ('__bot__', limits['auto_global_daily'], limits['auto_global_seconds']),
+        ):
+            count, last = db.execute(
+                'SELECT COALESCE(SUM(CASE WHEN day=? THEN count ELSE 0 END),0), MAX(last) FROM quotas WHERE scope=?',
+                (day, key),
+            ).fetchone()
+            if count >= cap or (last is not None and now - last < interval):
+                return False
         return True
+
+    def can_auto(self, scope, config, now=None):
+        now = time.time() if now is None else now
+        day = time.strftime('%Y-%m-%d',time.localtime(now))
+        with self.db() as db:
+            return self._auto_available(db,scope,config,now,day)
 
     def reserve_auto(self, scope, config, now=None):
         now = time.time() if now is None else now
-        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        day = time.strftime('%Y-%m-%d',time.localtime(now))
         with self.db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            for k, cap, cooldown in ((scope,config["auto_daily_cap"],config["cooldown"]), ("__bot__",100,1)):
-                row = db.execute("SELECT count,last FROM quotas WHERE scope=? AND day=?", (k,day)).fetchone()
-                if row and (row["count"] >= cap or now-row["last"] < cooldown):
-                    return False
+            db.execute('BEGIN IMMEDIATE')
+            if not self._auto_available(db,scope,config,now,day):
+                return False
             for k in (scope,"__bot__"):
                 db.execute("INSERT INTO quotas VALUES (?,?,1,?) ON CONFLICT(scope,day) DO UPDATE SET count=count+1,last=excluded.last", (k,day,now))
             db.execute("DELETE FROM quotas WHERE day<?", (time.strftime("%Y-%m-%d",time.localtime(now-7*86400)),))

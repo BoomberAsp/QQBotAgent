@@ -59,6 +59,19 @@ async def migrate(ident:str,request:Request):
         await call(s.migrate,ident,await call(s.scope,data.get('gid','')),'webui',data['config_revision'])
     note(request,ident,['legacy']);return {'ok':True}
 
+@router.get('/quotas')
+async def quotas():
+    from agent.media_ledger import policy,LIMITS
+    return {**await call(policy),'fields':LIMITS}
+
+@router.put('/quotas')
+async def change_quotas(request:Request):
+    from agent.media_ledger import set_policy
+    data,rev=await payload(request)
+    result=await call(set_policy,data,rev)
+    note(request,'global-quotas',data.keys())
+    return result
+
 @router.get('/{gid}')
 async def detail(gid:str):
     s=service();return await call(s.snapshot,await call(s.scope,gid))
