@@ -23,6 +23,8 @@ The profile is:
 """
 
 import asyncio
+import hashlib
+import uuid
 import json
 import os
 import re
@@ -34,6 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from .fact_filter import filter_many
+from .durable import locked, revision, recover, commit, atomic_json
 
 
 # DORMANT (P0 画像瘦身): the free-text `facts` field is no longer injected into
@@ -285,6 +288,8 @@ class ProfileManager:
             base_dir: Directory for profile JSON files.
             llm_client: DeepSeekClient for fact extraction (optional, can be set later).
         """
+        from .cognitive_state import CognitiveState
+        self.cognition = CognitiveState(os.path.join(base_dir, "_cognition"))
         self.base_dir = base_dir
         self.client = llm_client
         self._memory = None  # P1: TieredMemory engine, wired via set_memory()
@@ -295,25 +300,53 @@ class ProfileManager:
         # external writers (the WebUI panel edits profile.json directly).
         self._cache_mtime: Dict[str, Optional[int]] = {}
 
-        # ── Layer 3 batching state (per-user) ──
-        # _recent: rolling context window (maxlen=EXTRACT_WINDOW_N) of turns,
-        #          used to build the <conversation> block (batch + 3 preceding
-        #          turns so "该项目"-style references can be resolved).
-        # _pending_n: count of buffered turns not yet extracted; flush at >= K.
-        # _inflight: users with an extract_batch task currently running
-        #            (single-flight — never two extractions for one user).
-        # _force_flush: users whose pending tail must be flushed at next idle
-        #            even if < K (set by delete-flush on a substantive session).
-        # ⑦ (Memory-Optimization-Plan): _recent/_pending_n are mirrored to
-        # {user_dir}/buffer.json on every mutation and lazily restored on the
-        # first observe_turn after a restart, so a crash loses ≤1 turn instead
-        # of up to K-1 un-extracted turns. _inflight/_force_flush stay
-        # process-local (a crash mid-extraction re-buffers, never double-runs:
-        # _flush persists pending_n=0 BEFORE scheduling the task).
+        # Durable unacknowledged turns, each carrying a stable evidence ID.
+        # Batch boundaries persist across restart; no overlapping extraction.
+        # Only successful application acknowledges a batch. Recovery is lazy
+        # on next observation; no multi-process writer coordination is implied.
         self._recent: Dict[str, "deque[Tuple[str, str]]"] = {}
         self._pending_n: Dict[str, int] = {}
         self._inflight: set = set()
+        self._batch_sizes: Dict[str, int] = {}
         self._force_flush: set = set()
+        self._retry_after = {}
+        self._retry_counts = {}
+        self._queued_at = {}
+        self._worker_task = None
+
+    async def start_recovery(self):
+        if self._worker_task and not self._worker_task.done():
+            return
+        async def scan():
+            from pathlib import Path
+            while True:
+                for path in Path(self.base_dir).glob("*/buffer.json"):
+                    uid = path.parent.name
+                    try:
+                        recover(self._journal_path(uid))
+                        if uid not in self._recent:
+                            self._restore_buffer(uid)
+                        if self._pending_n.get(uid, 0) and uid not in self._inflight:
+                            self._force_flush.add(uid)
+                            self._flush(uid)
+                    except Exception as exc:
+                        logger.error("[profile] recovery blocked user={}: {}", uid, exc)
+                self._recovery_status = {"pending_users": sum(bool(n) for n in self._pending_n.values()),
+                    "pending_turns": sum(self._pending_n.values()), "inflight": len(self._inflight),
+                    "retry_wait": sum(t > time.time() for t in self._retry_after.values()),
+                    "oldest_pending_seconds": max([time.time() - self._queued_at.get(u, time.time()) for u, n in self._pending_n.items() if n] or [0]),
+                    "checked_at": time.time()}
+                atomic_json(os.path.join(self.base_dir, "_profile_recovery_status.json"), self._recovery_status)
+                await asyncio.sleep(30)
+        self._worker_task = asyncio.create_task(scan())
+
+    async def stop_recovery(self):
+        if self._worker_task:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
 
     def set_client(self, client):
         """Set or update the LLM client (for lazy initialization)."""
@@ -367,28 +400,38 @@ class ProfileManager:
         self._cache_mtime[user_id] = disk_mtime
         return profile
 
+    def _journal_path(self, user_id):
+        return self._path(user_id) + ".transaction.json"
+
     def save(self, profile: UserProfile):
-        """Persist a profile to disk."""
-        self._cache[profile.user_id] = profile
         path = self._path(profile.user_id)
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(profile.to_dict(), f, ensure_ascii=False, indent=2)
-            self._cache_mtime[profile.user_id] = self._stat_mtime(path)
-        except Exception as e:
-            # Non-fatal, but no longer silent: a failed persist used to be
-            # invisible (panel showed "saved" while nothing was written).
-            logger.warning("[profile] save failed user={}: {}", profile.user_id, e)
+        # Recovery before an explicit edit: committed extraction is completed,
+        # then the newer user edit wins.
+        while True:
+            recover(self._journal_path(profile.user_id))
+            with locked(path):
+                if os.path.exists(self._journal_path(profile.user_id)):
+                    continue
+                atomic_json(path, profile.to_dict())
+                break
+        self._cache[profile.user_id] = profile
+        self._cache_mtime[profile.user_id] = self._stat_mtime(path)
 
     # ── Layer 3: batched observation + extraction (§7.1, P0) ──────
 
-    def observe_turn(self, user_id: str, user_message: str, agent_response: str):
+    def observe_turn(self, user_id: str, user_message: str, agent_response: str,
+                     persona_name: str = "", turn_id: Optional[str] = None, expected_generation=None):
         """Per-turn hook (SYNC, no await): buffer the turn + touch the profile.
 
         Called from agent._schedule_profile_update on every turn. When the
         buffer reaches PROFILE_BATCH_K and no extraction is in flight for this
         user, a single-flight extract_batch is scheduled over the recent window.
+
+        persona_name: the active persona's short display label for THIS turn
+        (captured by the caller from _current_personality). Stored on the
+        buffered turn so a LONG snapshot persisted from this batch labels the
+        assistant with the persona that actually spoke, not a hardcoded default.
+        Empty → snapshots fall back to 助手(Roxy).
 
         Concurrency model (§12.1): no explicit locks. This method only does
         synchronous in-memory appends; the LLM work happens in a background
@@ -410,9 +453,23 @@ class ProfileManager:
             self._restore_buffer(user_id)
         dq = self._recent.get(user_id)
         if dq is None:
-            dq = deque(maxlen=EXTRACT_WINDOW_N)
+            dq = deque()
             self._recent[user_id] = dq
-        dq.append((user_message or "", agent_response or ""))
+        evidence_id = turn_id or uuid.uuid4().hex
+        if any(len(t) > 3 and t[3] == evidence_id for t in dq):
+            return
+        if self._memory and evidence_id in self._memory._get_state(user_id).applied_evidence:
+            return
+        if not dq:
+            self._queued_at[user_id] = time.time()
+        from .cognitive_state import current_scope
+        scope = current_scope.get()
+        payload = (user_message or "", agent_response or "", persona_name or "", evidence_id)
+        if scope:
+            if self.cognition.seen(user_id,scope,evidence_id):
+                return
+            payload += ({"scope":scope,"generation":self.cognition.generation(user_id,scope) if expected_generation is None else expected_generation},)
+        dq.append(payload)
 
         self._pending_n[user_id] = self._pending_n.get(user_id, 0) + 1
         self._save_buffer(user_id)
@@ -432,6 +489,8 @@ class ProfileManager:
                 self._flush(user_id)
         else:
             self._pending_n[user_id] = 0
+            self._recent.pop(user_id, None)
+            self._batch_sizes.pop(user_id, None)
             self._force_flush.discard(user_id)
             self._save_buffer(user_id)
             logger.debug(
@@ -439,38 +498,73 @@ class ProfileManager:
                 user_id, session_turn_count,
             )
 
-    def _flush(self, user_id: str):
-        """Snapshot the recent window and schedule a single-flight extract_batch."""
-        window = list(self._recent.get(user_id, ()))
-        self._pending_n[user_id] = 0
-        self._force_flush.discard(user_id)
-        # ⑦: persist pending_n=0 BEFORE scheduling — a crash mid-extraction
-        # loses this batch (same as the old in-memory behavior) but can never
-        # double-extract it after a restart.
+    def discard_scope_pending(self, user_id, scope):
+        """Drop raw queued turns after an explicit scope correction/forget.
+
+        In-flight copies are fenced by the generation checked at commit.
+        Other scopes remain queued in their original order.
+        """
+        if user_id not in self._recent:
+            self._restore_buffer(user_id)
+        queue = self._recent.get(user_id, deque())
+        discarded = [t[3] for t in queue if len(t)>4 and t[4].get("scope")==scope]
+        if discarded:
+            self.cognition.ingest(user_id,scope,-1,"discarded",[],discarded)
+        self._recent[user_id] = deque(t for t in queue if not (
+            len(t)>4 and t[4].get("scope")==scope))
+        self._pending_n[user_id] = len(self._recent[user_id])
+        self._batch_sizes.pop(user_id,None)
         self._save_buffer(user_id)
+
+    def _flush(self, user_id: str):
+        if user_id in self._inflight or time.time() < self._retry_after.get(user_id, 0):
+            return
+        size = self._batch_sizes.get(user_id, PROFILE_BATCH_K)
+        window = list(self._recent.get(user_id, ()))[:size]
+        if window:
+            scope = window[0][4] if len(window[0]) > 4 else None
+            stop = next((i for i,t in enumerate(window) if (t[4] if len(t)>4 else None) != scope), len(window))
+            window = window[:stop]
         if not window:
             return
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop (e.g. synchronous test): cannot schedule a
-            # background task. Drop the in-flight flag; callers/tests can drive
-            # extract_batch() directly.
             return
+        self._batch_sizes[user_id] = len(window)
+        self._save_buffer(user_id)
         self._inflight.add(user_id)
         asyncio.create_task(self._extract_batch_guarded(user_id, window))
 
     async def _extract_batch_guarded(self, user_id: str, turns):
-        """Single-flight wrapper: clear _inflight, then re-check pending tail."""
+        success = False
         try:
-            await self.extract_batch(user_id, turns)
+            for attempt in range(3):
+                success = await self.extract_batch(user_id, turns)
+                if success:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+            if success:
+                dq = self._recent.get(user_id, deque())
+                for turn in turns:
+                    if dq and dq[0] == turn:
+                        dq.popleft()
+                self._pending_n[user_id] = len(dq)
+                self._batch_sizes.pop(user_id, None)
+                self._save_buffer(user_id)
         except Exception as e:
-            # Non-critical background task — never propagate.
-            logger.warning("[profile] extract_batch failed user={}: {}", user_id, e)
+            if self._memory:
+                self._memory.load_user(user_id)
+            logger.warning("[profile] extraction retained for retry user={}: {}", user_id, e)
         finally:
             self._inflight.discard(user_id)
+            self._retry_counts[user_id] = 0 if success else self._retry_counts.get(user_id, 0) + 1
+            self._retry_after[user_id] = 0 if success else time.time() + min(1800, 30 * 2 ** min(6, self._retry_counts[user_id]))
+            self._save_buffer(user_id)
             pending = self._pending_n.get(user_id, 0)
-            if pending >= PROFILE_BATCH_K or (user_id in self._force_flush and pending > 0):
+            if success and (pending >= PROFILE_BATCH_K or
+                            (user_id in self._force_flush and pending > 0)):
                 self._flush(user_id)
 
     async def extract_batch(self, user_id: str, turns):
@@ -485,7 +579,15 @@ class ProfileManager:
         if not self.client or not turns:
             return
 
+        recover(self._journal_path(user_id))
         profile = self.get(user_id)
+        if self._memory and os.path.exists(self._memory._tier_path(user_id)):
+            self._memory.load_user(user_id)
+        profile_revision = revision(self._path(user_id))
+        memory_revision = revision(self._memory._tier_path(user_id)) if self._memory else None
+        batch_id = hashlib.sha256(json.dumps(turns, ensure_ascii=False).encode()).hexdigest() if all(len(t) > 3 for t in turns) else None
+        if self._memory and batch_id in self._memory._get_state(user_id).applied_batches:
+            return True
         existing = {
             "nickname": profile.nickname,
             "interests": profile.interests,
@@ -494,9 +596,16 @@ class ProfileManager:
         # P1: read the judge list BEFORE the await (synchronous read). Per-user
         # single-flight guarantees no concurrent extraction mutates state mid-call.
         judge_list = self._memory.get_judge_list(user_id) if self._memory else []
+        scope_info = turns[0][4] if len(turns[0]) > 4 else None
+        if scope_info:
+            judge_list = [{"id":f["id"],"content":f["content"],"tier":"medium"}
+                          for f in self.cognition.list(user_id,scope_info["scope"],limit=80)]
+            existing = {"nickname":None,"interests":[],"preferences":{}}
         conversation_block = self._format_conversation(turns)
         prompt = self._build_extraction_prompt(conversation_block, existing, judge_list)
 
+        if scope_info:
+            prompt += "\n只抽取用户明确表达的事实，不把虚构设定当现实。每条 memory_candidates 提供 evidence_turn_ids（本批来源消息ID）；可提供单值属性 predicate，例如 current_city。明确纠正用 judge=update 和已有 id。"
         result = await self.client.chat_completion(
             prompt, timeout_set=30.0, purpose="profile",
         )
@@ -507,27 +616,62 @@ class ProfileManager:
         # existing MEDIUM facts age normally (Decision 4: tick on every success).
         if extracted is None:
             return
+        if scope_info:
+            candidates = [c for c in (extracted.get("memory_candidates") or []) if isinstance(c,dict)]
+            from .fact_filter import filter_many
+            kept, _ = filter_many([str(c.get("content") or "") for c in candidates])
+            candidates = [c for c in candidates if c.get("content") in set(kept)]
+            for key,value in {**(extracted.get("new_preferences") or {}), **(extracted.get("updated_preferences") or {})}.items():
+                if value is not None:
+                    candidates.append({"content":f"用户偏好：{key}={value}","predicate":"preference:"+str(key)})
+                else:
+                    candidates.append({"content":f"用户已撤销偏好：{key}（不再按此偏好处理）","predicate":"preference:"+str(key)})
+            self.cognition.ingest(user_id,scope_info["scope"],scope_info["generation"],batch_id,
+                                  candidates,[t[3] for t in turns])
+            return True
 
         # ── synchronous atomic apply (no await between read and write) ──
         # Re-fetch the profile AFTER the LLM await: get() revalidates against
         # disk, so a panel edit that landed while the call was in flight is
         # picked up instead of being clobbered by the pre-await snapshot.
-        profile = self.get(user_id)
-        snapshot_turns = list(turns)
-        if self._apply_extraction(profile, user_id, extracted, snapshot_turns):
-            self.save(profile)
-            logger.debug(
-                "[profile] batch-updated user_id={} turns={}", user_id, len(turns)
-            )
-
-        # P1: advance the logical clock + persist tier state. Done AFTER a
-        # successful parse (Decision 4: count increments only on success) and
-        # after ingest (which ran inside _apply_extraction against the old clock).
+        paths = [self._path(user_id)]
         if self._memory:
-            self._memory.touch_extraction_count(user_id)
-            self._memory.save_user(user_id)
+            paths.append(self._memory._tier_path(user_id))
+        with locked(*paths):
+            if (profile_revision != revision(paths[0]) or
+                    (self._memory and memory_revision != revision(paths[1]))):
+                if self._memory:
+                    st = self._memory.load_user(user_id)
+                    if batch_id and batch_id not in st.applied_batches:
+                        # Persist supersession before acknowledging the queue:
+                        # a crash must not replay old evidence over the user's edit.
+                        st.applied_batches.append(batch_id)
+                        st.applied_evidence.extend(t[3] for t in turns)
+                        self._memory.save_user(user_id)
+                logger.warning("[profile] stale extraction superseded user={}", user_id)
+                return True
+            profile = self.get(user_id)
+            self._apply_extraction(profile, user_id, extracted, list(turns))
+            writes = [(paths[0], profile.to_dict())]
+            if self._memory:
+                self._memory.touch_extraction_count(user_id)
+                if batch_id:
+                    st = self._memory._get_state(user_id)
+                    st.applied_batches.append(batch_id)
+                    st.applied_evidence.extend(t[3] for t in turns)
+                for lo in self._memory._get_state(user_id).long:
+                    path = os.path.join(self._memory._long_user_dir(user_id), lo.id + ".md")
+                    if not os.path.exists(path):
+                        self._memory._save_long_snapshot(user_id, lo)
+                writes.append((paths[1], self._memory.serialize_user(user_id)))
+            commit(self._journal_path(user_id), writes)
+            self._cache_mtime[user_id] = self._stat_mtime(paths[0])
+            if self._memory:
+                self._memory._disk_revisions[user_id] = revision(paths[1])
+        return True
 
-    async def extract_and_update(self, user_id: str, user_message: str, agent_response: str):
+    async def extract_and_update(self, user_id: str, user_message: str, agent_response: str,
+                                 persona_name: str = ""):
         """Single-turn convenience wrapper over extract_batch (backward-compat).
 
         The runtime path now uses observe_turn() (buffered batching, Layer 3).
@@ -538,7 +682,8 @@ class ProfileManager:
             return
         profile = self.get(user_id)
         profile.touch()
-        await self.extract_batch(user_id, [(user_message or "", agent_response or "")])
+        await self.extract_batch(
+            user_id, [(user_message or "", agent_response or "", persona_name or "")])
 
     def _apply_extraction(self, profile: UserProfile, user_id: str, extracted: dict,
                           snapshot_turns: Optional[list] = None) -> bool:
@@ -625,13 +770,15 @@ class ProfileManager:
         """Layer-2 filter + route memory_candidates into TieredMemory. Sync, no await."""
         raw = extracted.get("memory_candidates", []) or []
         norm = []
+        seen = set()
         if isinstance(raw, list):
             for c in raw:
                 if not isinstance(c, dict):
                     continue
                 content = str(c.get("content", ""))[:300]
-                if not content.strip():
+                if not content.strip() or content.strip() in seen:
                     continue
+                seen.add(content.strip())
                 norm.append({
                     "content": content,
                     "judge": c.get("judge", "new"),
@@ -679,10 +826,19 @@ class ProfileManager:
         pieces: List[str] = []
         total = len(open_tag) + len(close_tag)
         # accumulate newest-first so dropping happens at the oldest end
-        for um, ar in reversed(list(turns)):
+        for turn in reversed(list(turns)):
+            um = turn[0] if len(turn) > 0 else ""
+            ar = turn[1] if len(turn) > 1 else ""
             u = (um or "")[:EXTRACT_USER_MSG_CAP]
             a = (ar or "")[:EXTRACT_AGENT_RESP_CAP]
-            piece = f"用户: {u}\n助手(Roxy): {a}"
+            # NOTE: the extraction prompt keeps a FIXED 助手(Roxy) third-person
+            # label on purpose — its hard rules and few-shot examples are keyed
+            # to that literal, and it is only a user/assistant disambiguation
+            # device for the extractor. The per-turn persona affects persisted
+            # LONG snapshots (memory.py), NOT this prompt label. Turns may be
+            # 3-tuples (user, agent, persona); the persona is ignored here.
+            evidence = f"[来源消息ID:{turn[3]}]\n" if len(turn) > 3 else ""
+            piece = evidence + f"用户: {u}\n助手(Roxy): {a}"
             add = len(piece) + (1 if pieces else 0)  # +1 for the joining newline
             if total + add > EXTRACT_TOTAL_CHAR_CAP:
                 break
@@ -825,8 +981,16 @@ class ProfileManager:
         """
         dq = self._recent.get(user_id)
         payload = {
-            "turns": [[m, r] for m, r in (dq or ())],
+            # 3-tuple (user_msg, agent_resp, persona_name) — persona survives a
+            # restart so a recovered buffer still snapshots in-character. The
+            # len guard tolerates any legacy 2-tuple still in the deque.
+            "turns": [list(t) for t in (dq or ())],
             "pending_n": int(self._pending_n.get(user_id, 0)),
+            "batch_size": self._batch_sizes.get(user_id),
+            "retry_after": self._retry_after.get(user_id, 0),
+            "retry_count": self._retry_counts.get(user_id, 0),
+            "queued_at": self._queued_at.get(user_id, time.time()),
+            "updated_at": time.time(),
         }
         path = self._buffer_path(user_id)
         try:
@@ -856,10 +1020,14 @@ class ProfileManager:
         turns = data.get("turns")
         if not isinstance(turns, list):
             return
-        dq = deque(maxlen=EXTRACT_WINDOW_N)
-        for t in turns[-EXTRACT_WINDOW_N:]:
-            if isinstance(t, (list, tuple)) and len(t) == 2:
-                dq.append((str(t[0]), str(t[1])))
+        dq = deque()
+        for t in turns:
+            # Accept legacy 2-element turns (persona → "") and new 3-element
+            # ones so a buffer.json written before the persona field still
+            # restores instead of being discarded.
+            if isinstance(t, (list, tuple)) and len(t) >= 2:
+                persona = str(t[2]) if len(t) >= 3 else ""
+                dq.append((str(t[0]), str(t[1]), persona, str(t[3]) if len(t) > 3 else uuid.uuid4().hex) + ((t[4],) if len(t)>4 and isinstance(t[4],dict) else ()))
         try:
             pending_n = max(0, int(data.get("pending_n") or 0))
         except (TypeError, ValueError):
@@ -867,6 +1035,12 @@ class ProfileManager:
         if not dq and not pending_n:
             return
         self._recent[user_id] = dq
+        self._retry_after[user_id] = float(data.get("retry_after") or 0)
+        self._retry_counts[user_id] = int(data.get("retry_count") or 0)
+        self._queued_at[user_id] = float(data.get("queued_at") or time.time())
+        batch_size = data.get("batch_size")
+        if isinstance(batch_size, int) and 0 < batch_size <= len(dq):
+            self._batch_sizes[user_id] = batch_size
         # pending can never legitimately exceed the buffered turn count
         self._pending_n[user_id] = min(pending_n, len(dq))
         logger.debug(

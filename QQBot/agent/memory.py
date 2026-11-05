@@ -13,6 +13,7 @@ returned when the matching user_id is provided.
 
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -428,6 +429,39 @@ def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+# ── per-turn persona speaker label (fixes the hardcoded 助手(Roxy)) ──
+# LONG-tier snapshots record WHO spoke each turn. The live pipeline captures
+# the active persona per turn (agent._resolve_persona_label →
+# ProfileManager.observe_turn), so a snapshot turn is a 3-tuple
+# (user_msg, agent_resp, persona_name). Legacy callers/tests may still pass
+# 2-tuples; those render with DEFAULT_SPEAKER, keeping pre-existing behavior
+# byte-identical. Before this, every assistant line was written as 助手(Roxy)
+# regardless of the session's bound persona — a character session's snapshot
+# mislabeled all her replies as the default assistant.
+DEFAULT_SPEAKER = "Roxy"
+_ASSISTANT_LINE_RE = re.compile(r"^助手\((?P<name>[^)]*)\):\s?(?P<text>.*)$")
+
+
+def _normalize_turn(turn: Any) -> Tuple[str, str, str]:
+    """Coerce a stored snapshot turn to (user_msg, agent_resp, persona_name).
+
+    Tolerates legacy 2-tuples (persona → "") and malformed/short entries so the
+    render + parse paths never raise on old on-disk snapshots.
+    """
+    if isinstance(turn, (list, tuple)):
+        if len(turn) >= 3:
+            return str(turn[0] or ""), str(turn[1] or ""), str(turn[2] or "")
+        if len(turn) == 2:
+            return str(turn[0] or ""), str(turn[1] or ""), ""
+    return "", "", ""
+
+
+def _speaker_label(persona_name: str) -> str:
+    """助手(<persona>) speaker label; falls back to 助手(Roxy) when unset."""
+    name = (persona_name or "").strip() or DEFAULT_SPEAKER
+    return f"助手({name})"
+
+
 def _norm_category(value: Any) -> Optional[str]:
     """④ Normalize an LLM-supplied category. Returns None when absent/invalid
     (callers then KEEP an existing item's category), DEFAULT_CATEGORY is only
@@ -543,7 +577,9 @@ class LongObject:
     id: str
     title: str
     summary: str
-    snapshot_turns: List[Tuple[str, str]]
+    # Canonical form is a 3-tuple (user_msg, agent_resp, persona_name); legacy
+    # 2-tuples are tolerated and normalized at render/parse time (_normalize_turn).
+    snapshot_turns: List[Tuple[str, ...]]
     snapshot_time: float
     query_count: int = 0                                  # bumped by recall_long
     query_log: List[Any] = field(default_factory=list)    # capped recall audit trail
@@ -555,6 +591,8 @@ class UserTierState:
     """Per-user container for all three tiers + the logical clock."""
     user_id: str
     extraction_count: int = 0
+    applied_batches: List[str] = field(default_factory=list)
+    applied_evidence: List[str] = field(default_factory=list)
     short: List[ShortItem] = field(default_factory=list)    # index 0 = front, -1 = eviction
     medium: List[MediumItem] = field(default_factory=list)  # plain list, sorted on demand (§12.1: heap is YAGNI)
     long: List[LongObject] = field(default_factory=list)
@@ -574,6 +612,7 @@ class TieredMemory:
         self.long_dir = os.path.join(self.tiers_dir, "long")
         os.makedirs(self.tiers_dir, exist_ok=True)
         self._states: Dict[str, UserTierState] = {}
+        self._disk_revisions = {}
 
     # ── path helpers ──────────────────────────────────────────────
 
@@ -1119,11 +1158,17 @@ class TieredMemory:
 
     @staticmethod
     def _format_snapshot_text(lo: "LongObject") -> str:
-        """Render snapshot turns to text, capped at LONG_RECALL_SNAPSHOT_CAP."""
+        """Render snapshot turns to text, capped at LONG_RECALL_SNAPSHOT_CAP.
+
+        Each turn's speaker label reflects the persona that produced it
+        (_speaker_label), so a character session's recall reads in that
+        character's name instead of the default Roxy.
+        """
         lines: List[str] = []
         total = 0
-        for um, ar in lo.snapshot_turns:
-            piece = f"用户: {um}\n助手(Roxy): {ar}"
+        for turn in lo.snapshot_turns:
+            um, ar, persona = _normalize_turn(turn)
+            piece = f"用户: {um}\n{_speaker_label(persona)}: {ar}"
             if total + len(piece) > LONG_RECALL_SNAPSHOT_CAP:
                 lines.append("…（快照过长，已截断）")
                 break
@@ -1141,10 +1186,23 @@ class TieredMemory:
             path = os.path.join(self._long_user_dir(user_id), lo.id + ".md")
             if not os.path.exists(path):
                 self._save_long_snapshot(user_id, lo)
+        from .durable import locked, revision
+        path = self._tier_path(user_id)
+        with locked(path):
+            if revision(path) != self._disk_revisions.get(user_id):
+                self.load_user(user_id)
+                raise RuntimeError("memory changed externally; stale write rejected")
+            self._atomic_write_json(path, self.serialize_user(user_id))
+            self._disk_revisions[user_id] = revision(path)
+
+    def serialize_user(self, user_id):
+        st = self._get_state(user_id)
         data = {
             "user_id": st.user_id,
             "extraction_count": st.extraction_count,
             "schema_version": TIER_SCHEMA_VERSION,
+            "applied_batches": st.applied_batches,
+            "applied_evidence": st.applied_evidence,
             "short": [{"id": s.id, "content": s.content, "count": s.count,
                        "category": s.category, "last_confirmed_ts": s.last_confirmed_ts}
                       for s in st.short],
@@ -1157,7 +1215,7 @@ class TieredMemory:
                       "query_log": lo.query_log, "linked_medium_id": lo.linked_medium_id}
                      for lo in st.long],
         }
-        self._atomic_write_json(self._tier_path(user_id), data)
+        return data
 
     def load_user(self, user_id: str) -> UserTierState:
         """Load (or create) one user's tier state from disk and cache it."""
@@ -1169,6 +1227,8 @@ class TieredMemory:
                     data = json.load(f)
                 st.user_id = data.get("user_id") or user_id
                 st.extraction_count = int(data.get("extraction_count", 0))
+                st.applied_batches = data.get("applied_batches", [])
+                st.applied_evidence = data.get("applied_evidence", [])
                 st.short = [
                     ShortItem(id=s.get("id") or _new_id(), content=s.get("content", ""),
                               count=int(s.get("count", 1)),
@@ -1198,6 +1258,8 @@ class TieredMemory:
             except Exception:
                 # corrupt/unreadable file → start fresh rather than crash the bot
                 st = UserTierState(user_id=user_id)
+        from .durable import revision
+        self._disk_revisions[user_id] = revision(path)
         self._states[user_id] = st
         return st
 
@@ -1246,24 +1308,29 @@ class TieredMemory:
             f"## Snapshot ({len(lo.snapshot_turns)} turns)",
             "",
         ]
-        for um, ar in lo.snapshot_turns:
+        for turn in lo.snapshot_turns:
+            um, ar, persona = _normalize_turn(turn)
             lines.append(f"用户: {um}")
-            lines.append(f"助手(Roxy): {ar}")
+            lines.append(f"{_speaker_label(persona)}: {ar}")
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         os.replace(tmp, path)
 
-    def _load_long_snapshot(self, user_id: str, long_id: str) -> List[Tuple[str, str]]:
-        """Best-effort parse of a LONG snapshot md back into (user, agent) turns.
+    def _load_long_snapshot(self, user_id: str, long_id: str) -> List[Tuple[str, str, str]]:
+        """Best-effort parse of a LONG snapshot md back into (user, agent, persona) turns.
+
+        The persona is recovered from the 助手(<name>) speaker label, so a
+        persisted character snapshot recalls in-character after a restart. A
+        legacy 助手(Roxy) line parses back with persona "Roxy" (the default),
+        which is exactly what it was.
 
         NOTE: lossy for messages containing newlines (the md format uses newline
-        as the turn separator). Acceptable in P1 — LONG objects are create+persist
-        only; snapshot_turns are not re-injected. P2 (RAG) can switch to a
+        as the turn separator). Acceptable in P1 — P2 (RAG) can switch to a
         structured body if exact fidelity becomes necessary.
         """
         path = os.path.join(self._long_user_dir(user_id), long_id + ".md")
-        turns: List[Tuple[str, str]] = []
+        turns: List[Tuple[str, str, str]] = []
         if not os.path.exists(path):
             return turns
         try:
@@ -1277,8 +1344,10 @@ class TieredMemory:
             for line in body.split("\n"):
                 if line.startswith("用户: "):
                     cur_user = line[len("用户: "):]
-                elif line.startswith("助手(Roxy): ") and cur_user is not None:
-                    turns.append((cur_user, line[len("助手(Roxy): "):]))
+                    continue
+                m = _ASSISTANT_LINE_RE.match(line)
+                if m and cur_user is not None:
+                    turns.append((cur_user, m.group("text"), m.group("name")))
                     cur_user = None
         except Exception:
             pass

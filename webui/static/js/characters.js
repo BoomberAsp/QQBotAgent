@@ -549,25 +549,95 @@
       : '仅影响该作者的这个角色。平台管理员在 QQ 里用 <code>/设形象</code> 走的也是同一条落盘通路。';
   }
 
+  // ── 立绘上传：先在浏览器里缩放，再发 ───────────────────────────
+  //
+  // 面板常挂在 nginx 后面，nginx 默认 client_max_body_size 1m；base64 还会把
+  // 体积再放大 1/3。于是 3 MB 的原图 = 3.4 MB 请求体，被**代理层**直接 413
+  // 拒掉，请求根本到不了 uvicorn（面板日志里看不到这条 POST）。
+  // 对策：在 canvas 里缩到长边 1536（与服务端 MAX_EDGE 一致）并压到请求体
+  // <1 MB 再发。透明底铺白，与 bot 侧 agent/portrait.py:_flatten_alpha 一致。
+  function readAsDataURL(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(new Error('读取文件失败'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function loadImageFile(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const im = new Image();
+      im.onload = () => { URL.revokeObjectURL(url); resolve(im); };
+      im.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('浏览器无法解码这张图片（HEIC/AVIF 请先转成 JPG/PNG）'));
+      };
+      im.src = url;
+    });
+  }
+
+  function drawToDataURL(img, edge, quality) {
+    const scale = Math.min(1, edge / Math.max(img.width, img.height));
+    const w = Math.max(1, Math.round(img.width * scale));
+    const h = Math.max(1, Math.round(img.height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';          // 透明底铺白（服务端也会这么做）
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    const dataUrl = canvas.toDataURL('image/jpeg', quality);
+    const bytes = Math.round((dataUrl.length - dataUrl.indexOf(',') - 1) * 3 / 4);
+    return { dataUrl, bytes, width: w, height: h };
+  }
+
+  async function shrinkImage(file) {
+    // 目标：整个请求体 < 1 MB。base64 ≈ 4/3 × 原始字节，所以解码后留 650 KB。
+    const LIMIT = 650 * 1024;
+    if (file.size <= 480 * 1024 && /^image\/(png|jpeg)$/.test(file.type)) {
+      return { dataUrl: await readAsDataURL(file), bytes: file.size, reencoded: false };
+    }
+    const img = await loadImageFile(file);
+    const plan = [[1536, 0.9], [1536, 0.82], [1280, 0.8], [1024, 0.8], [768, 0.75]];
+    let out = null;
+    for (const [edge, quality] of plan) {
+      out = drawToDataURL(img, edge, quality);
+      if (out.bytes <= LIMIT) break;
+    }
+    out.reencoded = true;
+    return out;
+  }
+
   el('pt-upload').addEventListener('click', async () => {
     const file = el('pt-file').files && el('pt-file').files[0];
     if (!file) { toast('先选择一张图片', 'error'); return; }
-    if (file.size > 10 * 1024 * 1024) { toast('原图超过 10 MB', 'error'); return; }
+    if (file.size > 32 * 1024 * 1024) { toast('原图超过 32 MB，请先压缩', 'error'); return; }
     const btn = el('pt-upload');
     btn.disabled = true;
     try {
-      const dataB64 = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result));
-        reader.onerror = () => reject(new Error('读取文件失败'));
-        reader.readAsDataURL(file);
-      });
+      let payload;
+      try {
+        payload = await shrinkImage(file);
+      } catch (e) {
+        // 解码失败（多为 HEIC）：退回原文件直传，让服务端给出更具体的报错
+        payload = { dataUrl: await readAsDataURL(file), bytes: file.size,
+                    reencoded: false, note: e.message };
+      }
       const res = await api('/api/characters/' + encodeURIComponent(state.cid) + '/portrait',
-        { method: 'POST', body: { data_b64: dataB64, filename: file.name } });
-      toast(`已保存 ${res.describe || ''}`, 'success', 5000);
+        { method: 'POST', body: { data_b64: payload.dataUrl, filename: file.name } });
+      const sent = Math.round(payload.bytes / 1024);
+      toast(`已保存 ${res.describe || ''}（上传 ${sent} KB`
+            + (payload.reencoded ? ' · 已压缩' : '') + '）', 'success', 5000);
       await selectChar(state.cid, { force: true, keepTab: true });
     } catch (e) {
-      toast(e.message, 'error', 8000);
+      const hint = /413/.test(e.message)
+        ? ' —— HTTP 413 是反向代理拒绝了请求体（nginx 默认 client_max_body_size 1m）。'
+          + '图片已压缩仍超限时，需给面板 vhost 加 client_max_body_size 20m 后 reload。'
+        : '';
+      toast(e.message + hint, 'error', 10000);
     } finally { btn.disabled = false; }
   });
 

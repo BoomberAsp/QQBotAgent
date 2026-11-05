@@ -27,6 +27,9 @@ fi
 echo -e "${GREEN}[INFO]${NC} 运行所有测试..."
 echo ""
 
+python -m unittest test_context_memory_phase1 test_reliability_p1 test_cognition_p23 test_experience_p4 test_legacy_migration test_mail_buttons test_group_behavior test_group_admin test_group_resources test_media_runtime -v
+COGNITION_EXIT=$?
+
 python test_agent.py
 AGENT_EXIT=$?
 
@@ -43,6 +46,8 @@ MEMBENCH_EXIT=$?
 
 # 离线测速管线测试（从仓库根目录运行）
 cd "$SCRIPT_DIR"
+python -m unittest discover -s test -p test_resource_admin.py -v
+python -m unittest discover -s test -p test_group_webui.py -v
 python test/test_ag_skill_index.py
 L1_EXIT=$?
 python test/test_ag_trigger_engine.py
@@ -73,6 +78,7 @@ EXIT_CODE=0
 if [ $AGENT_EXIT -ne 0 ]; then EXIT_CODE=$AGENT_EXIT; fi
 if [ $WS_EXIT -ne 0 ]; then EXIT_CODE=$WS_EXIT; fi
 if [ $STORYKB_EXIT -ne 0 ]; then EXIT_CODE=$STORYKB_EXIT; fi
+if [ $COGNITION_EXIT -ne 0 ]; then EXIT_CODE=$COGNITION_EXIT; fi
 if [ $MEMBENCH_EXIT -ne 0 ]; then EXIT_CODE=$MEMBENCH_EXIT; fi
 if [ $L1_EXIT -ne 0 ]; then EXIT_CODE=$L1_EXIT; fi
 if [ $ENGINE_EXIT -ne 0 ]; then EXIT_CODE=$ENGINE_EXIT; fi

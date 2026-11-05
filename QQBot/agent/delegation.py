@@ -32,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 # recall_asset: 找回影音记忆（P5，§8.2）——检索 asset_memory 文本卡并重发
 #   二进制（或让角色凭文本描述已淡去的原件）。同为角色面专属。
 SOCIAL_TOOLS: frozenset = frozenset(
-    {"delegate_task", "give_gift", "create_image", "send_voice", "recall_asset"}
+    {"delegate_task", "give_gift", "create_image", "send_voice", "recall_asset", "send_sticker", "fetch_image", "discover_images"}
 )
 
 DEFAULT_TASK_TIMEOUT = 240.0
@@ -90,8 +90,14 @@ async def run_delegated_task(
     if _delegate_depth.get():
         return "[Error] 不允许嵌套调用 delegate_task（任务智能体不能再委派任务）。"
 
-    role = perm_manager.get_role(user_id)
+    from .group_runtime import current_group_run
+    from .context import _current_user_role
+    from .permissions import UserRole
+    role = (UserRole(_current_user_role.get()) if current_group_run.get() is not None
+            else perm_manager.get_role(user_id))
     allowed: Set[str] = set(perm_manager.get_allowed_tools(role)) - {"delegate_task"}
+    if current_group_run.get() is not None:
+        allowed.update({"story_search","group_media"})
     if disabled_tools:
         allowed -= set(disabled_tools)
     # Story KB tools follow the *originating* persona, not the task plane's
@@ -99,7 +105,7 @@ async def run_delegated_task(
     # access just by delegating.
     try:
         from lib.story_kb import story_personas
-        if _current_personality.get() not in story_personas():
+        if current_group_run.get() is None and _current_personality.get() not in story_personas():
             allowed.discard("story_search")
     except Exception:  # noqa: BLE001
         pass
@@ -139,6 +145,8 @@ async def run_delegated_task(
     except asyncio.TimeoutError:
         return f"[Error] 任务执行超时（{int(timeout)}秒），请让用户简化任务或稍后重试。"
     except Exception as e:
+        if current_group_run.get() is not None:
+            return "[Error] 群任务执行失败，请稍后重试。"
         return f"[Error] 任务执行失败: {type(e).__name__}: {e}"
     finally:
         _pending_task_fold.set(saved_fold)

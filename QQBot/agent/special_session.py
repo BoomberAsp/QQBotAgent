@@ -100,6 +100,17 @@ class SpecialSession:
         }
 
 
+def _session_locked(method):
+    from functools import wraps
+    @wraps(method)
+    def wrapper(self, user_id, *args, **kwargs):
+        from .durable import locked
+        key = os.path.join(self.user_data_root, self._safe_id(user_id), "sessions", "_write")
+        with locked(key):
+            return method(self, user_id, *args, **kwargs)
+    return wrapper
+
+
 class SpecialSessionManager:
     """Manages special sessions for all users."""
 
@@ -345,6 +356,7 @@ class SpecialSessionManager:
         index["active_session"] = None
         self._save_index(user_id, index)
 
+    @_session_locked
     def clear_context(self, user_id: str):
         """Clear the active special session's message history, keeping it active.
 
@@ -360,11 +372,16 @@ class SpecialSessionManager:
         if os.path.exists(session_dir):
             for f in os.listdir(session_dir):
                 if (f.startswith("snapshot_") or f == "delta.jsonl"
-                        or f == COMPRESSION_BACKUP_FILE):
+                        or f == COMPRESSION_BACKUP_FILE or f == "committed_context.json"):
                     try:
                         os.remove(os.path.join(session_dir, f))
                     except OSError:
                         pass
+
+        archive_dir = os.path.join(session_dir, "history_archive")
+        if os.path.isdir(archive_dir) and not os.path.islink(archive_dir):
+            import shutil
+            shutil.rmtree(archive_dir)
 
         session.context = []
         session.total_messages = 0
@@ -381,6 +398,7 @@ class SpecialSessionManager:
 
     # ── Message Operations ─────────────────────────────────────────
 
+    @_session_locked
     def add_message(
         self,
         user_id: str,
@@ -413,12 +431,14 @@ class SpecialSessionManager:
 
     # ── Context Compression (PLAN.md Idea 4, Phase A) ──────────────
 
+    @_session_locked
     def apply_compression(
         self,
         user_id: str,
         name: str,
         summary_text: str,
         keep_recent: int = 10,
+        expected_context: Optional[list] = None,
     ) -> dict:
         """Replace a session's stored context with summary + recent tail.
 
@@ -447,6 +467,8 @@ class SpecialSessionManager:
             raise ValueError(f"会话「{name}」不存在。")
 
         context = session.context
+        if expected_context is not None and context != expected_context:
+            raise ValueError("会话在压缩期间已变化，请重新发起压缩；新消息已保留。")
         keep_recent = max(0, min(int(keep_recent), len(context) - 1))
         if len(context) <= keep_recent:
             raise ValueError(f"会话「{name}」消息不足，无需压缩。")
@@ -474,33 +496,15 @@ class SpecialSessionManager:
         session_dir = self._session_dir(user_id, name)
         os.makedirs(session_dir, exist_ok=True)
 
-        # 1) One-generation backup (best-effort — never block compression on
-        #    a backup failure, but log-less by design: disk issues surface on
-        #    the snapshot write below anyway).
-        backup_path = os.path.join(session_dir, COMPRESSION_BACKUP_FILE)
-        tmp_path = backup_path + ".tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(context, f, ensure_ascii=False)
-            os.replace(tmp_path, backup_path)
-        except Exception:
-            pass
-
-        # 2) Remove old snapshots + delta (they describe the old context).
-        for f in os.listdir(session_dir):
-            if ((f.startswith("snapshot_") and f.endswith(".json"))
-                    or f == "delta.jsonl"):
-                try:
-                    os.remove(os.path.join(session_dir, f))
-                except OSError:
-                    pass
-
-        # 3) Write the new snapshot; abort before touching the index if this
-        #    fails (backup still holds the old context for manual recovery).
+        # Preserve the original generation separately from the model projection.
+        archive_dir = os.path.join(session_dir, "history_archive")
+        os.makedirs(archive_dir, exist_ok=True)
+        self._atomic_context(os.path.join(archive_dir, uuid.uuid4().hex + ".json"), context)
+        # Prepare both files before switching the authoritative context. Failure
+        # leaves the previous context untouched; legacy snapshots are retained.
+        self._atomic_context(os.path.join(session_dir, COMPRESSION_BACKUP_FILE), context)
+        self._atomic_context(os.path.join(session_dir, "committed_context.json"), new_context)
         seq = len(new_context)
-        snapshot_path = os.path.join(session_dir, f"snapshot_{seq:05d}.json")
-        with open(snapshot_path, "w", encoding="utf-8") as f:
-            json.dump(new_context, f, ensure_ascii=False, indent=2)
 
         # 4) Commit session state + index.
         session.context = new_context
@@ -652,12 +656,31 @@ class SpecialSessionManager:
     def _append_delta(self, user_id: str, name: str, msg: dict):
         """Append a single message to the delta JSONL file."""
         session_dir = self._session_dir(user_id, name)
+        committed = os.path.join(session_dir, "committed_context.json")
+        if os.path.exists(committed):
+            with open(committed, encoding="utf-8") as f:
+                context = json.load(f)
+            self._atomic_context(committed, context + [msg])
+            return
         delta_path = os.path.join(session_dir, "delta.jsonl")
         try:
             with open(delta_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
         except Exception:
             pass
+
+    @staticmethod
+    def _atomic_context(path, value):
+        tmp = path + "." + uuid.uuid4().hex + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(value, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
     def _generate_snapshot(self, user_id: str, session: SpecialSession):
         """Generate a full snapshot of the current context."""
@@ -698,6 +721,7 @@ class SpecialSessionManager:
         session._last_snapshot_seq = seq
         session._delta_count = 0
 
+    @_session_locked
     def _load(self, user_id: str, name: str) -> Optional[SpecialSession]:
         """Load a special session from disk using snapshot + delta."""
         session_dir = self._session_dir(user_id, name)
@@ -705,6 +729,16 @@ class SpecialSessionManager:
             return None
 
         context = []
+        committed = os.path.join(session_dir, "committed_context.json")
+        if os.path.exists(committed):
+            with open(committed, encoding="utf-8") as f:
+                saved = json.load(f)
+            index = self._load_index(user_id)
+            meta = next((s for s in index.get("sessions", []) if s["name"] == name), {})
+            return SpecialSession(session_id=meta.get("session_id", name), user_id=user_id,
+                name=name, context=saved, created_at=meta.get("created_at", time.time()),
+                last_active=meta.get("last_active", time.time()), total_messages=len(saved),
+                metadata=meta.get("metadata", {}), _last_snapshot_seq=len(saved), _delta_count=0)
 
         # Find latest snapshot
         snapshots = []

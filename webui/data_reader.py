@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import config
+from lib.bond_names import reconcile as reconcile_bond_name
 
 DATA = config.QQBOT_DIR / "data"
 TOKEN_DIR = DATA / "token_usage"
@@ -397,7 +398,7 @@ def _special_manager():
     return SpecialSessionManager(user_data_root=str(config.USER_DATA_ROOT))
 
 
-# 剧情/创作会话不计普通特殊会话配额（scene-session-archive-design.md §2.1）
+# 剧情/创作会话不计通用会话配额（scene-session-archive-design.md §2.1）
 _NON_QUOTA_KINDS = {"bond_scene", "char_creation"}
 
 
@@ -418,10 +419,9 @@ def special_list(uid: str) -> dict:
             item["completed"] = bool(meta.get("completed"))
             item["counts_quota"] = kind not in _NON_QUOTA_KINDS
             sessions.append(item)
-        # 配额摘要：普通会话计配额；剧情/创作不计（与 turn.py 口径一致）
+        # 配额摘要：通用会话计配额；剧情/创作不计（与 turn.py 口径一致）
         try:
-            quota_max = _permissions.get_max_special_sessions(
-                _permissions.get_role(uid))
+            quota_max = _permissions.get_max_special_sessions(_role_of(uid))
         except Exception:
             quota_max = None
         return {
@@ -487,16 +487,50 @@ def task_detail(uid: str, task_id: str) -> dict:
 # Import is safe: webui.config puts QQBot/ on sys.path, and agent.permissions
 # has no nonebot dependency. get_role() re-reads .env on every call, so panel
 # edits via the config page take effect without a restart (same as the bot).
-from agent.permissions import PermissionManager  # noqa: E402
+from agent.permissions import PermissionManager, UserRole  # noqa: E402
 
 _permissions = PermissionManager()
 
+# 身份表按路由隔离（plan §7.7）：OneBot 用 QQ 号匹配 SUPERUSERS/VIP_USERS，
+# QQ 官方用 openid 匹配 QQ_OFFICIAL_*。面板只能看到磁盘上的 uid、拿不到事件
+# 里的 platform，所以按 id 形态还原路由 —— QQ 号全数字，官方 openid 是不透
+# 明字母数字串（线上实测 32 位十六进制）。少这一步 get_role() 永远查 OneBot
+# 表，官方用户的管理员/VIP 全部掉成「普通」。
+def _platform_of(uid: str) -> str:
+    return "onebot" if uid.isdigit() else "qq_official"
 
-def _role_of(uid: str) -> str:
-    return _permissions.get_role(uid).value
+
+def _role_of(uid: str) -> UserRole:
+    """Role enum for a stored uid, resolved under its own route's table."""
+    return _permissions.get_role(uid, platform=_platform_of(uid))
 
 
-_QUOTA_MB = {"admin": 2048, "vip": 500, "regular": 100}
+# USER_DATA_ROOT 同时承载非用户目录（数据盘单树化，见 QQBot/.env.example）：
+# 解包数据、长期记忆、角色卡、羁绊/事件、多模态资产、信箱、剧情库、缓存、
+# 认知库。它们与 {uid}/ 平级，必须排除，否则工作区页会把它们当成 0 字节的
+# 「普通用户」列出来（实测 memory/gamedata/characters 等全部中招）。
+_SHARED_DATA_DIRS = frozenset({
+    "gamedata", "memory", "characters", "bonds", "bond_events", "assets",
+    "mailboxes", "story_kb", "wiki_cache", "_cognition",
+})
+
+
+def _is_user_dir(path: Path) -> bool:
+    """True when ``path`` is a per-user data dir, not a shared store.
+
+    Primary test is a positive marker the bot writes for real users
+    (UserWorkspaceManager.ensure_dirs → workspace/ + sessions/;
+    ProfileManager → profile.json). The reserved names are a second line
+    of defence: a shared store that happens to grow such a subdirectory
+    still never shows up as a user.
+    """
+    if not path.is_dir() or not _safe_uid(path.name):
+        return False
+    if path.name.lower() in _SHARED_DATA_DIRS:
+        return False
+    return ((path / "workspace").is_dir()
+            or (path / "sessions").is_dir()
+            or (path / "profile.json").is_file())
 
 
 def _dir_size(path: Path, cap_files: int = 20000) -> int:
@@ -523,15 +557,16 @@ def workspace_stats() -> dict:
     users = []
     total_used = 0
     for d in sorted(root.iterdir()):
-        if not d.is_dir() or not _safe_uid(d.name):
+        if not _is_user_dir(d):
             continue
         ws = d / "workspace"
         used = _dir_size(ws) if ws.exists() else 0
         role = _role_of(d.name)
-        quota = _QUOTA_MB[role] * 1024 * 1024
+        quota = _permissions.get_workspace_quota_mb(role) * 1024 * 1024
         total_used += used
         users.append({
-            "user_id": d.name, "role": role,
+            "user_id": d.name, "role": role.value,
+            "platform": _platform_of(d.name),
             "used": used, "quota": quota,
             "percent": round(100.0 * used / quota, 1) if quota else 0,
         })
@@ -543,8 +578,9 @@ def workspace_stats() -> dict:
 def workspace_tree(uid: str, max_entries: int = 500) -> dict:
     if not _safe_uid(uid):
         return {"error": "非法用户 ID"}
-    ws = config.USER_DATA_ROOT / uid / "workspace"
-    if not ws.exists():
+    user_dir = config.USER_DATA_ROOT / uid
+    ws = user_dir / "workspace"
+    if not _is_user_dir(user_dir) or not ws.exists():
         return {"error": "工作区不存在", "entries": []}
     entries = []
     for root, dirs, files in os.walk(ws):
@@ -809,6 +845,23 @@ def _gamedata_roles() -> dict:
     return (src.roles or {}) if src is not None else {}
 
 
+def _gamedata_artifacts() -> dict:
+    """每次读取独立羁绊产物；原子上传后下一次请求立即生效。"""
+    directory = config.GAMEDATA_DIR
+    if directory is None:
+        return {}
+    try:
+        blob = json.loads((Path(directory) / "artifacts.json").read_text(encoding="utf-8"))
+        data = blob.get("artifacts", {})
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _gamedata_entries(kind: str) -> dict:
+    return _gamedata_artifacts() if kind == "bond" else _gamedata_roles()
+
+
 def _gd_role_names(role: dict, rid: str = "") -> tuple[str, str]:
     """(官方简中名, 官方英文名)；缺繁中回落。
 
@@ -841,9 +894,17 @@ def wiki_portrait_path(rid: str) -> Path | None:
     return p if p.is_file() else None
 
 
-def wiki_details_gamedata_entry(rid: str) -> dict:
+def wiki_details_gamedata_entry(rid: str, kind: str = "char") -> dict:
     """解包角色的只读条目视图（wiki 未收录 → 无可编辑的详情缓存条目）。"""
+    if kind not in ("char", "bond"):
+        return {"error": f"非法详情类型: {kind}"}
     rid = (rid or "").strip()
+    if kind == "bond":
+        entry = _gamedata_artifacts().get(rid)
+        if not isinstance(entry, dict):
+            return {"error": f"gamedata 无此羁绊: {rid}"}
+        return {"kind": "gamedata_bond", "rid": rid,
+                "entry": {**entry, "source": "gamedata"}}
     roles = _gamedata_roles()
     if not roles:
         return {"error": "gamedata 解包产物不可用（GAMEDATA_DIR 未配置或 roles.json 为空）"}
@@ -931,6 +992,13 @@ def wiki_aliases_missing(kind: str) -> dict:
     known_low = {k.lower() for k in known}
     canonicals = {str(c) for c in flat.values()}
 
+    gd_entries = _gamedata_entries(kind)
+    if kind in ("char", "bond"):
+        for title, entry in data.items():
+            if isinstance(entry, dict):
+                entry.setdefault("title", title)
+                reconcile_bond_name(entry, gd_entries)
+    reported_ids = set()
     items, seen = [], set()
     for title, entry in data.items():
         if not isinstance(entry, dict):
@@ -938,23 +1006,31 @@ def wiki_aliases_missing(kind: str) -> dict:
         title = str(title)
         if title in known or title.lower() in known_low:
             continue
-        canon = str(entry.get("name_cn") or "").strip() or title
+        eid = str(entry.get("id") or "")
+        official = gd_entries.get(eid, {}) if kind == "bond" else {}
+        zh, en = _gd_role_names(official, eid)
+        if eid in known or (zh and zh in known) or (en and en.lower() in known_low):
+            continue
+        canon = str(entry.get("name_cn") or "").strip() or zh or title
         if canon in known or canon in seen:
             continue
         seen.add(canon)
-        hint = [canon] + ([title] if title != canon else [])
+        reported_ids.add(eid)
+        hint = list(dict.fromkeys(x for x in [canon, title, zh, en, eid, *entry.get("name_aliases", [])] if x))
         items.append({"canonical": canon, "title_en": title,
                       "aliases_hint": hint, "source": "wiki"})
 
     # ── 解包侧增强（仅 char）──
-    if kind == "char":
+    if kind in ("char", "bond"):
         wiki_title_by_id = {str(e.get("id")): str(t) for t, e in data.items()
                             if isinstance(e, dict) and e.get("id")}
         gd_seen: set = set()
-        for rid, role in _gamedata_roles().items():
+        for rid, role in gd_entries.items():
             if not isinstance(role, dict):
                 continue
             rid = str(rid)
+            if rid in reported_ids:
+                continue
             zh, en = _gd_role_names(role, rid)
             if not zh and not en:
                 continue        # 本地化占位角色（无可读名字）
@@ -1058,6 +1134,12 @@ def _details_load(kind: str) -> tuple[Path | None, dict | None, str | None]:
         blob = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(blob, dict) or not isinstance(blob.get("data"), dict):
             return path, None, "详情缓存格式异常（缺少 data 对象）"
+        if kind in ("char", "bond"):
+            artifacts = _gamedata_entries(kind)
+            for title, entry in blob["data"].items():
+                if isinstance(entry, dict):
+                    entry.setdefault("title", title)
+                    reconcile_bond_name(entry, artifacts)
         return path, blob, None
     except Exception as e:
         return path, None, f"详情缓存读取失败: {e}"
@@ -1116,13 +1198,13 @@ def wiki_details_list(kind: str, q: str = "") -> dict:
 
     # ── 合并解包角色（wiki 未收录的；仅 char，产物不可用时静默跳过）──
     gd_total = 0
-    if kind == "char":
-        for rid, role in _gamedata_roles().items():
-            if not isinstance(role, dict) or str(rid) in wiki_ids:
+    if kind in ("char", "bond"):
+        for rid, role in _gamedata_entries(kind).items():
+            if not isinstance(role, dict) or (kind == "char" and str(rid) in wiki_ids):
                 continue
             rid = str(rid)
             zh, en = _gd_role_names(role, rid)
-            if not zh and not en:
+            if not zh and not en and kind == "char":
                 continue        # 本地化占位角色（如 H169）不进面板列表
             gd_total += 1
             title = en or rid
@@ -1211,6 +1293,8 @@ def wiki_details_save_fields(kind: str, title: str, fields: dict) -> dict:
             else:
                 if not isinstance(value, str):
                     return {"error": f"{key}: 值必须是字符串"}
+                if kind in ("char", "bond") and parts[0] == "name_cn" and entry.get("name_cn") != value:
+                    entry["name_aliases"] = list(dict.fromkeys([*entry.get("name_aliases", []), entry.get("name_cn", "")]))
                 entry[parts[0]] = value
         else:
             return {"error": f"字段不在白名单内: {key}"}

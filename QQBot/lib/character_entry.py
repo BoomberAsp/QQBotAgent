@@ -16,14 +16,27 @@ import os
 from functools import lru_cache
 
 from lib.paths import wiki_cache_dir
+from lib.game_names import file_stamp
+from pathlib import Path
 
 
 def _gd_dir() -> str:
     return os.environ.get("GAMEDATA_DIR") or ""
 
 
-@lru_cache(maxsize=1)
+def _signature():
+    gd = Path(_gd_dir() or ".")
+    return tuple(file_stamp(gd / name) for name in
+                 ("manifest.json", "roles.json", "skills.json", "status_catalog.json", "stats_base.json", "role_grants.json")) + (
+                     file_stamp(Path(wiki_cache_dir()) / "character_details.json"),)
+
+
 def _bundle() -> dict:
+    return _cached_bundle(_signature())
+
+
+@lru_cache(maxsize=1)
+def _cached_bundle(signature) -> dict:
     """加载 gamedata + wiki 详情，构建一次映射（进程内缓存）。"""
     gd = _gd_dir()
     if not gd:
@@ -52,12 +65,16 @@ def _bundle() -> dict:
 
 
 def invalidate() -> None:
-    _bundle.cache_clear()
-    _name_index.cache_clear()
+    _cached_bundle.cache_clear()
+    _cached_name_index.cache_clear()
+
+
+def _name_index() -> dict:
+    return _cached_name_index(_signature())
 
 
 @lru_cache(maxsize=1)
-def _name_index() -> dict:
+def _cached_name_index(signature) -> dict:
     """中文名/英文名 → 角色 ID（精确匹配优先于别名，避免 蜜拉贝儿→圣诞的蜜拉贝儿）。"""
     b = _bundle()
     roles = ((b.get("data") or {}).get("roles")) or {}

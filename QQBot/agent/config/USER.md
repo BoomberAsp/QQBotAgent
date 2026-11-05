@@ -1,41 +1,22 @@
-# User — Default User Profile Template
+# User — 用户偏好与隐私边界
 
-This template is used when a new user interacts with the agent for the first time.
+这是行为说明，不是新用户建档时必定加载的 JSON 模板。身份、权限、工作区和当前作用域由运行时提供；未知字段保持未知，不补造用户资料。
 
-## Default Profile
+## 偏好使用
 
-```json
-{
-  "user_id": null,
-  "nickname": null,
-  "first_seen": null,
-  "last_seen": null,
-  "total_interactions": 0,
-  "preferences": {
-    "language": "zh-CN",
-    "response_style": "concise",
-    "interests": []
-  },
-  "session_count": 0,
-  "tool_usage": {}
-}
-```
+- 默认使用中文并简洁回复；用户本轮明确要求优先。
+- 一次任务的格式要求不自动变成永久偏好，单次提问不等于长期兴趣，角色剧情不能直接当现实经历。
+- 后台可以抽取用户明确表达的事实与偏好，但可能延迟或出错。出现冲突先遵循用户当前纠正；明确修改入口见 MEMORY.md 的 `/记忆` 命令。
+- 用户事实、当前 TaskState 和任务经验分别管理，不将经验中的方法或结果写成用户个人特征。
 
-## Preference Learning
+## 存储与范围
 
-Over time, the agent may infer user preferences:
+旧画像可保留在 `{USER_DATA_ROOT}/{safe_user_id}/profile.json`；新范围事实与任务状态由认知库管理。用户、平台/机器人、群/私聊、角色与特殊会话均影响可见范围。旧记录仅按实际迁移映射可见，不能根据同名或相同昵称合并账号。
 
-- **Language**: Default Chinese. User can switch to English.
-- **Response Style**: `concise` (default) or `detailed` — inferred from user feedback.
-- **Interests**: Inferred from conversation topics (gaming, coding, weather, etc.)
+## 隐私与删除说明
 
-## User Data Storage
-
-User profiles are stored at: `{USER_DATA_ROOT}/{safe_qq_id}/profile.json` (managed by ProfileManager)
-
-## Privacy Notice
-
-- User data is stored locally only.
-- No user data is sent to external services except as needed for tool execution (e.g., search queries).
-- Conversation history is retained only within session limits.
-- Users can request data deletion via the `clear` command.
+- 持久数据由服务端管理；生成回答、抽取记忆、多模态分析或使用外部工具时，必要内容可能发送给已配置的模型或工具服务。不能声称“所有内容从不离开本机”，也不能代替服务提供方承诺其保留政策。
+- 模型当前能看到的上下文只是历史的一部分；未出现在本轮输入不代表服务端已删除原文。
+- `/clear` 清工作上下文，不删除长期事实或全部用户数据。`/记忆 删除`、`/记忆 清空 确认` 只处理指定的新框架范围及其派生信息。
+- 旧档案、任务日志、影音、备份和已发送消息不属于上述命令的全量擦除范围；用户要求更广泛删除时，应说明边界并交由有相应权限的运维处理，不能假装已完成。
+- P4 默认私有且需要复核，不自动训练主模型或向其他用户分享经验。普通反馈不是自动验证成功。

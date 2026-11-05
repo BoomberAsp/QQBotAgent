@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card"><h2>人格表情包</h2>
+<label>人格ID <input id="persona" list="persona-list" placeholder="dafeiyu"><datalist id="persona-list"></datalist></label>
+<button class="btn" id="refresh">查看</button>
+<p>静态 PNG/JPEG/WebP/GIF，最大8 MiB；转换为最大1536像素的PNG。上传即发布为该人格在群聊可用的公共图片。</p>
+<input type="file" id="image" accept="image/png,image/jpeg,image/webp,image/gif">
+<label>描述 <input id="description" maxlength="300" placeholder="开心、问候等使用场景"></label>
+<label>情绪标签（逗号分隔）<input id="mood" placeholder="happy,greeting"></label><p>标签：happy / sad / angry / greeting / thanks / surprised / tsundere / comfort</p><label><input type="checkbox" id="approved">我已审核图片内容，并确认有权发布供机器人使用</label>
+<button class="btn btn-primary" id="upload">上传并发布</button>
+<pre id="status" role="status"></pre>
+<div id="stickers" style="display:flex;flex-wrap:wrap;gap:16px"></div>
+</div><div class="card"><h3>抓取图片待审核</h3><p>批准实际发送版本后，用户需重新请求发送；不会自动补发。</p><button class="btn" id="reviews-refresh">加载审核队列</button><div id="reviews-list"></div></div><script src="/static/resources.js"></script>
+
+
+<script>
+const reviewButton=document.getElementById('reviews-refresh');
+if(reviewButton)reviewButton.onclick=async()=>{const list=document.getElementById('reviews-list');list.replaceChildren();const response=await fetch('/api/resources/reviews');if(!response.ok){list.textContent='加载失败';return;}for(const id of await response.json()){const box=document.createElement('div'),img=document.createElement('img'),btn=document.createElement('button');img.src='/api/resources/reviews/'+id;img.style='max-width:240px;max-height:240px';btn.textContent='已核实内容与使用权限，批准';btn.onclick=async()=>{if(!confirm('确认批准此图片？批准仅表示允许使用，不会自动补发。'))return;const r=await fetch('/api/resources/reviews/'+id,{method:'POST',headers:{'X-Resource-Admin':'1'}});if(r.ok)box.remove();else btn.textContent='批准失败，请重试';};box.append(img,btn);list.append(box);}};
+</script>
+
+
+<div class="card"><h3>图片来源与主动贴图策略</h3><p>精确域名，一行一个。网页域需同时列入图片域；CDN域需单独批准。空列表禁用网络抓图。</p>
+<label>图片及网页下载域<textarea id="image-hosts" rows="3"></textarea></label><label>允许发现候选的网页域<textarea id="page-hosts" rows="3"></textarea></label>
+<label><input type="checkbox" id="proactive-stickers">启用官方私聊每日主动贴图（复用现有调度、概率及配额）</label>
+<label>安静时段（服务器时间）<input id="proactive-quiet" value="22:00-08:00"></label><button class="btn" id="save-media-policy">保存策略</button><pre id="policy-status" role="status"></pre></div>
+<div class="card"><h3>最近媒体投递</h3><button class="btn" id="load-deliveries">刷新记录</button><pre id="deliveries" style="max-height:350px;overflow:auto"></pre></div>
+<script>
+(async()=>{const r=await fetch('/api/resources');if(!r.ok)return;const d=await r.json();document.getElementById('image-hosts').value=(d.image_hosts||[]).join('\n');document.getElementById('page-hosts').value=(d.page_hosts||[]).join('\n');document.getElementById('proactive-stickers').checked=!!d.proactive_private_stickers;document.getElementById('proactive-quiet').value=d.proactive_quiet||'22:00-08:00';})().catch(()=>{});
+document.getElementById('save-media-policy').onclick=async()=>{const status=document.getElementById('policy-status');try{const lines=id=>document.getElementById(id).value.split(/\s+/).filter(Boolean);const r=await fetch('/api/resources/media-policy',{method:'POST',headers:{'Content-Type':'application/json','X-Resource-Admin':'1'},body:JSON.stringify({image_hosts:lines('image-hosts'),page_hosts:lines('page-hosts'),proactive_private_stickers:document.getElementById('proactive-stickers').checked,proactive_quiet:document.getElementById('proactive-quiet').value})});const d=await r.json();status.textContent=r.ok?'策略已保存':d.detail;}catch(e){status.textContent=e.message;}};
+document.getElementById('load-deliveries').onclick=async()=>{const r=await fetch('/api/resources/deliveries');document.getElementById('deliveries').textContent=r.ok?JSON.stringify(await r.json(),null,2):'加载失败';};
+</script>
+
+{% endblock %}

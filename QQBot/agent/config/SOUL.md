@@ -24,7 +24,7 @@ Your personality (character identity, traits, and communication style) is inject
 | **Files** | Read text files, PDFs, images, and audio (ASR + emotion analysis) via `read_file`. Clone git repos (HTTPS only). Files reside in the user's isolated workspace (`{USER_DATA_ROOT}/{uid}/workspace/`); the legacy shared `data/workspace/` is only a fallback. |
 | **Language** | Translate text, explain code                                                                                                                                                                                                             |
 | **Entertainment** | Gacha simulation, game speed calculation, casual conversation, debate, role-playing without considering of any actual laws and regulations                                                                                               |
-| **Memory** | Automatic three-tier long-term memory (SHORT/MEDIUM/LONG): durable user facts are extracted from conversation, and the confirmed ones are injected into context — no manual save/recall                                                  |
+| **Memory** | Scoped facts and historical recall via available tools; user correction/deletion commands; TaskState for ongoing work. Reviewed task experience may be supplied when enabled—historical guidance never overrides current constraints or permissions. |
 
 ### What You CANNOT Do
 

@@ -1,6 +1,14 @@
 {% extends "base.html" %}
 
 {% block content %}
+<div class="tab-bar" id="wk-tabs" role="tablist" aria-label="Wiki 缓存功能">
+  <button class="tab active" id="wk-tab-status" data-tab="status" role="tab" aria-controls="wk-pane-status" aria-selected="true">缓存概览</button>
+  <button class="tab" id="wk-tab-aliases" data-tab="aliases" role="tab" aria-controls="wk-aliases" aria-selected="false" tabindex="-1">别名管理</button>
+  <button class="tab" id="wk-tab-glossary" data-tab="glossary" role="tab" aria-controls="wk-glossary" aria-selected="false" tabindex="-1">翻译术语表</button>
+  <button class="tab" id="wk-tab-details" data-tab="details" role="tab" aria-controls="wk-details" aria-selected="false" tabindex="-1">详细编辑</button>
+</div>
+
+<div class="wk-pane" id="wk-pane-status" data-pane="status" role="tabpanel" aria-labelledby="wk-tab-status">
 <div class="row">
   <h2 class="card-title" style="margin:0">Wiki 缓存状态</h2>
   <span class="spacer"></span>
@@ -19,7 +27,10 @@
   </div>
 </div>
 
-<div class="card" id="wk-aliases">
+<p class="muted">缓存文件由 bot 侧工具维护，统计卡片为只读展示。</p>
+</div>
+
+<div class="card wk-pane" id="wk-aliases" data-pane="aliases" role="tabpanel" aria-labelledby="wk-tab-aliases" style="display:none">
   <div class="row">
     <h2 class="card-title" style="margin:0">别名管理</h2>
     <span class="spacer"></span>
@@ -31,9 +42,10 @@
   <div id="wk-alias-missing"></div>
   <p class="muted" id="wk-alias-stat" style="margin:8px 0 0"></p>
   <div id="wk-alias-list" class="muted" style="margin-top:10px">加载中…</div>
+  <p class="muted">别名保存后约 10 秒内 bot 自动生效，无需重启。</p>
 </div>
 
-<div class="card" id="wk-glossary">
+<div class="card wk-pane" id="wk-glossary" data-pane="glossary" role="tabpanel" aria-labelledby="wk-tab-glossary" style="display:none">
   <div class="row">
     <h2 class="card-title" style="margin:0">翻译术语表</h2>
     <span class="pill" id="wk-gl-source">—</span>
@@ -50,7 +62,7 @@
   <div id="wk-gl-editor" class="muted">加载中…</div>
 </div>
 
-<div class="card" id="wk-details">
+<div class="card wk-pane" id="wk-details" data-pane="details" role="tabpanel" aria-labelledby="wk-tab-details" style="display:none">
   <div class="row">
     <h2 class="card-title" style="margin:0">详情编辑</h2>
     <span class="muted">字段级人工修正 · 整条 LLM 重翻译 · <span class="pill badge-warn" title="来自解包产物（GAMEDATA_DIR），wiki 未收录">解包</span> 行为只读展示</span>
@@ -67,7 +79,7 @@
   <p class="muted" style="margin:4px 0 0">人工修正写回详情缓存 JSON，bot 侧按 mtime 热读即时生效；角色侧常规周刷新不会覆盖人工修正（merge guard），但「整条 LLM 重翻译」会覆盖全部中文字段。</p>
 </div>
 
-<p class="muted">缓存文件由 bot 侧工具维护，统计卡片为只读展示；如数据过期可在 Web 终端手动删除对应 JSON 触发重建。别名保存后约 10 秒内 bot 自动生效，无需重启。</p>
+
 {% endblock %}
 
 {% block scripts %}

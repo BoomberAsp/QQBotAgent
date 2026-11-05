@@ -48,7 +48,7 @@ class CodeLimits:
 _PUBLIC_TOOLS: Set[str] = {
     "get_user_info",
     "delete_workspace_file",
-    "search_web",
+    "search_web", "fetch_image", "discover_images",
     "get_time",
     "get_weather",
     "read_file",           # Only text/PDF for regular; multimodal requires VIP
@@ -215,7 +215,8 @@ class PermissionManager:
         # Fall back to os.environ (for Docker / production deployments)
         return os.environ.get(key, "")
 
-    def get_role(self, user_id: str) -> UserRole:
+    def get_role(self, user_id: str,
+                 platform: str | None = None) -> UserRole:
         """Determine the user's role. Admin takes precedence over VIP.
 
         Reads .env file directly on every call — NoneBot2 may not expose
@@ -224,12 +225,16 @@ class PermissionManager:
         Stage 4 (§7.7): identity tables are per-platform. The qq_official
         route identifies users by opaque openids, so it consults
         QQ_OFFICIAL_SUPERUSERS / QQ_OFFICIAL_VIP_USERS; onebot keeps
-        SUPERUSERS / VIP_USERS (QQ numbers). The platform comes from the
-        _current_platform contextvar set per turn by agent.turn (default
-        "onebot" — every non-turn caller, e.g. webui, keeps old behavior).
+        SUPERUSERS / VIP_USERS (QQ numbers). Inside a turn the platform
+        comes from the _current_platform contextvar set by agent.turn
+        (default "onebot"); callers that only hold a stored id and know
+        which route it belongs to — e.g. the WebUI workspace page — pass
+        ``platform`` explicitly instead of inheriting the default.
         """
-        from agent.context import _current_platform
-        official = _current_platform.get() == "qq_official"
+        if platform is None:
+            from agent.context import _current_platform
+            platform = _current_platform.get()
+        official = platform == "qq_official"
         # openids are alphanumeric — the digit-only _parse_qq_list would
         # reject every one of them, so the official route uses _parse_id_list.
         parse = self._parse_id_list if official else self._parse_qq_list

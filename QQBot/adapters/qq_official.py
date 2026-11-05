@@ -160,8 +160,11 @@ def _md_record_success() -> None:
 #   40034029 内联键盘行/列超限、304062 按钮数量上限 → 先裁剪重试一次
 # 其余连续被拒走短熔断（3 次/600s），任何键盘失败都不丢正文：
 # kb → md-only（L1）→ 纯文本+命令清单（L2）。
+# 40011021 = 请求参数 rows.buttons.action.modal.content 无效（弹窗文案超长/
+# 非法）。平台按**整条消息**拒绝，不降级等于把正文也丢了。
 _KB_REJECT_CODES = frozenset({
     304037, 304038, 304039, 304040, 305007, 40034029, 304062,
+    40011021,
 })
 _KB_CLIP_CODES = frozenset({40034029, 304062})
 _KB_BUG_CODES = frozenset({304038, 304039, 304040, 305007})
@@ -527,8 +530,15 @@ def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
         text=_clean_content(event.content),
         message_id=str(event.id),
         self_id=str(bot.self_id),
-        mentioned=True if not is_group else bool(getattr(event, "to_me", True)),
+        mentioned=True if not is_group else (isinstance(event, GroupAtMessageCreateEvent)
+            or any(getattr(m, "is_you", False) for m in (getattr(event, "mentions", None) or []))),
+        received_at=(event.timestamp.timestamp() if hasattr(getattr(event,"timestamp",None),"timestamp") else __import__("time").time()),
+        actor_role=str(getattr(author, "member_role", "member")),
+        author_is_bot=bool(getattr(author, "bot", False)),
+        reply_to_bot=bool(is_group and getattr(getattr(getattr(event, "reply", None), "author", None), "id", None) == str(bot.self_id)),
         reply_context=_quote_context(quoted),
+        attachment_kinds=tuple(_classify_attachment(att,att.url or "")[0]
+            for att in [*(event.attachments or []),*(quoted.attachments if quoted else [])]),
         resolver=QQOfficialAttachmentResolver(event, quoted),
         platform="qq_official",
         raw=event,
@@ -736,6 +746,69 @@ class QQOfficialSender:
             return
         self._buffer.append(("kb", msg))
 
+    async def send_media_confirmed(self, img: OutImage) -> str:
+        if self._sent >= self.max_messages_per_turn:
+            return "dropped"
+        try:
+            await self._bot.send(self._event,MessageSegment.file_image(Path(img.path)))
+            self._sent += 1
+            return "sent"
+        except ActionFailed:
+            return "failed"
+        except Exception:
+            return "uncertain"
+
+    async def send_group_image(self, img: OutImage) -> str:
+        if not self._is_group or self._sent >= self.max_messages_per_turn:
+            return "dropped"
+        try:
+            await self._bot.send(self._event,MessageSegment.file_image(Path(img.path)))
+            self._sent += 1
+            return "sent"
+        except ActionFailed:
+            return "failed"
+        except Exception:
+            return "uncertain"
+
+    async def send_group_markdown(self,text,plain=None):
+        return await self.send_group_keyboard(text,[],plain)
+
+    async def send_group_keyboard(self,text,rows,plain=None):
+        if not self._is_group:return "dropped"
+        plain=plain or text
+        candidates=[]
+        if rows and self.supports_keyboard:
+            validate_buttons(rows)
+            candidates.append(self._kb_message(text,rows))
+        if self.supports_markdown:candidates.append(MessageSegment.markdown(text))
+        candidates.append(MessageSegment.text(plain))
+        for message in candidates:
+            if self._sent>=self.max_messages_per_turn:return "dropped"
+            self._sent+=1
+            try:
+                await self._bot.send(self._event,message)
+                return "sent"
+            except ActionFailed as exc:
+                # Only explicit unsupported-payload errors permit degradation.
+                code=getattr(exc,"code",None)
+                if code not in (_KB_REJECT_CODES | _MD_REJECT_CODES):return "failed"
+            except Exception:
+                return "uncertain"
+        return "failed"
+
+    async def send_group_text(self, text: str) -> str:
+        """Acknowledged group-only reply; never retry an uncertain delivery."""
+        if not self._is_group or self._sent >= self.max_messages_per_turn:
+            return "dropped"
+        try:
+            await self._bot.send(self._event, MessageSegment.text(text))
+            self._sent += 1
+            return "sent"
+        except ActionFailed:
+            return "failed"
+        except Exception:
+            return "uncertain"
+
     async def send_image(self, img: OutImage) -> None:
         self._buffer.append(("image", img))
 
@@ -810,9 +883,12 @@ class QQOfficialSender:
                 return
             except ActionFailed as e:
                 code = getattr(e, "code", None)
-                # 1) keyboard rejected → clip retry / strip to md-only
+                # 1) keyboard rejected → clip retry / strip to md-only.
+                #    判据是「载荷里有没有键盘」而不是错误码白名单：平台新加的
+                #    键盘校验码（如 40011021 modal.content）以前会落到最后的
+                #    log-and-drop，把正文一起静默丢掉（2026-11-01 线上事故）。
                 if (kb is not None and not kb_dropped
-                        and code in _KB_REJECT_CODES):
+                        and code not in _MD_REJECT_CODES):
                     if code in _KB_CLIP_CODES and not clipped:
                         clipped = True
                         rows = clip_rows(kb.rows)
@@ -823,7 +899,12 @@ class QQOfficialSender:
                         message = self._kb_message(md_text, rows)
                         continue
                     kb_dropped = True
-                    _kb_record_reject(code)
+                    if code in _KB_REJECT_CODES:
+                        _kb_record_reject(code)
+                    else:
+                        logger.warning(
+                            f"[qq_official] keyboard rejected with unknown "
+                            f"code={code}; treating as keyboard fault")
                     logger.warning(
                         f"[qq_official] keyboard rejected (code={code}); "
                         f"retrying markdown-only")
@@ -1145,13 +1226,6 @@ async def send_active_c2c_markdown(bot: QQBot, openid: str, md_text: str,
                         f"[qq_official] envelope keyboard over-limit "
                         f"(code={code}); clipped, retrying")
                     continue
-                if code in _KB_REJECT_CODES:
-                    _kb_record_reject(code)
-                    logger.warning(
-                        f"[qq_official] envelope keyboard rejected "
-                        f"(code={code}); retrying markdown-only")
-                    tier = "md" if md_on else "plain"
-                    continue
                 if code in _MD_REJECT_CODES:
                     _md_record_reject()
                     _kb_record_reject(code)  # md dead ⇒ kb dead: converge
@@ -1160,6 +1234,18 @@ async def send_active_c2c_markdown(bot: QQBot, openid: str, md_text: str,
                         f"({e!r}); retrying plain text")
                     tier = "plain"
                     continue
+                # 其余一律按键盘问题降级（含平台新增的未归类错误码）
+                if code in _KB_REJECT_CODES:
+                    _kb_record_reject(code)
+                else:
+                    logger.warning(
+                        f"[qq_official] envelope keyboard rejected with "
+                        f"unknown code={code}; treating as keyboard fault")
+                logger.warning(
+                    f"[qq_official] envelope keyboard rejected "
+                    f"(code={code}); retrying markdown-only")
+                tier = "md" if md_on else "plain"
+                continue
             elif tier == "md":
                 if code in _MD_REJECT_CODES:
                     _md_record_reject()
@@ -1261,4 +1347,7 @@ async def send_active_group(bot: QQBot, group_openid: str, text: str,
 
 # Event types this route handles — the entry plugin's isinstance guard
 # and the intent config (c2c_group_at_messages) must agree on this set.
-HANDLED_EVENTS = (C2CMessageCreateEvent, GroupAtMessageCreateEvent)
+# Some adapter releases define the full-message class without registering it.
+from nonebot.adapters.qq.event import register_event_class
+register_event_class(GroupMessageCreateEvent)
+HANDLED_EVENTS = (C2CMessageCreateEvent, GroupMessageCreateEvent)

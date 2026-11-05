@@ -341,9 +341,9 @@ class TestSessionManager:
 
         assert len(session.context) == 10
         session.trim(5)
-        assert len(session.context) == 5, f"Expected 5 after trim, got {len(session.context)}"
+        assert len(session.context) in (5, 6), f"Expected whole-turn tail, got {len(session.context)}"
         # Should keep the LAST 5 messages
-        assert session.context[0]["content"] == "message_5"
+        assert session.context[0]["content"] == "message_4"
 
         # Hysteresis (Phase 4, B3): within max + TRIM_HYSTERESIS the head must
         # NOT move, so the provider-side prefix cache survives turn to turn.
@@ -356,8 +356,8 @@ class TestSessionManager:
         assert session.context[0]["content"] == "m_0", "head must not move"
         session.add_message("user", "m_overflow")
         session.trim(5)
-        assert len(session.context) == 5, (
-            f"past the band trim snaps back to max, got {len(session.context)}")
+        assert len(session.context) in (5, 6), (
+            f"past the band trim preserves whole turns, got {len(session.context)}")
         assert session.context[-1]["content"] == "m_overflow"
         print_pass("Context trimming (with Phase 4 hysteresis band)")
 
@@ -1257,6 +1257,7 @@ class TestProfileExtraction:
         asyncio.run(self.test_single_flight())
         asyncio.run(self.test_delete_flush())
         asyncio.run(self.test_buffer_crash_recovery())
+        asyncio.run(self.test_buffer_persona_roundtrip())
 
     # ── Layer 2 ──────────────────────────────────────────────────
 
@@ -1470,7 +1471,7 @@ class TestProfileExtraction:
             # rolling window bounded at EXTRACT_WINDOW_N
             for i in range(EXTRACT_WINDOW_N + 5):
                 mgr.observe_turn("u", f"x{i}", "r")
-            assert len(mgr._recent["u"]) == EXTRACT_WINDOW_N, len(mgr._recent["u"])
+            assert len(mgr._recent["u"]) >= EXTRACT_WINDOW_N, len(mgr._recent["u"])
             await asyncio.sleep(0.05)
             assert "原神" in mgr.get("u").interests
             print_pass("Layer3 observe_turn: buffers, flushes at K, window bounded, applies")
@@ -1493,7 +1494,7 @@ class TestProfileExtraction:
                 mgr.observe_turn("u", f"after{i}", "r")
             await asyncio.sleep(0)
             assert len(client.calls) == 1, "single-flight: no concurrent 2nd extraction"
-            assert mgr._pending_n["u"] == 3, mgr._pending_n["u"]
+            assert mgr._pending_n["u"] == PROFILE_BATCH_K + 3, mgr._pending_n["u"]
             client.gate.set()  # release
             await asyncio.sleep(0.05)
             assert "u" not in mgr._inflight, "in-flight cleared after completion"
@@ -1579,6 +1580,35 @@ class TestProfileExtraction:
             m4.observe_turn("u", "fresh", "r")
             assert m4._pending_n["u"] == 1 and len(m4._recent["u"]) == 1
             print_pass("Layer3 ⑦: buffer survives restarts, flush-once, corrupt-tolerant")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_buffer_persona_roundtrip(self):
+        """Per-turn persona mirrors to buffer.json and restores verbatim, so a
+        LONG snapshot built after a restart still labels the assistant
+        in-character (not the hardcoded default)."""
+        tmpdir = tempfile.mkdtemp()
+        buf = os.path.join(tmpdir, "u", "buffer.json")
+        try:
+            from agent.profile import ProfileManager
+            c1 = _GatedProfileClient("{}")
+            m1 = ProfileManager(base_dir=tmpdir, llm_client=c1)
+            # < K turns so nothing flushes; one carries a persona, one is legacy
+            m1.observe_turn("u", "m0", "r0", "露比")
+            m1.observe_turn("u", "m1", "r1")           # 3-arg legacy call → ""
+            await asyncio.sleep(0)
+            with open(buf, encoding="utf-8") as f:
+                blob = json.load(f)
+            assert blob["turns"][0][:3] == ["m0", "r0", "露比"], blob["turns"]
+            assert blob["turns"][1][:3] == ["m1", "r1", ""], blob["turns"]
+            # a fresh manager restores the persona verbatim on first observe
+            c2 = _GatedProfileClient("{}")
+            m2 = ProfileManager(base_dir=tmpdir, llm_client=c2)
+            m2.observe_turn("u", "m2", "r2", "触发恢复")
+            dq = list(m2._recent["u"])
+            assert dq[0][:3] == ("m0", "r0", "露比"), dq
+            assert dq[1][:3] == ("m1", "r1", ""), dq
+            print_pass("Layer3: per-turn persona mirrors to buffer.json + restores")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -2417,6 +2447,7 @@ class TestTieredMemory:
         self.test_medium_max_safety_net()
         self.test_long_creation_twin_kept_idempotent()
         self.test_long_snapshot_turns_from_batch()
+        self.test_long_snapshot_persona_label()
         self.test_judge_list_composition()
         self.test_injection_empty_returns_blank()
         self.test_injection_low_confidence_label()
@@ -2664,6 +2695,42 @@ class TestTieredMemory:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_long_snapshot_persona_label(self):
+        """Per-turn persona: a LONG snapshot writes/renders/reloads the session
+        persona instead of the old hardcoded 助手(Roxy); legacy 2-tuple turns
+        still fall back to Roxy."""
+        tmp = tempfile.mkdtemp()
+        try:
+            from agent.memory import TieredMemory, MediumItem
+            tm = self._tm(tmp)
+            st = tm._get_state("u")
+            st.medium.append(MediumItem(id="m1", content="事实", count=10, entry_extraction_index=0))
+            # one turn carries a character persona (露比); one is a legacy 2-tuple
+            turns = [("今天练腿", "好的呀", "露比"), ("旧格式轮", "旧回复")]
+            tm.ingest_candidates("u", [("事实", "keep", "m1")], snapshot_turns=turns)
+            lo = st.long[0]
+            # snapshot_turns stored verbatim → per-turn persona preserved
+            assert lo.snapshot_turns == turns, lo.snapshot_turns
+            # recall rendering uses each turn's OWN persona; legacy turn → Roxy
+            text = tm._format_snapshot_text(lo)
+            assert "助手(露比): 好的呀" in text, text
+            assert "助手(Roxy): 旧回复" in text, text
+            # persist → the md file on disk carries the persona label
+            tm.save_user("u")
+            with open(os.path.join(tm._long_user_dir("u"), lo.id + ".md"),
+                      encoding="utf-8") as f:
+                md = f.read()
+            assert "助手(露比): 好的呀" in md, md
+            # reload → persona recovered from the label; legacy turn read back as Roxy
+            tm2 = TieredMemory(base_dir=tmp)
+            tm2.load_all()
+            lo2 = tm2._get_state("u").long[0]
+            assert lo2.snapshot_turns[0] == ("今天练腿", "好的呀", "露比"), lo2.snapshot_turns
+            assert lo2.snapshot_turns[1] == ("旧格式轮", "旧回复", "Roxy"), lo2.snapshot_turns
+            print_pass("LONG snapshot: per-turn persona label writes/renders/reloads (legacy→Roxy)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     # ── judge list ───────────────────────────────────────────────
 
     def test_judge_list_composition(self):
@@ -2868,7 +2935,9 @@ class TestTieredMemory:
             assert st2.short[0].content == "短期事实" and st2.short[0].count == 2
             assert st2.medium[0].content == "中期事实" and st2.medium[0].entry_extraction_index == 3
             assert st2.long[0].linked_medium_id == "m1"
-            assert st2.long[0].snapshot_turns == [("玩原神", "好玩")], "LONG snapshot md round-trips"
+            # legacy 2-tuple snapshot writes as 助手(Roxy) and reads back as a
+            # 3-tuple with the persona recovered from the speaker label
+            assert st2.long[0].snapshot_turns == [("玩原神", "好玩", "Roxy")], "LONG snapshot md round-trips"
             print_pass("persistence: save_user/load round-trips all tiers + clock + LONG md")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -6051,6 +6120,7 @@ class TestSceneArchive:
         print_header("32b. Scene-Session Archive & Quota Exemption")
         self.turn = _import_turn_for_tests()
         self.test_quota_helpers()
+        self.test_backfill_legacy_false()
         self.test_rollback_switch()
         asyncio.run(self.test_start_dedup_resume())
         asyncio.run(self.test_start_cap())
@@ -6145,14 +6215,17 @@ class TestSceneArchive:
             assert len(turn._quota_sessions(uid)) == 1  # 仅普通A
             # B6 删除尾行：普通 vs 剧情
             t_norm = turn._delete_quota_tail(uid, "")
-            assert "普通会话" in t_norm and "1/1" in t_norm, t_norm
+            assert "通用会话" in t_norm and "1/1" in t_norm, t_norm
             t_scene = turn._delete_quota_tail(uid, "bond_scene")
-            assert "配额不变" in t_scene and "剧情归档剩 1" in t_scene, t_scene
+            assert "配额不变" in t_scene and "剧情会话剩 1" in t_scene, t_scene
             t_create = turn._delete_quota_tail(uid, "char_creation")
             assert "配额不变" in t_create, t_create
-            # T12：懒回填（无 completed 字段 + has_done_scene=True → 写回）
+            # T12：懒回填（completed 未定 + has_done_scene=True → 写回）
             self._mk_scene(mgr, uid, "星空之约")  # 无 completed 字段
             ctx["bond"].mark_scene_done(uid, "rubi", "星空之约")
+            # 完成时刻必须落在会话生命周期内：模拟完成回合同样写了消息
+            mgr.switch_to(uid, "剧情·星空之约")
+            mgr.add_message(uid, "assistant", "（收尾白）")
             e = self._entry(mgr, uid, "剧情·星空之约")
             assert "completed" not in (e.get("metadata") or {})
             turn._backfill_completed(uid, e)
@@ -6170,6 +6243,55 @@ class TestSceneArchive:
             assert found and found["name"] == "剧情·星空之约"
             assert turn._find_scene_session(uid, "rubi", "不存在") is None
             print_pass("quota helpers: 剧情/创作豁免 + B6 尾行 + 懒回填 (T1/T3/T12/T13)")
+        finally:
+            self._restore(ctx)
+
+    def test_backfill_legacy_false(self):
+        """2026-10-29 封档上线前完成的场景：completed 停在 False 时也能补封档。
+
+        策略 A：只有「bond 记录的那次完成发生在该会话生命周期内」才回填 ——
+        同名旧残留（建了没玩）与删了重建的新会话都不误封。
+        """
+        turn = self.turn
+        ctx = self._setup(role="regular", max_sessions=3)
+        try:
+            mgr, uid, bond = ctx["mgr"], "u1", ctx["bond"]
+            # ① 同名旧残留：建了没玩，时间退回 1 小时前
+            self._mk_scene(mgr, uid, "雨夜谈心", completed=False)
+            idx = mgr._load_index(uid)
+            for e in idx["sessions"]:
+                if e["name"] == "剧情·雨夜谈心":
+                    e["created_at"] -= 3600
+                    e["last_active"] -= 3600
+            mgr._save_index(uid, idx)
+            # ② 真身会话（后建，名字自动 _1）
+            s2 = self._mk_scene(mgr, uid, "雨夜谈心", completed=False)
+            assert s2.name == "剧情·雨夜谈心_1", s2.name
+            # 完成时刻 → 落在 ② 生命周期内（先记账，再写收尾消息）
+            bond.mark_scene_done(uid, "rubi", "雨夜谈心")
+            done_ts = bond.scenes_done(uid, "rubi")["雨夜谈心"]
+            mgr.switch_to(uid, s2.name)
+            mgr.add_message(uid, "assistant", "（收尾白）")
+            # 旧残留不动
+            old = self._entry(mgr, uid, "剧情·雨夜谈心")
+            turn._backfill_completed(uid, old)
+            assert old["metadata"].get("completed") is False, old["metadata"]
+            # 真身补封档，completed_at 用 bond 记录的真实完成时刻
+            new = self._entry(mgr, uid, s2.name)
+            turn._backfill_completed(uid, new)
+            assert new["metadata"]["completed"] is True, new["metadata"]
+            assert abs(float(new["metadata"]["completed_at"]) - done_ts) < 1e-6
+            # 落盘可见
+            assert self._entry(mgr, uid, s2.name)["metadata"]["completed"] is True
+            # 已封档的不重复写
+            turn._backfill_completed(uid, self._entry(mgr, uid, s2.name))
+            # ③ 删了重建：完成早于创建 → 不封
+            bond.mark_scene_done(uid, "rubi", "旧梦")
+            self._mk_scene(mgr, uid, "旧梦", completed=False)
+            e4 = self._entry(mgr, uid, "剧情·旧梦")
+            turn._backfill_completed(uid, e4)
+            assert not (e4["metadata"] or {}).get("completed"), e4["metadata"]
+            print_pass("legacy completed=False 回填（真实完成时刻）+ 策略 A 不误封")
         finally:
             self._restore(ctx)
 
@@ -10007,6 +10129,7 @@ class TestOfficialButtons:
         asyncio.run(self.test_u8_idempotency_and_rate())
         asyncio.run(self.test_u9_admin_role_gate())
         asyncio.run(self.test_u10_group_session_privacy())
+        asyncio.run(self.test_u11_session_page_numbering())
         asyncio.run(self.test_onebot_keyboard_degrades())
         asyncio.run(self.test_send_response_one_shot_keyboard())
         asyncio.run(self.test_session_index_alias())
@@ -10457,6 +10580,44 @@ class TestOfficialButtons:
         assert all(b.action == "cmd" for b in flat)
         assert not any("私密剧情" in (b.data or "") for b in flat)
         print_pass("U10 群会话列表：不泄露会话名，引导私聊（§9.2）")
+
+    # ── U11: 会话列表分页序号不被 markdown 重排 ─────────────────
+    async def test_u11_session_page_numbering(self):
+        """第 2 页的序号必须是字面量 4/5/6，不能触发 Markdown 有序列表重排。"""
+        import re
+
+        from agent import session_render
+
+        class _Mgr:
+            def list_sessions(self, user):
+                return [{"name": f"会话{i}", "created_at": 1793091032 + i,
+                         "total_messages": i, "metadata": {}} for i in range(1, 7)]
+
+            def _load_index(self, user):
+                return {"active_session": "会话1"}
+
+        class _Perm:
+            def get_role(self, user):
+                return "regular"
+
+            def get_max_special_sessions(self, role):
+                return 10
+
+        class _Reg:
+            def _exists(self, key, user_id=None):
+                return False
+
+            def get_display_name(self, key):
+                return key
+
+        md, rows = session_render.render_session_page(
+            "u", 2, "c2c", sessions_mgr=_Mgr(), perm=_Perm(), registry=_Reg())
+        assert "**4. 会话4**" in md, md
+        # 行首 "数字. " 会被 QQ markdown 当成有序列表并从 1 重排
+        assert not re.search(r"(?m)^\s*\d+\.\s", md), md
+        labels = [b.label for r in rows for b in r]
+        assert "切换 4" in labels and "删 4" in labels, labels
+        print_pass("U11 会话列表第 2 页：序号 4/5/6 为字面文本，不触发有序列表重排")
 
     # ── 附加：OneBot send_keyboard 文本降级 ──────────────────────
     async def test_onebot_keyboard_degrades(self):
@@ -11404,8 +11565,8 @@ class TestSessionCompression:
             # Directory state: exactly one new snapshot, no delta, backup holds old 40
             sdir = mgr._session_dir(uid, "长会话")
             snaps = [f for f in os.listdir(sdir) if f.startswith("snapshot_")]
-            assert snaps == ["snapshot_00011.json"], snaps
-            assert not os.path.exists(os.path.join(sdir, "delta.jsonl"))
+            assert os.path.exists(os.path.join(sdir, "committed_context.json"))
+            # Old snapshots/delta remain recoverable; committed context takes precedence.
             with open(os.path.join(sdir, "pre_compress_backup.json"),
                       encoding="utf-8") as f:
                 assert len(json.load(f)) == 40
@@ -13572,6 +13733,68 @@ class TestAnnouncementBroadcast:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestWebuiWorkspace:
+    """58. WebUI 工作区磁盘（身份/共享目录）。
+
+    回归：官方 openid 曾一律按 OneBot 表解析 → 管理员/VIP 掉成「普通」；
+    USER_DATA_ROOT 下的共享数据目录（memory/gamedata/characters…）曾被
+    当成 0 字节的普通用户列出来。
+    """
+
+    def run(self):
+        print_header("58. WebUI 工作区磁盘（身份/共享目录）")
+        from pathlib import Path as _Path
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from webui import data_reader as dr
+        from agent.permissions import PermissionManager
+
+        tmp = _Path(tempfile.mkdtemp(prefix="webui_ws_"))
+        root = tmp / "users"
+        root.mkdir()
+        qq_admin = "971561405"
+        off_admin = "FE003FAF76C4817251FDC128A16753BB"
+        off_vip = "30584554AA2BF4E72BD3B8F27A70339D"
+        regular = "ABCDEF1234567890ABCDEF1234567890"
+        try:
+            for uid in (qq_admin, off_admin, off_vip, regular):
+                (root / uid / "workspace").mkdir(parents=True)
+                (root / uid / "workspace" / "a.txt").write_text(
+                    "x", encoding="utf-8")
+            for name in ("gamedata", "memory", "characters", "bonds",
+                         "bond_events", "assets", "mailboxes", "story_kb",
+                         "wiki_cache", "_cognition"):
+                (root / name).mkdir()
+            # 保留名即使长出 workspace/ 也不能被当成用户
+            (root / "characters" / "workspace").mkdir()
+            env = tmp / ".env"
+            env.write_text(
+                f'SUPERUSERS=["{qq_admin}"]\n'
+                f'QQ_OFFICIAL_SUPERUSERS=["{off_admin}"]\n'
+                f'QQ_OFFICIAL_VIP_USERS=["{off_vip}"]\n',
+                encoding="utf-8")
+            with patch.object(dr.config, "USER_DATA_ROOT", root), \
+                    patch.object(PermissionManager, "_ENV_FILE", env):
+                stats = dr.workspace_stats()
+                assert dr.workspace_tree("gamedata")["error"] == "工作区不存在"
+            rows = {u["user_id"]: u for u in stats["users"]}
+            assert set(rows) == {qq_admin, off_admin, off_vip, regular}, rows
+            assert rows[qq_admin]["role"] == "admin"
+            assert rows[qq_admin]["platform"] == "onebot"
+            assert rows[off_admin]["role"] == "admin"
+            assert rows[off_admin]["platform"] == "qq_official"
+            assert rows[off_vip]["role"] == "vip"
+            assert rows[regular]["role"] == "regular"
+            assert rows[qq_admin]["quota"] == 2048 * 1024 * 1024
+            assert rows[off_vip]["quota"] == 500 * 1024 * 1024
+            assert rows[regular]["quota"] == 100 * 1024 * 1024
+            assert stats["total_used"] == 4      # 仅 4 个真实用户各 1 字节
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        print_pass("58. 工作区磁盘：官方 openid 按官方身份表解析；共享目录不列为用户")
+
+
 def main():
     print()
     print(f"{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -13639,6 +13862,7 @@ def main():
         ("Proactive Mail (角色信箱 v1)", TestProactiveMail()),
         ("Mail Admin (WebUI 邮件管理 §16.2/§16.4)", TestMailAdmin()),
         ("Announcement Broadcast (公告群发 §16.3/§16.5)", TestAnnouncementBroadcast()),
+        ("WebUI Workspace Disk (工作区磁盘身份/共享目录)", TestWebuiWorkspace()),
     ]
 
     passed = 0

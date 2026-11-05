@@ -78,6 +78,9 @@ PAGES = [
     ("/memory", "记忆与画像"),
     ("/workspace", "工作区磁盘"),
     ("/characters", "角色管理"),
+    ("/groups", "群管理"),
+    ("/knowledge", "知识库管理"),
+    ("/stickers", "人格表情包"),
     ("/config", "配置热管理"),
     ("/playground", "Playground"),
     ("/wiki", "Wiki 缓存"),
@@ -91,7 +94,7 @@ _IMPLEMENTED = {"/", "/processes", "/logs", "/terminal",
                 "/tokens", "/audit", "/feedback", "/sessions",
                 "/tasks", "/workspace", "/config", "/memory", "/wiki",
                 "/playground", "/redeem", "/changelog", "/characters",
-                "/mail"}
+                "/mail", "/knowledge", "/stickers", "/groups"}
 
 _PUBLIC_PREFIXES = ("/static/", "/api/auth/")
 _PUBLIC_PATHS = {"/login", "/favicon.ico"}
@@ -763,13 +766,7 @@ async def api_config_group_features():
 
 @app.put("/api/config/group-features")
 async def api_config_group_features_put(payload: RawPayload, request: Request):
-    result = await asyncio.to_thread(config_editor.json_config_write,
-                                     config_editor.GROUP_FEATURES_FILE, payload.content)
-    if "error" in result:
-        return JSONResponse(result, status_code=400)
-    result["note"] = "已保存 — 下条群消息即生效"
-    audit.log_action("config.group_features_write", "修改群功能开关", _ip(request))
-    return result
+    return JSONResponse({"deprecated":True,"moved_to":"/groups","error":"群功能配置已迁至群管理"},status_code=410)
 
 
 @app.get("/api/config/personality")
@@ -784,6 +781,8 @@ class PersonalityPayload(BaseModel):
 
 @app.put("/api/config/personality")
 async def api_config_personality_put(payload: PersonalityPayload, request: Request):
+    if payload.group_personality.strip():
+        return JSONResponse({"deprecated":True,"moved_to":"/groups","error":"群人格配置已迁至群管理"},status_code=410)
     r1 = await asyncio.to_thread(config_editor.json_config_write,
                                  config_editor.PERSONALITY_FILE, payload.personality)
     if "error" in r1:
@@ -1234,8 +1233,8 @@ async def api_wiki_details_entry(kind: str = "char", title: str = ""):
 # 解包角色（gamedata）只读条目：wiki 未收录的新角色（如 H806 蜜拉贝儿）
 # 没有可编辑的详情缓存条目，面板展示 names/aliases/技能/卡面文案 的只读视图。
 @app.get("/api/wiki/details/gamedata")
-async def api_wiki_details_gamedata(rid: str = ""):
-    result = await asyncio.to_thread(data_reader.wiki_details_gamedata_entry, rid)
+async def api_wiki_details_gamedata(rid: str = "", kind: str = "char"):
+    result = await asyncio.to_thread(data_reader.wiki_details_gamedata_entry, rid, kind)
     if "error" in result:
         return JSONResponse(result, status_code=404)
     return result
@@ -1698,3 +1697,10 @@ async def ws_terminal(ws: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("webui.main:app", host=HOST, port=PORT)
+
+
+from .resource_routes import router as resource_router
+app.include_router(resource_router)
+
+from .group_admin import router as group_admin_router
+app.include_router(group_admin_router)

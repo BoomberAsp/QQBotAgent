@@ -322,7 +322,7 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 | `_compress_context(context, recent_full=20)` | 特殊会话读时压缩（Layer 1+2）: 最近 20 条保留完整，更早的 tool result 压缩为摘要首行；压缩边界按 `COMPRESS_STEP=4` 步进（相邻 4 轮字节级稳定，保护前缀缓存）。Layer 3 深度压缩不在读时做——由写侧 `/压缩会话`（turn.py）+ `_emergency_truncate` + L4 记忆负荷提示承担 |
 | `_emergency_truncate(context, budget_tokens)` | classmethod。上下文估算 token ≥95% 窗口时的读时兜底: 保留头部 `[会话摘要]` system 消息，插入「中间 N 条历史本轮未载入」系统注记，从尾部倒序回填至预算内；病态场景（单条超预算）退化为仅保留最后一条并截尾 4000 字 |
 | `_execute_tool_calls(tool_calls, session)` | 通过 ToolRegistry 执行 LLM 返回的工具调用；抽卡/测速类工具回复超 600 字自动折叠为降级记录 (`task_record`) |
-| `_schedule_profile_update(user_id, msg, response)` | 调用 `ProfileManager.observe_turn()`（同步缓冲，达 5 轮后台批量 extract+judge），不阻塞回复。旧 `_maybe_remember` 原始转储路径已移除——长期记忆完全由画像提取流水线驱动 |
+| `_schedule_profile_update(user_id, msg, response)` | 调用 `ProfileManager.observe_turn()`（同步缓冲，达 5 轮后台批量 extract+judge），不阻塞回复。在 `run()` 内读取 `_current_personality` 解析出当前人格短名（`_resolve_persona_label`，回退 `Roxy`）一并传入，使 LONG 快照按实际会话人格标注助手。旧 `_maybe_remember` 原始转储路径已移除——长期记忆完全由画像提取流水线驱动 |
 | `bootstrap()` | 启动健康检查 (API 连通性、工具数量、配置状态) |
 | `get_status()` | 返回 Agent 状态 (活跃会话、工具列表等) |
 | `clear_user_session(user_id)` | 清除指定用户的会话上下文 |
@@ -412,7 +412,7 @@ L4 易变尾部 (system)   → 真实当前时间、人格切换提示、羁绊�
 
 模块级还提供启发式 token 估算 `estimate_text_tokens()` / `estimate_context_tokens()`（CJK≈1 token/字、其余≈4 字/token，正则计数、无 tiktoken 依赖），供压缩阈值与 `/压缩会话` 展示口径使用。
 
-**剧情归档与配额豁免**（详见 `docs/scene-session-archive-design.md`）：`metadata.kind` 为 `bond_scene`（剧情）/`char_creation`（角色创作）的会话**不计入**按角色的数量配额（10/3/1 只约束普通特殊会话）。剧情走到结局由 `agent/turn.py::_finish_bond_scene` 经 `update_metadata` 写入 `completed=true` + `completed_at`（封档真源），随后 `end_active`——会话保留，可 `/切换会话` 回看，回看时 `is_scene=false`（不再注入剧情指令/剧本、工具集无 `complete_scene`）。`completed` 缺失的存量会话按“未完结”处理，并在 `/剧情` 去重与 `is_scene` 判定两个热点懒回填。剧情会话总量上限由 `MAX_SCENE_ARCHIVES`（默认 20，含进行中与已完结）在 `turn.py` 层强制；`SCENE_ARCHIVE_ENABLED=0`（热读）为紧急回滚开关，退回统一配额语义。`create()` 本身仍不检查任何配额——普通配额与剧情上限都在 `turn.py` 命令层强制。
+**剧情会话与配额豁免**（详见 `docs/scene-session-archive-design.md`）：`metadata.kind` 为 `bond_scene`（剧情）/`char_creation`（角色创作）的会话**不计入**按角色的数量配额（10/3/1 只约束通用会话）。剧情走到结局由 `agent/turn.py::_finish_bond_scene` 经 `update_metadata` 写入 `completed=true` + `completed_at`（封档真源），随后 `end_active`——会话保留，可 `/切换会话` 回看，回看时 `is_scene=false`（不再注入剧情指令/剧本、工具集无 `complete_scene`）。`completed` 缺失的存量会话按“未完结”处理，并在 `/剧情` 去重与 `is_scene` 判定两个热点懒回填。剧情会话总量上限由 `MAX_SCENE_ARCHIVES`（默认 20，含进行中与已完结）在 `turn.py` 层强制；`SCENE_ARCHIVE_ENABLED=0`（热读）为紧急回滚开关，退回统一配额语义。`create()` 本身仍不检查任何配额——通用会话配额与剧情上限都在 `turn.py` 命令层强制。
 
 **存储结构**:
 ```
@@ -461,7 +461,7 @@ Markdown 文件 + frontmatter 存储，`MEMORY.md` 索引。**无内存缓存**�
 |---|---|---|
 | `ShortItem` | `id, content, count` | count 为 1 或 2，达 3 晋升 MEDIUM |
 | `MediumItem` | `id, content, count, entry_extraction_index` | count≥3；age = 逻辑时钟 − entry_extraction_index |
-| `LongObject` | `id, title, summary, snapshot_turns, snapshot_time, query_count, query_log, linked_medium_id` | 长期对象；晋升时保留 MEDIUM 孪生条目（Decision G），创建幂等 |
+| `LongObject` | `id, title, summary, snapshot_turns, snapshot_time, query_count, query_log, linked_medium_id` | 长期对象；晋升时保留 MEDIUM 孪生条目（Decision G），创建幂等。`snapshot_turns` 每轮为 `(用户消息, 助手回复, 人格名)` 三元组——落盘/回显/回读均按该轮实际人格渲染 `助手(<人格>)` 标签（旧二元组回退 `助手(Roxy)`） |
 | `UserTierState` | `user_id, extraction_count, short, medium, long` | 每用户容器 + 逻辑时钟 |
 
 **常量**（`memory.py:324-337`）：
@@ -499,7 +499,7 @@ EARDUP_MERGE_DICE` | 0.6 | 近重复合并阈值（引擎级去重） |
 data/memory/
 ├── tiers/
 │   ├── {uid}.json           # UserTierState 全量（原子写: tmp + replace）
-│   └── long/{uid}/{id}.md   # LONG 对象快照（write-once，含 snapshot_turns）
+│   └── long/{uid}/{id}.md   # LONG 对象快照（write-once，含 snapshot_turns；助手行按每轮人格标注 助手(<人格>)）
 └── *.md                     # 旧版 MemorySystem 文件（knowledge/system 类仍在使用）
 ```
 
@@ -540,10 +540,10 @@ data/memory/
 | `get(user_id)` | 获取或创建用户画像。**mtime 重校验**（commit f9c36c7）：缓存命中时对比 `profile.json` 的 `st_mtime_ns`，面板外部编辑优先于内存缓存，不会被 bot 下次保存静默回滚 |
 | `save(profile)` | 持久化画像到 `{USER_DATA_ROOT}/{safe_id}/profile.json` 并刷新 mtime 记录；失败记录 warning（不再静默） |
 | `set_client(client)` / `set_memory(memory)` | 设置 flash LLM 客户端 / `TieredMemory` 实例（懒初始化） |
-| `observe_turn(user_id, msg, response)` | 运行时主路径：缓冲一轮对话，达 K 轮后台触发 `_flush` |
+| `observe_turn(user_id, msg, response, persona_name="")` | 运行时主路径：缓冲一轮对话（含该轮人格名，供 LONG 快照按实际人格标注助手），达 K 轮后台触发 `_flush` |
 | `flush_on_session_end(user_id, turn_count)` | delete-flush（Decision J）：会话被删除时，实质会话（>`DELETE_FLUSH_MIN_TURNS=5` 轮）强制冲刷尾批，短暂会话丢弃未提取的尾部 |
 | `extract_batch(user_id, turns)` | 单次合并的 extract+judge flash 调用；解析失败跳过时钟，空 `{}` 仍推进 `extraction_count`（Decision 4）；**LLM await 之后重新 `get()`** 以拾取调用期间落盘的面板编辑，再同步原子应用（`_apply_extraction` → `save` → `TieredMemory.ingest_candidates`/`touch_extraction_count`/`save_user`） |
-| `extract_and_update(user_id, msg, response)` | 单轮便捷包装（向后兼容/测试用）；运行时路径为 `observe_turn` 批量调度 |
+| `extract_and_update(user_id, msg, response, persona_name="")` | 单轮便捷包装（向后兼容/测试用）；运行时路径为 `observe_turn` 批量调度 |
 | `_route_memory_candidates(...)` | 将提取结果中记忆类候选路由给 `TieredMemory`，画像类字段留给 `UserProfile` |
 
 **提取规则**:
@@ -886,7 +886,7 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 - `delegation.py`：`SOCIAL_TOOLS` 白名单、`run_delegated_task`（中立 Roxy、`persist=False`、权限过滤、单层嵌套、默认 240s 超时）、`revoice_task_result`（角色开场白 + 正文透传，群聊用固定模板）、`repatch_last_assistant`（把持久化历史改写成角色口吻）。
 - `greeting.py`：官方 c2c 主动消息簿记（纯函数、可注入 rng/now）。候选索引 `data/bond_greet_targets.json` 只由 **c2c 入站**写入（群 member_openid 不能用于 c2c 主动消息）；配额 `data/official_active_quota.json` 按自然日/月滚动，文本与媒体**分账**（日配额各自独立；信箱信封走 `monthly_cap=10**9` 免月配额——平台已无主动消息月限额）。旧问候选靶四门（等级 ≥5、冷却 7 天、概率 0.25、批量 ≤5）保留为 `mail_enabled=false` 时的回滚路径。
 - **角色信箱（proactive-mail-design.md v0.5，v1）**：`plugins/qq_official.py::_daily_active_loop` 每日 `mail_hour`（默认 10 点，+0–600s 抖动）先跑 mail pass 再跑 media pass，启动时若在 10–22 点窗口内做减半补发。mail pass 三段式：A 收集候选（串行本地读，先按**并集**播种 `known_personas`——会话索引 `metadata.persona_key`（`_known_personas_from_sessions`）∪ 羁绊文件中 msgs>0 的角色（`_known_personas_from_bonds`，§4.2 权威源；兜住「靠默认人格攒羁绊、特殊会话没绑 persona_key」的用户，否则他们永远过不了 known 门、信箱永不建档）——再跑 `_mail_candidates` 过滤链：非 assistant、`split` 模式、Lv≥5、有消息、在 known_personas、沉默 ≥24h、人格 7 天冷却，按等级降序）→ B 生成（跨用户 `Semaphore(4)`，用户内串行，角色面 flash 写 ≤60 字留言，失败即丢弃**无模板兜底**，pass 预算 20 分钟）→ C 发送（串行，令牌桶 10 qps + 2–6s 随机间隔，`send_active_c2c_markdown` 信封 = markdown 摘要 + 「展开」按钮，共享 md/kb 熔断器逐档降级纯文本）。发送成功才记账：`record_digest`（同日幂等）+ 配额（kind=text）+ bond 事件（信件全文）。与媒体 pass **双向互斥**（同日只发一类）。`C2C_MSG_REJECT`/`RECEIVE` 事件（`on_notice`）翻 `active_enabled`，拒收即停发。
-- `mailbox.py`：信箱存储（纯同步、可单测）。每用户一 JSON（`data/mailboxes/{openid}.json`，原子写、损坏降级空箱）；信件 28 天保留 + 200 封上限裁剪；`letters`（id `L-YYYYMMDD-<4hex>`、preview、read）与 `digests`（id `D-…`，1 digest = 1 次主动调用）；`make_preview`（首行去舞台指示、20 字 + …）、`escape_md_text`（全角转义）为纯函数。`/邮件` 命令（turn.py 直连层）读侧再过滤保留期。面板邮件管理追加三个写入口：`delete_letter`（**撤回**：从 letters[] 移除但信封 letter_ids 保留该 id → `is_withdrawn()` 成立，`/邮件 <id>` 显示「这封信已被撤回。」）、`write_system_letter`（系统信：persona=`__system__`、`system=true`，不写 personas/known_personas、不动信封记账）、`set_active_enabled`。
+- `mailbox.py`：信箱存储（纯同步、可单测）。每用户一 JSON（`data/mailboxes/{openid}.json`，原子写、损坏降级空箱）；信件 28 天保留 + 200 封上限裁剪；`letters`（id `L-YYYYMMDD-<4hex>`、preview、read）与 `digests`（id `D-…`，1 digest = 1 次主动调用）；`make_preview`（首行去舞台指示、20 字 + …）、`escape_md_text`（全角转义）为纯函数。`/邮件` 命令（turn.py 直连层）列表与详情均过滤保留期；列表每页 5 封，①–⑤ 对应展开按钮，附上一页/下一页/刷新按钮；日期列表同样分页（`/邮件 MM-DD p2`），空态/撤回/无效编号附返回信箱按钮。按钮均为 `type=2`、`enter=true` 指令按钮，经过现有键盘/markdown 熔断与纯文本降级；不支持按钮时保留编号及明确页码命令。文字“下一页/上一页”按用户的最近列表页导航，机器人重启后从第一页起算，按钮始终使用明确页码。面板邮件管理追加三个写入口：`delete_letter`（**撤回**：从 letters[] 移除但信封 letter_ids 保留该 id → `is_withdrawn()` 成立，`/邮件 <id>` 显示「这封信已被撤回。」）、`write_system_letter`（系统信：persona=`__system__`、`system=true`，不写 personas/known_personas、不动信封记账）、`set_active_enabled`。
 - **邮件管理队列（§16.2，面板→bot 文件 IPC）**：`plugins/qq_official.py::_mail_admin_worker` 每 3–5s 扫 `data/mail_admin/queue/`，`os.replace` 改名到 `processing/` 原子认领，执行后回写 `status/`（操作 id `mailop_YYYYMMDD_<4hex>` 幂等；状态保留 7 天由 bot 清理）；操作类型白名单 `delete_letter` / `send_system`。系统邮件经 `send_active_c2c_markdown` 真实主动发送（markdown 信封样式 `## 系统邮件 · {title}`，共享熔断降级纯文本），**成功才** `write_system_letter` 入账；用户已拒收（`active_enabled=false`）→ 发送失败不入账。启动时 `_mail_admin_recover` 把上次进程中断的残留认领标记 `failed: bot restarted`。worker 不受 `mail_enabled` 开关影响（撤回/系统邮件独立于每日信封）。
 - `rate_limit.py`：`TokenBucket`/`ChannelLimiter`（c2c 10/s、group 1/s，按渠道懒建复用，可注入 monotonic）。
 - `group_registry.py`：官方群登记表 `data/group_registry.json`（v1 纯记账）：`GROUP_AT_MESSAGE_CREATE` 入站 upsert（60s 粒度节流防文件 churn），status `active/left/unknown` 状态机 + `active_enabled` 开关，为 P1 群主动消息预铺。
@@ -1432,14 +1432,14 @@ QQ语音(SILK_V3) → NapCat(.amr) → pilk解码 → ffmpeg → 16kHz mono WAV 
 | 2 | `TestSessionManager` | 7 | 创建/超时/裁剪/清空/删除/持久化/**外部删除生效**（面板清除临时会话不被缓存复活，含请求中途删除跳过写回） |
 | 3 | `TestMemorySystem` | 4 | 保存/读取/遗忘/搜索/列出 |
 | 4 | `TestUserProfile` | 7 | 创建/保存/空上下文/完整上下文/去重/持久化/**外部编辑优先**（面板改画像后 bot 缓存按 mtime 重读） |
-| 5 | `TestProfileExtraction` | 11 | Layer 2 确定性过滤（复合词/正则/结构规则）/提示词约束/对话窗口格式化/批量调度（observe_turn 达 K 冲刷、单飞、delete-flush） |
+| 5 | `TestProfileExtraction` | 12 | Layer 2 确定性过滤（复合词/正则/结构规则）/提示词约束/对话窗口格式化/批量调度（observe_turn 达 K 冲刷、单飞、delete-flush）/每轮人格缓冲往返（buffer.json 存/恢复 persona） |
 | 6 | `TestAgentCore` | 11 | 启动/提示词构建/纯文本/工具循环/会话持久化/清空/最大迭代/压缩回退/任务折叠/画像注入/MEDIUM 记忆注入 |
 | 7 | `TestDeepSeekClientParsing` | 3 | 解析纯文本/工具调用/混合响应 |
 | 8 | `TestBuiltinTools` | 4 | get_time/execute_code(成功/错误)/search_web |
 | 9 | `TestSearchArchive` | 7 | 存档 round-trip/用户隔离/路径穿越拒绝/TTL 过期（recall 拒绝+惰性清扫）/每用户上限/无上下文降级/helper 全链路（footer 携带可召回 id） |
 | 10 | `TestPersonality` | 4 | 人格优先级链/群人格模糊匹配/清除回退/歧义拒绝 |
 | 11 | `TestTokenLedger` | 7 | usage 解析（DeepSeek/DashScope 格式、缺失、缓存钳制）/记账/按日聚合/摘要格式化 |
-| 12 | `TestTieredMemory` | 20 | 三层状态机（入队/去重/强化前移/晋升/溢出淘汰/降级/安全网）/LONG 创建幂等+快照/judge 清单构成/注入规则（空态/低置信/top-N+最近晋升/字符上限）/逻辑时钟/持久化往返/全量加载 |
+| 12 | `TestTieredMemory` | 21 | 三层状态机（入队/去重/强化前移/晋升/溢出淘汰/降级/安全网）/LONG 创建幂等+快照/judge 清单构成/注入规则（空态/低置信/top-N+最近晋升/字符上限）/逻辑时钟/持久化往返/全量加载/LONG 快照按每轮人格标注助手（写盘·回显·回读，旧二元组回退 Roxy） |
 | 13 | `TestMergedExtraction` | 5 | 合并 extract+judge 单次调用（候选路由/L2 过滤/judge 清单嵌入提示词/时钟推进/reinforce 晋升） |
 | 14 | `TestMemoryMigration` | 2 | 旧记忆 → 三层结构迁移（seed+归档、散落 legacy dump 归档） |
 | 15 | `TestCacheStability` | 6 | 前缀缓存稳定性（提示词头部用户不变量/易变内容置尾/画像变化头部字节稳定/历史头部迟滞修剪/压缩边界步进/无时间戳） |
@@ -1644,7 +1644,7 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | `/tokens` Token 消耗 | `lib/token_ledger.py` 数据源；缓存命中率分口径观测（按提供商/模型分离） |
 | `/audit` 工具审计 | `data/audit/` JSONL 审计日志 + 面板自身操作审计（`audit.py`） |
 | `/feedback` 用户反馈 | `#反馈`/`#bug`/`#建议` 提交的处理流 |
-| `/sessions` 会话管理 | 临时会话查看/清除（写前备份到 `BACKUP_DIR/sessions`）、特殊会话查看（剧情/已完结/角色创作徽标 + 普通配额摘要 `q/max · 剧情归档 k`；`special_list` 展平 `kind`/`completed`/`counts_quota`） |
+| `/sessions` 会话管理 | 临时会话查看/清除（写前备份到 `BACKUP_DIR/sessions`）、特殊会话查看（剧情/已完结/角色创作徽标 + 通用会话配额摘要 `q/max · 剧情会话 k`；`special_list` 展平 `kind`/`completed`/`counts_quota`） |
 | `/tasks` 任务日志 | `data/task_log/{uid}.jsonl` 子任务记录浏览 |
 | `/memory` 记忆与画像 | MemorySystem Markdown 编辑、三层记忆查看、画像 JSON 编辑 |
 | `/workspace` 工作区磁盘 | 按用户配额/占用展示（角色感知） |
@@ -2336,3 +2336,142 @@ v2.29 基础上增加:
 
 - `docs/qqbot-official-buttons-design.md`：官方 API 按钮的能力边界、39 个可按钮化功能盘点、8 种交互模式、接入架构与降级方案、准入政策与申请材料。
 - 现状：**P0（指令按钮）+ P1（回调按钮）已落地**（见 2026-10-28 条）；自定义回调按钮需平台「内邀开通」，未开通时自动降级为纯 markdown/文本命令清单。流式消息（§6.10.11.2）已于 2026-10-29 落地。
+
+
+### 记忆与上下文可靠性（2026-11-02）
+
+- 特殊会话压缩使用原子 committed_context.json，提交前保留原历史；压缩期间历史变化则取消本次写回。
+- Agent 每次工具循环请求均检查消息、工具定义、输出预留和多模态估算预算；按完整用户轮次缩减历史，无法安全容纳时明确返回提示。
+- 画像抽取保留未确认队列和固定批次边界，成功后才移除；批次 ID 与证据 ID 持久化去重，避免重叠窗口强化。解析失败有限重试；启动恢复扫描无需新消息，失败按持久化退避重试。
+- 用户在抽取期间编辑画像或记忆时丢弃旧结果，避免覆盖修正。
+- 验证入口：`cd QQBot && python -m unittest test_context_memory_phase1 -v`，另运行 `python test_agent.py` 和 `python benchmarks/memory/bench_engine.py`。
+- 当前边界：单个机器人实例拥有抽取队列，支持 WebUI 并发画像编辑；Linux/WSL advisory locks、内容版本检查和恢复日志保护已接入写入口。精确供应商 tokenizer 仍待后续阶段。图片预算为保守估算，不保证所有供应商的精确计数。旧版本回滚前应先导出压缩后的会话，因为旧加载器不认识 committed_context.json。
+
+#### P0/P1 验收与恢复
+
+- 平台来源 ID 由 platform/self_id/group_id/user_id/message_id 组成，贯穿抽取队列；缺少消息 ID 的内部调用使用独立生成 ID。
+- 画像和 tiers 使用预写事务日志；部分提交在重放前恢复，外部非协调编辑冲突则停止恢复并告警，不覆盖新数据。
+- 启动后每 30 秒扫描待处理队列，失败冷却从 60 秒递增到最多 1800 秒；`_profile_recovery_status.json` 记录积压、在途及最老等待时间。
+- 日常 `bash test.sh` 已包含可靠性测试。离线基线：`cd QQBot && python benchmarks/reliability/run.py /tmp/p01-result.json`；已保存 `benchmarks/reliability/baseline_p01.json`，含源码 SHA-256 和解释器版本。
+- 基线只证明离线正确性与受控场景约束保留，不表示真实模型问答质量改善；现有低频事件 canary 仍待后续阶段。
+- 本实现使用 Linux/WSL 的 fcntl，暂不支持直接在原生 Windows Python 运行；不支持多个 bot 实例同时消费同一用户抽取队列。
+
+
+## 记忆与上下文 P2/P3（2026-11-02）
+
+新运行时按用户、平台/机器人、群聊、角色及特殊会话隔离记忆；支持 `/记忆 列表`、`历史 <id>`、`修正 <id> <内容>`、`删除 <id>`、`清空 确认`、`暂停/恢复`。纠正与遗忘会使旧抽取和本范围派生上下文失效。`/clear` 清理工作上下文和任务状态，保留长期事实。
+
+新增持久 TaskState、独立分段摘要、相关历史回读和可选资料共享注入预算。旧记忆不自动迁入；删除命令不删除旧档案、影音、任务日志和备份。详细行为、验收命令和上线边界见 `docs/P2-P3实施验收记录.md`（本地文档）；确定性回归入口为 `QQBot/test_cognition_p23.py`。
+
+
+### 旧记忆迁移
+
+提供 `scripts/migrate_legacy_cognition.py`，默认只读预览，`--apply` 才备份并建立新库；必须显式提供用户范围映射。支持 P2/P3 启用前的幂等重跑与补迁，新库被运行时修改后拒绝覆盖。服务器已完成一次全量快照迁移，旧机器人继续运行，正式发布前需停写并再次补迁。操作与实测结果见本地 `docs/旧记忆迁移操作与验收.md`，测试为 `QQBot/test_legacy_migration.py`。
+
+
+### P4 私有任务经验（开发机实现）
+
+新增可信工具观察 → 私有候选 → 操作员复核 → 版本发布 → 受控检索闭环。默认 `EXPERIENCE_MODE=shadow`，只记录和审计，不影响回答；未验证的模型成功声明不会自动发布。经验与用户/角色/会话范围绑定，支持撤回、回滚、到期清理及与遗忘联动。
+
+管理入口为 `scripts/experience_admin.py`，持久数据位于 `{USER_DATA_ROOT}/_experience/`。`mode off` 可关闭运行中已初始化的经验服务；`inject` 需先复核发布，最多注入 2 条、800 字符，并服从共享上下文预算。离线验收入口：`QQBot/test_experience_p4.py` 和 `QQBot/benchmarks/experience/run.py`；详细操作见本地 `docs/P4实施验收记录.md`。本阶段未部署服务器，合成检索成绩不代表真实模型任务效果。
+
+
+## 独立群会话（2026-11-03）
+
+群入口已切换为独立共享上下文，不再读取发言人的个人特殊会话、私人画像原文、邮件或个人资产。群主/群管理员（来自平台事件角色）和机器人系统管理员可设定内置人格；新群默认仅响应召唤。
+
+- 群内 @机器人：`/群帮助`、`/群状态`、`/群人格 rubi`、`/群参与 仅召唤|跟随|自然`、`/群接收 开|关`、`/群安静 22:00-08:00|关`。
+- `/群记忆` 查看公共记忆；管理员通过 `/群记忆 添加 内容` 或 `/群记忆 清空 确认` 管理。`/群重置`、`/群清除数据` 需要在 60 秒内再次发送同一命令加 `确认`。清除群数据撤销本群来源事实，保留个人好感度。
+- `/取消` 仅取消自己的当前群任务；群管理员可取消本群当前任务。旧群按钮拒绝执行，使用上述命令管理。
+- OneBot 同一 QQ 身份自动共用同人格好感度。官方渠道需在群中 `/绑定身份`，私聊 `/绑定群身份 绑定码`，由原群成员回群 `/确认绑定 绑定码 确认码`；10 分钟过期。关联使用私聊关系状态，临时关系保留且不相加。`/解除身份绑定` 可撤销。
+- `/记住 我……` 显式记录本人事实；群中的明确自述还会保守抽取。私聊 `/个人记忆` 查看最近条目，`/删除记忆 编号` 删除，`/公开记忆 编号 确认` 授权跨群使用。群来源默认仅限来源群及本人私聊；旧私人画像和记忆继续私有，不自动迁移为公开。
+
+`GROUP_DATA_ROOT` 默认是 `USER_DATA_ROOT` 的同级 `groups_store/`。SQLite 保存群配置、最近参与历史、群公共记忆、身份映射、带来源的共享用户事实、投递和去重记录；工作区位于该目录下的作用域哈希目录。备份时同时备份用户数据和群数据。旧群人格配置不自动导入，需管理员重新设定。
+
+全量群消息仅在账号实际获平台授权后可用；`/群接收 开` 只控制本地缓冲，不能代替平台开关。缓冲最多 200 条/30 分钟，全局最多保留 1024 个活动作用域。跟随限定同一成员与短窗口；自然参与先做规则及轻量模型判断，默认冷却 180 秒、每群每天 10 次、全局每天 100 次。非召唤行为尊重安静时段及拒收；发送不确定不重试，被动窗口过期不转主动。
+
+本轮落地 G1 核心及 G2 接收/有限跟随，并提供默认关闭的 G3 自然问答入口。当前历史保留最近 40 轮、提示使用最近 20 轮，尚未提供按话题摘要压缩、定时群公告/提醒、群媒体/文件/剧情工具和管理按钮的新版本；这些工具在群中不可用。共享事实采用独立的带来源存储，旧画像/中长期记忆不做批量迁移。上线需实测官方账号全量事件及投递能力。
+
+离线回归：`cd QQBot && python -m unittest test_group_behavior -v`。测试不连接 QQ、不调用真实模型。
+
+
+## 群媒体与可扩展人格知识库
+
+设置 `PERSONA_RESOURCE_REGISTRY` 为管理员维护的 JSON 文件绝对路径。所有资源文件路径相对注册文件所在目录，拒绝越界路径及越界符号链接。没有注册配置时，群不读取原私人剧情库，也不会自动扩大剧情可见范围。
+
+注册示例：
+```json
+{
+  "personas": {"rubi": ["ark"], "new_persona": ["new_world", "common"]},
+  "knowledge_bases": {"ark": {"path": "ark.json"}, "new_world": {"path": "world.json"}, "common": {"path": "common.json"}},
+  "media": [{"id": "rubi_happy", "description": "开心表情", "path": "images/happy.png", "personas": ["rubi"], "visibility": "public"}]
+}
+```
+
+每个知识文件是文档数组：
+```json
+[{"id":"intro", "title":"基础世界观", "text":"已审核的知识正文", "source":"原作出处", "chapter":0, "visibility":"public"}]
+```
+
+人格可以绑定多个库；新增人格或知识库只需添加文件与映射，无需修改工具。`chapter` 为该库自定义的非负整数进度，0 代表基础设定；群默认进度为0。管理员 @机器人发送 `/群剧情进度 库ID 数值` 更新进度。仅先通过 visibility/scopes 和章节过滤的文档进入排序；`scopes` 为群结构化 scope 字符串列表，与 public 二选一。文档缺失章节或可见性时不会默认公开。当前提供 JSON 文档后端，不自动导入缺乏剧透分级的旧 SQLite 剧情库；需要整理并发布相应文档。
+
+自动注入和 `story_search` 使用相同人格映射及群进度，委派仍继承原群人格。群模型不接受工具参数指定其他人格、群或任意文件路径。命中携带库ID、文档ID、标题和出处，空结果不回退到未授权的全库。
+
+`group_media` 空ID列出当前群人格可用的已发布图片/表情包，指定ID排队发送。每轮最多一张、最大10 MiB；自然接话不授予此工具。官方发送得到确认后才记录已投递，失败/不确定不重试；群重置、人格切换、被动窗口到期会丢弃旧队列。当前不包括任意远程图片抓取、生成图片及私人资产召回。
+
+话题摘要采用可追溯的摘录压缩：最近20轮完整历史，前20轮提取话题开头和回答片段，保存成员标签及消息ID；不调用模型推断个人事实，不迁入私人画像。它是最近40轮的有限窗口摘要，不是无限期语义话题归档；重置/切换人格同步清除。原文与摘要都受最终模型请求预算约束。
+
+验证：`python -m unittest test_group_behavior test_group_resources -v`。仍需部署注册文件和已审核语料/图片，并实机验证媒体投递。
+
+
+### WebUI资源管理
+
+侧栏提供“知识库管理”和“人格表情包”：知识库支持JSON发布、人格绑定和已注册库的只读SQL；表情包支持按人格上传静态图片、预览、下架。两者复用WebUI管理员登录。资源与机器人共用PERSONA_RESOURCE_REGISTRY（推荐绝对路径），默认QQBot/data/persona_resources/registry.json。上传图片需确认人工审核与发布权限；下架只撤销引用，保留底层文件。完整方案的实际完成度见docs/sticker-and-story-kb-design.md的当前实现状态表。
+
+
+## 媒体功能实施补充（2026-11-03）
+
+本轮实现群/私聊贴图、HTTPS直链抓图、静态网页候选发现，以及默认关闭的主动贴图。不采集或构建剧情库。以下为实际交付行为，覆盖上方较早的状态表。
+
+| 功能 | 当前实现 |
+|---|---|
+| 作用域 | 群人格/群上下文与私聊分离；候选ID绑定scope并在10分钟后失效；群配置、身份版本、图片总开关和资源下架在发送前复检 |
+| 投递 | SQLite票据queued/sent/failed/dropped/uncertain；取消发送中的请求视为uncertain；不重试未知结果；进程遗留queued在下一次额度预占时超时转uncertain。WebUI可查最近100条 |
+| 表情包 | send_sticker空参列目录、显式ID、固定mood标签选择；显式ID失败不随机替换；人工审核+权利确认+SHA256校验；群group_media为兼容入口；私聊角色面可用 |
+| 图包 | scripts/build_sticker_pack.py校验schema2、来源/审核/权利字段、尺寸、字节数和哈希；staging原子发布不可变版本；可重新发布旧版本manifest切回。WebUI单图上传为独立版本，删除只下架引用 |
+| 配额/去重 | 每scope每消息最多1张、每scope滚动5分钟最多2张、统一actor滚动24小时最多10张、scope/persona最近8张避免重复；明确要求重发可repeat=true但不越额度。failed/dropped释放发送占用，uncertain保留 |
+| 直链 | fetch_image仅批准域HTTPS默认端口，无凭据；解析结果全部必须公网并由自定义resolver用于连接；禁用环境代理/Cookie/自动重定向；每跳复检、最多3跳；20秒/8MiB硬限，拒绝压缩传输 |
+| 下载/处理 | 每scope滚动24小时30次、全局1000次处理尝试；至多4个媒体操作并发，域请求至少间隔0.5秒，429/567暂停60秒；失败仍计处理额度 |
+| 规整 | 独立子进程、10秒超时、CPU/内存限制、实际编码与MIME校验、2000万静态像素/100帧/累计1亿像素限制；去除元数据，最大1536像素RGBA PNG。动图采用明确的静态首帧派生，不保留动画 |
+| 审核/缓存 | 新下载图进入WebUI人工审核队列，批准绑定实际发送版本SHA256和review_policy；审核前所有角色均不发送。URL索引按scope哈希，24小时有效，命中不联网；内容按SHA256共用；策略变化需重新审核。512MiB容量门槛，满后拒绝新内容；当前保留文件、手工维护，不自动GC |
+| 网页抓图 | discover_images仅管理员批准的page_hosts，逐跳robots检查，静态HTML最大1MiB，og:image/img/lazy-src/srcset最多6候选；不运行JS，不默认发送首图；每个候选后续fetch仍走完整校验 |
+| 主动贴图 | 群需/群主动贴图 开，且自然参与已开启并通过判定；共享群冷却、安静时段和图片总开关。官方私聊复用每日媒体pass、既有概率及平台配额，与信封互斥，尊重拒收，只选greeting贴图；不另开调度，不提高生图概率 |
+
+### 开启与操作
+
+1. WebUI“人格表情包”上传并确认有权发布，填写happy/sad/angry/greeting/thanks/surprised/tsundere/comfort标签。旧的无哈希/审核/权利字段条目默认不可发送，需重新审核上传或通过正式图包发布，不能批量自动认定approved。
+2. 在该页配置image_hosts精确域名；网页发现另需page_hosts且包含在image_hosts内，CDN域独立加入。默认均为空，不自动批准历史调研中的站点。
+3. 用户请求直链图片或网页候选；新图片由管理员在“抓取图片待审核”预览并批准。批准不会自动补发，用户重新请求后使用审核缓存。来源权利由审核者核实。
+4. 群管理员可通过 `/群主动贴图 开|关` 配置；官方私聊主动贴图在WebUI独立开启，默认安静时段22:00–08:00（服务器时区）。未主动开启保持关闭。
+5. 图包发布：`python scripts/build_sticker_pack.py /absolute/path/manifest.json --registry /absolute/path/registry.json`。不会下载素材、构造作者/许可或自动改审核结论。
+
+数据：`PERSONA_RESOURCE_REGISTRY` 默认QQBot/data/persona_resources/registry.json；`MEDIA_DATA_ROOT` 默认QQBot/data/media_runtime，含ledger.sqlite3和images/。Bot与WebUI须设置相同绝对路径，备份时一起备份。发布图片由公共资源管理维护，不挂到个人资产GC；当前recall_asset仍不检索这些新公共资源。
+
+### 验证与明确限制
+
+本轮97项群/媒体/记忆/邮件回归与5项WebUI管理测试通过。主Agent 59/60套件通过，唯一失败为改造前已有的帮助文本单条超长。没有请求真实外站、没有向真实用户发送测试消息，未做动图/真实QQ投递联调。
+
+设计中可选的自动内容审核服务、ETag条件更新、自动GC、站点专用解析、近似图去重联系表、私聊普通统一人格贴图以及无消息的群定时提醒不在本轮交付路径中；采用人工审核、过期重取、静态HTML/静态图片及已有每日私聊媒体调度。正式首包16–24张需实际授权素材，不生成虚构素材来充数。
+
+
+### 自然参与改为Agent自主决策（2026-11-03）
+
+已删除自然参与的关键词/长度门槛及独立判官模型。开启全量上下文与自然模式后，普通非@消息进入群Agent，由人格提示词结合上下文决定回复或输出内部静默标记。跟随模式不再要求特定开头，仍保留同一发言人与有限跟随窗口。自然模式的静默不发送、不提交参与历史、不结算好感、不消耗自动发言额度或冷却；媒体排队会被丢弃。仍保留接收/模式开关、安静时段、自动发言配额、并发保护、去重、权限和版本检查。无人召唤时的处理错误不主动发错误消息。相较独立判官，此模式会让更多普通消息触发完整Agent，模型调用量可能增加。
+
+群图片与附件：普通旁听消息在限时缓冲里保留图片、语音和文件类型，按参与策略进入回合后才解析附件。当前图片及明确引用的近期图片由支持视觉的模型读取；只有文字模型或解码失败时报告附件类型。文件和语音的存在不等于已解读内容。
+
+群消息参与历史、公共记忆、带成员身份及来源人格的画像事实在 GROUP_DATA_ROOT/groups.sqlite3；附件在同根 workspaces/<群作用域哈希>/uploads。生产 USER_DATA_ROOT=/home/ubuntu/datadisk/QQBotData 时默认群根为 /home/ubuntu/datadisk/groups_store。可设置 GROUP_DATA_MOUNT=/home/ubuntu/datadisk 强制校验写入目录及挂载设备。旧事实保留原数据，未知来源人格不追溯猜测。近期旁听缓冲仍按原策略驻内存。
+
+群管理页的“本群自动参与配额”可设置每日自动发言数（默认100）、间隔（默认120秒）与跟随窗口。“全局发言与媒体配额”可设置全局发言（日限额默认1000、间隔默认1秒）、每轮图片数、成员及会话滚动图片额度、近期去重条数与抓图尝试额度。保存后新预占即时读取，不重置用量。升级会一次性转换等于旧默认值10次或180秒的对应字段。已存在的非默认值保留。
+
+群成员 @机器人或回复机器人后，可直接使用系统查询：/角色详情、/羁绊详情、/兑换码、/长期兑换码、/功能、/更新日志。/群帮助 列出命令；/status 查看本群状态。禁图群使用文字输出。个人会话、邮箱、画像管理及会读取私人上下文的反馈命令引导至私聊，未知斜杠命令由系统处理。

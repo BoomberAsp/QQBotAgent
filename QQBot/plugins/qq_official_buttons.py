@@ -182,6 +182,15 @@ async def _on_interaction(bot: QQBot, event: InteractionCreateEvent) -> None:
             await _ack(bot, event.id, 1)
             return
 
+        if scene == "group":
+            from agent.group_callbacks import handle
+            if _seen_before(str(bot.self_id)+":"+group+":"+str(event.id)):
+                await _ack(bot,event.id,3);return
+            result=await handle(bot,event,user,group,button_data)
+            await _ack(bot,event.id,result.code)
+            await _receipt(bot,event,scene,user,result)
+            return
+
         # 3. contextvars for the permission/role layer
         agent_context._current_platform.set("qq_official")
         agent_context._current_user_id.set(user)

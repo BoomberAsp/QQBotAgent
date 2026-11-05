@@ -29,6 +29,18 @@ RRF_K = 60            # RRF 常量：越大越平滑，60 是常用默认
 PER_DB_FACTOR = 4     # 每个库取 limit*factor 条参与融合
 MIN_PER_DB = 6
 
+# 转发白名单：调用方给的是**门面级**关键字（limit / max_chars / min_score …），
+# 而 StoryKB.render_block / format_tool_result 的签名各不相同，整包 **kwargs 直接
+# 转发会 TypeError（详见 StorySources 渲染段的注释）。
+_RENDER_KEYS = ("persona_char_id", "persona_name", "max_chars",
+                "dialogue_chars", "with_preamble")
+_TOOL_KEYS = ("persona_char_id", "detail")
+
+
+def _pick(kwargs: dict, keys: Sequence[str]) -> dict:
+    """只保留内部函数认识的参数，丢掉门面级关键字。"""
+    return {k: v for k, v in kwargs.items() if k in keys}
+
 
 def _gd_candidates() -> List[str]:
     """gamedata 库的候选路径（优先数据盘，其次仓库内）。"""
@@ -140,10 +152,16 @@ class StorySources:
         return any(kb.entity_hit(query) for _n, kb in self.sources)
 
     # ── 渲染 / 注入：复用首个库的实现（各库同 schema 同代码）──
+    #
+    # ⚠️ 只能转发**内部函数认识**的参数：`StoryKB.render_block()` 没有
+    # limit / min_score；`StoryKB.format_tool_result()` 的第二个位置参数是
+    # limit，把 hits 按位置传会和 kwargs 里的 limit 撞成"重复传参"。
+    # 2026-11-01 线上就是这两处 TypeError：story_search 每次返回错误文本，
+    # 自动注入则被 `_build_story_context` 的 except 静默吞掉。
     def render_block(self, hits, **kwargs) -> str:
         if not self.sources:
             return ""
-        return self.sources[0][1].render_block(hits, **kwargs)
+        return self.sources[0][1].render_block(hits, **_pick(kwargs, _RENDER_KEYS))
 
     def format_injection(self, query: str, **kwargs) -> str:
         if not self.sources:
@@ -162,7 +180,7 @@ class StorySources:
                            persona_char_id=kwargs.get("persona_char_id", ""),
                            min_score=kwargs.get("min_score", 0.0))
         kb = self.sources[0][1]
-        return kb.format_tool_result(query, hits, **kwargs)
+        return kb.format_tool_result(query, hits=hits, **_pick(kwargs, _TOOL_KEYS))
 
 
 def get_story_sources(dbs: Sequence[tuple[str, str]] | None = None) -> StorySources:

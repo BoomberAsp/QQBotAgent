@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+<h2>知识库管理</h2>
+<p class="muted">JSON知识库的查询表为 documents。SQL只读，最多返回200行、单元格2000字，查询预算2秒。</p>
+<label>知识库 <select id="kb"></select></label>
+<button class="btn" id="refresh">刷新</button>
+<textarea id="sql" rows="4" style="width:100%">SELECT id, title, chapter, visibility FROM documents LIMIT 50</textarea>
+<button class="btn btn-primary" id="query">执行查询</button>
+<pre id="status" role="status"></pre><div style="overflow:auto;max-height:500px"><table id="results"></table></div>
+</div>
+<div class="card"><h3>发布/更新JSON知识库</h3>
+<p>同ID发布会切换到新文档版本并替换人格绑定；旧文件保留。文档必须包含 id、text、chapter 和 visibility。</p>
+<label>知识库ID <input id="kid" placeholder="hsr"></label>
+<label>人格ID（逗号分隔）<input id="personas" placeholder="herta"></label>
+<input type="file" id="docs" accept="application/json,.json">
+<button class="btn btn-primary" id="publish">发布文档与绑定</button>
+<pre id="publish-status" role="status"></pre>
+</div>
+<script src="/static/resources.js"></script>
+{% endblock %}

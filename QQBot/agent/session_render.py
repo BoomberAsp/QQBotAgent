@@ -27,6 +27,17 @@ from lib.button_spec import Btn, Rows, stamp
 
 SESSION_PAGE_SIZE = 3   # 3 session rows + nav row + footer row ≤ 5 rows
 
+# 官方平台对 action.modal.content 有长度限制：超长时**整条**键盘消息被拒
+# （40011021「请求参数 rows.buttons.action.modal.content 无效」），连正文一起丢。
+# 所以弹窗文案统一压缩，名字超过 MODAL_NAME_MAX 字折叠省略。
+MODAL_NAME_MAX = 10
+
+
+def _fold_name(name: str, limit: int = MODAL_NAME_MAX) -> str:
+    """超过 limit 的名字折叠成「前 limit 字…」（供 modal 文案控长）。"""
+    name = str(name or "")
+    return name if len(name) <= limit else name[:limit] + "…"
+
 
 def _persona_note(meta: dict, registry, user_id: str) -> str:
     """Mirror of turn.py /会话列表's persona annotation (keep in sync)."""
@@ -83,7 +94,7 @@ def render_session_page(
     sessions = sessions_mgr.list_sessions(user_id)
     archive_on = _t._scene_archive_enabled()
     if not sessions:
-        hint = (f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个普通会话；"
+        hint = (f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个通用会话；"
                 f"剧情/创作会话不计配额）。" if archive_on else
                 f"使用 /新会话 [名称] 创建一个（最多 {max_sessions} 个）。")
         return (
@@ -111,13 +122,15 @@ def render_session_page(
         kind_note = ""
         if archive_on and kind == _t.SCENE_KIND:
             state = "已完结" if _t._scene_completed(s) else "进行中"
-            kind_note = f" [{state}] · 不计配额"
+            kind_note = f" · [{state}] · 不计配额"
         elif archive_on and kind == _t.CREATION_KIND:
-            kind_note = " [角色创作] · 不计配额"
+            kind_note = " · [角色创作] · 不计配额"
         created = time.strftime("%m/%d %H:%M", time.localtime(s["created_at"]))
         p_note = _persona_note(meta, registry, user_id)
+        # 序号必须裹在粗体里：行首 "4. " 会被 QQ 的 markdown 当成有序列表，
+        # 分页后一律从 1 重排（第 2 页显示 1/2/3，与按钮「切换 4」对不上）。
         lines.append(
-            f"{i}. **{s['name']}**{marker}{kind_note}\n"
+            f"**{i}. {s['name']}**{marker}{kind_note}\n"
             f"   创建: {created} | 消息数: {s['total_messages']} | {p_note}"
         )
         rows.append([
@@ -125,7 +138,7 @@ def render_session_page(
                 style=0 if is_cur else 1, visited="当前" if is_cur else ""),
             Btn(label=f"删 {i}", data=f"qb1:session.del:{i}:{ver}",
                 action="cb", style=1, admin_only=False,
-                modal=f"确认删除会话「{s['name']}」？关联文件会一并清理，此操作不可撤销。"),
+                modal=f"删除会话「{_fold_name(s['name'])}」及其文件？不可撤销。"),
         ])
 
     if total_pages > 1:
@@ -149,8 +162,10 @@ def render_session_page(
     if archive_on:
         used = _t._quota_used(user_id)
         n_scene = len(_t._scene_archives(user_id))
-        lines.append(f"\n普通会话 {used}/{max_sessions} · "
-                     f"剧情归档 {n_scene}（不计配额）")
+        # 术语：临时会话 / 特殊会话（上位）；特殊会话分三类——通用会话
+        # （计配额）、剧情会话、创作会话（后两者不计配额）。
+        lines.append(f"\n通用会话 {used}/{max_sessions} · "
+                     f"剧情会话 {n_scene}（不计配额）")
     else:
         lines.append(f"\n共 {len(sessions)}/{max_sessions} 个会话")
     return "\n".join(lines), rows
@@ -189,7 +204,7 @@ def render_character_page(user_id: str, *, registry) -> tuple[str, Rows]:
             rows.append([Btn(
                 label=f"删 {i}", data=f"qb1:char.del:{i}:{ver}",
                 action="cb", style=1,
-                modal=f"确认删除角色「{display}」？好感度记录会保留，此操作不可撤销。")])
+                modal=f"删除角色「{_fold_name(display)}」？好感度保留，不可撤销。")])
     if len(metas) > CHAR_PAGE_SIZE:
         lines.append("（更多角色请用 /删除角色 <名称> 删除）")
     lines.append("\n好感度记录在删除后保留；重建同名角色不会自动继承。")

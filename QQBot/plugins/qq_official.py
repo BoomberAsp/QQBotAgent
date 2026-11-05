@@ -8,9 +8,8 @@ the _turn_sender contextvar, and flush() of the buffering official
 sender once the turn completes.
 
 Official-route specifics vs the OneBot entry (plan §7.5/§7.6):
-  - no continuous-session router: group messages only ever arrive
-    @-gated (c2c_group_at_messages intent) and c2c has no @ concept,
-    so "no-@ window" mode has nothing to act on;
+  - group @ and full-message events enter the independent group runtime;
+    non-@ participation remains opt-in and requires platform capability;
   - no poke router (no official API equivalent); changelog/announcement
     broadcast and the merged group-list export live in agent_router
     (they serve both routes), while this plugin owns the official group
@@ -45,6 +44,7 @@ from nonebot import get_bots, get_driver, logger, on_message, on_notice
 from nonebot.adapters.qq import Bot as QQBot, MessageSegment
 from nonebot.adapters.qq.event import (
     C2CMsgReceiveEvent, C2CMsgRejectEvent, QQMessageEvent,
+    GroupAddRobotEvent, GroupDelRobotEvent, GroupMsgRejectEvent, GroupMsgReceiveEvent,
 )
 
 from adapters.qq_official import (
@@ -74,6 +74,7 @@ from lib import media_gen
 from lib.button_spec import Btn
 from lib.button_spec import fit_label as _fit_label
 from lib.button_spec import max_per_row as _buttons_max_per_row
+from lib.button_spec import max_rows as _buttons_max_rows
 from lib.button_spec import validate as _validate_buttons
 from lib.status_heartbeat import read_status, write_status
 from tools.social_tools import build_image_prompt, enforce_asset_quota
@@ -517,7 +518,8 @@ def _build_envelope(letters: list, cfg: dict):
     now_dt = datetime.now()
     date_label = f"{now_dt.month}月{now_dt.day}日"
     max_chars = int(cfg.get("mail_max_chars", 800))
-    max_previews = max(1, int(cfg.get("mail_max_previews", 5)))
+    max_previews = min(10, _buttons_max_rows() * _buttons_max_per_row(),
+                       max(1, int(cfg.get("mail_max_previews", 5))))
 
     # ── B2：单封全文 ──
     if (len(letters) == 1 and bool(cfg.get("mail_full_when_single", True))
@@ -588,6 +590,12 @@ def _build_envelope(letters: list, cfg: dict):
         hidden += 1
         note = f"\n\n另有 {hidden} 封，发送 /邮件 查看"
         md = header + "\n" + "\n".join(body) + note + footer
+
+    # Truncation must remove the corresponding buttons as well: every open
+    # button needs a visible preview (especially circled long-name labels).
+    if rows:
+        visible = [b for row in rows for b in row][:len(body)]
+        rows = [visible[i:i + per_row] for i in range(0, len(visible), per_row)]
 
     plain_lines = [f"【今日角色来信 · {date_label}】", f"共 {len(letters)} 封："]
     for letter in letters:
@@ -967,8 +975,8 @@ async def _run_media_pass() -> None:
     img_min = int(cfg.get("media_image_min_level", 4))
     voice_min = int(cfg.get("media_proactive_voice_min_level", 7))
     prob = float(cfg.get("proactive_media_probability", 0.15))
-    media_daily_cap = int(cfg.get("proactive_media_daily_cap", 1))
-    monthly_cap = int(cfg.get("greet_monthly_cap", 4))
+    media_daily_cap = int(cfg.get("proactive_media_daily_cap", 4))
+    monthly_cap = int(cfg.get("greet_monthly_cap", 40))
     max_batch = int(cfg.get("greet_batch_max", 5))
     ttl = float(cfg.get("media_dedupe_ttl_hours", 168))
 
@@ -984,9 +992,16 @@ async def _run_media_pass() -> None:
             if not isinstance(state, dict):
                 continue
             level = int(state.get("level", 1))
+            from agent.group_resources import registry as resource_registry
+            resources,_ = resource_registry()
+            from agent.group_runtime import quiet_now
+            can_sticker = (bool(resources.get("proactive_private_stickers",False)) and level>=img_min
+                           and not quiet_now(resources.get("proactive_quiet","22:00-08:00")))
+            if not _mailbox_manager.load_user(openid).get("active_enabled",True):
+                continue
             can_image = level >= img_min and media_gen.is_image_available()
             can_voice = level >= voice_min and media_gen.is_tts_available()
-            if not (can_image or can_voice):
+            if not (can_image or can_voice or can_sticker):
                 continue
             if random.random() >= prob:
                 continue
@@ -998,6 +1013,11 @@ async def _run_media_pass() -> None:
                     str(_GREET_QUOTA_FILE), openid,
                     daily_cap=media_daily_cap, monthly_cap=monthly_cap,
                     kind="media"):
+                continue
+            if can_sticker and await _try_proactive_sticker(bot,openid,persona):
+                sent += 1
+                continue
+            if not (can_image or can_voice):
                 continue
             kind = "voice" if (can_voice and random.random() < 0.5) else (
                 "image" if can_image else "voice")
@@ -1180,8 +1200,18 @@ async def handle_official_notice(bot: QQBot, event):
 
     C2CMsgReject/ReceiveEvent 是 NoticeEvent（不是 Message），需要独立
     matcher；bot 注解把 OneBot 事件挡在外面。GROUP_MSG_REJECT/RECEIVE
-    与群发送一起归 P1，v1 不处理。
+    由独立群运行时处理，并使旧 generation 的结果失效。
     """
+    if isinstance(event,(GroupAddRobotEvent,GroupDelRobotEvent,GroupMsgRejectEvent,GroupMsgReceiveEvent)):
+        from agent.group_runtime import get_store
+        from agent.group_state import key
+        scope = key("qq_official",str(bot.self_id),"group",str(event.group_openid))
+        from agent.group_service import GroupService
+        kind=("removed" if isinstance(event,GroupDelRobotEvent) else "added" if isinstance(event,GroupAddRobotEvent) else "receive" if isinstance(event,GroupMsgReceiveEvent) else "reject")
+        stamp=getattr(event,"timestamp",None)
+        stamp=stamp.timestamp() if hasattr(stamp,"timestamp") else float(stamp or time.time())
+        GroupService(get_store()).observe(scope,kind,stamp,str(getattr(event,"id","")))
+        return
     if isinstance(event, C2CMsgRejectEvent):
         openid = str(getattr(event, "openid", "") or "")
         if openid:
@@ -1206,7 +1236,8 @@ async def handle_official_message(bot: QQBot, event: QQMessageEvent):
     if not isinstance(event, HANDLED_EVENTS):
         return
     _anchor = str(getattr(event, "id", "") or "")
-    if _is_duplicate_event(_anchor):
+    _dedup_key = f"{bot.self_id}:{getattr(event, 'group_openid', '')}:{_anchor}" if _anchor else ""
+    if _is_duplicate_event(_dedup_key):
         # 平台重推同一被动回复锚点（文档 §22 :2154）：再跑一遍就是两条
         # 一模一样的答复，直接跳过并留痕。
         logger.warning(
@@ -1216,6 +1247,13 @@ async def handle_official_message(bot: QQBot, event: QQMessageEvent):
 
     view = build_view(bot, event)
     scope = "group" if view.is_group else "c2c"
+    if view.is_group:
+        from nonebot.adapters.qq.event import GroupAtMessageCreateEvent
+        if not isinstance(event,GroupAtMessageCreateEvent):
+            from agent.group_service import GroupService
+            from agent.group_runtime import get_store
+            from agent.group_state import scope_for
+            GroupService(get_store()).observe(scope_for(view),"full",view.received_at,view.message_id)
     if not view.is_group:
         # P3b: c2c user_openid is the only identity usable for active
         # c2c pushes → maintain the greeting candidate index from here
@@ -1235,11 +1273,11 @@ async def handle_official_message(bot: QQBot, event: QQMessageEvent):
         f"group={view.group_id or '-'} msg_id={view.message_id} "
         f"attachments={len(event.attachments or [])} "
         f"quoted={'yes' if getattr(event, 'reply', None) else 'no'} "
-        f"text={view.text[:60]!r}"
+        f"text={view.text[:60]!r}" if not view.is_group else f"[qq_official] group message received id={view.message_id}"
     )
 
     sender = QQOfficialSender(bot, event, view.is_group)
-    if not sender.wants_reply(view):
+    if not view.is_group and not sender.wants_reply(view):
         return
 
     # Bind this event's sender for the whole turn: _safe_send resolves
@@ -1253,3 +1291,36 @@ async def handle_official_message(bot: QQBot, event: QQMessageEvent):
         _turn_sender.reset(token)
         # Best-effort: buffered output goes out even if the turn raised.
         await sender.flush()
+
+
+async def _try_proactive_sticker(bot,openid,persona):
+    """Uses the existing single media pass; no second loop or retry on uncertainty."""
+    from agent.group_resources import registry,local_file
+    from agent.media_tools import published
+    from agent import media_ledger as ledger
+    from agent.group_runtime import get_store
+    from types import SimpleNamespace
+    data,root=registry()
+    scope=json.dumps(['qq_official',str(bot.self_id),'private',openid])
+    ident=get_store().identity(SimpleNamespace(platform='qq_official',self_id=str(bot.self_id),group_id='',is_group=False,user_id=openid))
+    for asset in sorted(data.get('media',[]),key=lambda a:a.get('id','')):
+        if persona not in asset.get('personas',[]) or 'greeting' not in asset.get('mood',[]):
+            continue
+        try:path=str(local_file(root,asset['path']))
+        except (OSError,ValueError,KeyError):continue
+        if not published(persona,scope,asset['id'],path):continue
+        ticket=ledger.reserve(scope,ident['canonical'],persona,'proactive:'+time.strftime('%Y-%m-%d'),asset['id'])
+        if not ticket:continue
+        if not _mailbox_manager.load_user(openid).get('active_enabled',True) or not published(persona,scope,asset['id'],path):
+            ledger.outcome(ticket,'dropped');return True
+        # Reserve platform quota before the network call; unknown sends retain it.
+        greeting.record_active_send(str(_GREET_QUOTA_FILE),openid,kind='media')
+        try:
+            await bot.send_to_c2c(openid=openid,message=MessageSegment.file_image(Path(path)))
+            status='sent'
+        except Exception:
+            status='uncertain'
+        ledger.outcome(ticket,status)
+        if status=='sent':greeting.mark_greeted(str(_GREET_TARGETS_FILE),openid)
+        return True
+    return False

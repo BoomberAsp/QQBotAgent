@@ -18,6 +18,7 @@ import sys
 
 from tools.name_resolver import get_resolver
 from lib.paths import wiki_cache_dir
+from lib.game_names import load_roles, roles_path, file_stamp, reconcile
 
 
 _CACHE_PATH = os.path.join(
@@ -61,6 +62,7 @@ def _load() -> dict:
         mtime = os.path.getmtime(_CACHE_PATH)
     except OSError:
         mtime = None
+    mtime = (file_stamp(_CACHE_PATH), file_stamp(roles_path()))
     if _data is not None and mtime == _data_mtime:
         return _data
     _data_mtime = mtime
@@ -87,9 +89,12 @@ def _load() -> dict:
     _by_cn_name_norm = {}
     _by_title = {}
     _by_id = {}
-    for entry in _data.values():
+    roles = load_roles()
+    for title_key, entry in _data.items():
         if not isinstance(entry, dict):
             continue
+        entry.setdefault("title", title_key)
+        reconcile(entry, roles)
         cn = entry.get("name_cn") or entry.get("title")
         if cn:
             _by_cn_name[cn] = entry
@@ -107,6 +112,12 @@ def _load() -> dict:
             _by_cn_name_norm.setdefault(_normalize_name(canonical), entry)
         if cn:
             _by_cn_name_norm.setdefault(_normalize_name(cn), entry)
+
+    for entry in _data.values():
+        if isinstance(entry, dict):
+            for alias in entry.get("name_aliases", []):
+                _by_cn_name.setdefault(alias, entry)
+                _by_cn_name_norm.setdefault(_normalize_name(alias), entry)
 
     return _data
 
@@ -315,7 +326,7 @@ async def character_detail_with_card(character_name: str) -> tuple[str, str | No
     # 游戏数据优先：wiki 未收录（如 H806 蜜拉贝儿）或 wiki 文案过旧时，用解包产物组装
     try:
         from lib.character_entry import build_entry as _gd_entry
-        gd_entry = _gd_entry(character_name)
+        gd_entry = _gd_entry((entry or {}).get("id") or character_name)
     except Exception:  # noqa: BLE001
         gd_entry = None
     if gd_entry:

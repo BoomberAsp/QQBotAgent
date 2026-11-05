@@ -530,7 +530,9 @@ async def handle_poke(bot: Bot, event):
     try:
         user_id = str(event.user_id)
         group_id = str(event.group_id) if getattr(event, "group_id", None) else ""
-        await _handle_poke(user_id, group_id, private=not group_id)
+        if group_id:
+            return  # group relationships settle only from attributed chat turns
+        await _handle_poke(user_id, group_id, private=True)
     except Exception as e:
         log_exception("poke handling failed", e)
 

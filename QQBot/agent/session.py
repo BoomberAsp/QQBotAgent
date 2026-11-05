@@ -65,7 +65,10 @@ class Session:
         the prefix-cache rationale.
         """
         if len(self.context) > max_messages + TRIM_HYSTERESIS:
-            self.context = self.context[-max_messages:]
+            start = len(self.context) - max_messages
+            while start > 0 and self.context[start].get("role") != "user":
+                start -= 1
+            self.context = self.context[start:]
 
     def clear(self):
         """Clear conversation context."""

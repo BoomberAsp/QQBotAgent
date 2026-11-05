@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row" style="align-items:flex-start;gap:16px;flex-wrap:wrap">
+<div class="card" style="min-width:240px;flex:1"><h2>群列表</h2><input id="group-search" placeholder="备注、群号、openid"><button class="btn" id="reload-groups">刷新</button><div id="group-list"></div></div>
+<div class="card" style="flex:3;min-width:350px"><h2 id="group-title">选择一个群</h2><pre id="group-status" role="status"></pre>
+<form id="group-form" hidden>
+<p id="group-platform" class="muted"></p>
+<label>备注名（仅管理面板可见）<input id="memo" maxlength="40"></label>
+<label>内置人格<select id="persona"></select></label>
+<label>切换人格时的历史处理<select id="history"><option value="">请选择</option><option value="keep">保留并注入切换提示</option><option value="clear">清空群历史</option></select></label>
+<label>参与模式<select id="mode"><option value="mention">仅召唤</option><option value="follow">跟随</option><option value="natural">自然（Agent自主决定）</option></select></label>
+<label><input id="receive_all" type="checkbox">非 @ 上下文接收</label><p class="muted">平台推送需群主在机器人设置中开启；本地开关无法代替。</p>
+<label>安静时段<input id="quiet" placeholder="22:00-08:00，留空关闭"></label>
+<label><input id="proactive_stickers" type="checkbox">群主动贴图</label>
+<p>功能策略（开启不代表尚未接入的工具已经可用）</p>
+<label><input id="image" type="checkbox">图片</label><label><input id="gacha" type="checkbox">抽卡</label><label><input id="voice" type="checkbox">语音</label>
+<label>剧情进度（JSON，库ID→章节整数）<textarea id="story_progress" rows="3"></textarea></label><p id="kb-list" class="muted"></p>
+<fieldset><legend>本群自动参与配额</legend>
+<label>每日自动发言上限<input type="number" id="auto_daily_cap" min="0" max="100000" required></label>
+<label>自动发言间隔（秒）<input type="number" id="cooldown" min="0" max="86400" required></label>
+<label>跟随窗口（秒）<input type="number" id="follow_seconds" min="0" max="86400" required></label>
+<label>每个窗口最多跟随次数<input type="number" id="follow_limit" min="0" max="1000" required></label></fieldset>
+<button class="btn btn-primary" type="submit">保存配置</button>
+</form>
+<div id="group-detail" hidden>
+<h3>群公共记忆</h3><ul id="memory-list"></ul><textarea id="new-memory" maxlength="500" placeholder="最多500字"></textarea><button id="add-memory" class="btn">追加</button><button id="clear-memory" class="btn btn-danger">清空公共记忆</button>
+<h3>本群来源事实</h3><p>仅显示来源元数据，不显示私人画像或对话正文。删除会撤销本群来源事实及旧后台写入。</p><div id="group-facts"></div>
+<h3>最近投递</h3><pre id="group-deliveries" style="max-height:300px;overflow:auto"></pre>
+<h3>危险操作</h3><p>重置仅清除对话、切换提示及待确认操作；清除数据还撤销公共记忆和本群来源事实。好感度保留。</p><button id="reset-group" class="btn btn-danger">重置会话</button><button id="clear-group" class="btn btn-danger">清除群数据</button>
+</div></div></div>
+<div class="card"><h3>旧配置迁移</h3><p>选择目标群后再确认迁移。存在歧义不会自动采纳，已有新配置不会覆盖。可逐条忽略。</p><div id="legacy-groups"></div></div>
+<div class="card"><h3>群命令说明</h3><pre id="command-help"></pre></div>
+<div class="card"><h3>全局发言与媒体配额</h3><p>对所有群生效。媒体限额也适用于使用同一媒体服务的私聊。次数上限设为0会禁止相应操作，去重条数和冷却设为0会关闭相应限制。保存不会重置已用额度。</p>
+<form id="quota-form"><div id="quota-fields"></div><button class="btn btn-primary">保存全局配额</button><button type="button" id="quota-refresh">刷新</button><output id="quota-status"></output></form></div>
+<script src="/static/groups.js"></script>
+{% endblock %}

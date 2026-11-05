@@ -943,9 +943,18 @@ class StoryKB:
         limit: int = 4,
         persona_char_id: str = "",
         detail: int = 1400,
+        hits: Optional[Sequence[StoryHit]] = None,
     ) -> str:
-        """Build the ``story_search`` tool response (deeper than auto injection)."""
-        hits = self.search(query, limit=limit, persona_char_id=persona_char_id)
+        """Build the ``story_search`` tool response (deeper than auto injection).
+
+        *hits* 允许调用方传入已经算好的命中 —— 多库融合门面会把 wiki + 解包两库的
+        结果融合后交过来，此时不再回查本库。注意它是**第 5 个**参数：位置传会把
+        第 2 个位置参数 ``limit`` 顶掉（2026-11-01 修过一次）。
+        """
+        if hits is None:
+            hits = self.search(query, limit=limit, persona_char_id=persona_char_id)
+        else:
+            hits = list(hits)
         if not hits:
             return (
                 "[story_search] 原作剧情库中没有找到相关内容。\n"
@@ -1015,7 +1024,8 @@ def get_story_kb(db_path: Optional[str] = None):
     * ``db_path`` 明确给出 → 直接返回该库的 :class:`StoryKB`（测试/脚本用）。
     * 否则：若发现**多个**库（gamedata + wiki），返回融合门面
       :class:`lib.story_sources.StorySources`（接口与 StoryKB 兼容：search /
-      render_block / format_injection / entity_hit / stats），调用方无需改动。
+      render_block / format_injection / format_tool_result / entity_hit / stats），
+      调用方无需改动。
     """
     global _story_kb
     if db_path is not None:

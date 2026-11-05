@@ -1,96 +1,48 @@
-# Session — Conversation Session Configuration
+# Session — 会话与模型上下文
 
-## Session Parameters
+本文说明运行语义，不是可执行参数来源；实际值由当前配置、模型和工具实现决定。
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| **max_context_messages** | 20 | Maximum conversation history messages kept per user |
-| **max_context_turns** | 10 | Maximum conversation turns (user + assistant pairs) |
-| **session_timeout** | 1800 | Session inactivity timeout in seconds (30 minutes) |
-| **max_tool_calls_per_turn** | 20 | Maximum tool invocations per user message |
-| **tool_timeout** | 60 | Default tool execution timeout in seconds |
-| **thinking_timeout** | 180 | Maximum time for LLM reasoning in seconds |
-| **reminder_interval** | 15 | Seconds between "still thinking" reminders |
+## 默认参数
 
-## Session Lifecycle
+| 参数 | 当前默认/约束 |
+| --- | --- |
+| 新范围模型历史 | 最近 10 轮完整用户/助手问答，再加按需资料 |
+| 旧 SessionManager | 最近约 20 条消息，30 分钟不活跃过期；不能据此认定认知库原文也已删除 |
+| Agent 工具循环 | 常规入口最多 20 轮；不是所有工具都共享固定 60 秒超时 |
+| LLM 请求超时 | 常规入口 180 秒，以实际客户端设置为准 |
+| 可选资料 | 共 2400 字符，按完整块选择；字符配额不等于精确 token 数 |
+| 任务经验 | 启用 inject 且有合格案例时，最多 2 条、共 800 字符，包含在可选资料预算内 |
+| 最终请求 | 含消息、工具 schema/调用参数、多模态开销，并预留输出和安全余量 |
 
-```
-User sends message
-      │
-      ▼
-┌──────────────┐     Session exists?
-│  Lookup       │────Yes──→ Load context from memory
-│  user_id      │
-└──────┬───────┘
-       │ No
-       ▼
-┌──────────────┐
-│  Create new   │  Initialize empty context
-│  session      │  Load USER.md template
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│  Process      │  Agent loop (THINK→ACT→OBSERVE→RESPOND)
-│  message      │
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│  Update       │  Append user msg + agent response to context
-│  session      │  Trim to max_context_messages
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│  Persist      │  Save session state to disk
-│  (optional)   │  (enables session survival across restarts)
-└──────────────┘
-```
+## 上下文生命周期
 
-## Context Trimming Strategy
+1. 入口确定用户、平台/机器人、私聊或群、角色及特殊会话 ID；这些范围字段来自可信运行时，不由模型传参指定。
+2. 加载当前范围最近问答、TaskState 和相关事实/历史片段。无范围的旧兼容入口保留原会话读取逻辑，不据此扩大新范围的权限。
+3. 当前请求进入工具循环。每次模型调用前检查完整预算，按完整历史轮次裁剪；系统约束、当前用户请求与正在进行的工具交换不能随意截断。
+4. 完整输入仍装不下时，要求缩小输入或拆分任务，不承诺无限上下文。
+5. 问答、任务状态和派生摘要分别持久化；后台抽取与经验候选写入遵守 generation 屏障。
 
-When context exceeds `max_context_messages`:
-1. Keep the most recent messages (FIFO)
-2. Always preserve the system prompt (SOUL + IDENTITY + TOOLS + AGENTS)
-3. Truncate from the oldest user/assistant pairs first
+## 原文、摘要与清理
 
-## Session Persistence
+`/压缩会话` 仍需确认，仅私聊特殊会话可用，剧情/创作会话不支持。在新范围中独立生成早期历史的分段摘要，保留原始问答用于按主题回读，不用旧摘要不断重写自身。不要承诺所有历史始终直接发送给模型，也不要把“整理摘要”说成“删除原文”。旧兼容路径可以采用摘要加近期消息的模型视图。
 
-系统有三套独立的存储系统，功能不同、路径不同、互不干扰：
+工具摘要优先保留错误、状态、结果和引用，但仍可能截断；关键细节应回查真实来源。TaskState 中的目标、约束与待办优先于模糊摘要。`reported_complete` 不等于独立验证成功。
 
-### 存储架构总览
+`/clear` 清理工作上下文和 TaskState，保留长期事实与人格绑定；P4 派生经验会随范围失效。`/记忆 删除` 与 `/记忆 清空 确认` 的删除范围见 MEMORY.md。切换或删除一个旧会话文件，不等于自动擦除其他存储中的所有派生数据。
 
-| 存储系统 | 路径 | 管理者 | 用途 |
-|---------|------|--------|------|
-| **临时会话** | `data/sessions/{uid}.json` | `SessionManager` (`agent/session.py`) | 默认会话，最近 20 条消息，30 分钟过期 |
-| **特殊会话** | `{USER_DATA_ROOT}/{uid}/sessions/{name}/` | `SpecialSessionManager` (`agent/special_session.py`) | 持久化长对话，完整上下文，快照+增量双层存储 |
-| **用户工作区** | `{USER_DATA_ROOT}/{uid}/workspace/` | `UserWorkspaceManager` (`agent/workspace.py`) | 用户独立文件空间，500MB 配额，QQ 号隔离 |
+## 存储与模型视图的区别
 
-**重要**: 临时会话 (`data/sessions/`) 和特殊会话 (`users_store/.../sessions/`) 是完全独立的存储系统，互不关联。不要将它们描述为同一系统的不同"层"。
+| 数据 | 存储/用途 |
+| --- | --- |
+| 新范围事实、问答、摘要、TaskState | `{USER_DATA_ROOT}/_cognition/cognitive_state.sqlite3`，按用户与 scope 隔离 |
+| 私有任务经验（启用时） | `{USER_DATA_ROOT}/_experience/experience.sqlite3`，观察、候选、版本、发布和审计 |
+| 临时会话兼容存储 | `QQBot/data/sessions/{uid}.json`，SessionManager 管理 |
+| 特殊会话 | `{USER_DATA_ROOT}/{uid}/sessions/{name}/`，会话索引及快照/增量等记录 |
+| 用户工作区 | `{USER_DATA_ROOT}/{uid}/workspace/`，用户文件；配额以本轮注入为准 |
 
-### 临时会话持久化
+以上数据有不同职责，也有清理与版本联动，不能再描述成“互不关联”。原文持久化不表示全部原文每轮可见；缓存过期也不表示已删除长期记忆。模型不得直接访问这些内部存储来绕过工具权限。
 
-临时会话存储为单个 JSON 文件：
-
-```
-QQBot/data/sessions/{user_id}.json
-```
-
-Each session file contains:
-```json
-{
-  "user_id": "123456789",
-  "created_at": "2026-05-26T10:00:00",
-  "last_active": "2026-05-26T10:30:00",
-  "context": [
-    {"role": "user", "content": "..."},
-    {"role": "assistant", "content": "..."}
-  ],
-  "tool_call_count": 5,
-  "metadata": {}
-}
-```
+`persist=False` 的委派运行不读取或写回当前聊天历史，也不写入本次自动记忆/经验；它只处理调用者提供的任务与可用工具，不能声称拥有父会话的全部上下文。
 
 ## 会话人格绑定
 
@@ -102,12 +54,12 @@ Each session file contains:
 - **懒校验**：绑定 key 失效（内置卡被删/UGC 角色被删）时静默穿透到下一优先级层，存量无绑定的旧会话同样穿透，零迁移。
 - `/clear` 清空会话历史但**保留**人格绑定（清历史 ≠ 换人格）。
 
-## 剧情归档与配额豁免
+## 剧情会话与配额豁免
 
-剧情会话 (`kind=bond_scene`) 与角色创作会话 (`kind=char_creation`) **不占用**特殊会话配额（配额只约束普通特殊会话：管理员 10 / 会员 3 / 普通 1）。设计详见 `docs/scene-session-archive-design.md`。
+剧情会话 (`kind=bond_scene`) 与角色创作会话 (`kind=char_creation`) **不占用**特殊会话配额（配额只约束通用会话：管理员 10 / 会员 3 / 普通 1）。设计详见 `docs/scene-session-archive-design.md`。
 
 - **完结封档**：剧情走到结局，LLM 调 `complete_scene` 收尾时，会话被写入 `metadata.completed=true` + `completed_at`（封档真源）。封档后会话**保留**、退出活跃，可随时 `/切换会话 <名称>` 回看。
-- **回看即普通会话**：已封档剧情回看时 `is_scene=false`——不再注入剧情指令与剧本、工具集无 `complete_scene`，只作历史查阅（人格仍钉住原角色）。
+- **回看即按通用会话处理**：已封档剧情回看时 `is_scene=false`——不再注入剧情指令与剧本、工具集无 `complete_scene`，只作历史查阅（人格仍钉住原角色）。
 - **去重恢复**：`/剧情 <标题>` 命中同 `(角色, 标题)` 的既有会话时**恢复**而非新建（未完结→继续演绎；已完结→提示已封档可回看）。
 - **总量上限**：剧情会话（含进行中与已完结）上限 `MAX_SCENE_ARCHIVES`（默认 20）；超限拒绝新建，提示先 `/删除会话` 清理，但**恢复**未完成剧情不受限。
 - **创作会话**：`/创建角色` 中途退出后再发 `/创建角色` 恢复同一访谈；角色创建成功后该会话**自动删除**（访谈设定已落入角色卡，无残留价值）。

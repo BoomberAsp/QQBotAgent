@@ -1,40 +1,22 @@
-# Heartbeat — Health Monitoring Configuration
+# Heartbeat — 监控说明与恢复任务
 
-## Health Check Schedule
+本文不是已运行的调度配置，修改表格不会自动创建定时器。不要声称机器人固定每五分钟 ping 模型、每分钟检测 QQ 或发生故障后自动重启：这些能力必须由实际运维配置和日志证明。
 
-| Check | Interval | Timeout | Description |
-|-------|----------|---------|-------------|
-| **DeepSeek API** | 300s (5 min) | 30s | Ping DeepSeek API with minimal request |
-| **QQ Connection** | 60s (1 min) | 10s | Check Napcat WebSocket state |
-| **Memory Usage** | 600s (10 min) | 5s | Check Python process memory |
-| **Disk Space** | 1800s (30 min) | 5s | Check data directory free space |
-| **Session Cleanup** | 900s (15 min) | 30s | Purge expired sessions |
+## 代码中已有的相关后台任务
 
-## Health Status Levels
+| 任务 | 行为 |
+| --- | --- |
+| 画像抽取恢复 | 启动 hook 开启扫描，约每 30 秒检查待处理数据；遵守重试退避及单用户串行限制 |
+| P4 经验恢复（已初始化且非 off） | 启动时及约每 30 秒处理有限队列并清理过期正文；正常请求也处理少量积压 |
+| P4 工作租约 | running 租约 60 秒；结算前中断的 recording 记录在 30 分钟无更新后可恢复为 unknown 候选 |
+| P4 保留期 | 案例、观察及未完成任务正文按 90 天清理；最小幂等与审计元数据、外部备份另行管理 |
 
-| Status | Meaning | Action |
-|--------|---------|--------|
-| **HEALTHY** | All checks passing | Normal operation |
-| **DEGRADED** | LLM unreachable, QQ connected | Respond with maintenance message |
-| **DISCONNECTED** | QQ connection lost | Log error, wait for auto-reconnect |
-| **CRITICAL** | Both LLM and QQ down | Log critical, attempt full restart |
+经验恢复不发起额外 LLM 请求，也不自动发布案例或修改业务代码。工作器异常不是任务失败证据；权限撤回和遗忘优先于在途结果。
 
-## Heartbeat Log Format
+## 状态解释
 
-```
-[2026-05-26 10:00:00] HEARTBEAT: HEALTHY
-  DeepSeek API: OK (234ms)
-  QQ Connection: OK (ws://127.0.0.1:8080)
-  Memory: 45.2 MB / 512 MB
-  Disk: 12.3 GB free
-  Active Sessions: 3
-```
-
-## Alert Thresholds
-
-| Metric | Warning | Critical |
-|--------|---------|----------|
-| LLM Latency | > 5s | > 30s |
-| Memory Usage | > 80% | > 95% |
-| Disk Free | < 500 MB | < 100 MB |
-| Active Sessions | > 100 | > 500 |
+- 监控模型请求失败、QQ 断连、磁盘不足、队列积压或恢复错误时，区分可见事实与推测。
+- 活跃会话数量、工具注册数量或一次 ping 成功不能证明所有工具、外部服务及任务产物都正常。
+- 会话缓存清理、原文删除、长期记忆遗忘和经验退役是不同操作，不相互冒充。
+- 面向用户只说明影响、已完成部分和可行下一步；不要暴露私密正文、凭据或内部配置。
+- 监控阈值、通知与服务重启由运维配置管理，聊天模型不擅自创建后台任务或重启系统。

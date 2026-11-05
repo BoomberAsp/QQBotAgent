@@ -1,74 +1,29 @@
-# Bootstrap — Agent Initialization Sequence
+# Bootstrap — 配置加载与恢复
 
-This document defines what happens when the agent starts up.
+本文描述代码实际入口，不是会自行执行的启动脚本。不能根据文档存在就向用户声称某项检测、定时任务或部署已经完成。
 
-## Initialization Order
+## 配置与工具
 
-```
-1. Load IDENTITY.md       → Agent name, version, capabilities
-2. Load SOUL.md           → Personality and behavior rules
-3. Load TOOLS.md          → Available tool definitions
-4. Load AGENTS.md         → Orchestration rules
-5. Load WORKSPACE.md      → Capability boundaries and workspace constraints
-6. Load SESSION.md        → Session configuration
-7. Load MEMORY.md         → Three-tier long-term memory rules (injected into the system prompt)
-8. Register built-in tools → ToolRegistry initialization
-9. Verify LLM connection   → Health check to DeepSeek API
-10. Verify QQ connection    → Health check to Napcat WebSocket
-11. Start HEARTBEAT.md     → Begin periodic health checks
-12. Agent READY            → Begin accepting messages
-```
+- Agent 读取 SOUL、IDENTITY、TOOLS、AGENTS、BOOTSTRAP、SESSION、MEMORY。
+- 基础系统提示词实际拼接 SOUL、IDENTITY、AGENTS、MEMORY，再加入运行时硬件等信息；TOOLS/SESSION 等文件不是全部原样拼入提示词。
+- USER.md 是行为说明，不是代码必定载入的新用户 JSON 模板。HELP/FEATURES 由用户帮助入口使用。
+- 工具由 Python 注册并按本轮权限、人格及会话类型过滤；文档列名不等于当前可调用。函数名、参数与权限以实际 schema 为准。
+- 人格、范围、时间、工作区、TaskState、相关记忆与可选经验在运行时确定。静态文档不能改变这些可信值。
 
-## Tool Registration
+## 可选启动检查
 
-On bootstrap, the following tools are registered by default:
+`Agent.bootstrap()` 被调用时，会汇总工具与已加载配置、尝试硬件检测，并向配置的客户端发送一次限时 ping，返回 healthy/degraded 等结果。它不保证所有工具可用，不实现此文档旧版所写的“三次重试后每分钟自动重连”，也不负责验证 QQ 登录状态。
 
-**Built-in tools** (`tools.builtin_tools`) — Required:
-| Tool Name | Description |
-|-----------|-------------|
-| `search_web` | SearXNG meta-search engine |
-| `web_fetch` | HTTPS URL fetcher with HTML-to-text extraction |
-| `get_time` | Current date/time |
-| `execute_code` | Sandboxed Python execution (tiered by role) |
-| `shell_exec` | Read-only shell commands (40+ whitelist, admin only) |
-| `download_repo` | Git clone HTTPS repos |
-| `summarize_pdf` | PDF text extraction |
-| `read_file` | Text/PDF/image/audio file analysis |
-| `get_system_load` | CPU/memory/disk load check |
-| `get_user_info` | User profile, permissions, workspace snapshot |
+是否实际调用该检查、QQ 连接情况与模型健康度，以运行日志和真实状态为准，不编造已经完成的检查。
 
-**Map tools** (`tools.map_tools`) — Required:
-| Tool Name | Description |
-|-----------|-------------|
-| `geocode` | Address → coordinates |
-| `reverse_geocode` | Coordinates → address |
-| `get_weather` | Real-time/forecast weather (Amap API) |
-| `search_poi` | Points of interest search |
-| `plan_route` | Driving/walking/transit routing |
+## 持久状态恢复
 
-**Legacy tools** (`tools.legacy_tools`) — Optional:
-| Tool Name | Description |
-|-----------|-------------|
-| `gacha_pull` | Game gacha simulation |
-| `play_gacha_animation` | Gacha animation in QQ chat |
-| `calculate_speed` | Game speed calculation |
-| `compare_speed_probability` | Speed randomization probability |
-| `explain_code` | Code explanation |
-| `translate_text` | Text translation |
+- P0/P1 画像抽取通过启动/关闭 hook 管理恢复扫描；待处理批次持久化，失败退避重试。
+- P2/P3 认知库保存范围、版本、问答和 TaskState；在途写入必须通过 generation 检查，不从旧档案绕过删除屏障。
+- 若初始化了 P4 服务，启动 hook 启动恢复工作器，关闭 hook 停止；默认 shadow，只记录候选与检索审计。
+- P4 第一条工具观察即持久化，未结算记录可在超时后恢复为 unknown 候选；候选不会自动发布。经验数据库不可用时相关记录/检索可降级，不能谎报经验已保存。
+- 以环境 off 启动时不初始化经验服务；已初始化服务的持久模式可由运维关闭。聊天模型不能启动管理脚本或修改模式。
 
-## Startup Health Checks
+## 启动后的回答原则
 
-- **DeepSeek API**: Send a minimal chat completion request. If it fails, log error and retry 3 times with 5s interval.
-- **Napcat WebSocket**: Check if the reverse WebSocket connection is established. If not, log warning (QQ may still be logging in).
-- **Disk Space**: Ensure at least 100MB free for session/memory persistence.
-
-## Fallback Behavior
-
-If the DeepSeek API is unreachable after retries:
-1. Log critical error
-2. Enter degraded mode: respond to all messages with "Roxy 正在维护中，请稍后再试~"
-3. Retry connection every 60 seconds
-
-If tools fail to register:
-- Required tools → critical error, agent won't start
-- Optional tools → log warning, agent starts without them
+记忆、任务状态和经验都不是新的系统授权。旧迁入信息遵守迁移范围，不能因启动或恢复而扩大可见范围。后台恢复状态不等于当前任务已完成；缺少验证材料时保持 unknown。出现问题报告实际可见的错误和未完成项，不自行重启服务、改配置或重写全局提示词。

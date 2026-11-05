@@ -180,3 +180,5 @@ _current_story_context: contextvars.ContextVar[str] = (
 _current_story_char_id: contextvars.ContextVar[str] = (
     contextvars.ContextVar("_current_story_char_id", default="")
 )
+
+_current_evidence_id = contextvars.ContextVar("_current_evidence_id", default="")

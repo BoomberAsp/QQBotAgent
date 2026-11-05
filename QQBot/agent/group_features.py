@@ -26,7 +26,7 @@ FEATURE_LABELS: Dict[str, str] = {
 # Feature key → set of tool names to filter when disabled
 FEATURE_TOOLS: Dict[str, Set[str]] = {
     "gacha": {"gacha_pull", "play_gacha_animation"},
-    "image": {"play_gacha_animation"},
+    "image": {"play_gacha_animation", "group_media", "send_sticker", "fetch_image", "discover_images"},
     "voice": set(),  # Hook for future voice recognition tools
 }
 
@@ -176,3 +176,10 @@ def get_group_features() -> GroupFeatureManager:
     if _group_features is None:
         _group_features = GroupFeatureManager()
     return _group_features
+
+
+def disabled_tools(features):
+    result=set()
+    for feature,enabled in features.items():
+        if enabled is False:result.update(FEATURE_TOOLS.get(feature,set()))
+    return result

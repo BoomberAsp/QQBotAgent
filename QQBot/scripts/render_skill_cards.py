@@ -19,10 +19,14 @@ import hashlib
 import json
 import os
 import sys
-from lib.paths import wiki_cache_dir
 
+# 本脚本在 scripts/ 下，sys.path[0] 是 scripts/ 而不是仓库根；把仓库根补进去，
+# 否则 `import lib` 会失败（ModuleNotFoundError: No module named 'lib'）。
+# 这段必须在 `from lib...` 之前执行，所以那个 import 只能放在它下面。
 QQBOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, QQBOT)
+
+from lib.paths import wiki_cache_dir  # noqa: E402  （依赖上面的 sys.path 引导）
 
 CACHE = wiki_cache_dir()
 DETAILS = os.path.join(CACHE, "character_details.json")
@@ -91,7 +95,9 @@ def build_entry(rid: str, g: dict, wiki: dict | None, gd: dict) -> dict:
     entry = dict(wiki or {})                      # 以 wiki 为骨架（保留 multi/discs/pot）
     entry["id"] = rid
     entry["title"] = names.get("en") or (wiki or {}).get("title") or rid
-    entry["name_cn"] = names.get("zh_hans") or (wiki or {}).get("name_cn") or rid
+    from lib.game_names import reconcile
+    reconcile(entry, {rid: g})
+    entry.pop("_card_hash", None)  # recompute from the complete merged card
     entry["stars"] = g.get("star") or (wiki or {}).get("stars")
     entry["element"] = ELEMENT_MAP_HINT.get(g.get("element") or "", (wiki or {}).get("element"))
     entry["element_en"] = g.get("element") or (wiki or {}).get("element_en")
@@ -106,6 +112,16 @@ def build_entry(rid: str, g: dict, wiki: dict | None, gd: dict) -> dict:
     for k in ("birthday", "height", "weight"):
         if card.get(k):
             entry[k] = card[k]
+    # 天赋/潜能：卡面渲染器只认 wiki 的 discs / team_pot / self_pot；
+    # 没有 wiki 词条的角色（实测 19 个新角色）用解包侧导出值兜底。
+    talents = g.get("talents") or []
+    if talents and not entry.get("discs"):
+        entry["discs"] = talents
+    pot = g.get("potential") or {}
+    if pot.get("team") and not entry.get("team_pot"):
+        entry["team_pot"] = pot["team"]
+    if pot.get("self") and not entry.get("self_pot"):
+        entry["self_pot"] = pot["self"]
     # 数值：方案甲 —— gamedata 全 7 维；卡面沿用 wiki 的 4 键版式，多余 3 维进 stats_ext
     if g.get("stats"):
         s = g["stats"]
