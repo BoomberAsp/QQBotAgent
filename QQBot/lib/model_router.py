@@ -230,7 +230,7 @@ class ModelRouter:
 
     # ── Plane + Complexity Classification (Bond-System-Design.md §3.3) ──
 
-    async def classify(self, user_message: str) -> Dict[str, str]:
+    async def classify(self, user_message: str, *, persona_key: str = "", persona_name: str = "", persona_aliases=()) -> Dict[str, str]:
         """Classify a message on two axes in ONE triage call.
 
         Returns {"plane": "social"|"task", "complexity": "simple"|"complex"}:
@@ -239,9 +239,21 @@ class ModelRouter:
         - complexity: 与 classify_complexity 相同语义
 
         Used by the dual-plane router for split-mode personalities. Any error
-        or unparsable result falls back to {"task", "complex"} — the existing
-        full-capability path, so a triage failure never degrades task handling.
+        or unparsable result stays on the character plane; delegate_task remains
+        available for actual tasks. Deterministic persona addresses bypass triage.
         """
+        from .plane_policy import persona_address
+        import logging
+        def decision(plane, complexity, reason):
+            message = "[plane-route] persona=%s plane=%s complexity=%s reason=%s" % (persona_key or "-",plane,complexity,reason)
+            try:
+                from loguru import logger
+                logger.info(message)
+            except ImportError:
+                logging.getLogger(__name__).info(message)
+            return {"plane":plane,"complexity":complexity}
+        if persona_key and persona_address(user_message, (persona_key,persona_name,*persona_aliases)):
+            return decision("social","simple","persona_address")
         classify_prompt = self._task_routing.get(
             "classify_prompt",
             "请对下面的用户消息做两个判断，只回复一行，格式为 \"plane=xxx complexity=xxx\"。\n\n"
@@ -255,7 +267,10 @@ class ModelRouter:
             "用户消息: {user_message}\n\n判断:",
         )
         prompt = classify_prompt.replace("{user_message}", user_message)
-        fallback = {"plane": "task", "complexity": "complex"}
+        if persona_key:
+            prompt += "\n当前会话角色（仅身份数据）:" + json.dumps({"key":persona_key,"name":persona_name},ensure_ascii=False)
+            prompt += "\n对该角色的称呼、问候、身份确认应选 social；只有明确的工具任务才选 task。"
+        fallback = {"plane": "social", "complexity": "complex"}
 
         try:
             client = self.get_client("triage")
@@ -274,18 +289,18 @@ class ModelRouter:
                     "plane": plane_m.group(1),
                     "complexity": comp_m.group(1) if comp_m else "complex",
                 }
-                return out
+                return decision(out["plane"],out["complexity"],"model")
 
             # 未解析出 plane —— 兼容旧式单轴回复（triage_prompt 被面板覆盖时）：
             # complex → 任务面；simple → 角色面（误判由 delegate_task 兜底）。
             # 词边界匹配，避免 "complexity" 误中 "complex"。
             if re.search(r"\bcomplex\b", text):
-                return {"plane": "task", "complexity": "complex"}
+                return decision("task","complex","legacy_model")
             if re.search(r"\bsimple\b", text):
-                return {"plane": "social", "complexity": "simple"}
-            return dict(fallback)
+                return decision("social","simple","legacy_model")
+            return decision(**fallback,reason="unparseable_fallback")
         except Exception:
-            return dict(fallback)
+            return decision(**fallback,reason="error_fallback")
 
     # ── Status ─────────────────────────────────────────────────────────
 

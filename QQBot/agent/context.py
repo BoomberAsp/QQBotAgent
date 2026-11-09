@@ -182,3 +182,6 @@ _current_story_char_id: contextvars.ContextVar[str] = (
 )
 
 _current_evidence_id = contextvars.ContextVar("_current_evidence_id", default="")
+
+# Internal execution persona must not replace the user-selected public identity.
+_current_task_persona = contextvars.ContextVar("_current_task_persona", default="")

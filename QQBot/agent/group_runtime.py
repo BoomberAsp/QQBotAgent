@@ -91,6 +91,9 @@ class GroupRun:
             "不要猜测或透露私聊历史、私人关系细节、个人文件；不要公开好感数值。"
             "回答简洁，通常不超过800字；工具不可用时说明，不声称完成未执行的操作。\n"
             + ("你是中立任务助手。" if _delegate_depth.get() else self.persona_text)))]
+        if _delegate_depth.get():
+            from lib.plane_policy import task_presentation
+            messages.append(dict(role="system",content=task_presentation(self.persona)))
         if self.autonomous and not _delegate_depth.get():
             messages.append(dict(role="system",content=
                 "本轮是群内非召唤消息，由你结合人格、近期上下文和成员关系自行决定是否参与。"
@@ -336,7 +339,7 @@ async def run_group_turn(view, sender=None):
                               (ctx._current_group_id,view.group_id),(ctx._current_user_id,"group_"+__import__("hashlib").sha256(scope.encode()).hexdigest()[:24]),
                               (ctx._current_user_role,role),(ctx._current_user_workspace,str(group_workspace)),
                               (ctx._on_file_created,None),(ctx._current_sender,None),
-                              (ctx._current_bond_context,""),(ctx._current_story_context,""),
+                              (ctx._current_bond_context,""),(ctx._current_task_persona,""),(ctx._current_story_context,""),
                               (ctx._current_story_char_id,""),(ctx._personality_transition,""),
                               (ctx._current_render_context,""),(ctx._delegate_depth,0)):
                 tokens.append((var,var.set(value)))

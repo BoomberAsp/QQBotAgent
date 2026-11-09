@@ -60,7 +60,7 @@ from agent.context import (
     _personality_transition, _on_file_created, _current_quota_bytes,
     _pending_task_fold, _current_bond_context, _delegate_depth,
     _current_story_context, _current_story_char_id, _current_render_context,
-    _turn_keyboard,
+    _turn_keyboard, _current_task_persona,
 )
 from lib.button_spec import max_rows as _button_max_rows, max_per_row as _button_max_per_row
 from lib.button_spec import Btn, Rows, to_text as _buttons_to_text
@@ -2973,7 +2973,7 @@ async def handle_agent_turn(view: InboundMessage):
             client = _model_router.flash_client
         elif not is_special:
             if persona_mode == "split":
-                _cls = await _model_router.classify(augmented_message)
+                _cls = await _model_router.classify(augmented_message, persona_key=persona_key, persona_name=pm.get_display_name(persona_key), persona_aliases=(pm.get_short_name(persona_key),))
                 plane = _cls.get("plane", "task")
                 complexity = _cls.get("complexity", "complex")
             else:
@@ -3102,6 +3102,7 @@ async def handle_agent_turn(view: InboundMessage):
             _current_personality.set(
                 "assistant" if persona_mode == "split" else persona_key
             )
+        _current_task_persona.set(persona_key if persona_mode == "split" and not character_plane and not is_creation and not is_scene else "")
         # story_search only for allowlisted personas (schema filtering; the
         # executor additionally refuses tools outside allowed_tools).
         if not _story_persona_ok:
@@ -3188,7 +3189,10 @@ async def handle_agent_turn(view: InboundMessage):
             # Best-effort: rewrite the persisted assistant turn so stored
             # session history reads in the character's voice (verbatim-match
             # guard inside skips it if the turn was already folded/compressed).
-            if session_type == "temporary":
+            if session_type == "special" and active_special:
+                _special_sessions.replace_last_assistant(user_id, raw_response, response,
+                    expected_session_id=active_special.session_id)
+            else:
                 repatch_last_assistant(_session_manager, user_id, raw_response, response)
 
         # ── Stream close / fallback tree (§6.10.11.2, 2026-10-30 重写) ──
@@ -3505,7 +3509,7 @@ async def handle_continuous_turn(view: InboundMessage):
 
         plane = "task"
         if persona_mode == "split":
-            _cls = await _model_router.classify(augmented_message)
+            _cls = await _model_router.classify(augmented_message, persona_key=persona_key, persona_name=pm.get_display_name(persona_key), persona_aliases=(pm.get_short_name(persona_key),))
             plane = _cls.get("plane", "task")
             complexity = _cls.get("complexity", "complex")
         else:
@@ -3570,6 +3574,7 @@ async def handle_continuous_turn(view: InboundMessage):
                 _current_personality.set(
                     "assistant" if persona_mode == "split" else persona_key
                 )
+            _current_task_persona.set(persona_key if persona_mode == "split" and not character_plane else "")
             _delegate_depth.set(0)
             _personality_transition.set(_personality_switch_marker.get(user_id, ""))
 

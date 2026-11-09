@@ -729,6 +729,12 @@ class Agent:
             if persona_content:
                 system_content += "\n\n---\n\n" + persona_content
 
+        from .context import _current_task_persona
+        from lib.plane_policy import task_presentation
+        presentation = task_presentation(_current_task_persona.get())
+        if presentation:
+            system_content += "\n\n## 当前对外身份边界\n" + presentation
+
         # ── L2: group feature restrictions (stable per group) ──
         group_ctx = _current_group_context.get()
         if group_ctx:

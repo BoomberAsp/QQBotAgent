@@ -80,7 +80,7 @@ async def run_delegated_task(
     """
     from agent.context import (
         _delegate_depth, _current_personality, _current_bond_context,
-        _pending_task_fold,
+        _pending_task_fold, _current_task_persona,
     )
 
     if not user_id:
@@ -109,6 +109,8 @@ async def run_delegated_task(
     if current_group_run.get() is None and not active(current_story_scope.get()):
         allowed.discard("story_search")
 
+    origin = _current_task_persona.get() or _current_personality.get()
+    origin_token = _current_task_persona.set(origin)
     tokens = (
         _delegate_depth.set(1),
         _current_personality.set("assistant"),   # 任务面 = Roxy 中立人格
@@ -152,6 +154,7 @@ async def run_delegated_task(
         _delegate_depth.reset(tokens[0])
         _current_personality.reset(tokens[1])
         _current_bond_context.reset(tokens[2])
+        _current_task_persona.reset(origin_token)
 
 
 async def revoice_task_result(
@@ -171,6 +174,8 @@ async def revoice_task_result(
     摘要且被要求只输出一句开场白，从结构上杜绝改写事实。
     LLM 失败/超时/输出不合格 → 降级模板开场白。
     """
+    from lib.plane_policy import strip_worker_identity
+    response = strip_worker_identity(response, user_request)
     opening: Optional[str] = None
     if use_llm and client is not None and persona_content:
         try:
