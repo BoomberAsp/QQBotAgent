@@ -23,7 +23,12 @@ def local_file(root, name):
     return p
 
 
-def retrieve(persona, query, scope, limit=4):
+def retrieve(persona, query, scope, limit=4, valid=None):
+    from lib.story_router import make_scope, hsr_injection
+    story_scope = make_scope(persona, scope, valid)
+    if story_scope and story_scope.game == 'hsr':
+        return hsr_injection(persona, query, story_scope)
+
     config,root=registry()
     if root is None:
         return ''
@@ -54,6 +59,17 @@ def story_search(query='',limit=4):
     run=current_group_run.get()
     if run is None or not run.valid():
         return '本工具仅用于有效群任务。'
+    from lib.story_router import make_scope, tool_search, current_story_scope, active
+    inherited = current_story_scope.get()
+    if inherited is not None and not active(inherited):
+        return '当前群资料作用域已失效。'
+    story_scope = make_scope(run.persona, run.scope, run.valid)
+    if story_scope and story_scope.game == 'hsr':
+        from lib.story_router import current_story_scope, active
+        inherited = current_story_scope.get()
+        if inherited is None or not active(inherited) or inherited.persona != run.persona or inherited.audience != run.scope:
+            return '当前群资料作用域已失效。'
+        return tool_search(query, limit, inherited)
     return retrieve(run.persona,query,run.scope,limit) or '当前人格可用知识库中未找到资料。'
 
 

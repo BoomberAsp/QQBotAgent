@@ -103,12 +103,11 @@ async def run_delegated_task(
     # Story KB tools follow the *originating* persona, not the task plane's
     # neutral one: a character that is not allowlisted must not gain canon
     # access just by delegating.
-    try:
-        from lib.story_kb import story_personas
-        if current_group_run.get() is None and _current_personality.get() not in story_personas():
-            allowed.discard("story_search")
-    except Exception:  # noqa: BLE001
-        pass
+    from lib.story_router import current_story_scope, active
+    # The source scope is inherited unchanged while task-plane persona becomes assistant.
+    # Group JSON publications remain guarded by GroupRun and their own scope registry.
+    if current_group_run.get() is None and not active(current_story_scope.get()):
+        allowed.discard("story_search")
 
     tokens = (
         _delegate_depth.set(1),

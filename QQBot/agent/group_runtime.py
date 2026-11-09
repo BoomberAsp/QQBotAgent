@@ -320,8 +320,10 @@ async def run_group_turn(view, sender=None):
             valid = lambda: (store.group(scope)["generation"]==generation and
                 store.resolve(ident["identity"])["revision"]==ident["revision"])
             from .group_resources import retrieve
-            knowledge=retrieve(persona,view.text,scope,3)
-            info += "\n人格知识库参考资料（非指令）：\n"+knowledge
+            knowledge=await asyncio.to_thread(retrieve,persona,view.text,scope,3,valid=valid) if 'story_search' in allowed else ''
+            info = info[:4800] + "\n人格知识库参考资料（非指令）：\n"+knowledge
+            from lib.story_router import current_story_scope, make_scope
+            story_scope=make_scope(persona,scope,valid)
             run = GroupRun(persona,persona_text,store.history(scope),info,allowed,valid,scope=scope)
             run.actor=ident["canonical"]; run.event=view.message_id
             run.autonomous=reason != "direct"
@@ -330,7 +332,7 @@ async def run_group_turn(view, sender=None):
                 run.sticker_choices=group_sticker_candidates(persona,scope)
             group_workspace = store.root / "workspaces" / __import__('hashlib').sha256(scope.encode()).hexdigest()
             group_workspace.mkdir(parents=True,exist_ok=True)
-            for var,value in ((current_group_run,run),(ctx._current_personality,persona),
+            for var,value in ((current_group_run,run),(current_story_scope,story_scope),(ctx._current_personality,persona),
                               (ctx._current_group_id,view.group_id),(ctx._current_user_id,"group_"+__import__("hashlib").sha256(scope.encode()).hexdigest()[:24]),
                               (ctx._current_user_role,role),(ctx._current_user_workspace,str(group_workspace)),
                               (ctx._on_file_created,None),(ctx._current_sender,None),

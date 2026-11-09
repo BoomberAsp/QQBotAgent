@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "kbs": {
+    "ark_re": {"game": "ark_re", "driver": "ark_legacy"},
+    "hsr": {"game": "hsr", "driver": "hsr_local", "path": "story_kb/hsr/story.db"}
+  },
+  "bindings": {
+    "rubi": {"kb_id": "ark_re", "auto_inject": true},
+    "assistant": {"kb_id": "ark_re", "neutral": true, "auto_inject": true},
+    "herta": {"kb_id": "hsr", "neutral": true, "auto_inject": true}
+  }
+}

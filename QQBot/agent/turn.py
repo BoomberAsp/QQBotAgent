@@ -2265,25 +2265,13 @@ def _story_log(message: str) -> None:
 
 
 def _story_persona_allowed(persona_key: str) -> bool:
-    """True when this persona may use story memory (config/story_personas.json)."""
-    if not persona_key:
-        return False
-    try:
-        from lib.story_kb import story_personas
-        return persona_key in story_personas()
-    except Exception:  # noqa: BLE001 — never block a turn on config issues
-        return persona_key in ("rubi", "assistant")
+    from lib.story_router import binding
+    return bool(binding(persona_key))
 
 
 def _story_neutral_persona(persona_key: str) -> bool:
-    """True when this persona may inject without a story character mapping."""
-    if not persona_key:
-        return False
-    try:
-        from lib.story_kb import story_neutral_personas
-        return persona_key in story_neutral_personas()
-    except Exception:  # noqa: BLE001
-        return persona_key == "assistant"
+    from lib.story_router import binding
+    return bool((binding(persona_key) or {}).get("neutral", False))
 
 
 def _story_char_id_for(persona_key: str, pm) -> str:
@@ -2304,6 +2292,21 @@ def _build_story_context(persona_key: str, query: str, pm) -> tuple:
         # 逐人格白名单：不在 config/story_personas.json 里的人格完全不注入。
         if not _story_persona_allowed(persona_key):
             return "", ""
+        from lib.story_router import binding, current_story_scope, hsr_injection, make_scope, active
+        item = binding(persona_key)
+        if not item:
+            return "", ""
+        if not item.get("auto_inject", True):
+            return "", ""
+        if item and item["kb_id"]:
+            scope = current_story_scope.get()
+            if scope is None or scope.persona != persona_key:
+                scope = make_scope(persona_key)
+            if not active(scope):
+                return "", ""
+            if scope.game == "hsr":
+                q = _story_query_from(query)
+                return (hsr_injection(persona_key, q, scope, _STORY_INJECT_CHARS) if q else ""), ""
         kb = get_story_kb()
         if not kb.available:
             return "", ""
@@ -2330,7 +2333,7 @@ def _build_story_context(persona_key: str, query: str, pm) -> tuple:
         if block:
             _story_log(f"[story-kb] inject {len(block)}c persona={persona_key} "
                        f"char={char_id or '-'} q={q[:40]!r}")
-        return block or "", char_id
+        return (block or "", char_id) if active(scope) else ("", "")
     except Exception:  # noqa: BLE001 — never break a reply
         return "", ""
 
@@ -2341,37 +2344,20 @@ def _story_search(query: str = "", limit: int = 4) -> str:
     if current_group_run.get() is not None:
         from .group_resources import story_search
         return story_search(query,limit)
-    try:
-        from lib.story_kb import get_story_kb
+    from lib.story_router import tool_search
+    return tool_search(query, limit)
 
-        kb = get_story_kb()
-        if not kb.available:
-            return (f"[story_search] 剧情知识库尚未构建（{kb.db_path} 不存在）。"
-                    f"管理员可运行 python scripts/build_story_kb.py --all 生成。")
-        q = (query or "").strip()
-        if not q:
-            return "[story_search] 请提供要查询的关键词（角色名、事件名、章节等）。"
-        try:
-            limit = max(1, min(int(limit), 8))
-        except (TypeError, ValueError):
-            limit = 4
-        out = kb.format_tool_result(
-            q, limit=limit, persona_char_id=_current_story_char_id.get(),
-        )
-        _story_log(f"[story-kb] tool q={q[:40]!r} limit={limit} "
-                   f"-> {len(out)}c{' (miss)' if '没有找到' in out else ''}")
-        return out
-    except Exception as exc:  # noqa: BLE001
-        return f"[story_search] 检索失败：{type(exc).__name__}: {exc}"
+
+async def _story_search_async(query: str = "", limit: int = 4) -> str:
+    # Copy request ContextVars into the worker; first activation may hash a large DB.
+    return await asyncio.to_thread(_story_search, query, limit)
 
 
 _tool_registry.register(
-    "story_search", _story_search,
-    "人格所属知识库检索（群内按人格映射与资料访问权限检索，不按剧情进度过滤；私聊兼容原剧情库）。当用户询问游戏剧情、角色过往、"
-    "活动故事或世界观事件（如「第一次方舟战争」「谁是指挥官高文」「露比的过去」）时，"
-    "用此工具取回台词原文（英文）与中文梗概。返回内容含场景出处、单元梗概、"
-    "本段梗概与对白摘录；回复时请把英文台词译成中文转述，不要整段照抄。"
-    "查不到时换用角色名/事件名的其他说法重试。",
+    "story_search", _story_search_async,
+    "查询当前来源人格绑定的原作资料库。工具不能切换作品；委派继承来源人格。"
+    "星穹铁道返回中文语音、阅读物或任务资料及来源/分支条件，不能当作角色亲历。"
+    "旧 Ark 资料可能包含英文对白，应中文转述。使用角色名、话题、书名等关键词，查不到就说明资料不足。",
     {
         "type": "object",
         "properties": {
@@ -3085,6 +3071,9 @@ async def handle_agent_turn(view: InboundMessage):
         # Personas not on the list get neither the L4 injection nor the
         # story_search tool, so UGC characters never recite the game's canon.
         _story_persona_ok = _story_persona_allowed(persona_key)
+        from lib.story_router import current_story_scope, make_scope
+        current_story_scope.set(None if (is_creation or is_scene) else make_scope(
+            persona_key, "private:" + _current_platform.get() + ":" + str(user_id)))
         if is_creation:
             # UGC creation interview: neutral assistant persona (globally-shared
             # cache prefix), only the create_character tool exposed, no bond.
@@ -3129,8 +3118,8 @@ async def handle_agent_turn(view: InboundMessage):
         _story_block, _story_char = "", ""
         if _story_persona_ok and not is_creation and not is_scene:
             if character_plane or persona_mode != "split":
-                _story_block, _story_char = _build_story_context(
-                    persona_key, text_content or augmented_message, pm)
+                _story_block, _story_char = await asyncio.to_thread(
+                    _build_story_context, persona_key, text_content or augmented_message, pm)
         _current_story_context.set(_story_block)
         _current_story_char_id.set(_story_char)
 
@@ -3566,6 +3555,8 @@ async def handle_continuous_turn(view: InboundMessage):
             # ── Plane context ──
             character_plane = (persona_mode == "split" and plane == "social")
             _story_persona_ok = _story_persona_allowed(persona_key)
+            from lib.story_router import current_story_scope, make_scope
+            current_story_scope.set(make_scope(persona_key, "private:" + _current_platform.get() + ":" + str(user_id)))
             if character_plane:
                 client = _model_router.flash_client
                 # Social plane keeps only delegate_task (+ window control).
@@ -3588,8 +3579,8 @@ async def handle_continuous_turn(view: InboundMessage):
                 allowed_tools = set(allowed_tools) - {"story_search"}
             _story_block, _story_char = "", ""
             if _story_persona_ok and (character_plane or persona_mode != "split"):
-                _story_block, _story_char = _build_story_context(
-                    persona_key, text_content or augmented_message, pm)
+                _story_block, _story_char = await asyncio.to_thread(
+                    _build_story_context, persona_key, text_content or augmented_message, pm)
             _current_story_context.set(_story_block)
             _current_story_char_id.set(_story_char)
 
