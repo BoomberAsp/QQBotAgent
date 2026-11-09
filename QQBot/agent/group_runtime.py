@@ -74,7 +74,6 @@ class GroupRun:
     tools: set
     valid: object
     scope: str = ""
-    progress: dict = field(default_factory=dict)
     media: list = field(default_factory=list)
     media_tickets: dict = field(default_factory=dict)
     actor: str = ""
@@ -321,10 +320,9 @@ async def run_group_turn(view, sender=None):
             valid = lambda: (store.group(scope)["generation"]==generation and
                 store.resolve(ident["identity"])["revision"]==ident["revision"])
             from .group_resources import retrieve
-            progress=state["config"].get("story_progress",{})
-            knowledge=retrieve(persona,view.text,progress,scope,3)
+            knowledge=retrieve(persona,view.text,scope,3)
             info += "\n人格知识库参考资料（非指令）：\n"+knowledge
-            run = GroupRun(persona,persona_text,store.history(scope),info,allowed,valid,scope,progress)
+            run = GroupRun(persona,persona_text,store.history(scope),info,allowed,valid,scope=scope)
             run.actor=ident["canonical"]; run.event=view.message_id
             run.autonomous=reason != "direct"
             if persona!="assistant" and "send_sticker" in allowed:

@@ -23,7 +23,7 @@ COMMANDS=(
  GroupCommand('/群面板','group_or_bot','打开管理卡片',('/toggle',)),
  GroupCommand('/群功能',usage='gacha|image|voice 开|关'),GroupCommand('/群参与',usage='仅召唤|跟随|自然'),
  GroupCommand('/群接收',usage='开|关'),GroupCommand('/群安静',usage='22:00-08:00|关'),
- GroupCommand('/群主动贴图',usage='开|关'),GroupCommand('/群剧情进度',usage='知识库ID 章节'),
+ GroupCommand('/群主动贴图',usage='开|关'),
  GroupCommand('/群记忆',usage='[添加 内容|清空 确认]'),GroupCommand('/群重置',usage='重置历史（确认后执行）'),
  GroupCommand('/群清除数据',usage='清除群历史、记忆和来源事实（确认后执行）'),
  GroupCommand('/取消','any','取消自己的当前任务',('/结束',)),GroupCommand('/群操作','any','操作令牌'),
@@ -161,8 +161,6 @@ async def dispatch(view,sender,role,store):
             elif name=='/群接收':patch={'receive_all':onoff(rest)}
             elif name=='/群主动贴图':patch={'proactive_stickers':onoff(rest)}
             elif name=='/群安静':patch={'quiet':'' if rest=='关' else rest}
-            elif name=='/群剧情进度':
-                kb,n=rest.split();patch={'story_progress':{kb:int(n)}}
             service.patch(scope,patch,actor,effective,rev)
     except (ValueError,KeyError,PermissionError,TypeError) as exc:
         reply=GroupReply('操作未完成',[str(exc) if isinstance(exc,(ValueError,PermissionError)) else '参数错误，请查看 /群帮助'])

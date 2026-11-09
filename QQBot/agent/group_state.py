@@ -33,7 +33,7 @@ DEFAULTS = dict(persona="assistant", mode="mention", receive_all=False,
                 quiet="", active_enabled=True, status="active",
                 cooldown=120, auto_daily_cap=100, follow_seconds=120,
                 follow_limit=2, scheduled_push_enabled=False, features={"gacha":True,"image":True,"voice":True},
-                memo="",persona_pending=None,platform_full_events="unknown",proactive_stickers=False,story_progress={})
+                memo="",persona_pending=None,platform_full_events="unknown",proactive_stickers=False)
 
 
 class GroupStore:
@@ -82,6 +82,17 @@ class GroupStore:
             db.execute("CREATE INDEX IF NOT EXISTS facts_scope_persona ON facts(scope,source_persona,identity)")
             if 'config_revision' not in {r[1] for r in db.execute('PRAGMA table_info(groups)')}:
                 db.execute('ALTER TABLE groups ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0')
+            # Retire only story-progress configuration; preserve history and other settings.
+            db.execute("CREATE TABLE IF NOT EXISTS retired_story_progress(scope TEXT PRIMARY KEY,value TEXT NOT NULL,retired_at REAL NOT NULL)")
+            for scope, raw in db.execute('SELECT scope,config FROM groups').fetchall():
+                cfg = json.loads(raw)
+                if 'story_progress' not in cfg:
+                    continue
+                retired = cfg.pop('story_progress')
+                db.execute('INSERT OR IGNORE INTO retired_story_progress VALUES (?,?,?)',
+                           (scope,json.dumps(retired,ensure_ascii=False),time.time()))
+                db.execute('UPDATE groups SET config=?,generation=generation+1,config_revision=config_revision+1 WHERE scope=?',
+                           (json.dumps(cfg,ensure_ascii=False),scope))
             db.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version','2')")
             if not db.execute("SELECT 1 FROM meta WHERE key='auto_limits_v2'").fetchone():
                 for scope,raw in db.execute('SELECT scope,config FROM groups').fetchall():

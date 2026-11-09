@@ -20,7 +20,7 @@ class GroupService:
 
     def patch(self,scope,patch,actor,role,expected=None,prompt=False):
         if not isinstance(patch,dict):raise ValueError('配置必须为对象')
-        allowed={'memo','persona','features','mode','receive_all','quiet','proactive_stickers','story_progress','history','auto_daily_cap','cooldown','follow_limit','follow_seconds'}
+        allowed={'memo','persona','features','mode','receive_all','quiet','proactive_stickers','history','auto_daily_cap','cooldown','follow_limit','follow_seconds'}
         if set(patch)-allowed:raise ValueError('包含不可写字段')
         if role not in ('admin','group_or_bot'):raise PermissionError('需要群管理员或机器人管理员权限')
         patch=dict(patch)
@@ -40,16 +40,11 @@ class GroupService:
         if 'features' in patch:
             f=patch['features']
             if not isinstance(f,dict) or set(f)-{'image','voice','gacha'} or any(type(v) is not bool for v in f.values()):raise ValueError('功能开关无效')
-        if 'story_progress' in patch:
-            from .group_resources import registry
-            registered=registry()[0].get('knowledge_bases',{})
-            v=patch['story_progress']
-            if not isinstance(v,dict) or any(k not in registered or type(n) is not int or not 0<=n<=1000000 for k,n in v.items()):raise ValueError('剧情库或章节无效')
         def apply(db,c,m,row):
             old=c['persona'];new=patch.get('persona',old)
             for k,v in patch.items():
                 if k=='history':continue
-                if k in ('features','story_progress'):c[k]={**c.get(k,{}),**v}
+                if k=='features':c[k]={**c.get(k,{}),**v}
                 else:c[k]=v
             if patch.get('receive_all') is False:c['mode']='mention'
             if c['mode']!='mention' and not c['receive_all']:raise ValueError('请先开启非 @ 上下文接收')

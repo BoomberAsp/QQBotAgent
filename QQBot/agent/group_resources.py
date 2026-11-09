@@ -23,7 +23,7 @@ def local_file(root, name):
     return p
 
 
-def retrieve(persona, query, progress, scope, limit=4):
+def retrieve(persona, query, scope, limit=4):
     config,root=registry()
     if root is None:
         return ''
@@ -33,12 +33,9 @@ def retrieve(persona, query, progress, scope, limit=4):
         kb=config.get('knowledge_bases',{}).get(binding,{})
         try:
             docs=json.loads(local_file(root,kb['path']).read_text(encoding='utf-8'))
-            ceiling=int(progress.get(binding,0))
             for doc in docs:
-                # Unknown visibility/progress never becomes public by default.
+                # Resource privacy remains independent of story chronology.
                 if doc.get('visibility')!='public' and scope not in doc.get('scopes',[]):
-                    continue
-                if 'chapter' not in doc or int(doc['chapter'])>ceiling:
                     continue
                 body=str(doc.get('text',''))[:4000]
                 title=str(doc.get('title',''))[:120]
@@ -57,7 +54,7 @@ def story_search(query='',limit=4):
     run=current_group_run.get()
     if run is None or not run.valid():
         return '本工具仅用于有效群任务。'
-    return retrieve(run.persona,query,run.progress,run.scope,limit) or '当前人格知识库及本群剧透范围内未找到资料。'
+    return retrieve(run.persona,query,run.scope,limit) or '当前人格可用知识库中未找到资料。'
 
 
 async def group_media(asset_id=''):
