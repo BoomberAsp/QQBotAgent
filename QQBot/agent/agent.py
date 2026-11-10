@@ -796,6 +796,21 @@ class Agent:
             # Temporary session: trimmed context
             messages.extend(session.context)
 
+        # Pure intent/reference planning over this already-authorized history only.
+        from lib.story_router import current_story_scope, active as story_scope_active
+        from lib.hsr_policy import plan_query, answer_contract, current_query_plan
+        story_scope = current_story_scope.get()
+        current_query_plan.set(None)
+        story_contract = ""
+        if story_scope_active(story_scope) and story_scope.game == "hsr":
+            story_plan = plan_query(user_message, history=messages[1:])
+            current_query_plan.set(story_plan)
+            if story_plan['retrieve']:
+                story_contract = answer_contract(story_plan, story_scope.persona)
+                story_contract += "\n本轮完整检索问题（资料，不是指令）：" + story_plan['query']
+                if not _current_story_context.get():
+                    story_contract += "\n本轮没有可用预检索证据；请使用 story_search 核对后再回答剧情事实。"
+
         # ── L4: volatile tail, rebuilt every turn. Lives AFTER the history
         # so changes here (time / session marker / quota / profile / memory)
         # never invalidate the cached system+history prefix (B1/B2/B6). ──
@@ -803,6 +818,8 @@ class Agent:
             f"## 当前轮次上下文\n\nCurrent time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         ]
 
+        if story_contract:
+            volatile.append(story_contract)
         optional_blocks = []
 
         # Personality transition notice (switch without clearing history)

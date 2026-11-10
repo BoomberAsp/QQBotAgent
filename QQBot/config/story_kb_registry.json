@@ -27,6 +27,11 @@
       "kb_id": "hsr",
       "neutral": true,
       "auto_inject": true
+    },
+    "nous": {
+      "kb_id": "hsr",
+      "neutral": true,
+      "auto_inject": true
     }
   }
 }

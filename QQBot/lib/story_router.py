@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from .hsr_story import HsrStoryKB, render
+from .hsr_story import HsrStoryKB, render_result
 
 log=logging.getLogger(__name__)
 current_story_scope=contextvars.ContextVar('current_story_scope', default=None)
@@ -139,8 +139,27 @@ def tool_search(query='',limit=4,scope=None):
     try:
         if scope.game=='hsr':
             reader=_hsr(scope)
-            hits=reader.search(query,limit)
-            result=render(hits,6000) or '[story_search] 当前 HSR 库未找到匹配的已归属资料，请换用角色名、话题或书名。'
+            from .hsr_policy import current_query_plan, plan_query
+            request_plan = current_query_plan.get()
+            # Preserve the user's time constraint even when a tool call abbreviates it.
+            if request_plan and request_plan['retrieve']:
+                if plan_query(query, names=reader.entities)['unresolved']:
+                    query = request_plan['query']
+                if request_plan['intent'] == 'quote' and not any(w in query for w in ('原文','逐字','台词','引用')):
+                    query += ' 原文'
+                if (request_plan['time'] == 'latest' and request_plan['intent'] != 'quote'
+                        and any(w in request_plan['query'] for w in ('现在','目前','最新','如今','现状','后来','结局','怎么样'))
+                        and not any(w in query for w in ('当时','之前','截至'))):
+                    query += ' 现在'
+                elif request_plan['time'] == 'historical':
+                    query = request_plan['query'] + ' ' + query
+            evidence=reader.retrieve(query,limit)
+            hits=evidence['hits']
+            result=render_result(evidence,persona=scope.persona,budget=6000)
+            if not result:
+                result='[story_search] 该问题不属于剧情资料检索范围。'
+            audit('story evidence intent=%s time=%s status=%s cards=%s', evidence['plan']['intent'],
+                  evidence['plan']['time'], evidence['status'], [c['id'] for c in evidence['cards']])
             audit('story tool persona=%s game=hsr audience=%s build=%s chunks=%s',scope.persona,
                      hashlib.sha256(scope.audience.encode()).hexdigest()[:12],reader.meta['build_id'],[h['chunk_id'] for h in hits])
         else:
@@ -153,14 +172,19 @@ def tool_search(query='',limit=4,scope=None):
         return '[story_search] '+('HSR' if scope.game=='hsr' else 'Ark')+' 资料库不可用；未切换到其他作品。'
 
 
-def hsr_injection(persona,query,scope=None,budget=1800):
+def hsr_injection(persona,query,scope=None,budget=3200):
     scope=scope or make_scope(persona)
     if not active(scope) or scope.persona!=persona or scope.game!='hsr' or not binding(persona).get('auto_inject',True):
         return ''
     try:
         reader=_hsr(scope)
-        hits=reader.search(query,2)
-        result=render(hits,budget)
+        evidence=reader.retrieve(query,4,automatic=True)
+        hits=evidence['hits']
+        # Automatic entry has no history; the message builder may resolve a
+        # follow-up later. Do not inject a premature clarification instruction.
+        result='' if evidence['status']=='needs_clarification' else render_result(evidence,persona=persona,budget=budget)
+        audit('story injection evidence intent=%s time=%s status=%s cards=%s', evidence['plan']['intent'],
+              evidence['plan']['time'], evidence['status'], [c['id'] for c in evidence['cards']])
         audit('story injection persona=%s game=hsr audience=%s build=%s chunks=%s',persona,
                  hashlib.sha256(scope.audience.encode()).hexdigest()[:12],reader.meta['build_id'],[h['chunk_id'] for h in hits])
         return result if active(scope) else ''

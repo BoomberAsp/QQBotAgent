@@ -831,34 +831,13 @@ P4 candidates, review, publication, rollback and mode controls are managed by tr
 
 ## Tool: story_search
 
-**Description**: Search the 《星陨计划 (Ark Re:Code)》 original-story knowledge base — every dialogue line of the main story (序章 / Part I–III, including the S-rank stages) and all limited-time event stories. Returns, for each hit: the scene's source label (chapter/event + scene title), the unit-level Chinese synopsis, the scene-level Chinese gist, and an excerpt of the **original English dialogue** with speaker names.
+查询当前来源人格绑定的原作资料库。注册表 `config/story_kb_registry.json` 控制作品与能力；委派继承来源人格。黑塔与博识尊使用 HSR；独立 assistant 与 rubi 保留 Ark。不能通过参数切库，缺库不回退其他作品。
 
-**When to use**:
-- The user asks about game plot, character backstory or world events: 剧情, 故事, 主线, 活动剧情, 谁是谁, 发生了什么, 后来怎么样了, 第一次方舟战争, 使徒, 三大方舟, 露比/伊娥丝/挪亚的过去…
-- A `## 剧情记忆（原作剧情检索命中）` block already appeared but you need more scenes than the two it carries
-- You are about to state something canon about Ark Re:Code and want to verify it instead of guessing
+用于剧情、人物经历、世界观、台词原文或解释的问题。参数 `query` 为完整检索问题，保留实体、任务名、现在/当时和原文要求；追问补全当前会话的对象。`limit` 为 1–8，默认 4。
 
-**Parameters**:
-```json
-{
-  "type": "object",
-  "properties": {
-    "query": {
-      "type": "string",
-      "description": "检索关键词：角色名、事件名、章节号或情节描述（中文优先）"
-    },
-    "limit": {
-      "type": "integer",
-      "description": "返回片段数，1-8，默认 4"
-    }
-  },
-  "required": ["query"]
-}
-```
+HSR 结果包括中文资料、来源、条件、目标时间和覆盖状态；状态卡属于转述，不能冒充原文，也不证明后续无变化。Ark 可能返回英文对白，按用户语言转述。查不到可以改写一次，但不能丢掉时间条件再把旧结果当现状。
 
-**Availability**: Gated by persona — only the personas listed in `config/story_personas.json` (default `rubi` + `assistant`) see this tool and receive the per-turn `## 剧情记忆` injection. Other personas (user-created characters, 角色 Roxy) get neither; edit that JSON to change it (takes effect on the next turn).
-
-**Note**: The corpus is English; always translate quoted dialogue into Chinese when answering. If a search returns nothing, retry once with a different phrasing (character name instead of a plot description) and then admit you don't have that part of the story — never invent plot details. The database is built offline by `python scripts/build_story_kb.py --all`; if the tool reports it is missing, tell the user to rebuild it.
+角色直接自然作答，原文保留说话者和出处；不要向用户复述内部字段、规则或流水。不将所有证据当成角色亲历，不捏造获知渠道。没有足够证据就说明可确认的范围。
 
 ---
 

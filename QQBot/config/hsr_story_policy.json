@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "revision": "2026-11-10-p01",
+  "live_anchor": {
+    "label": "4.6 千星城·月升之前，与兽共舞（篇章级，非末尾子任务ID）",
+    "verified_at": "2026-11-10T11:00:00+00:00",
+    "recheck_after": "2026-11-10T22:00:00+00:00",
+    "source": "https://hsr.hoyoverse.com/zh-cn/news/166468",
+    "coverage": "announcement_only_not_full_mission_text"
+  },
+  "aliases": {
+    "翁法罗斯": ["翁法羅斯", "Amphoreus"],
+    "大黑塔": ["黑塔本体", "黑塔本尊", "The Herta"],
+    "黑塔": ["黑塔人偶"],
+    "白厄": ["白厄哥"],
+    "昔涟": ["昔漣"],
+    "卡芙卡": ["Kafka"],
+    "三月七": ["三月", "March 7th"],
+    "丹恒": ["丹恆"],
+    "博识尊": ["博識尊", "Nous"],
+    "那刻夏": ["阿那克萨戈拉斯"],
+    "万敌": ["迈德漠斯"],
+    "风堇": ["雅辛忒丝"],
+    "赛飞儿": ["赛法利娅"],
+    "千星城": [],
+    "二相乐园": [],
+    "匹诺康尼": [],
+    "仙舟罗浮": ["罗浮"],
+    "星核猎手": [],
+    "星穹列车": [],
+    "帝皇权杖": [],
+    "盗火行者": [],
+    "铁墓": [],
+    "如我所书": []
+  },
+  "cards": [
+    {
+      "id": "amphoreus-3.7-main-ending",
+      "review_status": "source_checked",
+      "entities": ["翁法罗斯", "昔涟", "如我所书"],
+      "as_of": "3.7 开拓任务·落英啊，残芳纷飞留归躅",
+      "time_markers": ["3.7", "落英", "主线结局", "成为昨日的明天"],
+      "knowledge_scope": "narrator_only",
+      "claims": [
+        {"text": "这一阶段已走到逐火故事的收束：昔涟回溯并锚定因果，故事的终点与起点闭合。不能再把更早日志中的再创世之前当作该阶段现状。", "source_ids": ["main37"]}
+      ],
+      "sources": [{"id": "main37", "title": "BWIKI·落英啊，残芳纷飞留归躅（游戏对白转录）", "url": "https://wiki.biligame.com/sr/落英啊，残芳纷飞留归躅", "locator": "用仪式剑锚定最初的因果；找个温暖又熟悉的地方，好好休息吧", "checked_on": "2026-11-10", "license": "CC BY-NC-SA 4.0"}]
+    },
+    {
+      "id": "amphoreus-3.7-epilogue",
+      "review_status": "source_checked",
+      "entities": ["翁法罗斯", "昔涟", "如我所书"],
+      "as_of": "3.7 主线结束后的冒险任务《如我所书》（非开拓任务）",
+      "time_markers": ["3.7", "如我所书", "后日谈"],
+      "knowledge_scope": "narrator_only",
+      "claims": [
+        {"text": "昔涟留下的是不能对话的记忆留言；留言说明铁墓被封在过去，故事与花园随《如我所书》同行。", "source_ids": ["epilogue37"]},
+        {"text": "叙述展示了现实翁法罗斯的新生可能，真正生命的诞生仍属于未来；开拓者推动出版和传播故事。不能把这一愿景说成所有人已经复活。", "source_ids": ["epilogue37"]}
+      ],
+      "sources": [{"id": "epilogue37", "title": "BWIKI·《如我所书》（游戏对白转录）", "url": "https://wiki.biligame.com/sr/《如我所书》", "locator": "那是…昔涟？；探索全新的永恒一页；跟姬子和瓦尔特商讨此事", "checked_on": "2026-11-10", "license": "CC BY-NC-SA 4.0"}]
+    }
+  ]
+}

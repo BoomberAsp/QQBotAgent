@@ -2306,7 +2306,7 @@ def _build_story_context(persona_key: str, query: str, pm) -> tuple:
                 return "", ""
             if scope.game == "hsr":
                 q = _story_query_from(query)
-                return (hsr_injection(persona_key, q, scope, _STORY_INJECT_CHARS) if q else ""), ""
+                return (hsr_injection(persona_key, q, scope, 3200) if q else ""), ""
         kb = get_story_kb()
         if not kb.available:
             return "", ""
@@ -2357,13 +2357,13 @@ _tool_registry.register(
     "story_search", _story_search_async,
     "查询当前来源人格绑定的原作资料库。工具不能切换作品；委派继承来源人格。"
     "星穹铁道返回中文语音、阅读物或任务资料及来源/分支条件，不能当作角色亲历。"
-    "旧 Ark 资料可能包含英文对白，应中文转述。使用角色名、话题、书名等关键词，查不到就说明资料不足。",
+    "旧 Ark 资料可能包含英文对白，应中文转述。保留对象、现在或当时、任务名与原文要求；允许完整问句，查不到就说明资料不足。",
     {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "剧情检索关键词：角色名、事件名、章节号或情节描述",
+                "description": "剧情检索问题：保留角色、事件、章节、时间要求；追问先补全本会话指代",
             },
             "limit": {
                 "type": "integer",
@@ -3055,6 +3055,9 @@ async def handle_agent_turn(view: InboundMessage):
         if code_limits:
             _current_code_limits.set(code_limits.to_dict())
 
+        from lib.hsr_policy import native_story_turn
+        _hsr_native = (not is_creation and not is_scene and 'story_search' in allowed_tools
+                       and native_story_turn(persona_key, text_content or augmented_message))
         # ── Plane context (Bond-System-Design.md §3) ──
         # character_plane: split persona routed to social → L2 = 角色卡,
         #   tools = SOCIAL_TOOLS only (delegate_task fallback), bond state
@@ -3102,7 +3105,10 @@ async def handle_agent_turn(view: InboundMessage):
             _current_personality.set(
                 "assistant" if persona_mode == "split" else persona_key
             )
-        _current_task_persona.set(persona_key if persona_mode == "split" and not character_plane and not is_creation and not is_scene else "")
+        if _hsr_native:
+            _current_personality.set(persona_key)
+            allowed_tools = set(allowed_tools) | {"story_search"}
+        _current_task_persona.set(persona_key if persona_mode == "split" and not character_plane and not is_creation and not is_scene and not _hsr_native else "")
         # story_search only for allowlisted personas (schema filtering; the
         # executor additionally refuses tools outside allowed_tools).
         if not _story_persona_ok:
@@ -3118,7 +3124,7 @@ async def handle_agent_turn(view: InboundMessage):
         # neutral Roxy and reaches the KB through story_search instead.
         _story_block, _story_char = "", ""
         if _story_persona_ok and not is_creation and not is_scene:
-            if character_plane or persona_mode != "split":
+            if character_plane or persona_mode != "split" or _hsr_native:
                 _story_block, _story_char = await asyncio.to_thread(
                     _build_story_context, persona_key, text_content or augmented_message, pm)
         _current_story_context.set(_story_block)
@@ -3170,7 +3176,7 @@ async def handle_agent_turn(view: InboundMessage):
         # The social plane already speaks in character; unified personas are
         # never re-voiced. Creation interviews stay neutral (no revoice).
         if (persona_mode == "split" and not character_plane
-                and not is_creation and not is_scene):
+                and not is_creation and not is_scene and not _hsr_native):
             # Restore persona so _send_response's disclaimer is signed by the
             # character and revoice speaks in the character's voice.
             _current_personality.set(persona_key)
@@ -3556,6 +3562,9 @@ async def handle_continuous_turn(view: InboundMessage):
                     f"{augmented_message}"
                 )
 
+            from lib.hsr_policy import native_story_turn
+            _hsr_native = ('story_search' in allowed_tools and
+                           native_story_turn(persona_key, text_content or augmented_message))
             # ── Plane context ──
             character_plane = (persona_mode == "split" and plane == "social")
             _story_persona_ok = _story_persona_allowed(persona_key)
@@ -3574,7 +3583,10 @@ async def handle_continuous_turn(view: InboundMessage):
                 _current_personality.set(
                     "assistant" if persona_mode == "split" else persona_key
                 )
-            _current_task_persona.set(persona_key if persona_mode == "split" and not character_plane else "")
+            if _hsr_native:
+                _current_personality.set(persona_key)
+                allowed_tools = set(allowed_tools) | {"story_search"}
+            _current_task_persona.set(persona_key if persona_mode == "split" and not character_plane and not _hsr_native else "")
             _delegate_depth.set(0)
             _personality_transition.set(_personality_switch_marker.get(user_id, ""))
 
@@ -3583,7 +3595,7 @@ async def handle_continuous_turn(view: InboundMessage):
             if not _story_persona_ok:
                 allowed_tools = set(allowed_tools) - {"story_search"}
             _story_block, _story_char = "", ""
-            if _story_persona_ok and (character_plane or persona_mode != "split"):
+            if _story_persona_ok and (character_plane or persona_mode != "split" or _hsr_native):
                 _story_block, _story_char = await asyncio.to_thread(
                     _build_story_context, persona_key, text_content or augmented_message, pm)
             _current_story_context.set(_story_block)
@@ -3605,7 +3617,7 @@ async def handle_continuous_turn(view: InboundMessage):
             _current_sender.reset(token)
 
         # ── Revoicing layer (task plane of split persona; group → template) ──
-        if persona_mode == "split" and not character_plane:
+        if persona_mode == "split" and not character_plane and not _hsr_native:
             _current_personality.set(persona_key)
             raw_response = response
             response = await revoice_task_result(
