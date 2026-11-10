@@ -1,12 +1,32 @@
 {
   "schema": 1,
   "kbs": {
-    "ark_re": {"game": "ark_re", "driver": "ark_legacy"},
-    "hsr": {"game": "hsr", "driver": "hsr_local", "path": "story_kb/hsr/story.db"}
+    "ark_re": {
+      "game": "ark_re",
+      "driver": "ark_legacy"
+    },
+    "hsr": {
+      "game": "hsr",
+      "driver": "hsr_local",
+      "path": "story_kb/hsr/releases/web-20261110-014630-6f7053-4c44867c3977/story.db",
+      "sha256": "52801b6333c81a3d911d3c0f2040e1004a32d6abfa8664e8fb6e90bb44eff68f",
+      "build_id": "local-v2-f56fb61d23a3be2b"
+    }
   },
   "bindings": {
-    "rubi": {"kb_id": "ark_re", "auto_inject": true},
-    "assistant": {"kb_id": "ark_re", "neutral": true, "auto_inject": true},
-    "herta": {"kb_id": "hsr", "neutral": true, "auto_inject": true}
+    "rubi": {
+      "kb_id": "ark_re",
+      "auto_inject": true
+    },
+    "assistant": {
+      "kb_id": "ark_re",
+      "neutral": true,
+      "auto_inject": true
+    },
+    "herta": {
+      "kb_id": "hsr",
+      "neutral": true,
+      "auto_inject": true
+    }
   }
 }

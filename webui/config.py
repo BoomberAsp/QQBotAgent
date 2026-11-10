@@ -43,6 +43,15 @@ def bot_env(key: str, default: str = "") -> str:
 
 USER_DATA_ROOT = Path(bot_env("USER_DATA_ROOT", str(ROOT / "data" / "users")))
 
+# Story readers use os.environ, while this panel only reads dotenv_values.
+# Match the bot's load_dotenv(override=False) precedence, including custom
+# registries and Ark sources. Do not inject the panel's development fallback.
+for _story_key in ("USER_DATA_ROOT", "STORY_KB_DATA_ROOT", "STORY_KB_REGISTRY",
+                   "STORY_KB_DIR", "STORY_GDATA_DB"):
+    if _BOT_ENV.get(_story_key):
+        os.environ.setdefault(_story_key, str(_BOT_ENV[_story_key]))
+
+
 # 角色卡 / 羁绊 / 多模态资产（与 bot 侧同源约定）。
 # ⚠️ 面板进程**不调用 load_dotenv**（只用 dotenv_values 读 _BOT_ENV），所以
 # os.environ 里没有 CHARACTERS_DIR —— 必须在这里显式解析，并显式传参给

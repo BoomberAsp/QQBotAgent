@@ -5,7 +5,6 @@ import json
 import os
 import re
 import sqlite3
-import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -82,17 +81,8 @@ def query(kid,sql):
         conn.executemany('INSERT INTO documents VALUES (?,?,?,?,?,?,?)',[(d.get('id'),d.get('title'),d.get('text'),d.get('source'),d.get('chapter'),d.get('visibility'),json.dumps(d.get('scopes',[]))) for d in docs]);conn.commit()
     else:
         conn=sqlite3.connect(p.as_uri()+'?mode=ro',uri=True)
-    start=time.monotonic()
-    try:
-        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH,1000000)
-        conn.execute('PRAGMA query_only=ON')
-        allowed={sqlite3.SQLITE_SELECT,sqlite3.SQLITE_READ,sqlite3.SQLITE_FUNCTION,sqlite3.SQLITE_RECURSIVE}
-        conn.set_authorizer(lambda action,a,b,c,d:sqlite3.SQLITE_OK if action in allowed and not(action==sqlite3.SQLITE_FUNCTION and (b or '').lower() in ('load_extension','readfile','writefile')) else sqlite3.SQLITE_DENY)
-        conn.set_progress_handler(lambda:int(time.monotonic()-start>2),1000)
-        cur=conn.execute(sql);rows=cur.fetchmany(201)
-        return {'columns':[c[0] for c in cur.description or []],'rows':[[str(v)[:2000] if v is not None else None for v in row] for row in rows[:200]],'truncated':len(rows)>200}
-    except sqlite3.Error as e:raise ValueError('查询被拒绝或执行失败：'+str(e)) from e
-    finally:conn.close()
+    from .readonly_sql import execute
+    return execute(conn,sql)
 
 
 def upload(persona,description,raw,mood=""):

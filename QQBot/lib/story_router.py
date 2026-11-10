@@ -89,16 +89,27 @@ def active(scope):
     return version==scope.revision and data['bindings'].get(scope.persona,{}).get('kb_id')==scope.kb_id
 
 
-def _hsr(scope):
+def hsr_database_path(kb_id):
+    """Resolve an administrator-registered HSR release inside the data root."""
     _,data=registry()
-    config=data['kbs'][scope.kb_id]
+    config=data['kbs'][kb_id]
+    if config.get('driver')!='hsr_local':
+        raise ValueError('Not an HSR knowledge base')
     root=Path(os.environ.get('STORY_KB_DATA_ROOT') or os.environ.get('USER_DATA_ROOT') or Path(__file__).resolve().parents[1]/'data').resolve()
     path=(root/config['path']).resolve()
     if not path.is_relative_to(root):
         raise ValueError('HSR path escaped published data root')
+    return path
+
+
+def get_hsr_reader(kb_id):
+    """Validated reader for trusted runtime/admin callers; no chat authorization."""
+    version,data=registry()
+    config=data['kbs'][kb_id]
+    path=hsr_database_path(kb_id)
     manifest=path.with_name('manifest.json')
     stamp=(str(path),path.stat().st_ino,path.stat().st_size,path.stat().st_mtime_ns,
-           manifest.stat().st_mtime_ns,manifest.stat().st_size,scope.revision)
+           manifest.stat().st_mtime_ns,manifest.stat().st_size,version)
     with _lock:
         reader=_readers.get(stamp)
         if reader is None:
@@ -108,6 +119,10 @@ def _hsr(scope):
             _readers.clear()  # only the immutable metadata is shared, never SQLite connections
             _readers[stamp]=reader
         return reader
+
+
+def _hsr(scope):
+    return get_hsr_reader(scope.kb_id)
 
 
 def tool_search(query='',limit=4,scope=None):
