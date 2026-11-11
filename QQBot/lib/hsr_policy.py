@@ -100,8 +100,7 @@ def temporal_context(plan, *, now=None):
                  datetime.fromisoformat(anchor['recheck_after']))
     except (KeyError, ValueError, TypeError):
         fresh = False
-    return dict(requested=plan['time'], anchor=anchor, anchor_fresh=fresh,
-                coverage='partial_native_structure')
+    return dict(requested=plan['time'], anchor=anchor, anchor_fresh=fresh)
 
 
 def matching_cards(plan):
