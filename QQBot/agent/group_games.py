@@ -69,12 +69,14 @@ async def dispatch_game(view,sender,store,command=None,argument=''):
 
     dialog.busy=True
     finished=False
+    rows=[]
     try:
         if game in ('/抽卡','/十连抽'):
             if not state['config']['features'].get('gacha',True):
                 result='本群已关闭抽卡。';finished=True
             elif not pool and not up_reply:
                 result='请选择卡池：'+'、'.join(POOLS)+'。UP池可在池名后附角色名。'
+                rows=legacy_tools.gacha_pool_rows(ten=game=='/十连抽',as_command=True)
             else:
                 pool=pool or dialog.pool
                 name=text[3:].strip() if up_reply else ' '.join(parts[1:])
@@ -120,5 +122,5 @@ async def dispatch_game(view,sender,store,command=None,argument=''):
     if _pending.get(key) is dialog and dialog.generation==store.group(scope)['generation'] and dialog.expires>time.monotonic():
         if finished:_pending.pop(key,None)
         else:result+='\n5分钟内由本人补充，或发送 /取消。未开启非 @ 接收时请 @机器人补充。'
-        await GroupReply(game[1:],[result]).send(sender)
+        await GroupReply(game[1:],[result],rows=rows).send(sender)
     return True

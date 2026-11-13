@@ -1042,13 +1042,13 @@ Agent 必须在以下情况拒绝 (礼貌):
 | 函数 | 说明 | 依赖 |
 |------|------|------|
 | `gacha_pull(pool_type, count, up_character)` | 模拟抽卡 (4 种卡池) | `pullingMonitor.drawing_cards` + `format_result` |
-| `play_gacha_animation(star_level, is_single)` | 播放抽卡动画 (图片序列) | `pullingMonitor` 图片资源 + `_send_msg` contextvar |
+| `play_gacha_animation(star_level, is_single)` | 播放抽卡动画（6 帧合成单张 GIF） | `pullingMonitor` 图片资源 + `lib/gacha_animation` + `_send_msg` contextvar |
 | `calculate_speed(battle_data)` | 敌方速度计算 | `group.parse_speed_data` + `compute_speed_results` |
 | `compare_speed_probability(speed_1, speed_2)` | 乱速概率计算 | `speed.compute_prob` |
 | `explain_code_tool(code)` | LLM 代码解释 | `deepseek_client.chat_completion` |
 | `translate_text(text, target_language)` | LLM 多语言翻译 | `deepseek_client.chat_completion` |
 
-`play_gacha_animation` 通过 `agent/context.py` 中的 `contextvars.ContextVar` 获取图片发送回调，直接向 QQ 聊天窗口发送 `MessageSegment.image`。无需修改 Agent → ToolRegistry → Tool 的中间层签名。
+`play_gacha_animation` 通过 `agent/context.py` 中的 `contextvars.ContextVar` 获取图片发送回调；官方与 OneBot 渠道都会把 6 张 PNG 合成 1 张 1280×720 GIF，只发送 1 条图片消息，播放一轮并定格末帧。无需修改 Agent → ToolRegistry → Tool 的中间层签名。
 
 ### 5.4 `tools/map_tools.py` — 地图工具 (5 个)
 

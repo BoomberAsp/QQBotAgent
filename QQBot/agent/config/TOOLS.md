@@ -371,7 +371,7 @@ Anti-bot handling is a two-tier ladder:
 
 ## Tool: play_gacha_animation
 
-**Description**: Play gacha pull animation images directly in the QQ chat. Sends a sequence of animation frames with 0.75s intervals.
+**Description**: Play the gacha pull animation as ONE animated GIF in the QQ chat. The six PNG frames are merged into a 1280×720 GIF (about 1.5 MB), so the animation costs one image message instead of six. It plays one round and holds the final frame. On failure it degrades to the last static frame. Do not narrate the frame count or claim a full six-message sequence was sent.
 
 **When to use**: BEFORE showing text gacha results, when the user has agreed to see the animation. Always ask first: "要先看抽卡动画还是直接看结果？"
 

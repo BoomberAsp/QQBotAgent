@@ -124,6 +124,7 @@ from tools.legacy_tools import (
     calculate_speed,
     compare_speed_probability,
     explain_code_tool,
+    gacha_pool_rows,
     gacha_pull,
     play_gacha_animation,
     translate_text,
@@ -2702,6 +2703,10 @@ async def handle_agent_turn(view: InboundMessage):
             return
         # /更新日志 [d] / /update record [d] command (direct, no agent, zero token)
         cmd_handled = await _handle_changelog_command(text_content, user_id)
+        if cmd_handled:
+            return
+        # /抽卡 / /十连抽 空参：官方私聊返回卡池按钮（直连，零 token）
+        cmd_handled = await _handle_gacha_pool_prompt(text_content, view=view)
         if cmd_handled:
             return
         # /personality / /人格切换 command
@@ -5412,6 +5417,32 @@ async def _handle_changelog_command(text: str, user_id: str, *, allow_images: bo
             Btn(label="官网", data=_PUBLIC_SITE_URL, action="url"),
             Btn(label="反馈", data="#反馈 ", action="cmd", enter=False),
         ]], label="changelog-nav")
+    return True
+
+
+_GACHA_POOL_CMD_RE = re.compile(r"^\s*[/#](?P<cmd>抽卡|单抽|十连抽)\s*$")
+
+
+async def _handle_gacha_pool_prompt(text: str, *, view, sender=None) -> bool:
+    """官方私聊空参抽卡：返回带卡池按钮的提示（零 token）。
+
+    只拦截严格空参的 /抽卡、/单抽、/十连抽；带参数的请求继续走
+    agent + gacha_pull，文本结果链路完全不变。OneBot 私聊不拦截。
+    """
+    match = _GACHA_POOL_CMD_RE.match(text or "")
+    if not match or getattr(view, "platform", "") != "qq_official":
+        return False
+
+    ten = match.group("cmd") == "十连抽"
+    rows = gacha_pool_rows(ten=ten, as_command=False)
+    if _channel_supports_keyboard(sender):
+        await _safe_send_kb(
+            "## 选择卡池\n请选择要抽取的卡池；几率UP招募需要补充 UP 角色名。",
+            rows, sender=sender, label="gacha-pool-picker")
+    else:
+        # 无键盘能力时仍给出可直接发送的指令，避免“请点按钮”但没有按钮。
+        body = "选择卡池：请发送对应指令。\n" + _buttons_to_text(rows)
+        await _safe_send(body, sender=sender)
     return True
 
 
