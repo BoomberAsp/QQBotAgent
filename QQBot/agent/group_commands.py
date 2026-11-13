@@ -30,7 +30,7 @@ COMMANDS=(
  GroupCommand('/问卷答案','any','查看当前问卷草稿'),
  GroupCommand('/问卷详情','any','查看问卷审阅卡'),
  GroupCommand('/确认提交','any','提交当前问卷'),
- GroupCommand('/取消问卷','any','放弃当前问卷草稿'),
+ GroupCommand('/取消问卷','any','放弃当前问卷草稿',('/退出问卷',)),
  GroupCommand('/重试提交','any','[确认] 重试提交'),
  GroupCommand('/问卷选','any','<草稿> <题号> <选项号>'),
  GroupCommand('/问卷跳过','any','[草稿] [题号]'),

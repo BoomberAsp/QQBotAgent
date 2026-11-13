@@ -37,7 +37,7 @@ from lib.survey.model import (
 from lib.survey.surveycake import SurveyError, fetch_schema, parse_survey_url
 
 _MAX_OPTION_BUTTONS = 12          # keep 跳过/取消 inside the 15-button cap
-_DEFAULT_LOCK_TTL = 900.0
+_DEFAULT_LOCK_TTL = 300.0
 _DEFAULT_LOCK_TURNS = 60
 
 _STORE: DraftStore | None = None
@@ -268,6 +268,19 @@ def _lock_hint(lock: SurveyLock) -> str:
             "请等 TA 完成，或让管理员发送 /问卷释放。")
 
 
+def _group_task_hint(view) -> str:
+    """Gacha-style hint: the task is alive for a few minutes, /取消 exits."""
+    if not getattr(view, "is_group", False):
+        return ""
+    lock = _locks.get(_scope(view))
+    if lock is None:
+        return ""
+    minutes = max(1, int((lock.expires_at - time.time()) / 60))
+    return ("\n\n（问卷任务进行中，约剩 "
+            f"{minutes} 分钟；由本人继续，发送 /取消 退出。"
+            "未开启非 @ 接收时请 @机器人 或引用回复补充。）")
+
+
 # ── command / URL parsing ───────────────────────────────────────
 
 # Users paste links in many shapes: full-width punctuation from a Chinese
@@ -388,6 +401,28 @@ def _pending_start_valid(identity: str) -> bool:
     return True
 
 
+def _strip_mentions(text: str) -> str:
+    text = re.sub(
+        r"^(?:(?:<@!?[^>]+>|\[CQ:at,[^\]]+\])[\s\u200b\ufeff]*)+",
+        "", text,
+    )
+    return re.sub(r"^(?:@\S+\s+)+", "", text)
+
+
+_EXIT_COMMANDS = frozenset({
+    "/取消", "/结束", "#取消", "#结束", "/退出问卷", "#退出问卷",
+})
+_EXIT_WORDS = frozenset({
+    "取消", "退出", "结束", "算了", "不填了", "退出问卷",
+})
+
+
+def _is_exit_text(text: str) -> bool:
+    normalized = _strip_mentions(_normalize_command_text(text))
+    normalized = normalized.strip(" \t，,。.;；!！")
+    return normalized in _EXIT_COMMANDS or normalized in _EXIT_WORDS
+
+
 _VERBS = {
     "问卷": "start",
     "问卷诊断": "diag",
@@ -395,6 +430,7 @@ _VERBS = {
     "问卷详情": "detail",
     "确认提交": "confirm",
     "取消问卷": "cancel",
+    "退出问卷": "cancel",
     "重试提交": "retry",
     "问卷释放": "release",
     "问卷选": "pick",
@@ -413,15 +449,7 @@ def _parse_command(text: str) -> tuple[str, str] | None:
     Accepted: ``/问卷 https://…``, ``/问卷https://…``, ``/问卷：https://…``,
     ``／问卷 https://…`` (full-width slash) and a bare ``问卷 https://…``.
     """
-    normalized = _normalize_command_text(text)
-    # QQ official group content keeps an "<@openid>" mention prefix; OneBot
-    # may keep a CQ:at code. A textual "@nickname" also shows up in some
-    # clients. Strip all of them before matching the command.
-    normalized = re.sub(
-        r"^(?:(?:<@!?[^>]+>|\[CQ:at,[^\]]+\])[\s\u200b\ufeff]*)+",
-        "", normalized,
-    )
-    normalized = re.sub(r"^(?:@\S+\s+)+", "", normalized)
+    normalized = _strip_mentions(_normalize_command_text(text))
     if not normalized:
         return None
     if not normalized.startswith(("/", "#")):
@@ -490,6 +518,9 @@ async def try_handle(view, sender=None) -> bool:
                 await _send(_lock_hint(lock), sender=sender)
                 return True
             return False
+    if draft is not None and _is_exit_text(text):
+        await _cmd_cancel(view, draft, store, scope, sender)
+        return True
     if command is not None:
         return await _dispatch(command[0], command[1], view, draft, store,
                                scope, sender)
@@ -845,7 +876,7 @@ async def _cmd_cancel(view, draft, store, scope, sender) -> bool:
     store.delete(_identity(view))
     _locks.pop(scope, None)
     _locks.pop(draft.origin_scope, None)
-    await _send(f"已取消问卷 #{draft.draft_id}（{draft.title}）。", sender)
+    await _send("问卷任务已取消。", sender)
     return True
 
 
@@ -1005,8 +1036,16 @@ async def _handle_answer(view, draft, store, scope, sender) -> bool:
 
     text = (getattr(view, "text", "") or "").strip()
     applied: list[str] = []
+    is_group = bool(getattr(view, "is_group", False))
+    direct = bool(
+        getattr(view, "mentioned", False)
+        or getattr(view, "reply_to_bot", False)
+        or not is_group
+    )
 
     if draft.follow_up_for is not None:
+        if not direct:
+            return False
         question = survey.question(draft.follow_up_for)
         answer = draft.answers.get(draft.follow_up_for)
         if question is not None and answer is not None:
@@ -1018,8 +1057,14 @@ async def _handle_answer(view, draft, store, scope, sender) -> bool:
         else:
             draft.follow_up_for = None
     else:
-        applied, error = _parse_free_text(survey, draft, text)
+        applied, error = _parse_free_text(
+            survey, draft, text, allow_fallback=direct
+        )
         if error:
+            if not direct:
+                # Not a recognisable survey answer: let normal group chat
+                # (or the agent) handle it instead of hijacking the message.
+                return False
             current = _next_question(survey, draft)
             body = f"⚠ {error}"
             if current is not None:
@@ -1027,6 +1072,8 @@ async def _handle_answer(view, draft, store, scope, sender) -> bool:
             await _send(body, sender)
             return True
         if not applied:
+            if not direct:
+                return False
             current = _next_question(survey, draft)
             if current is None:
                 await _send_review(view, survey, draft, sender)
@@ -1064,7 +1111,9 @@ async def _after_change(view, survey, draft, store, sender, ack: list[str]) -> b
                 data=f"/问卷跳过 {draft.draft_id} {number}",
                 action="cmd",
             )]]
-            await _send_with_buttons("\n\n".join(parts), rows, sender)
+            await _send_with_buttons(
+                "\n\n".join(parts) + _group_task_hint(view), rows, sender
+            )
             return True
         draft.follow_up_for = None
 
@@ -1082,7 +1131,8 @@ async def _after_change(view, survey, draft, store, sender, ack: list[str]) -> b
 
 
 def _parse_free_text(survey: SurveyDef, draft: SurveyDraft,
-                     text: str) -> tuple[list[str], str | None]:
+                     text: str, *, allow_fallback: bool = True
+                     ) -> tuple[list[str], str | None]:
     """Map one plain-text message to draft answers (deterministic rules).
 
     P0 deliberately avoids an LLM here: the stepwise prompts plus buttons
@@ -1164,6 +1214,9 @@ def _parse_free_text(survey: SurveyDef, draft: SurveyDraft,
 
     if applied:
         return applied, ""
+
+    if not allow_fallback:
+        return [], ""
 
     # 5) Fallback: the whole message answers the current question.
     current = _next_question(survey, draft)
@@ -1376,7 +1429,7 @@ async def _send_question(view, survey: SurveyDef, draft: SurveyDraft,
         await _send_review(view, survey, draft, sender)
         return
     await _send_with_buttons(
-        _question_block(survey, draft, question),
+        _question_block(survey, draft, question) + _group_task_hint(view),
         _question_rows(survey, draft, question),
         sender,
     )
@@ -1391,8 +1444,10 @@ async def _send_review(view, survey: SurveyDef, draft: SurveyDraft, sender) -> N
         lines += ["", "⚠ 还不能提交："] + [f"- {item}" for item in issues]
     else:
         lines += ["", "✅ 本地校验通过。"]
-    lines += ["", "发送 /确认提交 才会提交；发送 /取消问卷 放弃。"]
-    await _send_with_buttons("\n".join(lines), _review_rows(draft), sender)
+    lines += ["", "发送 /确认提交 才会提交；发送 /取消 放弃。"]
+    await _send_with_buttons(
+        "\n".join(lines) + _group_task_hint(view), _review_rows(draft), sender
+    )
 
 
 def _next_question(survey: SurveyDef, draft: SurveyDraft) -> SurveyQuestion | None:
