@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,8 @@ _STORE: DraftStore | None = None
 _locks: dict[str, "SurveyLock"] = {}
 _submitting: set[str] = set()
 _attempt_times: dict[str, list[float]] = {}
+_pending_start: dict[str, float] = {}
+_PENDING_START_TTL = 300.0
 
 
 # ── configuration ─────────────────────────────────────────────────
@@ -200,9 +203,10 @@ def _record_attempt_time(identity: str) -> None:
 
 
 def _reset_submit_state() -> None:
-    """Test hook: clear in-flight and rate-limit state."""
+    """Test hook: clear in-flight, rate-limit and pending-link state."""
     _submitting.clear()
     _attempt_times.clear()
+    _pending_start.clear()
 
 
 # ── sending / view helpers ────────────────────────────────────────
@@ -264,7 +268,75 @@ def _lock_hint(lock: SurveyLock) -> str:
             "请等 TA 完成，或让管理员发送 /问卷释放。")
 
 
-# ── command parsing ──────────────────────────────────────────────
+# ── command / URL parsing ───────────────────────────────────────
+
+# Users paste links in many shapes: full-width punctuation from a Chinese
+# IME, no space after the command, an explanatory prefix
+# ("问卷链接：…"), angle brackets around the URL, or the link in a
+# follow-up message. Normalise and extract the URL instead of taking the
+# first whitespace token.
+_ZERO_WIDTH = {"\u200b", "\u200c", "\u200d", "\u200e", "\u200f", "\ufeff"}
+_URL_RE = re.compile(r"https?://[^\s<>\"'，。；、）】》]+", re.IGNORECASE)
+_NAKED_URL_RE = re.compile(
+    r"(?:www\.)?surveycake\.com/s/[A-Za-z0-9]{4,20}", re.IGNORECASE
+)
+_BARE_SVID_RE = re.compile(
+    r"(?:svid\s*[=:]\s*)?([A-Za-z0-9]{4,20})", re.IGNORECASE
+)
+
+
+def _normalize_command_text(text: str) -> str:
+    out = []
+    for char in (text or ""):
+        if char in _ZERO_WIDTH:
+            continue
+        code = ord(char)
+        if 0xFF01 <= code <= 0xFF5E:          # full-width ASCII ／：＃ｈｔｔｐ
+            char = chr(code - 0xFEE0)
+        elif char == "\u3000":               # ideographic space
+            char = " "
+        out.append(char)
+    return "".join(out).replace("\xa0", " ").strip()
+
+
+def _extract_survey_url(text: str) -> str:
+    """Return the first survey URL in the text, without wrappers.
+
+    Tolerates a missing scheme: ``www.surveycake.com/s/ABb8y`` becomes
+    ``https://www.surveycake.com/s/ABb8y``.
+    """
+    normalized = _normalize_command_text(text)
+    match = _URL_RE.search(normalized)
+    if match:
+        return match.group(0).rstrip(".,;:!?)]}>）】》」』\"'")
+    naked = _NAKED_URL_RE.search(normalized)
+    if naked:
+        return "https://" + naked.group(0).lstrip("/")
+    return ""
+
+
+def _url_from_bare_svid(text: str) -> str:
+    """``ABb8y`` / ``svid=ABb8y`` -> full share URL (last-resort fallback)."""
+    candidate = _normalize_command_text(text).strip().lstrip("#")
+    for token in candidate.split():
+        token = token.strip("，,。.;:：；")
+        match = _BARE_SVID_RE.fullmatch(token.lstrip("#"))
+        if match and any(char.isalpha() for char in match.group(1)):
+            return f"https://www.surveycake.com/s/{match.group(1)}"
+    return ""
+
+
+def _set_pending_start(identity: str) -> None:
+    _pending_start[identity] = time.time() + _PENDING_START_TTL
+
+
+def _pending_start_valid(identity: str) -> bool:
+    expires = _pending_start.get(identity, 0.0)
+    if expires <= time.time():
+        _pending_start.pop(identity, None)
+        return False
+    return True
+
 
 _VERBS = {
     "问卷": "start",
@@ -280,14 +352,30 @@ _VERBS = {
 
 
 def _parse_command(text: str) -> tuple[str, str] | None:
-    if not text.startswith(("/", "#")):
+    """Parse a survey command, tolerating common chat-input shapes.
+
+    Accepted: ``/问卷 https://…``, ``/问卷https://…``, ``/问卷：https://…``,
+    ``／问卷 https://…`` (full-width slash) and a bare ``问卷 https://…``.
+    """
+    normalized = _normalize_command_text(text)
+    if not normalized:
         return None
-    parts = text.split(maxsplit=1)
-    verb = parts[0][1:]
-    action = _VERBS.get(verb)
-    if action is None:
+    if not normalized.startswith(("/", "#")):
+        if normalized.startswith("问卷") and _extract_survey_url(normalized):
+            return "start", normalized[len("问卷"):].lstrip(" :：,，、")
         return None
-    return action, (parts[1].strip() if len(parts) > 1 else "")
+    body = normalized[1:]
+    parts = body.split(maxsplit=1)
+    first = parts[0]
+    remainder = parts[1].strip() if len(parts) > 1 else ""
+    action = _VERBS.get(first)
+    if action is not None:
+        return action, remainder
+    # No space or extra punctuation between verb and argument.
+    for verb in sorted(_VERBS, key=len, reverse=True):
+        if body.startswith(verb):
+            return _VERBS[verb], body[len(verb):].lstrip(" :：,，、")
+    return None
 
 
 # ── public entry ─────────────────────────────────────────────────
@@ -295,6 +383,9 @@ def _parse_command(text: str) -> tuple[str, str] | None:
 async def try_handle(view, sender=None) -> bool:
     """Handle one message for the survey flow; False = let the kernel decide."""
     if not enabled():
+        raw = (getattr(view, "text", "") or "").strip()
+        if "问卷" in raw:
+            print(f"[Survey] disabled; text={raw[:120]!r}", file=sys.stderr)
         return False
     text = (getattr(view, "text", "") or "").strip()
     if not text:
@@ -306,6 +397,10 @@ async def try_handle(view, sender=None) -> bool:
     _prune_locks()
 
     command = _parse_command(text)
+    if command is None and (
+        text.startswith(("/", "#", "问卷")) or "surveycake" in text.lower()
+    ):
+        print(f"[Survey] unparsed text={text[:140]!r}", file=sys.stderr)
     is_group = bool(getattr(view, "is_group", False))
 
     # Admin release must work even while another member holds the lock.
@@ -322,13 +417,26 @@ async def try_handle(view, sender=None) -> bool:
                 return True
             return False
     if command is not None:
-        return await _dispatch(command[0], view, draft, store, scope, sender)
+        return await _dispatch(command[0], command[1], view, draft, store,
+                               scope, sender)
 
     # Other slash/hash commands must never be eaten as survey answers.
     if text.startswith(("/", "#")):
         return False
 
     if draft is None:
+        # A prior bare "/问卷" asked for the link; accept it as the next
+        # message (the platform may deliver a link as its own message).
+        if _pending_start_valid(identity):
+            url = (_extract_survey_url(text)
+                   or _extract_survey_url(getattr(view, "reply_context", "") or "")
+                   or _url_from_bare_svid(text)
+                   or _url_from_bare_svid(
+                       getattr(view, "reply_context", "") or ""))
+            if url:
+                _pending_start.pop(identity, None)
+                return await _dispatch("start", url, view, None, store, scope,
+                                       sender)
         return False
     # Plain text only auto-answers in the conversation that started the draft;
     # other chats must use explicit commands (/问卷答案, /问卷选, ...).
@@ -337,7 +445,7 @@ async def try_handle(view, sender=None) -> bool:
     return await _handle_answer(view, draft, store, scope, sender)
 
 
-async def _dispatch(action: str, view, draft, store, scope, sender) -> bool:
+async def _dispatch(action: str, rest: str, view, draft, store, scope, sender) -> bool:
     identity = _identity(view)
     if draft is not None:
         draft = store.get(identity) or draft
@@ -345,11 +453,11 @@ async def _dispatch(action: str, view, draft, store, scope, sender) -> bool:
             _touch_or_acquire(scope, identity, draft.draft_id)
 
     if action == "start":
-        return await _cmd_start(view, view.text, draft, store, scope, sender)
+        return await _cmd_start(view, rest, draft, store, scope, sender)
     if action == "pick":
-        return await _cmd_pick(view, _rest(view), draft, store, scope, sender)
+        return await _cmd_pick(view, rest, draft, store, scope, sender)
     if action == "skip":
-        return await _cmd_skip(view, _rest(view), draft, store, scope, sender)
+        return await _cmd_skip(view, rest, draft, store, scope, sender)
     if action == "show":
         return await _cmd_show(view, draft, store, scope, sender)
     if action == "detail":
@@ -359,14 +467,8 @@ async def _dispatch(action: str, view, draft, store, scope, sender) -> bool:
     if action == "cancel":
         return await _cmd_cancel(view, draft, store, scope, sender)
     if action == "retry":
-        return await _cmd_retry(view, draft, store, scope, sender)
+        return await _cmd_retry(view, rest, draft, store, scope, sender)
     return False
-
-
-def _rest(view) -> str:
-    text = (getattr(view, "text", "") or "").strip()
-    parts = text.split(maxsplit=1)
-    return parts[1].strip() if len(parts) > 1 else ""
 
 
 # ── schema access ────────────────────────────────────────────────
@@ -385,7 +487,7 @@ async def _survey_for(draft: SurveyDraft) -> SurveyDef:
 
 # ── command implementations ──────────────────────────────────────
 
-async def _cmd_start(view, text, draft, store, scope, sender) -> bool:
+async def _cmd_start(view, rest, draft, store, scope, sender) -> bool:
     identity = _identity(view)
     if draft is not None:
         await _send(
@@ -394,15 +496,23 @@ async def _cmd_start(view, text, draft, store, scope, sender) -> bool:
             sender,
         )
         return True
-    rest = _rest(view)
-    if not rest:
+
+    url = (_extract_survey_url(rest)
+           or _extract_survey_url(getattr(view, "text", "") or "")
+           or _extract_survey_url(getattr(view, "reply_context", "") or "")
+           or _url_from_bare_svid(rest))
+    if not url:
+        _set_pending_start(identity)
         await _send(
-            "用法：/问卷 <链接>\n"
-            "例如：/问卷 https://www.surveycake.com/s/ABb8y",
+            "请直接发送问卷链接（https://www.surveycake.com/s/...），\n"
+            "也可以只发送问卷编号（如 ABb8y）。\n"
+            "命令用法：/问卷 https://www.surveycake.com/s/ABb8y",
             sender,
         )
         return True
-    url = rest.split()[0].strip("，,。.;；")
+
+    print(f"[Survey] start raw={getattr(view, 'text', '')[:160]!r} url={url!r}",
+          file=sys.stderr)
     try:
         svid = parse_survey_url(url)
         survey = await _load_schema(svid)
@@ -413,6 +523,7 @@ async def _cmd_start(view, text, draft, store, scope, sender) -> bool:
         await _send(f"⚠ 读取问卷失败：{type(exc).__name__}", sender)
         return True
 
+    _pending_start.pop(identity, None)
     draft = store.create(identity, scope, getattr(view, "group_id", "") or "", survey)
     if getattr(view, "is_group", False):
         _touch_or_acquire(scope, identity, draft.draft_id)
@@ -630,6 +741,7 @@ async def _cmd_confirm(view, draft, store, scope, sender) -> bool:
 
 
 async def _cmd_cancel(view, draft, store, scope, sender) -> bool:
+    _pending_start.pop(_identity(view), None)
     if draft is None:
         # A stale group lock must not outlive its draft.
         _locks.pop(scope, None)
@@ -642,7 +754,7 @@ async def _cmd_cancel(view, draft, store, scope, sender) -> bool:
     return True
 
 
-async def _cmd_retry(view, draft, store, scope, sender) -> bool:
+async def _cmd_retry(view, rest, draft, store, scope, sender) -> bool:
     if draft is None:
         await _send("当前没有进行中的问卷，请先发送 /问卷 <链接>。", sender)
         return True
@@ -658,7 +770,7 @@ async def _cmd_retry(view, draft, store, scope, sender) -> bool:
     except SurveyError as exc:
         await _send(f"⚠ {exc}", sender)
         return True
-    if draft.state == "unknown" and "确认" not in _rest(view):
+    if draft.state == "unknown" and "确认" not in rest:
         await _send(
             "上次提交结果未知，可能已经提交。\n"
             "如确认未提交，请发送 /重试提交 确认。",

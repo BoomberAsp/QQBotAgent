@@ -53,11 +53,16 @@ def proxy_url() -> str:
 
 def parse_survey_url(url: str) -> str:
     """Return the svid from a SurveyCake share link."""
-    raw = (url or "").strip()
+    raw = (url or "").strip().strip("<>「」『』\"'")
+    raw = raw.rstrip(".,;:!?，。；：！？）】》")
     if not raw:
         raise SurveyError("请提供问卷链接，例如：/问卷 https://www.surveycake.com/s/ABb8y")
+    if re.match(r"(?i)^http://", raw):
+        # Chat clients sometimes paste the http form; the site is https-only
+        # and the host is allowlisted, so upgrade instead of rejecting.
+        raw = "https://" + raw[len("http://"):]
     if not re.match(r"(?i)^https://", raw):
-        raise SurveyError("仅支持 https:// 开头的问卷链接")
+        raise SurveyError("请提供 https:// 开头的问卷链接")
     parts = urllib.parse.urlsplit(raw)
     host = (parts.hostname or "").lower()
     if host not in allowed_hosts():
