@@ -16,6 +16,9 @@ Data source:
     since ~2026-09. Plain HTTP cannot pass it; the optional ruyiPage
     browser engine can (see below). (gamevoyant / cofregamers were
     removed 2026-10: incomplete data.)
+  The page injects a runtime "Copy" button into every code cell (Copy
+  The Code plugin); tag-stripping would glue its label onto the code
+  ("CopyArk3rdVvqYfU"), so _strip_copy_button_label removes it.
 
 Browser engine (Cloudflare bypass, opt-in): ucngame's JS challenge defeats
 curl_cffi/httpx (403 direct and via proxy). Setting REDEEM_CODE_BROWSER=
@@ -266,7 +269,8 @@ def is_refresh_in_flight() -> bool:
 def _load_cache() -> list[dict]:
     """Load the raw list of all redeem code entries from cache.
 
-    On read, entries are normalized: missing `valid` dates are backfilled
+    On read, entries are normalized: a stale injected "Copy" button label
+    is removed from scraped codes, missing `valid` dates are backfilled
     from English prose in `content` (e.g. "(Valid until September 30th,
     2026)"), and generic filler content is stripped. Normalization is
     idempotent and persisted on the next _save_cache.
@@ -281,6 +285,15 @@ def _load_cache() -> list[dict]:
     except (json.JSONDecodeError, IOError):
         return []
     for entry in entries:
+        code = entry.get("code", "") or ""
+        # Repair caches written before the injected "Copy" label was
+        # stripped in _parse_html ("CopyArk3rdVvqYfU" -> "Ark3rdVvqYfU").
+        # Scraped entries only: panel codes are admin-authored and must
+        # never be rewritten here.
+        if code and entry.get("_source") != "panel":
+            cleaned = _strip_copy_button_label(code)
+            if cleaned:
+                entry["code"] = cleaned
         content = entry.get("content", "") or ""
         if not entry.get("valid"):
             parsed = _parse_prose_date(content)
@@ -622,6 +635,29 @@ def _fullwidth_to_ascii(text: str) -> str:
     )
 
 
+# The source page injects a "Copy" button into every code cell at render
+# time (Copy The Code plugin rule: `.wp-block-table tbody tr td:first-child
+# strong`, button_text "Copy"). The plugin prepends the button to the cell,
+# so stripping HTML tags glues the label onto the code:
+#   <td><div class="ctc-wrapper">...<button>...Copy...</button>
+#       <strong>Ark3rdVvqYfU</strong></div></td>  ->  "CopyArk3rdVvqYfU"
+# Left in, that label becomes part of the stored code and no player can
+# redeem it. Only a leading label is removed (the button is always inserted
+# before the code) so genuine code characters are never touched.
+_COPY_BUTTON_LABEL_RE = re.compile(r'^(?:cop(?:y|ied))\s*!?\s*', re.IGNORECASE)
+
+
+def _strip_copy_button_label(text: str) -> str:
+    """Drop a leading "Copy"/"Copied!" button label from cell text.
+
+    No-op for any text that does not start with the injected label, so real
+    codes and reward prose pass through unchanged.
+    """
+    if not text:
+        return text
+    return _COPY_BUTTON_LABEL_RE.sub("", text)
+
+
 def _parse_html(html: str) -> list[dict]:
     """Extract redeem codes from HTML table.
 
@@ -642,8 +678,13 @@ def _parse_html(html: str) -> list[dict]:
         if len(cells) < 2:
             continue
 
-        # Clean HTML tags from cells
-        clean_cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+        # Clean HTML tags from cells. The page injects a "Copy" button as
+        # each code cell's first child (see _strip_copy_button_label), so
+        # its label has to go before any code matching.
+        clean_cells = [
+            _strip_copy_button_label(re.sub(r'<[^>]+>', '', c).strip())
+            for c in cells
+        ]
 
         # Find the code cell and content cell
         code = None
