@@ -402,6 +402,11 @@ _VERBS = {
 }
 
 
+def is_survey_command(text: str) -> bool:
+    """True when the text is any survey command (used by group dispatch)."""
+    return _parse_command(text) is not None
+
+
 def _parse_command(text: str) -> tuple[str, str] | None:
     """Parse a survey command, tolerating common chat-input shapes.
 

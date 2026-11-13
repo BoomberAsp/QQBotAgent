@@ -27,6 +27,15 @@ COMMANDS=(
  GroupCommand('/群记忆',usage='[添加 内容|清空 确认]'),GroupCommand('/群重置',usage='重置历史（确认后执行）'),
  GroupCommand('/群清除数据',usage='清除群历史、记忆和来源事实（确认后执行）'),
  GroupCommand('/取消','any','取消自己的当前任务',('/结束',)),GroupCommand('/群操作','any','操作令牌'),
+ GroupCommand('/问卷答案','any','查看当前问卷草稿'),
+ GroupCommand('/问卷详情','any','查看问卷审阅卡'),
+ GroupCommand('/确认提交','any','提交当前问卷'),
+ GroupCommand('/取消问卷','any','放弃当前问卷草稿'),
+ GroupCommand('/重试提交','any','[确认] 重试提交'),
+ GroupCommand('/问卷选','any','<草稿> <题号> <选项号>'),
+ GroupCommand('/问卷跳过','any','[草稿] [题号]'),
+ GroupCommand('/问卷释放','admin','释放本群问卷锁'),
+ GroupCommand('/问卷诊断','any','问卷命令诊断'),
 )
 COMMANDS += tuple(GroupCommand(c.name,'any',c.usage,c.aliases) for c in PUBLIC_COMMANDS)
 IDENTITY_COMMANDS=('/绑定身份','/绑定群身份','/确认绑定','/解除身份绑定','/个人记忆','/记住','/删除记忆','/公开记忆')
@@ -98,6 +107,15 @@ async def dispatch(view,sender,role,store):
     if not(view.mentioned or view.reply_to_bot):
         if text=='/取消' and store.group(scope_for(view))['config']['receive_all']:
             await dispatch_game(view,sender,store,'/取消')
+        return True
+    # Survey commands need the full view (group/scope/sender) — the generic
+    # dispatch_public path only passes text+user_id and cannot start a draft.
+    from . import survey_flow
+    if survey_flow.is_survey_command(view.text):
+        if await survey_flow.try_handle(view, sender):
+            return True
+        await GroupReply('问卷功能当前未启用',
+                         ['请管理员开启 SURVEY_ENABLED=1 后重启机器人。']).send(sender)
         return True
     if text.partition(' ')[0] in IDENTITY_COMMANDS:
         await runtime.manage_identity(replace(view,text=text),sender);return True
