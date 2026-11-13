@@ -19,8 +19,12 @@ GIF_HEIGHT_DEFAULT = 720
 # 官方二进制直传硬限制 5 MiB；留一点余量，避免恰好撞线。
 GIF_MAX_BYTES = 5_000_000
 
-FRAME_DURATIONS_FULL = (400, 500, 700, 900, 500, 1800)  # 末帧停留 1.8s
-FRAME_DURATIONS_KEY = (800, 900, 1800)
+# Real QQ clients keep looping the GIF even with loop=1, so make every
+# frame slower and hold the final frame longer.  Default 0.75s interval
+# becomes 1.0s per frame; the last frame holds for 3s.
+FRAME_INTERVAL_EXTRA_MS = 250
+LAST_FRAME_MS = 3000
+GIF_CACHE_VERSION = 2
 
 _BUILD_LOCK = threading.Lock()
 
@@ -35,26 +39,21 @@ def cache_dir() -> str:
 
 
 def durations_for(interval: float = 0.75, mode: str = "full") -> tuple[int, ...]:
-    """按工具参数 ``interval`` 生成每帧毫秒时长。
+    """按 ``interval`` 生成每帧毫秒时长。
 
-    GIF 在客户端播放，不需要服务端逐帧 sleep；这里保留 interval 的
-    语义（默认 0.75s），末帧额外停留，形成“播放一轮 + 定格”。
+    真实 QQ 客户端会无视 loop=1 继续循环，因此：
+      - 每帧在 interval 基础上再加 250ms（默认 0.75s → 1.0s）；
+      - 最后一帧固定 3000ms，给揭晓结果更长的停留。
     """
     try:
         base = int(round(float(interval) * 1000))
     except (TypeError, ValueError):
         base = 750
-    base = max(250, min(base, 2000))
+    base = max(0, min(base, 2000))
+    frame_ms = max(250, base + FRAME_INTERVAL_EXTRA_MS)
     if str(mode).lower() in ("key", "3", "frames3"):
-        return (max(300, base),
-                max(350, int(base * 1.2)),
-                max(1500, int(base * 2.4)))
-    return (max(250, int(base * 0.55)),
-            max(300, int(base * 0.70)),
-            max(350, int(base * 0.95)),
-            max(450, int(base * 1.20)),
-            max(300, int(base * 0.65)),
-            max(1500, int(base * 2.40)))
+        return (frame_ms, frame_ms, LAST_FRAME_MS)
+    return (frame_ms, frame_ms, frame_ms, frame_ms, frame_ms, LAST_FRAME_MS)
 
 
 def ensure_gif(frame_paths, *, star_level: int, is_single: bool,
@@ -170,9 +169,11 @@ def _durations_for_count(n: int, interval: float) -> tuple[int, ...]:
         base = int(round(float(interval) * 1000))
     except (TypeError, ValueError):
         base = 750
-    base = max(250, min(base, 2000))
-    return tuple([max(300, base)] * max(1, n - 1)
-                 + [max(1500, int(base * 2.2))])
+    base = max(0, min(base, 2000))
+    frame_ms = max(250, base + FRAME_INTERVAL_EXTRA_MS)
+    if n <= 1:
+        return (LAST_FRAME_MS,)
+    return tuple([frame_ms] * (n - 1) + [LAST_FRAME_MS])
 
 
 def _cache_path(star_level: int, is_single: bool, width: int, height: int,
@@ -183,7 +184,7 @@ def _cache_path(star_level: int, is_single: bool, width: int, height: int,
         star = 0
     ms = int(round(float(interval) * 1000)) if interval is not None else 750
     name = (f"gacha_s{star}_{'single' if is_single else 'ten'}"
-            f"_{width}x{height}_{mode}_{ms}ms_{loop}loop.gif")
+            f"_{width}x{height}_{mode}_{ms}ms_{loop}loop_v{GIF_CACHE_VERSION}.gif")
     return os.path.join(cache_dir(), name)
 
 

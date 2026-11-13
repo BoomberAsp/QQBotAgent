@@ -59,7 +59,7 @@ class GachaGifTests(unittest.TestCase):
                     mode="full", width=1280, interval=0.75)
                 self.assertTrue(os.path.isfile(gif_path))
                 self.assertLess(os.path.getsize(gif_path), 5_000_000)
-                self.assertGreater(total_ms, 3_000)
+                self.assertEqual(total_ms, 8_000)
                 with Image.open(gif_path) as im:
                     self.assertEqual(im.n_frames, 6)
                     self.assertEqual(im.size, (1280, 720))
@@ -69,6 +69,15 @@ class GachaGifTests(unittest.TestCase):
                     mode="full", width=1280, interval=0.75)
                 self.assertEqual(gif_path, gif_path2)
                 self.assertEqual(os.path.getmtime(gif_path), first_mtime)
+
+    def test_frame_timing(self):
+        from lib.gacha_animation import LAST_FRAME_MS, durations_for
+
+        full = durations_for(0.75, "full")
+        self.assertEqual(full, (1000, 1000, 1000, 1000, 1000, 3000))
+        self.assertEqual(full[-1], LAST_FRAME_MS)
+        key = durations_for(0.75, "key")
+        self.assertEqual(key, (1000, 1000, 3000))
 
     def test_key_mode_three_frames(self):
         from lib.gacha_animation import ensure_gif
@@ -83,7 +92,7 @@ class GachaGifTests(unittest.TestCase):
                     mode="key", width=1280, interval=0.75)
                 with Image.open(gif_path) as im:
                     self.assertEqual(im.n_frames, 3)
-                self.assertGreater(total_ms, 2_000)
+                self.assertEqual(total_ms, 5_000)
 
 
 class GachaCommandTests(unittest.IsolatedAsyncioTestCase):

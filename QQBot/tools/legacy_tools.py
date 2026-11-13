@@ -290,8 +290,9 @@ async def _play_gacha_animation_core(sender, star_level: int,
 
     if gif_path and await _send_image_once(sender, gif_path, "gacha animation"):
         # GIF animates client-side; wait one round so the text result
-        # lands after the reveal. Cap at 6s against a bad duration.
-        await asyncio.sleep(min(max(total_ms, 0) / 1000.0, 6.0))
+        # lands after the reveal. The default timing is now ~8s
+        # (5×1.0s + 3.0s), so the cap must cover the whole round.
+        await asyncio.sleep(min(max(total_ms, 0) / 1000.0, 12.0))
         return f"[Gacha] {star_label}抽卡动画已发送（GIF，{len(selected)} 帧）。"
 
     fallback = selected[-1] if selected else paths[-1]
