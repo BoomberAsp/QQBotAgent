@@ -326,6 +326,56 @@ def _url_from_bare_svid(text: str) -> str:
     return ""
 
 
+def _view_raw_text(view) -> str:
+    """Concatenate strings from the platform raw event.
+
+    QQ clients may turn a pasted link into a ``json`` (link card) message
+    segment; OneBot's ``get_plaintext()`` then omits it and ``view.text`` is
+    only ``/问卷``. Scanning the raw segments recovers the URL.
+    """
+    raw = getattr(view, "raw", None)
+    if raw is None:
+        return ""
+    chunks = []
+    message = getattr(raw, "message", None)
+    if message is not None:
+        try:
+            for segment in message:
+                data = getattr(segment, "data", None) or {}
+                if isinstance(data, dict):
+                    chunks.extend(
+                        str(value) for value in data.values()
+                        if isinstance(value, (str, int))
+                    )
+        except TypeError:
+            pass
+    content = getattr(raw, "content", None)
+    if isinstance(content, str):
+        chunks.append(content)
+    for attachment in getattr(raw, "attachments", None) or []:
+        url = getattr(attachment, "url", None)
+        if isinstance(url, str):
+            chunks.append(url)
+    return "\n".join(chunks)[:8000]
+
+
+def _raw_segment_types(view) -> str:
+    raw = getattr(view, "raw", None)
+    message = getattr(raw, "message", None)
+    if message is None:
+        return ""
+    try:
+        return ",".join(str(getattr(seg, "type", "?")) for seg in message)[:120]
+    except TypeError:
+        return ""
+
+
+def _extract_url_from_view(view) -> str:
+    return (_extract_survey_url(getattr(view, "text", "") or "")
+            or _extract_survey_url(getattr(view, "reply_context", "") or "")
+            or _extract_survey_url(_view_raw_text(view)))
+
+
 def _set_pending_start(identity: str) -> None:
     _pending_start[identity] = time.time() + _PENDING_START_TTL
 
@@ -340,6 +390,7 @@ def _pending_start_valid(identity: str) -> bool:
 
 _VERBS = {
     "问卷": "start",
+    "问卷诊断": "diag",
     "问卷答案": "show",
     "问卷详情": "detail",
     "确认提交": "confirm",
@@ -358,6 +409,8 @@ def _parse_command(text: str) -> tuple[str, str] | None:
     ``／问卷 https://…`` (full-width slash) and a bare ``问卷 https://…``.
     """
     normalized = _normalize_command_text(text)
+    # Some clients leave the group @nickname as plain text before the command.
+    normalized = re.sub(r"^(?:@\S+\s+)+", "", normalized)
     if not normalized:
         return None
     if not normalized.startswith(("/", "#")):
@@ -382,21 +435,31 @@ def _parse_command(text: str) -> tuple[str, str] | None:
 
 async def try_handle(view, sender=None) -> bool:
     """Handle one message for the survey flow; False = let the kernel decide."""
-    if not enabled():
-        raw = (getattr(view, "text", "") or "").strip()
-        if "问卷" in raw:
-            print(f"[Survey] disabled; text={raw[:120]!r}", file=sys.stderr)
-        return False
     text = (getattr(view, "text", "") or "").strip()
-    if not text:
+    command = _parse_command(text) if text else None
+    # Diagnostics must work even when the feature is disabled.
+    if command is not None and command[0] == "diag":
+        return await _cmd_diag(view, _store(), sender)
+    if not enabled():
+        if "问卷" in text:
+            print(f"[Survey] disabled; text={text[:120]!r}", file=sys.stderr)
         return False
-
     identity = _identity(view)
     scope = _scope(view)
     store = _store()
     _prune_locks()
 
-    command = _parse_command(text)
+    if not text:
+        # A link-card-only message has no text but carries the URL in the raw
+        # event; accept it while a link is pending.
+        if _pending_start_valid(identity):
+            url = _extract_url_from_view(view)
+            if url:
+                _pending_start.pop(identity, None)
+                return await _dispatch("start", url, view, None, store, scope,
+                                       sender)
+        return False
+
     if command is None and (
         text.startswith(("/", "#", "问卷")) or "surveycake" in text.lower()
     ):
@@ -428,11 +491,9 @@ async def try_handle(view, sender=None) -> bool:
         # A prior bare "/问卷" asked for the link; accept it as the next
         # message (the platform may deliver a link as its own message).
         if _pending_start_valid(identity):
-            url = (_extract_survey_url(text)
-                   or _extract_survey_url(getattr(view, "reply_context", "") or "")
+            url = (_extract_url_from_view(view)
                    or _url_from_bare_svid(text)
-                   or _url_from_bare_svid(
-                       getattr(view, "reply_context", "") or ""))
+                   or _url_from_bare_svid(_view_raw_text(view)))
             if url:
                 _pending_start.pop(identity, None)
                 return await _dispatch("start", url, view, None, store, scope,
@@ -454,6 +515,8 @@ async def _dispatch(action: str, rest: str, view, draft, store, scope, sender) -
 
     if action == "start":
         return await _cmd_start(view, rest, draft, store, scope, sender)
+    if action == "diag":
+        return await _cmd_diag(view, store, sender)
     if action == "pick":
         return await _cmd_pick(view, rest, draft, store, scope, sender)
     if action == "skip":
@@ -487,6 +550,28 @@ async def _survey_for(draft: SurveyDraft) -> SurveyDef:
 
 # ── command implementations ──────────────────────────────────────
 
+async def _cmd_diag(view, store, sender) -> bool:
+    """Echo what the survey flow actually received (remote debugging)."""
+    identity = _identity(view)
+    draft = store.get(identity)
+    lines = [
+        "问卷诊断：",
+        f"enabled={enabled()}",
+        f"platform={getattr(view, 'platform', '')} "
+        f"group={bool(getattr(view, 'is_group', False))}",
+        f"text={getattr(view, 'text', '')!r}",
+        f"url={_extract_url_from_view(view)!r}",
+        f"parts={_raw_segment_types(view)!r}",
+        f"browser_ready={_browser_ready()}",
+        f"env SURVEY_ENABLED={os.environ.get('SURVEY_ENABLED', '')!r} "
+        f"SUBMIT={os.environ.get('SURVEY_ENABLE_SUBMIT', '')!r} "
+        f"BROWSER={os.environ.get('SURVEY_BROWSER', '')!r}",
+        f"draft={draft.draft_id if draft else 'none'}",
+    ]
+    await _send("\n".join(lines), sender)
+    return True
+
+
 async def _cmd_start(view, rest, draft, store, scope, sender) -> bool:
     identity = _identity(view)
     if draft is not None:
@@ -498,8 +583,7 @@ async def _cmd_start(view, rest, draft, store, scope, sender) -> bool:
         return True
 
     url = (_extract_survey_url(rest)
-           or _extract_survey_url(getattr(view, "text", "") or "")
-           or _extract_survey_url(getattr(view, "reply_context", "") or "")
+           or _extract_url_from_view(view)
            or _url_from_bare_svid(rest))
     if not url:
         _set_pending_start(identity)
@@ -511,8 +595,8 @@ async def _cmd_start(view, rest, draft, store, scope, sender) -> bool:
         )
         return True
 
-    print(f"[Survey] start raw={getattr(view, 'text', '')[:160]!r} url={url!r}",
-          file=sys.stderr)
+    print(f"[Survey] start raw={getattr(view, 'text', '')[:160]!r} url={url!r} "
+          f"parts={_raw_segment_types(view)!r}", file=sys.stderr)
     try:
         svid = parse_survey_url(url)
         survey = await _load_schema(svid)
@@ -1321,7 +1405,10 @@ async def handle_public_command(text: str, user_id: str) -> bool:
 
     The real flow runs earlier in the kernel; this only tells users how to
     start when the message reached the generic public-command dispatcher.
+    Reaching here with a URL means the kernel hook is missing/disabled.
     """
+    print(f"[Survey] public fallback reached; text={text[:120]!r}",
+          file=sys.stderr)
     if not enabled():
         await _send("问卷功能当前未启用。")
         return True
