@@ -111,8 +111,10 @@ async def dispatch(view,sender,role,store):
     # Survey commands need the full view (group/scope/sender) — the generic
     # dispatch_public path only passes text+user_id and cannot start a draft.
     from . import survey_flow
-    if survey_flow.is_survey_command(view.text):
-        if await survey_flow.try_handle(view, sender):
+    if survey_flow.is_survey_command(text):
+        # command_text() already removed the <@openid>/CQ:at prefix that
+        # QQ official group content keeps; pass that cleaned text on.
+        if await survey_flow.try_handle(replace(view, text=text), sender):
             return True
         await GroupReply('问卷功能当前未启用',
                          ['请管理员开启 SURVEY_ENABLED=1 后重启机器人。']).send(sender)
@@ -125,6 +127,15 @@ async def dispatch(view,sender,role,store):
     cmd,rest,alias=parse(text)
     if cmd is None:
         await GroupReply('未知命令',['发送 /群帮助 查看本群可用命令。']).send(sender);return True
+    if survey_flow.is_survey_command(cmd.name):
+        # Defence in depth for registered survey commands: never let them
+        # fall through to the generic service.patch() branch.
+        rewritten=cmd.name+((' '+rest) if rest else '')
+        if await survey_flow.try_handle(replace(view,text=rewritten), sender):
+            return True
+        await GroupReply('问卷功能当前未启用',
+                         ['请管理员开启 SURVEY_ENABLED=1 后重启机器人。']).send(sender)
+        return True
     if not authorized(cmd.who,role,view.actor_role):
         await GroupReply('权限不足',['此操作需要机器人管理员权限。' if cmd.who=='admin' else '此操作需要群主、群管理员或机器人管理员权限。']).send(sender);return True
     if cmd.name in GAMES or cmd.name=='/取消':

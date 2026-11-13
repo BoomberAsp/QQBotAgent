@@ -414,7 +414,13 @@ def _parse_command(text: str) -> tuple[str, str] | None:
     ``／问卷 https://…`` (full-width slash) and a bare ``问卷 https://…``.
     """
     normalized = _normalize_command_text(text)
-    # Some clients leave the group @nickname as plain text before the command.
+    # QQ official group content keeps an "<@openid>" mention prefix; OneBot
+    # may keep a CQ:at code. A textual "@nickname" also shows up in some
+    # clients. Strip all of them before matching the command.
+    normalized = re.sub(
+        r"^(?:(?:<@!?[^>]+>|\[CQ:at,[^\]]+\])[\s\u200b\ufeff]*)+",
+        "", normalized,
+    )
     normalized = re.sub(r"^(?:@\S+\s+)+", "", normalized)
     if not normalized:
         return None
