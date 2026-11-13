@@ -653,8 +653,11 @@ async def _cmd_start(view, rest, draft, store, scope, sender) -> bool:
     draft = store.create(identity, scope, getattr(view, "group_id", "") or "", survey)
     if getattr(view, "is_group", False):
         _touch_or_acquire(scope, identity, draft.draft_id)
-    await _send(
-        _render_overview(survey, draft, mask=bool(getattr(view, "is_group", False))),
+    await _send_with_buttons(
+        _render_overview(
+            survey, draft, mask=bool(getattr(view, "is_group", False))
+        ) + _group_task_hint(view),
+        _overview_rows(draft),
         sender,
     )
     await _send_question(view, survey, draft, sender)
@@ -1069,7 +1072,11 @@ async def _handle_answer(view, draft, store, scope, sender) -> bool:
             body = f"⚠ {error}"
             if current is not None:
                 body += "\n\n" + _question_block(survey, draft, current)
-            await _send(body, sender)
+                await _send_with_buttons(
+                    body, _question_rows(survey, draft, current), sender
+                )
+            else:
+                await _send(body, sender)
             return True
         if not applied:
             if not direct:
@@ -1078,8 +1085,9 @@ async def _handle_answer(view, draft, store, scope, sender) -> bool:
             if current is None:
                 await _send_review(view, survey, draft, sender)
             else:
-                await _send(
+                await _send_with_buttons(
                     "没有识别到答案。\n\n" + _question_block(survey, draft, current),
+                    _question_rows(survey, draft, current),
                     sender,
                 )
             return True
@@ -1302,25 +1310,26 @@ def _extract_named_text(question: SurveyQuestion, text: str) -> str:
 # ── rendering ───────────────────────────────────────────────────
 
 def _render_overview(survey: SurveyDef, draft: SurveyDraft, mask: bool) -> str:
+    """First message: a short summary, not the full form."""
     meta = []
     if survey.deadline_hint:
         meta.append(f"截止 {survey.deadline_hint}")
     meta.append(f"{len(survey.questions)} 题")
     meta.append(f"必填 {survey.required_count} 题")
-    lines = [f"📋 {survey.title}", "｜".join(meta), f"草稿 #{draft.draft_id}", ""]
+    lines = [f"📋 {survey.title}", "｜".join(meta), f"草稿 #{draft.draft_id}", "", "题目概览："]
     for question in survey.questions:
         number = survey.number_of(question.subject_id)
-        required = "（必填）" if question.required else ""
-        lines.append(f"{number}) {question.text}{required}")
+        suffix = "（必填）" if question.required else ""
         if question.is_choice:
-            options = " / ".join(
-                f"{index}.{option.text}" for index, option in enumerate(question.options, 1)
-            )
-            lines.append(f"   选项：{options}")
+            suffix += f"（{len(question.options)} 个选项）"
+        text = question.text.strip()
+        if len(text) > 30:
+            text = text[:29] + "…"
+        lines.append(f"{number}) {text}{suffix}")
     lines += [
         "",
-        "可直接一句话回答，例如：",
-        "「会员编号 ABC123456，最喜欢露比，服装选 2，留言：三周年快乐」",
+        "接下来会一题一题提问：选择题点按钮，文本题直接回复。",
+        "发送 /取消 可随时退出。",
     ]
     return "\n".join(lines)
 
@@ -1328,8 +1337,9 @@ def _render_overview(survey: SurveyDef, draft: SurveyDraft, mask: bool) -> str:
 def _question_block(survey: SurveyDef, draft: SurveyDraft,
                     question: SurveyQuestion) -> str:
     number = survey.number_of(question.subject_id)
+    total = len(survey.questions)
     suffix = "（必填）" if question.required else "（可选）"
-    lines = [f"{number}) {question.text}{suffix}"]
+    lines = [f"第 {number}/{total} 题 · {question.text}{suffix}"]
     if question.desc:
         lines.append(question.desc)
     if question.is_choice:
@@ -1352,48 +1362,49 @@ def _question_block(survey: SurveyDef, draft: SurveyDraft,
     return "\n".join(lines)
 
 
+def _add_button(rows: Rows, button: Btn) -> None:
+    """Append a button within the platform limit (3/row, 5 rows, 15 total)."""
+    if sum(len(row) for row in rows) >= 15:
+        return
+    if rows and len(rows[-1]) < 3:
+        rows[-1].append(button)
+        return
+    if len(rows) < 5:
+        rows.append([button])
+
+
 def _question_rows(survey: SurveyDef, draft: SurveyDraft,
                    question: SurveyQuestion) -> Rows:
     number = survey.number_of(question.subject_id)
     rows: Rows = []
     if question.is_choice:
-        buttons = [
-            Btn(
+        for index, _option in enumerate(
+                question.options[:_MAX_OPTION_BUTTONS], 1):
+            _add_button(rows, Btn(
                 label=f"选{index}",
                 data=f"/问卷选 {draft.draft_id} {number} {index}",
                 action="cmd",
-            )
-            for index in range(1, len(question.options) + 1)
-        ][:_MAX_OPTION_BUTTONS]
-        rows = [buttons[index:index + 3] for index in range(0, len(buttons), 3)]
+            ))
         if not question.required:
-            skip = Btn(
+            _add_button(rows, Btn(
                 label="跳过",
                 data=f"/问卷跳过 {draft.draft_id} {number}",
                 action="cmd",
-            )
-            if len(rows[-1]) >= 3:
-                rows.append([skip])
-            else:
-                rows[-1].append(skip)
+            ))
     elif not question.required:
-        rows = [[Btn(
+        _add_button(rows, Btn(
             label="跳过",
             data=f"/问卷跳过 {draft.draft_id} {number}",
             action="cmd",
-        )]]
+        ))
 
-    total = sum(len(row) for row in rows)
-    if rows and len(rows) < 5 and total < 15:
-        cancel = Btn(
-            label="取消问卷",
-            data=f"/取消问卷 {draft.draft_id}",
-            action="cmd",
-        )
-        if len(rows[-1]) >= 3:
-            rows.append([cancel])
-        else:
-            rows[-1].append(cancel)
+    # Every question (including the required first text question) gets an
+    # explicit exit button; previously the required text question had none.
+    _add_button(rows, Btn(
+        label="取消问卷",
+        data=f"/取消问卷 {draft.draft_id}",
+        action="cmd",
+    ))
     return rows
 
 
@@ -1408,6 +1419,12 @@ def _review_lines(survey: SurveyDef, draft: SurveyDraft, mask: bool) -> list[str
             shown = mask_member_id(shown)
         lines.append(f"{number}) {question.text[:24]}：{shown}")
     return lines
+
+
+def _overview_rows(draft: SurveyDraft) -> Rows:
+    return [[
+        Btn(label="取消问卷", data=f"/取消问卷 {draft.draft_id}", action="cmd"),
+    ]]
 
 
 def _review_rows(draft: SurveyDraft) -> Rows:
