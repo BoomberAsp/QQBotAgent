@@ -268,11 +268,19 @@ async def run_group_turn(view, sender=None):
         for confirmation in list(_confirmations):
             if confirmation[0]==scope:_confirmations.pop(confirmation,None)
         _observed_generations[scope]=initial["generation"]
+        try:
+            from .survey_flow import reset_scope as _survey_reset_scope
+            _survey_reset_scope(scope)
+        except Exception:
+            pass
     if config["status"] != "active":
         return
     tokens = [(ctx._current_platform,ctx._current_platform.set(view.platform))]
     try:
         role = turn._perm_manager.get_role(view.user_id).value
+        from .survey_flow import try_handle as _survey_try_handle
+        if await _survey_try_handle(view, sender):
+            return
         if await group_command(view,sender,config,role):
             return
         now = time.time()

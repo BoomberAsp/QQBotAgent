@@ -14,6 +14,7 @@ PUBLIC_COMMANDS = (
     PublicCommand('/羁绊详情','_handle_bond_detail_command','游戏羁绊名或别名',renders_image=True),
     PublicCommand('/兑换码','_handle_redeem_code_command','限时兑换码',('/redeem-code',)),
     PublicCommand('/长期兑换码','_handle_redeem_code_command','长期有效兑换码'),
+    PublicCommand('/问卷','_handle_survey_command','<问卷链接>'),
     PublicCommand('/功能','_handle_features_command','功能一览',('/features',),True),
     PublicCommand('/更新日志','_handle_changelog_command','[条数]',('/更新记录','/update record','/update log','/changelog'),True),
 )

@@ -2645,6 +2645,11 @@ async def handle_agent_turn(view: InboundMessage):
         # are appended, so it sits directly after the old-persona turns.
         _inject_personality_transition_into_history(user_id)
 
+    # ── Survey flow (P0: collect answers only, never submits) ───────
+    from .survey_flow import try_handle as _survey_try_handle
+    if await _survey_try_handle(view):
+        return
+
     # ── Handle feedback / bug report (before agent, zero token cost) ─
     if text_content.startswith(("#反馈", "#bug", "#建议")):
         await _handle_feedback(text_content, user_id)
@@ -3857,6 +3862,12 @@ def _redeem_long_md(lt_codes: list, stale_note: str) -> str:
     if stale_note:
         lines.append(stale_note)
     return "\n".join(lines)
+
+
+async def _handle_survey_command(text: str, user_id: str) -> bool:
+    """Public-command fallback; the real survey flow runs before the kernel."""
+    from .survey_flow import handle_public_command
+    return await handle_public_command(text, user_id)
 
 
 async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
