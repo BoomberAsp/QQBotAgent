@@ -164,6 +164,13 @@ _turn_keyboard: contextvars.ContextVar[Optional[list]] = (
     contextvars.ContextVar("_turn_keyboard", default=None)
 )
 
+# Last gacha pull's highest star (3/4/5/6; 0 = no valid pull).
+# gacha_pull sets it; the group command path reads it to choose the GIF
+# animation branch without changing gacha_pull's user-visible text result.
+_last_gacha_star: contextvars.ContextVar[int] = (
+    contextvars.ContextVar("_last_gacha_star", default=0)
+)
+
 # ── Story knowledge base (Ark Re:Code 原作剧情) ────────────────────
 # Per-turn retrieved original-story block. Built by agent/turn.py from the
 # local FTS index when a character persona is about to speak, then injected by

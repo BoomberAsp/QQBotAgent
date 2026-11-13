@@ -1048,7 +1048,7 @@ Agent 必须在以下情况拒绝 (礼貌):
 | `explain_code_tool(code)` | LLM 代码解释 | `deepseek_client.chat_completion` |
 | `translate_text(text, target_language)` | LLM 多语言翻译 | `deepseek_client.chat_completion` |
 
-`play_gacha_animation` 通过 `agent/context.py` 中的 `contextvars.ContextVar` 获取图片发送回调；官方与 OneBot 渠道都会把 6 张 PNG 合成 1 张 1280×720 GIF，只发送 1 条图片消息，播放一轮并定格末帧。无需修改 Agent → ToolRegistry → Tool 的中间层签名。
+`play_gacha_animation` 通过 `agent/context.py` 中的 `contextvars.ContextVar` 获取图片发送回调；官方与 OneBot 渠道都会把 6 张 PNG 合成 1 张 1280×720 GIF，只发送 1 条图片消息，播放一轮并定格末帧。群聊 `/抽卡 <卡池>`/`/十连抽 <卡池>` 在 image 功能开启时也会在文字结果前自动播放同一张 GIF。无需修改 Agent → ToolRegistry → Tool 的中间层签名。
 
 ### 5.4 `tools/map_tools.py` — 地图工具 (5 个)
 

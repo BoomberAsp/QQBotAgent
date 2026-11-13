@@ -84,7 +84,15 @@ async def dispatch_game(view,sender,store,command=None,argument=''):
                     dialog.pool=pool
                     result='请回复 UP 角色名，或重新选择卡池。'
                 else:
+                    legacy_tools.reset_last_gacha_star()
                     result=await legacy_tools.gacha_pull(pool,10 if game=='/十连抽' else 1,name or None)
+                    star=legacy_tools.last_gacha_star()
+                    if star in (3,4,5,6) and state['config']['features'].get('image',True):
+                        try:
+                            await legacy_tools.play_gacha_animation_for_sender(
+                                sender,star,is_single=(game=='/抽卡'))
+                        except Exception:  # 动画是增强，绝不影响文字结果
+                            pass
                     finished=True
         elif game=='/乱速':
             if pair and min(map(int,pair.groups()))>0:

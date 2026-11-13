@@ -58,6 +58,12 @@ async def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -
     """
     from plugins.pullingMonitor import drawing_cards, format_result
 
+    try:
+        from agent.context import _last_gacha_star
+        _last_gacha_star.set(0)
+    except Exception:  # noqa: BLE001
+        pass
+
     # Trigger background wiki refresh if cache is stale
     from tools.wiki_scraper import WikiScraper
     from lib.model_router import model_router
@@ -87,7 +93,12 @@ async def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -
             actual_up = resolved
 
     results = [drawing_cards(pool_type, actual_up) for _ in range(count)]
-    text_segment, _ = format_result(results, count)
+    text_segment, star = format_result(results, count)
+    try:
+        from agent.context import _last_gacha_star
+        _last_gacha_star.set(int(star))
+    except Exception:  # noqa: BLE001
+        pass
 
     # buttons P1：结果页按钮预约——_send_response 的官方 md 路径一次性消费
     # （键盘只能骑 msg_type=2 代理回复），OneBot/split 路径忽略并清空。
@@ -103,6 +114,24 @@ async def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -
     except Exception:  # noqa: BLE001 — 按钮是增强，绝不影响抽卡结果
         pass
     return resolved_note + str(text_segment)
+
+
+def last_gacha_star() -> int:
+    """Highest star of the most recent gacha_pull (0 when unavailable)."""
+    try:
+        from agent.context import _last_gacha_star
+        return int(_last_gacha_star.get() or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def reset_last_gacha_star() -> None:
+    """Clear the per-turn star before a new group pull."""
+    try:
+        from agent.context import _last_gacha_star
+        _last_gacha_star.set(0)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _frame_file_path(frame) -> str:
@@ -151,6 +180,8 @@ async def _send_image_once(sender, path: str, label: str) -> bool:
 
     image = OutImage(path=path, label=label)
     raw = _turn_sender.get()
+    if getattr(raw, "send_media_confirmed", None) is None:
+        raw = sender
     confirmed = getattr(raw, "send_media_confirmed", None)
     if confirmed is not None:
         try:
@@ -187,21 +218,10 @@ async def _play_gacha_frames_legacy(sender, frames, star_label: str,
     return f"[Gacha] {star_label}抽卡动画已播放 ({sent_count}/{len(frames)} 帧)。"
 
 
-async def play_gacha_animation(star_level: int, is_single: bool = False, interval: float = 0.75) -> str:
-    """Play the gacha animation as one animated GIF.
-
-    The six PNG frames are built into a 1280×720 GIF and sent as ONE
-    image message, so a c2c turn keeps 3 passive-reply slots for the
-    text result instead of spending 6 on frames. The tool waits for one
-    GIF round before returning, so the result text does not spoil the
-    reveal. ``QQ_GACHA_GIF=off`` restores the legacy per-frame path.
-
-    Args:
-        star_level: Highest star level (3=blue, 4=purple, 5=gold, 6=red).
-        is_single: True for single pull, False for ten-pull.
-        interval: Base frame interval in seconds (default 0.75).
-    """
-    from agent.context import _current_group_id, _current_sender
+async def _play_gacha_animation_core(sender, star_level: int,
+                                     is_single: bool, interval: float) -> str:
+    """Shared GIF animation path for private tools and group commands."""
+    from agent.context import _current_group_id
     from plugins.pullingMonitor import (
         pull_1, blue_end, blue_middle, blue_or_purple_spaceship_close,
         blue_spaceship_open, gold_spaceship_close, gold_spaceship_open,
@@ -209,10 +229,6 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
         red_end, red_spaceship_close, red_spaceship_open,
         single_pull_start, ten_pull_start,
     )
-
-    sender = _current_sender.get()
-    if sender is None:
-        return "[Gacha] 当前环境不支持发送图片（非QQ聊天上下文）。"
 
     # ── Group feature toggle check ────────────────────────────────
     group_id = _current_group_id.get()
@@ -282,6 +298,40 @@ async def play_gacha_animation(star_level: int, is_single: bool = False, interva
     if await _send_image_once(sender, fallback, "gacha frame"):
         return f"[Gacha] {star_label}抽卡动画已降级为静态图。"
     return "[Gacha] 动画发送失败: 图片资源缺失或平台拒绝。"
+
+
+async def play_gacha_animation(star_level: int, is_single: bool = False, interval: float = 0.75) -> str:
+    """Play the gacha animation as one animated GIF (agent tool path).
+
+    The six PNG frames are built into a 1280×720 GIF and sent as ONE
+    image message, so a c2c turn keeps 3 passive-reply slots for the
+    text result instead of spending 6 on frames. The tool waits for one
+    GIF round before returning, so the result text does not spoil the
+    reveal. ``QQ_GACHA_GIF=off`` restores the legacy per-frame path.
+    """
+    from agent.context import _current_sender
+
+    sender = _current_sender.get()
+    if sender is None:
+        return "[Gacha] 当前环境不支持发送图片（非QQ聊天上下文）。"
+    return await _play_gacha_animation_core(
+        sender, star_level, is_single, interval)
+
+
+async def play_gacha_animation_for_sender(sender, star_level: int,
+                                          is_single: bool = False,
+                                          interval: float = 0.75) -> str:
+    """Play the gacha GIF through an explicit Sender (group command path).
+
+    Group commands do not run inside the agent tool context, so they
+    cannot rely on ``_current_sender``. The caller passes the raw group
+    sender (QQOfficialSender / OneBotSender); this entry point shares the
+    exact GIF build/send/fallback logic with ``play_gacha_animation``.
+    """
+    if sender is None:
+        return "[Gacha] 当前环境不支持发送图片。"
+    return await _play_gacha_animation_core(
+        sender, star_level, is_single, interval)
 
 
 # ── Speed Calculation ────────────────────────────────────────────
