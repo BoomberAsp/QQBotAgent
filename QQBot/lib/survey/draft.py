@@ -7,6 +7,7 @@ on every chat message.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -162,8 +163,36 @@ class DraftStore:
     def _draft_path(self, identity: str) -> str:
         return os.path.join(self.drafts_dir, self._digest(identity) + ".json")
 
-    def _submitted_path(self, identity: str, svid: str) -> str:
-        return os.path.join(self.submitted_dir, f"{svid}_{self._digest(identity)}.json")
+    def _submitted_path(self, identity: str, svid: str,
+                        member_key: str = "") -> str:
+        suffix = f"_{member_key[:10]}" if member_key else ""
+        return os.path.join(
+            self.submitted_dir,
+            f"{svid}_{self._digest(identity)}{suffix}.json",
+        )
+
+    @staticmethod
+    def member_key(svid: str, member_id: str) -> str:
+        """Stable, PII-free dedupe key for one game account in one survey."""
+        normalized = "".join(str(member_id).split()).upper()
+        return hashlib.sha256(f"{svid}:{normalized}".encode("utf-8")).hexdigest()[:32]
+
+    def _member_index_path(self, svid: str) -> str:
+        return os.path.join(self.submitted_dir, f"_members_{svid}.json")
+
+    def _member_index(self, svid: str) -> dict:
+        path = self._member_index_path(svid)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def member_submission(self, svid: str, member_id: str) -> dict | None:
+        """Look up a prior submission by game account, across QQ identities."""
+        key = self.member_key(svid, member_id)
+        return self._member_index(svid).get(key)
 
     # -- CRUD ----------------------------------------------------------
     def get(self, identity: str) -> SurveyDraft | None:
@@ -209,7 +238,8 @@ class DraftStore:
         except OSError:
             pass
 
-    def mark_submitted(self, draft: SurveyDraft, meta: dict | None = None) -> None:
+    def mark_submitted(self, draft: SurveyDraft, meta: dict | None = None,
+                       member_id: str = "") -> None:
         payload = {
             "svid": draft.svid,
             "draft_id": draft.draft_id,
@@ -223,18 +253,34 @@ class DraftStore:
             ).hexdigest()[:16],
             "meta": meta or {},
         }
-        _atomic_write_json(self._submitted_path(draft.identity, draft.svid), payload)
+        key = self.member_key(draft.svid, member_id) if member_id else ""
+        if key:
+            payload["member_key"] = key
+        _atomic_write_json(
+            self._submitted_path(draft.identity, draft.svid, key), payload
+        )
+        if key:
+            index = self._member_index(draft.svid)
+            index[key] = {
+                "draft_id": draft.draft_id,
+                "submitted_at": payload["submitted_at"],
+                "identity_digest": self._digest(draft.identity),
+            }
+            _atomic_write_json(self._member_index_path(draft.svid), index)
         self.delete(draft.identity)
 
     def submission_record(self, identity: str, svid: str) -> dict | None:
-        path = self._submitted_path(identity, svid)
-        if not os.path.exists(path):
-            return None
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                return json.load(handle)
-        except (OSError, ValueError):
-            return None
+        pattern = os.path.join(
+            self.submitted_dir, f"{svid}_{self._digest(identity)}*.json"
+        )
+        paths = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    return json.load(handle)
+            except (OSError, ValueError):
+                continue
+        return None
 
     def receipt_path(self, draft: SurveyDraft) -> str:
         os.makedirs(self.receipts_dir, exist_ok=True)

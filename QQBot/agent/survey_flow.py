@@ -43,6 +43,7 @@ _DEFAULT_LOCK_TURNS = 60
 _STORE: DraftStore | None = None
 _locks: dict[str, "SurveyLock"] = {}
 _submitting: set[str] = set()
+_pending_members: set[str] = set()
 _attempt_times: dict[str, list[float]] = {}
 _pending_start: dict[str, float] = {}
 _PENDING_START_TTL = 300.0
@@ -449,6 +450,7 @@ SURVEY_PROMPT_STATIC = """## 问卷填写（Ark Re:Code 周年问卷）
 - 选择题点按钮，文本题直接回复；可选文本可发 /问卷跳过；/问卷答案 查看当前题，/问卷详情 查看审阅。
 - 群聊任务约 5 分钟；/取消、/取消问卷 或 /退出问卷 退出；同一群同时只能有一个进行中的问卷。
 - 只有用户本人发送 /确认提交 才会提交，且提交不可撤销；管理员可能未开启真实提交。
+去重按会员编号：同一会员编号只能提交一次；同一 QQ 的多个游戏账号可用不同编号分别提交。
 - 不要替用户编造答案、不要自动提交、不要声称已提交；用户问进度时先查看状态，再建议 /问卷答案。
 """
 
@@ -953,21 +955,49 @@ async def _cmd_confirm(view, draft, store, scope, sender) -> bool:
         await _send(f"⚠ {exc}", sender)
         return True
 
-    record = store.submission_record(_identity(view), draft.svid)
-    if record:
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(record.get("submitted_at") or 0))
-        await _send(
-            f"该问卷已有提交记录（{when}）。\n为避免重复提交，同一问卷只能提交一次。",
-            sender,
-        )
-        return True
-
     issues = validate_answers(survey, draft.answers)
     if issues:
         lines = ["⚠ 还不能提交："] + [f"- {item}" for item in issues]
         lines += ["", "发送 /问卷答案 查看当前草稿。"]
         await _send("\n".join(lines), sender)
         return True
+
+    identity = _identity(view)
+    member_id = _member_id(survey, draft)
+    member_key = (store.member_key(survey.svid, member_id)
+                  if member_id else "")
+    if member_key:
+        existing = store.member_submission(survey.svid, member_id)
+        if existing:
+            when = time.strftime(
+                "%Y-%m-%d %H:%M",
+                time.localtime(existing.get("submitted_at") or 0),
+            )
+            await _send(
+                f"该会员编号已提交过本问卷（{when}）。\n"
+                "同一会员编号只能提交一次；同一 QQ 的其他游戏账号"
+                "请填写另一个会员编号。",
+                sender,
+            )
+            return True
+        if member_key in _pending_members:
+            await _send("该会员编号正在提交，请稍候。", sender)
+            return True
+    else:
+        # Generic surveys without a member-id question keep the legacy
+        # per-identity guard.
+        record = store.submission_record(identity, draft.svid)
+        if record:
+            when = time.strftime(
+                "%Y-%m-%d %H:%M",
+                time.localtime(record.get("submitted_at") or 0),
+            )
+            await _send(
+                f"该问卷已有提交记录（{when}）。\n"
+                "为避免重复提交，同一问卷只能提交一次。",
+                sender,
+            )
+            return True
 
     ready, reason = _browser_ready()
     if not ready:
@@ -983,7 +1013,13 @@ async def _cmd_confirm(view, draft, store, scope, sender) -> bool:
         ]
         await _send_with_buttons("\n".join(lines), _review_rows(draft), sender)
         return True
-    return await _do_submit(view, survey, draft, store, scope, sender)
+    if member_key:
+        _pending_members.add(member_key)
+    try:
+        return await _do_submit(view, survey, draft, store, scope, sender)
+    finally:
+        if member_key:
+            _pending_members.discard(member_key)
 
 
 async def _cmd_cancel(view, draft, store, scope, sender) -> bool:
@@ -1034,11 +1070,32 @@ async def _do_submit(view, survey, draft, store, scope, sender) -> bool:
         lines += ["", "发送 /问卷答案 检查答案后重试。"]
         await _send("\n".join(lines), sender)
         return True
-    record = store.submission_record(identity, draft.svid)
-    if record:
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(record.get("submitted_at") or 0))
-        await _send(f"该问卷已有提交记录（{when}）。\n为避免重复提交，同一问卷只能提交一次。", sender)
-        return True
+    member_id = _member_id(survey, draft)
+    if member_id:
+        existing = store.member_submission(survey.svid, member_id)
+        if existing:
+            when = time.strftime(
+                "%Y-%m-%d %H:%M",
+                time.localtime(existing.get("submitted_at") or 0),
+            )
+            await _send(
+                f"该会员编号已提交过本问卷（{when}）。\n"
+                "同一会员编号只能提交一次；同一 QQ 的其他游戏账号"
+                "请填写另一个会员编号。",
+                sender,
+            )
+            return True
+    else:
+        record = store.submission_record(identity, draft.svid)
+        if record:
+            when = time.strftime("%Y-%m-%d %H:%M",
+                                 time.localtime(record.get("submitted_at") or 0))
+            await _send(
+                f"该问卷已有提交记录（{when}）。\n"
+                "为避免重复提交，同一问卷只能提交一次。",
+                sender,
+            )
+            return True
     limit = _rate_limit_message(identity)
     if limit:
         await _send(limit, sender)
@@ -1099,7 +1156,7 @@ async def _do_submit(view, survey, draft, store, scope, sender) -> bool:
             "screenshot": os.path.basename(result.get("screenshot") or ""),
             # Persisted records stay PII-free; only the chat receipt is full.
             "member_masked": mask_member_id(member_id) if member_id else "",
-        })
+        }, member_id=member_id)
         _locks.pop(scope, None)
         _locks.pop(draft.origin_scope, None)
         await _send(_receipt_text(survey, draft, member_id), sender)
