@@ -1154,6 +1154,7 @@ async def _do_submit(view, survey, draft, store, scope, sender) -> bool:
             "stage": stage,
             "duration_ms": duration,
             "screenshot": os.path.basename(result.get("screenshot") or ""),
+            "api_status": result.get("api_status"),
             # Persisted records stay PII-free; only the chat receipt is full.
             "member_masked": mask_member_id(member_id) if member_id else "",
         }, member_id=member_id)

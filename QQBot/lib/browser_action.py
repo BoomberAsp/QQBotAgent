@@ -108,7 +108,13 @@ def build_plan(survey, draft, screenshot_path: str = "") -> dict:
         "answers": answers,
         "screenshot": screenshot_path,
         "proxy": proxy_url(),
-        "success_texts": ["感谢团长参与", "感謝團長參與", "已送出", "已提交"],
+        # The unique substring comes from SurveyCake's thankyoutext; the
+        # generic "感谢团长参与" is also in Q5, so it must never be first.
+        "success_texts": [
+            "3 周年社群纪念问活动",
+            "感谢团长参与本次《星陨计划》3 周年社群纪念问活动",
+            "已送出", "提交成功", "已提交",
+        ],
         "max_pages": 10,
         "step_timeout_ms": 5000,
         "after_click_ms": 900,

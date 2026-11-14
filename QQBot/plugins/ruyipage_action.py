@@ -188,6 +188,63 @@ def fill_answers(page, plan):
         log(f"filled subject {subject_id}")
 
 
+_SUBMIT_HOOK_JS = """(() => {
+  if (window.__surveySubmitHooked) return;
+  window.__surveySubmitHooked = true;
+  window.__surveySubmitResult = null;
+  const record = (url, status, body) => {
+    const u = String(url || "");
+    if (u.includes("/s/submit") || u.includes("/api/v2/s/submit")) {
+      window.__surveySubmitResult = {
+        url: u, status: Number(status) || 0, body: String(body || "").slice(0, 2000)
+      };
+    }
+  };
+  const originalFetch = window.fetch;
+  if (originalFetch) {
+    window.fetch = function(input, init) {
+      const url = typeof input === "string" ? input : (input && input.url) || "";
+      return originalFetch.apply(this, arguments).then(function(resp) {
+        try {
+          resp.clone().text().then(function(body) {
+            record(url, resp.status, body);
+          });
+        } catch (e) {}
+        return resp;
+      });
+    };
+  }
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    this.__surveyUrl = url;
+    return originalOpen.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function(body) {
+    this.addEventListener("loadend", function() {
+      try { record(this.__surveyUrl, this.status, this.responseText); } catch (e) {}
+    });
+    return originalSend.apply(this, arguments);
+  };
+})()"""
+
+
+def submit_api_result(page):
+    try:
+        return page.run_js("(() => window.__surveySubmitResult || null)()")
+    except Exception:                              # noqa: BLE001 - best effort
+        return None
+
+
+def form_gone(page):
+    try:
+        return not bool(page.run_js(
+            "(() => !!document.querySelector('[data-subject-id]'))()"
+        ))
+    except Exception:                              # noqa: BLE001 - best effort
+        return False
+
+
 def ensure_submit(page, plan):
     max_pages = int(plan.get("max_pages") or MAX_PAGES_DEFAULT)
     after_ms = int(plan.get("after_click_ms") or AFTER_CLICK_MS_DEFAULT)
@@ -200,15 +257,30 @@ def ensure_submit(page, plan):
 
 
 def wait_success(page, plan):
+    """Require the actual thank-you page, not the Q5 text on the form."""
     timeout = float(plan.get("success_timeout_s") or SUCCESS_TIMEOUT_S_DEFAULT)
-    markers = plan.get("success_texts") or ["感谢团长参与"]
+    markers = plan.get("success_texts") or ["感谢团长参与本次"]
+    unique_marker = str(markers[0]) if markers else ""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             body = page.ele("tag:body").text or ""
         except Exception:                          # noqa: BLE001 - transient
             body = ""
-        if any(marker in body for marker in markers):
+        api = submit_api_result(page) or {}
+        try:
+            api_ok = 200 <= int(api.get("status") or 0) < 300
+        except (TypeError, ValueError):
+            api_ok = False
+        gone = form_gone(page)
+        # Q5 already contains the generic "感谢团长参与" wording, so the
+        # generic marker alone is never enough. The unique thank-you copy or
+        # form disappearance must confirm the transition.
+        if unique_marker and unique_marker in body:
+            # The unique copy exists only on SurveyCake's thankyoutext page;
+            # the form's Q5 uses the shorter "本次活动" wording.
+            return True
+        if api_ok and gone:
             return True
         time.sleep(1.0)
     return False
@@ -272,17 +344,31 @@ def run(plan, out_path):
                 "error": "submit button disappeared",
             })
             return 10
-        submit.click()
+        try:
+            page.run_js(_SUBMIT_HOOK_JS)
+        except Exception as exc:                   # noqa: BLE001 - capture only
+            log(f"submit hook failed: {type(exc).__name__}")
+        if not click(page, 'css:[data-qa="submit"]',
+                     int(plan.get("step_timeout_ms") or STEP_TIMEOUT_MS_DEFAULT),
+                     int(plan.get("after_click_ms") or AFTER_CLICK_MS_DEFAULT)):
+            write_result(out_path, {
+                "ok": False, "stage": "submit_click_failed", "submitted": False,
+                "error": "submit click failed",
+            })
+            return 10
         submitted = True
         write_result(out_path, {"stage": "submit_clicked", "submitted": True})
-        log("submit clicked; waiting for success text")
+        log("submit clicked; waiting for thank-you page / submit API")
 
         if not wait_success(page, plan):
+            api = submit_api_result(page) or {}
             write_result(out_path, {
                 "ok": False, "stage": "unconfirmed", "submitted": True,
-                "error": "success text not found",
+                "api_status": api.get("status"),
+                "error": "thank-you page not confirmed",
             })
             return 11
+        time.sleep(0.8)
 
         screenshot = str(plan.get("screenshot") or "")
         if screenshot:
@@ -293,8 +379,10 @@ def run(plan, out_path):
             except Exception as exc:               # noqa: BLE001 - receipt only
                 log(f"screenshot failed: {type(exc).__name__}: {exc}")
                 screenshot = ""
+        api = submit_api_result(page) or {}
         write_result(out_path, {
             "ok": True, "stage": "done", "submitted": True,
+            "api_status": api.get("status"),
             "screenshot": screenshot, "url": page.url, "title": page.title,
         })
         log("submission confirmed")
