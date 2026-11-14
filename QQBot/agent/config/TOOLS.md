@@ -863,3 +863,19 @@ HSR 结果包括中文资料、来源、条件、目标时间和覆盖状态；�
 ```
 
 **Note**: The `/更新日志 [d]`, `/update record [d]` and `/changelog [d]` slash commands also trigger this feature directly without going through the agent (zero token cost). The tool is for natural-language requests like "最近有什么更新". Summarize the returned entries in your reply; the text is already user-ready plain text.
+
+
+---
+
+## Tool: survey_status
+
+**Description**: Read-only snapshot of the current user's Ark Re:Code anniversary survey task: draft id/title, answered and skipped counts, submission state, group time window, and whether real submission is enabled. It never modifies answers, cancels, or submits.
+
+**When to use**: The user asks "问卷填到哪了", "还差什么", "提交成功了吗", "还有草稿吗", or otherwise asks about survey progress/status.
+
+**Parameters**:
+```json
+{"type": "object", "properties": {}, "required": []}
+```
+
+**Safety**: owner-scoped. In a group, another member's draft is never returned. Real submission still requires the user's explicit `/确认提交`; this tool has no side effects.

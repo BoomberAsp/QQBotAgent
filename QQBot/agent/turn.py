@@ -61,6 +61,7 @@ from agent.context import (
     _pending_task_fold, _current_bond_context, _delegate_depth,
     _current_story_context, _current_story_char_id, _current_render_context,
     _turn_keyboard, _current_task_persona, _current_survey_context,
+    _current_survey_view,
 )
 from lib.button_spec import max_rows as _button_max_rows, max_per_row as _button_max_per_row
 from lib.button_spec import Btn, Rows, to_text as _buttons_to_text
@@ -1816,6 +1817,25 @@ async def _auto_cleanup_after(user_id: str, deadline: float) -> None:
 
 
 
+# ── Survey Status Tool (read-only) ────────────────────────────────
+
+def _survey_status() -> str:
+    """Read-only snapshot of the current user's survey task."""
+    view = _current_survey_view.get()
+    if view is None:
+        return json.dumps(
+            {"active": False, "message": "当前没有问卷任务上下文。"},
+            ensure_ascii=False,
+        )
+    try:
+        from .survey_flow import status_payload
+        payload = status_payload(view)
+    except Exception as exc:                      # noqa: BLE001 - tool never raises
+        payload = {"active": False,
+                   "message": f"无法读取问卷状态：{type(exc).__name__}"}
+    return json.dumps(payload, ensure_ascii=False)
+
+
 # ── User Info Tool ─────────────────────────────────────────────────
 
 def _get_user_info() -> str:
@@ -1937,6 +1957,14 @@ def _get_user_info() -> str:
 
 # Register user info tool (must happen after _get_user_info definition and after
 # singletons like _workspace_manager, _special_sessions are initialized)
+_tool_registry.register(
+    "survey_status", _survey_status,
+    "只读查询当前用户的问卷任务：草稿编号、标题、已填/跳过题数、提交状态、"
+    "群聊剩余时间、是否可提交。当用户询问「问卷填到哪了」「还差什么」"
+    "「提交成功了吗」「还有草稿吗」时调用。不会修改答案、不会提交、不会取消。",
+    {"type": "object", "properties": {}, "required": []},
+)
+
 _tool_registry.register(
     "get_user_info", _get_user_info,
     "获取当前用户的系统信息，包括：权限级别、特殊会话列表、工作区用量与目录快照"
@@ -3164,6 +3192,7 @@ async def handle_agent_turn(view: InboundMessage):
         try:
             _survey_token = _current_survey_context.set(
                 _survey_prompt_hint(view))
+            _survey_view_token = _current_survey_view.set(view)
             response = await asyncio.wait_for(
                 agent.run(
                     augmented_message, user_id,
@@ -3188,6 +3217,7 @@ async def handle_agent_turn(view: InboundMessage):
             )
         finally:
             _current_survey_context.reset(_survey_token)
+            _current_survey_view.reset(_survey_view_token)
             _current_sender.reset(token)
 
         # ── Revoicing layer (Bond-System-Design.md §3.3) ──
@@ -3547,6 +3577,7 @@ async def handle_continuous_turn(view: InboundMessage):
             client = _model_router.reasoning_client
 
         _survey_token = None
+        _survey_view_token = None
         token = _current_sender.set(_ToolSender(continuous_sender))
         try:
             # Resolve user permissions
@@ -3625,6 +3656,7 @@ async def handle_continuous_turn(view: InboundMessage):
 
             _survey_token = _current_survey_context.set(
                 _survey_prompt_hint(view))
+            _survey_view_token = _current_survey_view.set(view)
             response = await asyncio.wait_for(
                 agent.run(augmented_message, user_id, client=client,
                            progress_callback=lambda msg: _safe_send(OutProgress(msg), sender=continuous_sender),
@@ -3640,6 +3672,8 @@ async def handle_continuous_turn(view: InboundMessage):
         finally:
             if _survey_token is not None:
                 _current_survey_context.reset(_survey_token)
+            if _survey_view_token is not None:
+                _current_survey_view.reset(_survey_view_token)
             _current_sender.reset(token)
 
         # ── Revoicing layer (task plane of split persona; group → template) ──

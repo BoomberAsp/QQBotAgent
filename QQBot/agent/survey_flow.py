@@ -458,6 +458,72 @@ def prompt_static() -> str:
     return SURVEY_PROMPT_STATIC
 
 
+def status_payload(view) -> dict:
+    """Read-only status for the survey_status tool (owner-scoped, no writes)."""
+    try:
+        if not enabled():
+            return {"enabled": False, "active": False,
+                    "message": "问卷功能当前未启用。"}
+        identity = _identity(view)
+        scope = _scope(view)
+        is_group = bool(getattr(view, "is_group", False))
+        lock = _locks.get(scope)
+        if is_group and lock is not None and lock.owner != identity:
+            return {"enabled": True, "active": False,
+                    "message": "当前没有你名下的问卷任务。"}
+        draft = _store().get(identity)
+        if draft is None or draft.origin_scope != scope:
+            ready, reason = (False, "unavailable")
+            try:
+                ready, reason = _browser_ready()
+            except Exception:
+                pass
+            return {
+                "enabled": True,
+                "active": False,
+                "submit_ready": bool(ready),
+                "submit_reason": reason,
+                "message": "当前没有进行中的问卷草稿。发送 /问卷 <链接> 开始。",
+            }
+        answered = sum(1 for answer in draft.answers.values()
+                       if not answer.is_empty())
+        skipped = len(draft.skipped)
+        try:
+            ready, reason = _browser_ready()
+        except Exception:
+            ready, reason = False, "unavailable"
+        if draft.state == "submitting":
+            message = "问卷正在提交，请稍候。"
+        elif draft.state == "unknown":
+            message = ("上次提交结果未知；如确认未提交，发送 /重试提交 确认。")
+        elif draft.state == "failed":
+            message = "上次提交失败；可发送 /问卷答案 检查答案，或 /重试提交。"
+        else:
+            message = ("可发送 /问卷答案 查看当前题，/问卷详情 查看审阅，"
+                       "/确认提交 提交，/取消 退出。")
+        payload = {
+            "enabled": True,
+            "active": True,
+            "draft_id": draft.draft_id,
+            "title": draft.title,
+            "svid": draft.svid,
+            "state": draft.state,
+            "answered": answered,
+            "skipped": skipped,
+            "follow_up": bool(draft.follow_up_for),
+            "submit_ready": bool(ready),
+            "submit_reason": reason,
+            "message": message,
+        }
+        if is_group and lock is not None:
+            payload["group_remaining_min"] = max(
+                0, int((lock.expires_at - time.time()) / 60))
+        return payload
+    except Exception:
+        return {"enabled": bool(enabled()), "active": False,
+                "message": "无法读取问卷状态。"}
+
+
 def prompt_hint(view) -> str:
     """Per-turn survey state for the agent (owner-only, never raises)."""
     try:

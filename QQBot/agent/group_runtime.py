@@ -15,6 +15,7 @@ current_group_run = ContextVar("current_group_run", default=None)
 # Public, stateless tools only. File, shell, personal retrieval and social-media
 # tools need explicit group-resource adapters before they may join this list.
 GROUP_TOOLS = frozenset({"search_web", "get_time", "geocode", "reverse_geocode",
+                        "survey_status",
                         "search_poi", "get_weather", "character_detail", "bond_detail",
                         "redeem_code", "get_changelog", "delegate_task", "story_search", "group_media", "send_sticker", "fetch_image", "discover_images"})
 _store = None
@@ -378,7 +379,8 @@ async def run_group_turn(view, sender=None):
                               (ctx._current_bond_context,""),(ctx._current_task_persona,""),(ctx._current_story_context,""),
                               (ctx._current_story_char_id,""),(ctx._personality_transition,""),
                               (ctx._current_render_context,""),(ctx._delegate_depth,0),
-                              (ctx._current_survey_context,_survey_hint)):
+                              (ctx._current_survey_context,_survey_hint),
+                              (ctx._current_survey_view,view)):
                 tokens.append((var,var.set(value)))
             turn.set_usage_context(view.user_id,view.group_id,"group")
             async def execute():

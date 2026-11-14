@@ -47,6 +47,7 @@ class CodeLimits:
 # Tools available to ALL users
 _PUBLIC_TOOLS: Set[str] = {
     "get_user_info",
+    "survey_status",
     "delete_workspace_file",
     "search_web", "fetch_image", "discover_images",
     "get_time",

@@ -198,3 +198,9 @@ _current_task_persona = contextvars.ContextVar("_current_task_persona", default=
 _current_survey_context: contextvars.ContextVar[str] = (
     contextvars.ContextVar("_current_survey_context", default="")
 )
+
+# Current turn's inbound message for the read-only survey_status tool; it
+# carries the actual group member identity that the group agent does not see.
+_current_survey_view: contextvars.ContextVar[object] = (
+    contextvars.ContextVar("_current_survey_view", default=None)
+)
