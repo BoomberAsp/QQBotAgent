@@ -75,30 +75,43 @@ def bring_into_view(element):
 
 _REACT_SET_VALUE_JS = """function(text) {
   const el = this;
+  // SurveyCake reads a controlled React input on Next. Its value tracker can
+  // already equal the typed value (ruyipage's real key events update it), so
+  // React never fires onChange and validation still says "此题必填".
+  // Resetting the tracker forces React to see a change; blur then lets the
+  // form run its onBlur validation.
+  const tracker = el._valueTracker;
+  if (tracker) tracker.setValue('');
   const proto = el.tagName === 'TEXTAREA'
     ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
   setter.call(el, text);
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
+  el.dispatchEvent(new Event('blur', { bubbles: true }));
 }"""
 
 
 def type_text(element, text):
-    """Type like a user; fall back to a React-safe JS setter if needed."""
+    """Set a controlled React input so SurveyCake's onNext validation sees it."""
     bring_into_view(element)
+    try:
+        element.run_js(_REACT_SET_VALUE_JS, str(text))
+        value = element.run_js("function(){ return this.value; }")
+        if str(value) == str(text):
+            return
+        log(f"React setter value mismatch: {value!r}")
+    except Exception as exc:                       # noqa: BLE001
+        log(f"React setter failed: {type(exc).__name__}; trying native input")
     try:
         element.input(str(text))
         return
     except Exception as exc:                       # noqa: BLE001
         log(f"input fallback to JS: {type(exc).__name__}")
     try:
-        # Native setter + input/change events is what React's value tracker
-        # needs; plain `el.value = ...` can be swallowed as "unchanged".
-        element.run_js(_REACT_SET_VALUE_JS, str(text))
-    except Exception as exc:                       # noqa: BLE001
-        log(f"native setter failed: {type(exc).__name__}; plain JS value")
         element.input(str(text), by_js=True)
+    except Exception as exc:                       # noqa: BLE001
+        log(f"native setter failed: {type(exc).__name__}")
 
 
 def click(page, locator, timeout_ms, after_ms):
