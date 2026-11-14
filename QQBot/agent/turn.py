@@ -60,7 +60,7 @@ from agent.context import (
     _personality_transition, _on_file_created, _current_quota_bytes,
     _pending_task_fold, _current_bond_context, _delegate_depth,
     _current_story_context, _current_story_char_id, _current_render_context,
-    _turn_keyboard, _current_task_persona,
+    _turn_keyboard, _current_task_persona, _current_survey_context,
 )
 from lib.button_spec import max_rows as _button_max_rows, max_per_row as _button_max_per_row
 from lib.button_spec import Btn, Rows, to_text as _buttons_to_text
@@ -2470,6 +2470,14 @@ async def run_agent_turn(view: InboundMessage):
         _user_busy.discard(user_id)
 
 
+def _survey_prompt_hint(view):
+    try:
+        from .survey_flow import prompt_hint
+        return prompt_hint(view)
+    except Exception:
+        return ""
+
+
 def _view_scope(view):
     from agent.cognitive_state import scope_key
     if view.is_group:
@@ -3154,6 +3162,8 @@ async def handle_agent_turn(view: InboundMessage):
                 )
 
         try:
+            _survey_token = _current_survey_context.set(
+                _survey_prompt_hint(view))
             response = await asyncio.wait_for(
                 agent.run(
                     augmented_message, user_id,
@@ -3177,6 +3187,7 @@ async def handle_agent_turn(view: InboundMessage):
                 timeout=300.0,
             )
         finally:
+            _current_survey_context.reset(_survey_token)
             _current_sender.reset(token)
 
         # ── Revoicing layer (Bond-System-Design.md §3.3) ──
@@ -3535,6 +3546,7 @@ async def handle_continuous_turn(view: InboundMessage):
         else:
             client = _model_router.reasoning_client
 
+        _survey_token = None
         token = _current_sender.set(_ToolSender(continuous_sender))
         try:
             # Resolve user permissions
@@ -3611,6 +3623,8 @@ async def handle_continuous_turn(view: InboundMessage):
             _current_story_context.set(_story_block)
             _current_story_char_id.set(_story_char)
 
+            _survey_token = _current_survey_context.set(
+                _survey_prompt_hint(view))
             response = await asyncio.wait_for(
                 agent.run(augmented_message, user_id, client=client,
                            progress_callback=lambda msg: _safe_send(OutProgress(msg), sender=continuous_sender),
@@ -3624,6 +3638,8 @@ async def handle_continuous_turn(view: InboundMessage):
                 timeout=300.0,
             )
         finally:
+            if _survey_token is not None:
+                _current_survey_context.reset(_survey_token)
             _current_sender.reset(token)
 
         # ── Revoicing layer (task plane of split persona; group → template) ──

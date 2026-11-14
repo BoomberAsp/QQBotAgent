@@ -276,6 +276,14 @@ class Agent:
         if "memory" in self._configs:
             parts.append(self._configs["memory"])
 
+        # Survey commands bypass the LLM; this static card keeps the agent
+        # able to explain the flow and the safety rules when asked.
+        try:
+            from .survey_flow import SURVEY_PROMPT_STATIC
+            parts.append(SURVEY_PROMPT_STATIC)
+        except Exception:
+            pass
+
         # NOTE (Cache-Hit-Rate-Plan.md Phase 3, B6): the "Current time" block
         # used to live here — but this prompt is cached in _system_prompt, so
         # the timestamp froze at first build (startup time) and went stale.
@@ -709,6 +717,7 @@ class Agent:
         from agent.context import (
             _current_personality, _personality_transition, _current_group_context,
             _current_bond_context, _current_story_context, _current_render_context,
+            _current_survey_context,
         )
         from agent.character_registry import get_character_registry
 
@@ -851,6 +860,11 @@ class Agent:
         story_ctx = _current_story_context.get()
         if story_ctx:
             optional_blocks.append(story_ctx)
+
+        # Survey task state (owner-only, rebuilt per turn by turn.py).
+        survey_ctx = _current_survey_context.get()
+        if survey_ctx:
+            optional_blocks.append(survey_ctx)
 
         # Multimodal asset memories (P5, Bond-System-Design.md §8): recent
         # images/voices shared with the current character, so the character
@@ -1355,3 +1369,4 @@ class Agent:
         """Clean up expired sessions."""
         removed = self.sessions.cleanup_expired()
         return removed
+

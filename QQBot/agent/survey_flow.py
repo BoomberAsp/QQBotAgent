@@ -163,23 +163,24 @@ def _receipt_days() -> int:
     return max(1, _env_int("SURVEY_SCREENSHOT_RETENTION_DAYS", 7))
 
 
-def _masked_member_id(survey: SurveyDef, draft: SurveyDraft) -> str:
+def _member_id(survey: SurveyDef, draft: SurveyDraft) -> str:
+    """Full member id for user-facing verification (not a secret in chat)."""
     for question in survey.questions:
         if _is_member_id_question(question):
             answer = draft.answers.get(question.subject_id)
             if answer is not None and (answer.text or "").strip():
-                return mask_member_id(answer.text)
+                return answer.text.strip()
     return ""
 
 
-def _receipt_text(survey: SurveyDef, draft: SurveyDraft, masked: str) -> str:
+def _receipt_text(survey: SurveyDef, draft: SurveyDraft, member_id: str) -> str:
     now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
     return "\n".join([
         "✅ 已提交成功",
         f"问卷：{survey.title}",
         f"时间：{now}（UTC+8）",
         f"草稿：#{draft.draft_id}",
-        f"会员编号：{masked or '（未填）'}",
+        f"会员编号：{member_id or '（未填）'}",
         "回执截图见下一条消息。",
         "奖励将发送至该编号的游戏信箱，请勿重复提交。",
     ])
@@ -443,6 +444,62 @@ def is_survey_command(text: str) -> bool:
     return _parse_command(text) is not None
 
 
+SURVEY_PROMPT_STATIC = """## 问卷填写（Ark Re:Code 周年问卷）
+用户可以用 /问卷 <链接> 开始填写（群聊需 @机器人）；系统先发概览，再逐题提问。
+- 选择题点按钮，文本题直接回复；可选文本可发 /问卷跳过；/问卷答案 查看当前题，/问卷详情 查看审阅。
+- 群聊任务约 5 分钟；/取消、/取消问卷 或 /退出问卷 退出；同一群同时只能有一个进行中的问卷。
+- 只有用户本人发送 /确认提交 才会提交，且提交不可撤销；管理员可能未开启真实提交。
+- 不要替用户编造答案、不要自动提交、不要声称已提交；用户问进度时先查看状态，再建议 /问卷答案。
+"""
+
+
+def prompt_static() -> str:
+    """Static capability card injected into private and group prompts."""
+    return SURVEY_PROMPT_STATIC
+
+
+def prompt_hint(view) -> str:
+    """Per-turn survey state for the agent (owner-only, never raises)."""
+    try:
+        if not enabled():
+            return ""
+        identity = _identity(view)
+        scope = _scope(view)
+        is_group = bool(getattr(view, "is_group", False))
+        lock = _locks.get(scope)
+        if is_group and lock is not None and lock.owner != identity:
+            return ""
+        draft = _store().get(identity)
+        if draft is None or draft.origin_scope != scope:
+            return ""
+        answered = sum(1 for answer in draft.answers.values()
+                       if not answer.is_empty())
+        skipped = len(draft.skipped)
+        bits = [f"[问卷任务] 草稿 #{draft.draft_id}"]
+        if draft.title:
+            bits[0] += f"《{draft.title[:30]}》"
+        bits.append(f"已填 {answered} 题" + (f"，跳过 {skipped} 题" if skipped else ""))
+        if draft.follow_up_for:
+            bits.append("当前在补充说明")
+        if draft.state == "submitting":
+            bits.append("正在提交")
+        elif draft.state == "failed":
+            bits.append("上次提交失败，可 /重试提交")
+        elif draft.state == "unknown":
+            bits.append("上次提交结果未知，需 /重试提交 确认")
+        if is_group:
+            if lock is not None:
+                minutes = max(1, int((lock.expires_at - time.time()) / 60))
+                bits.append(f"群聊窗口约剩 {minutes} 分钟")
+            else:
+                bits.append("群聊窗口已过期，可发 /问卷答案 继续")
+        bits.append("用户可发 /问卷答案 查看当前题、/问卷详情 查看审阅、/取消 退出；"
+                    "只有用户发 /确认提交 才会提交")
+        return "；".join(bits)
+    except Exception:
+        return ""
+
+
 def _parse_command(text: str) -> tuple[str, str] | None:
     """Parse a survey command, tolerating common chat-input shapes.
 
@@ -654,9 +711,7 @@ async def _cmd_start(view, rest, draft, store, scope, sender) -> bool:
     if getattr(view, "is_group", False):
         _touch_or_acquire(scope, identity, draft.draft_id)
     await _send_with_buttons(
-        _render_overview(
-            survey, draft, mask=bool(getattr(view, "is_group", False))
-        ) + _group_task_hint(view),
+        _render_overview(survey, draft) + _group_task_hint(view),
         _overview_rows(draft),
         sender,
     )
@@ -796,10 +851,7 @@ async def _cmd_show(view, draft, store, scope, sender) -> bool:
     except SurveyError as exc:
         await _send(f"⚠ {exc}", sender)
         return True
-    await _send(
-        _render_overview(survey, draft, mask=bool(getattr(view, "is_group", False))),
-        sender,
-    )
+    await _send(_render_overview(survey, draft), sender)
     if draft.follow_up_for:
         await _send_question(view, survey, draft, sender,
                              question=survey.question(draft.follow_up_for))
@@ -857,9 +909,8 @@ async def _cmd_confirm(view, draft, store, scope, sender) -> bool:
             status = "提交功能已开启，但浏览器引擎未就绪（需 SURVEY_BROWSER=ruyipage）"
         else:
             status = "提交功能未启用"
-        mask = bool(getattr(view, "is_group", False))
         lines = [f"✅ 本地校验通过（{status}，本次不会真正提交）", ""]
-        lines.extend(_review_lines(survey, draft, mask))
+        lines.extend(_review_lines(survey, draft))
         lines += [
             "",
             "管理员开启 SURVEY_ENABLE_SUBMIT=1 且 SURVEY_BROWSER=ruyipage 后，这里会真正提交。",
@@ -974,17 +1025,18 @@ async def _do_submit(view, survey, draft, store, scope, sender) -> bool:
     _record_attempt_time(identity)
 
     if result.get("ok"):
-        masked = _masked_member_id(survey, draft)
+        member_id = _member_id(survey, draft)
         store.mark_submitted(draft, meta={
             "backend": "ruyipage",
             "stage": stage,
             "duration_ms": duration,
             "screenshot": os.path.basename(result.get("screenshot") or ""),
-            "member_masked": masked,
+            # Persisted records stay PII-free; only the chat receipt is full.
+            "member_masked": mask_member_id(member_id) if member_id else "",
         })
         _locks.pop(scope, None)
         _locks.pop(draft.origin_scope, None)
-        await _send(_receipt_text(survey, draft, masked), sender)
+        await _send(_receipt_text(survey, draft, member_id), sender)
         shot = str(result.get("screenshot") or "")
         if shot and os.path.exists(shot):
             try:
@@ -1309,7 +1361,7 @@ def _extract_named_text(question: SurveyQuestion, text: str) -> str:
 
 # ── rendering ───────────────────────────────────────────────────
 
-def _render_overview(survey: SurveyDef, draft: SurveyDraft, mask: bool) -> str:
+def _render_overview(survey: SurveyDef, draft: SurveyDraft) -> str:
     """First message: a short summary, not the full form."""
     meta = []
     if survey.deadline_hint:
@@ -1408,15 +1460,13 @@ def _question_rows(survey: SurveyDef, draft: SurveyDraft,
     return rows
 
 
-def _review_lines(survey: SurveyDef, draft: SurveyDraft, mask: bool) -> list[str]:
+def _review_lines(survey: SurveyDef, draft: SurveyDraft) -> list[str]:
     lines = []
     for question in survey.questions:
         number = survey.number_of(question.subject_id)
         shown = describe_answer(question, draft.answers.get(question.subject_id))
         if not shown:
             shown = "（必填未填）" if question.required else "（未填）"
-        elif mask and _is_member_id_question(question):
-            shown = mask_member_id(shown)
         lines.append(f"{number}) {question.text[:24]}：{shown}")
     return lines
 
@@ -1453,10 +1503,9 @@ async def _send_question(view, survey: SurveyDef, draft: SurveyDraft,
 
 
 async def _send_review(view, survey: SurveyDef, draft: SurveyDraft, sender) -> None:
-    mask = bool(getattr(view, "is_group", False))
     issues = validate_answers(survey, draft.answers)
     lines = [f"请确认（草稿 #{draft.draft_id}）", ""]
-    lines.extend(_review_lines(survey, draft, mask))
+    lines.extend(_review_lines(survey, draft))
     if issues:
         lines += ["", "⚠ 还不能提交："] + [f"- {item}" for item in issues]
     else:

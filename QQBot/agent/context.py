@@ -192,3 +192,9 @@ _current_evidence_id = contextvars.ContextVar("_current_evidence_id", default=""
 
 # Internal execution persona must not replace the user-selected public identity.
 _current_task_persona = contextvars.ContextVar("_current_task_persona", default="")
+
+# Per-turn survey task hint (owner-only). Injected into the L4 volatile tail
+# (private) or the group prompt; never into the cached prefix.
+_current_survey_context: contextvars.ContextVar[str] = (
+    contextvars.ContextVar("_current_survey_context", default="")
+)
