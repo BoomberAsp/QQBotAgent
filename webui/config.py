@@ -207,3 +207,10 @@ def log_sources() -> dict:
 os.environ.setdefault("MEDIA_DATA_ROOT", bot_env("MEDIA_DATA_ROOT", str(QQBOT_DIR / "data" / "media_runtime")))
 
 os.environ.setdefault("PERSONA_RESOURCE_REGISTRY",bot_env("PERSONA_RESOURCE_REGISTRY",str(QQBOT_DIR/"data/persona_resources/registry.json")))
+
+# 兑换码 X 源：面板「粘贴推文链接」走 crc._fetch_url(use_proxy=True)，它读
+# os.environ 里的 REDEEM_CODE_PROXY。面板不 load_dotenv，不注入的话服务器上
+# URL 解析会因「无代理」静默失败。未配置时不注入，保留直连行为（开发机）。
+_REDEEM_PROXY = bot_env("REDEEM_CODE_PROXY", "")
+if _REDEEM_PROXY:
+    os.environ.setdefault("REDEEM_CODE_PROXY", _REDEEM_PROXY)

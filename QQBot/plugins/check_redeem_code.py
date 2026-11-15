@@ -10,14 +10,21 @@ Supports:
     entries (_source="panel") are authoritative: the scraper never
     overwrites them and cleanup never removes them.
 
-Data source:
-  - https://ucngame.com/codes/ark-recode-redeem-codes/ — the only
-    high-timeliness aggregator, but behind a Cloudflare JS challenge
-    since ~2026-09. Plain HTTP cannot pass it; the optional ruyiPage
-    browser engine can (see below). (gamevoyant / cofregamers were
-    removed 2026-10: incomplete data.)
-  The page injects a runtime "Copy" button into every code cell (Copy
-  The Code plugin); tag-stripping would glue its label onto the code
+Data sources:
+  - X/Twitter official account (@Arkrecode_ZH) — opt-in via REDEEM_CODE_X=on
+    (see redeem_x_source.py). Codes are posted as self-replies under
+    announcement tweets; discovered through SearXNG search indexing and
+    fetched anonymously from the syndication CDN. Highest timeliness
+    (official, index delay <= 6h). A periodic poll (redeem_x_poll.py)
+    keeps the cache fresh every ~2h while enabled.
+  - https://ucngame.com/codes/ark-recode-redeem-codes/ — aggregator behind
+    a Cloudflare JS challenge since ~2026-09. Plain HTTP cannot pass it;
+    the optional ruyiPage browser engine can (see below). (gamevoyant /
+    cofregamers were removed 2026-10: incomplete data.) NOTE: with the X
+    source on, its ~2h refresh keeps the cache fresh, so ucngame's
+    staleness-triggered lazy refresh no longer fires — X supersedes it.
+  The ucngame page injects a runtime "Copy" button into every code cell
+  (Copy The Code plugin); tag-stripping would glue its label onto the code
   ("CopyArk3rdVvqYfU"), so _strip_copy_button_label removes it.
 
 Browser engine (Cloudflare bypass, opt-in): ucngame's JS challenge defeats
@@ -211,15 +218,16 @@ async def check_and_refresh() -> bool:
     Returns True if a refresh was triggered (not whether it succeeded).
     Call get_redeem_codes() afterwards to get the best available data.
 
-    With the browser engine enabled the refresh runs as a non-blocking
-    background task (a cold Firefox+Cloudflare fetch can take >60s and must
-    not hang the caller); a single in-flight refresh is deduplicated. The
-    default HTTP path is awaited inline as before.
+    With the browser engine or the X source enabled the refresh runs as a
+    non-blocking background task (a cold Firefox+Cloudflare fetch can take
+    >60s, and X discovery queries SearXNG for 10-40s — neither may hang the
+    caller); a single in-flight refresh is deduplicated. The default
+    HTTP-only path is awaited inline as before.
     """
     if not _is_stale():
         return False
 
-    if _browser_engine_enabled():
+    if _browser_engine_enabled() or _x_source().enabled():
         global _refresh_in_flight, _refresh_task
         if _refresh_in_flight:
             # Already refreshing in the background; don't stack another
@@ -370,9 +378,25 @@ async def _refresh():
               file=sys.stderr)
         return
 
-    # Merge: update existing entries, add new ones, preserve unmatched
+    added = _merge_scraped(scraped)
+    print(f"[RedeemCode] Refresh complete: {len(scraped)} scraped, "
+          f"{added} new codes", file=sys.stderr)
+
+
+def _merge_scraped(scraped: list[dict]) -> int:
+    """Merge scraped entries into the cache; return count of NEW codes.
+
+    Panel-authored entries stay authoritative (scraper may only max-merge
+    _added). Synchronous on purpose: no await inside means the merge is
+    atomic within the event loop, so the periodic X poll and a lazy
+    background refresh can never interleave read-modify-write steps.
+    Also used directly by redeem_x_poll for X-only passes (an empty list
+    is a successful check: it still freshens scraped_at and clears the
+    alert, keeping the "自动更新失败" banner honest).
+    """
     existing = _load_cache()
     existing_by_code = {e["code"]: e for e in existing}
+    before = len(existing_by_code)
 
     for entry in scraped:
         code = entry["code"]
@@ -404,8 +428,7 @@ async def _refresh():
     # the alert's premise was "scraping failed", which is no longer true.
     _clear_admin_alert()
 
-    print(f"[RedeemCode] Refresh complete: {len(scraped)} scraped, "
-          f"{len(merged)} total in cache", file=sys.stderr)
+    return len(existing_by_code) - before
 
 
 def _get_proxy_url() -> str:
@@ -577,6 +600,15 @@ _SOURCES = [
 ]
 
 
+def _x_source():
+    """Lazy import of the X/Twitter source (avoids import cycles)."""
+    try:
+        from plugins import redeem_x_source as xs
+    except ImportError:  # pragma: no cover - QQBot/ not on sys.path
+        from QQBot.plugins import redeem_x_source as xs
+    return xs
+
+
 async def _scrape() -> list[dict] | None:
     """Scrape redeem codes from all reachable sources and merge.
 
@@ -586,7 +618,23 @@ async def _scrape() -> list[dict] | None:
     all_entries = []
     ok_any = False
 
-    for src in _SOURCES:
+    sources = list(_SOURCES)
+    xs = _x_source()
+    if xs.enabled():
+        sources.append({"name": "x"})
+
+    for src in sources:
+        if src["name"] == "x":
+            # X source discovers + fetches + parses on its own; entries
+            # already carry _source="x". None = discovery failed/in flight.
+            entries = await xs.scrape()
+            if entries is None:
+                continue
+            ok_any = True
+            print(f"[RedeemCode] x: parsed {len(entries)} codes",
+                  file=sys.stderr)
+            all_entries.extend(entries)
+            continue
         html = await _fetch_for_source(src)
         if html is None:
             continue

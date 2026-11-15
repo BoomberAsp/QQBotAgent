@@ -171,7 +171,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   $('rd-parse').addEventListener('click', async () => {
     const text = $('rd-tweet').value;
-    if (!text.trim()) { toast('请先粘贴推文文本', 'error'); return; }
+    if (!text.trim()) { toast('请先粘贴推文文本或链接', 'error'); return; }
     try {
       const r = await api('/api/redeem/parse-tweet', { method: 'POST', body: { text } });
       if (!r.code && !r.valid && !r.content) {

@@ -59,7 +59,7 @@ QQBotAgent/
 │   ├── qqbot-official-buttons-design.md   #   官方渠道按钮交互设计（功能盘点 + 接入方案）
 │   ├── 更新日志.md / aliyun_models_api.md / COMPARISON-QQBOTAGENT.md
 │   └── QQBOTAGENT-IMPROVEMENT-PLAN.md / openrubi_migration_plan.md / bot-site-nginx.md
-├── test/                       # 离线测试与实验脚本（gitignore，仅开发机；test.sh 调用其中 11 个）
+├── test/                       # 离线测试与实验脚本（gitignore，仅开发机；test.sh 调用其中 17 个）
 ├── evidence/                   # 验证证据 / 截图
 ├── *.md                        # 设计与计划文档（Bond / Story-KB / Voice / Cache-Hit-Rate / Memory 等）
 │
@@ -106,6 +106,8 @@ QQBotAgent/
     │   ├── qq_official.py      #   官方入口 + 每日主动循环（角色信箱信封 + 主动发媒体，双向互斥）+ 拒收/恢复事件 + 状态心跳 + 邮件管理队列 worker（面板删信/系统邮件，§16.2）
     │   ├── qq_official_buttons.py  # 官方 INTERACTION_CREATE 回调入口（幂等+限频+审计）
     │   ├── pullingMonitor.py / check_redeem_code.py / ruyipage_fetch.py / offline_logger.py
+    │   ├── redeem_x_source.py  #   兑换码 X 官方推文源（SearXNG 发现 + syndication 抓取，零 nonebot 依赖）
+    │   ├── redeem_x_poll.py    #   X 源周期轮询（REDEEM_CODE_X=on 时每 2h，失败指数退避）
     │   └── group.py / speed.py / photos.py / test.py / utils.py（旧插件，仅保留个别工具函数）
     │
     ├── tools/                  # Agent 工具实现
@@ -168,7 +170,7 @@ QQBotAgent/
         ├── feedback/           #   用户反馈 / Bug 报告
         ├── name_index/         #   角色名索引缓存
         ├── wiki_cache/         #   Wiki 爬取缓存与卡片图
-        ├── redeem_code/        #   兑换码缓存
+        ├── redeem_code/        #   兑换码缓存 + admin_alert.json + x_seen.json（X 源已见推文状态）
         ├── mailboxes/          #   角色信箱（每用户信件/摘要 JSON，28 天保留；bot 单写、面板只读）
         ├── mail_admin/         #   面板邮件管理队列（queue/processing/status；面板写、bot 认领执行回写）
         ├── changelog/          #   更新记录 + 公告 + 群发/群列表文件队列（按需创建）
@@ -1653,7 +1655,24 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | `/wiki` Wiki 缓存 | 角色/羁绊数据浏览（详情列表**合并解包 gamedata 中 wiki 未收录的新角色**，`解包` 徽标只读视图：立绘/星阶/技能/卡面文案）、**别名字典编辑**（`character_dic.json` / `bonds_search_dic.json`）、待补录（wiki + 解包双来源；**官方名被旧分组占用**时置顶冲突项，可一键「拆分为新组」） |
 | `/changelog` 更新日志与公告 | 编辑**更新记录**（版本/日期/分类变更条目，`changelog.json`）与**自由公告**（标题/正文/markdown，`announcements.json`），按渠道勾选**双渠道群发**（OneBot 群 + 官方群） |
 | `/mail` 邮件管理 | 用户信箱只读查看（列表 = 信箱建档 ∪ c2c 联系人登记表，openid 脱敏 W4）、勾选发送**系统邮件**（text/markdown）、**撤回**信件；经 `data/mail_admin/` 文件队列由 bot 执行并回写状态（§16.2/§16.4） |
-| `/redeem` 兑换码管理 | 限时/长期兑换码人工维护（权威源，`_source=panel`），支持导入/清理与自动抓取联动 |
+| `/redeem` 兑换码管理 | 限时/长期兑换码人工维护（权威源，`_source=panel`），推文文本/**推文链接**粘贴解析（链接走 syndication 抓取，需代理），支持导入/清理与自动抓取联动 |
+
+### 兑换码数据源（panel 权威 + X 自动源 + ucngame 备胎）
+
+三层数据源，合并时 **panel 条目永远权威**（`_source=panel`：爬虫只能 max-merge `_added`，不得覆盖 content/valid；过期清理也豁免）：
+
+1. **WebUI 面板人工录入**（主渠道）：`/redeem` 页粘贴推文文本或**推文链接**解析入列。链接路径（`POST /api/redeem/parse-tweet` 检测到 `x.com/…/status/…`）走 `redeem_x_source.parse_tweet_url` → syndication CDN 匿名抓取，需 `REDEEM_CODE_PROXY`（面板进程不 load_dotenv，`webui/config.py` 已显式注入该变量）。
+2. **X/Twitter 官方源**（`plugins/redeem_x_source.py` + `redeem_x_poll.py`，opt-in `REDEEM_CODE_X=on`，默认 off 时行为与旧版逐字节一致）：官方 @Arkrecode_ZH 把兑换码作为**自回复**发在公告推下，活动期间**每天一个**，故需持续轮询而非一次抓全。链路（2026-11-15 实测验证）：
+   - **发现**：自建 SearXNG（`SEARXNG_ENDPOINT`，Google 引擎索引推文含回复，标题带全文）两条查询 `site:x.com/<账号>/status` 与 `兌換期限至 site:x.com/<账号>`，各翻 1-2 页，**不用 time_range**（会静默丢结果）；`httpx trust_env=False` 防全局 HTTPS_PROXY 泄漏进 localhost 调用。索引时延 ≤6h，覆盖是概率性的。
+   - **抓取**：`cdn.syndication.twimg.com/tweet-result?id=…&token=…` 匿名接口（无需登录/UA）；token = `((id/1e15)*π)` 的 base36 去 0 去点（Python 10 位小数截断版实测可用，服务端校验宽松）。走 `crc._fetch_url(use_proxy=True)`（curl_cffi chrome131 + 代理）。
+   - **守卫**：`__typename=Tweet`（拒 tombstone）、screen_name 匹配、code **且** valid 非空（真实码推全带期限；兼拒 EN 格式误解析与公告根推）、期限距今 ≤30 天（挡去年旧码）。`_added` = created_at 转北京日期。
+   - **状态**：`data/redeem_code/x_seen.json`（原子写，2000 ID 上限淘汰最旧）；**抓取成功即标 seen**（无论是否解析出码，防根推每轮重抓），抓取失败不标（下轮重试）。单飞 `_scrape_busy`，每轮 ≤15 条新推、0.5s 间隔。
+   - **轮询**（`redeem_x_poll.py`，`on_startup` 建任务）：90s 预热，每 `REDEEM_CODE_X_INTERVAL`（默认 7200s，下限 300）+ 0-15min 抖动；每轮热读 `REDEEM_CODE_X`（off 即休眠，热 kill 开关）与代理；成功巡检（含零新码）即 `_merge_scraped([])` 保鲜 `scraped_at` + 清 admin 告警（「自动更新失败」横幅不说谎）；失败指数退避 2h→4h→6h 封顶，成功归零。
+   - **懒触发**：`check_and_refresh()` 在 X 开启时也走后台任务（SearXNG 10-40s 不能挂住 `/兑换码`），复用 `_refresh_in_flight` 去重。**副作用**：X 每 2h 保鲜后 ucngame 的 stale 懒刷新不再触发——ucngame 本就是休眠备胎，X 是严格更优的官方源。
+   - **死路清单（勿再尝试）**：nitter 全灭（X Corp 2026-08 律师函）、syndication timeline-profile 全局 429、guest graphql TweetDetail 404、x.com 匿名登录墙、legacy conversation API 404。
+3. **ucngame 聚合站**（备胎）：Cloudflare JS 挑战，需 `REDEEM_CODE_BROWSER=ruyipage` 浏览器引擎（共享 `lib/browser_fetch.py` 运行器）；未启用时休眠。
+
+降级矩阵：SearXNG 挂 → discover None → 轮询退避、缓存不动；代理挂 → 单条抓取失败不标 seen 下轮重试；零命中 → [] 照常保鲜；门控 off/无代理 → 零行为变化/跳过本轮。离线测试：`test/test_redeem_x_source.py`（token 向量/锚定正则/守卫/seen/单飞/门控同一性）+ `test_redeem_panel.py` URL 粘贴路径。
 
 ### 更新记录 / 公告群发（`data/changelog/`，双渠道）
 

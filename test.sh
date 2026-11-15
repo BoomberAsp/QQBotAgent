@@ -69,6 +69,8 @@ python test/test_redeem_code.py
 REDEEM_EXIT=$?
 python test/test_redeem_panel.py
 REDEEMPANEL_EXIT=$?
+python test/test_redeem_x_source.py
+REDEEMX_EXIT=$?
 python test/test_webui_wiki_gamedata.py
 WIKIGD_EXIT=$?
 python test/test_web_fetch.py
@@ -99,6 +101,7 @@ if [ $TASKREC_EXIT -ne 0 ]; then EXIT_CODE=$TASKREC_EXIT; fi
 if [ $CHARHEAL_EXIT -ne 0 ]; then EXIT_CODE=$CHARHEAL_EXIT; fi
 if [ $REDEEM_EXIT -ne 0 ]; then EXIT_CODE=$REDEEM_EXIT; fi
 if [ $REDEEMPANEL_EXIT -ne 0 ]; then EXIT_CODE=$REDEEMPANEL_EXIT; fi
+if [ $REDEEMX_EXIT -ne 0 ]; then EXIT_CODE=$REDEEMX_EXIT; fi
 if [ $WIKIGD_EXIT -ne 0 ]; then EXIT_CODE=$WIKIGD_EXIT; fi
 if [ $WEBFETCH_EXIT -ne 0 ]; then EXIT_CODE=$WEBFETCH_EXIT; fi
 if [ $SURVEY_MODEL_EXIT -ne 0 ]; then EXIT_CODE=$SURVEY_MODEL_EXIT; fi

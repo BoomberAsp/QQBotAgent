@@ -25,7 +25,7 @@
 - **用户系统** — 三层记忆引擎（SHORT / MEDIUM / LONG，`TieredMemory`）+ LLM 驱动用户画像提取（含确定性事实过滤 `fact_filter`）
 - **Web 管理面板** — FastAPI 后台（`webui/`）：进程管理、配置热编辑（提示词/人格/.env/模型结构化表单+API 可用性探测）、记忆/画像编辑（与 bot 内存缓存 mtime 一致性校验）、**角色管理（用户自创角色的 card.md / meta.json 分区编辑 + 静态体检 + 版本回滚 + 立绘上传 + 注入预览）**、Wiki 别名管理（详情列表合并解包数据中 wiki 未收录的新角色，待补录含官方名占用冲突一键拆分）、Token 用量看板、反馈处理、更新记录/公告编辑与双渠道群发、**邮件管理（用户信箱只读查看 + 勾选发送系统邮件 + 信件撤回，经文件队列由 bot 执行回写状态）**、Playground
 - **更新记录与公告** — 结构化更新日志（版本/日期/分类变更条目），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询；管理员在面板编辑**更新记录**与**自由公告**，并可双渠道群发（OneBot 群 + QQ 官方群，图片卡片/markdown 呈现，官方群按登记表预检、退群自动标记）；更新内容自动同步到公开使用站点 `bot.oneweblog.cn`（使用说明+演示）
-- **游戏工具** — 抽卡模拟（Wiki 自动爬取卡池数据）、团战截图测速（OCR 解析战斗截图，轻量/全量两种模式）、乱速概率计算、角色/羁绊查询（面板/技能/倍率）、兑换码查询（自动爬取+手动维护）
+- **游戏工具** — 抽卡模拟（Wiki 自动爬取卡池数据）、团战截图测速（OCR 解析战斗截图，轻量/全量两种模式）、乱速概率计算、角色/羁绊查询（面板/技能/倍率）、兑换码查询（X 官方推文自动更新 + 面板手动维护）
 - **地图服务** — 地址↔坐标转换、实时天气、POI搜索、路线规划（高德地图）
 - **群聊管理** — 按群开关功能（抽卡/图片/语音），超级用户可远程管理
 - **人格切换** — 内置人格（助手 Roxy / 角色 Roxy / 露比）+ 用户自创角色；人格绑定在**会话**上（特殊会话各自记住自己的人格，切换会话自动切换人格），并支持用户级与群级默认（`/toggle personality`）；切换后可选择保留历史或清空上下文
@@ -118,6 +118,11 @@ BUFF_DETECTOR_WORKERS=2                # 团战测速 buff 图标匹配并行线
 # SEARXNG_ENDPOINT=http://localhost:8082
 # NAPCAT_HTTP_BASE=http://127.0.0.1:6099
 # BOT_PUBLIC_SITE_URL=https://bot.oneweblog.cn   # 更新公告里的指路短链
+
+# ── 兑换码自动源（可选，默认关闭）──
+# REDEEM_CODE_X=on                     # X 官方推文自动更新（SearXNG 发现 + syndication 抓取，
+#                                      #   需 REDEEM_CODE_PROXY 可达 X；详见 .env.example）
+# REDEEM_CODE_PROXY=http://127.0.0.1:1081
 ```
 
 > 完整清单（含兑换码抓取代理、`web_fetch` 反爬浏览器、`WIKI_PROXY` 等可选段）见 `QQBot/.env.example` 的逐行注释。
@@ -733,7 +738,7 @@ cd QQBot && python test_agent.py
 | 渠道 / 多模态 / 面板（16） | `TestQQOfficialQuoteParsing`、`TestOfficialMarkdown`、`TestOfficialStatusHeartbeat`、`TestWebuiOfficialStatus`、`TestMediaGen`、`TestProactiveMedia`、`TestMediaQuota`、`TestAnchorVoiceId`、`TestDirectVision`、`TestDelegation`、`TestAgentPersist`、`TestActiveGreeting`、`TestModelRouterClassify`、`TestPersonalityMarkerPersistence`、`TestWebuiPermissionsEditor`、`TestWebuiModelSections` |
 | 资产记忆 / 剧情（7） | `TestAssetCardsP4`、`TestAssetSearch`、`TestAssetRecall`、`TestUploadTextualization`、`TestEpisodeDistill`、`TestAssetEvictionInjection`、`TestStoryKbInjectionGate` |
 
-`test.sh` 还会跑 `benchmarks/memory/bench_engine.py`（确定性场景流的记忆引擎 benchmark）与 `test/` 下 11 个离线脚本（测速管线、别名、卡片渲染、兑换码、web_fetch 等）。
+`test.sh` 还会跑 `benchmarks/memory/bench_engine.py`（确定性场景流的记忆引擎 benchmark）与 `test/` 下 17 个离线脚本（测速管线、别名、卡片渲染、兑换码/X 自动源、web_fetch 等）。
 
 ## 安全模型
 
