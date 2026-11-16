@@ -2774,6 +2774,10 @@ async def handle_agent_turn(view: InboundMessage):
         cmd_handled = await _handle_portrait_command(text_content, user_id, view)
         if cmd_handled:
             return
+        # /找图 /找源 /找作者 /找图帮助 — 找图反查一期（直连，零 token）
+        cmd_handled = await _handle_find_source_command(text_content, user_id, view)
+        if cmd_handled:
+            return
 
     # ── Quota cleanup protocol intercept ───────────────────────────
     # Runs before file download / agent so that, when the user is over quota,
@@ -5904,6 +5908,117 @@ async def _handle_portrait_command(text: str, user_id: str, view) -> bool:
     else:
         tail = "，之后按文字外观设定作画"
     await _safe_send(f"已清除「{display}」的参考立绘{tail}{global_note}。")
+    return True
+
+
+# ── 找图反查：/找图 · /找源 · /找作者（一期，零 token）──────────────
+# 设计见 docs/找图反查-方案.md。一期纯 HTTP 引擎（SauceNAO/IQDB/ascii2d/
+# trace.moe）+ VLM 识别 + 同名共识，不碰浏览器。命令直连，不进 agent 循环。
+_FIND_SOURCE_CMDS = ("/找图", "#找图", "/找源", "#找源", "/找作者", "#找作者")
+_FIND_SOURCE_HELP_CMDS = ("/找图帮助", "#找图帮助")
+
+
+async def _find_source_image(view, args: str):
+    """Find the image for /找图 → (data_bytes, local_path, error_msg).
+
+    Priority: URL arg > 本条消息新发的图 > 引用图。local_path 供 VLM 用，
+    URL 下载时没有本地路径（VLM 分支自动跳过）。
+    """
+    from lib.reverse_search.net import safe_download
+    args = args.strip()
+    if args.startswith(("http://", "https://")):
+        try:
+            data = await safe_download(args)
+            return data, "", ""
+        except ValueError as e:
+            return b"", "", str(e)
+        except Exception:  # noqa: BLE001
+            return b"", "", "图片下载失败，换个链接或直接把图发给我试试。"
+
+    atts = await view.load_attachments()
+    images = [a for a in atts if a.kind == "image"]
+    for att in images:
+        if att.path and os.path.isfile(att.path):
+            try:
+                return await asyncio.to_thread(_read_bytes, att.path), att.path, ""
+            except OSError:
+                continue
+    if images:
+        return b"", "", (
+            f"图片下载失败了（{images[0].error or '未知原因'}），重新发一次试试")
+    if getattr(view, "platform", "") == "onebot":
+        try:
+            from adapters.onebot import quoted_file_paths
+            for path in quoted_file_paths(view.raw):
+                if path.lower().endswith(_IMAGE_EXTS) and os.path.isfile(path):
+                    return await asyncio.to_thread(_read_bytes, path), path, ""
+        except Exception:  # noqa: BLE001
+            pass
+    return b"", "", (
+        "没看到图片。把图片和命令一起发（图片 + `/找图`），"
+        "或引用那张图再发 `/找图`，也可以 `/找图 <图片URL>`。")
+
+
+async def _handle_find_source_command(text: str, user_id: str, view) -> bool:
+    """`/找图` / `/找源` / `/找作者` / `/找图帮助` —— 找图反查（零 token）。
+
+    热读开关 FIND_SOURCE_ENABLED（默认 on，设 off 关闭）。配额/冷却/缓存
+    由 lib.reverse_search.service 统一管；这里只负责取图、回话。
+    """
+    cmd = text.partition(" ")[0]
+    if cmd not in (_FIND_SOURCE_CMDS + _FIND_SOURCE_HELP_CMDS):
+        return False
+    if os.environ.get("FIND_SOURCE_ENABLED", "on").strip().lower() in ("off", "0", "false", "no"):
+        return False
+
+    if cmd in _FIND_SOURCE_HELP_CMDS:
+        await _safe_send(
+            "🔍 找图反查\n"
+            "用法：图片 + `/找图`（或引用那张图再发 `/找图`），"
+            "也可以 `/找图 <图片URL>`。\n"
+            "别名：/找源 /找作者\n"
+            "能找什么：二次元画作/插画的出处与画师账号、番剧截图的作品与集数、"
+            "真人照片/coser 的社交账号（Google Lens 视觉匹配 + AI 概览识别）。\n"
+            "限额：每人每天 20 次、全服每天 100 次、同用户 30 秒冷却；"
+            "同图 30 天内重查走缓存不耗次数。\n"
+            "⚠️ 图片会上传到第三方反查引擎（SauceNAO/IQDB/ascii2d/trace.moe/Google Lens），"
+            "请勿发送涉及隐私的图片。结果可能认错，请自行核实。")
+        return True
+
+    _, _, args = text.partition(" ")
+    data, path, err = await _find_source_image(view, args)
+    if err:
+        await _safe_send(err)
+        return True
+    from lib.reverse_search.net import validate_image
+    err = validate_image(data)
+    if err:
+        await _safe_send(err)
+        return True
+
+    try:
+        from lib.reverse_search.service import QuotaDenied, precheck, run
+        from lib.reverse_search.lens import lens_enabled
+    except ImportError:
+        await _safe_send("找图组件未安装（缺 PicImageSearch），请联系管理员。")
+        return True
+    reason = await precheck(data, user_id=user_id)
+    if reason:
+        await _safe_send(reason)
+        return True
+
+    wait = "60" if lens_enabled() else "30"
+    await _safe_send(f"收到，开始找图，稍等（最多约 {wait} 秒）…")
+    try:
+        result = await run(data, image_path=path or None, user_id=user_id)
+    except QuotaDenied as e:
+        await _safe_send(str(e))
+        return True
+    except Exception as e:  # noqa: BLE001
+        code = log_exception("find_source failed", e)
+        await _safe_send(f"找图出错了（诊断编号 {code}），稍后再试。")
+        return True
+    await _safe_send(result.render())
     return True
 
 

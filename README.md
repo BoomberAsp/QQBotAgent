@@ -22,6 +22,7 @@
 - **自托管搜索** — SearXNG 聚合搜索 + `web_fetch` 直接抓取网页（搜索无结果时的 fallback）；完整结果自动存档（7 天/每用户 50 条），上下文折叠后可经 `recall_search_result` 按 id 取回，无需重搜
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制，分级限制：管理员 60s，会员 15s；输出上限统一 16KB）
 - **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
+- **找图反查** — `/找图`（别名 `/找源` `/找作者`）以图找出处：SauceNAO/IQDB/ascii2d 反查画作出处与画师/社交账号、trace.moe 认番剧作品与集数、**Google Lens**（无头 Chrome 裸 CDP + 代理上传，/goto 卡片解链）反查真人/coser 社交账号并带 AI 概览识别，视觉模型并行识别作品/角色；**同名共识**（名字在 ≥2 条命中出现，或高相似度+作者主页链接，或 Lens 作者主页单独命中才采纳）过滤低置信账号，pixiv 标注「画师（非 coser 本人）」；配额（20/人/天、100/全服/天、30s 冷却）+ 同图 30 天缓存。HTTP 引擎直传无需图床；Lens 连续被拦截（验证码/静默限制）自动熔断 10 分钟。热读开关 `FIND_SOURCE_ENABLED` / `FIND_SOURCE_LENS` / `FIND_SOURCE_LENS_COOKIE`（可选真人 cookie 注入）
 - **用户系统** — 三层记忆引擎（SHORT / MEDIUM / LONG，`TieredMemory`）+ LLM 驱动用户画像提取（含确定性事实过滤 `fact_filter`）
 - **Web 管理面板** — FastAPI 后台（`webui/`）：进程管理、配置热编辑（提示词/人格/.env/模型结构化表单+API 可用性探测）、记忆/画像编辑（与 bot 内存缓存 mtime 一致性校验）、**角色管理（用户自创角色的 card.md / meta.json 分区编辑 + 静态体检 + 版本回滚 + 立绘上传 + 注入预览）**、Wiki 别名管理（详情列表合并解包数据中 wiki 未收录的新角色，待补录含官方名占用冲突一键拆分）、Token 用量看板、反馈处理、更新记录/公告编辑与双渠道群发、**邮件管理（用户信箱只读查看 + 勾选发送系统邮件 + 信件撤回，经文件队列由 bot 执行回写状态）**、Playground
 - **更新记录与公告** — 结构化更新日志（版本/日期/分类变更条目），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询；管理员在面板编辑**更新记录**与**自由公告**，并可双渠道群发（OneBot 群 + QQ 官方群，图片卡片/markdown 呈现，官方群按登记表预检、退群自动标记）；更新内容自动同步到公开使用站点 `bot.oneweblog.cn`（使用说明+演示）
@@ -222,6 +223,13 @@ bash start.sh
 | `/羁绊详情 <名称>` | 查询羁绊详情，渲染卡片图片返回（如 `/羁绊详情 驰骋的快感`） |
 | `/刷新角色数据` | **仅管理员**：强制后台刷新角色/羁绊数据库（抓取+翻译+图片下载+卡片重渲染） |
 
+**找图反查**（直接返回，零 token，不经智能体）
+
+| 命令 | 说明 |
+|------|------|
+| `/找图` 或 `/找源` 或 `/找作者` | 图片 + 命令一起发（或引用那张图再发命令，或 `/找图 <图片URL>`）反查出处：二次元画作/插画的出处与画师账号（SauceNAO/IQDB/ascii2d）、番剧截图的作品与集数（trace.moe）、真人/coser 社交账号（Google Lens 视觉匹配 + AI 概览），视觉模型并行识别作品/角色；同名共识过滤低置信账号。每人 20 次/天、全服 100 次/天、30 秒冷却，同图 30 天内重查走缓存。⚠️ 图片会上传第三方引擎（含 Google Lens），勿发隐私图。热读开关 `FIND_SOURCE_ENABLED`（默认 on）、`FIND_SOURCE_LENS`（默认 on） |
+| `/找图帮助` | 查看找图用法、限额与第三方上传告知 |
+
 **连续对话**
 
 | 命令 | 说明 |
@@ -266,7 +274,7 @@ bash start.sh
 QQBotAgent/
 ├── setup.sh / start.sh / stop.sh / start_bot.sh   # 安装 / 启动 / 停止 / 仅启动 NoneBot
 ├── start_webui.sh              # Web 管理面板 启动|停止|重启|状态（127.0.0.1:8090）
-├── test.sh                     # 测试调度：3 个主测试 + 记忆 benchmark + 11 个离线脚本
+├── test.sh                     # 测试调度：3 个主测试 + 记忆 benchmark + 21 个离线脚本
 ├── bot.py                      # NoneBot 备用入口（仅注册 OneBot 适配器；生产用 `cd QQBot && nb run`）
 ├── main.py                     # PyCharm 占位入口（非实际入口）
 ├── docker-compose.yml          # Docker 编排（searxng + qqbot 两服务）
@@ -367,6 +375,7 @@ QQBotAgent/
     │   ├── story_kb.py         #   原作剧情检索（SQLite FTS5 + BM25/RRF）
     │   ├── ocr_engine.py / buff_alias.py / status_icons.py
     │   ├── browser_fetch.py    #   ruyiPage 无头浏览器抓取共享运行器
+    │   ├── reverse_search/     #   找图反查（net/engines/accounts/consensus/quota/vlm/render/service + browser/lens）
     │   ├── status_heartbeat.py #   状态文件原子读写（面板↔bot 文件 IPC）
     │   ├── errors.py           #   错误分类 + 诊断编号
     │   └── amap_client.py
@@ -738,7 +747,7 @@ cd QQBot && python test_agent.py
 | 渠道 / 多模态 / 面板（16） | `TestQQOfficialQuoteParsing`、`TestOfficialMarkdown`、`TestOfficialStatusHeartbeat`、`TestWebuiOfficialStatus`、`TestMediaGen`、`TestProactiveMedia`、`TestMediaQuota`、`TestAnchorVoiceId`、`TestDirectVision`、`TestDelegation`、`TestAgentPersist`、`TestActiveGreeting`、`TestModelRouterClassify`、`TestPersonalityMarkerPersistence`、`TestWebuiPermissionsEditor`、`TestWebuiModelSections` |
 | 资产记忆 / 剧情（7） | `TestAssetCardsP4`、`TestAssetSearch`、`TestAssetRecall`、`TestUploadTextualization`、`TestEpisodeDistill`、`TestAssetEvictionInjection`、`TestStoryKbInjectionGate` |
 
-`test.sh` 还会跑 `benchmarks/memory/bench_engine.py`（确定性场景流的记忆引擎 benchmark）与 `test/` 下 17 个离线脚本（测速管线、别名、卡片渲染、兑换码/X 自动源、web_fetch 等）。
+`test.sh` 还会跑 `benchmarks/memory/bench_engine.py`（确定性场景流的记忆引擎 benchmark）与 `test/` 下 21 个离线脚本（测速管线、别名、卡片渲染、兑换码/X 自动源、web_fetch、问卷、找图反查/Lens 等）。
 
 ## 安全模型
 

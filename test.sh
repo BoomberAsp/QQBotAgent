@@ -83,6 +83,10 @@ python test/test_survey_flow.py
 SURVEY_FLOW_EXIT=$?
 python test/test_browser_action.py
 SURVEY_BROWSER_EXIT=$?
+python test/test_find_source.py
+FINDSRC_EXIT=$?
+python test/test_lens.py
+LENS_EXIT=$?
 cd "$SCRIPT_DIR/QQBot"
 
 EXIT_CODE=0
@@ -108,6 +112,8 @@ if [ $SURVEY_MODEL_EXIT -ne 0 ]; then EXIT_CODE=$SURVEY_MODEL_EXIT; fi
 if [ $SURVEY_DRAFT_EXIT -ne 0 ]; then EXIT_CODE=$SURVEY_DRAFT_EXIT; fi
 if [ $SURVEY_FLOW_EXIT -ne 0 ]; then EXIT_CODE=$SURVEY_FLOW_EXIT; fi
 if [ $SURVEY_BROWSER_EXIT -ne 0 ]; then EXIT_CODE=$SURVEY_BROWSER_EXIT; fi
+if [ $FINDSRC_EXIT -ne 0 ]; then EXIT_CODE=$FINDSRC_EXIT; fi
+if [ $LENS_EXIT -ne 0 ]; then EXIT_CODE=$LENS_EXIT; fi
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}=========================================${NC}"

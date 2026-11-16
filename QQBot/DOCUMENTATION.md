@@ -131,6 +131,7 @@ QQBotAgent/
     │   ├── story_kb.py         #   原作剧情检索（SQLite FTS5 + BM25/RRF）
     │   ├── ocr_engine.py / buff_alias.py / status_icons.py
     │   ├── browser_fetch.py    #   ruyiPage 无头浏览器抓取共享运行器
+    │   ├── reverse_search/     #   找图反查（net/engines/accounts/consensus/quota/vlm/render/service + browser/lens）
     │   ├── status_heartbeat.py #   状态文件原子读写（面板↔bot 文件 IPC）
     │   ├── errors.py           #   错误分类 + 诊断编号
     │   └── amap_client.py
@@ -710,11 +711,12 @@ turn.py / 入口插件
 | 人格 | `/personality`、`/人格切换`（均支持带名称；无 `#` 变体；特殊会话内只写会话绑定，`--全局` 后缀改写用户默认） |
 | 养成 | `/好感度`（`#好感度`/`/bond`）、`/剧情`、`/设好感 <1-10>`、`/创建角色`、`/删除角色`（回复「确认删除角色 <名称>」）、`/设形象`、`/形象`（`/查看形象`）、`/清除形象`（`/删形象`）、`/邮件`（角色信箱，仅官方单聊：列表/`下一页`/`p<N>`/`MM-DD`/信件编号看全文并标记已读；系统邮件带【系统】前缀，面板删除过的信件显示「已被撤回」） |
 | 游戏 | `/兑换码`（`/redeem-code`）、`/长期兑换码`、`/角色详情 <名>`、`/羁绊详情 <名>`、`/刷新角色数据`（仅 admin） |
+| 找图 | `/找图`（`#找图`/`/找源`/`/找作者`）、`/找图帮助`（图片 + 命令 / 引用图 / `/找图 <URL>`；反查出处账号 + 番剧作品 + 真人/coser 社交账号（Lens），零 token；热读开关 `FIND_SOURCE_ENABLED`、`FIND_SOURCE_LENS`） |
 | 群管理 | `/toggle`、`/toggle <gacha\|image\|voice> <on\|off>`、`/toggle personality [名称\|默认]`（仅群聊 + admin） |
 | 其他 | `/功能`（`/features`）、`/更新日志 [d]`（多个别名）、`/管理工作区`（落入 agent）、`/取消`（`#取消`/`/结束`/`#结束`，连续对话窗口内）、`/免责声明`（`#免责声明`；查看/`关`/`开` 免责尾追加，三级用户均可，按渠道独立） |
 | 反馈 | `#反馈 <内容>`、`#bug <描述>`、`#建议 <内容>`（**必须用空格分隔**，且三者都零 token 直达开发者） |
 
-> 分发顺序（命中即 return）：反馈 → `/取消` → `/toggle` → `/兑换码` → `/角色详情` → `/羁绊详情` → `/邮件` → `/免责声明` → `/刷新角色数据` → `/功能` → `/更新日志` → `/人格切换` → `/好感度` → `/设好感` → `/剧情` → 会话族 → 形象族 → 元命令（`/clear`、`/status` 等）→ Agent。
+> 分发顺序（命中即 return）：反馈 → `/取消` → `/toggle` → `/兑换码` → `/角色详情` → `/羁绊详情` → `/邮件` → `/免责声明` → `/刷新角色数据` → `/功能` → `/更新日志` → `/人格切换` → `/好感度` → `/设好感` → `/剧情` → 会话族 → 形象族 → 找图族 → 元命令（`/clear`、`/status` 等）→ Agent。
 > 特例：`/帮助` 由会话族处理（渲染 HELP.md 卡片）；`/管理工作区` 与私聊 `/取消` 会落入 Agent。
 
 #### 已注册工具（40 个）
@@ -892,6 +894,25 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 - **邮件管理队列（§16.2，面板→bot 文件 IPC）**：`plugins/qq_official.py::_mail_admin_worker` 每 3–5s 扫 `data/mail_admin/queue/`，`os.replace` 改名到 `processing/` 原子认领，执行后回写 `status/`（操作 id `mailop_YYYYMMDD_<4hex>` 幂等；状态保留 7 天由 bot 清理）；操作类型白名单 `delete_letter` / `send_system`。系统邮件经 `send_active_c2c_markdown` 真实主动发送（markdown 信封样式 `## 系统邮件 · {title}`，共享熔断降级纯文本），**成功才** `write_system_letter` 入账；用户已拒收（`active_enabled=false`）→ 发送失败不入账。启动时 `_mail_admin_recover` 把上次进程中断的残留认领标记 `failed: bot restarted`。worker 不受 `mail_enabled` 开关影响（撤回/系统邮件独立于每日信封）。
 - `rate_limit.py`：`TokenBucket`/`ChannelLimiter`（c2c 10/s、group 1/s，按渠道懒建复用，可注入 monotonic）。
 - `group_registry.py`：官方群登记表 `data/group_registry.json`（v1 纯记账）：`GROUP_AT_MESSAGE_CREATE` 入站 upsert（60s 粒度节流防文件 churn），status `active/left/unknown` 状态机 + `active_enabled` 开关，为 P1 群主动消息预铺。
+
+### 2.17 `lib/reverse_search/` — 找图反查（一期 HTTP 引擎 + 二期 Google Lens）
+
+设计见 `docs/找图反查-方案.md`。一期纯 HTTP 引擎 + VLM 识别 + 同名共识；二期接 Google Lens（无头 Chrome 裸 CDP，spike 3/3 零验证码；Yandex 留三期）。命令 `/找图`（`/找源`/`/找作者`/`/找图帮助`）在 `agent/turn.py::_handle_find_source_command` 直连拦截（零 token，双适配器经 `run_agent_turn`），取图复用 `view.load_attachments()` + OneBot `quoted_file_paths` 引用兜底 + `/找图 <URL>`（`net.safe_download`）。
+
+| 模块 | 职责 |
+|---|---|
+| `net.py` | 魔数判格式（PNG/JPG/GIF/WEBP/BMP）、`validate_image`（512B–10MB）、SSRF 校验 `check_url_allowed`（http(s) + 公网 IP，挡内网/环回/.local/.internal）、`safe_download`（重定向末 URL 复校验 + 大小上限） |
+| `engines.py` | 四引擎适配（PicImageSearch `file=bytes` 直传，无需图床）：SauceNAO（`SAUCENAO_API_KEY` 可选，匿名兜底）/ IQDB / ascii2d / trace.moe（库内相似度已 ×100）。统一 `Candidate`；`run_engines` 并发 gather + 30s/引擎超时，引擎级失败分类 `ENGINE_ERROR/QUOTA/TIMEOUT` 不拖垮整体 |
+| `accounts.py` | 纯函数：`platform_of`/`handle_of`/`is_post_page`（14 平台），`aggregate_accounts` 按 (平台, handle) 聚合证据，**作者主页优先于帖子页**，pixiv/ArtStation/DeviantArt 标「画师（非 coser 本人）」 |
+| `consensus.py` | 纯函数同名共识（坑 4）：名字/handle 在 ≥2 条不同候选出现，或相似度 ≥80 且有 author_url，或 **Lens 作者主页单独命中**（Lens 无相似度分，视觉匹配=精确图匹配）才采纳；**账号必须有真实链接**（纯名字不进结论）；其余进低置信区只报数量 + ≤3 handle |
+| `quota.py` | 坑 5：30s 冷却 / 20 次每人每天 / 100 次全服每天；图片 sha256 缓存 30 天（命中只查冷却、不耗当日次数）；`QuotaStore` JSON 原子写（`data/find_source/quota.json`），`evaluate`/`record_use`/`cache_*` 纯函数可离线测 |
+| `vlm.py` | `identify_work` 经 `multimodal_client` 识别作品/角色/水印@账号（≤150 字）；不可用/出错返回 None，不阻塞引擎主路 |
+| `render.py` | 纯函数版式（§2.3）：账号反查 / 作品识别（trace.moe 作品 + 集数 + VLM）/ 未找到三态；低置信过滤注记 + 引擎状态 + 「反查结果可能认错，请自行核实。」 |
+| `service.py` | 编排 `run()`：配额闸 `_gate` → 缓存命中直返 → `run_engines` ∥ `_lens_leg` ∥ `identify_work` → 共识 → trace.moe ≥87 取作品 → 落缓存。Lens 腿异常内捕只进 `engine_errors["Lens"]`；VLM 缺席时 Lens AI 概览以「（Lens AI 概览）」前缀补位。`precheck()` 供指令层发回执前先挡配额；`QuotaDenied` 文案可直接回用户；`FindResult.to_payload/from_payload` 缓存序列化 |
+| `browser.py` | 二期：无头 Chrome 裸 CDP 驱动（asyncio subprocess + aiohttp WebSocket，无 playwright）。`find_chrome`（`CHROME_BIN` 热读覆盖）、`chrome_ua`（大版本对齐）、启动旗标组合回退 + 成功记忆、`resolve_redirect`（Fetch.requestPaused 拦截非 Google 请求 + 页面 URL 轮询 + HTML 捞地址，绝不拉目标页）、`sem()` 并发闸固定 1。与 `browser_fetch.py`（ruyiPage Firefox 指纹）互不复用 |
+| `lens.py` | 二期：Lens 引擎。隐藏 form 注入 → `DOM.setFileInputFiles` → 提交 `lens.google.com/v3/upload` → 等渲染 → EXTRACT_JS 抽直链 + ≤24 张 `/goto` 卡片 + AI 概览；`/goto` 解链 HTTP 优先（读 Location ≤3 跳、中间跳必须 Google 域）CDP 兜底，≤3 张卡社交标题优先、已有社交直链则跳过；错误分级 `GOOGLE_CAPTCHA/CONSENT/UNREACHABLE/EMPTY`，`lensImgDead`（上传被接受但 lens.usercontent 图片全部加载失败）识别谷歌对出口 IP 的静默限制 → IMG_DEAD → GOOGLE_UNREACHABLE；连续 3 次被拦截（验证码/静默限制）内存熔断 600s；每次搜索 launch→kill + finally 清理 profile/临时图；`recordable_url` 纯语法私网拦截（不做 DNS）；`FIND_SOURCE_LENS_COOKIE` 真人 cookie 注入（consent 打底后覆盖，解链 Cookie 头同步）。Candidate similarity=0，author_url 仅在「平台+handle+非帖子页」时设置 |
+
+热读开关 `FIND_SOURCE_ENABLED`（默认 on，off 时命令静默落回 Agent）；`FIND_SOURCE_PROXY` 可选引擎代理（四引擎国内直连已实测通）；`FIND_SOURCE_LENS`（默认 on）、`FIND_SOURCE_LENS_PROXY`（默认 `http://127.0.0.1:1081`，Lens 必须走代理）、`CHROME_BIN`、`FIND_SOURCE_LENS_COOKIE`（可选：Cookie-Editor 导出的真人谷歌 cookie JSON 文件路径，注入后覆盖 consent 打底值，对付谷歌对自动化会话的静默限制；缺失/损坏静默回退）。离线测试 `test/test_find_source.py`（DNS/httpx/PicImageSearch/VLM 全 stub）+ `test/test_lens.py`（CDP/httpx/Chrome 全 stub）。
 
 ---
 
