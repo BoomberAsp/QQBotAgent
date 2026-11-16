@@ -341,6 +341,20 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('私聊',self.sender.send_group_text.await_args.args[0])
         self.assertEqual(self.calls,[])
 
+    async def test_find_source_group_command_gets_view_and_aliases(self):
+        handler=AsyncMock(return_value=True)
+        self.fake._handle_find_source_command=handler
+        cases=(('/找图','/找图'),('/找源','/找图'),('/找作者','/找图'),
+               ('/找图帮助','/找图帮助'),('/找图 https://x/y.png','/找图 https://x/y.png'))
+        for spelling,expected in cases:
+            with self.subTest(command=spelling):
+                v=view(message=spelling);v.text='<@123> '+spelling
+                await runtime.run_group_turn(v,self.sender)
+                handler.assert_awaited_once_with(expected,'a',view=v)
+                handler.reset_mock()
+        self.assertEqual(self.calls,[])
+        self.assertEqual(self.store.history(scope_for(v)),[])
+
     async def test_group_game_owner_followup_and_direct_calculation(self):
         from agent.group_games import _pending
         self.addCleanup(_pending.clear)

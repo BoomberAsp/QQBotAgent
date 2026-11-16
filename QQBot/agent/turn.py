@@ -5975,7 +5975,7 @@ async def _handle_find_source_command(text: str, user_id: str, view) -> bool:
         await _safe_send(
             "🔍 找图反查\n"
             "用法：图片 + `/找图`（或引用那张图再发 `/找图`），"
-            "也可以 `/找图 <图片URL>`。\n"
+            "也可以 `/找图 <图片URL>`；群聊里 @我 后同样可用。\n"
             "别名：/找源 /找作者\n"
             "能找什么：二次元画作/插画的出处与画师账号、番剧截图的作品与集数、"
             "真人照片/coser 的社交账号（Google Lens 视觉匹配 + AI 概览识别）。\n"

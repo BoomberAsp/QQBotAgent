@@ -148,7 +148,7 @@ async def dispatch(view,sender,role,store):
         group_token=_current_group_id.set(view.group_id)
         try:
             images=store.group(scope_for(view))['config']['features'].get('image',True)
-            if not await dispatch_public(public,rest,view.user_id,allow_images=images):
+            if not await dispatch_public(public,rest,view.user_id,allow_images=images,view=view):
                 await GroupReply('命令参数有误',[cmd.name+' '+cmd.usage]).send(sender)
         finally:
             _current_group_id.reset(group_token)

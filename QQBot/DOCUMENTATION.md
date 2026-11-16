@@ -711,7 +711,7 @@ turn.py / 入口插件
 | 人格 | `/personality`、`/人格切换`（均支持带名称；无 `#` 变体；特殊会话内只写会话绑定，`--全局` 后缀改写用户默认） |
 | 养成 | `/好感度`（`#好感度`/`/bond`）、`/剧情`、`/设好感 <1-10>`、`/创建角色`、`/删除角色`（回复「确认删除角色 <名称>」）、`/设形象`、`/形象`（`/查看形象`）、`/清除形象`（`/删形象`）、`/邮件`（角色信箱，仅官方单聊：列表/`下一页`/`p<N>`/`MM-DD`/信件编号看全文并标记已读；系统邮件带【系统】前缀，面板删除过的信件显示「已被撤回」） |
 | 游戏 | `/兑换码`（`/redeem-code`）、`/长期兑换码`、`/角色详情 <名>`、`/羁绊详情 <名>`、`/刷新角色数据`（仅 admin） |
-| 找图 | `/找图`（`#找图`/`/找源`/`/找作者`）、`/找图帮助`（图片 + 命令 / 引用图 / `/找图 <URL>`；反查出处账号 + 番剧作品 + 真人/coser 社交账号（Lens），零 token；热读开关 `FIND_SOURCE_ENABLED`、`FIND_SOURCE_LENS`） |
+| 找图 | `/找图`（`#找图`/`/找源`/`/找作者`）、`/找图帮助`（图片 + 命令 / 引用图 / `/找图 <URL>`；反查出处账号 + 番剧作品 + 真人/coser 社交账号（Lens），零 token；私聊与群聊均可用，群聊需 @机器人、配额共用；热读开关 `FIND_SOURCE_ENABLED`、`FIND_SOURCE_LENS`） |
 | 群管理 | `/toggle`、`/toggle <gacha\|image\|voice> <on\|off>`、`/toggle personality [名称\|默认]`（仅群聊 + admin） |
 | 其他 | `/功能`（`/features`）、`/更新日志 [d]`（多个别名）、`/管理工作区`（落入 agent）、`/取消`（`#取消`/`/结束`/`#结束`，连续对话窗口内）、`/免责声明`（`#免责声明`；查看/`关`/`开` 免责尾追加，三级用户均可，按渠道独立） |
 | 反馈 | `#反馈 <内容>`、`#bug <描述>`、`#建议 <内容>`（**必须用空格分隔**，且三者都零 token 直达开发者） |
@@ -897,7 +897,7 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 
 ### 2.17 `lib/reverse_search/` — 找图反查（一期 HTTP 引擎 + 二期 Google Lens）
 
-设计见 `docs/找图反查-方案.md`。一期纯 HTTP 引擎 + VLM 识别 + 同名共识；二期接 Google Lens（无头 Chrome 裸 CDP，spike 3/3 零验证码；Yandex 留三期）。命令 `/找图`（`/找源`/`/找作者`/`/找图帮助`）在 `agent/turn.py::_handle_find_source_command` 直连拦截（零 token，双适配器经 `run_agent_turn`），取图复用 `view.load_attachments()` + OneBot `quoted_file_paths` 引用兜底 + `/找图 <URL>`（`net.safe_download`）。
+设计见 `docs/找图反查-方案.md`。一期纯 HTTP 引擎 + VLM 识别 + 同名共识；二期接 Google Lens（无头 Chrome 裸 CDP，spike 3/3 零验证码；Yandex 留三期）。命令 `/找图`（`/找源`/`/找作者`/`/找图帮助`）在 `agent/turn.py::_handle_find_source_command` 直连拦截（零 token，双适配器经 `run_agent_turn`），取图复用 `view.load_attachments()` + OneBot `quoted_file_paths` 引用兜底 + `/找图 <URL>`（`net.safe_download`）。群聊走独立分发：`/找图`（别名 `/找源`/`/找作者`）与 `/找图帮助` 注册在 `agent/public_commands.py::PUBLIC_COMMANDS`（`needs_view=True`，`dispatch_public` 透传 view 供取附件），由 `group_commands.dispatch` 在 @机器人/回复机器人时调用，自动进 `/群帮助` 列表；配额/冷却/缓存与私聊共用同一 `QuotaStore`。
 
 | 模块 | 职责 |
 |---|---|

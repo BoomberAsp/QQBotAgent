@@ -8,6 +8,7 @@ class PublicCommand:
     usage: str
     aliases: tuple = ()
     renders_image: bool = False
+    needs_view: bool = False
 
 PUBLIC_COMMANDS = (
     PublicCommand('/角色详情','_handle_character_detail_command','游戏角色名或别名',renders_image=True),
@@ -17,6 +18,8 @@ PUBLIC_COMMANDS = (
     PublicCommand('/问卷','_handle_survey_command','<问卷链接>'),
     PublicCommand('/功能','_handle_features_command','功能一览',('/features',),True),
     PublicCommand('/更新日志','_handle_changelog_command','[条数]',('/更新记录','/update record','/update log','/changelog'),True),
+    PublicCommand('/找图','_handle_find_source_command','图片+命令/引用图/<图片URL>',('/找源','/找作者'),needs_view=True),
+    PublicCommand('/找图帮助','_handle_find_source_command','找图用法与限额',needs_view=True),
 )
 
 # These handlers use private session state, alter personal preferences or operate
@@ -28,9 +31,10 @@ PRIVATE_ONLY = frozenset("""
 /记忆 /clear /管理工作区 /创建角色 /删除角色 /设形象 /形象 /清除形象 /反馈 /bug /建议
 """.split())
 
-async def dispatch_public(command,rest,user_id,*,allow_images=True):
+async def dispatch_public(command,rest,user_id,*,allow_images=True,view=None):
     from . import turn
     handler=getattr(turn,command.handler)
     text=command.name+(' '+rest if rest else '')
     options={'allow_images':allow_images} if command.renders_image else {}
+    if command.needs_view:options['view']=view
     return await handler(text,user_id,**options)
