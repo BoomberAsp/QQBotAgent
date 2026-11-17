@@ -10,13 +10,15 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from loguru import logger
 from PIL import Image, ImageDraw
 
-from lib.reverse_search import accounts, consensus, lens, quota, service, source_verification
+from agent.inbound import InboundMessage
+from lib.reverse_search import accounts, consensus, engines, lens, quota, service, source_verification
 from lib.reverse_search.engines import Candidate
-from lib.reverse_search.source_evidence import merge_sources
+from lib.reverse_search.source_evidence import SourceEvidence, merge_sources
 from lib.reverse_search.vlm import parse_clues
-from tools import image_source_tools as tool
+from tools import image_source_followup as followup, image_source_tools as tool
 
 
 POST = "https://x.com/creator/status/2122151597283422308"
@@ -121,7 +123,149 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replay.engine_status, first.engine_status)
 
 
+class FollowupTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.addCleanup(followup._recent.clear)
+        self.view = InboundMessage(user_id="tester", self_id="bot", platform="qq_official")
+
+    async def test_two_pages_share_one_deadline_and_return_known_links(self):
+        urls = ["https://x.com/ChocoQAQ", "https://www.instagram.com/ChocoQAQ"]
+        found = service.FindResult(
+            visual=parse_clues('{"watermarks":["@ChocoQAQ"]}'),
+            sources=[SourceEvidence(url, kind="profile") for url in urls] +
+                    [SourceEvidence("https://twitter.com/chocoqaq", kind="profile")])
+        followup.remember(self.view, "scope", "", photo(), found)
+        intent = followup.resolve(self.view, "scope", "根据水印爬取一下")
+
+        async def slow(url):
+            await asyncio.sleep(60)
+
+        read = AsyncMock(side_effect=slow)
+        with patch.object(followup, "_TOTAL_SECONDS", .08), patch.object(followup, "_PAGE_SECONDS", .03), \
+             patch.object(source_verification, "read_public_profile", read):
+            summary = await asyncio.wait_for(followup.run(intent, ""), .3)
+        self.assertIn("网页读取超时", summary)
+        self.assertTrue(all(url in summary for url in urls))
+        self.assertEqual([call.args[0] for call in read.await_args_list], urls)
+
+    async def test_ambiguous_handle_requires_selection_and_scopes_expire(self):
+        found = service.FindResult(visual=parse_clues('{"watermarks":["@ChocoQAQ", "@another"]}'))
+        followup.remember(self.view, "scope", "", photo(), found)
+        intent = followup.resolve(self.view, "scope", "帮我查那个账号")
+        lookup = AsyncMock(return_value=[])
+        with patch.object(source_verification, "lookup_watermark", lookup):
+            self.assertIn("想查哪一个", await followup.run(intent, ""))
+            lookup.assert_not_awaited()
+            selected = followup.resolve(self.view, "scope", "@ChocoQAQ")
+            self.assertIn("@ChocoQAQ", await followup.run(selected, ""))
+            lookup.assert_awaited_once_with("@ChocoQAQ")
+            self.assertIsNone(followup.resolve(self.view, "elsewhere", "帮我查那个账号"))
+            with patch.object(followup.time, "monotonic", return_value=time.monotonic() + 301):
+                self.assertIsNone(followup.resolve(self.view, "scope", "帮我查那个账号"))
+
+    async def test_an_older_in_flight_search_cannot_replace_a_newer_upload(self):
+        later = InboundMessage(user_id=self.view.user_id, self_id=self.view.self_id,
+                               platform=self.view.platform, received_at=self.view.received_at + 1)
+        found = service.FindResult(visual=parse_clues('{"watermarks":["@ChocoQAQ"]}'))
+        followup.forget(later, "scope")
+        followup.remember(self.view, "scope", "", photo(), found)
+        self.assertIsNone(followup.resolve(later, "scope", "帮我查这个账号"))
+
+    async def test_original_prefers_post_media_and_uses_original_attachment_only(self):
+        data = photo()
+        profile = "https://x.com/ChocoQAQ"
+        post = profile + "/status/125"
+        found = service.FindResult(sources=[
+            SourceEvidence(profile, kind="profile", match="exact"),
+            SourceEvidence("https://example.com/profile", kind="page", match="watermark"),
+            SourceEvidence(post, kind="post", match="watermark")])
+        verify = AsyncMock(return_value=source_verification.Verification("same_image", "@ChocoQAQ"))
+        with tempfile.TemporaryDirectory() as directory, patch.object(source_verification, "verify_source", verify):
+            image = Path(directory, "input.png")
+            image.write_bytes(data)
+            followup.remember(self.view, "scope", str(image), data, found)
+            intent = followup.resolve(self.view, "scope", "继续查原帖")
+            answer = await followup.run(intent, directory)
+            verify.assert_awaited_once_with(post, data)
+            self.assertIn("找到含同图", answer)
+            self.assertIn("首发出处仍需核实", answer)
+            image.write_bytes(photo(fmt="JPEG"))
+            changed = "scope-after-file-replacement"
+            followup.remember(self.view, changed, str(image), data, found)
+            intent = followup.resolve(self.view, changed, "继续查原帖")
+            self.assertIn("原附件已无法读取", await followup.run(intent, directory))
+            verify.assert_awaited_once()
+
+
+class HttpStageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_engine_traces_connect_upload_and_response_without_query_data(self):
+        async def serve(reader, writer):
+            wire = (await reader.readuntil(b"\r\n\r\n")).lower()
+            size = next((int(line.split(b":", 1)[1]) for line in wire.splitlines()
+                         if line.startswith(b"content-length:")), 0)
+            await reader.readexactly(size)
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        logs = []
+        sink = logger.add(lambda line: logs.append(str(line)))
+        self.addCleanup(logger.remove, sink)
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+
+        async def upload(data):
+            client = engines._engine_client.get()
+            await client.post(f"http://127.0.0.1:{port}/search?token=SECRET", content=data)
+            return []
+
+        async with server:
+            with patch.object(engines, "_ENGINES", (("test", upload),)), \
+                 patch.dict("os.environ", {"FIND_SOURCE_PROXY": "", "NO_PROXY": "127.0.0.1"}):
+                _, errors = await engines.run_engines(b"test-body", timeout=2)
+        self.assertEqual(errors, {})
+        text = "".join(logs)
+        for stage in ("connect", "upload", "response_headers", "response_body", "response_status"):
+            self.assertIn(f"stage={stage}", text)
+        self.assertNotIn("SECRET", text)
+        self.assertNotIn("test-body", text)
+
+
 class LensReplay(unittest.IsolatedAsyncioTestCase):
+    async def test_lens_upload_navigation_timeout_and_separate_network_failure(self):
+        browser = unittest.mock.MagicMock()
+        browser.start = AsyncMock()
+        browser.send = AsyncMock(return_value={"success": True})
+        browser.navigate = AsyncMock(return_value="https://www.google.com/")
+        browser.evaluate_object = AsyncMock(return_value="file-picker")
+        browser.wait_for = AsyncMock(return_value=False)
+
+        async def evaluate(expr, timeout):
+            if expr == lens.PREPARE_JS:
+                return "ok"
+            if expr == lens.SUBMIT_JS:
+                notify = browser.add_listener.call_args.args[0]
+                notify({"method": "Network.requestWillBeSent", "params": {
+                    "requestId": "42", "request": {"url": "https://lens.google.com/v3/upload?secret=token",
+                                                   "method": "POST"}}})
+                notify({"method": "Network.loadingFailed", "params": {
+                    "requestId": "42", "errorText": "net::ERR_TIMED_OUT"}})
+                return "submitted"
+            return {"url": "https://www.google.com/"}
+
+        browser.evaluate = AsyncMock(side_effect=evaluate)
+        logs = []
+        sink = logger.add(lambda line: logs.append(str(line)))
+        self.addCleanup(logger.remove, sink)
+        with patch.object(lens, "user_cookies", return_value=[]):
+            with self.assertRaisesRegex(lens.EngineError, "上传后未进入结果页"):
+                await lens._search_once(browser, Path("/tmp/test.png"), "UA", time.monotonic() + 2)
+        text = "".join(logs)
+        self.assertIn("network=upload outcome=failed error=net::ERR_TIMED_OUT", text)
+        self.assertIn("stage=result_extract", text)
+        self.assertNotIn("secret=token", text)
+
     async def test_duplicate_cards_advance_and_exact_tab_reuses_upload(self):
         default = "https://www.google.com/search?udm=26&vsrid=same-upload"
         exact = "https://www.google.com/search?udm=48&vsrid=same-upload&gsessionid=fixture"
@@ -143,6 +287,7 @@ class LensReplay(unittest.IsolatedAsyncioTestCase):
             send = AsyncMock(return_value={"success": True})
             wait_for = AsyncMock(return_value=True)
             evaluate_object = AsyncMock(return_value="file-picker")
+            add_listener = unittest.mock.MagicMock()
 
             async def evaluate(self, code, timeout=0):
                 if code == lens.EXTRACT_JS:
@@ -178,7 +323,13 @@ class LensReplay(unittest.IsolatedAsyncioTestCase):
         inputs = [call for call in browser.send.await_args_list if call.args[0] == "DOM.setFileInputFiles"]
         self.assertEqual(len(inputs), 1)
 
+    async def test_exact_page_timeout_preserves_default_results(self):
+        await self._assert_exact_failure_preserves_default(asyncio.TimeoutError())
+
     async def test_exact_page_failure_preserves_default_results(self):
+        await self._assert_exact_failure_preserves_default(lens.BrowserError("offline"))
+
+    async def _assert_exact_failure_preserves_default(self, error):
         url = "https://www.google.com/search?udm=26&vsrid=fixture"
         page = {"results": [{"url": POST}], "cards": []}
         browser = unittest.mock.MagicMock()
@@ -189,8 +340,9 @@ class LensReplay(unittest.IsolatedAsyncioTestCase):
         browser.evaluate_object = AsyncMock(return_value="input")
         browser.url = AsyncMock(return_value=url)
         browser.evaluate = AsyncMock(side_effect=lambda expr, timeout: (
-            "ok" if expr == lens.PREPARE_JS else page if expr == lens.EXTRACT_JS else ""))
-        with patch.object(lens, "_fetch_exact_page", AsyncMock(side_effect=lens.BrowserError("offline"))):
+            "ok" if expr == lens.PREPARE_JS else "submitted" if expr == lens.SUBMIT_JS
+            else page if expr == lens.EXTRACT_JS else ""))
+        with patch.object(lens, "_fetch_exact_page", AsyncMock(side_effect=error)):
             candidates, _ = await lens._search_once(browser, Path("/tmp/test.png"), "FakeUA", time.monotonic() + 30)
         self.assertEqual([candidate.page_url for candidate in candidates], [POST])
         self.assertEqual(candidates[0].extra["exact_status"], "unavailable")
@@ -217,6 +369,19 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
                 await source_verification._public_get(
                     "https://public.test/post", limit=500, content="text/html")
         self.assertEqual(requests, [("93.184.216.34", "public.test", "public.test")])
+
+    async def test_public_profile_checks_metadata_identity_and_post_redirect_is_rejected(self):
+        url = "https://x.com/ChocoQAQ"
+        html = b'<meta property="og:title" content="Example (@ChocoQAQ)"><meta name="description" content="Creator">'
+        get = AsyncMock(return_value=(html, "https://twitter.com/ChocoQAQ"))
+        with patch.object(source_verification, "_public_get", get):
+            result = await source_verification.read_public_profile(url)
+            self.assertEqual(result, source_verification.PublicProfile("Example (@ChocoQAQ)", "Creator"))
+            redirected_post = await source_verification.verify_source(url + "/status/123", photo())
+            self.assertEqual(redirected_post.status, "unavailable")
+        get.return_value = (b'<meta property="og:title" content="Log in">', url)
+        with patch.object(source_verification, "_public_get", get):
+            self.assertIsNone(await source_verification.read_public_profile(url))
 
     async def test_metadata_and_reencoded_image_prove_a_matching_page(self):
         html = b'<meta property="og:image" content="/photo.jpg"><meta name="author" content="Example credit">'

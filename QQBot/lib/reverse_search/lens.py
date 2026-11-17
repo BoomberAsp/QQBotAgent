@@ -17,10 +17,8 @@ lens.usercontent.google.com/image?vsrid=… 被选择性挂起（垃圾 token �
 标记识别该形态，分级 IMG_DEAD → GOOGLE_UNREACHABLE 并计入熔断。
 
 阶段日志（loguru，[Lens] 前缀，随 turn.py 文件 sink 落 logs/bot_*.log）：
-开始（bytes/proxy/chrome/UA）→ 出口IP → cookie 注入 ok/fail+名单（只记名
-不记值）→ 首页/consent 落地 → 上传后 ready/results+URL(含 vsrid) →
-verdict+直链/卡片数+lens 图死亡计数 → 非 SUCCESS 附 bodyHead → 逐卡解链
-→ 完成/失败 code。诊断「cookie 伪装后仍被拦」按此链查。
+记录浏览器启动、提交上传、浏览器网络事件、导航、结果就绪、卡片解析及完全匹配。
+上传及结果请求只记录阶段、状态和错误类型。Cookie 诊断只记录名称与域。
 """
 from __future__ import annotations
 
@@ -32,8 +30,9 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import TypeVar
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -181,8 +180,9 @@ PREPARE_JS = r"""
 })()
 """
 SUBMIT_JS = "document.getElementById('fishLensForm').submit(); 'submitted'"
-READY_JS = ('document.body && document.body.innerText.length > 200 && '
-            'document.querySelectorAll("a[href]").length > 10')
+UPLOAD_NAVIGATION_JS = (
+    'location.pathname !== "/" && /(^|[.])google[.]com$/.test(location.hostname)'
+)
 RESULTS_JS = r"""
 (() => {
   const isGoogle = (h) => /(^|\.)google\.[a-z.]+$/i.test(h) || /\.google$/i.test(h) ||
@@ -197,7 +197,8 @@ RESULTS_JS = r"""
     } catch (e) {}
   }
   const cards = document.querySelectorAll('a[href*="/goto?url="]').length;
-  return n >= 3 || cards >= 2;
+  const text = document.body?.innerText.slice(0, 2500) || '';
+  return n >= 3 || cards >= 1 || /unusual traffic|异常流量|No matches|No results|找不到相符|没有找到/i.test(text);
 })()
 """
 HOME_STATE_JS = r"""
@@ -451,6 +452,8 @@ def rows_to_candidates(rows: list[dict]) -> list[Candidate]:
 
 def _classify_browser_error(exc: Exception) -> EngineError:
     msg = str(exc)
+    if "CDP 调用超时" in msg:
+        return EngineError("ENGINE_TIMEOUT", f"Lens 浏览器命令超时（{msg[:75]}）")
     if "net::" in msg or "ERR_" in msg:
         return EngineError("GOOGLE_UNREACHABLE", "谷歌连不上（检查代理/外网）")
     return EngineError("ENGINE_ERROR", f"Lens 浏览器失败：{msg[:120]}")
@@ -554,23 +557,100 @@ async def _resolve_card(cdp, client, url: str, deadline: float) -> tuple[str, st
     return "", "http"
 
 
+_T = TypeVar("_T")
+
+
+async def _lens_phase(name: str, deadline: float, maximum: float,
+                      action: Callable[[float], Awaitable[_T]]) -> _T:
+    started = time.monotonic()
+    budget = min(maximum, deadline - started)
+    try:
+        if budget <= 0:
+            raise asyncio.TimeoutError
+        value = await asyncio.wait_for(action(max(.001, budget - .05)), budget)
+    except asyncio.TimeoutError:
+        logger.warning("[Lens] stage={} outcome=timeout elapsed={:.2f}s",
+                       name, time.monotonic() - started)
+        raise EngineError("ENGINE_TIMEOUT", f"Lens 阶段超时（{name}）") from None
+    except BrowserError as exc:
+        logger.warning("[Lens] stage={} outcome=cdp_error elapsed={:.2f}s error={}",
+                       name, time.monotonic() - started, str(exc)[:120])
+        raise
+    logger.info("[Lens] stage={} outcome={} elapsed={:.2f}s", name,
+                "pending" if value is False else "ok", time.monotonic() - started)
+    return value
+
+
+def _observe_upload_network(cdp) -> None:
+    # Only the Lens upload and result navigation. Never log cookies, request
+    # bodies or the query strings that identify an upload.
+    tracked: dict[str, str] = {}
+
+    def observe(event: dict) -> None:
+        name = event.get("method")
+        params = event.get("params") or {}
+        request_id = params.get("requestId")
+        if not request_id:
+            return
+        if name == "Network.requestWillBeSent":
+            req = params.get("request") or {}
+            url = urlsplit(req.get("url") or "")
+            phase = ""
+            if url.hostname == "lens.google.com" and url.path == "/v3/upload" and req.get("method") == "POST":
+                phase = "upload"
+            elif (url.hostname or "").endswith(".google.com") and url.path == "/search" and params.get("type") == "Document":
+                phase = "result_document"
+            elif url.hostname == "lens.usercontent.google.com" and url.path == "/image":
+                phase = "result_image"
+            if phase and (len(tracked) < 16 or request_id in tracked):
+                redirect = params.get("redirectResponse") or {}
+                if request_id in tracked and redirect:
+                    logger.info("[Lens] network={} outcome=redirect status={}",
+                                tracked[request_id], redirect.get("status"))
+                tracked[request_id] = phase
+                logger.info("[Lens] network={} outcome=request method={}", phase, req.get("method"))
+        elif request_id in tracked:
+            if name == "Network.responseReceived":
+                response = params.get("response") or {}
+                logger.info("[Lens] network={} outcome=response status={}",
+                            tracked[request_id], response.get("status"))
+            elif name == "Network.loadingFailed":
+                logger.warning("[Lens] network={} outcome=failed error={} canceled={}",
+                               tracked[request_id], params.get("errorText", ""), bool(params.get("canceled")))
+
+    cdp.add_listener(observe)
+
+
 async def _fetch_exact_page(cdp, url: str, timeout: float) -> dict:
-    await cdp.navigate(url, timeout=min(5.0, timeout), settle=.5)
-    await cdp.wait_for(RESULTS_JS, timeout=min(5.0, timeout), settle=.4)
-    return _parse_page(await cdp.evaluate(EXTRACT_JS, timeout=min(3.0, timeout)))
+    deadline = time.monotonic() + timeout
+    await _lens_phase("exact_navigation", deadline, 5.0,
+                      lambda budget: cdp.navigate(url, timeout=budget, settle=.5))
+    try:
+        await _lens_phase("exact_ready", deadline - 1.5, 4.0,
+                          lambda budget: cdp.wait_for(RESULTS_JS, timeout=max(.01, budget - .6), settle=.25))
+    except EngineError:
+        pass  # A small or incomplete result page can still have useful links.
+    return _parse_page(await _lens_phase("exact_extract", deadline, 2.5,
+                                        lambda budget: cdp.evaluate(EXTRACT_JS, timeout=budget)))
 
 
 async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
                        deadline: float, *,
                        watermarks: Callable[[], list[str]] | None = None) -> tuple[list[Candidate], str]:
     t0 = time.monotonic()
-    await cdp.start()
+    await _lens_phase("browser_start", deadline, 12.0, lambda _budget: cdp.start())
+    _observe_upload_network(cdp)
     # 真人 cookie 在后，覆盖 consent 打底值（SOCS 等）
     real = user_cookies()
     ck_ok = ck_fail = 0
+    ck_deadline = min(deadline, time.monotonic() + 4.0)
     for ck in (*CONSENT_COOKIES, *real):
+        remaining = ck_deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning("[Lens] stage=cookie outcome=budget")
+            break
         try:
-            r = await cdp.send("Network.setCookie", dict(ck), timeout=8)
+            r = await cdp.send("Network.setCookie", dict(ck), timeout=min(1.0, remaining))
             if r.get("success", True):
                 ck_ok += 1
             else:
@@ -581,19 +661,24 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
                 f"名单={','.join(sorted({c['name'] for c in real})) or '-'}")
     # 导航前查入库的 Cookie 和域，方便区分注入失败与后续会话变化。
     try:
-        r = await cdp.send("Network.getAllCookies", timeout=8)
+        r = await cdp.send("Network.getAllCookies", timeout=1)
         jar = r.get("cookies") or []
         summary = ",".join(f"{c.get('name')}@{c.get('domain')}" for c in jar)
         logger.info(f"[Lens] 注入后罐(导航前) {len(jar)} 条: {summary or '-'}")
     except BrowserError:
         pass
-    home = await cdp.navigate("https://www.google.com/?hl=zh-CN&gl=US",
-                              timeout=25, settle=0.8)
+    home = await _lens_phase(
+        "homepage", deadline, 12.0,
+        lambda budget: cdp.navigate("https://www.google.com/?hl=zh-CN&gl=US",
+                                    timeout=budget, settle=.6))
+    if not home:
+        raise EngineError("ENGINE_TIMEOUT", "Lens 无法读取浏览器首页地址")
     logger.info(f"[Lens] 首页落地 {home}（+{time.monotonic() - t0:.1f}s）")
     if CONSENT_RE.search(home):
-        clicked = await cdp.evaluate(ACCEPT_CONSENT_JS)
-        await asyncio.sleep(1.5)
-        home = await cdp.url()
+        clicked = await _lens_phase("consent", deadline, 2.0,
+                                    lambda budget: cdp.evaluate(ACCEPT_CONSENT_JS, timeout=budget))
+        await asyncio.sleep(.6)
+        home = await _lens_phase("consent_navigation", deadline, 2.0, lambda _budget: cdp.url())
         logger.info(f"[Lens] consent 页点击={clicked} 重落地 {home}")
         if CONSENT_RE.search(home):
             _note_verdict("CONSENT")
@@ -601,54 +686,68 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
 
     # 首页 DOM 提供登录态线索，getCookies 查看与两个 URL 匹配的 Cookie。
     try:
-        state = await cdp.evaluate(HOME_STATE_JS, timeout=8)
+        state = await cdp.evaluate(HOME_STATE_JS, timeout=1)
         logger.info(f"[Lens] 首页登录态 {state}")
     except BrowserError:
         pass
     try:
         r = await cdp.send("Network.getCookies",
                            {"urls": ["https://www.google.com/",
-                                     "https://lens.google.com/"]}, timeout=8)
+                                     "https://lens.google.com/"]}, timeout=1)
         names = sorted({str(c.get("name") or "") for c in (r.get("cookies") or [])})
         logger.info(f"[Lens] 浏览器cookie罐 {len(names)} 条: {','.join(names) or '-'}")
     except BrowserError:
         pass
     # 对比全量罐和 URL 匹配结果，区分 Cookie 已消失与作用范围不匹配。
     try:
-        r = await cdp.send("Network.getAllCookies", timeout=8)
+        r = await cdp.send("Network.getAllCookies", timeout=1)
         jar = r.get("cookies") or []
         names = sorted({str(c.get("name") or "") for c in jar})
         logger.info(f"[Lens] 导航后全量罐 {len(names)} 条: {','.join(names) or '-'}")
     except BrowserError:
         pass
 
-    prepared = await cdp.evaluate(PREPARE_JS, timeout=10)
+    prepared = await _lens_phase("form_prepare", deadline, 3.0,
+                                 lambda budget: cdp.evaluate(PREPARE_JS, timeout=budget))
     if prepared not in ("ok", "exists"):
-        raise EngineError("ENGINE_ERROR", f"Lens 上传表单注入失败：{prepared}")
-    object_id = ""
-    obj_deadline = time.monotonic() + 8
-    while time.monotonic() < obj_deadline and not object_id:
-        try:
-            object_id = await cdp.evaluate_object("document.querySelector('#fishLensFile')")
-        except BrowserError:
-            pass
-        if not object_id:
-            await asyncio.sleep(0.3)
+        raise EngineError("ENGINE_ERROR", "Lens 上传表单注入失败")
+    object_id = await _lens_phase(
+        "file_picker", deadline, 3.0,
+        lambda budget: cdp.evaluate_object("document.querySelector('#fishLensFile')", timeout=budget))
     if not object_id:
         raise EngineError("ENGINE_ERROR", "Lens 上传表单注入失败：无 #fishLensFile")
-    await cdp.send("DOM.setFileInputFiles",
-                   {"files": [str(img_path)], "objectId": object_id}, timeout=15)
-    await cdp.evaluate(SUBMIT_JS, timeout=10)
-    # Leave time to collect partial rows and open the exact-match tab.
-    ready_budget = max(.1, min(16.0, deadline - time.monotonic() - 10))
-    ready_ok = await cdp.wait_for(READY_JS, timeout=ready_budget, settle=0.8)
-    results_budget = max(.1, min(16.0, deadline - time.monotonic() - 10))
-    results_ok = await cdp.wait_for(RESULTS_JS, timeout=results_budget, settle=1.0)
+    await _lens_phase("file_attach", deadline, 4.0, lambda budget: cdp.send(
+        "DOM.setFileInputFiles", {"files": [str(img_path)], "objectId": object_id}, timeout=budget))
+    submitted = await _lens_phase("upload_submit", deadline, 4.0,
+                                  lambda budget: cdp.evaluate(SUBMIT_JS, timeout=budget))
+    if submitted != "submitted":
+        raise EngineError("ENGINE_ERROR", "Lens 未提交上传表单")
 
-    final_url = await cdp.url()
+    # Both probes share a deadline and leave room for a single DOM snapshot,
+    # even if Chrome never commits the navigation.
+    read_deadline = min(deadline, time.monotonic() + 22)
+    async def probe(name: str, expr: str, cap: float) -> bool:
+        try:
+            return await _lens_phase(name, read_deadline - 3, cap, lambda budget: cdp.wait_for(
+                expr, timeout=max(.01, budget - .7), settle=.25))
+        except EngineError:
+            return False
+
+    ready_ok = await probe("upload_navigation", UPLOAD_NAVIGATION_JS, 12.0)
+    results_ok = ready_ok and await probe("result_ready", RESULTS_JS, 10.0)
     logger.info(f"[Lens] 上传后 ready={ready_ok} results={results_ok} "
-                f"url={final_url}（+{time.monotonic() - t0:.1f}s）")
-    page = _parse_page(await cdp.evaluate(EXTRACT_JS, timeout=20))
+                f"（+{time.monotonic() - t0:.1f}s）")
+    page = _parse_page(await _lens_phase("result_extract", read_deadline, 3.0,
+                                        lambda budget: cdp.evaluate(EXTRACT_JS, timeout=budget)))
+    final_url = str(page.get("url") or "")
+    if not final_url and page:  # Older captured page snapshots omitted the URL.
+        try:
+            final_url = await _lens_phase("result_url", deadline, 1.0, lambda _budget: cdp.url())
+        except EngineError:
+            pass
+    parsed = urlsplit(final_url)
+    if not ready_ok and (not _google_request_url(final_url) or parsed.path in {"", "/"}):
+        raise EngineError("ENGINE_TIMEOUT", "Lens 上传后未进入结果页")
     verdict = grade_page(page, final_url)
     _note_verdict(verdict)
     logger.info(
@@ -687,15 +786,19 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
             exact_deadline = time.monotonic() + remaining
             exact_page = await asyncio.wait_for(
                 _fetch_exact_page(cdp, exact_url, remaining), remaining)
-            exact_verdict = grade_page(exact_page, str(exact_page.get("url") or exact_url))
+            landed = str(exact_page.get("url") or exact_url)
+            exact_verdict = grade_page(exact_page, landed)
             exact_status = exact_verdict.lower()
-            if exact_verdict == "SUCCESS":
+            params = dict(parse_qsl(urlsplit(landed).query))
+            if exact_verdict == "SUCCESS" and params.get("udm") != "48":
+                exact_status = "not_exact"
+            elif exact_verdict == "SUCCESS":
                 exact_rows = await _collect_rows(
                     cdp, exact_page, ua, exact_deadline, attempts, match="exact",
                     watermarks=watermarks() if watermarks else None)
                 if not exact_rows:
                     exact_status = "no_candidates"
-        except (BrowserError, asyncio.TimeoutError):
+        except (BrowserError, EngineError, asyncio.TimeoutError):
             exact_status = "unavailable"
     logger.info(f"[Lens] 完全匹配 status={exact_status} 匹配页面={len(exact_rows)}")
 
@@ -709,6 +812,10 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
     if not candidates and not overview:
         if verdict == "EMPTY":
             raise EngineError("GOOGLE_EMPTY", "Lens 未找到匹配")
+        if verdict == "UNKNOWN" and not ready_ok:
+            raise EngineError("ENGINE_TIMEOUT", "Lens 上传后未进入结果页")
+        if verdict == "UNKNOWN" and not results_ok:
+            raise EngineError("ENGINE_TIMEOUT", "Lens 结果页未就绪")
         if verdict != "SUCCESS":
             raise EngineError("ENGINE_ERROR", f"Lens 结果页异常（{verdict}）")
     logger.info(f"[Lens] 完成 candidates={len(candidates)} overview={len(overview)}字 "
@@ -748,7 +855,9 @@ async def search_lens(data: bytes, timeout: float = LENS_TIMEOUT, *,
     try:
         proxy = _proxy()
         ua = chrome_ua(exe)
-        logger.info(f"[Lens] 开始 bytes={len(data)} proxy={proxy} chrome={exe} ua={ua}")
+        endpoint = urlsplit(proxy)
+        logger.info(f"[Lens] 开始 bytes={len(data)} proxy_host={endpoint.hostname} "
+                    f"proxy_port={endpoint.port} chrome={exe} ua={ua}")
         try:
             exit_ip = await asyncio.wait_for(_exit_ip(proxy), max(.01, min(3, deadline - time.monotonic())))
         except asyncio.TimeoutError:

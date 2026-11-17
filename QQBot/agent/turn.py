@@ -114,7 +114,7 @@ from tools.builtin_tools import (
     _ensure_workspace_dirs,
 )
 from tools.file_tools import read_file
-from tools import image_source_tools
+from tools import image_source_followup, image_source_tools
 from tools.map_tools import (
     geocode,
     reverse_geocode,
@@ -2835,11 +2835,18 @@ async def handle_agent_turn(view: InboundMessage):
     active_metadata = (active_special.metadata or {}) if active_special else {}
     active_kind = active_metadata.get("kind")
     workspace = _current_user_workspace.get()
+    if any(att.kind == "image" for att in attachments):
+        image_source_followup.forget(view, image_scope)
     if active_kind == "char_creation" or (
             active_kind == SCENE_KIND
             and not (_scene_archive_enabled() and active_metadata.get("completed"))):
         image_search = image_source_tools.ImageSearchTurn(user_id, workspace)
     else:
+        followup = image_source_followup.resolve(view, image_scope, text_content) if not attachments else None
+        if followup and image_source_tools.TOOL_NAME in _perm_manager.get_allowed_tools(
+                _perm_manager.get_role(user_id)):
+            await _safe_send(await image_source_followup.run(followup, workspace))
+            return
         image_search = image_source_tools.prepare(
             view, workspace, attachments, image_offer, text=text_content)
     for att in attachments:
@@ -3261,6 +3268,7 @@ async def handle_agent_turn(view: InboundMessage):
                 timeout=300.0,
             )
         finally:
+            image_source_followup.remember_turn(view, image_scope, image_search)
             _current_survey_context.reset(_survey_token)
             _current_survey_view.reset(_survey_view_token)
             image_source_tools.current.reset(image_search_token)
@@ -3411,7 +3419,10 @@ async def handle_agent_turn(view: InboundMessage):
                 await streamer.close()   # never leave a stream generating
             except Exception:
                 pass
-        await _safe_send("抱歉，超时了。请尝试用更简单的方式提问~")
+        if image_search.query is not None:
+            await _send_response(image_search.query.result.render())
+        else:
+            await _safe_send("抱歉，超时了。请尝试用更简单的方式提问~")
     except Exception as e:
         if streamer is not None:
             try:
@@ -6058,11 +6069,20 @@ async def _handle_find_source_command(text: str, user_id: str, view) -> bool:
             "请勿发送涉及隐私的图片。结果可能认错，请自行核实。")
         return True
 
+    if view.is_group:
+        from .group_runtime import get_store, scope_for
+        scope = scope_for(view)
+        groups = get_store()
+        image_scope = (scope, groups.group(scope)["generation"])
+    else:
+        groups = None
+        image_scope = _view_scope(view)
     _, _, args = text.partition(" ")
     data, path, err = await _find_source_image(view, args)
     if err:
         await _safe_send(err)
         return True
+    image_source_followup.forget(view, image_scope)
     from lib.reverse_search.net import validate_image
     err = validate_image(data)
     if err:
@@ -6091,6 +6111,8 @@ async def _handle_find_source_command(text: str, user_id: str, view) -> bool:
         code = log_exception("find_source failed", e)
         await _safe_send(f"找图出错了（诊断编号 {code}），稍后再试。")
         return True
+    if groups is None or groups.group(scope)["generation"] == image_scope[1]:
+        image_source_followup.remember(view, image_scope, path, data, result)
     await _safe_send(result.render())
     return True
 

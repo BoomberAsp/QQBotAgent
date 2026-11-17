@@ -108,8 +108,10 @@ class PrivateImageSourceTests(unittest.IsolatedAsyncioTestCase):
         from agent import survey_flow
         from agent.cognitive_state import current_scope
         from agent.inbound import Attachment
-        from lib.reverse_search import service
-        from tools import image_source_tools
+        from lib.reverse_search import service, source_verification
+        from lib.reverse_search.source_evidence import SourceEvidence
+        from lib.reverse_search.vlm import parse_clues
+        from tools import image_source_followup, image_source_tools
 
         with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
             dirs = ("USER_DATA_ROOT", "CHARACTERS_DIR", "BONDS_DIR",
@@ -134,6 +136,7 @@ class PrivateImageSourceTests(unittest.IsolatedAsyncioTestCase):
 
             stack.enter_context(patch.dict("os.environ", {"FIND_SOURCE_ENABLED": "on"}))
             stack.enter_context(patch.object(survey_flow, "try_handle", AsyncMock(return_value=False)))
+            model_run = AsyncMock(side_effect=run)
             stack.enter_context(patch.multiple(
                 turn,
                 _workspace_manager=NS(ensure_dirs=MagicMock(), get_workspace=lambda user: tmp),
@@ -150,10 +153,20 @@ class PrivateImageSourceTests(unittest.IsolatedAsyncioTestCase):
                 _story_persona_allowed=lambda persona: False,
                 _safe_send=AsyncMock(return_value=True),
                 _send_response=AsyncMock(),
-                agent=NS(run=run),
+                agent=NS(run=model_run),
             ))
+            profile_url = "https://x.com/ChocoQAQ"
             search = stack.enter_context(patch.object(service, "run", AsyncMock(
-                return_value=service.FindResult(vlm_text="查到图片来源。"))))
+                return_value=service.FindResult(
+                    vlm_text="查到图片来源。", visual=parse_clues('{"watermarks":["@ChocoQAQ"]}'),
+                    sources=[SourceEvidence("https://vgen.co/ChocoQAQ", match="watermark"),
+                             SourceEvidence("https://mobile.twstalker.com/ChocoQAQ", match="watermark"),
+                             SourceEvidence(profile_url, kind="profile", match="watermark"),
+                             SourceEvidence("https://x.com/ChocoQAQ/status/123", kind="post", match="watermark")]))))
+            read = stack.enter_context(patch.object(source_verification, "read_public_profile",
+                                    AsyncMock(side_effect=asyncio.TimeoutError)))
+            lookup = stack.enter_context(patch.object(source_verification, "lookup_watermark", AsyncMock()))
+            stack.callback(image_source_followup._recent.clear)
             token = current_scope.set("private-test")
             stack.callback(current_scope.reset, token)
             stack.callback(image_source_tools._pending.clear)
@@ -174,6 +187,15 @@ class PrivateImageSourceTests(unittest.IsolatedAsyncioTestCase):
             await send("可以", "yes")
             search.assert_awaited_once_with(data, image_path=str(path), user_id="private-user")
             self.assertIn("查到图片来源。", turn._send_response.await_args.args[0])
+            model_run.reset_mock()
+            await send("帮我去抓取一下那个账号", "profile-followup")
+            self.assertIn(profile_url, turn._safe_send.await_args.args[0])
+            self.assertIn("原图出处待核实", turn._safe_send.await_args.args[0])
+            self.assertIn("网页读取超时", turn._safe_send.await_args.args[0])
+            model_run.assert_not_awaited()
+            read.assert_awaited_once_with(profile_url)
+            lookup.assert_not_awaited()
+            search.assert_awaited_once()
             await send("帮我查这张图的出处", "explicit", image=True)
             self.assertEqual(search.await_count, 2)
 
@@ -434,9 +456,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_image_source_agent_uses_only_the_uploaders_confirmation(self):
         from hashlib import sha256
         from agent.inbound import Attachment
-        from lib.reverse_search import service
-        from tools import image_source_tools
+        from lib.reverse_search import service, source_verification
+        from lib.reverse_search.source_evidence import SourceEvidence
+        from lib.reverse_search.vlm import parse_clues
+        from tools import image_source_followup, image_source_tools
 
+        self.addCleanup(image_source_followup._recent.clear)
         photo = view(message="photo")
         scope = scope_for(photo)
         workspace = self.store.root / "workspaces" / sha256(scope.encode()).hexdigest()
@@ -459,8 +484,13 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return "看到了。"
 
         self.fake.agent.run = run
-        search = AsyncMock(return_value=service.FindResult(vlm_text="找到来源。"))
-        with patch.object(service, "run", search), patch.dict("os.environ", {"FIND_SOURCE_ENABLED": "on"}):
+        profile = "https://x.com/ChocoQAQ"
+        search = AsyncMock(return_value=service.FindResult(
+            vlm_text="找到来源。", visual=parse_clues('{"watermarks":["@ChocoQAQ"]}'),
+            sources=[SourceEvidence(profile, kind="profile", match="watermark")]))
+        read = AsyncMock(return_value=source_verification.PublicProfile("公开账号", "公开简介示例"))
+        with patch.object(service, "run", search), patch.object(source_verification, "read_public_profile", read), \
+             patch.dict("os.environ", {"FIND_SOURCE_ENABLED": "on"}):
             await runtime.run_group_turn(photo, self.sender)
             self.assertIn("要帮你查这张图的来源吗", self.sender.send_group_text.await_args.args[0])
             self.assertIn("第三方", self.sender.send_group_text.await_args.args[0])
@@ -478,7 +508,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             again.text = "可以"
             await runtime.run_group_turn(again, self.sender)
             search.assert_awaited_once()
-        self.assertEqual(observed, [False, False, False, True, False])
+            for user, group, mid in (("b", "g", "followup-other-user"), ("a", "other", "followup-other-group")):
+                other = view(user=user, group=group, message=mid)
+                other.text = "帮我查那个账号"
+                await runtime.run_group_turn(other, self.sender)
+            read.assert_not_awaited()
+            followup = view(message="followup-owner")
+            followup.text = "帮我查那个账号"
+            await runtime.run_group_turn(followup, self.sender)
+            read.assert_awaited_once_with(profile)
+            self.assertIn("公开简介示例", self.sender.send_group_text.await_args.args[0])
+            self.store.reset(scope, clear=True)
+            after_reset = view(message="followup-after-reset")
+            after_reset.text = "帮我查那个账号"
+            await runtime.run_group_turn(after_reset, self.sender)
+            read.assert_awaited_once()
+        self.assertEqual(observed, [False, False, False, True, False, False, False, False])
 
     async def test_group_game_owner_followup_and_direct_calculation(self):
         from agent.group_games import _pending

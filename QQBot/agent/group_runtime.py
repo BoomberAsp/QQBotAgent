@@ -264,7 +264,7 @@ async def extract_self_fact(store, view, identity, generation, client):
 
 
 async def run_group_turn(view, sender=None):
-    from tools import image_source_tools
+    from tools import image_source_followup, image_source_tools
     from . import turn, context as ctx
     from .group_commands import without_mention_prefix
     from .character_registry import get_character_registry
@@ -391,6 +391,12 @@ async def run_group_turn(view, sender=None):
 
             async def execute():
                 nonlocal image_search
+                if "image" in view.attachment_kinds or any(att.kind == "image" for att in view.attachments):
+                    image_source_followup.forget(view, image_scope)
+                if image_source_tools.TOOL_NAME in allowed:
+                    followup = image_source_followup.resolve(view, image_scope, without_mention_prefix(view.text))
+                    if followup:
+                        return await image_source_followup.run(followup, str(group_workspace))
                 # Load only after installing the group workspace. Overheard messages
                 # retain type information without downloading the whole group feed.
                 source=view
@@ -435,6 +441,8 @@ async def run_group_turn(view, sender=None):
                         "group_"+__import__('hashlib').sha256(scope.encode()).hexdigest()[:24],
                         client=client,images=images or None,allowed_tools=allowed,user_role=role,persist=False)
                 finally:
+                    if valid():
+                        image_source_followup.remember_turn(view, image_scope, image_search)
                     image_source_tools.current.reset(token)
             task = asyncio.create_task(execute())
             _jobs[scope]=(identity_for(view),task)
@@ -443,9 +451,12 @@ async def run_group_turn(view, sender=None):
             except asyncio.CancelledError:
                 return
             except asyncio.TimeoutError:
-                if reason == "direct" and valid():
-                    await send_text(sender,"这次处理超时了，请缩小问题范围后再试。")
-                return
+                if image_search is not None and image_search.query is not None:
+                    answer = image_search.query.result.render()
+                else:
+                    if reason == "direct" and valid():
+                        await send_text(sender,"这次处理超时了，请缩小问题范围后再试。")
+                    return
             except Exception:
                 if reason == "direct" and valid():
                     await send_text(sender,"这次处理未能完成，请稍后重试。")

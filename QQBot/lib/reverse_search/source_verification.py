@@ -15,7 +15,7 @@ from urllib.parse import urljoin
 import httpx
 from PIL import Image, ImageChops, ImageOps, ImageStat
 
-from .accounts import canonical_url, handle_of, handles_in_text, page_key
+from .accounts import canonical_url, handle_of, handles_in_text, is_author_page, is_post_page, page_key
 from .engines import Candidate
 
 _MAX_HTML = 1024 * 1024
@@ -29,6 +29,12 @@ _HANDLE = re.compile(r"@[A-Za-z0-9_.]{2,30}")
 class Verification:
     status: str
     attribution: str = ""
+
+
+@dataclass(frozen=True)
+class PublicProfile:
+    title: str
+    description: str
 
 
 class PublicPageUnavailable(Exception):
@@ -92,6 +98,7 @@ class _PageMetadata(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.images: list[str] = []
+        self.summary: dict[str, str] = {}
         self.attribution = ""
         self._json_ld: list[str] | None = None
 
@@ -99,6 +106,9 @@ class _PageMetadata(HTMLParser):
         pairs = dict(attrs)
         key = str(pairs.get("property") or pairs.get("name") or "").lower()
         content = pairs.get("content") or ""
+        if tag == "meta" and key in {"og:title", "og:description", "og:url", "twitter:title",
+                                     "twitter:description", "description"} and content:
+            self.summary.setdefault(key, " ".join(content.split())[:350])
         if tag == "meta" and key in {"og:image", "og:image:secure_url", "twitter:image"}:
             if content and content not in self.images and len(self.images) < 3:
                 self.images.append(content)
@@ -164,12 +174,42 @@ def _same_image(left: bytes, right: bytes) -> bool:
     return max(texture.stddev) >= 8 and sum(diff.mean) / 3 <= 4 and max(diff.rms) <= 10
 
 
+async def _get_metadata(url: str) -> tuple[_PageMetadata, str]:
+    data, final_url = await _public_get(url, limit=_MAX_HTML, content="text/html")
+    metadata = _PageMetadata()
+    try:
+        metadata.feed(data.decode("utf-8", errors="replace"))
+    except (ValueError, AssertionError) as exc:
+        raise PublicPageUnavailable from exc
+    return metadata, final_url
+
+
+async def read_public_profile(url: str) -> PublicProfile | None:
+    if not is_author_page(url):
+        return None
+    try:
+        metadata, final_url = await _get_metadata(url)
+    except PublicPageUnavailable:
+        return None
+    if page_key(final_url) != page_key(url):
+        return None
+    fields = metadata.summary
+    title = fields.get("og:title") or fields.get("twitter:title", "")
+    about = fields.get("og:description") or fields.get("twitter:description") or fields.get("description", "")
+    handles = {name.casefold() for name in handles_in_text(f"{title} {about}")}
+    og_url = fields.get("og:url", "")
+    identified = handle_of(url).casefold() in handles or (og_url and page_key(og_url) == page_key(url))
+    if not identified or not (title or about):
+        return None
+    return PublicProfile(title[:120], about[:280])
+
+
 async def verify_source(url: str, image: bytes) -> Verification:
     try:
-        payload, final_url = await _public_get(url, limit=_MAX_HTML, content="text/html")
-        metadata = _PageMetadata()
-        metadata.feed(payload.decode("utf-8", errors="replace"))
+        metadata, final_url = await _get_metadata(url)
     except PublicPageUnavailable:
+        return Verification("unavailable")
+    if is_post_page(url) and page_key(final_url) != page_key(url):
         return Verification("unavailable")
     checked = False
     for media in metadata.images:
