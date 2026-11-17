@@ -5918,6 +5918,23 @@ _FIND_SOURCE_CMDS = ("/找图", "#找图", "/找源", "#找源", "/找作者", "
 _FIND_SOURCE_HELP_CMDS = ("/找图帮助", "#找图帮助")
 
 
+def _log_find_source_pick(view, source: str, path: str, data: bytes,
+                          quoted: bool) -> None:
+    """记录 /找图 实际选中的图（来源/文件名/字节/sha256/消息号）。
+
+    用于核对「平台递交的图」与「用户以为发的图」是否一致——2026-11-17
+    用户报找图偏移，落盘文件证实当条消息附件本身就是上一张图（客户端/
+    平台递交错图），非选图逻辑问题；此日志让下次可直接对证。
+    """
+    import hashlib
+    from loguru import logger
+    logger.info(
+        f"[找图] 选图 source={source} quoted={quoted} "
+        f"file={os.path.basename(path)} bytes={len(data)} "
+        f"sha256={hashlib.sha256(data).hexdigest()[:12]} "
+        f"msg_id={getattr(view, 'message_id', '')}")
+
+
 async def _find_source_image(view, args: str):
     """Find the image for /找图 → (data_bytes, local_path, error_msg).
 
@@ -5940,7 +5957,9 @@ async def _find_source_image(view, args: str):
     for att in images:
         if att.path and os.path.isfile(att.path):
             try:
-                return await asyncio.to_thread(_read_bytes, att.path), att.path, ""
+                data = await asyncio.to_thread(_read_bytes, att.path)
+                _log_find_source_pick(view, "本条上传", att.path, data, att.quoted)
+                return data, att.path, ""
             except OSError:
                 continue
     if images:
@@ -5951,7 +5970,9 @@ async def _find_source_image(view, args: str):
             from adapters.onebot import quoted_file_paths
             for path in quoted_file_paths(view.raw):
                 if path.lower().endswith(_IMAGE_EXTS) and os.path.isfile(path):
-                    return await asyncio.to_thread(_read_bytes, path), path, ""
+                    data = await asyncio.to_thread(_read_bytes, path)
+                    _log_find_source_pick(view, "引用图", path, data, True)
+                    return data, path, ""
         except Exception:  # noqa: BLE001
             pass
     return b"", "", (

@@ -42,6 +42,7 @@ from .accounts import handle_of, handles_in_text, is_post_page, platform_of
 from .browser import (BrowserError, CdpBrowser, chrome_ua, find_chrome,
                       is_google_url, sem)
 from .engines import Candidate, EngineError
+from .net import sniff_format
 
 LENS_TIMEOUT = 60.0
 QUEUE_TIMEOUT = 20.0          # 排队超 20s 快速失败，别挤爆 60s 回执
@@ -102,18 +103,20 @@ def user_cookies() -> list[dict]:
             continue
         name = str(ck.get("name") or "")
         value = ck.get("value")
-        domain = str(ck.get("domain") or "").lstrip(".")
-        if not name or value is None or not domain:
+        exported_domain = str(ck.get("domain") or "").strip()
+        domain = exported_domain.removeprefix(".").lower()
+        if not name or value is None or not re.fullmatch(r"(?:[a-z0-9-]+\.)*google\.com", domain):
             continue
-        if domain != "google.com" and not domain.endswith(".google.com"):
-            continue
-        # CDP setCookie 只给 domain 不给 url 时静默不入库：success=true 但
-        # 浏览器罐里查无此 cookie（2026-11-17 13:18 真实运行，18 条真人 cookie
-        # 全丢、首页仍 signedOut）。必须带 url 提供安全源，__Secure- 前缀与
-        # SameSite=None 才过校验；domain 仍保留以匹配子域（lens.google.com）。
-        item = {"name": name, "value": str(value), "domain": domain,
+        # CDP 用带点的 domain 设置域 Cookie，用 URL 单独设置 host-only Cookie。
+        # Cookie-Editor 的 hostOnly 优先，旧导出按原始域名前导点推断。
+        host_only = ck.get("hostOnly")
+        if not isinstance(host_only, bool):
+            host_only = not exported_domain.startswith(".")
+        item = {"name": name, "value": str(value),
                 "path": str(ck.get("path") or "/"),
                 "url": f"https://{domain}/"}
+        if not host_only:
+            item["domain"] = "." + domain
         exp = ck.get("expirationDate")
         if isinstance(exp, (int, float)) and exp > 0:
             if exp <= time.time():
@@ -448,9 +451,7 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
             ck_fail += 1
     logger.info(f"[Lens] cookie 注入 ok={ck_ok} fail={ck_fail} 真人={len(real)} "
                 f"名单={','.join(sorted({c['name'] for c in real})) or '-'}")
-    # 导航前 getAllCookies：区分「setCookie 根本没存进罐」vs「存了、导航后
-    # 被谷歌清掉/去登录化」。导航后的罐无法区分这两者（谷歌拒绝会话时会
-    # Set-Cookie 清空 auth cookie）。只记 name@domain，绝不记值。
+    # 导航前查入库的 Cookie 和域，方便区分注入失败与后续会话变化。
     try:
         r = await cdp.send("Network.getAllCookies", timeout=8)
         jar = r.get("cookies") or []
@@ -470,8 +471,7 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
             _note_verdict("CONSENT")
             raise EngineError("GOOGLE_CONSENT", "谷歌同意页拦截，无法上传")
 
-    # 诊断 cookie 会话是否被谷歌承认：首页仍见 ServiceLogin 链接=未登录态；
-    # getCookies 列出浏览器实际会发给 google 的 cookie（只记名不记值）
+    # 首页 DOM 提供登录态线索，getCookies 查看与两个 URL 匹配的 Cookie。
     try:
         state = await cdp.evaluate(HOME_STATE_JS, timeout=8)
         logger.info(f"[Lens] 首页登录态 {state}")
@@ -483,6 +483,14 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
                                      "https://lens.google.com/"]}, timeout=8)
         names = sorted({str(c.get("name") or "") for c in (r.get("cookies") or [])})
         logger.info(f"[Lens] 浏览器cookie罐 {len(names)} 条: {','.join(names) or '-'}")
+    except BrowserError:
+        pass
+    # 对比全量罐和 URL 匹配结果，区分 Cookie 已消失与作用范围不匹配。
+    try:
+        r = await cdp.send("Network.getAllCookies", timeout=8)
+        jar = r.get("cookies") or []
+        names = sorted({str(c.get("name") or "") for c in jar})
+        logger.info(f"[Lens] 导航后全量罐 {len(names)} 条: {','.join(names) or '-'}")
     except BrowserError:
         pass
 
@@ -594,6 +602,9 @@ async def search_lens(data: bytes, timeout: float = LENS_TIMEOUT,
     if time.monotonic() < _breaker_until:
         logger.warning(f"[Lens] 熔断中，剩余 {_breaker_until - time.monotonic():.0f}s，本次跳过")
         raise EngineError("GOOGLE_CAPTCHA", "Lens 连续被谷歌拦截，熔断中，请稍后再试")
+    image_format = sniff_format(data)
+    if not image_format:
+        raise EngineError("INVALID_IMAGE", "Lens 无法识别上传图片的格式")
     exe = find_chrome()
     if not exe:
         raise EngineError("ENGINE_ERROR", "未找到 Chrome（可设 CHROME_BIN）")
@@ -609,7 +620,8 @@ async def search_lens(data: bytes, timeout: float = LENS_TIMEOUT,
     logger.info(f"[Lens] 开始 bytes={len(data)} proxy={proxy} chrome={exe} ua={ua}")
     logger.info(f"[Lens] 出口IP={await _exit_ip(proxy)}")
     profile = Path(tempfile.mkdtemp(prefix="findlens_"))
-    img_path = profile / "upload.image"
+    # Chrome 根据文件名后缀设置 multipart 图片的 MIME 类型。
+    img_path = profile / f"upload.{image_format}"
     cdp = CdpBrowser(profile, exe=exe, proxy=proxy, ua=ua)
     deadline = time.monotonic() + timeout - 3.0
     try:
