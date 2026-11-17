@@ -15,6 +15,12 @@ FIND_SOURCE_LENS_COOKIE（可选，Cookie-Editor 导出的真人谷歌 cookie JS
 lens.usercontent.google.com/image?vsrid=… 被选择性挂起（垃圾 token 秒回、
 真 token 超时），结果页只剩空壳 + 语言提示。EXTRACT 的 lensImgDead
 标记识别该形态，分级 IMG_DEAD → GOOGLE_UNREACHABLE 并计入熔断。
+
+阶段日志（loguru，[Lens] 前缀，随 turn.py 文件 sink 落 logs/bot_*.log）：
+开始（bytes/proxy/chrome/UA）→ 出口IP → cookie 注入 ok/fail+名单（只记名
+不记值）→ 首页/consent 落地 → 上传后 ready/results+URL(含 vsrid) →
+verdict+直链/卡片数+lens 图死亡计数 → 非 SUCCESS 附 bodyHead → 逐卡解链
+→ 完成/失败 code。诊断「cookie 伪装后仍被拦」按此链查。
 """
 from __future__ import annotations
 
@@ -30,6 +36,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+from loguru import logger
 
 from .accounts import handle_of, handles_in_text, is_post_page, platform_of
 from .browser import (BrowserError, CdpBrowser, chrome_ua, find_chrome,
@@ -57,6 +64,21 @@ def _proxy() -> str:
     return os.environ.get("FIND_SOURCE_LENS_PROXY", "").strip() or _DEFAULT_PROXY
 
 
+async def _exit_ip(proxy: str) -> str:
+    """尽力探测代理出口 IP（谷歌静默限制与出口信誉强相关，诊断用）。
+
+    失败返回「未知」，绝不影响主路。
+    """
+    try:
+        async with httpx.AsyncClient(proxy=proxy, trust_env=False, timeout=6.0) as client:
+            resp = await client.get("https://api.ipify.org")
+            if resp.status_code == 200:
+                return resp.text.strip()[:64]
+            return f"HTTP{resp.status_code}"
+    except Exception:  # noqa: BLE001 — 探测失败不阻塞搜索
+        return "未知"
+
+
 def user_cookies() -> list[dict]:
     """FIND_SOURCE_LENS_COOKIE 指向 Cookie-Editor 导出的 JSON 数组。
 
@@ -68,9 +90,11 @@ def user_cookies() -> list[dict]:
         return []
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as e:
+        logger.warning(f"[Lens] cookie 文件不可读，回退 consent 打底：{path}（{e.__class__.__name__}）")
         return []
     if not isinstance(raw, list):
+        logger.warning(f"[Lens] cookie 文件不是 JSON 数组，回退 consent 打底：{path}")
         return []
     out: list[dict] = []
     for ck in raw:
@@ -192,7 +216,8 @@ EXTRACT_JS = r"""
   }
   const bodyText = document.body ? document.body.innerText.slice(0, 4000) : '';
   const lensImgs = Array.from(document.images).filter(i => /lens\.usercontent\.google\.com\/image/.test(i.src || ''));
-  const lensImgDead = lensImgs.length > 0 && lensImgs.every(i => i.naturalWidth === 0);
+  const lensImgDeadCount = lensImgs.filter(i => i.naturalWidth === 0).length;
+  const lensImgDead = lensImgs.length > 0 && lensImgDeadCount === lensImgs.length;
   let aiOverview = '';
   const aiStart = bodyText.search(/AI 概览|AI Overview/i);
   if (aiStart >= 0) {
@@ -215,7 +240,9 @@ EXTRACT_JS = r"""
     empty: /No matches|No results|找不到相符|没有找到|未找到/i.test(bodyText),
     bodyHead: bodyText.slice(0, 600),
     aiOverview: aiOverview,
-    lensImgDead: lensImgDead
+    lensImgDead: lensImgDead,
+    lensImgTotal: lensImgs.length,
+    lensImgDeadCount: lensImgDeadCount
   });
 })()
 """
@@ -341,8 +368,10 @@ def _note_verdict(verdict: str) -> None:
     global _captcha_streak, _breaker_until
     if verdict in ("CAPTCHA", "IMG_DEAD"):
         _captcha_streak += 1
+        logger.info(f"[Lens] 拦截计数 streak={_captcha_streak}/{CAPTCHA_STREAK_LIMIT}（{verdict}）")
         if _captcha_streak >= CAPTCHA_STREAK_LIMIT:
             _breaker_until = time.monotonic() + CAPTCHA_BREAKER_S
+            logger.warning(f"[Lens] 连续 {CAPTCHA_STREAK_LIMIT} 次被拦截，熔断 {CAPTCHA_BREAKER_S:.0f}s")
     elif verdict in ("SUCCESS", "EMPTY"):
         _captcha_streak = 0
 
@@ -381,19 +410,30 @@ def _classify_browser_error(exc: Exception) -> EngineError:
 
 async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
                        deadline: float) -> tuple[list[Candidate], str]:
+    t0 = time.monotonic()
     await cdp.start()
     # 真人 cookie 在后，覆盖 consent 打底值（SOCS 等）
-    for ck in (*CONSENT_COOKIES, *user_cookies()):
+    real = user_cookies()
+    ck_ok = ck_fail = 0
+    for ck in (*CONSENT_COOKIES, *real):
         try:
-            await cdp.send("Network.setCookie", dict(ck), timeout=8)
+            r = await cdp.send("Network.setCookie", dict(ck), timeout=8)
+            if r.get("success", True):
+                ck_ok += 1
+            else:
+                ck_fail += 1
         except BrowserError:
-            pass
+            ck_fail += 1
+    logger.info(f"[Lens] cookie 注入 ok={ck_ok} fail={ck_fail} 真人={len(real)} "
+                f"名单={','.join(sorted({c['name'] for c in real})) or '-'}")
     home = await cdp.navigate("https://www.google.com/?hl=zh-CN&gl=US",
                               timeout=25, settle=0.8)
+    logger.info(f"[Lens] 首页落地 {home}（+{time.monotonic() - t0:.1f}s）")
     if CONSENT_RE.search(home):
-        await cdp.evaluate(ACCEPT_CONSENT_JS)
+        clicked = await cdp.evaluate(ACCEPT_CONSENT_JS)
         await asyncio.sleep(1.5)
         home = await cdp.url()
+        logger.info(f"[Lens] consent 页点击={clicked} 重落地 {home}")
         if CONSENT_RE.search(home):
             _note_verdict("CONSENT")
             raise EngineError("GOOGLE_CONSENT", "谷歌同意页拦截，无法上传")
@@ -415,16 +455,27 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
     await cdp.send("DOM.setFileInputFiles",
                    {"files": [str(img_path)], "objectId": object_id}, timeout=15)
     await cdp.evaluate(SUBMIT_JS, timeout=10)
-    await cdp.wait_for(READY_JS, timeout=20, settle=0.8)
-    await cdp.wait_for(RESULTS_JS, timeout=20, settle=2.0)
+    ready_ok = await cdp.wait_for(READY_JS, timeout=20, settle=0.8)
+    results_ok = await cdp.wait_for(RESULTS_JS, timeout=20, settle=2.0)
 
     final_url = await cdp.url()
+    logger.info(f"[Lens] 上传后 ready={ready_ok} results={results_ok} "
+                f"url={final_url}（+{time.monotonic() - t0:.1f}s）")
     raw = await cdp.evaluate(EXTRACT_JS, timeout=20)
     page = json.loads(raw) if isinstance(raw, str) else (raw or {})
     if not isinstance(page, dict):
         page = {}
     verdict = grade_page(page, final_url)
     _note_verdict(verdict)
+    logger.info(
+        f"[Lens] verdict={verdict} 直链={len(page.get('results') or [])} "
+        f"卡片={len(page.get('cards') or [])} "
+        f"lens图死={page.get('lensImgDeadCount', '?')}/{page.get('lensImgTotal', '?')} "
+        f"captcha={bool(page.get('captcha'))} empty={bool(page.get('empty'))} "
+        f"aiOverview={len(str(page.get('aiOverview') or ''))}字 "
+        f"（+{time.monotonic() - t0:.1f}s）")
+    if verdict != "SUCCESS":
+        logger.warning(f"[Lens] bodyHead: {str(page.get('bodyHead') or '')[:300]!r}")
     if verdict == "CONSENT":
         raise EngineError("GOOGLE_CONSENT", "谷歌同意页拦截，无法上传")
     if verdict == "CAPTCHA":
@@ -447,27 +498,39 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
         social = [c for c in cards if LENS_SOCIAL_RE.search(str(c.get("title") or ""))]
         others = [c for c in cards if not LENS_SOCIAL_RE.search(str(c.get("title") or ""))]
         if cards:
+            picked = (social + others)[:_RESOLVE_CARDS]
+            logger.info(f"[Lens] 解链 {len(picked)} 张 /goto 卡（社交优先={bool(social)}）")
             async with httpx.AsyncClient(
                     proxy=_proxy(), trust_env=False, follow_redirects=False,
                     headers={"User-Agent": ua, "Cookie": _cookie_header()}) as client:
-                for card in (social + others)[:_RESOLVE_CARDS]:
+                for i, card in enumerate(picked):
                     remaining = deadline - time.monotonic()
                     if remaining < 4:
+                        logger.info("[Lens] 解链预算耗尽，跳过剩余卡片")
                         break
                     target = await resolve_goto_http(
                         client, str(card["wrapper"]), timeout=min(8.0, remaining))
+                    via = "http"
                     if not target:
+                        via = "cdp"
                         try:
                             target = await cdp.resolve_redirect(
                                 str(card["wrapper"]), timeout=min(8.0, remaining))
                         except BrowserError:
                             target = ""
+                    logger.info(f"[Lens] goto#{i + 1} {via} → {target or '-'} "
+                                f"标题={str(card.get('title') or '')[:40]!r}")
                     if not target or target in seen or not recordable_url(target):
                         continue
                     seen.add(target)
                     rows.append({"url": target, "title": str(card.get("title") or "")[:200],
                                  "wrapper": card["wrapper"]})
-    return rows_to_candidates(rows), overview
+    else:
+        logger.info("[Lens] 已有社交直链，跳过 /goto 解链")
+    candidates = rows_to_candidates(rows)
+    logger.info(f"[Lens] 完成 candidates={len(candidates)} overview={len(overview)}字 "
+                f"总耗时={time.monotonic() - t0:.1f}s")
+    return candidates, overview
 
 
 async def search_lens(data: bytes, timeout: float = LENS_TIMEOUT,
@@ -480,6 +543,7 @@ async def search_lens(data: bytes, timeout: float = LENS_TIMEOUT,
     if not lens_enabled():
         return [], ""
     if time.monotonic() < _breaker_until:
+        logger.warning(f"[Lens] 熔断中，剩余 {_breaker_until - time.monotonic():.0f}s，本次跳过")
         raise EngineError("GOOGLE_CAPTCHA", "Lens 连续被谷歌拦截，熔断中，请稍后再试")
     exe = find_chrome()
     if not exe:
@@ -487,23 +551,34 @@ async def search_lens(data: bytes, timeout: float = LENS_TIMEOUT,
     try:
         await asyncio.wait_for(sem().acquire(), QUEUE_TIMEOUT)
     except asyncio.TimeoutError:
+        logger.warning(f"[Lens] 排队超时（>{QUEUE_TIMEOUT:.0f}s），放弃")
         raise EngineError("ENGINE_TIMEOUT", "Lens 排队超时") from None
 
+    t_start = time.monotonic()
+    proxy = _proxy()
+    ua = chrome_ua(exe)
+    logger.info(f"[Lens] 开始 bytes={len(data)} proxy={proxy} chrome={exe} ua={ua}")
+    logger.info(f"[Lens] 出口IP={await _exit_ip(proxy)}")
     profile = Path(tempfile.mkdtemp(prefix="findlens_"))
     img_path = profile / "upload.image"
-    ua = chrome_ua(exe)
-    cdp = CdpBrowser(profile, exe=exe, proxy=_proxy(), ua=ua)
+    cdp = CdpBrowser(profile, exe=exe, proxy=proxy, ua=ua)
     deadline = time.monotonic() + timeout - 3.0
     try:
         img_path.write_bytes(data)
         return await asyncio.wait_for(
             _search_once(cdp, img_path, ua, deadline), timeout)
     except asyncio.TimeoutError:
+        logger.warning(f"[Lens] 总超时 {timeout:.0f}s")
         raise EngineError("ENGINE_TIMEOUT", "Lens 超时") from None
-    except EngineError:
+    except EngineError as e:
+        logger.warning(f"[Lens] 失败 code={e.code} msg={e.message} "
+                       f"耗时={time.monotonic() - t_start:.1f}s")
         raise
     except BrowserError as e:
-        raise _classify_browser_error(e) from e
+        err = _classify_browser_error(e)
+        logger.warning(f"[Lens] 浏览器失败 code={err.code} msg={err.message} "
+                       f"耗时={time.monotonic() - t_start:.1f}s")
+        raise err from e
     finally:
         await cdp.kill()
         shutil.rmtree(profile, ignore_errors=True)

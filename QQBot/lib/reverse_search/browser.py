@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import aiohttp
+from loguru import logger
 
 _CHROME_PATHS = (
     "/usr/bin/google-chrome-stable", "/usr/bin/google-chrome",
@@ -160,6 +161,8 @@ class CdpBrowser:
             try:
                 await self._launch(args)
                 _WORKING_FLAGS = (headless, sandbox)
+                logger.info(f"[Lens] chrome 启动成功 headless={headless or 'headed'} "
+                            f"sandbox={sandbox or 'default'}")
                 return
             except Exception as e:
                 last = e
