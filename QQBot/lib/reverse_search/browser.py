@@ -301,6 +301,11 @@ class CdpBrowser:
             await self.ws.send_str(json.dumps(
                 {"id": mid, "method": method, "params": params or {}}))
             return await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            # 必须转 BrowserError：navigate/wait_for 的轮询只捕 BrowserError，
+            # 裸 TimeoutError 会穿透 _search_once 被误标成「Lens 总超时」，
+            # 一次慢探针（如上传后跨域导航期间 evaluate 挂起）就杀掉整次搜索
+            raise BrowserError(f"CDP 调用超时: {method} ({timeout:.0f}s)") from None
         finally:
             self.pending.pop(mid, None)
 
