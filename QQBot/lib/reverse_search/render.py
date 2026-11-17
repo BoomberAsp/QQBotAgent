@@ -1,11 +1,8 @@
-"""回话版式（方案 §2.3，纯函数可离线测试）。
-
-一期不含头像附图与「不对→下一候选」（三期）。两种形态：
-账号反查结果 / 作品识别；都没有 → 未找到 + 引擎状态。
-"""
+"""按证据分别渲染同图页面、账号线索、作品识别和水印。"""
 from __future__ import annotations
 
 from .accounts import Account
+from .source_evidence import SourceEvidence, source_order
 
 ACCURACY_NOTE = "反查结果可能认错，请自行核实。"
 
@@ -25,6 +22,7 @@ def _account_block(acc: Account) -> str:
         lines.append(f"🆔 链接：{acc.url}")
     if acc.label:
         lines.append(f"🏷 备注：{acc.label}")
+    lines.append("🔎 账号线索，作者归属待核验")
     return "\n".join(lines)
 
 
@@ -54,34 +52,62 @@ def _footer(elapsed_s: float, engines: list[str], cached: bool,
     return "\n".join(lines)
 
 
+def _represent_sources(sources: list[SourceEvidence], excluded: set[str]) -> list[str]:
+    ordered = sorted(
+        (source for source in sources
+         if source.verification == "same_image" or source.url not in excluded),
+        key=source_order)
+    verified = [source for source in ordered if source.verification == "same_image"]
+    clues = [source for source in ordered if source.verification != "same_image"]
+    sections = []
+    if verified:
+        lines = ["🔗 同图页面"]
+        for source in verified[:3]:
+            credit = f" · 页面署名：{source.attribution}" if source.attribution else ""
+            lines.append(f"{source.url}{credit}")
+        sections.append("\n".join(lines))
+    if clues:
+        lines = ["🔎 待核实的来源线索"]
+        for source in clues[:3]:
+            label = {"exact": "完全匹配结果", "similar_art": "相似画作", "watermark": "水印搜索"}.get(
+                source.match, "搜索候选")
+            lines.append(f"{label} · {source.url}")
+        sections.append("\n".join(lines))
+    return sections
+
+
 def render_reply(*, accounts: list[Account], rejected: list[Account],
                  work: dict | None, vlm_text: str | None,
                  engine_errors: dict[str, str], elapsed_s: float,
-                 engines: list[str], cached: bool = False) -> str:
+                 engines: list[str], cached: bool = False,
+                 sources: list[SourceEvidence] | None = None,
+                 watermark_text: list[str] | None = None, lens_overview: str = "") -> str:
     footer = _footer(elapsed_s, engines, cached, engine_errors)
 
+    sections = []
     if accounts:
-        blocks = [_account_block(a) for a in accounts[:3]]
-        body = "🎯 找图结果\n\n" + "\n\n".join(blocks)
-        if work:
-            body += "\n\n" + _work_block(work)
-        if rejected:
-            handles = [f"@{a.handle}" if a.handle else a.display
-                       for a in rejected[:3]]
-            more = " 等" if len(rejected) > 3 else ""
-            body += (f"\n\n另过滤 {len(rejected)} 个低置信账号"
-                     f"（{'、'.join(handles)}{more}），未作为结论。")
-        return body + "\n\n" + footer
-
-    if work or vlm_text:
-        body = "🎬 作品识别\n"
-        if work:
-            body += "\n" + _work_block(work)
-        if vlm_text:
-            body += f"\n\n🤖 视觉识别：{vlm_text}"
-        return body + "\n\n" + footer
-
-    body = "没找到可靠来源。可以换更清晰的原图、带水印的图再试。"
+        sections.append("🎯 找图结果")
+        sections.extend(_account_block(account) for account in accounts[:3])
+    elif work or vlm_text:
+        sections.append("🎬 作品识别")
+    elif not sources and not watermark_text:
+        sections.append("没找到可靠来源。可以换更清晰的原图、带水印的图再试。")
+    excluded = {account.url for account in accounts[:3]}
+    if work:
+        excluded.add(work.get("url", ""))
+    sections.extend(_represent_sources(sources or [], excluded))
+    if work:
+        sections.append(_work_block(work))
     if vlm_text:
-        body += f"\n\n🤖 视觉识别：{vlm_text}"
-    return body + "\n\n" + footer
+        sections.append(f"🤖 视觉识别：{vlm_text}")
+    if lens_overview and (not vlm_text or not vlm_text.startswith("（Lens AI 概览）")):
+        sections.append(f"Lens 概览（识别线索）：{lens_overview}")
+    if watermark_text:
+        sections.append("图中水印线索：" + "、".join(watermark_text[:5]))
+    if rejected:
+        handles = [f"@{account.handle}" if account.handle else account.display
+                   for account in rejected[:3]]
+        more = " 等" if len(rejected) > 3 else ""
+        sections.append(f"另过滤 {len(rejected)} 个低置信账号（{'、'.join(handles)}{more}），未作为结论。")
+    sections.append(footer)
+    return "\n\n".join(sections)

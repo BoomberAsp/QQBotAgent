@@ -24,7 +24,7 @@ class Candidate:
     page_url: str = ""
     title: str = ""
     thumbnail: str = ""
-    similarity: float = 0.0
+    similarity: float | None = 0.0
     author: str = ""
     author_url: str = ""
     extra: dict = field(default_factory=dict)
@@ -155,6 +155,9 @@ _ENGINES = (
     ("ascii2d", search_ascii2d),
     ("trace.moe", search_tracemoe),
 )
+
+
+ENGINE_NAMES = tuple(name for name, _ in _ENGINES)
 
 
 async def run_engines(data: bytes,

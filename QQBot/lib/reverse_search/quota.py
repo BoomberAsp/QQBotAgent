@@ -16,6 +16,8 @@ COOLDOWN_S = 30.0
 USER_DAILY = 20
 GLOBAL_DAILY = 100
 CACHE_TTL_S = 30 * 86400
+PARTIAL_CACHE_TTL_S = 3600
+SEARCH_POLICY_VERSION = 2
 
 _DEFAULT_PATH = (Path(__file__).resolve().parents[2]
                  / "data" / "find_source" / "quota.json")
@@ -23,6 +25,10 @@ _DEFAULT_PATH = (Path(__file__).resolve().parents[2]
 
 def image_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def cache_key(data: bytes) -> str:
+    return f"{SEARCH_POLICY_VERSION}:{image_hash(data)}"
 
 
 def _fresh() -> dict:
@@ -62,20 +68,21 @@ def cache_get(state: dict, digest: str, now: float) -> dict | None:
     entry = state.get("cache", {}).get(digest)
     if not entry:
         return None
-    if now - entry.get("ts", 0) > CACHE_TTL_S:
+    if now - entry.get("ts", 0) > entry.get("ttl", CACHE_TTL_S):
         return None
     payload = entry.get("result")
     return payload if isinstance(payload, dict) else None
 
 
-def cache_put(state: dict, digest: str, payload: dict, now: float) -> None:
-    state.setdefault("cache", {})[digest] = {"ts": now, "result": payload}
+def cache_put(state: dict, digest: str, payload: dict, now: float,
+              *, ttl: float = CACHE_TTL_S) -> None:
+    state.setdefault("cache", {})[digest] = {"ts": now, "ttl": ttl, "result": payload}
 
 
 def prune(state: dict, now: float) -> None:
     cache = state.get("cache", {})
     for digest in [d for d, e in cache.items()
-                   if now - e.get("ts", 0) > CACHE_TTL_S]:
+                   if now - e.get("ts", 0) > e.get("ttl", CACHE_TTL_S)]:
         del cache[digest]
 
 

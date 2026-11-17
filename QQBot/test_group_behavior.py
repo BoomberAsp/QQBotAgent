@@ -128,7 +128,8 @@ class PrivateImageSourceTests(unittest.IsolatedAsyncioTestCase):
 
             async def run(*args, allowed_tools, **kwargs):
                 if "find_image_source" in allowed_tools:
-                    return await turn._tool_registry.execute("find_image_source", {})
+                    raw = await turn._tool_registry.execute("find_image_source", {})
+                    return json.loads(raw)["summary"]
                 return "普通回复"
 
             stack.enter_context(patch.dict("os.environ", {"FIND_SOURCE_ENABLED": "on"}))
@@ -152,7 +153,7 @@ class PrivateImageSourceTests(unittest.IsolatedAsyncioTestCase):
                 agent=NS(run=run),
             ))
             search = stack.enter_context(patch.object(service, "run", AsyncMock(
-                return_value=NS(render=lambda: "查到图片来源。"))))
+                return_value=service.FindResult(vlm_text="查到图片来源。"))))
             token = current_scope.set("private-test")
             stack.callback(current_scope.reset, token)
             stack.callback(image_source_tools._pending.clear)
@@ -172,7 +173,7 @@ class PrivateImageSourceTests(unittest.IsolatedAsyncioTestCase):
             await send("", "second", image=True)
             await send("可以", "yes")
             search.assert_awaited_once_with(data, image_path=str(path), user_id="private-user")
-            turn._send_response.assert_awaited_with("查到图片来源。")
+            self.assertIn("查到图片来源。", turn._send_response.await_args.args[0])
             await send("帮我查这张图的出处", "explicit", image=True)
             self.assertEqual(search.await_count, 2)
 
@@ -453,10 +454,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         async def run(*args, allowed_tools, **kwargs):
             can_search = "find_image_source" in allowed_tools
             observed.append(can_search)
-            return await image_source_tools.find_image_source() if can_search else "看到了。"
+            if can_search:
+                return json.loads(await image_source_tools.find_image_source())["summary"]
+            return "看到了。"
 
         self.fake.agent.run = run
-        search = AsyncMock(return_value=NS(render=lambda: "找到来源。"))
+        search = AsyncMock(return_value=service.FindResult(vlm_text="找到来源。"))
         with patch.object(service, "run", search), patch.dict("os.environ", {"FIND_SOURCE_ENABLED": "on"}):
             await runtime.run_group_turn(photo, self.sender)
             self.assertIn("要帮你查这张图的来源吗", self.sender.send_group_text.await_args.args[0])

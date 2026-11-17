@@ -323,9 +323,16 @@ def _build_tool_registry() -> ToolRegistry:
     )
     registry.register(
         image_source_tools.TOOL_NAME, image_source_tools.find_image_source,
-        "反查用户已同意查询的单张图片，返回出处、作品或作者候选及来源链接。"
-        "直接使用本轮已绑定的图片，调用时无需参数。",
-        {"type": "object", "properties": {}, "additionalProperties": False},
+        "反查用户已同意查询的单张图片，返回结构化证据。"
+        "先用 search（无需参数），再按返回的可用动作与 ID 有限复查。",
+        {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "action": {"type": "string", "enum": ["search", "lookup_watermark", "verify_source"],
+                           "description": "首查、水印检索或同图页面核验", "default": "search"},
+                "target_id": {"type": "string", "description": "复查时传入本轮返回的可用 ID"},
+            },
+        },
     )
     registry.register(
         "web_fetch", web_fetch,

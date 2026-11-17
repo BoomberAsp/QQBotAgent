@@ -2,7 +2,7 @@
 
 无头 Chrome 上传 → DOM 抽卡片 → /goto 解链 → Candidate。
 spike 已验证（2026-11-16，服务器 Chrome 157 + 1081 代理 3/3 零验证码）。
-Lens 无相似度分（similarity=0），共识端对「Lens 作者主页单独命中」另开采纳条款。
+Lens 未提供相似度分。默认页和完全匹配页的候选分别标注，页面与账号证据分开处理。
 
 热读开关：FIND_SOURCE_LENS（默认 on）、FIND_SOURCE_LENS_PROXY
 （默认 http://127.0.0.1:1081，Lens 必须走代理）、CHROME_BIN、
@@ -32,13 +32,14 @@ import re
 import shutil
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 from loguru import logger
 
-from .accounts import handle_of, handles_in_text, is_post_page, platform_of
+from .accounts import handles_in_text, is_author_page, page_key, platform_of
 from .browser import (BrowserError, CdpBrowser, chrome_ua, find_chrome,
                       is_google_url, sem)
 from .engines import Candidate, EngineError
@@ -50,7 +51,9 @@ CAPTCHA_STREAK_LIMIT = 3
 CAPTCHA_BREAKER_S = 600.0
 _DEFAULT_PROXY = "http://127.0.0.1:1081"
 _MAX_CANDIDATES = 24
-_RESOLVE_CARDS = 3            # 每解一条要一次请求/导航，QQ 里没人愿意等
+_RESOLVE_CARDS = 3            # 每页的唯一落地链接目标数
+_MAX_GOTO_ATTEMPTS = 8        # 两页共用的跳转卡片上限
+_EXACT_TIMEOUT = 12.0
 
 _captcha_streak = 0
 _breaker_until = 0.0          # time.monotonic 基准
@@ -223,15 +226,23 @@ EXTRACT_JS = r"""
     return String((heading && heading.textContent) || node.getAttribute('aria-label') || node.textContent || '')
       .replace(/\s+/g, ' ').trim().slice(0, 200);
   };
-  const rows = [], cards = [], seen = new Set();
+  const rows = [], cards = [], seen = new Set(), seenWrappers = new Set();
+  let exactUrl = '';
   for (const a of document.querySelectorAll('a[href]')) {
-    if (a.closest('header, footer, nav, [role=navigation]')) continue;
     let u; try { u = new URL(a.getAttribute('href') || '', location.href); } catch (e) { continue; }
     if (u.protocol !== 'https:') continue;
+    if (u.origin === location.origin && u.pathname === '/search' &&
+        u.searchParams.get('udm') === '48' && u.searchParams.has('vsrid')) {
+      if (!exactUrl) exactUrl = u.href;
+    }
+    if (a.closest('header, footer, nav, [role=navigation]')) continue;
     const title = cleanTitle(a);
     if (!title) continue;
     if (isGoogle(u.hostname) && u.pathname === '/goto' && u.searchParams.get('url')) {
-      if (cards.length < 24) cards.push({ wrapper: u.href, title });
+      if (cards.length < 24 && !seenWrappers.has(u.href)) {
+        seenWrappers.add(u.href);
+        cards.push({ wrapper: u.href, title });
+      }
       continue;
     }
     if (isGoogleOwned(u.hostname) || seen.has(u.href)) continue;
@@ -259,7 +270,7 @@ EXTRACT_JS = r"""
   }
   return JSON.stringify({
     url: location.href,
-    results: rows, cards: cards,
+    results: rows, cards: cards, exactUrl: exactUrl,
     captcha: /unusual traffic|our systems have detected|异常流量/i.test(bodyText),
     empty: /No matches|No results|找不到相符|没有找到|未找到/i.test(bodyText),
     bodyHead: bodyText.slice(0, 600),
@@ -342,6 +353,18 @@ def recordable_url(url: str) -> bool:
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
+def _google_request_url(url: str) -> bool:
+    """Only Google-owned HTTPS hosts may receive the session cookie header."""
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        return (parts.scheme == "https" and parts.username is None
+                and parts.port in (None, 443)
+                and (host == "google.com" or host.endswith(".google.com")))
+    except ValueError:
+        return False
+
+
 async def resolve_goto_http(client: httpx.AsyncClient, wrapper_url: str,
                             timeout: float = 8.0) -> str:
     """不跟重定向、读 Location 解 `/goto?url=<token>`（真 302 形态，~1s）。
@@ -351,7 +374,7 @@ async def resolve_goto_http(client: httpx.AsyncClient, wrapper_url: str,
     """
     current = str(wrapper_url or "")
     for _ in range(3):
-        if not re.match(r"^https?://", current, re.I) or not is_google_url(current):
+        if not _google_request_url(current):
             return ""
         try:
             resp = await client.get(current, timeout=timeout, follow_redirects=False)
@@ -408,17 +431,19 @@ def rows_to_candidates(rows: list[dict]) -> list[Candidate]:
     seen: set[str] = set()
     for row in rows:
         url = str(row.get("url") or "")
-        if not url or url in seen or not recordable_url(url):
+        key = page_key(url)
+        if not key or key in seen or not recordable_url(url):
             continue
-        seen.add(url)
+        seen.add(key)
         title = str(row.get("title") or "")[:200]
         plat = platform_of(url)
         author = social_name_from_title(title) if plat else ""
-        author_url = url if (plat and handle_of(url) and not is_post_page(url)) else ""
+        author_url = url if is_author_page(url) else ""
         out.append(Candidate(
             engine="Lens", page_url=url, title=title, author=author,
-            author_url=author_url, similarity=0.0,
-            extra={"wrapper": str(row.get("wrapper") or "")}))
+            author_url=author_url, similarity=None,
+            extra={"match": row.get("match") or "visual",
+                   "wrapper": str(row.get("wrapper") or "")}))
         if len(out) >= _MAX_CANDIDATES:
             break
     return out
@@ -433,8 +458,111 @@ def _classify_browser_error(exc: Exception) -> EngineError:
 
 # ── 主流程 ────────────────────────────────────────────────────────────
 
+def _exact_url(final_url: str, advertised: str) -> str:
+    if not _google_request_url(final_url):
+        return ""
+    base = urlsplit(final_url)
+    params = parse_qsl(base.query, keep_blank_values=True)
+    query = dict(params)
+    if base.path != "/search" or not query.get("vsrid") or query.get("udm") == "48":
+        return ""
+    if advertised and _google_request_url(advertised):
+        target = urlsplit(advertised)
+        target_params = dict(parse_qsl(target.query, keep_blank_values=True))
+        if (target.netloc == base.netloc and target.path == "/search"
+                and target_params.get("udm") == "48"
+                and target_params.get("vsrid") == query["vsrid"]):
+            return advertised
+    rest = [(name, value) for name, value in params if name != "udm"]
+    return urlunsplit((base.scheme, base.netloc, base.path, urlencode(rest + [("udm", "48")]), ""))
+
+
+def _parse_page(raw) -> dict:
+    try:
+        page = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return {}
+    return page if isinstance(page, dict) else {}
+
+
+async def _collect_rows(cdp, page: dict, ua: str, deadline: float,
+                        attempts: dict[str, str], *, match: str,
+                        watermarks: list[str] | None = None) -> list[dict]:
+    rows = [dict(row, match=match) for row in (page.get("results") or []) if page_key(row.get("url"))]
+    seen = {page_key(row["url"]) for row in rows}
+    cards = [card for card in (page.get("cards") or []) if card.get("wrapper")]
+    if not cards:
+        return rows
+    handles = {name.lower() for name in handles_in_text(str(page.get("aiOverview") or ""))}
+    handles.update(handle.lstrip("@").lower() for handle in watermarks or [])
+
+    def priority(card):
+        title = str(card.get("title") or "")
+        mentions = {name.lower() for name in handles_in_text(title)}
+        return (not bool(handles & mentions), not bool(LENS_SOCIAL_RE.search(title)))
+
+    # Keep the fast path for profile-rich SERPs with only supplemental cards.
+    if (match == "visual" and any(is_author_page(row["url"]) for row in rows)
+            and all(priority(card) == (True, True) for card in cards)):
+        logger.info("[Lens] 已有社交直链，跳过补充 /goto 卡片")
+        return rows
+    added = 0
+    before = len(attempts)
+    async with httpx.AsyncClient(
+            proxy=_proxy(), trust_env=False, follow_redirects=False,
+            headers={"User-Agent": ua, "Cookie": _cookie_header()}) as client:
+        for card in sorted(cards, key=priority):
+            if added >= _RESOLVE_CARDS:
+                break
+            wrapper = str(card["wrapper"])
+            target = attempts.get(wrapper)
+            if target is None:
+                remaining = deadline - time.monotonic()
+                if (len(attempts) >= _MAX_GOTO_ATTEMPTS or remaining < .5
+                        or not _google_request_url(wrapper)):
+                    continue
+                target, via = await _resolve_card(cdp, client, wrapper, deadline)
+                attempts[wrapper] = target
+                logger.info(f"[Lens] goto#{len(attempts)} {via} → {target or '-'}")
+            key = page_key(target)
+            if not key or key in seen or not recordable_url(target):
+                continue
+            seen.add(key)
+            rows.append({"url": target, "title": str(card.get("title") or "")[:200],
+                         "match": match, "wrapper": wrapper})
+            added += 1
+    logger.info(f"[Lens] {match} 解链尝试={len(attempts) - before} 新增唯一页面={added}")
+    return rows
+
+
+async def _resolve_card(cdp, client, url: str, deadline: float) -> tuple[str, str]:
+    timeout = min(2.0, deadline - time.monotonic())
+    try:
+        target = await asyncio.wait_for(resolve_goto_http(client, url, timeout=timeout), timeout)
+    except asyncio.TimeoutError:
+        target = ""
+    if target:
+        return target, "http"
+    remaining = deadline - time.monotonic()
+    if remaining > .5:
+        timeout = min(3.0, remaining)
+        try:
+            return (await asyncio.wait_for(cdp.resolve_redirect(url, timeout=timeout), timeout)
+                    or ""), "cdp"
+        except (BrowserError, asyncio.TimeoutError):
+            return "", "cdp"
+    return "", "http"
+
+
+async def _fetch_exact_page(cdp, url: str, timeout: float) -> dict:
+    await cdp.navigate(url, timeout=min(5.0, timeout), settle=.5)
+    await cdp.wait_for(RESULTS_JS, timeout=min(5.0, timeout), settle=.4)
+    return _parse_page(await cdp.evaluate(EXTRACT_JS, timeout=min(3.0, timeout)))
+
+
 async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
-                       deadline: float) -> tuple[list[Candidate], str]:
+                       deadline: float, *,
+                       watermarks: Callable[[], list[str]] | None = None) -> tuple[list[Candidate], str]:
     t0 = time.monotonic()
     await cdp.start()
     # 真人 cookie 在后，覆盖 consent 打底值（SOCS 等）
@@ -511,16 +639,16 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
     await cdp.send("DOM.setFileInputFiles",
                    {"files": [str(img_path)], "objectId": object_id}, timeout=15)
     await cdp.evaluate(SUBMIT_JS, timeout=10)
-    ready_ok = await cdp.wait_for(READY_JS, timeout=20, settle=0.8)
-    results_ok = await cdp.wait_for(RESULTS_JS, timeout=20, settle=2.0)
+    # Leave time to collect partial rows and open the exact-match tab.
+    ready_budget = max(.1, min(16.0, deadline - time.monotonic() - 10))
+    ready_ok = await cdp.wait_for(READY_JS, timeout=ready_budget, settle=0.8)
+    results_budget = max(.1, min(16.0, deadline - time.monotonic() - 10))
+    results_ok = await cdp.wait_for(RESULTS_JS, timeout=results_budget, settle=1.0)
 
     final_url = await cdp.url()
     logger.info(f"[Lens] 上传后 ready={ready_ok} results={results_ok} "
                 f"url={final_url}（+{time.monotonic() - t0:.1f}s）")
-    raw = await cdp.evaluate(EXTRACT_JS, timeout=20)
-    page = json.loads(raw) if isinstance(raw, str) else (raw or {})
-    if not isinstance(page, dict):
-        page = {}
+    page = _parse_page(await cdp.evaluate(EXTRACT_JS, timeout=20))
     verdict = grade_page(page, final_url)
     _note_verdict(verdict)
     logger.info(
@@ -537,61 +665,59 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
         raise EngineError("GOOGLE_CONSENT", "谷歌同意页拦截，无法上传")
     if verdict == "CAPTCHA":
         raise EngineError("GOOGLE_CAPTCHA", "谷歌验证码拦截")
-    if verdict == "EMPTY":
-        raise EngineError("GOOGLE_EMPTY", "Lens 未找到匹配")
     if verdict == "IMG_DEAD":
         raise EngineError("GOOGLE_UNREACHABLE",
                           "Lens 图片服务无响应（代理出口被谷歌静默限制，换节点或稍后再试）")
-    if verdict != "SUCCESS":
-        raise EngineError("ENGINE_ERROR", f"Lens 结果页异常（{verdict}）")
-
     overview = str(page.get("aiOverview") or "") or ai_overview_from_body(
         str(page.get("bodyHead") or ""))
-    rows = [dict(r) for r in (page.get("results") or []) if r.get("url")]
-    # 已有直链含社交链接时不再逐条解 /goto —— 每解一条都要一次请求/导航
-    if not lens_has_social(rows):
-        seen = {str(r.get("url")) for r in rows}
-        cards = [c for c in (page.get("cards") or []) if c.get("wrapper")]
-        social = [c for c in cards if LENS_SOCIAL_RE.search(str(c.get("title") or ""))]
-        others = [c for c in cards if not LENS_SOCIAL_RE.search(str(c.get("title") or ""))]
-        if cards:
-            picked = (social + others)[:_RESOLVE_CARDS]
-            logger.info(f"[Lens] 解链 {len(picked)} 张 /goto 卡（社交优先={bool(social)}）")
-            async with httpx.AsyncClient(
-                    proxy=_proxy(), trust_env=False, follow_redirects=False,
-                    headers={"User-Agent": ua, "Cookie": _cookie_header()}) as client:
-                for i, card in enumerate(picked):
-                    remaining = deadline - time.monotonic()
-                    if remaining < 4:
-                        logger.info("[Lens] 解链预算耗尽，跳过剩余卡片")
-                        break
-                    target = await resolve_goto_http(
-                        client, str(card["wrapper"]), timeout=min(8.0, remaining))
-                    via = "http"
-                    if not target:
-                        via = "cdp"
-                        try:
-                            target = await cdp.resolve_redirect(
-                                str(card["wrapper"]), timeout=min(8.0, remaining))
-                        except BrowserError:
-                            target = ""
-                    logger.info(f"[Lens] goto#{i + 1} {via} → {target or '-'} "
-                                f"标题={str(card.get('title') or '')[:40]!r}")
-                    if not target or target in seen or not recordable_url(target):
-                        continue
-                    seen.add(target)
-                    rows.append({"url": target, "title": str(card.get("title") or "")[:200],
-                                 "wrapper": card["wrapper"]})
+    attempts: dict[str, str] = {}
+    exact_url = _exact_url(final_url, str(page.get("exactUrl") or ""))
+    on_exact_page = dict(parse_qsl(urlsplit(final_url).query)).get("udm") == "48"
+    rows = await _collect_rows(
+        cdp, page, ua, min(deadline, time.monotonic() + 6), attempts,
+        match="exact" if on_exact_page else "visual",
+        watermarks=watermarks() if watermarks else None)
+    exact_rows = []
+    remaining = min(_EXACT_TIMEOUT, deadline - time.monotonic())
+    exact_status = "no_tab" if not exact_url else "budget"
+    if on_exact_page:
+        exact_status = "success" if rows else "no_candidates"
+    elif exact_url and remaining >= 6:
+        try:
+            exact_deadline = time.monotonic() + remaining
+            exact_page = await asyncio.wait_for(
+                _fetch_exact_page(cdp, exact_url, remaining), remaining)
+            exact_verdict = grade_page(exact_page, str(exact_page.get("url") or exact_url))
+            exact_status = exact_verdict.lower()
+            if exact_verdict == "SUCCESS":
+                exact_rows = await _collect_rows(
+                    cdp, exact_page, ua, exact_deadline, attempts, match="exact",
+                    watermarks=watermarks() if watermarks else None)
+                if not exact_rows:
+                    exact_status = "no_candidates"
+        except (BrowserError, asyncio.TimeoutError):
+            exact_status = "unavailable"
+    logger.info(f"[Lens] 完全匹配 status={exact_status} 匹配页面={len(exact_rows)}")
+
+    if exact_rows and rows:
+        combined = exact_rows[:16] + rows + exact_rows[16:]
     else:
-        logger.info("[Lens] 已有社交直链，跳过 /goto 解链")
-    candidates = rows_to_candidates(rows)
+        combined = exact_rows or rows
+    candidates = rows_to_candidates(combined)
+    for candidate in candidates:
+        candidate.extra["exact_status"] = exact_status
+    if not candidates and not overview:
+        if verdict == "EMPTY":
+            raise EngineError("GOOGLE_EMPTY", "Lens 未找到匹配")
+        if verdict != "SUCCESS":
+            raise EngineError("ENGINE_ERROR", f"Lens 结果页异常（{verdict}）")
     logger.info(f"[Lens] 完成 candidates={len(candidates)} overview={len(overview)}字 "
                 f"总耗时={time.monotonic() - t0:.1f}s")
     return candidates, overview
 
 
-async def search_lens(data: bytes, timeout: float = LENS_TIMEOUT,
-                      ) -> tuple[list[Candidate], str]:
+async def search_lens(data: bytes, timeout: float = LENS_TIMEOUT, *,
+                      watermarks: Callable[[], list[str]] | None = None) -> tuple[list[Candidate], str]:
     """Lens 反查主入口。返回 (候选, AI 概览文本)；失败抛 EngineError。
 
     每次搜索独立 launch→kill（配额低，不做常驻）；finally 清理 profile
@@ -608,26 +734,33 @@ async def search_lens(data: bytes, timeout: float = LENS_TIMEOUT,
     exe = find_chrome()
     if not exe:
         raise EngineError("ENGINE_ERROR", "未找到 Chrome（可设 CHROME_BIN）")
+    t_start = time.monotonic()
+    deadline = t_start + timeout
+    gate = sem()
     try:
-        await asyncio.wait_for(sem().acquire(), QUEUE_TIMEOUT)
+        await asyncio.wait_for(gate.acquire(), min(QUEUE_TIMEOUT, timeout))
     except asyncio.TimeoutError:
         logger.warning(f"[Lens] 排队超时（>{QUEUE_TIMEOUT:.0f}s），放弃")
         raise EngineError("ENGINE_TIMEOUT", "Lens 排队超时") from None
 
-    t_start = time.monotonic()
-    proxy = _proxy()
-    ua = chrome_ua(exe)
-    logger.info(f"[Lens] 开始 bytes={len(data)} proxy={proxy} chrome={exe} ua={ua}")
-    logger.info(f"[Lens] 出口IP={await _exit_ip(proxy)}")
-    profile = Path(tempfile.mkdtemp(prefix="findlens_"))
-    # Chrome 根据文件名后缀设置 multipart 图片的 MIME 类型。
-    img_path = profile / f"upload.{image_format}"
-    cdp = CdpBrowser(profile, exe=exe, proxy=proxy, ua=ua)
-    deadline = time.monotonic() + timeout - 3.0
+    profile = None
+    cdp = None
     try:
+        proxy = _proxy()
+        ua = chrome_ua(exe)
+        logger.info(f"[Lens] 开始 bytes={len(data)} proxy={proxy} chrome={exe} ua={ua}")
+        try:
+            exit_ip = await asyncio.wait_for(_exit_ip(proxy), max(.01, min(3, deadline - time.monotonic())))
+        except asyncio.TimeoutError:
+            exit_ip = "未知"
+        logger.info(f"[Lens] 出口IP={exit_ip}")
+        profile = Path(tempfile.mkdtemp(prefix="findlens_"))
+        img_path = profile / f"upload.{image_format}"
+        cdp = CdpBrowser(profile, exe=exe, proxy=proxy, ua=ua)
         img_path.write_bytes(data)
         return await asyncio.wait_for(
-            _search_once(cdp, img_path, ua, deadline), timeout)
+            _search_once(cdp, img_path, ua, deadline - 2, watermarks=watermarks),
+            max(.01, deadline - time.monotonic()))
     except asyncio.TimeoutError:
         logger.warning(f"[Lens] 总超时 {timeout:.0f}s")
         raise EngineError("ENGINE_TIMEOUT", "Lens 超时") from None
@@ -641,6 +774,10 @@ async def search_lens(data: bytes, timeout: float = LENS_TIMEOUT,
                        f"耗时={time.monotonic() - t_start:.1f}s")
         raise err from e
     finally:
-        await cdp.kill()
-        shutil.rmtree(profile, ignore_errors=True)
-        sem().release()
+        try:
+            if cdp is not None:
+                await cdp.kill()
+        finally:
+            if profile is not None:
+                shutil.rmtree(profile, ignore_errors=True)
+            gate.release()

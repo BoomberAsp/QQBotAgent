@@ -897,7 +897,7 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 
 ### 2.17 `lib/reverse_search/` — 找图反查（一期 HTTP 引擎 + 二期 Google Lens）
 
-`find_image_source` 是普通用户可用的免参数智能体工具，复用反查服务的配额、缓存与结果渲染。私聊裸图、群里直接发给机器人的裸图会附上确认问题；发图者在同一会话五分钟内的下一轮回复可确认，带图明确请求查来源也可授权。待查图片绑定到会话与发送者，群聊只读取本群工作区的附件。
+`find_image_source` 是普通用户可用的智能体工具。首查无需参数，之后最多复查两次，可用本轮 ID 查询水印或核验候选页。一次确认绑定一张图和一次查询配额。私聊裸图、群里直接发给机器人的裸图会附上确认问题；发图者在同一会话五分钟内的下一轮回复可确认，带图明确请求查来源也可授权。待查图片绑定到会话与发送者，群聊只读取本群工作区的附件。
 
 设计见 `docs/找图反查-方案.md`。一期纯 HTTP 引擎 + VLM 识别 + 同名共识；二期接 Google Lens（无头 Chrome 裸 CDP，spike 3/3 零验证码；Yandex 留三期）。命令 `/找图`（`/找源`/`/找作者`/`/找图帮助`）在 `agent/turn.py::_handle_find_source_command` 直连拦截（零 token，双适配器经 `run_agent_turn`），取图复用 `view.load_attachments()` + OneBot `quoted_file_paths` 引用兜底 + `/找图 <URL>`（`net.safe_download`）；选图落 `[找图] 选图` 日志（source/quoted/文件名/bytes/sha256 前 12 位/msg_id）——2026-11-17 用户报「查的是上一张图」，取证为平台送达旧图（保存的附件本就是芙莉莲图）而非选图 bug，此日志供后续对质。群聊走独立分发：`/找图`（别名 `/找源`/`/找作者`）与 `/找图帮助` 注册在 `agent/public_commands.py::PUBLIC_COMMANDS`（`needs_view=True`，`dispatch_public` 透传 view 供取附件），由 `group_commands.dispatch` 在 @机器人/回复机器人时调用，自动进 `/群帮助` 列表；配额/冷却/缓存与私聊共用同一 `QuotaStore`。
 
@@ -905,14 +905,16 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 |---|---|
 | `net.py` | 魔数判格式（PNG/JPG/GIF/WEBP/BMP）、`validate_image`（512B–20MB）、SSRF 校验 `check_url_allowed`（http(s) + 公网 IP，挡内网/环回/.local/.internal）、`safe_download`（重定向末 URL 复校验 + 大小上限）、`compress_for_upload`（>2MB 或长边 >2048 时白底合成 alpha + 长边 2048/JPEG q88；压缩后不小于原图或解码失败则原样返回。引擎指纹工作尺寸远低于 2048，真匹配 A/B 实测命中集合与排序稳定） |
 | `engines.py` | 四引擎适配（PicImageSearch `file=bytes` 直传，无需图床）：SauceNAO（`SAUCENAO_API_KEY`，免费档 4 次/30s、100 次/24h；匿名 API 已被官方禁用）/ IQDB / ascii2d / trace.moe（库内相似度已 ×100）。统一 `Candidate`；`run_engines` 并发 gather + 30s/引擎超时，引擎级失败分类 `ENGINE_ERROR/QUOTA/TIMEOUT` 不拖垮整体 |
-| `accounts.py` | 纯函数：`platform_of`/`handle_of`/`is_post_page`（14 平台），`aggregate_accounts` 按 (平台, handle) 聚合证据，**作者主页优先于帖子页**，pixiv/ArtStation/DeviantArt 标「画师（非 coser 本人）」。DeviantArt `/view/<id>`·`/art/` 判帖子页且 view/art 等首段非 handle（防两条噪声命中聚成「view 证据 2」假采纳——2026-11-17 真实事故），`<user>.deviantart.com` 子域取 handle |
-| `consensus.py` | 纯函数同名共识（坑 4）：名字/handle 在 ≥2 条不同候选出现，或相似度 ≥80 且有 author_url，或 **Lens 作者主页单独命中**（Lens 无相似度分，视觉匹配=精确图匹配）才采纳；**账号必须有真实链接**（纯名字不进结论）；其余进低置信区只报数量 + ≤3 handle |
-| `quota.py` | 坑 5：30s 冷却 / 20 次每人每天 / 100 次全服每天；图片 sha256 缓存 30 天（命中只查冷却、不耗当日次数）；`QuotaStore` JSON 原子写（`data/find_source/quota.json`），`evaluate`/`record_use`/`cache_*` 纯函数可离线测 |
-| `vlm.py` | `identify_work` 经 `multimodal_client` 识别作品/角色/水印@账号（≤150 字）；不可用/出错返回 None，不阻塞引擎主路 |
-| `render.py` | 纯函数版式（§2.3）：账号反查 / 作品识别（trace.moe 作品 + 集数 + VLM）/ 未找到三态；低置信过滤注记 + 引擎状态 + 「反查结果可能认错，请自行核实。」 |
-| `service.py` | 编排 `run()`：配额闸 `_gate` → 缓存命中直返 → `compress_for_upload`（引擎/Lens 用压缩版；缓存键仍原图 sha256，VLM 仍原图路径）→ `run_engines` ∥ `_lens_leg` ∥ `identify_work` → 共识 → trace.moe ≥87 取作品 → 落缓存（仅正向结果，全失败不缓存）。Lens 腿异常内捕只进 `engine_errors["Lens"]`；VLM 缺席时 Lens AI 概览以「（Lens AI 概览）」前缀补位。`precheck()` 供指令层发回执前先挡配额；`QuotaDenied` 文案可直接回用户；`FindResult.to_payload/from_payload` 缓存序列化 |
+| `accounts.py` | 规范化页面链接，按已知平台帖子 ID 去重，分别识别作者主页与帖子。 |
+| `consensus.py` | 按账号关联的独立来源页计算证据。弱相似画作留作线索，Lens 主页命中保留为待核验账号。 |
+| `quota.py` | 配额沿用 30 秒冷却、每人每天 20 次、全服每天 100 次。图片哈希加策略版本作为缓存键，完整结论缓存 30 天，弱证据或部分引擎失败缓存 1 小时。 |
+| `vlm.py` | 结构化提取作品、角色和图中水印。模型未返回有效 JSON 时保留文本识别，水印账号可供同轮复查。 |
+| `render.py` | 独立展示同图页面、页面署名、账号候选、待核实来源线索及作品识别。低置信账号在有视觉识别时也可见。 |
+| `service.py` | 并行首查、按证据聚合、写入版本化缓存。命令直接渲染首查结果，智能体入口可继续复查。 |
+| `source_evidence.py` | 来源页独立于账号结论，记录引擎、匹配模式及核验状态。 |
+| `source_verification.py` | SearXNG 精确水印查找，验证公开候选的页面媒体与署名。每次重定向检查公网目标，限制响应大小。 |
 | `browser.py` | 二期：无头 Chrome 裸 CDP 驱动（asyncio subprocess + aiohttp WebSocket，无 playwright）。`find_chrome`（`CHROME_BIN` 热读覆盖）、`chrome_ua`（大版本对齐）、启动旗标组合回退 + 成功记忆、`resolve_redirect`（Fetch.requestPaused 拦截非 Google 请求 + 页面 URL 轮询 + HTML 捞地址，绝不拉目标页）、`sem()` 并发闸固定 1；`send()` 把 CDP 超时统一转 `BrowserError`（裸 `asyncio.TimeoutError` 会穿透 navigate/wait_for 轮询、被误标成「Lens 总超时」，一次慢探针即杀掉整次搜索——2026-11-17 真实运行 7.4s 假超时事故后加固）。与 `browser_fetch.py`（ruyiPage Firefox 指纹）互不复用 |
-| `lens.py` | 二期：Lens 引擎。隐藏 form 注入 → `DOM.setFileInputFiles` → 提交 `lens.google.com/v3/upload` → 等渲染 → EXTRACT_JS 抽直链 + ≤24 张 `/goto` 卡片 + AI 概览；`/goto` 解链 HTTP 优先（读 Location ≤3 跳、中间跳必须 Google 域）CDP 兜底，≤3 张卡社交标题优先、已有社交直链则跳过；错误分级 `GOOGLE_CAPTCHA/CONSENT/UNREACHABLE/EMPTY`，`lensImgDead`（上传被接受但 lens.usercontent 图片全部加载失败）识别谷歌对出口 IP 的静默限制 → IMG_DEAD → GOOGLE_UNREACHABLE；连续 3 次被拦截（验证码/静默限制）内存熔断 600s；每次搜索 launch→kill + finally 清理 profile/临时图；`recordable_url` 纯语法私网拦截（不做 DNS）；`FIND_SOURCE_LENS_COOKIE` 真人 cookie 注入（consent 打底后覆盖，解链 Cookie 头同步；`user_cookies()` 保留导出的 `hostOnly`（旧导出按域名前导点推断）；域 Cookie 带点传给 CDP，让 `.google.com` 匹配 www/lens，host-only Cookie 仅用其 HTTPS 源 URL 设置；Cookie-Editor `sameSite` 映射 CDP 枚举 no_restriction→None+强制 Secure / lax→Lax / strict→Strict / null→省略）。Candidate similarity=0，author_url 仅在「平台+handle+非帖子页」时设置。**阶段日志**（loguru `[Lens]` 前缀，随 turn.py 文件 sink 落 `logs/bot_*.log`）：开始(bytes/proxy/chrome/UA)→出口IP探测→cookie 注入 ok/fail 计数+名单（只记名不记值）→**注入后罐(导航前) Network.getAllCookies name@domain**（区分 setCookie 没存 vs 存了导航后被谷歌清空）→首页/consent 落地→**首页登录态（ServiceLogin/账号链接）+ Network.getCookies cookie 罐名单 + 导航后全量罐 getAllCookies + 结果页 signedOut**（对照全量罐与 URL 匹配结果，区分 Cookie 消失与作用范围不匹配）→上传后 ready/results+URL(含 vsrid)→verdict+直链/卡片数+lens 图死亡计数(`lensImgTotal/lensImgDeadCount`)→非 SUCCESS 附 bodyHead→逐卡解链(http/cdp)→完成/失败 code+耗时；cookie 文件不可读/非数组由静默回退改告警 |
+| `lens.py` | 同一 Chrome 会话上传一次，先读默认结果页，按唯一落地页推进跳转卡片解链，必要时在预算内补查完全匹配。保存候选的匹配页类型与补查状态。 |
 
 热读开关 `FIND_SOURCE_ENABLED`（默认 on，off 时命令静默落回 Agent）；`FIND_SOURCE_PROXY` 可选引擎代理（四引擎国内直连已实测通）；`FIND_SOURCE_LENS`（默认 on）、`FIND_SOURCE_LENS_PROXY`（默认 `http://127.0.0.1:1081`，Lens 必须走代理）、`CHROME_BIN`、`FIND_SOURCE_LENS_COOKIE`（可选：Cookie-Editor 导出的真人谷歌 cookie JSON 文件路径，注入后覆盖 consent 打底值，对付谷歌对自动化会话的静默限制；缺失/损坏告警回退）。离线测试 `test/test_find_source.py`（DNS/httpx/PicImageSearch/VLM 全 stub）+ `test/test_lens.py`（CDP/httpx/Chrome 全 stub）。
 
