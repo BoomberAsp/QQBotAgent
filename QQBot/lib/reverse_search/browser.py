@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -345,6 +346,77 @@ class CdpBrowser:
             await asyncio.sleep(0.4)
         await asyncio.sleep(settle)
         return await self.url()
+
+    async def wait_dom(self, accepts: Callable[[str], bool], timeout: float) -> str:
+        """Wait for a usable HTML document on an allowed URL."""
+        deadline = time.monotonic() + timeout
+        last_error = None
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                state = await self.evaluate(
+                    "({url:location.href, ready:document.readyState, body:!!document.body})",
+                    timeout=min(.8, remaining))
+                url = state.get("url", "") if isinstance(state, dict) else ""
+                if url and accepts(url) and state.get("body") and state.get("ready") in {"interactive", "complete"}:
+                    logger.info("[Lens] homepage_dom outcome=ready state={}", state["ready"])
+                    return url
+                last_error = None
+            except BrowserError as exc:
+                last_error = exc
+            await asyncio.sleep(min(.15, max(0, deadline - time.monotonic())))
+        if last_error:
+            raise last_error
+        logger.warning("[Lens] homepage_dom outcome=pending")
+        return ""
+
+    async def navigate_dom(self, url: str, accepts: Callable[[str], bool], timeout: float) -> str:
+        """Navigate the root frame and return once the new document is usable."""
+        started = time.monotonic()
+        deadline = started + timeout
+        commits: set[tuple[str, str]] = set()
+        requests: dict[str, str] = {}
+
+        def observe(event: dict) -> None:
+            method = event.get("method")
+            params = event.get("params") or {}
+            if method == "Page.frameNavigated":
+                frame = params.get("frame") or {}
+                if not frame.get("parentId"):
+                    commits.add((frame.get("id", ""), frame.get("loaderId", "")))
+                return
+            request_id = params.get("requestId")
+            if method == "Network.requestWillBeSent" and params.get("type") == "Document" and request_id:
+                target = (params.get("request") or {}).get("url", "")
+                if accepts(target):
+                    host = urlsplit(target).hostname or "-"
+                    requests[request_id] = host
+                    logger.info("[Lens] homepage_document id={} host={} outcome=request elapsed={:.2f}s",
+                                request_id, host, time.monotonic() - started)
+            elif request_id in requests and method == "Network.responseReceived":
+                logger.info("[Lens] homepage_document id={} host={} outcome=response status={} elapsed={:.2f}s",
+                            request_id, requests[request_id], (params.get("response") or {}).get("status"),
+                            time.monotonic() - started)
+            elif request_id in requests and method == "Network.loadingFailed":
+                logger.warning("[Lens] homepage_document id={} host={} outcome=failed error={} elapsed={:.2f}s",
+                               request_id, requests[request_id], params.get("errorText") or "-",
+                               time.monotonic() - started)
+
+        self.add_listener(observe)
+        try:
+            nav = await self.send("Page.navigate", {"url": url}, timeout=max(.01, timeout - .15))
+            if nav.get("errorText"):
+                raise BrowserError(f"导航失败: {nav['errorText']}")
+            frame = nav.get("frameId")
+            loader = nav.get("loaderId")
+            while frame and loader and (remaining := deadline - time.monotonic()) > 0:
+                if (frame, loader) in commits:
+                    return await self.wait_dom(accepts, remaining)
+                await asyncio.sleep(min(.08, remaining))
+            logger.warning("[Lens] homepage_dom outcome=no_main_document elapsed={:.2f}s",
+                           time.monotonic() - started)
+            return ""
+        finally:
+            self.remove_listener(observe)
 
     async def wait_for(self, expr: str, timeout: float = 25, settle: float = 1.0) -> bool:
         deadline = time.monotonic() + timeout

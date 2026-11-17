@@ -15,9 +15,18 @@ import time
 import httpx
 from loguru import logger
 from PicImageSearch import Ascii2D, Iqdb, SauceNAO, TraceMoe
-from PicImageSearch.network import Network
+from PicImageSearch.network import DEFAULT_HEADERS
+
+from .net import configured_proxy
 
 ENGINE_TIMEOUT = 30.0
+IQDB_BODY_TIMEOUT = 8.0
+_ENGINE_PROXY_ENV = {
+    "SauceNAO": "FIND_SOURCE_SAUCENAO_PROXY",
+    "IQDB": "FIND_SOURCE_IQDB_PROXY",
+    "ascii2d": "FIND_SOURCE_ASCII2D_PROXY",
+    "trace.moe": "FIND_SOURCE_TRACEMOE_PROXY",
+}
 
 _QUOTA_HINTS = ("429", "403", "quota", "limit", "rate too high", "too many")
 
@@ -56,9 +65,13 @@ def _classify(exc: Exception) -> EngineError:
     return EngineError("ENGINE_ERROR", msg[:120] or exc.__class__.__name__)
 
 
-def _proxies() -> str | None:
-    # 四引擎国内直连可通；留 env 逃生门（如需走 1081）
-    return os.environ.get("FIND_SOURCE_PROXY") or None
+def _proxy_for(engine: str) -> str | None:
+    engine_env = _ENGINE_PROXY_ENV.get(engine)
+    names = [engine_env] if engine_env else []
+    names.append("FIND_SOURCE_PROXY")
+    if engine == "trace.moe":
+        names.append("FIND_SOURCE_LENS_PROXY")
+    return configured_proxy(*names)
 
 
 _engine_client: ContextVar[httpx.AsyncClient | None] = ContextVar("reverse_engine_client", default=None)
@@ -77,8 +90,9 @@ _HTTP_PHASES = {
 
 
 class _EngineTrace:
-    def __init__(self, engine: str):
+    def __init__(self, engine: str, *, body_timeout: float | None = None):
         self.engine = engine
+        self.body_timeout = body_timeout
         self.host = "-"
         self.stage = "prepare"
         self.started = time.monotonic()
@@ -93,6 +107,14 @@ class _EngineTrace:
     async def response(self, response: httpx.Response) -> None:
         logger.info("[找图] HTTP engine={} stage=response_status host={} status={}",
                     self.engine, self.host, response.status_code)
+        if self.body_timeout is not None:
+            # HTTPX's read timeout is per socket read. Bound the entire body,
+            # including a chunked response which sends data before stalling.
+            self.stage = "response_body"
+            try:
+                await asyncio.wait_for(response.aread(), self.body_timeout)
+            except asyncio.TimeoutError as exc:
+                raise EngineError("ENGINE_TIMEOUT", f"{self.engine} 响应体读取超时") from exc
 
     async def trace(self, event: str, info: dict) -> None:
         name, _, state = event.rpartition(".")
@@ -114,7 +136,7 @@ class _EngineTrace:
 
 async def search_saucenao(data: bytes) -> list[Candidate]:
     api_key = os.environ.get("SAUCENAO_API_KEY") or None
-    client = SauceNAO(api_key=api_key, numres=6, client=_engine_client.get(), proxies=_proxies())
+    client = SauceNAO(api_key=api_key, numres=6, client=_engine_client.get(), proxies=_proxy_for("SauceNAO"))
     resp = await client.search(file=data)
     header = resp.origin.get("header", {}) if isinstance(resp.origin, dict) else {}
     status = header.get("status", 0) or 0
@@ -141,7 +163,7 @@ async def search_saucenao(data: bytes) -> list[Candidate]:
 
 
 async def search_iqdb(data: bytes) -> list[Candidate]:
-    client = Iqdb(client=_engine_client.get(), proxies=_proxies())
+    client = Iqdb(client=_engine_client.get(), proxies=_proxy_for("IQDB"))
     resp = await client.search(file=data)
     out = []
     for item in resp.raw:
@@ -159,7 +181,7 @@ async def search_iqdb(data: bytes) -> list[Candidate]:
 
 
 async def search_ascii2d(data: bytes) -> list[Candidate]:
-    client = Ascii2D(client=_engine_client.get(), proxies=_proxies())
+    client = Ascii2D(client=_engine_client.get(), proxies=_proxy_for("ascii2d"))
     resp = await client.search(file=data)
     out = []
     for item in resp.raw:
@@ -181,7 +203,7 @@ async def search_ascii2d(data: bytes) -> list[Candidate]:
 
 
 async def search_tracemoe(data: bytes) -> list[Candidate]:
-    client = TraceMoe(client=_engine_client.get(), proxies=_proxies())
+    client = TraceMoe(client=_engine_client.get(), proxies=_proxy_for("trace.moe"))
     resp = await client.search(file=data)
     origin = resp.origin if isinstance(resp.origin, dict) else {}
     if origin.get("error"):
@@ -221,12 +243,16 @@ async def run_engines(data: bytes,
                       ) -> tuple[list[Candidate], dict[str, str]]:
     """并发跑四引擎。返回 (全部候选, {引擎名: 错误描述})。"""
     async def _one(name, fn):
-        trace = _EngineTrace(name)
+        trace = _EngineTrace(name, body_timeout=IQDB_BODY_TIMEOUT if name == "IQDB" else None)
         started = time.monotonic()
-        proxy = _proxies()
+        proxy = _proxy_for(name)
         try:
-            async with Network(proxies=proxy, timeout=timeout) as client:
-                client.event_hooks = {"request": [trace.request], "response": [trace.response]}
+            tls = httpx.create_ssl_context()
+            tls.set_ciphers("DEFAULT")
+            async with httpx.AsyncClient(
+                    proxy=proxy, trust_env=False, timeout=timeout, verify=tls,
+                    headers=DEFAULT_HEADERS, follow_redirects=True,
+                    event_hooks={"request": [trace.request], "response": [trace.response]}) as client:
                 token = _engine_client.set(client)
                 try:
                     return await asyncio.wait_for(fn(data), timeout)

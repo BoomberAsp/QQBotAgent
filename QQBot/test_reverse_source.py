@@ -15,7 +15,9 @@ from PIL import Image, ImageDraw
 
 from agent.inbound import InboundMessage
 from lib.reverse_search import accounts, consensus, engines, lens, quota, service, source_verification
+from lib.reverse_search.browser import BrowserError, CdpBrowser
 from lib.reverse_search.engines import Candidate
+from lib.reverse_search.profile_transport import ProfileProxyError, ProfileResponse, _headers
 from lib.reverse_search.source_evidence import SourceEvidence, merge_sources
 from lib.reverse_search.vlm import parse_clues
 from tools import image_source_followup as followup, image_source_tools as tool
@@ -198,6 +200,61 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HttpStageTests(unittest.IsolatedAsyncioTestCase):
+    def test_proxy_precedence_keeps_unverified_engines_direct(self):
+        with patch.dict("os.environ", {"FIND_SOURCE_LENS_PROXY": "http://127.0.0.1:1083"}, clear=True):
+            self.assertEqual(engines._proxy_for("trace.moe"), "http://127.0.0.1:1083")
+            self.assertIsNone(engines._proxy_for("IQDB"))
+            with patch.dict("os.environ", {"FIND_SOURCE_PROXY": "http://fallback.test:8080",
+                                           "FIND_SOURCE_IQDB_PROXY": "http://dedicated.test:8080",
+                                           "FIND_SOURCE_TRACEMOE_PROXY": "direct"}):
+                self.assertEqual(engines._proxy_for("IQDB"), "http://dedicated.test:8080")
+                self.assertEqual(engines._proxy_for("SauceNAO"), "http://fallback.test:8080")
+                self.assertIsNone(engines._proxy_for("trace.moe"))
+
+    async def test_iqdb_total_body_timeout_keeps_other_engine_candidates(self):
+        open_writers = set()
+        finished = asyncio.Event()
+
+        async def serve(reader, writer):
+            open_writers.add(writer)
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                await writer.drain()
+                for _ in range(30):
+                    writer.write(b"1\r\na\r\n")
+                    await writer.drain()
+                    await asyncio.sleep(.015)
+            except (ConnectionError, asyncio.IncompleteReadError):
+                pass
+            finally:
+                writer.close()
+                open_writers.discard(writer)
+                finished.set()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+
+        async def reading(_):
+            await engines._engine_client.get().get(f"http://127.0.0.1:{port}/")
+            return []
+
+        async def succeeds(_):
+            return [Candidate("trace.moe", POST)]
+
+        async with server:
+            try:
+                with patch.dict("os.environ", {}, clear=True), patch.object(engines, "IQDB_BODY_TIMEOUT", .06), \
+                     patch.object(engines, "_ENGINES", (("IQDB", reading), ("trace.moe", succeeds))):
+                    candidates, errors = await engines.run_engines(b"fixture", timeout=1)
+            finally:
+                for writer in open_writers:
+                    writer.close()
+                if open_writers:
+                    await asyncio.wait_for(finished.wait(), 1)
+        self.assertEqual([item.page_url for item in candidates], [POST])
+        self.assertEqual(errors, {"IQDB": "IQDB 响应体读取超时"})
+
     async def test_engine_traces_connect_upload_and_response_without_query_data(self):
         async def serve(reader, writer):
             wire = (await reader.readuntil(b"\r\n\r\n")).lower()
@@ -233,11 +290,45 @@ class HttpStageTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LensReplay(unittest.IsolatedAsyncioTestCase):
+    async def test_home_returns_interactive_dom_only_after_matching_root_commit(self):
+        browser = CdpBrowser(Path("/tmp/test-browser"), exe="fake", proxy="fake", ua="fake")
+        url = "https://www.google.com/?sensitive=test"
+
+        async def navigate(method, params, timeout):
+            self.assertEqual(method, "Page.navigate")
+            listener = browser._listeners[0]
+            listener({"method": "Page.frameNavigated", "params": {"frame": {
+                "id": "frame", "loaderId": "stale"}}})
+            listener({"method": "Page.frameNavigated", "params": {"frame": {
+                "id": "frame", "loaderId": "next", "parentId": "other"}}})
+            # The new top-level document commits after the command resolves.
+            asyncio.get_running_loop().call_later(.02, listener, {
+                "method": "Page.frameNavigated", "params": {"frame": {
+                    "id": "frame", "loaderId": "next"}}})
+            return {"frameId": "frame", "loaderId": "next"}
+
+        browser.send = AsyncMock(side_effect=navigate)
+        browser.evaluate = AsyncMock(return_value={"url": url, "body": True, "ready": "interactive"})
+        self.assertEqual(await browser.navigate_dom(url, lens._google_home, timeout=.8), url)
+        browser.evaluate.assert_awaited_once()
+        self.assertFalse(browser._listeners)
+
+    async def test_home_retries_at_most_once_under_shared_deadline(self):
+        browser = unittest.mock.MagicMock()
+        browser.navigate_dom = AsyncMock(side_effect=[BrowserError("navigation"), lens._HOME_URL])
+        self.assertEqual(await lens._open_home(browser, time.monotonic() + 20), lens._HOME_URL)
+        self.assertEqual(browser.navigate_dom.await_count, 2)
+        self.assertLessEqual(browser.navigate_dom.await_args_list[0].kwargs["timeout"], 7)
+        browser.navigate_dom = AsyncMock(return_value="")
+        with self.assertRaisesRegex(lens.EngineError, "主文档未就绪"):
+            await lens._open_home(browser, time.monotonic() + 20)
+        self.assertEqual(browser.navigate_dom.await_count, 2)
+
     async def test_lens_upload_navigation_timeout_and_separate_network_failure(self):
         browser = unittest.mock.MagicMock()
         browser.start = AsyncMock()
         browser.send = AsyncMock(return_value={"success": True})
-        browser.navigate = AsyncMock(return_value="https://www.google.com/")
+        browser.navigate_dom = AsyncMock(return_value="https://www.google.com/")
         browser.evaluate_object = AsyncMock(return_value="file-picker")
         browser.wait_for = AsyncMock(return_value=False)
 
@@ -283,6 +374,7 @@ class LensReplay(unittest.IsolatedAsyncioTestCase):
         class Browser:
             location = default
             navigate = AsyncMock()
+            navigate_dom = AsyncMock(return_value="https://www.google.com/")
             start = AsyncMock()
             send = AsyncMock(return_value={"success": True})
             wait_for = AsyncMock(return_value=True)
@@ -335,6 +427,7 @@ class LensReplay(unittest.IsolatedAsyncioTestCase):
         browser = unittest.mock.MagicMock()
         browser.start = AsyncMock()
         browser.send = AsyncMock(return_value={"success": True})
+        browser.navigate_dom = AsyncMock(return_value="https://www.google.com/")
         browser.navigate = AsyncMock(return_value=url)
         browser.wait_for = AsyncMock(return_value=True)
         browser.evaluate_object = AsyncMock(return_value="input")
@@ -369,6 +462,52 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
                 await source_verification._public_get(
                     "https://public.test/post", limit=500, content="text/html")
         self.assertEqual(requests, [("93.184.216.34", "public.test", "public.test")])
+
+    async def test_proxy_headers_skip_interim_status_and_preserve_location(self):
+        pipe = asyncio.StreamReader()
+        pipe.feed_data(b"HTTP/1.1 103 Early Hints\r\nLink: </fast>\r\n\r\n"
+                       b"HTTP/1.1 302 Found\r\nLocation: https://twitter.com/ChocoQAQ\r\n\r\n")
+        pipe.feed_eof()
+        status, response = await _headers(pipe)
+        self.assertEqual(status, 302)
+        self.assertEqual(response["Location"], "https://twitter.com/ChocoQAQ")
+
+    async def test_x_profile_retries_tls_once_then_revalidates_alias_redirect(self):
+        html = b'<meta property="og:title" content="Public (@ChocoQAQ)"><meta name="description" content="Bio">'
+        target = "https://x.com/ChocoQAQ"
+        proxied = AsyncMock(side_effect=[
+            ProfileProxyError(35),
+            ProfileResponse(302, httpx.Headers({"location": "https://twitter.com/ChocoQAQ"})),
+            ProfileResponse(200, httpx.Headers({"content-type": "text/html; charset=utf-8"}), html),
+        ])
+        resolver = AsyncMock(side_effect=[["93.184.216.34"], ["8.8.8.8"]])
+        direct = AsyncMock()
+        with patch.dict("os.environ", {"FIND_SOURCE_LENS_PROXY": "http://localhost:1083"}, clear=True), \
+             patch.object(source_verification, "fetch_pinned", proxied), \
+             patch.object(source_verification, "_public_addresses", resolver), \
+             patch.object(source_verification, "_public_get", direct):
+            profile = await source_verification.read_public_profile(target)
+        self.assertEqual(profile, source_verification.PublicProfile("Public (@ChocoQAQ)", "Bio"))
+        self.assertEqual([call.args[0] for call in resolver.await_args_list], ["x.com", "twitter.com"])
+        self.assertEqual([call.args[1] for call in proxied.await_args_list],
+                         ["93.184.216.34", "93.184.216.34", "8.8.8.8"])
+        direct.assert_not_awaited()
+
+    async def test_proxy_blocks_private_redirect_and_does_not_retry_certificate_error(self):
+        target = "https://x.com/ChocoQAQ"
+        resolver = AsyncMock(return_value=["93.184.216.34"])
+        proxied = AsyncMock(return_value=ProfileResponse(
+            302, httpx.Headers({"location": "https://127.0.0.1/ChocoQAQ"})))
+        with patch.dict("os.environ", {"FIND_SOURCE_X_PROFILE_PROXY": "http://localhost:1083"}, clear=True), \
+             patch.object(source_verification, "_public_addresses", resolver), \
+             patch.object(source_verification, "fetch_pinned", proxied):
+            self.assertIsNone(await source_verification.read_public_profile(target))
+            proxied.assert_awaited_once()
+            resolver.assert_awaited_once_with("x.com")
+            proxied.reset_mock()
+            proxied.side_effect = ProfileProxyError(60)
+            self.assertIsNone(await source_verification.read_public_profile(target))
+            proxied.assert_awaited_once()
 
     async def test_public_profile_checks_metadata_identity_and_post_redirect_is_rejected(self):
         url = "https://x.com/ChocoQAQ"

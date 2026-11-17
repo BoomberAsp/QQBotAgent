@@ -53,6 +53,9 @@ _MAX_CANDIDATES = 24
 _RESOLVE_CARDS = 3            # 每页的唯一落地链接目标数
 _MAX_GOTO_ATTEMPTS = 8        # 两页共用的跳转卡片上限
 _EXACT_TIMEOUT = 12.0
+_HOME_URL = "https://www.google.com/?hl=zh-CN&gl=US"
+_HOME_TIMEOUT = 12.0
+_HOME_FIRST_ATTEMPT = 7.0
 
 _captcha_streak = 0
 _breaker_until = 0.0          # time.monotonic 基准
@@ -634,6 +637,32 @@ async def _fetch_exact_page(cdp, url: str, timeout: float) -> dict:
                                         lambda budget: cdp.evaluate(EXTRACT_JS, timeout=budget)))
 
 
+def _google_home(url: str, *, consent: bool = True) -> bool:
+    if not _google_request_url(url):
+        return False
+    parts = urlsplit(url)
+    if consent and parts.hostname == "consent.google.com":
+        return True
+    return parts.hostname in {"google.com", "www.google.com"} and (
+        parts.path.rstrip("/") in {"", "/webhp"} or parts.path.startswith("/sorry/"))
+
+
+async def _open_home(cdp: CdpBrowser, deadline: float) -> str:
+    home_deadline = min(deadline, time.monotonic() + _HOME_TIMEOUT)
+    for attempt, maximum in enumerate((_HOME_FIRST_ATTEMPT, _HOME_TIMEOUT), 1):
+        try:
+            url = await _lens_phase("homepage", home_deadline, maximum,
+                                    lambda budget: cdp.navigate_dom(_HOME_URL, _google_home, timeout=budget))
+            if url:
+                return url
+            raise EngineError("ENGINE_TIMEOUT", "Lens 首页主文档未就绪")
+        except (BrowserError, EngineError) as exc:
+            if attempt == 2 or home_deadline - time.monotonic() < .25:
+                raise
+            logger.warning("[Lens] homepage outcome=retry cause={}", type(exc).__name__)
+    raise AssertionError("首页重试未返回")
+
+
 async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
                        deadline: float, *,
                        watermarks: Callable[[], list[str]] | None = None) -> tuple[list[Candidate], str]:
@@ -667,22 +696,20 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
         logger.info(f"[Lens] 注入后罐(导航前) {len(jar)} 条: {summary or '-'}")
     except BrowserError:
         pass
-    home = await _lens_phase(
-        "homepage", deadline, 12.0,
-        lambda budget: cdp.navigate("https://www.google.com/?hl=zh-CN&gl=US",
-                                    timeout=budget, settle=.6))
-    if not home:
-        raise EngineError("ENGINE_TIMEOUT", "Lens 无法读取浏览器首页地址")
-    logger.info(f"[Lens] 首页落地 {home}（+{time.monotonic() - t0:.1f}s）")
+    home = await _open_home(cdp, deadline)
+    logger.info(f"[Lens] 首页落地 {urlsplit(home).hostname}（+{time.monotonic() - t0:.1f}s）")
     if CONSENT_RE.search(home):
         clicked = await _lens_phase("consent", deadline, 2.0,
                                     lambda budget: cdp.evaluate(ACCEPT_CONSENT_JS, timeout=budget))
-        await asyncio.sleep(.6)
-        home = await _lens_phase("consent_navigation", deadline, 2.0, lambda _budget: cdp.url())
-        logger.info(f"[Lens] consent 页点击={clicked} 重落地 {home}")
-        if CONSENT_RE.search(home):
+        home = await _lens_phase("consent_navigation", deadline, 2.5,
+                                 lambda budget: cdp.wait_dom(lambda url: _google_home(url, consent=False), budget))
+        logger.info("[Lens] consent 页点击={} 首页就绪={}", bool(clicked), bool(home))
+        if not home:
             _note_verdict("CONSENT")
             raise EngineError("GOOGLE_CONSENT", "谷歌同意页拦截，无法上传")
+    if urlsplit(home).path.startswith("/sorry/"):
+        _note_verdict("CAPTCHA")
+        raise EngineError("GOOGLE_CAPTCHA", "谷歌验证码拦截")
 
     # 首页 DOM 提供登录态线索，getCookies 查看与两个 URL 匹配的 Cookie。
     try:

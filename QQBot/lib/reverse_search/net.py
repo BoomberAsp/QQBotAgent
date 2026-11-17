@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import ipaddress
+import os
 import socket
 from urllib.parse import urlsplit
 
@@ -28,6 +29,15 @@ _MAGIC = (
     (b"RIFF", "webp"),          # RIFF....WEBP，下面再验 WEBP 标记
     (b"BM", "bmp"),
 )
+
+
+def configured_proxy(*names: str) -> str | None:
+    """Use the first configured route. An explicit direct route ends fallback."""
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return None if value.lower() in {"direct", "off", "0", "no", "false"} else value
+    return None
 
 
 def sniff_format(data: bytes) -> str:

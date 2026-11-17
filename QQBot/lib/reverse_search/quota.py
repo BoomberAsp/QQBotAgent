@@ -17,7 +17,7 @@ USER_DAILY = 20
 GLOBAL_DAILY = 100
 CACHE_TTL_S = 30 * 86400
 PARTIAL_CACHE_TTL_S = 3600
-SEARCH_POLICY_VERSION = 3
+SEARCH_POLICY_VERSION = 4
 
 _DEFAULT_PATH = (Path(__file__).resolve().parents[2]
                  / "data" / "find_source" / "quota.json")

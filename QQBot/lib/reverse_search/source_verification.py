@@ -13,10 +13,15 @@ import socket
 from urllib.parse import urljoin
 
 import httpx
+from loguru import logger
 from PIL import Image, ImageChops, ImageOps, ImageStat
 
-from .accounts import canonical_url, handle_of, handles_in_text, is_author_page, is_post_page, page_key
+from .accounts import (
+    canonical_url, handle_of, handles_in_text, is_author_page, is_post_page, page_key, platform_of,
+)
 from .engines import Candidate
+from .net import configured_proxy
+from .profile_transport import ProfileProxyError, fetch_pinned
 
 _MAX_HTML = 1024 * 1024
 _MAX_MEDIA = 4 * 1024 * 1024
@@ -91,6 +96,43 @@ async def _public_get(url: str, *, limit: int, content: str) -> tuple[bytes, str
                 raise PublicPageUnavailable
         except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
             raise PublicPageUnavailable from exc
+    raise PublicPageUnavailable
+
+
+async def _proxied_x_profile(url: str, proxy: str) -> tuple[bytes, str]:
+    original = page_key(url)
+    retry_available = True
+    try:
+        # Preserve the caller's per-page budget, including DNS and redirects.
+        async with asyncio.timeout(7.5):
+            for _ in range(4):
+                target = httpx.URL(url)
+                if (target.scheme != "https" or target.userinfo or target.port not in (None, 443)
+                        or not is_author_page(url) or page_key(url) != original):
+                    raise PublicPageUnavailable
+                host = target.raw_host.decode("ascii")
+                addresses = await _public_addresses(host)
+                while True:
+                    try:
+                        response = await fetch_pinned(target, addresses[0], proxy, _MAX_HTML)
+                        break
+                    except ProfileProxyError as exc:
+                        logger.info("[找图] X 主页代理 host={} curl_code={} retry={}",
+                                    host, exc.curl_code, exc.retryable and retry_available)
+                        if not exc.retryable or not retry_available:
+                            raise PublicPageUnavailable from exc
+                        retry_available = False
+                location = response.headers.get("location")
+                if response.status in _REDIRECTS and location:
+                    url = urljoin(url, location)
+                    continue
+                mime = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                if response.status == 200 and mime == "text/html":
+                    return response.body, url
+                logger.info("[找图] X 主页代理 host={} status={}", host, response.status)
+                break
+    except (httpx.InvalidURL, ValueError, asyncio.TimeoutError) as exc:
+        raise PublicPageUnavailable from exc
     raise PublicPageUnavailable
 
 
@@ -174,8 +216,11 @@ def _same_image(left: bytes, right: bytes) -> bool:
     return max(texture.stddev) >= 8 and sum(diff.mean) / 3 <= 4 and max(diff.rms) <= 10
 
 
-async def _get_metadata(url: str) -> tuple[_PageMetadata, str]:
-    data, final_url = await _public_get(url, limit=_MAX_HTML, content="text/html")
+async def _get_metadata(url: str, *, profile_proxy: str | None = None) -> tuple[_PageMetadata, str]:
+    if profile_proxy:
+        data, final_url = await _proxied_x_profile(url, profile_proxy)
+    else:
+        data, final_url = await _public_get(url, limit=_MAX_HTML, content="text/html")
     metadata = _PageMetadata()
     try:
         metadata.feed(data.decode("utf-8", errors="replace"))
@@ -187,8 +232,10 @@ async def _get_metadata(url: str) -> tuple[_PageMetadata, str]:
 async def read_public_profile(url: str) -> PublicProfile | None:
     if not is_author_page(url):
         return None
+    proxy = (configured_proxy("FIND_SOURCE_X_PROFILE_PROXY", "FIND_SOURCE_LENS_PROXY")
+             if platform_of(url) == "Twitter/X" else None)
     try:
-        metadata, final_url = await _get_metadata(url)
+        metadata, final_url = await _get_metadata(url, profile_proxy=proxy)
     except PublicPageUnavailable:
         return None
     if page_key(final_url) != page_key(url):

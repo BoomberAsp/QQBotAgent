@@ -906,7 +906,7 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 | 模块 | 职责 |
 |---|---|
 | `net.py` | 魔数判格式（PNG/JPG/GIF/WEBP/BMP）、`validate_image`（512B–20MB）、SSRF 校验 `check_url_allowed`（http(s) + 公网 IP，挡内网/环回/.local/.internal）、`safe_download`（重定向末 URL 复校验 + 大小上限）、`compress_for_upload`（>2MB 或长边 >2048 时白底合成 alpha + 长边 2048/JPEG q88；压缩后不小于原图或解码失败则原样返回。引擎指纹工作尺寸远低于 2048，真匹配 A/B 实测命中集合与排序稳定） |
-| `engines.py` | 四引擎适配（PicImageSearch `file=bytes` 直传，无需图床）：SauceNAO（`SAUCENAO_API_KEY`，免费档 4 次/30s、100 次/24h；匿名 API 已被官方禁用）/ IQDB / ascii2d / trace.moe（库内相似度已 ×100）。统一 `Candidate`；`run_engines` 并发 gather + 30s/引擎超时，引擎级失败分类 `ENGINE_ERROR/QUOTA/TIMEOUT` 不拖垮整体。日志记录主机、TCP/TLS、上传、响应头/体及状态码 |
+| `engines.py` | 四引擎适配（PicImageSearch `file=bytes` 直传，无需图床）：SauceNAO（`SAUCENAO_API_KEY`，免费档 4 次/30s、100 次/24h；匿名 API 已被官方禁用）/ IQDB / ascii2d / trace.moe（库内相似度已 ×100）。统一 `Candidate`；`run_engines` 并发 gather + 30s/引擎超时，引擎级失败分类 `ENGINE_ERROR/QUOTA/TIMEOUT` 不拖垮整体。日志记录主机、TCP/TLS、上传、响应头/体及状态码。IQDB 收到响应头后，整个响应体最多读取 8 秒 |
 | `accounts.py` | 规范化页面链接，按已知平台帖子 ID 去重，分别识别作者主页与帖子。 |
 | `consensus.py` | 按账号关联的独立来源页计算证据。弱相似画作留作线索，Lens 主页命中保留为待核验账号。 |
 | `quota.py` | 配额沿用 30 秒冷却、每人每天 20 次、全服每天 100 次。图片哈希加策略版本作为缓存键，完整结论缓存 30 天，弱证据或部分引擎失败缓存 1 小时。 |
@@ -914,11 +914,13 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 | `render.py` | 独立展示同图页面、页面署名、账号候选、待核实来源线索及作品识别。低置信账号在有视觉识别时也可见。 |
 | `service.py` | 并行首查、按证据聚合、写入版本化缓存。命令直接渲染首查结果，智能体入口可继续复查。 |
 | `source_evidence.py` | 来源页独立于账号结论，记录引擎、匹配模式及核验状态。 |
-| `source_verification.py` | SearXNG 精确水印查找，读已核对账号的公开主页简介，验证具体候选帖的媒体与署名。每次重定向检查公网目标，限制响应大小。 |
+| `source_verification.py` | SearXNG 精确水印查找，读已核对账号的公开主页简介，验证具体候选帖的媒体与署名。每次重定向检查公网目标，限制响应大小。X 主页代理用系统 curl 连接经校验的公网 IP，使用原域名验证 TLS 证书，别名重定向需保持同一账号，连接或 TLS 失败时最多重试一次。 |
 | `browser.py` | 二期：无头 Chrome 裸 CDP 驱动（asyncio subprocess + aiohttp WebSocket，无 playwright）。`find_chrome`（`CHROME_BIN` 热读覆盖）、`chrome_ua`（大版本对齐）、启动旗标组合回退 + 成功记忆、`resolve_redirect`（Fetch.requestPaused 拦截非 Google 请求 + 页面 URL 轮询 + HTML 捞地址，绝不拉目标页）、`sem()` 并发闸固定 1；`send()` 把 CDP 超时统一转 `BrowserError`（裸 `asyncio.TimeoutError` 会穿透 navigate/wait_for 轮询、被误标成「Lens 总超时」，一次慢探针即杀掉整次搜索——2026-11-17 真实运行 7.4s 假超时事故后加固）。与 `browser_fetch.py`（ruyiPage Firefox 指纹）互不复用 |
-| `lens.py` | 同一 Chrome 会话上传一次，先读默认结果页，按唯一落地页推进跳转卡片解链，必要时在预算内补查完全匹配。保存候选的匹配页类型与补查状态。上传提交、页面导航、结果就绪和解析分别限时，CDP 日志记录相关网络事件，补查异常时保留默认页结果。 |
+| `lens.py` | 同一 Chrome 会话上传一次，先读默认结果页，按唯一落地页推进跳转卡片解链，必要时在预算内补查完全匹配。保存候选的匹配页类型与补查状态。首页等待新主文档提交并进入 interactive/complete，12 秒内最多导航两次。日志关联主文档请求与响应，上传提交、结果导航和解析分别限时，补查异常时保留默认页结果。 |
 
-热读开关 `FIND_SOURCE_ENABLED`（默认 on，off 时命令静默落回 Agent）；`FIND_SOURCE_PROXY` 可选引擎代理（四引擎国内直连已实测通）；`FIND_SOURCE_LENS`（默认 on）、`FIND_SOURCE_LENS_PROXY`（默认 `http://127.0.0.1:1081`，Lens 必须走代理）、`CHROME_BIN`、`FIND_SOURCE_LENS_COOKIE`（可选：Cookie-Editor 导出的真人谷歌 cookie JSON 文件路径，注入后覆盖 consent 打底值，对付谷歌对自动化会话的静默限制；缺失/损坏告警回退）。离线测试 `test/test_find_source.py`（DNS/httpx/PicImageSearch/VLM 全 stub）+ `test/test_lens.py`（CDP/httpx/Chrome 全 stub）。
+HTTP 引擎依次读取单引擎代理和全局 `FIND_SOURCE_PROXY`。单引擎变量为 `FIND_SOURCE_SAUCENAO_PROXY`、`FIND_SOURCE_IQDB_PROXY`、`FIND_SOURCE_ASCII2D_PROXY` 和 `FIND_SOURCE_TRACEMOE_PROXY`。前两级均未设置时，trace.moe 复用明确配置的 `FIND_SOURCE_LENS_PROXY`，其余引擎直连。X 主页优先读取 `FIND_SOURCE_X_PROFILE_PROXY`，其次复用明确配置的 Lens 代理。代理变量可设为 `direct` 强制直连。启用 X 主页代理的部署机需要系统 `curl`。
+
+热读开关 `FIND_SOURCE_ENABLED`（默认 on，off 时命令静默落回 Agent）；`FIND_SOURCE_LENS`（默认 on）、`FIND_SOURCE_LENS_PROXY`（默认 `http://127.0.0.1:1081`，Lens 必须走代理）、`CHROME_BIN`、`FIND_SOURCE_LENS_COOKIE`（可选：Cookie-Editor 导出的真人谷歌 cookie JSON 文件路径，注入后覆盖 consent 打底值，对付谷歌对自动化会话的静默限制；缺失/损坏告警回退）。离线测试 `test/test_find_source.py`（DNS/httpx/PicImageSearch/VLM 全 stub）+ `test/test_lens.py`（CDP/httpx/Chrome 全 stub）。
 
 ---
 
