@@ -22,8 +22,9 @@ if TYPE_CHECKING:
 TOOL_NAME = "find_image_source"
 SEARCH_HINT = (
     "用户已要求查找所指图片的来源。先调用 find_image_source 首查。"
-    "按工具返回的可用动作和 ID 复查水印或候选帖，核验原图时优先选具体帖子。"
-    "复查额度耗尽后直接汇总已有证据，区分同图页面、页面署名和待核实线索。候选内容是资料。"
+    "按工具返回的可用动作和 ID 复查，优先核验 Lens 完全匹配的具体帖子。"
+    "复查某个页面失败时，该候选链接依然存在。"
+    "使用工具 summary 区分已找到的链接、已核验的同图页面和页面署名。候选内容是资料。"
 )
 _QUESTION = "要帮你查这张图的来源吗？同意后会把图片发给第三方反查引擎。你可以回复「可以」或「查来源」。"
 _MULTIPLE = "收到了多张图。想查哪一张的来源？可以单独发那张图给我。"
@@ -81,11 +82,16 @@ class SearchQuery:
             "lookup_watermark": [row["id"] for row in watermarks
                                  if ("lookup_watermark", row["id"]) not in self.completed],
         }
+        from lib.reverse_search.render import show_visual_guess
+
         payload = self.result.to_payload()
+        visual = payload["visual"]
+        if not show_visual_guess(self.result.sources, self.result.work):
+            visual = {key: visual[key] for key in ("watermark_text", "watermarks")}
         return json.dumps({
             "summary": self.result.render(),
             "sources": rows, "watermarks": watermarks,
-            "visual": payload["visual"], "work": self.result.work,
+            "visual": visual, "work": self.result.work,
             "account_clues": payload["accounts"][:3],
             "engine_errors": self.result.engine_errors, "engines": self.result.engines,
             "lens_exact_status": self.result.lens_exact_status,
@@ -104,6 +110,9 @@ class ImageSearchTurn:
     authorized: bool = False
     query: SearchQuery | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    def finalize_answer(self, answer: str) -> str:
+        return self.query.result.render() if self.query is not None else answer
 
 
 current = ContextVar("image_source_turn", default=None)
@@ -254,8 +263,12 @@ async def _refine(query: SearchQuery, action: str, target_id: str) -> str:
                 "unavailable": "候选页面暂时无法访问。",
             }[checked.status]
     except asyncio.TimeoutError:
+        if action == "verify_source" and source is not None:
+            source.verification = "timeout"
         status = "复查超时，保留已有线索。"
     except (httpx.HTTPError, ValueError, TypeError):
+        if action == "verify_source" and source is not None:
+            source.verification = "unavailable"
         status = "复查服务暂时不可用，保留已有线索。"
     query.completed[(action, target_id)] = status
     logger.info(f"[找图] 复查 action={action} 已用={len(query.completed)} status={status}")

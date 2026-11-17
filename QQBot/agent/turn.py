@@ -3202,8 +3202,9 @@ async def handle_agent_turn(view: InboundMessage):
         if _hsr_native:
             _current_personality.set(persona_key)
             allowed_tools = set(allowed_tools) | {"story_search"}
-        if image_search.authorized and can_search_image and not (is_creation or is_scene):
-            allowed_tools = set(allowed_tools) | {image_source_tools.TOOL_NAME}
+        image_search_authorized = image_search.authorized and can_search_image and not (is_creation or is_scene)
+        if image_search_authorized:
+            allowed_tools = {image_source_tools.TOOL_NAME}
             augmented_message += "\n[系统提示] " + image_source_tools.SEARCH_HINT
         _current_task_persona.set(persona_key if persona_mode == "split" and not character_plane and not is_creation and not is_scene and not _hsr_native else "")
         # story_search only for allowlisted personas (schema filtering; the
@@ -3263,10 +3264,12 @@ async def handle_agent_turn(view: InboundMessage):
                     # streamer opened this turn (None keeps every other
                     # route on the non-streaming LLM call, byte-identical).
                     content_callback=(_content_delta
-                                      if streamer is not None else None),
+                                      if streamer is not None and not image_search_authorized else None),
+                    finalize_answer=image_search.finalize_answer if image_search_authorized else None,
                 ),
                 timeout=300.0,
             )
+            response = image_search.finalize_answer(response)
         finally:
             image_source_followup.remember_turn(view, image_scope, image_search)
             _current_survey_context.reset(_survey_token)
@@ -3280,11 +3283,12 @@ async def handle_agent_turn(view: InboundMessage):
         # character's voice (opening line) while passing the body verbatim.
         # The social plane already speaks in character; unified personas are
         # never re-voiced. Creation interviews stay neutral (no revoice).
-        if (persona_mode == "split" and not character_plane
-                and not is_creation and not is_scene and not _hsr_native):
-            # Restore persona so _send_response's disclaimer is signed by the
-            # character and revoice speaks in the character's voice.
+        revoice = (persona_mode == "split" and not character_plane
+                   and not is_creation and not is_scene and not _hsr_native)
+        if revoice:
+            # Restore the character for delivery, including tool-owned replies.
             _current_personality.set(persona_key)
+        if revoice and image_search.query is None:
             _use_llm_voice = (
                 not group_id and pm.get_task_voice(persona_key) == "character"
             )

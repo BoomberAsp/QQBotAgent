@@ -71,9 +71,26 @@ class SampleReplay(unittest.TestCase):
                                     sources=merge_sources([], candidates))
         self.assertFalse(accepted)
         self.assertEqual(visual.watermarks, ["@ChocoQAQ"])
-        self.assertIn("作品识别", result.render())
+        self.assertIn("视觉识别（推测）", result.render())
         self.assertIn("instagram.com/reel/First_Reel", result.render())
         self.assertIn("@ChocoQAQ", result.render())
+
+    def test_command_output_prioritizes_exact_post_and_omits_work_guess(self):
+        url = "https://x.com/example/status/2115756993977708771"
+        visual = parse_clues('{"work":"错误作品","character":"错误角色","watermarks":["@ChocoQAQ"]}')
+        result = service.FindResult(
+            visual=visual, vlm_text=visual.text, lens_overview="第二个错误猜测",
+            sources=[SourceEvidence(url, kind="post", match="exact", verification="unavailable")])
+        summary = result.render()
+        self.assertTrue(summary.startswith("🔗 Lens 完全匹配的候选帖子（待核实）"))
+        self.assertIn(url + " · 页面暂未读到", summary)
+        self.assertIn("@ChocoQAQ", summary)
+        self.assertNotIn("错误", summary)
+        self.assertNotIn("首发", summary)
+        query = tool.SearchQuery("fixture", photo(), result, time.monotonic() + 30)
+        response = json.loads(query.response())
+        self.assertNotIn("character", response["visual"])
+        self.assertNotIn("错误", query.response())
 
     def test_duplicate_post_cannot_promote_author(self):
         variants = [POST, POST + "?utm_source=one",
@@ -509,6 +526,29 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await source_verification.read_public_profile(target))
             proxied.assert_awaited_once()
 
+    async def test_x_photo_viewer_uses_post_and_ignores_avatar_metadata(self):
+        post = "https://x.com/example/status/123"
+        avatar = "https://pbs.twimg.com/profile_images/123/photo.jpg"
+        media = "https://pbs.twimg.com/media/example?format=jpg&name=large"
+        meta = '<meta property="og:image" content="{}">'
+        header = httpx.Headers({"content-type": "text/html"})
+        resolver = AsyncMock(return_value=["93.184.216.34"])
+        with patch.dict("os.environ", {"FIND_SOURCE_LENS_PROXY": "http://localhost:1083"}, clear=True), \
+             patch.object(source_verification, "_public_addresses", resolver):
+            fetch = AsyncMock(return_value=ProfileResponse(200, header, meta.format(avatar).encode()))
+            with patch.object(source_verification, "fetch_pinned", fetch):
+                checked = await source_verification.verify_source(post + "/photo/1", photo())
+                self.assertEqual(checked.status, "no_media")
+                self.assertEqual([str(call.args[0]) for call in fetch.await_args_list], [post])
+            fetch = AsyncMock(side_effect=[
+                ProfileResponse(200, header, (meta.format(avatar) + meta.format(media)).encode()),
+                ProfileResponse(200, httpx.Headers({"content-type": "image/jpeg"}), photo("JPEG")),
+            ])
+            with patch.object(source_verification, "fetch_pinned", fetch):
+                checked = await source_verification.verify_source(post + "/photo/1", photo())
+                self.assertEqual(checked.status, "same_image")
+                self.assertEqual([str(call.args[0]) for call in fetch.await_args_list], [post, media])
+
     async def test_public_profile_checks_metadata_identity_and_post_redirect_is_rejected(self):
         url = "https://x.com/ChocoQAQ"
         html = b'<meta property="og:title" content="Example (@ChocoQAQ)"><meta name="description" content="Creator">'
@@ -534,6 +574,33 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AgentRefinementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_buffered_agent_response_and_history_keep_the_tool_evidence(self):
+        from types import SimpleNamespace
+        from agent.agent import Agent
+        from agent.session import SessionManager
+        from agent.tool_registry import ToolRegistry
+
+        quote = SourceEvidence(POST, kind="post", match="exact", verification="unavailable")
+        result = service.FindResult(sources=[quote], vlm_text="错误角色")
+        image_turn = tool.ImageSearchTurn("tester", "", query=tool.SearchQuery(
+            "fixture", photo(), result, time.monotonic() + 10))
+        incorrect = "找不到 X 原帖，角色是错误角色"
+        client = SimpleNamespace(
+            chat_completion_with_tools=AsyncMock(return_value={"content": incorrect}),
+            chat_completion_with_tools_stream=AsyncMock(return_value={"content": incorrect}))
+        deltas = AsyncMock()
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = SessionManager()
+            agent = Agent(client, ToolRegistry(), directory, session_manager=sessions)
+            with patch.object(agent, "_build_messages", return_value=[{"role": "user", "content": "查来源"}]):
+                response = await agent.run("查来源", "tester", content_callback=deltas,
+                                           finalize_answer=image_turn.finalize_answer)
+        self.assertIn(POST, response)
+        self.assertNotIn("错误角色", response)
+        self.assertEqual(sessions.get("tester").context[-1]["content"], response)
+        client.chat_completion_with_tools_stream.assert_not_awaited()
+        deltas.assert_not_awaited()
+
     async def test_same_turn_reuses_first_search_and_dedups_refinements(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory, "input.png")

@@ -52,26 +52,51 @@ def _footer(elapsed_s: float, engines: list[str], cached: bool,
     return "\n".join(lines)
 
 
+def _exact_post(source: SourceEvidence) -> bool:
+    return source.kind == "post" and source.match == "exact"
+
+
+def show_visual_guess(sources: list[SourceEvidence], work: dict | None) -> bool:
+    return not work and not any(
+        source.verification == "same_image" or _exact_post(source) for source in sources)
+
+
+def _source_line(source: SourceEvidence) -> str:
+    status = {
+        "unavailable": "页面暂未读到",
+        "timeout": "同图核验超时",
+        "no_media": "未读到可比对图片",
+        "unconfirmed": "未确认同图",
+    }.get(source.verification)
+    return f"{source.url} · {status}" if status else source.url
+
+
 def _represent_sources(sources: list[SourceEvidence], excluded: set[str]) -> list[str]:
     ordered = sorted(
         (source for source in sources
-         if source.verification == "same_image" or source.url not in excluded),
+         if source.verification == "same_image" or _exact_post(source) or source.url not in excluded),
         key=source_order)
     verified = [source for source in ordered if source.verification == "same_image"]
-    clues = [source for source in ordered if source.verification != "same_image"]
+    exact = [source for source in ordered if _exact_post(source) and source.verification != "same_image"]
+    clues = [source for source in ordered if source.verification != "same_image" and not _exact_post(source)]
     sections = []
     if verified:
         lines = ["🔗 同图页面"]
         for source in verified[:3]:
             credit = f" · 页面署名：{source.attribution}" if source.attribution else ""
             lines.append(f"{source.url}{credit}")
+        lines.append("首发出处和作者归属仍待核实。")
+        sections.append("\n".join(lines))
+    if exact:
+        lines = ["🔗 Lens 完全匹配的候选帖子（待核实）"]
+        lines.extend(_source_line(source) for source in exact[:3])
         sections.append("\n".join(lines))
     if clues:
         lines = ["🔎 待核实的来源线索"]
         for source in clues[:3]:
             label = {"exact": "完全匹配结果", "similar_art": "相似画作", "watermark": "水印搜索"}.get(
                 source.match, "搜索候选")
-            lines.append(f"{label} · {source.url}")
+            lines.append(f"{label} · {_source_line(source)}")
         sections.append("\n".join(lines))
     return sections
 
@@ -84,24 +109,25 @@ def render_reply(*, accounts: list[Account], rejected: list[Account],
                  watermark_text: list[str] | None = None, lens_overview: str = "") -> str:
     footer = _footer(elapsed_s, engines, cached, engine_errors)
 
-    sections = []
-    if accounts:
-        sections.append("🎯 找图结果")
-        sections.extend(_account_block(account) for account in accounts[:3])
-    elif work or vlm_text:
-        sections.append("🎬 作品识别")
-    elif not sources and not watermark_text:
-        sections.append("没找到可靠来源。可以换更清晰的原图、带水印的图再试。")
+    rows = sources or []
+    show_guess = show_visual_guess(rows, work)
     excluded = {account.url for account in accounts[:3]}
     if work:
         excluded.add(work.get("url", ""))
-    sections.extend(_represent_sources(sources or [], excluded))
+    sections = _represent_sources(rows, excluded)
+    if accounts:
+        sections.append("🎯 找图结果")
+        sections.extend(_account_block(account) for account in accounts[:3])
+    if not sections and (work or (show_guess and (vlm_text or lens_overview))):
+        sections.append("🎬 作品识别")
+    elif not sections and not watermark_text:
+        sections.append("没找到可靠来源。可以换更清晰的原图、带水印的图再试。")
     if work:
         sections.append(_work_block(work))
-    if vlm_text:
-        sections.append(f"🤖 视觉识别：{vlm_text}")
-    if lens_overview and (not vlm_text or not vlm_text.startswith("（Lens AI 概览）")):
-        sections.append(f"Lens 概览（识别线索）：{lens_overview}")
+    if show_guess and vlm_text:
+        sections.append(f"🤖 视觉识别（推测）：{vlm_text}")
+    if show_guess and lens_overview and (not vlm_text or not vlm_text.startswith("（Lens AI 概览）")):
+        sections.append(f"Lens 概览（推测）：{lens_overview}")
     if watermark_text:
         sections.append("图中水印线索：" + "、".join(watermark_text[:5]))
     if rejected:

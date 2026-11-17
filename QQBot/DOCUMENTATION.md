@@ -912,13 +912,13 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 | `quota.py` | 配额沿用 30 秒冷却、每人每天 20 次、全服每天 100 次。图片哈希加策略版本作为缓存键，完整结论缓存 30 天，弱证据或部分引擎失败缓存 1 小时。 |
 | `vlm.py` | 结构化提取作品、角色和图中水印。模型未返回有效 JSON 时保留文本识别，水印账号可供同轮复查。 |
 | `render.py` | 独立展示同图页面、页面署名、账号候选、待核实来源线索及作品识别。低置信账号在有视觉识别时也可见。 |
-| `service.py` | 并行首查、按证据聚合、写入版本化缓存。命令直接渲染首查结果，智能体入口可继续复查。 |
+| `service.py` | 并行首查、按证据聚合、写入版本化缓存。命令直接渲染首查，智能体可复查并使用同一证据版式回复。完全匹配的具体帖子优先展示，页面核验失败时保留候选链接。命中完全匹配帖子、已核验同图或引擎识别作品时，保留水印并省略视觉推测。 |
 | `source_evidence.py` | 来源页独立于账号结论，记录引擎、匹配模式及核验状态。 |
 | `source_verification.py` | SearXNG 精确水印查找，读已核对账号的公开主页简介，验证具体候选帖的媒体与署名。每次重定向检查公网目标，限制响应大小。X 主页代理用系统 curl 连接经校验的公网 IP，使用原域名验证 TLS 证书，别名重定向需保持同一账号，连接或 TLS 失败时最多重试一次。 |
 | `browser.py` | 二期：无头 Chrome 裸 CDP 驱动（asyncio subprocess + aiohttp WebSocket，无 playwright）。`find_chrome`（`CHROME_BIN` 热读覆盖）、`chrome_ua`（大版本对齐）、启动旗标组合回退 + 成功记忆、`resolve_redirect`（Fetch.requestPaused 拦截非 Google 请求 + 页面 URL 轮询 + HTML 捞地址，绝不拉目标页）、`sem()` 并发闸固定 1；`send()` 把 CDP 超时统一转 `BrowserError`（裸 `asyncio.TimeoutError` 会穿透 navigate/wait_for 轮询、被误标成「Lens 总超时」，一次慢探针即杀掉整次搜索——2026-11-17 真实运行 7.4s 假超时事故后加固）。与 `browser_fetch.py`（ruyiPage Firefox 指纹）互不复用 |
 | `lens.py` | 同一 Chrome 会话上传一次，先读默认结果页，按唯一落地页推进跳转卡片解链，必要时在预算内补查完全匹配。保存候选的匹配页类型与补查状态。首页等待新主文档提交并进入 interactive/complete，12 秒内最多导航两次。日志关联主文档请求与响应，上传提交、结果导航和解析分别限时，补查异常时保留默认页结果。 |
 
-HTTP 引擎依次读取单引擎代理和全局 `FIND_SOURCE_PROXY`。单引擎变量为 `FIND_SOURCE_SAUCENAO_PROXY`、`FIND_SOURCE_IQDB_PROXY`、`FIND_SOURCE_ASCII2D_PROXY` 和 `FIND_SOURCE_TRACEMOE_PROXY`。前两级均未设置时，trace.moe 复用明确配置的 `FIND_SOURCE_LENS_PROXY`，其余引擎直连。X 主页优先读取 `FIND_SOURCE_X_PROFILE_PROXY`，其次复用明确配置的 Lens 代理。代理变量可设为 `direct` 强制直连。启用 X 主页代理的部署机需要系统 `curl`。
+HTTP 引擎依次读取单引擎代理和全局 `FIND_SOURCE_PROXY`。单引擎变量为 `FIND_SOURCE_SAUCENAO_PROXY`、`FIND_SOURCE_IQDB_PROXY`、`FIND_SOURCE_ASCII2D_PROXY` 和 `FIND_SOURCE_TRACEMOE_PROXY`。前两级均未设置时，trace.moe 复用明确配置的 `FIND_SOURCE_LENS_PROXY`，其余引擎直连。X 主页优先读取 `FIND_SOURCE_X_PROFILE_PROXY`，其次复用明确配置的 Lens 代理。代理变量可设为 `direct` 强制直连。X 帖子核验可用 `FIND_SOURCE_X_POST_PROXY` 单独配置，未设置时沿用 X 主页的代理配置。只核验帖子媒体，头像和主页横幅不参与比对。启用 X 代理的部署机需要系统 `curl`。
 
 热读开关 `FIND_SOURCE_ENABLED`（默认 on，off 时命令静默落回 Agent）；`FIND_SOURCE_LENS`（默认 on）、`FIND_SOURCE_LENS_PROXY`（默认 `http://127.0.0.1:1081`，Lens 必须走代理）、`CHROME_BIN`、`FIND_SOURCE_LENS_COOKIE`（可选：Cookie-Editor 导出的真人谷歌 cookie JSON 文件路径，注入后覆盖 consent 打底值，对付谷歌对自动化会话的静默限制；缺失/损坏告警回退）。离线测试 `test/test_find_source.py`（DNS/httpx/PicImageSearch/VLM 全 stub）+ `test/test_lens.py`（CDP/httpx/Chrome 全 stub）。
 

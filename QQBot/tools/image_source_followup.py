@@ -241,7 +241,7 @@ async def _source(followup: Followup, workspace: str, deadline: float) -> str:
         if note:
             status.append(note)
         posts = _post_rows(result)
-    candidates = [source for source in posts if source.verification in {"unverified", "unavailable"}]
+    candidates = [source for source in posts if source.verification in {"unverified", "unavailable", "timeout"}]
     if candidates and not any(source.verification == "same_image" for source in posts):
         try:
             attachment = await asyncio.wait_for(asyncio.to_thread(

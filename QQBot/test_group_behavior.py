@@ -130,8 +130,9 @@ class PrivateImageSourceTests(unittest.IsolatedAsyncioTestCase):
 
             async def run(*args, allowed_tools, **kwargs):
                 if "find_image_source" in allowed_tools:
-                    raw = await turn._tool_registry.execute("find_image_source", {})
-                    return json.loads(raw)["summary"]
+                    self.assertEqual(allowed_tools, {"find_image_source"})
+                    await turn._tool_registry.execute("find_image_source", {})
+                    return "模型误称找不到来源"
                 return "普通回复"
 
             stack.enter_context(patch.dict("os.environ", {"FIND_SOURCE_ENABLED": "on"}))
@@ -480,7 +481,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             can_search = "find_image_source" in allowed_tools
             observed.append(can_search)
             if can_search:
-                return json.loads(await image_source_tools.find_image_source())["summary"]
+                self.assertEqual(allowed_tools, {"find_image_source"})
+                await image_source_tools.find_image_source()
+                return "模型误称找不到来源"
             return "看到了。"
 
         self.fake.agent.run = run

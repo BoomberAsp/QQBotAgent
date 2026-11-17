@@ -320,6 +320,7 @@ class Agent:
         persist: bool = True,
         images: Optional[List[str]] = None,
         content_callback: Optional[Callable[[str], Any]] = None,
+        finalize_answer: Optional[Callable[[str], str]] = None,
     ) -> str:
         """Process a user message through the agent loop.
 
@@ -353,10 +354,15 @@ class Agent:
                      (fragments suppress forwarding), so deltas only flow
                      for the final-answer round. Transport-only — session
                      persistence still stores the full assembled text.
+            finalize_answer: Optional deterministic finalizer for a scoped
+                     tool task. Its result is persisted and delivered. Raw
+                     model deltas are buffered whenever a finalizer is set.
 
         Returns:
             The agent's final response string.
         """
+        if finalize_answer is not None:
+            content_callback = None
         from .group_runtime import current_group_run
         group_run = current_group_run.get()
         if group_run is not None:
@@ -600,8 +606,13 @@ class Agent:
 
             else:
                 # RESPOND: Final response
-                final_content = response.get("content", "")
+                final_content = response.get("content") or ""
                 reasoning = response.get("reasoning_content")
+                if finalize_answer is not None:
+                    final_text = finalize_answer(final_content)
+                    if final_text != final_content:
+                        reasoning = None
+                    final_content = final_text
 
                 # Isolated run (delegate_task task plane): no session write,
                 # no TaskRecord folding, no profile extraction — the caller
@@ -682,7 +693,8 @@ class Agent:
                 return final_content
 
         # Max iterations reached
-        return f"抱歉，Roxy 在尝试处理你的请求时似乎陷入了循环或工具调用次数已经超过当前配额上限（{self.max_tool_iterations}次）。请尝试换一种方式提问~"
+        fallback = f"抱歉，Roxy 在尝试处理你的请求时似乎陷入了循环或工具调用次数已经超过当前配额上限（{self.max_tool_iterations}次）。请尝试换一种方式提问~"
+        return finalize_answer(fallback) if finalize_answer is not None else fallback
 
     # ── Message Building ──────────────────────────────────────────
 

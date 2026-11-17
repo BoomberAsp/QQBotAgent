@@ -431,15 +431,17 @@ async def run_group_turn(view, sender=None):
                             image_offer, text=(without_mention_prefix(view.text)
                                                if reason == "direct" else view.text))
                         if image_search.authorized:
+                            allowed.clear()
                             allowed.add(image_source_tools.TOOL_NAME)
                             prompt += "\n" + image_source_tools.SEARCH_HINT
                         elif image_search.question:
                             prompt += "\n回复后会附上找图确认问题，请自然回应即可。"
                 token = image_source_tools.current.set(image_search)
                 try:
-                    return await turn.agent.run(f"成员[{member_tag(view)}]：{prompt[:5000]}",
+                    answer = await turn.agent.run(f"成员[{member_tag(view)}]：{prompt[:5000]}",
                         "group_"+__import__('hashlib').sha256(scope.encode()).hexdigest()[:24],
                         client=client,images=images or None,allowed_tools=allowed,user_role=role,persist=False)
+                    return image_search.finalize_answer(answer) if image_search else answer
                 finally:
                     if valid():
                         image_source_followup.remember_turn(view, image_scope, image_search)

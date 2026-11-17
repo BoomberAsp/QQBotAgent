@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 import io
@@ -10,7 +11,7 @@ import json
 import os
 import re
 import socket
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from loguru import logger
@@ -28,6 +29,9 @@ _MAX_MEDIA = 4 * 1024 * 1024
 _MAX_PIXELS = 20_000_000
 _REDIRECTS = {301, 302, 303, 307, 308}
 _HANDLE = re.compile(r"@[A-Za-z0-9_.]{2,30}")
+_X_HOSTS = {"x.com", "www.x.com", "m.x.com", "twitter.com", "www.twitter.com",
+            "m.twitter.com", "mobile.twitter.com"}
+_X_PHOTO_PATH = re.compile(r"^(.+/status/\d+)/(?:photo|video)/\d+/?$")
 
 
 @dataclass(frozen=True)
@@ -99,8 +103,20 @@ async def _public_get(url: str, *, limit: int, content: str) -> tuple[bytes, str
     raise PublicPageUnavailable
 
 
-async def _proxied_x_profile(url: str, proxy: str) -> tuple[bytes, str]:
-    original = page_key(url)
+def _x_host(url: str) -> bool:
+    return urlsplit(url).hostname in _X_HOSTS
+
+
+def _x_post_media(url: str) -> bool:
+    try:
+        target = httpx.URL(url)
+    except (httpx.InvalidURL, ValueError):
+        return False
+    return target.host == "pbs.twimg.com" and target.path.startswith("/media/")
+
+
+async def _proxied_x_get(url: str, proxy: str, *, limit: int, content: str,
+                         allowed_url: Callable[[str], bool]) -> tuple[bytes, str]:
     retry_available = True
     try:
         # Preserve the caller's per-page budget, including DNS and redirects.
@@ -108,16 +124,16 @@ async def _proxied_x_profile(url: str, proxy: str) -> tuple[bytes, str]:
             for _ in range(4):
                 target = httpx.URL(url)
                 if (target.scheme != "https" or target.userinfo or target.port not in (None, 443)
-                        or not is_author_page(url) or page_key(url) != original):
+                        or not allowed_url(url)):
                     raise PublicPageUnavailable
                 host = target.raw_host.decode("ascii")
                 addresses = await _public_addresses(host)
                 while True:
                     try:
-                        response = await fetch_pinned(target, addresses[0], proxy, _MAX_HTML)
+                        response = await fetch_pinned(target, addresses[0], proxy, limit)
                         break
                     except ProfileProxyError as exc:
-                        logger.info("[找图] X 主页代理 host={} curl_code={} retry={}",
+                        logger.info("[找图] X 代理核验 host={} curl_code={} retry={}",
                                     host, exc.curl_code, exc.retryable and retry_available)
                         if not exc.retryable or not retry_available:
                             raise PublicPageUnavailable from exc
@@ -127,9 +143,9 @@ async def _proxied_x_profile(url: str, proxy: str) -> tuple[bytes, str]:
                     url = urljoin(url, location)
                     continue
                 mime = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                if response.status == 200 and mime == "text/html":
+                if response.status == 200 and mime.startswith(content):
                     return response.body, url
-                logger.info("[找图] X 主页代理 host={} status={}", host, response.status)
+                logger.info("[找图] X 代理核验 host={} status={}", host, response.status)
                 break
     except (httpx.InvalidURL, ValueError, asyncio.TimeoutError) as exc:
         raise PublicPageUnavailable from exc
@@ -216,9 +232,11 @@ def _same_image(left: bytes, right: bytes) -> bool:
     return max(texture.stddev) >= 8 and sum(diff.mean) / 3 <= 4 and max(diff.rms) <= 10
 
 
-async def _get_metadata(url: str, *, profile_proxy: str | None = None) -> tuple[_PageMetadata, str]:
-    if profile_proxy:
-        data, final_url = await _proxied_x_profile(url, profile_proxy)
+async def _get_metadata(url: str, *, proxy: str | None = None,
+                        allowed_url: Callable[[str], bool] | None = None) -> tuple[_PageMetadata, str]:
+    if proxy and allowed_url:
+        data, final_url = await _proxied_x_get(
+            url, proxy, limit=_MAX_HTML, content="text/html", allowed_url=allowed_url)
     else:
         data, final_url = await _public_get(url, limit=_MAX_HTML, content="text/html")
     metadata = _PageMetadata()
@@ -234,8 +252,10 @@ async def read_public_profile(url: str) -> PublicProfile | None:
         return None
     proxy = (configured_proxy("FIND_SOURCE_X_PROFILE_PROXY", "FIND_SOURCE_LENS_PROXY")
              if platform_of(url) == "Twitter/X" else None)
+    expected = page_key(url)
     try:
-        metadata, final_url = await _get_metadata(url, profile_proxy=proxy)
+        metadata, final_url = await _get_metadata(
+            url, proxy=proxy, allowed_url=lambda target: _x_host(target) and page_key(target) == expected)
     except PublicPageUnavailable:
         return None
     if page_key(final_url) != page_key(url):
@@ -252,16 +272,36 @@ async def read_public_profile(url: str) -> PublicProfile | None:
 
 
 async def verify_source(url: str, image: bytes) -> Verification:
+    post = is_post_page(url)
+    x_post = post and _x_host(url)
+    expected = page_key(url)
+    proxy = None
+    if x_post:
+        proxy = configured_proxy("FIND_SOURCE_X_POST_PROXY", "FIND_SOURCE_X_PROFILE_PROXY", "FIND_SOURCE_LENS_PROXY")
+        target = httpx.URL(url)
+        # The /photo/1 viewer may load differently from the post. Both
+        # identify the same post, which is rechecked after redirects.
+        url = str(target.copy_with(path=_X_PHOTO_PATH.sub(r"\1", target.path), query=None, fragment=None))
     try:
-        metadata, final_url = await _get_metadata(url)
+        metadata, final_url = await _get_metadata(
+            url, proxy=proxy, allowed_url=lambda target: _x_host(target) and page_key(target) == expected)
     except PublicPageUnavailable:
         return Verification("unavailable")
-    if is_post_page(url) and page_key(final_url) != page_key(url):
+    if post and page_key(final_url) != expected:
         return Verification("unavailable")
     checked = False
     for media in metadata.images:
+        media_url = urljoin(final_url, media)
+        if x_post and not _x_post_media(media_url):
+            continue
         try:
-            data, _ = await _public_get(urljoin(final_url, media), limit=_MAX_MEDIA, content="image/")
+            if x_post and proxy:
+                data, _ = await _proxied_x_get(
+                    media_url, proxy, limit=_MAX_MEDIA, content="image/", allowed_url=_x_post_media)
+            else:
+                data, landed = await _public_get(media_url, limit=_MAX_MEDIA, content="image/")
+                if x_post and not _x_post_media(landed):
+                    continue
         except PublicPageUnavailable:
             continue
         checked = True
