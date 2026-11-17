@@ -8,9 +8,9 @@
     "hsr": {
       "game": "hsr",
       "driver": "hsr_local",
-      "path": "story_kb/hsr/releases/web-20261110-014630-6f7053-4c44867c3977/story.db",
-      "sha256": "52801b6333c81a3d911d3c0f2040e1004a32d6abfa8664e8fb6e90bb44eff68f",
-      "build_id": "local-v2-f56fb61d23a3be2b"
+      "path": "story_kb/hsr/releases/p2-chapter-105010-01/story.db",
+      "sha256": "a19260d97f80ef5e1c1f2f4438f2736842ccba4cfe1503c1fc873d2d6d21c32e",
+      "build_id": "local-v2-d1b17302dbcc3121"
     }
   },
   "bindings": {

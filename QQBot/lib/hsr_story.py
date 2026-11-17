@@ -36,6 +36,9 @@ class HsrStoryKB:
             if self.meta.get('game') != 'hsr' or self.meta.get('lang') != 'zh-CN' or self.meta.get('build_id') != manifest['build_id']:
                 raise ValueError('HSR identity mismatch')
             self.entities = sorted({r[0].removesuffix('/语音') for r in db.execute('SELECT title FROM unit') if len(r[0])>=2}, key=len, reverse=True)
+            self.reference_titles = sorted({r[0] for r in db.execute(
+                "SELECT title FROM unit WHERE unit_id LIKE 'hsr:local:reference:%' AND length(title)>=3")},
+                key=lambda title: (-len(title), title)) if manifest.get('reference_coverage') else []
             self.topics = sorted({r[0] for r in db.execute("SELECT DISTINCT s.title FROM scene s JOIN unit u USING(unit_id) WHERE u.work='voice'") if 2<=len(r[0])<=25}, key=len, reverse=True)
             self.books={r[0] for r in db.execute("SELECT title FROM unit WHERE work='readable'")}
             counts = [dict(work=r[0], structure_status=r[1], chunks=r[2]) for r in db.execute(
@@ -46,10 +49,15 @@ class HsrStoryKB:
             tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.has_catalogue = {'mission_chapter', 'mission_node', 'mission_edge'} <= tables
             self.chapters = [dict(r) for r in db.execute('SELECT * FROM mission_chapter')] if self.has_catalogue else []
+            self.batch_missions = {
+                row['title'] for row in db.execute('SELECT title FROM mission_node WHERE length(title)>=3')
+            } if self.has_catalogue and manifest.get('mission_evidence_batch') else set()
             self.coverage = dict(client_version=self.meta.get('game_version', manifest.get('game_version', 'unknown')),
                                  completeness=self.meta.get('completeness', manifest.get('completeness', 'unknown')),
                                  native_mission_graph=manifest.get('native_mission_graph', 'unknown'), counts=counts,
                                  counts_by_kind=kind_counts, mission_catalogue=self.has_catalogue,
+                                 native_evidence=manifest.get('native_evidence'),
+                                 reference_coverage=manifest.get('reference_coverage'),
                                  verified_main_dialogue_chunks=sum(r['chunks'] for r in kind_counts
                                      if r['work']=='main' and r['structure_status']=='verified'
                                      and r['kind'] in ('game_dialogue','game_narration','choice','caption_text')))
@@ -130,6 +138,35 @@ class HsrStoryKB:
                 result.append(item)
             return result
 
+    def mission_quote_candidates(self, db, query):
+        if not self.batch_missions or not re.search(r'原文|对白|台词|选项', query):
+            return []
+        parts = list(re.finditer(r'「([^」]+)」|《([^》]+)》|“([^”]+)”', query))
+        quoted = [(match, next(value for value in match.groups() if value)) for match in parts]
+        missions = [(match, value) for match, value in quoted if value in self.batch_missions]
+        if len(missions) != 1:
+            return []
+        mission, title = missions[0]
+        phrases = [value for match, value in quoted if match is not mission]
+        if not phrases:
+            line = re.search(r'[，,]\s*([^，,。！？?]{4,64}?)那句(?:对白|台词)', query[mission.end():])
+            if line:
+                phrases = [line.group(1)]
+        kind = 'choice' if '选项' in query else 'game_dialogue'
+        rows = []
+        for phrase in phrases[:4]:
+            if not 4 <= len(phrase) <= 100:
+                continue
+            rows.extend(db.execute('''SELECT c.chunk_id,c.text,c.unit_id,c.scene_id,u.title,u.work,
+                s.title AS scene_title,b.branch_id,b.condition_raw,b.ord,b.speaker_raw,b.knowledge_scope,
+                b.kind,b.metadata AS block_metadata,b.provenance
+                FROM mission_node n JOIN unit u USING(unit_id) JOIN chunk c USING(unit_id)
+                JOIN scene s ON s.scene_id=c.scene_id JOIN block b ON b.block_id=c.block_id
+                WHERE n.title=? AND c.structure_status='verified' AND b.kind=? AND instr(c.text,?)>0
+                    AND json_extract(b.metadata,'$.native_mission_evidence')=1
+                ORDER BY c.chunk_id LIMIT 8''', (title, kind, phrase)))
+        return rows
+
     def retrieve(self, query, limit=4, *, automatic=False, history=()):
         if self.signature() != self.stamp:
             raise ValueError('HSR release changed; reload required')
@@ -164,12 +201,33 @@ class HsrStoryKB:
             matches.append(' OR '.join(groups))
         elif len(terms) > 1:
             matches.append(' OR '.join('"'+t+'"' for t in terms))
+        native_columns = (', b.metadata AS block_metadata,b.provenance' if self.coverage.get('native_evidence')
+                          else " , '{}' AS block_metadata, '{}' AS provenance")
+        names = [title for title in self.reference_titles if title in query][:12]
+        names = [title for title in names if not any(title != other and title in other for other in names)]
+        mode_names = {'模拟宇宙', '差分宇宙'}
+        if any(title not in mode_names for title in names):
+            names = [title for title in names if title not in mode_names]
+        if re.search(r'对白|台词|结局|现在|目前|最新|后来|之前|之后', query):
+            names = []
         with self.connection() as db:
-            candidates = {}
-            for expression in dict.fromkeys(matches):
+            quote_rows = self.mission_quote_candidates(db, query)
+            candidates = {row['chunk_id']: dict(row, candidate_rank=rank, mission_quote=True)
+                          for rank, row in enumerate(quote_rows)}
+            for title in (() if quote_rows else names):
+                rows = db.execute('''SELECT c.chunk_id,c.text,c.unit_id,c.scene_id,u.title,u.work,
+                    s.title AS scene_title,b.branch_id,b.condition_raw,b.ord,b.speaker_raw,b.knowledge_scope,
+                    b.kind,b.metadata AS block_metadata,b.provenance
+                    FROM unit u JOIN chunk c USING(unit_id) JOIN scene s ON s.scene_id=c.scene_id
+                    JOIN block b ON b.block_id=c.block_id
+                    WHERE u.title=? AND u.unit_id LIKE 'hsr:local:reference:%' AND c.structure_status='verified'
+                    ORDER BY (b.ord=1),b.ord,c.chunk_id LIMIT 24''', (title,))
+                for row in rows:
+                    candidates[row['chunk_id']] = dict(row, candidate_rank=len(candidates), exact_reference=True)
+            for expression in (() if quote_rows else dict.fromkeys(matches)):
                 parameters=[expression]+([volume[0]] if volume_filter else [])+[40]
                 rows = db.execute('''SELECT c.chunk_id,c.text,c.unit_id,c.scene_id,u.title,u.work,
-                s.title AS scene_title,b.branch_id,b.condition_raw,b.ord,b.speaker_raw,b.knowledge_scope,b.kind
+                s.title AS scene_title,b.branch_id,b.condition_raw,b.ord,b.speaker_raw,b.knowledge_scope,b.kind'''+native_columns+'''
                 FROM chunk_fts JOIN chunk c ON c.id=chunk_fts.rowid JOIN unit u ON u.unit_id=c.unit_id
                 JOIN scene s ON s.scene_id=c.scene_id JOIN block b ON b.block_id=c.block_id
                 WHERE chunk_fts MATCH ? AND c.structure_status='verified' '''+volume_filter+'''
@@ -179,6 +237,9 @@ class HsrStoryKB:
                         candidates[row['chunk_id']] = dict(row, candidate_rank=len(candidates))
             scored = []
             for hit in candidates.values():
+                if hit.get('mission_quote'):
+                    scored.append((5, hit))
+                    continue
                 if re.search(r'对白|台词', query) and hit['kind'].startswith(('mission_', 'chapter_', 'overview_')):
                     continue
                 if requested_topics and hit['work'] == 'voice' and hit['scene_title'] not in requested_topics:
@@ -186,6 +247,16 @@ class HsrStoryKB:
                 body = hit['title']+' '+hit['scene_title']+' '+hit['text']
                 overlap = len(set(terms) & set(tokens(body))) / len(terms)
                 entity_count = sum(e in body for e in plan['entities'])
+                if hit.get('exact_reference'):
+                    reference = json.loads(hit['block_metadata'])
+                    topic = reference.get('topic', '')
+                    category_score = sum(word in query for word in topic.split())
+                    category = reference.get('reference_category')
+                    instrument_match = '仪器' in query and category in {'rogue_instrument', 'map_prop'}
+                    tourn_event_match = '差分宇宙' in query and '事件' in query and category == 'rogue_tourn_event'
+                    scoped_match = instrument_match or tourn_event_match
+                    scored.append((4 + overlap + .25 * category_score + int(scoped_match), hit))
+                    continue
                 if plan['entities'] and not entity_count:
                     continue
                 if overlap < 0.6:
@@ -213,10 +284,28 @@ class HsrStoryKB:
                 if ancestry is None:
                     continue
                 hit['conditions']=list(reversed(ancestry))
+                metadata = json.loads(hit.pop('block_metadata'))
+                hit['provenance'] = json.loads(hit['provenance'])
+                if metadata.get('reference_category'):
+                    hit['reference_role'] = metadata['field_role']
+                if metadata.get('native_mission_evidence'):
+                    paths = metadata['choice_paths']
+                    hit['choice_paths'] = paths
+                    labels = []
+                    for path in paths:
+                        names = []
+                        for choice in path.values():
+                            row = db.execute("SELECT text FROM block WHERE block_id=? AND kind='choice'", (choice,)).fetchone()
+                            if row is None:
+                                raise ValueError('Missing native choice evidence')
+                            names.append(row[0])
+                        if names:
+                            labels.append(' ＋ '.join(names))
+                    hit['conditions'] = [' 或 '.join(dict.fromkeys(labels))] if labels else []
                 # Keep original hit + evidence IDs; context never crosses a branch.
                 hit['matched_text'] = hit['text']
                 hit['evidence_chunks'] = [hit['chunk_id']]
-                if hit['work'] != 'voice' and hit['ord'] is not None:
+                if hit['work'] != 'voice' and hit['ord'] is not None and not hit.get('reference_role'):
                     nearby=db.execute('''SELECT b.speaker_raw,c.text,c.chunk_id FROM chunk c
                         JOIN block b ON b.block_id=c.block_id
                         WHERE c.unit_id=? AND c.scene_id=? AND b.branch_id IS ? AND c.structure_status='verified'
@@ -264,6 +353,10 @@ def render(hits, budget=1800):
             label+='\n上下文证据：'+', '.join(hit['evidence_chunks'])
         if hit['speaker_raw']:
             label+=' / 说话人：'+hit['speaker_raw']
+        if hit.get('reference_role'):
+            label += '\n客户端配置：' + hit['reference_role']
+        if hit.get('kind') == 'choice':
+            label += '\n证据类型：玩家选项。'
         if hit['conditions']:
             label+='\n选项条件：'+' → '.join(hit['conditions'])
         room=min(900,remaining-len(label)-3)
