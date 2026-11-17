@@ -901,14 +901,14 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 
 | 模块 | 职责 |
 |---|---|
-| `net.py` | 魔数判格式（PNG/JPG/GIF/WEBP/BMP）、`validate_image`（512B–10MB）、SSRF 校验 `check_url_allowed`（http(s) + 公网 IP，挡内网/环回/.local/.internal）、`safe_download`（重定向末 URL 复校验 + 大小上限） |
-| `engines.py` | 四引擎适配（PicImageSearch `file=bytes` 直传，无需图床）：SauceNAO（`SAUCENAO_API_KEY` 可选，匿名兜底）/ IQDB / ascii2d / trace.moe（库内相似度已 ×100）。统一 `Candidate`；`run_engines` 并发 gather + 30s/引擎超时，引擎级失败分类 `ENGINE_ERROR/QUOTA/TIMEOUT` 不拖垮整体 |
+| `net.py` | 魔数判格式（PNG/JPG/GIF/WEBP/BMP）、`validate_image`（512B–20MB）、SSRF 校验 `check_url_allowed`（http(s) + 公网 IP，挡内网/环回/.local/.internal）、`safe_download`（重定向末 URL 复校验 + 大小上限）、`compress_for_upload`（>2MB 或长边 >2048 时白底合成 alpha + 长边 2048/JPEG q88；压缩后不小于原图或解码失败则原样返回。引擎指纹工作尺寸远低于 2048，真匹配 A/B 实测命中集合与排序稳定） |
+| `engines.py` | 四引擎适配（PicImageSearch `file=bytes` 直传，无需图床）：SauceNAO（`SAUCENAO_API_KEY`，免费档 4 次/30s、100 次/24h；匿名 API 已被官方禁用）/ IQDB / ascii2d / trace.moe（库内相似度已 ×100）。统一 `Candidate`；`run_engines` 并发 gather + 30s/引擎超时，引擎级失败分类 `ENGINE_ERROR/QUOTA/TIMEOUT` 不拖垮整体 |
 | `accounts.py` | 纯函数：`platform_of`/`handle_of`/`is_post_page`（14 平台），`aggregate_accounts` 按 (平台, handle) 聚合证据，**作者主页优先于帖子页**，pixiv/ArtStation/DeviantArt 标「画师（非 coser 本人）」 |
 | `consensus.py` | 纯函数同名共识（坑 4）：名字/handle 在 ≥2 条不同候选出现，或相似度 ≥80 且有 author_url，或 **Lens 作者主页单独命中**（Lens 无相似度分，视觉匹配=精确图匹配）才采纳；**账号必须有真实链接**（纯名字不进结论）；其余进低置信区只报数量 + ≤3 handle |
 | `quota.py` | 坑 5：30s 冷却 / 20 次每人每天 / 100 次全服每天；图片 sha256 缓存 30 天（命中只查冷却、不耗当日次数）；`QuotaStore` JSON 原子写（`data/find_source/quota.json`），`evaluate`/`record_use`/`cache_*` 纯函数可离线测 |
 | `vlm.py` | `identify_work` 经 `multimodal_client` 识别作品/角色/水印@账号（≤150 字）；不可用/出错返回 None，不阻塞引擎主路 |
 | `render.py` | 纯函数版式（§2.3）：账号反查 / 作品识别（trace.moe 作品 + 集数 + VLM）/ 未找到三态；低置信过滤注记 + 引擎状态 + 「反查结果可能认错，请自行核实。」 |
-| `service.py` | 编排 `run()`：配额闸 `_gate` → 缓存命中直返 → `run_engines` ∥ `_lens_leg` ∥ `identify_work` → 共识 → trace.moe ≥87 取作品 → 落缓存。Lens 腿异常内捕只进 `engine_errors["Lens"]`；VLM 缺席时 Lens AI 概览以「（Lens AI 概览）」前缀补位。`precheck()` 供指令层发回执前先挡配额；`QuotaDenied` 文案可直接回用户；`FindResult.to_payload/from_payload` 缓存序列化 |
+| `service.py` | 编排 `run()`：配额闸 `_gate` → 缓存命中直返 → `compress_for_upload`（引擎/Lens 用压缩版；缓存键仍原图 sha256，VLM 仍原图路径）→ `run_engines` ∥ `_lens_leg` ∥ `identify_work` → 共识 → trace.moe ≥87 取作品 → 落缓存（仅正向结果，全失败不缓存）。Lens 腿异常内捕只进 `engine_errors["Lens"]`；VLM 缺席时 Lens AI 概览以「（Lens AI 概览）」前缀补位。`precheck()` 供指令层发回执前先挡配额；`QuotaDenied` 文案可直接回用户；`FindResult.to_payload/from_payload` 缓存序列化 |
 | `browser.py` | 二期：无头 Chrome 裸 CDP 驱动（asyncio subprocess + aiohttp WebSocket，无 playwright）。`find_chrome`（`CHROME_BIN` 热读覆盖）、`chrome_ua`（大版本对齐）、启动旗标组合回退 + 成功记忆、`resolve_redirect`（Fetch.requestPaused 拦截非 Google 请求 + 页面 URL 轮询 + HTML 捞地址，绝不拉目标页）、`sem()` 并发闸固定 1。与 `browser_fetch.py`（ruyiPage Firefox 指纹）互不复用 |
 | `lens.py` | 二期：Lens 引擎。隐藏 form 注入 → `DOM.setFileInputFiles` → 提交 `lens.google.com/v3/upload` → 等渲染 → EXTRACT_JS 抽直链 + ≤24 张 `/goto` 卡片 + AI 概览；`/goto` 解链 HTTP 优先（读 Location ≤3 跳、中间跳必须 Google 域）CDP 兜底，≤3 张卡社交标题优先、已有社交直链则跳过；错误分级 `GOOGLE_CAPTCHA/CONSENT/UNREACHABLE/EMPTY`，`lensImgDead`（上传被接受但 lens.usercontent 图片全部加载失败）识别谷歌对出口 IP 的静默限制 → IMG_DEAD → GOOGLE_UNREACHABLE；连续 3 次被拦截（验证码/静默限制）内存熔断 600s；每次搜索 launch→kill + finally 清理 profile/临时图；`recordable_url` 纯语法私网拦截（不做 DNS）；`FIND_SOURCE_LENS_COOKIE` 真人 cookie 注入（consent 打底后覆盖，解链 Cookie 头同步）。Candidate similarity=0，author_url 仅在「平台+handle+非帖子页」时设置 |
 

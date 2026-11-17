@@ -5980,7 +5980,8 @@ async def _handle_find_source_command(text: str, user_id: str, view) -> bool:
             "能找什么：二次元画作/插画的出处与画师账号、番剧截图的作品与集数、"
             "真人照片/coser 的社交账号（Google Lens 视觉匹配 + AI 概览识别）。\n"
             "限额：每人每天 20 次、全服每天 100 次、同用户 30 秒冷却；"
-            "同图 30 天内重查走缓存不耗次数。\n"
+            "同图 30 天内重查走缓存不耗次数。图片最大 20MB，"
+            "大图会自动压缩后再送引擎（不影响匹配精度）。\n"
             "⚠️ 图片会上传到第三方反查引擎（SauceNAO/IQDB/ascii2d/trace.moe/Google Lens），"
             "请勿发送涉及隐私的图片。结果可能认错，请自行核实。")
         return True

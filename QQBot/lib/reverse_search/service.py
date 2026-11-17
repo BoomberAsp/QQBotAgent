@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from .accounts import Account
 from .consensus import build_consensus
 from .engines import Candidate, EngineError, run_engines
+from .net import compress_for_upload
 from .quota import (COOLDOWN_S, QuotaStore, cache_get, cache_put, evaluate,
                     image_hash, now_and_day, prune, record_use)
 from .render import render_reply
@@ -142,10 +143,13 @@ async def run(image_bytes: bytes, image_path: str | None = None,
         _store.save(state)
 
     t0 = time.monotonic()
+    # 大图先压缩再送引擎/Lens（指纹工作尺寸远低于 2048，无损命中）；
+    # 缓存键仍用原图 sha256，VLM 仍走原图路径
+    upload = await asyncio.to_thread(compress_for_upload, image_bytes)
     (candidates, errors), vlm_text, (lens_cands, lens_overview, lens_err) = await asyncio.gather(
-        run_engines(image_bytes),
+        run_engines(upload),
         identify_work(image_path) if image_path else _none(),
-        _lens_leg(image_bytes),
+        _lens_leg(upload),
     )
     candidates = candidates + lens_cands
     if lens_err:
