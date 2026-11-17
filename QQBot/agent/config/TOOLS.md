@@ -662,6 +662,10 @@ Anti-bot handling is a two-tier ladder:
 
 ---
 
+## Tool: find_image_source
+
+根据用户明确请求反查已绑定的一张图片，返回出处、作品或作者候选与链接。无需参数。用户只发图时，可向用户询问是否要查来源，告知图片会发送给第三方反查引擎。运行时会处理裸图的确认问题。当前轮获得查询授权后调用本工具，按工具证据说明匹配结果和不确定性。
+
 ## Tool: read_file
 
 **Description**: Read and analyze files that users upload in QQ messages. Supports text files (code, logs, configs, etc. — returns content; large files are segmented via `offset`), PDF files (returns extracted text), image files (returns metadata + AI analysis if multimodal LLM configured), and audio files (returns metadata + AI transcription/emotion/context analysis if audio model configured).

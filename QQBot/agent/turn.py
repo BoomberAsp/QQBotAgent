@@ -114,6 +114,7 @@ from tools.builtin_tools import (
     _ensure_workspace_dirs,
 )
 from tools.file_tools import read_file
+from tools import image_source_tools
 from tools.map_tools import (
     geocode,
     reverse_geocode,
@@ -319,6 +320,12 @@ def _build_tool_registry() -> ToolRegistry:
             },
             "required": ["query"],
         },
+    )
+    registry.register(
+        image_source_tools.TOOL_NAME, image_source_tools.find_image_source,
+        "反查用户已同意查询的单张图片，返回出处、作品或作者候选及来源链接。"
+        "直接使用本轮已绑定的图片，调用时无需参数。",
+        {"type": "object", "properties": {}, "additionalProperties": False},
     )
     registry.register(
         "web_fetch", web_fetch,
@@ -2580,6 +2587,9 @@ async def handle_agent_turn(view: InboundMessage):
     _on_file_created.set(lambda p: _record_session_file(user_id, p))
 
     text_content = view.text
+    from agent.cognitive_state import current_scope
+    image_scope = current_scope.get()
+    image_offer = image_source_tools.take_offer(view, image_scope)
     if await _handle_memory_control(view):
         return
 
@@ -2813,7 +2823,19 @@ async def handle_agent_turn(view: InboundMessage):
     # supports_vision 时随 user message 以 image_url parts 直传模型。
     # 占位文本行照旧保留（工具/后续轮次的 read_file 懒分析回退仍靠它）。
     vision_image_paths: list = []
-    for att in await view.load_attachments():
+    attachments = await view.load_attachments()
+    active_special = _special_sessions.get_active(user_id)
+    active_metadata = (active_special.metadata or {}) if active_special else {}
+    active_kind = active_metadata.get("kind")
+    workspace = _current_user_workspace.get()
+    if active_kind == "char_creation" or (
+            active_kind == SCENE_KIND
+            and not (_scene_archive_enabled() and active_metadata.get("completed"))):
+        image_search = image_source_tools.ImageSearchTurn(user_id, workspace)
+    else:
+        image_search = image_source_tools.prepare(
+            view, workspace, attachments, image_offer, text=text_content)
+    for att in attachments:
         has_quoted_attachment = has_quoted_attachment or att.quoted
         if att.kind == "image":
             if att.path:
@@ -2877,9 +2899,12 @@ async def handle_agent_turn(view: InboundMessage):
             ack = f"已收到 {'、'.join(names)}，需要分析的话引用这条消息告诉我~"
         else:
             ack = "已收到文件，需要分析的话引用这条消息告诉我~"
+        if image_search.question:
+            ack = f"收到图片。{image_search.question}"
         if quota_warn:
             ack += f"\n\n{quota_warn}"
-        await _safe_send(ack)
+        if await _safe_send(ack):
+            image_source_tools.remember_offer(view, image_scope, image_search)
         return
 
     # ── Build augmented message ────────────────────────────────────
@@ -2918,6 +2943,9 @@ async def handle_agent_turn(view: InboundMessage):
             augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请根据用户意图选择合适的工具查看内容。"
     else:
         augmented_message = text_content
+
+    if image_search.question:
+        augmented_message += "\n[系统提示] 回复后会附上找图确认问题，请自然回应即可。"
 
     # Guard: nothing to process
     if not augmented_message:
@@ -2982,7 +3010,6 @@ async def handle_agent_turn(view: InboundMessage):
                 pass
 
         # Detect session type (also gates the UGC creation interview below)
-        active_special = _special_sessions.get_active(user_id)
         session_type = "special" if active_special else "temporary"
         is_creation = bool(active_special) and (
             (active_special.metadata or {}).get("kind") == "char_creation"
@@ -3096,6 +3123,9 @@ async def handle_agent_turn(view: InboundMessage):
             _current_group_id.set("")
             _current_group_context.set("")
 
+        can_search_image = image_source_tools.TOOL_NAME in allowed_tools
+        allowed_tools = allowed_tools - {image_source_tools.TOOL_NAME}
+
         # Set permission contextvars for downstream tools
         _current_user_id.set(user_id)
         _current_user_role.set(role.value)
@@ -3158,6 +3188,9 @@ async def handle_agent_turn(view: InboundMessage):
         if _hsr_native:
             _current_personality.set(persona_key)
             allowed_tools = set(allowed_tools) | {"story_search"}
+        if image_search.authorized and can_search_image and not (is_creation or is_scene):
+            allowed_tools = set(allowed_tools) | {image_source_tools.TOOL_NAME}
+            augmented_message += "\n[系统提示] " + image_source_tools.SEARCH_HINT
         _current_task_persona.set(persona_key if persona_mode == "split" and not character_plane and not is_creation and not is_scene and not _hsr_native else "")
         # story_search only for allowlisted personas (schema filtering; the
         # executor additionally refuses tools outside allowed_tools).
@@ -3197,6 +3230,7 @@ async def handle_agent_turn(view: InboundMessage):
             _survey_token = _current_survey_context.set(
                 _survey_prompt_hint(view))
             _survey_view_token = _current_survey_view.set(view)
+            image_search_token = image_source_tools.current.set(image_search)
             response = await asyncio.wait_for(
                 agent.run(
                     augmented_message, user_id,
@@ -3222,6 +3256,7 @@ async def handle_agent_turn(view: InboundMessage):
         finally:
             _current_survey_context.reset(_survey_token)
             _current_survey_view.reset(_survey_view_token)
+            image_source_tools.current.reset(image_search_token)
             _current_sender.reset(token)
 
         # ── Revoicing layer (Bond-System-Design.md §3.3) ──
@@ -3271,6 +3306,9 @@ async def handle_agent_turn(view: InboundMessage):
         #      允许整篇发送的情形。
         # 前提：close() 现在对断流也补发 state=10 收尾片（平台侧未收尾的流
         # 会被回滚到首包），否则 ② 的"只补尾巴"会丢内容。
+        question = image_search.question
+        if question:
+            response = "\n\n".join(part for part in (response, question) if part)
         sent_via_stream = False
         _decision = "buffered_full"
         _remainder = ""
@@ -3285,7 +3323,8 @@ async def handle_agent_turn(view: InboundMessage):
                 _disc = ""
             # 还活着的流：末片一次送完（尾巴 + 免责），不留第二条消息。
             if streamer.answer_opened and not streamer.broken:
-                await streamer.finish_answer(_disc)
+                tail = "\n\n".join(part for part in (question, _disc) if part)
+                await streamer.finish_answer(tail)
             _happy = streamer.answer_opened and not streamer.broken
             await streamer.close()      # 断流也补 state=10（防平台回滚）
             _decision, _remainder = _plan_stream_delivery(
@@ -3314,6 +3353,9 @@ async def handle_agent_turn(view: InboundMessage):
         if not sent_via_stream:
             # Send response (split long messages)
             await _send_response(response)
+        if question and (not sent_via_stream or question in _remainder
+                         or question in streamer.answer_sent):
+            image_source_tools.remember_offer(view, image_scope, image_search)
 
         # ── Creation session auto-close (scene-session-archive-design.md §5.2/D6):
         # create_character 本轮成功 → 访谈会话无保留价值（设定已完整落入角色卡），
@@ -3720,6 +3762,8 @@ async def _safe_send(message, max_retries: int = 2, sender=None):
         sender: Optional Sender to use. Falls back to the _turn_sender
             contextvar (QQ official entry binds a per-event sender there)
             and then to default_sender.
+
+    Returns True when the sender accepts the payload.
     """
     s = sender or _turn_sender.get() or default_sender
     last_error = None
@@ -3747,7 +3791,7 @@ async def _safe_send(message, max_retries: int = 2, sender=None):
                 await s.send_progress(message.text, immediate=message.immediate)
             else:
                 await s.send_text(message)
-            return
+            return True
         except SendFailed as e:
             last_error = e
             if attempt < max_retries - 1:
@@ -5989,7 +6033,7 @@ async def _handle_find_source_command(text: str, user_id: str, view) -> bool:
     cmd = text.partition(" ")[0]
     if cmd not in (_FIND_SOURCE_CMDS + _FIND_SOURCE_HELP_CMDS):
         return False
-    if os.environ.get("FIND_SOURCE_ENABLED", "on").strip().lower() in ("off", "0", "false", "no"):
+    if not image_source_tools.enabled():
         return False
 
     if cmd in _FIND_SOURCE_HELP_CMDS:

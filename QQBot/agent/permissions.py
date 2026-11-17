@@ -49,7 +49,7 @@ _PUBLIC_TOOLS: Set[str] = {
     "get_user_info",
     "survey_status",
     "delete_workspace_file",
-    "search_web", "fetch_image", "discover_images",
+    "search_web", "fetch_image", "discover_images", "find_image_source",
     "get_time",
     "get_weather",
     "read_file",           # Only text/PDF for regular; multimodal requires VIP

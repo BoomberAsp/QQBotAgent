@@ -897,6 +897,8 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 
 ### 2.17 `lib/reverse_search/` — 找图反查（一期 HTTP 引擎 + 二期 Google Lens）
 
+`find_image_source` 是普通用户可用的免参数智能体工具，复用反查服务的配额、缓存与结果渲染。私聊裸图、群里直接发给机器人的裸图会附上确认问题；发图者在同一会话五分钟内的下一轮回复可确认，带图明确请求查来源也可授权。待查图片绑定到会话与发送者，群聊只读取本群工作区的附件。
+
 设计见 `docs/找图反查-方案.md`。一期纯 HTTP 引擎 + VLM 识别 + 同名共识；二期接 Google Lens（无头 Chrome 裸 CDP，spike 3/3 零验证码；Yandex 留三期）。命令 `/找图`（`/找源`/`/找作者`/`/找图帮助`）在 `agent/turn.py::_handle_find_source_command` 直连拦截（零 token，双适配器经 `run_agent_turn`），取图复用 `view.load_attachments()` + OneBot `quoted_file_paths` 引用兜底 + `/找图 <URL>`（`net.safe_download`）；选图落 `[找图] 选图` 日志（source/quoted/文件名/bytes/sha256 前 12 位/msg_id）——2026-11-17 用户报「查的是上一张图」，取证为平台送达旧图（保存的附件本就是芙莉莲图）而非选图 bug，此日志供后续对质。群聊走独立分发：`/找图`（别名 `/找源`/`/找作者`）与 `/找图帮助` 注册在 `agent/public_commands.py::PUBLIC_COMMANDS`（`needs_view=True`，`dispatch_public` 透传 view 供取附件），由 `group_commands.dispatch` 在 @机器人/回复机器人时调用，自动进 `/群帮助` 列表；配额/冷却/缓存与私聊共用同一 `QuotaStore`。
 
 | 模块 | 职责 |

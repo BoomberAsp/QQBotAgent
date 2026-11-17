@@ -42,10 +42,16 @@ IDENTITY_COMMANDS=('/绑定身份','/绑定群身份','/确认绑定','/解除�
 
 # QQ can leave the mention in event.content even on a genuine group-@ event.
 # Stripping a textual envelope classifies the message; it never grants permission.
-_COMMAND_START = re.compile(
-    r"^[\s\u200b\ufeff]*(?:(?:<@!?[\w.-]+>|\[CQ:at,[^\]\r\n]+\]|@[^\s/／＃#<>]+(?=\s))"
-    r"[\s\u200b\ufeff]*)*([/／#＃])"
+_MENTION_PREFIX = (
+    r"^[\s\u200b\ufeff]*(?:(?:<@!?[\w.-]+>|\[CQ:at,[^\]\r\n]+\]|@[^\s/／＃#<>]+(?=\s|$))"
+    r"[\s\u200b\ufeff]*)*"
 )
+_COMMAND_START = re.compile(_MENTION_PREFIX + r"([/／#＃])")
+
+
+def without_mention_prefix(text):
+    return re.sub(_MENTION_PREFIX, "", text, count=1)
+
 
 def command_text(text):
     match = _COMMAND_START.match(text)

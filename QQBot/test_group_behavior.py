@@ -102,6 +102,81 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(b.get_state('a','rubi')['exp'],result['exp'])
 
 
+class PrivateImageSourceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_photo_offer_and_natural_confirmation(self):
+        from contextlib import ExitStack
+        from agent import survey_flow
+        from agent.cognitive_state import current_scope
+        from agent.inbound import Attachment
+        from lib.reverse_search import service
+        from tools import image_source_tools
+
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            dirs = ("USER_DATA_ROOT", "CHARACTERS_DIR", "BONDS_DIR",
+                    "MAILBOX_DIR", "MEMORY_DIR", "ASSETS_DIR")
+            stack.enter_context(patch.dict("os.environ", {
+                key: str(Path(tmp) / key.lower()) for key in dirs
+            }))
+            from agent import turn
+
+            path = Path(tmp) / "photo.png"
+            data = b"\x89PNG\r\n\x1a\n" + bytes(1000)
+            path.write_bytes(data)
+            pm = NS(resolve_effective_personality=lambda *args: "assistant",
+                    get_mode=lambda persona: "unified", get_short_name=lambda persona: "Roxy")
+            model = NS(flash_client=NS(), classify_complexity=AsyncMock(return_value="simple"))
+
+            async def run(*args, allowed_tools, **kwargs):
+                if "find_image_source" in allowed_tools:
+                    return await turn._tool_registry.execute("find_image_source", {})
+                return "普通回复"
+
+            stack.enter_context(patch.dict("os.environ", {"FIND_SOURCE_ENABLED": "on"}))
+            stack.enter_context(patch.object(survey_flow, "try_handle", AsyncMock(return_value=False)))
+            stack.enter_context(patch.multiple(
+                turn,
+                _workspace_manager=NS(ensure_dirs=MagicMock(), get_workspace=lambda user: tmp),
+                _special_sessions=NS(get_active=lambda user: None),
+                _session_manager=NS(message_count=lambda user: 0),
+                _handle_cleanup_flow=AsyncMock(return_value=False),
+                _quota_warning=lambda user: "",
+                _record_session_file=MagicMock(),
+                _record_file=MagicMock(),
+                _any_vision_client=lambda: False,
+                _build_render_context=lambda mode: "",
+                get_character_registry=lambda: pm,
+                _model_router=model,
+                _story_persona_allowed=lambda persona: False,
+                _safe_send=AsyncMock(return_value=True),
+                _send_response=AsyncMock(),
+                agent=NS(run=run),
+            ))
+            search = stack.enter_context(patch.object(service, "run", AsyncMock(
+                return_value=NS(render=lambda: "查到图片来源。"))))
+            token = current_scope.set("private-test")
+            stack.callback(current_scope.reset, token)
+            stack.callback(image_source_tools._pending.clear)
+
+            async def send(text, message, image=False):
+                v = view(user="private-user", group="", message=message)
+                v.text = text
+                if image:
+                    v.attachments = [Attachment("image", str(path))]
+                await turn.handle_agent_turn(v)
+
+            await send("", "first", image=True)
+            self.assertIn("第三方", turn._safe_send.await_args.args[0])
+            await send("不用了", "no")
+            await send("可以", "unrelated-yes")
+            search.assert_not_awaited()
+            await send("", "second", image=True)
+            await send("可以", "yes")
+            search.assert_awaited_once_with(data, image_path=str(path), user_id="private-user")
+            turn._send_response.assert_awaited_with("查到图片来源。")
+            await send("帮我查这张图的出处", "explicit", image=True)
+            self.assertEqual(search.await_count, 2)
+
+
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         import agent
@@ -354,6 +429,53 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 handler.reset_mock()
         self.assertEqual(self.calls,[])
         self.assertEqual(self.store.history(scope_for(v)),[])
+
+    async def test_image_source_agent_uses_only_the_uploaders_confirmation(self):
+        from hashlib import sha256
+        from agent.inbound import Attachment
+        from lib.reverse_search import service
+        from tools import image_source_tools
+
+        photo = view(message="photo")
+        scope = scope_for(photo)
+        workspace = self.store.root / "workspaces" / sha256(scope.encode()).hexdigest()
+        workspace.mkdir(parents=True)
+        path = workspace / "test.png"
+        data = b"\x89PNG\r\n\x1a\n" + bytes(1000)
+        path.write_bytes(data)
+        photo.attachments = [Attachment("image", str(path))]
+        photo.attachment_kinds = ("image",)
+        photo.text = "<@bot>"
+        self.fake._perm_manager.get_allowed_tools = lambda role: {"find_image_source"}
+
+        observed = []
+
+        async def run(*args, allowed_tools, **kwargs):
+            can_search = "find_image_source" in allowed_tools
+            observed.append(can_search)
+            return await image_source_tools.find_image_source() if can_search else "看到了。"
+
+        self.fake.agent.run = run
+        search = AsyncMock(return_value=NS(render=lambda: "找到来源。"))
+        with patch.object(service, "run", search), patch.dict("os.environ", {"FIND_SOURCE_ENABLED": "on"}):
+            await runtime.run_group_turn(photo, self.sender)
+            self.assertIn("要帮你查这张图的来源吗", self.sender.send_group_text.await_args.args[0])
+            self.assertIn("第三方", self.sender.send_group_text.await_args.args[0])
+            for user, group, mid in (("b", "g", "other-member"), ("a", "other", "other-group")):
+                reply = view(user=user, group=group, message=mid)
+                reply.text = "<@bot> 可以"
+                await runtime.run_group_turn(reply, self.sender)
+            search.assert_not_awaited()
+            yes = view(message="confirm")
+            yes.text = "可以"
+            await runtime.run_group_turn(yes, self.sender)
+            search.assert_awaited_once_with(data, image_path=str(path), user_id="a")
+            self.assertIn("找到来源", self.sender.send_group_text.await_args.args[0])
+            again = view(message="confirm-again")
+            again.text = "可以"
+            await runtime.run_group_turn(again, self.sender)
+            search.assert_awaited_once()
+        self.assertEqual(observed, [False, False, False, True, False])
 
     async def test_group_game_owner_followup_and_direct_calculation(self):
         from agent.group_games import _pending

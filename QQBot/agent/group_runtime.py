@@ -14,7 +14,7 @@ from .group_state import GroupStore, scope_for, identity_for
 current_group_run = ContextVar("current_group_run", default=None)
 # Public, stateless tools only. File, shell, personal retrieval and social-media
 # tools need explicit group-resource adapters before they may join this list.
-GROUP_TOOLS = frozenset({"search_web", "get_time", "geocode", "reverse_geocode",
+GROUP_TOOLS = frozenset({"search_web", "find_image_source", "get_time", "geocode", "reverse_geocode",
                         "survey_status",
                         "search_poi", "get_weather", "character_detail", "bond_detail",
                         "redeem_code", "get_changelog", "delegate_task", "story_search", "group_media", "send_sticker", "fetch_image", "discover_images"})
@@ -264,7 +264,9 @@ async def extract_self_fact(store, view, identity, generation, client):
 
 
 async def run_group_turn(view, sender=None):
+    from tools import image_source_tools
     from . import turn, context as ctx
+    from .group_commands import without_mention_prefix
     from .character_registry import get_character_registry
     sender = sender or ctx._turn_sender.get() or turn.default_sender
     store = get_store()
@@ -287,6 +289,8 @@ async def run_group_turn(view, sender=None):
             pass
     if config["status"] != "active":
         return
+    image_scope = (scope, initial["generation"])
+    image_offer = image_source_tools.take_offer(view, image_scope)
     tokens = [(ctx._current_platform,ctx._current_platform.set(view.platform))]
     try:
         role = turn._perm_manager.get_role(view.user_id).value
@@ -383,7 +387,10 @@ async def run_group_turn(view, sender=None):
                               (ctx._current_survey_view,view)):
                 tokens.append((var,var.set(value)))
             turn.set_usage_context(view.user_id,view.group_id,"group")
+            image_search = None
+
             async def execute():
+                nonlocal image_search
                 # Load only after installing the group workspace. Overheard messages
                 # retain type information without downloading the whole group feed.
                 source=view
@@ -394,6 +401,7 @@ async def run_group_turn(view, sender=None):
                         source=previous[4]
                         prompt+=f'（引用近期成员[{previous[1]}]发送的图片）'
                 images=[]
+                attachments=[]
                 client=turn._model_router.flash_client
                 if source.media_summary():
                     try:
@@ -409,9 +417,25 @@ async def run_group_turn(view, sender=None):
                     if not getattr(client,'supports_vision',False):images=[]
                     if not images:prompt+='（本轮仅有附件类型信息，未读取内容，请勿猜测。）'
                     if not valid():return ''
-                return await turn.agent.run(f"成员[{member_tag(view)}]：{prompt[:5000]}",
-                    "group_"+__import__('hashlib').sha256(scope.encode()).hexdigest()[:24],
-                    client=client,images=images or None,allowed_tools=allowed,user_role=role,persist=False)
+                if image_source_tools.TOOL_NAME in allowed:
+                    allowed.discard(image_source_tools.TOOL_NAME)
+                    if reason == "direct" or (reason == "follow" and image_offer):
+                        image_search = image_source_tools.prepare(
+                            view, str(group_workspace), attachments if source is view else [],
+                            image_offer, text=(without_mention_prefix(view.text)
+                                               if reason == "direct" else view.text))
+                        if image_search.authorized:
+                            allowed.add(image_source_tools.TOOL_NAME)
+                            prompt += "\n" + image_source_tools.SEARCH_HINT
+                        elif image_search.question:
+                            prompt += "\n回复后会附上找图确认问题，请自然回应即可。"
+                token = image_source_tools.current.set(image_search)
+                try:
+                    return await turn.agent.run(f"成员[{member_tag(view)}]：{prompt[:5000]}",
+                        "group_"+__import__('hashlib').sha256(scope.encode()).hexdigest()[:24],
+                        client=client,images=images or None,allowed_tools=allowed,user_role=role,persist=False)
+                finally:
+                    image_source_tools.current.reset(token)
             task = asyncio.create_task(execute())
             _jobs[scope]=(identity_for(view),task)
             try:
@@ -431,8 +455,11 @@ async def run_group_turn(view, sender=None):
                     _jobs.pop(scope,None)
             if not valid():
                 return
+            question = image_search.question if image_search else ""
             if not isinstance(answer,str) or not answer.strip():
-                return
+                if not question:
+                    return
+                answer = ""
             if run.autonomous and answer.strip() == "[[GROUP_SILENT]]":
                 return
             # Silence spends no automatic-message quota or cooldown. Recheck at delivery.
@@ -449,7 +476,9 @@ async def run_group_turn(view, sender=None):
                 if selected in {a['id'] for a in run.sticker_choices} and not run.media:
                     from .media_tools import send_sticker
                     await send_sticker(sticker_id=selected)
-            sticker_only=bool(prefer_sticker and run.media and not run.media[0][1].startswith("image:"))
+            if question:
+                answer = "\n\n".join(part for part in (answer[:1200 - len(question) - 2], question) if part)
+            sticker_only=bool(not question and prefer_sticker and run.media and not run.media[0][1].startswith("image:"))
             async def deliver_text():
                 ticket = store.delivery(scope,view.message_id,"queued")
                 try:
@@ -461,6 +490,8 @@ async def run_group_turn(view, sender=None):
                 return status=="sent" and valid()
             if not sticker_only and (not answer or not await deliver_text()):
                 return
+            if question:
+                image_source_tools.remember_offer(view, image_scope, image_search)
             delivered=[]
             from .outbound import OutImage
             for path,asset in run.media:
