@@ -180,6 +180,13 @@ RESULTS_JS = r"""
   return n >= 3 || cards >= 2;
 })()
 """
+HOME_STATE_JS = r"""
+(() => {
+  const signedOut = !!document.querySelector('a[href*="ServiceLogin"]');
+  const accountLink = !!document.querySelector('a[href*="myaccount.google.com"], a[aria-label*="Google Account"], a[aria-label*="Google 帳戶"], a[aria-label*="Google 账号"]');
+  return JSON.stringify({signedOut: signedOut, accountLink: accountLink});
+})()
+"""
 ACCEPT_CONSENT_JS = r"""
 (() => {
   const nodes = Array.from(document.querySelectorAll('button, [role=button], a'));
@@ -242,7 +249,8 @@ EXTRACT_JS = r"""
     aiOverview: aiOverview,
     lensImgDead: lensImgDead,
     lensImgTotal: lensImgs.length,
-    lensImgDeadCount: lensImgDeadCount
+    lensImgDeadCount: lensImgDeadCount,
+    signedOut: !!document.querySelector('a[href*="ServiceLogin"]')
   });
 })()
 """
@@ -438,6 +446,22 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
             _note_verdict("CONSENT")
             raise EngineError("GOOGLE_CONSENT", "谷歌同意页拦截，无法上传")
 
+    # 诊断 cookie 会话是否被谷歌承认：首页仍见 ServiceLogin 链接=未登录态；
+    # getCookies 列出浏览器实际会发给 google 的 cookie（只记名不记值）
+    try:
+        state = await cdp.evaluate(HOME_STATE_JS, timeout=8)
+        logger.info(f"[Lens] 首页登录态 {state}")
+    except BrowserError:
+        pass
+    try:
+        r = await cdp.send("Network.getCookies",
+                           {"urls": ["https://www.google.com/",
+                                     "https://lens.google.com/"]}, timeout=8)
+        names = sorted({str(c.get("name") or "") for c in (r.get("cookies") or [])})
+        logger.info(f"[Lens] 浏览器cookie罐 {len(names)} 条: {','.join(names) or '-'}")
+    except BrowserError:
+        pass
+
     prepared = await cdp.evaluate(PREPARE_JS, timeout=10)
     if prepared not in ("ok", "exists"):
         raise EngineError("ENGINE_ERROR", f"Lens 上传表单注入失败：{prepared}")
@@ -472,6 +496,7 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
         f"卡片={len(page.get('cards') or [])} "
         f"lens图死={page.get('lensImgDeadCount', '?')}/{page.get('lensImgTotal', '?')} "
         f"captcha={bool(page.get('captcha'))} empty={bool(page.get('empty'))} "
+        f"signedOut={bool(page.get('signedOut'))} "
         f"aiOverview={len(str(page.get('aiOverview') or ''))}字 "
         f"（+{time.monotonic() - t0:.1f}s）")
     if verdict != "SUCCESS":

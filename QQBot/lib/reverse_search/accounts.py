@@ -46,6 +46,11 @@ _NON_HANDLE = {
     "Facebook": {"watch", "photo", "story.php", "groups", "pages", "permalink.php"},
     "Tumblr": {"tagged", "search", "dashboard"},
     "Bluesky": {"search", "notifications", "settings"},
+    # /view/<id> 是旧版作品页——曾把 "view" 当 handle、两条噪声命中聚成
+    # 「证据 2」假采纳（2026-11-17 真实运行，sim 27.79）
+    "DeviantArt": {"view", "art", "gallery", "favorites", "favourites", "tag",
+                   "browse", "daily", "topic", "shop", "poll", "status",
+                   "journal", "search", "users", "settings", "login", "welcome"},
 }
 
 _POST_PATTERNS = (
@@ -59,6 +64,7 @@ _POST_PATTERNS = (
     ("抖音/TikTok", re.compile(r"^/video/")),
     ("Tumblr", re.compile(r"^/post/")),
     ("Bluesky", re.compile(r"/post/")),
+    ("DeviantArt", re.compile(r"^/(view|art)/|/art/")),
 )
 
 _HANDLE_RE = re.compile(r"@([A-Za-z0-9_.]{2,30})")
@@ -114,6 +120,10 @@ def handle_of(url: str) -> str:
         if segs and segs[0] not in _NON_HANDLE[plat]:
             return segs[0]
         return ""
+    if plat == "DeviantArt" and host != "deviantart.com":
+        # 作者主页常用 <user>.deviantart.com 子域
+        sub = host.split(".")[0]
+        return "" if sub in _NON_HANDLE[plat] else sub
     if not segs:
         return ""
     first = segs[0]
