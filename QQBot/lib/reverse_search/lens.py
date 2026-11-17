@@ -107,8 +107,13 @@ def user_cookies() -> list[dict]:
             continue
         if domain != "google.com" and not domain.endswith(".google.com"):
             continue
+        # CDP setCookie 只给 domain 不给 url 时静默不入库：success=true 但
+        # 浏览器罐里查无此 cookie（2026-11-17 13:18 真实运行，18 条真人 cookie
+        # 全丢、首页仍 signedOut）。必须带 url 提供安全源，__Secure- 前缀与
+        # SameSite=None 才过校验；domain 仍保留以匹配子域（lens.google.com）。
         item = {"name": name, "value": str(value), "domain": domain,
-                "path": str(ck.get("path") or "/")}
+                "path": str(ck.get("path") or "/"),
+                "url": f"https://{domain}/"}
         exp = ck.get("expirationDate")
         if isinstance(exp, (int, float)) and exp > 0:
             if exp <= time.time():
@@ -118,6 +123,15 @@ def user_cookies() -> list[dict]:
             item["secure"] = True
         if ck.get("httpOnly"):
             item["httpOnly"] = True
+        # Cookie-Editor sameSite → CDP 枚举；None 必须配 Secure
+        ss = ck.get("sameSite")
+        if ss == "no_restriction":
+            item["sameSite"] = "None"
+            item["secure"] = True
+        elif ss == "lax":
+            item["sameSite"] = "Lax"
+        elif ss == "strict":
+            item["sameSite"] = "Strict"
         out.append(item)
     return out
 
