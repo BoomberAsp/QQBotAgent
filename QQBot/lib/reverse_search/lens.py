@@ -448,6 +448,16 @@ async def _search_once(cdp: CdpBrowser, img_path: Path, ua: str,
             ck_fail += 1
     logger.info(f"[Lens] cookie 注入 ok={ck_ok} fail={ck_fail} 真人={len(real)} "
                 f"名单={','.join(sorted({c['name'] for c in real})) or '-'}")
+    # 导航前 getAllCookies：区分「setCookie 根本没存进罐」vs「存了、导航后
+    # 被谷歌清掉/去登录化」。导航后的罐无法区分这两者（谷歌拒绝会话时会
+    # Set-Cookie 清空 auth cookie）。只记 name@domain，绝不记值。
+    try:
+        r = await cdp.send("Network.getAllCookies", timeout=8)
+        jar = r.get("cookies") or []
+        summary = ",".join(f"{c.get('name')}@{c.get('domain')}" for c in jar)
+        logger.info(f"[Lens] 注入后罐(导航前) {len(jar)} 条: {summary or '-'}")
+    except BrowserError:
+        pass
     home = await cdp.navigate("https://www.google.com/?hl=zh-CN&gl=US",
                               timeout=25, settle=0.8)
     logger.info(f"[Lens] 首页落地 {home}（+{time.monotonic() - t0:.1f}s）")
