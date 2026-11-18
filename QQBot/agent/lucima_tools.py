@@ -27,7 +27,7 @@ TOOLS = {
     "lucima_account": (
         ("login", "redeem", "donate", "cancel", "unbind"),
         "操作星陨账号：login=生成扫码登录链接、redeem=在游戏内兑换、donate=佣兵团单次捐赠、"
-        "cancel=取消排队任务、unbind=解除当前账号绑定。",
+        "cancel=取消排队任务或请求停止正在执行的长任务、unbind=解除当前账号绑定。",
         "redeem 填用户指定的一条兑换码；donate 填 gold（金币）或 courage（英勇证明）；其他留空。",
     ),
     "lucima_query": (
@@ -35,6 +35,16 @@ TOOLS = {
         "查询 Lucima：status=授权和任务状态、receipt=最近回执、encyclopedia=星陨角色图鉴、"
         "stages=已解锁关卡查询、equipment=按副属性分数筛装备。",
         "encyclopedia 填角色名；stages 填 hunt（讨伐）或 elf（元素探索）；equipment 可填套装名；其他留空。",
+    ),
+    "lucima_long": (
+        ("long_info", "activity", "abyss", "buy_batch", "schedule_set", "schedule_status", "schedule_stop"),
+        "处理长任务：long_info=查询活动、深渊或商店报价，activity=活动推进，abyss=单层虚构深渊，"
+        "buy_batch=批量购买，schedule_set=启用每日托管，schedule_status=查看托管，schedule_stop=停止托管。"
+        "缺少关卡、队伍、角色或报价时询问用户或先查询，不猜测 ID、数量、预算或价格。",
+        "long_info 填 activity、abyss 或 shop；activity 填‘活动ID 队伍ID 最多关数 体力上限’；"
+        "abyss 填‘MysteriousRealm_层数 上半角色ID逗号列表 下半角色ID逗号列表’，空位用 -；"
+        "buy_batch 填空格分隔的‘商品ID:数量:货币ID:单价’；schedule_set 填‘signin|mail|base HH:MM’"
+        "（选择一项，北京时间）；其余留空。",
     ),
 }
 
@@ -56,12 +66,12 @@ def lucima_tool_names() -> set[str]:
     return set(TOOLS) if _private_turn.get() is not None else set()
 
 
-def proposal_tool(allowed: tuple[str, ...]):
+def proposal_tool(allowed: tuple[str, ...], max_length: int = 64):
     async def propose(operation: str, arg: str = "") -> str:
         turn = _private_turn.get()
         if turn is None:
             return "请在和机器人私聊时发起 Lucima 操作。"
-        if operation not in allowed or not isinstance(arg, str) or len(arg) > 64:
+        if operation not in allowed or not isinstance(arg, str) or len(arg) > max_length:
             return "操作或参数无效，请根据用户指定的内容重新选择。"
         if turn.proposed:
             return "这一条私聊消息已有待确认操作，请先让用户处理确认。"
@@ -83,7 +93,7 @@ def proposal_tool(allowed: tuple[str, ...]):
 def register_lucima_tools(registry) -> None:
     for name, (operations, context, parameters) in TOOLS.items():
         registry.register(
-            name, proposal_tool(operations),
+            name, proposal_tool(operations, 255 if name == "lucima_long" else 64),
             context + "每次只准备一个用户明确要求的操作。系统发确认卡，等用户点击或输入确认。"
             "用户只回复‘确认’时引导使用原卡，不重复提案。账户、密码、网页核对码和确认令牌均由系统界面处理。",
             {"type": "object", "properties": {

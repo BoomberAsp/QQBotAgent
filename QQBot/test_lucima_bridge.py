@@ -4,13 +4,16 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
+from lucima_bridge.long_tasks import LOCAL, TASK_TIMEOUT
 from lucima_bridge.service import Bridge, Vault, Worker
 from lucima_bridge.web import app
 
@@ -231,8 +234,128 @@ class WebAuthorizationTests(unittest.TestCase):
         refused = self.command("approve", arg=proposed["approval"], event="later-click")
         self.assertNotIn("login_url", refused)
 
+    def test_long_commands_and_agent_require_owner_confirmation(self):
+        self.command("confirm", arg=self.open_ticket())
+        self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub"}).status_code, 200)
+        self.assertNotIn("approval", self.command("schedule_set", arg="signin 08:00"))
+        self.assertNotIn("approval", self.command("buy_batch", arg="FriendShip3:11:24:100"))
+        for proposal in (False, True):
+            with self.subTest(proposal=proposal):
+                self.worker.reset_mock()
+                plan = self.command("buy_batch", arg="FriendShip3:2:24:100", event="request", proposal=proposal)
+                self.assertIn("24 × 200", plan["message"])
+                self.worker.assert_not_called()
+                ticket = plan["approval"]
+                self.assertNotIn("job", self.command("approve", arg=ticket, event="request"))
+                self.assertNotIn("job", self.command("approve", user="other", arg=ticket, event="accept"))
+                event = f"accept-{proposal}"
+                job = self.command("approve", arg=ticket, event=event)
+                self.assertTrue(job["long_job"])
+                self.assertNotIn("job", self.command("approve", arg=ticket, event="replay"))
+                for _ in range(50):
+                    result = self.command("receipt", arg=job["job"])
+                    if "receipt" in result:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(result["receipt"]["task"], "批量购买")
+                self.assertNotIn("receipt", self.command("receipt", user="other", arg=job["job"]))
+                payload, timeout = self.worker.await_args.args
+                self.assertEqual((payload["task"], payload["code"], timeout), ("buy_batch", "FriendShip3:2:24:100", TASK_TIMEOUT))
+
+    def test_schedule_changes_require_confirmation_and_remembered_login(self):
+        self.command("confirm", arg=self.open_ticket())
+        self.post("/api/login", {"account": "stub", "password": "stub", "remember": True})
+        ticket = self.command("schedule_set", arg="mail 08:00", event="schedule")["approval"]
+        self.assertIn("没有有效", self.command("schedule_status")["message"])
+        self.assertIn("已启用", self.command("approve", arg=ticket, event="enable")["message"])
+        self.assertIn("08:00", self.command("schedule_status")["message"])
+        self.assertIn("没有有效", self.command("schedule_status", user="other")["message"])
+        ticket = self.command("schedule_stop", event="stop")["approval"]
+        self.assertIn("08:00", self.command("schedule_status")["message"])
+        self.assertIn("已停止", self.command("approve", arg=ticket, event="disable")["message"])
+        self.assertIn("没有有效", self.command("schedule_status")["message"])
+
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_schedule_is_deduplicated_across_restart_and_never_replays_started_jobs(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())
+        self.addCleanup(vault.db.close)
+        vault.bind("alice", AUTH, True)
+        vault.bind("bob", {**AUTH, "user_id": "bob"}, True)
+        worker = AsyncMock()
+        bridge = Bridge(vault, worker, ORIGIN)
+        created = int(datetime(2025, 1, 1, 22, tzinfo=LOCAL).timestamp())
+        due = int(datetime(2025, 1, 2, 0, 10, tzinfo=LOCAL).timestamp())
+        bridge.long_tasks.replace_schedule("alice", vault.record("alice")[0], "mail", "23:45", "rev", created)
+        bridge.enqueue_due(due)
+        bridge.enqueue_due(due)
+        self.assertEqual(len(bridge.queue), 1)
+        job = bridge.queue.popleft()
+        self.assertEqual((job.task, job.schedule), ("mail", "rev"))
+        bridge.long_tasks.progress(job.id, "最后的模拟进度", int(time.time()))
+        queued = bridge.submit("bob", "activity", "BH001 0 1 30", "queue")["job"]
+        restarted = Bridge(vault, worker, ORIGIN)
+        restarted.enqueue_due(due)
+        self.assertFalse(restarted.queue)
+        self.assertEqual(restarted.receipt("alice", job.id)["receipt"]["status"], "unconfirmed")
+        self.assertEqual(restarted.receipt("alice", job.id)["receipt"]["details"], ["最后的模拟进度"])
+        self.assertNotIn("receipt", restarted.receipt("bob", job.id))
+        self.assertEqual(restarted.receipt("bob", queued)["receipt"]["status"], "cancelled")
+        worker.assert_not_called()
+
+    async def test_revoked_schedule_cannot_fall_back_to_a_live_session(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())
+        self.addCleanup(vault.db.close)
+        vault.bind("alice", AUTH, True)
+        worker = AsyncMock()
+        bridge = Bridge(vault, worker, ORIGIN)
+        bridge.sessions["alice"] = (time.monotonic() + 900, AUTH)
+        created = int(datetime(2025, 1, 1, 7, tzinfo=LOCAL).timestamp())
+        bridge.long_tasks.replace_schedule("alice", vault.record("alice")[0], "mail", "08:00", "rev", created)
+        bridge.enqueue_due(created + 3600)
+        job = bridge.queue.popleft()
+        vault.forget("alice")
+        await bridge.run_job(job)
+        self.assertEqual(bridge.receipt("alice", job.id)["receipt"]["status"], "cancelled")
+        self.assertIn(job.id, bridge.schedule_status("alice"))
+        worker.assert_not_called()
+
+    async def test_cancel_only_targets_owners_active_long_job_and_releases_slot(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())
+        self.addCleanup(vault.db.close)
+        vault.bind("alice", AUTH, True)
+        entered = asyncio.Event()
+
+        async def worker(payload, timeout, *, cancel, progress):
+            progress("模拟进度 1/3")
+            entered.set()
+            await cancel.wait()
+            return {"status": "cancelled", "details": ["模拟已完成第一关"]}
+
+        bridge = Bridge(vault, worker, ORIGIN)
+        job = bridge.submit("alice", "activity", "BH001 0 3 100", "queue")["job"]
+        consumer = asyncio.create_task(bridge.consume())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            self.assertIn("模拟进度 1/3", bridge.status("alice"))
+            self.assertNotIn("模拟进度", bridge.status("bob"))
+            self.assertNotIn("请求停止", bridge.cancel("bob", job_id=job))
+            plan = bridge.prepare("alice", "cancel", "", preview="停止活动", event="request")
+            self.assertIn("请求停止", bridge.approve("alice", plan["approval"], "accept", None)["message"])
+            for _ in range(50):
+                if bridge.active is None:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIsNone(bridge.active)
+            self.assertEqual(bridge.receipt("alice", job)["receipt"]["details"], ["模拟已完成第一关"])
+        finally:
+            consumer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await consumer
+
     async def test_waiting_login_notifications_wake_and_only_one_collects(self):
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())
@@ -300,6 +423,31 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await Worker(directory, sys.executable)({"action": "test"}, 1)
         self.assertEqual(result, {"status": "timeout"})
+        pid, work = (directory / "worker-state").read_text().splitlines()
+        self.assertFalse(Path("/proc", pid).exists())
+        self.assertFalse(Path(work).exists())
+
+    async def test_streaming_worker_reports_progress_then_stops_and_reaps(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (directory / "backend").mkdir()
+        (directory / "backend/bot_worker.py").write_text(
+            "import json, os, signal, sys, threading\nfrom pathlib import Path\n"
+            "stop = threading.Event()\nsignal.signal(signal.SIGTERM, lambda *_: stop.set())\n"
+            "Path('worker-state').write_text(str(os.getpid()) + '\\n' + os.environ['ARK_DATA_DIR'])\n"
+            "assert json.loads(sys.stdin.readline())['stream']\n"
+            "print(json.dumps({'progress':'one stage'}), flush=True)\n"
+            "assert stop.wait(10)\nprint(json.dumps({'status':'cancelled'}), flush=True)\n", encoding="utf-8",
+        )
+        cancel = asyncio.Event()
+        messages = []
+
+        def progress(message):
+            messages.append(message)
+            cancel.set()
+
+        result = await Worker(directory, sys.executable)({"action": "test"}, 5, cancel=cancel, progress=progress)
+        self.assertEqual(result, {"status": "cancelled"})
+        self.assertEqual(messages, ["one stage"])
         pid, work = (directory / "worker-state").read_text().splitlines()
         self.assertFalse(Path("/proc", pid).exists())
         self.assertFalse(Path(work).exists())

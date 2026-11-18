@@ -16,6 +16,8 @@ from tempfile import TemporaryDirectory
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from .long_tasks import LONG_NAMES, LONG_QUEUE_TTL, SCHEDULE_TASKS, TASK_TIMEOUT, LongTasks, schedule_arguments
+
 
 TICKET_TTL = 300
 LOGIN_TIMEOUT = 110
@@ -30,6 +32,7 @@ TASK_NAMES = {
     "dispatch": "派遣领取", "achievement": "成就奖励", "guild": "佣兵团签到",
     "guild_weekly": "佣兵团周奖励", "donate": "佣兵团捐赠", "recruit": "免费招募",
     "stages": "扫荡关卡查询", "equipment": "装备筛选",
+    "long_info": "长任务查询", **LONG_NAMES,
 }
 APPROVALS = {
     ("donate", "gold"): "佣兵团捐赠 1 次，最多消耗 5000 金币。",
@@ -47,6 +50,8 @@ OUTCOMES = {
     "invalid_code": "兑换码无效或已过期。",
     "unexpected_cost": "游戏返回了意外消耗，请核对账户。",
     "duplicate_login": "检测到重复登录，已停止。请退出游戏客户端后再手动发起。",
+    "partial": "部分操作已经游戏确认，详见回执。",
+    "cancelled": "已停止，游戏已确认的操作见回执。",
 }
 
 
@@ -193,7 +198,7 @@ class LoginNotice:
 def lobby_message(summary: str) -> str:
     return (f"璐茜玛大厅\n{summary}\n\n"
             "/璐茜玛 签到 · 领邮件 · 领基地\n"
-            "/璐茜玛 进阶 · 状态 · 回执")
+            "/璐茜玛 进阶 · 长任务 · 状态 · 回执")
 
 
 @dataclass
@@ -203,6 +208,18 @@ class Job:
     code: str
     created: float
     id: str = field(default_factory=lambda: secrets.token_urlsafe(12))
+    game: str | None = None
+    schedule: str | None = None
+    progress: str = ""
+    cancel: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def durable(self) -> bool:
+        return self.task in LONG_NAMES or self.schedule is not None
+
+    @property
+    def label(self) -> str:
+        return ("托管·" if self.schedule else "") + TASK_NAMES[self.task]
 
 
 @dataclass
@@ -220,7 +237,7 @@ class Worker:
         self.root = root
         self.python = python
 
-    async def __call__(self, payload: dict, timeout: int) -> dict:
+    async def __call__(self, payload: dict, timeout: int, *, cancel=None, progress=None) -> dict:
         with TemporaryDirectory(prefix="lucima-worker-") as directory:
             env = {key: os.environ[key] for key in (
                 "PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
@@ -239,6 +256,8 @@ class Worker:
                 raise
             except OSError:
                 return {"status": "worker_error"}
+            if cancel is not None:
+                return await self.stream(proc, {**payload, "stream": True}, timeout, cancel, progress)
             exchange = asyncio.create_task(proc.communicate(json.dumps(payload).encode() + b"\n"))
             try:
                 stdout, _ = await asyncio.wait_for(asyncio.shield(exchange), timeout)
@@ -257,6 +276,53 @@ class Worker:
                 result = None
             return result if isinstance(result, dict) else {"status": "worker_error"}
 
+    async def stream(self, proc, payload, timeout, cancel, progress):
+        async def exchange():
+            proc.stdin.write(json.dumps(payload).encode() + b"\n")
+            await proc.stdin.drain()
+            proc.stdin.close()
+            result = None
+            while line := await proc.stdout.readline():
+                if len(line) >= 16_384 or result is not None:
+                    raise ValueError("invalid worker stream")
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("invalid worker response")
+                if set(row) == {"progress"} and isinstance(row["progress"], str):
+                    progress(row["progress"])
+                else:
+                    result = row
+            await proc.wait()
+            return result if result and proc.returncode == 0 else {"status": "worker_error"}
+
+        async def request_stop():
+            await cancel.wait()
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), 12)
+                except ProcessLookupError:
+                    pass
+                except asyncio.TimeoutError:
+                    await self.stop(proc)
+
+        stopper = asyncio.create_task(request_stop())
+        try:
+            return await asyncio.wait_for(exchange(), timeout)
+        except asyncio.TimeoutError:
+            return {"status": "timeout"}
+        except (OSError, ValueError):
+            return {"status": "worker_error"}
+        finally:
+            stopper.cancel()
+            try:
+                await stopper
+            except asyncio.CancelledError:
+                pass
+            if proc.returncode is None:
+                # Drain stdout concurrently with process exit so a full pipe cannot hold the slot.
+                await asyncio.gather(self.stop(proc), proc.stdout.read())
+
     @staticmethod
     async def stop(proc) -> None:
         if proc.returncode is None:
@@ -270,6 +336,7 @@ class Worker:
 class Bridge:
     def __init__(self, vault: Vault, worker: Worker, public_origin: str):
         self.vault = vault
+        self.long_tasks = LongTasks(vault.db, int(time.time()))
         self.worker = worker
         self.public_origin = public_origin
         self.tickets: dict[str, Ticket] = {}
@@ -297,9 +364,10 @@ class Bridge:
         self.receipts = {key: result for key, result in self.receipts.items() if result[1] > now}
         self.plans = {key: plan for key, plan in self.plans.items() if plan.expires > now}
         self.submitted = {key: expiry for key, expiry in self.submitted.items() if expiry > now}
-        while self.queue and now - self.queue[0].created >= QUEUE_TTL:
-            job = self.queue.popleft()
-            self.result(job, "排队已超时，请重新提交。", "queue_expired")
+        for job in tuple(self.queue):
+            if now - job.created >= (LONG_QUEUE_TTL if job.durable else QUEUE_TTL):
+                self.queue.remove(job)
+                self.result(job, "排队已超时，请重新提交。", "queue_expired")
 
     def drop_tickets(self, owner: str) -> None:
         self.tickets = {key: ticket for key, ticket in self.tickets.items() if ticket.owner != owner}
@@ -388,6 +456,7 @@ class Bridge:
             return 429, "执行服务正忙，请稍等后再提交。"
         if owner in self.attempts:
             return 429, "刚尝试过登录，请稍等后再提交。"
+        had_remembered = self.vault.candidate(owner) is not None
         saved_auth = self.vault.load(owner) if use_saved and not ticket.saved_attempted else None
         if use_saved and (saved_auth is None or not saved_auth["refresh_token"]):
             return 409, "已保存的授权暂不可用，请填写账号密码登录。"
@@ -417,6 +486,8 @@ class Bridge:
                 self.drop_tickets(owner)
             elif not self.vault.bind(owner, auth, saved, account=account):
                 return 409, "该账号无法与此 QQ 身份绑定。若要切换已有绑定，请先在私聊解绑。"
+            if not saved or not had_remembered:
+                self.stop_schedule(owner)
             self.sessions[owner] = (time.monotonic() + SESSION_TTL, auth)
             self.last.pop(owner, None)
             self.plans.pop(owner, None)
@@ -455,8 +526,13 @@ class Bridge:
         if owner not in self.plans and len(self.plans) >= 256:
             return {"message": "待确认操作已满，请稍后再试。"}
         binding = self.vault.record(owner)
+        if task in LONG_NAMES and (binding is None or not self.auth_for(owner)):
+            return {"message": "请先用 /璐茜玛 登录 完成扫码。"}
+        if task == "schedule_set" and not self.vault.candidate(owner):
+            return {"message": "请在登录网页勾选记住 30 天，再设置托管。"}
         if task == "cancel":
-            code = next((job.id for job in self.queue if job.owner == owner), "")
+            code = next((job.id for job in (*self.queue, self.active_job)
+                         if job and job.owner == owner and (job is not self.active_job or job.task in LONG_NAMES)), "")
         plan = Plan(secrets.token_urlsafe(12), task, code, time.monotonic() + 300,
                     binding[0] if binding else None, event)
         self.plans[owner] = plan
@@ -489,7 +565,7 @@ class Bridge:
         del self.plans[owner]
         return "已放弃这份待确认操作。"
 
-    def submit(self, owner: str, task: str, code: str, message_id: str) -> dict:
+    def submit(self, owner: str, task: str, code: str, message_id: str, *, scheduled=None) -> dict:
         self.prune()
         anchor = (owner, message_id)
         if anchor in self.submitted:
@@ -500,21 +576,37 @@ class Bridge:
             return {"message": "请先用 /璐茜玛 登录 完成扫码。"}
         if len(self.queue) >= QUEUE_SIZE:
             return {"message": "游戏任务队列已满，请稍后再试。"}
+        job = Job(owner, task, code, time.monotonic())
+        binding = self.vault.record(owner)
+        job.game = binding[0] if binding else None
+        if scheduled:
+            job.schedule = scheduled[1]
+        if job.durable and not self.long_tasks.enqueue(job, job.label, int(time.time()), scheduled):
+            return {"message": "本次托管已处理或计划已变化。"}
         self.submitted[anchor] = time.monotonic() + 600
         self.last.pop(owner, None)
-        job = Job(owner, task, code, time.monotonic())
         self.queue.append(job)
         self.wake.set()
-        return {"message": f"已提交{TASK_NAMES[task]}。用 /璐茜玛 状态 查看进度。", "job": job.id}
+        response = {"message": f"已提交{TASK_NAMES[task]}。用 /璐茜玛 状态 查看进度。", "job": job.id}
+        if job.durable:
+            response.update(long_job=True, message=response["message"] + f"\n回执编号 {job.id}")
+        return response
 
     def status(self, owner: str) -> str:
         self.prune()
         if self.active == owner:
+            if (job := self.active_job) and job.durable:
+                phase = "正在停止" if job.cancel.is_set() else "正在执行"
+                return f"{job.label}{phase}。{job.progress}\n回执编号 {job.id}"
             return "正在处理你的操作。"
-        if any(job.owner == owner for job in self.queue):
-            return "你的任务正在排队。"
+        for index, job in enumerate(self.queue, 1):
+            if job.owner == owner:
+                return f"{job.label}正在排队，前面还有 {index - 1 + int(self.active is not None)} 项。"
         if owner in self.last:
             return self.last[owner][1]
+        previous = self.long_tasks.receipt(owner, "", int(time.time()))
+        if previous:
+            return previous["message"]
         if self.auth_for(owner):
             return "账号已授权，当前没有任务。"
         return "当前无有效授权。请用 /璐茜玛 登录 扫码。"
@@ -527,6 +619,10 @@ class Bridge:
                 self.queue.remove(job)
                 self.result(job, "已取消排队任务。", "cancelled")
                 return "已取消排队任务。"
+        job = self.active_job
+        if job and job.owner == owner and job.task in LONG_NAMES and (job_id is None or job.id == job_id):
+            job.cancel.set()
+            return "已请求停止。正在提交的操作以游戏结算和最终回执为准。"
         if plan:
             return "已取消待确认操作。"
         if job_id is not None:
@@ -543,14 +639,59 @@ class Bridge:
         self.sessions.pop(owner, None)
         self.last.pop(owner, None)
         self.receipts = {key: row for key, row in self.receipts.items() if row[0] != owner}
+        self.long_tasks.clear(owner)
         return "已解除绑定并清除本服务的登录授权。"
+
+    def set_schedule(self, owner: str, code: str) -> str:
+        binding, args = self.vault.record(owner), schedule_arguments(code)
+        if not binding or not args or not self.vault.candidate(owner):
+            return "记住的登录授权不可用，请重新扫码。"
+        task, hhmm = args
+        self.cancel_queued_schedule(owner)
+        self.long_tasks.replace_schedule(owner, binding[0], task, hhmm, secrets.token_urlsafe(12), int(time.time()))
+        self.wake.set()
+        return f"托管已启用。每天北京时间 {hhmm} 执行{SCHEDULE_TASKS[task]}。"
+
+    def schedule_status(self, owner: str) -> str:
+        record = self.long_tasks.schedule(owner)
+        receipt = self.long_tasks.receipt(owner, "", int(time.time()), scheduled_only=True)
+        result = f"\n最近托管回执 /璐茜玛 回执 {receipt['id']}" if receipt else ""
+        if not record or not self.vault.candidate(owner):
+            return "当前没有有效的托管计划。" + result
+        _, task, hhmm, first, last, _ = record
+        recent = f"\n最近排队日期 {last}" if last else ""
+        return f"每天北京时间 {hhmm} 执行{SCHEDULE_TASKS[task]}，自 {first} 起。{recent}{result}"
+
+    def cancel_queued_schedule(self, owner: str) -> None:
+        for job in tuple(self.queue):
+            if job.owner == owner and job.schedule:
+                self.queue.remove(job)
+                self.result(job, "已取消排队中的托管任务。", "cancelled")
+
+    def stop_schedule(self, owner: str) -> str:
+        self.long_tasks.stop(owner)
+        self.cancel_queued_schedule(owner)
+        return "已停止托管，并取消排队中的托管任务。"
+
+    def enqueue_due(self, now: int) -> None:
+        if len(self.queue) >= QUEUE_SIZE:
+            return
+        for owner, task, day, revision in self.long_tasks.due(now, QUEUE_SIZE + 1):
+            if not self.vault.candidate(owner):
+                self.stop_schedule(owner)
+                continue
+            self.submit(owner, task, "", f"schedule:{revision}:{day}", scheduled=(day, revision))
+            if len(self.queue) >= QUEUE_SIZE:
+                break
 
     def result(self, job: Job, message: str, status: str, details=None) -> None:
         expires = time.monotonic() + 3600
         facts = details if isinstance(details, list) else []
         clean = [" ".join(item.split())[:120] for item in facts[:8] if isinstance(item, str)]
-        payload = {"id": job.id, "task": TASK_NAMES[job.task], "status": status,
+        payload = {"id": job.id, "task": job.label, "status": status,
                    "message": message, "details": clean, "completed_at": int(time.time())}
+        if job.durable:
+            self.long_tasks.finish(job.id, payload)
         self.last[job.owner] = (expires, message)
         self.receipts[job.id] = (job.owner, expires, payload)
         if len(self.receipts) > 512:
@@ -562,6 +703,9 @@ class Bridge:
             stored = self.receipts.get(job_id)
         else:
             stored = next((row for row in reversed(self.receipts.values()) if row[0] == owner), None)
+        durable = self.long_tasks.receipt(owner, job_id, int(time.time()))
+        if durable and (not stored or stored[0] != owner or durable["completed_at"] > stored[2]["completed_at"]):
+            return {"message": durable["message"], "receipt": durable}
         if stored and stored[0] == owner:
             return {"message": stored[2]["message"], "receipt": stored[2]}
         if job_id and any(job and job.id == job_id and job.owner == owner
@@ -573,6 +717,9 @@ class Bridge:
         while True:
             self.prune()
             self.vault.expire()
+            now = int(time.time())
+            self.long_tasks.prune(now)
+            self.enqueue_due(now)
             if self.active or not self.queue:
                 self.wake.clear()
                 try:
@@ -593,10 +740,27 @@ class Bridge:
 
     async def run_job(self, job: Job) -> None:
         auth = self.auth_for(job.owner)
-        if not auth:
+        binding = self.vault.record(job.owner)
+        if not auth or job.game != (binding[0] if binding else None):
             self.result(job, OUTCOMES["auth_expired"], "auth_expired")
             return
-        result = await self.worker({"action": "run", "auth": auth, "task": job.task, "code": job.code}, 100)
+        if job.schedule:
+            schedule = self.long_tasks.schedule(job.owner)
+            auth = self.vault.load(job.owner)
+            if not schedule or schedule[-1] != job.schedule or not auth or not auth["refresh_token"]:
+                self.result(job, "托管授权已失效或计划已变化，本次任务已取消。", "cancelled")
+                return
+        payload = {"action": "run", "auth": auth, "task": job.task, "code": job.code}
+        if job.durable:
+            def update(message):
+                job.progress = " ".join(message.split())[:160]
+                self.long_tasks.progress(job.id, job.progress, int(time.time()))
+
+            update("正在准备游戏连接")
+        if job.task in LONG_NAMES:
+            result = await self.worker(payload, TASK_TIMEOUT, cancel=job.cancel, progress=update)
+        else:
+            result = await self.worker(payload, 100)
         status = result.get("status")
         if not isinstance(status, str) or status not in OUTCOMES:
             status = "worker_error"
@@ -604,10 +768,14 @@ class Bridge:
         if status == "auth_expired":
             self.sessions.pop(job.owner, None)
             self.vault.forget(job.owner)
+            self.stop_schedule(job.owner)
         elif refreshed and refreshed["user_id"] == auth["user_id"]:
             session = self.sessions.get(job.owner)
             if session and session[0] > time.monotonic():
                 self.sessions[job.owner] = (session[0], refreshed)
             if refreshed != auth:
                 self.vault.update(job.owner, refreshed)
-        self.result(job, f"{TASK_NAMES[job.task]}：{OUTCOMES[status]}", status, result.get("details"))
+        details = result.get("details")
+        if not details and job.progress and status in {"timeout", "worker_error", "unconfirmed"}:
+            details = [f"停止前进度：{job.progress}"]
+        self.result(job, f"{job.label}：{OUTCOMES[status]}", status, details)

@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
+from .long_tasks import CONFIRMED_OPERATIONS, preview as long_preview
 from .service import APPROVALS, Bridge, TASK_NAMES, TICKET_TTL, Vault, Worker
 
 
@@ -213,8 +214,12 @@ async def command_context(request: Request):
 
 
 def operation_preview(action: str, arg: str) -> str | None:
-    if not isinstance(arg, str):
+    if not isinstance(arg, str) or len(arg) > 255:
         return None
+    if action in CONFIRMED_OPERATIONS:
+        return long_preview(action, arg)
+    if action == "long_info" and arg in {"activity", "abyss", "shop"}:
+        return "查询长任务可用的关卡、队伍或商品报价。"
     display_arg = re.sub(r"([\\`*_\[\]()<>])", r"\\\1", arg.strip())
     if (action, arg) in APPROVALS:
         return APPROVALS[(action, arg)]
@@ -232,8 +237,9 @@ def operation_preview(action: str, arg: str) -> str | None:
         "login": "生成私聊扫码登录链接。账号密码在登录网页填写。",
         "status": "查看你的 Lucima 授权和任务状态。",
         "receipt": "在原私聊取回最近一张 Lucima 任务回执。",
-        "cancel": "取消此刻仍在排队的任务。已经开始的任务会继续运行。",
+        "cancel": "取消当前排队任务，或请求停止正在执行的长任务。",
         "unbind": "解除当前游戏账号绑定并清除 Lucima 保存的登录授权。",
+        "schedule_status": "查看当前托管计划和最近排队日期。",
     }
     if action in labels:
         return labels[action]
@@ -253,6 +259,12 @@ def execute_operation(bridge, owner: str, action: str, arg: str, event: str, cat
         return {"message": bridge.unbind(owner)}
     if action == "receipt":
         return bridge.receipt(owner, arg)
+    if action == "schedule_set":
+        return {"message": bridge.set_schedule(owner, arg)}
+    if action == "schedule_stop":
+        return {"message": bridge.stop_schedule(owner)}
+    if action == "schedule_status":
+        return {"message": bridge.schedule_status(owner)}
     if action == "encyclopedia":
         query = arg.strip().casefold()
         matches = [line for names, line in catalog if query in names]
@@ -300,6 +312,9 @@ async def command(request: Request):
         return execute(action, arg)
     if (action, arg) in APPROVALS:
         return bridge.prepare(owner, action, arg, event=event)
-    if operation_preview(action, arg) is not None:
+    preview = operation_preview(action, arg)
+    if preview is not None:
+        if action in CONFIRMED_OPERATIONS:
+            return bridge.prepare(owner, action, arg, preview=preview, event=event)
         return execute(action, arg)
     return answer("命令无效。", 400)
