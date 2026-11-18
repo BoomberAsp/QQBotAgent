@@ -43,6 +43,15 @@ def bot_env(key: str, default: str = "") -> str:
 
 USER_DATA_ROOT = Path(bot_env("USER_DATA_ROOT", str(ROOT / "data" / "users")))
 
+# Story readers use os.environ, while this panel only reads dotenv_values.
+# Match the bot's load_dotenv(override=False) precedence, including custom
+# registries and Ark sources. Do not inject the panel's development fallback.
+for _story_key in ("USER_DATA_ROOT", "STORY_KB_DATA_ROOT", "STORY_KB_REGISTRY",
+                   "STORY_KB_DIR", "STORY_GDATA_DB"):
+    if _BOT_ENV.get(_story_key):
+        os.environ.setdefault(_story_key, str(_BOT_ENV[_story_key]))
+
+
 # 角色卡 / 羁绊 / 多模态资产（与 bot 侧同源约定）。
 # ⚠️ 面板进程**不调用 load_dotenv**（只用 dotenv_values 读 _BOT_ENV），所以
 # os.environ 里没有 CHARACTERS_DIR —— 必须在这里显式解析，并显式传参给
@@ -198,3 +207,10 @@ def log_sources() -> dict:
 os.environ.setdefault("MEDIA_DATA_ROOT", bot_env("MEDIA_DATA_ROOT", str(QQBOT_DIR / "data" / "media_runtime")))
 
 os.environ.setdefault("PERSONA_RESOURCE_REGISTRY",bot_env("PERSONA_RESOURCE_REGISTRY",str(QQBOT_DIR/"data/persona_resources/registry.json")))
+
+# 兑换码 X 源：面板「粘贴推文链接」走 crc._fetch_url(use_proxy=True)，它读
+# os.environ 里的 REDEEM_CODE_PROXY。面板不 load_dotenv，不注入的话服务器上
+# URL 解析会因「无代理」静默失败。未配置时不注入，保留直连行为（开发机）。
+_REDEEM_PROXY = bot_env("REDEEM_CODE_PROXY", "")
+if _REDEEM_PROXY:
+    os.environ.setdefault("REDEEM_CODE_PROXY", _REDEEM_PROXY)

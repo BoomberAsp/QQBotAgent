@@ -29,6 +29,29 @@ async def query(request:Request):
     except ValueError:raise HTTPException(400,'JSON无效')
     return await call(service.query,str(data.get('kb','')),str(data.get('sql','')))
 
+@router.get('/stories')
+async def stories():
+    from . import story_admin
+    return await call(story_admin.catalog)
+
+@router.post('/story-query')
+async def story_query(request:Request):
+    import json
+    from . import story_admin
+    try:data=json.loads(await body(request))
+    except ValueError:raise HTTPException(400,'JSON无效')
+    if not isinstance(data,dict):raise HTTPException(400,'请求必须是 JSON 对象')
+    return await call(story_admin.query,str(data.get('kb','')),str(data.get('source','')),str(data.get('sql','')))
+
+@router.post('/story-search')
+async def story_search(request:Request):
+    import json
+    from . import story_admin
+    try:data=json.loads(await body(request))
+    except ValueError:raise HTTPException(400,'JSON无效')
+    if not isinstance(data,dict):raise HTTPException(400,'请求必须是 JSON 对象')
+    return await call(story_admin.search,str(data.get('kb','')),str(data.get('query','')),str(data.get('persona','')))
+
 @router.post('/knowledge')
 async def publish(request:Request):
     import json

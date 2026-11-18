@@ -59,7 +59,7 @@ QQBotAgent/
 │   ├── qqbot-official-buttons-design.md   #   官方渠道按钮交互设计（功能盘点 + 接入方案）
 │   ├── 更新日志.md / aliyun_models_api.md / COMPARISON-QQBOTAGENT.md
 │   └── QQBOTAGENT-IMPROVEMENT-PLAN.md / openrubi_migration_plan.md / bot-site-nginx.md
-├── test/                       # 离线测试与实验脚本（gitignore，仅开发机；test.sh 调用其中 11 个）
+├── test/                       # 离线测试与实验脚本（gitignore，仅开发机；test.sh 调用其中 17 个）
 ├── evidence/                   # 验证证据 / 截图
 ├── *.md                        # 设计与计划文档（Bond / Story-KB / Voice / Cache-Hit-Rate / Memory 等）
 │
@@ -106,6 +106,8 @@ QQBotAgent/
     │   ├── qq_official.py      #   官方入口 + 每日主动循环（角色信箱信封 + 主动发媒体，双向互斥）+ 拒收/恢复事件 + 状态心跳 + 邮件管理队列 worker（面板删信/系统邮件，§16.2）
     │   ├── qq_official_buttons.py  # 官方 INTERACTION_CREATE 回调入口（幂等+限频+审计）
     │   ├── pullingMonitor.py / check_redeem_code.py / ruyipage_fetch.py / offline_logger.py
+    │   ├── redeem_x_source.py  #   兑换码 X 官方推文源（SearXNG 发现 + syndication 抓取，零 nonebot 依赖）
+    │   ├── redeem_x_poll.py    #   X 源周期轮询（REDEEM_CODE_X=on 时每 2h，失败指数退避）
     │   └── group.py / speed.py / photos.py / test.py / utils.py（旧插件，仅保留个别工具函数）
     │
     ├── tools/                  # Agent 工具实现
@@ -129,6 +131,7 @@ QQBotAgent/
     │   ├── story_kb.py         #   原作剧情检索（SQLite FTS5 + BM25/RRF）
     │   ├── ocr_engine.py / buff_alias.py / status_icons.py
     │   ├── browser_fetch.py    #   ruyiPage 无头浏览器抓取共享运行器
+    │   ├── reverse_search/     #   找图反查（net/engines/accounts/consensus/quota/vlm/render/service + browser/lens）
     │   ├── status_heartbeat.py #   状态文件原子读写（面板↔bot 文件 IPC）
     │   ├── errors.py           #   错误分类 + 诊断编号
     │   └── amap_client.py
@@ -168,7 +171,7 @@ QQBotAgent/
         ├── feedback/           #   用户反馈 / Bug 报告
         ├── name_index/         #   角色名索引缓存
         ├── wiki_cache/         #   Wiki 爬取缓存与卡片图
-        ├── redeem_code/        #   兑换码缓存
+        ├── redeem_code/        #   兑换码缓存 + admin_alert.json + x_seen.json（X 源已见推文状态）
         ├── mailboxes/          #   角色信箱（每用户信件/摘要 JSON，28 天保留；bot 单写、面板只读）
         ├── mail_admin/         #   面板邮件管理队列（queue/processing/status；面板写、bot 认领执行回写）
         ├── changelog/          #   更新记录 + 公告 + 群发/群列表文件队列（按需创建）
@@ -708,11 +711,12 @@ turn.py / 入口插件
 | 人格 | `/personality`、`/人格切换`（均支持带名称；无 `#` 变体；特殊会话内只写会话绑定，`--全局` 后缀改写用户默认） |
 | 养成 | `/好感度`（`#好感度`/`/bond`）、`/剧情`、`/设好感 <1-10>`、`/创建角色`、`/删除角色`（回复「确认删除角色 <名称>」）、`/设形象`、`/形象`（`/查看形象`）、`/清除形象`（`/删形象`）、`/邮件`（角色信箱，仅官方单聊：列表/`下一页`/`p<N>`/`MM-DD`/信件编号看全文并标记已读；系统邮件带【系统】前缀，面板删除过的信件显示「已被撤回」） |
 | 游戏 | `/兑换码`（`/redeem-code`）、`/长期兑换码`、`/角色详情 <名>`、`/羁绊详情 <名>`、`/刷新角色数据`（仅 admin） |
+| 找图 | `/找图`（`#找图`/`/找源`/`/找作者`）、`/找图帮助`（图片 + 命令 / 引用图 / `/找图 <URL>`；反查出处账号 + 番剧作品 + 真人/coser 社交账号（Lens），零 token；私聊与群聊均可用，群聊需 @机器人、配额共用；热读开关 `FIND_SOURCE_ENABLED`、`FIND_SOURCE_LENS`） |
 | 群管理 | `/toggle`、`/toggle <gacha\|image\|voice> <on\|off>`、`/toggle personality [名称\|默认]`（仅群聊 + admin） |
 | 其他 | `/功能`（`/features`）、`/更新日志 [d]`（多个别名）、`/管理工作区`（落入 agent）、`/取消`（`#取消`/`/结束`/`#结束`，连续对话窗口内）、`/免责声明`（`#免责声明`；查看/`关`/`开` 免责尾追加，三级用户均可，按渠道独立） |
 | 反馈 | `#反馈 <内容>`、`#bug <描述>`、`#建议 <内容>`（**必须用空格分隔**，且三者都零 token 直达开发者） |
 
-> 分发顺序（命中即 return）：反馈 → `/取消` → `/toggle` → `/兑换码` → `/角色详情` → `/羁绊详情` → `/邮件` → `/免责声明` → `/刷新角色数据` → `/功能` → `/更新日志` → `/人格切换` → `/好感度` → `/设好感` → `/剧情` → 会话族 → 形象族 → 元命令（`/clear`、`/status` 等）→ Agent。
+> 分发顺序（命中即 return）：反馈 → `/取消` → `/toggle` → `/兑换码` → `/角色详情` → `/羁绊详情` → `/邮件` → `/免责声明` → `/刷新角色数据` → `/功能` → `/更新日志` → `/人格切换` → `/好感度` → `/设好感` → `/剧情` → 会话族 → 形象族 → 找图族 → 元命令（`/clear`、`/status` 等）→ Agent。
 > 特例：`/帮助` 由会话族处理（渲染 HELP.md 卡片）；`/管理工作区` 与私聊 `/取消` 会落入 Agent。
 
 #### 已注册工具（40 个）
@@ -891,6 +895,33 @@ sha256 乐观锁（并发改 → 409）、保存前静态体检（L1–L14：非
 - `rate_limit.py`：`TokenBucket`/`ChannelLimiter`（c2c 10/s、group 1/s，按渠道懒建复用，可注入 monotonic）。
 - `group_registry.py`：官方群登记表 `data/group_registry.json`（v1 纯记账）：`GROUP_AT_MESSAGE_CREATE` 入站 upsert（60s 粒度节流防文件 churn），status `active/left/unknown` 状态机 + `active_enabled` 开关，为 P1 群主动消息预铺。
 
+### 2.17 `lib/reverse_search/` — 找图反查（一期 HTTP 引擎 + 二期 Google Lens）
+
+`find_image_source` 是普通用户可用的智能体工具。首查无需参数，之后最多复查两次，可用本轮 ID 查询水印或核验候选页。一次确认绑定一张图和一次查询配额。私聊裸图、群里直接发给机器人的裸图会附上确认问题；发图者在同一会话五分钟内的下一轮回复可确认，带图明确请求查来源也可授权。待查图片绑定到会话与发送者，群聊只读取本群工作区的附件。
+
+首查结果在内存保留五分钟，绑定发送者、会话和群配置代次。私聊或已参与的群聊里，可追问「帮我查那个账号」或「继续查原帖」。`tools/image_source_followup.py` 直接复用结果，使用 20 秒总预算，最多读取两页。账号续查优先读取公开主页简介，发现多个账号时请用户指定。原帖续查优先对具体帖子的媒体做同图核验，使用会话工作区里内容哈希一致的附件。超时会返回已找到的链接和核验状态。
+
+设计见 `docs/找图反查-方案.md`。一期纯 HTTP 引擎 + VLM 识别 + 同名共识；二期接 Google Lens（无头 Chrome 裸 CDP，spike 3/3 零验证码；Yandex 留三期）。命令 `/找图`（`/找源`/`/找作者`/`/找图帮助`）在 `agent/turn.py::_handle_find_source_command` 直连拦截（零 token，双适配器经 `run_agent_turn`），取图复用 `view.load_attachments()` + OneBot `quoted_file_paths` 引用兜底 + `/找图 <URL>`（`net.safe_download`）；选图落 `[找图] 选图` 日志（source/quoted/文件名/bytes/sha256 前 12 位/msg_id）——2026-11-17 用户报「查的是上一张图」，取证为平台送达旧图（保存的附件本就是芙莉莲图）而非选图 bug，此日志供后续对质。群聊走独立分发：`/找图`（别名 `/找源`/`/找作者`）与 `/找图帮助` 注册在 `agent/public_commands.py::PUBLIC_COMMANDS`（`needs_view=True`，`dispatch_public` 透传 view 供取附件），由 `group_commands.dispatch` 在 @机器人/回复机器人时调用，自动进 `/群帮助` 列表；配额/冷却/缓存与私聊共用同一 `QuotaStore`。
+
+| 模块 | 职责 |
+|---|---|
+| `net.py` | 魔数判格式（PNG/JPG/GIF/WEBP/BMP）、`validate_image`（512B–20MB）、SSRF 校验 `check_url_allowed`（http(s) + 公网 IP，挡内网/环回/.local/.internal）、`safe_download`（重定向末 URL 复校验 + 大小上限）、`compress_for_upload`（>2MB 或长边 >2048 时白底合成 alpha + 长边 2048/JPEG q88；压缩后不小于原图或解码失败则原样返回。引擎指纹工作尺寸远低于 2048，真匹配 A/B 实测命中集合与排序稳定） |
+| `engines.py` | 四引擎适配（PicImageSearch `file=bytes` 直传，无需图床）：SauceNAO（`SAUCENAO_API_KEY`，免费档 4 次/30s、100 次/24h；匿名 API 已被官方禁用）/ IQDB / ascii2d / trace.moe（库内相似度已 ×100）。统一 `Candidate`；`run_engines` 并发 gather + 30s/引擎超时，引擎级失败分类 `ENGINE_ERROR/QUOTA/TIMEOUT` 不拖垮整体。日志记录主机、TCP/TLS、上传、响应头/体及状态码。IQDB 收到响应头后，整个响应体最多读取 8 秒 |
+| `accounts.py` | 规范化页面链接，按已知平台帖子 ID 去重，分别识别作者主页与帖子。 |
+| `consensus.py` | 按账号关联的独立来源页计算证据。弱相似画作留作线索，Lens 主页命中保留为待核验账号。 |
+| `quota.py` | 配额沿用 30 秒冷却、每人每天 20 次、全服每天 100 次。图片哈希加策略版本作为缓存键，完整结论缓存 30 天，弱证据或部分引擎失败缓存 1 小时。 |
+| `vlm.py` | 结构化提取作品、角色和图中水印。模型未返回有效 JSON 时保留文本识别，水印账号可供同轮复查。 |
+| `render.py` | 独立展示同图页面、页面署名、账号候选、待核实来源线索及作品识别。低置信账号在有视觉识别时也可见。 |
+| `service.py` | 并行首查、按证据聚合、写入版本化缓存。命令直接渲染首查，智能体可复查并使用同一证据版式回复。完全匹配的具体帖子优先展示，页面核验失败时保留候选链接。命中完全匹配帖子、已核验同图或引擎识别作品时，保留水印并省略视觉推测。 |
+| `source_evidence.py` | 来源页独立于账号结论，记录引擎、匹配模式及核验状态。 |
+| `source_verification.py` | SearXNG 精确水印查找，读已核对账号的公开主页简介，验证具体候选帖的媒体与署名。每次重定向检查公网目标，限制响应大小。X 主页代理用系统 curl 连接经校验的公网 IP，使用原域名验证 TLS 证书，别名重定向需保持同一账号，连接或 TLS 失败时最多重试一次。 |
+| `browser.py` | 二期：无头 Chrome 裸 CDP 驱动（asyncio subprocess + aiohttp WebSocket，无 playwright）。`find_chrome`（`CHROME_BIN` 热读覆盖）、`chrome_ua`（大版本对齐）、启动旗标组合回退 + 成功记忆、`resolve_redirect`（Fetch.requestPaused 拦截非 Google 请求 + 页面 URL 轮询 + HTML 捞地址，绝不拉目标页）、`sem()` 并发闸固定 1；`send()` 把 CDP 超时统一转 `BrowserError`（裸 `asyncio.TimeoutError` 会穿透 navigate/wait_for 轮询、被误标成「Lens 总超时」，一次慢探针即杀掉整次搜索——2026-11-17 真实运行 7.4s 假超时事故后加固）。与 `browser_fetch.py`（ruyiPage Firefox 指纹）互不复用 |
+| `lens.py` | 同一 Chrome 会话上传一次，先读默认结果页，按唯一落地页推进跳转卡片解链，必要时在预算内补查完全匹配。保存候选的匹配页类型与补查状态。首页等待新主文档提交并进入 interactive/complete，12 秒内最多导航两次。日志关联主文档请求与响应，上传提交、结果导航和解析分别限时，补查异常时保留默认页结果。 |
+
+HTTP 引擎依次读取单引擎代理和全局 `FIND_SOURCE_PROXY`。单引擎变量为 `FIND_SOURCE_SAUCENAO_PROXY`、`FIND_SOURCE_IQDB_PROXY`、`FIND_SOURCE_ASCII2D_PROXY` 和 `FIND_SOURCE_TRACEMOE_PROXY`。前两级均未设置时，trace.moe 复用明确配置的 `FIND_SOURCE_LENS_PROXY`，其余引擎直连。X 主页优先读取 `FIND_SOURCE_X_PROFILE_PROXY`，其次复用明确配置的 Lens 代理。代理变量可设为 `direct` 强制直连。X 帖子核验可用 `FIND_SOURCE_X_POST_PROXY` 单独配置，未设置时沿用 X 主页的代理配置。只核验帖子媒体，头像和主页横幅不参与比对。启用 X 代理的部署机需要系统 `curl`。
+
+热读开关 `FIND_SOURCE_ENABLED`（默认 on，off 时命令静默落回 Agent）；`FIND_SOURCE_LENS`（默认 on）、`FIND_SOURCE_LENS_PROXY`（默认 `http://127.0.0.1:1081`，Lens 必须走代理）、`CHROME_BIN`、`FIND_SOURCE_LENS_COOKIE`（可选：Cookie-Editor 导出的真人谷歌 cookie JSON 文件路径，注入后覆盖 consent 打底值，对付谷歌对自动化会话的静默限制；缺失/损坏告警回退）。离线测试 `test/test_find_source.py`（DNS/httpx/PicImageSearch/VLM 全 stub）+ `test/test_lens.py`（CDP/httpx/Chrome 全 stub）。
+
 ---
 
 ## 三、工作区隔离 & 安全模型
@@ -1042,13 +1073,13 @@ Agent 必须在以下情况拒绝 (礼貌):
 | 函数 | 说明 | 依赖 |
 |------|------|------|
 | `gacha_pull(pool_type, count, up_character)` | 模拟抽卡 (4 种卡池) | `pullingMonitor.drawing_cards` + `format_result` |
-| `play_gacha_animation(star_level, is_single)` | 播放抽卡动画 (图片序列) | `pullingMonitor` 图片资源 + `_send_msg` contextvar |
+| `play_gacha_animation(star_level, is_single)` | 播放抽卡动画（6 帧合成单张 GIF） | `pullingMonitor` 图片资源 + `lib/gacha_animation` + `_send_msg` contextvar |
 | `calculate_speed(battle_data)` | 敌方速度计算 | `group.parse_speed_data` + `compute_speed_results` |
 | `compare_speed_probability(speed_1, speed_2)` | 乱速概率计算 | `speed.compute_prob` |
 | `explain_code_tool(code)` | LLM 代码解释 | `deepseek_client.chat_completion` |
 | `translate_text(text, target_language)` | LLM 多语言翻译 | `deepseek_client.chat_completion` |
 
-`play_gacha_animation` 通过 `agent/context.py` 中的 `contextvars.ContextVar` 获取图片发送回调，直接向 QQ 聊天窗口发送 `MessageSegment.image`。无需修改 Agent → ToolRegistry → Tool 的中间层签名。
+`play_gacha_animation` 通过 `agent/context.py` 中的 `contextvars.ContextVar` 获取图片发送回调；官方与 OneBot 渠道都会把 6 张 PNG 合成 1 张 1280×720 GIF，只发送 1 条图片消息；每帧约 1 秒、末帧停留 3 秒（真实 QQ 仍可能循环 GIF）。群聊 `/抽卡 <卡池>`/`/十连抽 <卡池>` 在 image 功能开启时也会在文字结果前自动播放同一张 GIF。无需修改 Agent → ToolRegistry → Tool 的中间层签名。
 
 ### 5.4 `tools/map_tools.py` — 地图工具 (5 个)
 
@@ -1653,7 +1684,24 @@ WebUI「配置热管理 → 模型」提供 5 段结构化表单（REASONING/FLA
 | `/wiki` Wiki 缓存 | 角色/羁绊数据浏览（详情列表**合并解包 gamedata 中 wiki 未收录的新角色**，`解包` 徽标只读视图：立绘/星阶/技能/卡面文案）、**别名字典编辑**（`character_dic.json` / `bonds_search_dic.json`）、待补录（wiki + 解包双来源；**官方名被旧分组占用**时置顶冲突项，可一键「拆分为新组」） |
 | `/changelog` 更新日志与公告 | 编辑**更新记录**（版本/日期/分类变更条目，`changelog.json`）与**自由公告**（标题/正文/markdown，`announcements.json`），按渠道勾选**双渠道群发**（OneBot 群 + 官方群） |
 | `/mail` 邮件管理 | 用户信箱只读查看（列表 = 信箱建档 ∪ c2c 联系人登记表，openid 脱敏 W4）、勾选发送**系统邮件**（text/markdown）、**撤回**信件；经 `data/mail_admin/` 文件队列由 bot 执行并回写状态（§16.2/§16.4） |
-| `/redeem` 兑换码管理 | 限时/长期兑换码人工维护（权威源，`_source=panel`），支持导入/清理与自动抓取联动 |
+| `/redeem` 兑换码管理 | 限时/长期兑换码人工维护（权威源，`_source=panel`），推文文本/**推文链接**粘贴解析（链接走 syndication 抓取，需代理），支持导入/清理与自动抓取联动 |
+
+### 兑换码数据源（panel 权威 + X 自动源 + ucngame 备胎）
+
+三层数据源，合并时 **panel 条目永远权威**（`_source=panel`：爬虫只能 max-merge `_added`，不得覆盖 content/valid；过期清理也豁免）：
+
+1. **WebUI 面板人工录入**（主渠道）：`/redeem` 页粘贴推文文本或**推文链接**解析入列。链接路径（`POST /api/redeem/parse-tweet` 检测到 `x.com/…/status/…`）走 `redeem_x_source.parse_tweet_url` → syndication CDN 匿名抓取，需 `REDEEM_CODE_PROXY`（面板进程不 load_dotenv，`webui/config.py` 已显式注入该变量）。
+2. **X/Twitter 官方源**（`plugins/redeem_x_source.py` + `redeem_x_poll.py`，opt-in `REDEEM_CODE_X=on`，默认 off 时行为与旧版逐字节一致）：官方 @Arkrecode_ZH 把兑换码作为**自回复**发在公告推下，活动期间**每天一个**，故需持续轮询而非一次抓全。链路（2026-11-15 实测验证）：
+   - **发现**：自建 SearXNG（`SEARXNG_ENDPOINT`，Google 引擎索引推文含回复，标题带全文）两条查询 `site:x.com/<账号>/status` 与 `兌換期限至 site:x.com/<账号>`，各翻 1-2 页，**不用 time_range**（会静默丢结果）；`httpx trust_env=False` 防全局 HTTPS_PROXY 泄漏进 localhost 调用。索引时延 ≤6h，覆盖是概率性的。
+   - **抓取**：`cdn.syndication.twimg.com/tweet-result?id=…&token=…` 匿名接口（无需登录/UA）；token = `((id/1e15)*π)` 的 base36 去 0 去点（Python 10 位小数截断版实测可用，服务端校验宽松）。走 `crc._fetch_url(use_proxy=True)`（curl_cffi chrome131 + 代理）。
+   - **守卫**：`__typename=Tweet`（拒 tombstone）、screen_name 匹配、code **且** valid 非空（真实码推全带期限；兼拒 EN 格式误解析与公告根推）、期限距今 ≤30 天（挡去年旧码）。`_added` = created_at 转北京日期。
+   - **状态**：`data/redeem_code/x_seen.json`（原子写，2000 ID 上限淘汰最旧）；**抓取成功即标 seen**（无论是否解析出码，防根推每轮重抓），抓取失败不标（下轮重试）。单飞 `_scrape_busy`，每轮 ≤15 条新推、0.5s 间隔。
+   - **轮询**（`redeem_x_poll.py`，`on_startup` 建任务）：90s 预热，每 `REDEEM_CODE_X_INTERVAL`（默认 7200s，下限 300）+ 0-15min 抖动；每轮热读 `REDEEM_CODE_X`（off 即休眠，热 kill 开关）与代理；成功巡检（含零新码）即 `_merge_scraped([])` 保鲜 `scraped_at` + 清 admin 告警（「自动更新失败」横幅不说谎）；失败指数退避 2h→4h→6h 封顶，成功归零。
+   - **懒触发**：`check_and_refresh()` 在 X 开启时也走后台任务（SearXNG 10-40s 不能挂住 `/兑换码`），复用 `_refresh_in_flight` 去重。**副作用**：X 每 2h 保鲜后 ucngame 的 stale 懒刷新不再触发——ucngame 本就是休眠备胎，X 是严格更优的官方源。
+   - **死路清单（勿再尝试）**：nitter 全灭（X Corp 2026-08 律师函）、syndication timeline-profile 全局 429、guest graphql TweetDetail 404、x.com 匿名登录墙、legacy conversation API 404。
+3. **ucngame 聚合站**（备胎）：Cloudflare JS 挑战，需 `REDEEM_CODE_BROWSER=ruyipage` 浏览器引擎（共享 `lib/browser_fetch.py` 运行器）；未启用时休眠。
+
+降级矩阵：SearXNG 挂 → discover None → 轮询退避、缓存不动；代理挂 → 单条抓取失败不标 seen 下轮重试；零命中 → [] 照常保鲜；门控 off/无代理 → 零行为变化/跳过本轮。离线测试：`test/test_redeem_x_source.py`（token 向量/锚定正则/守卫/seen/单飞/门控同一性）+ `test_redeem_panel.py` URL 粘贴路径。
 
 ### 更新记录 / 公告群发（`data/changelog/`，双渠道）
 

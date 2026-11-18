@@ -1,0 +1,276 @@
+"""四个纯 HTTP 反查引擎适配（找图反查一期）。
+
+SauceNAO / IQDB / ascii2d / trace.moe，全部 file=bytes 直传，
+不需要图床。服务器实测四引擎国内直连均通（2026-11-16）。
+统一产出 Candidate，引擎级失败不拖垮整体（run_engines 并发收集）。
+"""
+from __future__ import annotations
+
+import asyncio
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+import os
+import time
+
+import httpx
+from loguru import logger
+from PicImageSearch import Ascii2D, Iqdb, SauceNAO, TraceMoe
+from PicImageSearch.network import DEFAULT_HEADERS
+
+from .net import configured_proxy
+
+ENGINE_TIMEOUT = 30.0
+IQDB_BODY_TIMEOUT = 8.0
+_ENGINE_PROXY_ENV = {
+    "SauceNAO": "FIND_SOURCE_SAUCENAO_PROXY",
+    "IQDB": "FIND_SOURCE_IQDB_PROXY",
+    "ascii2d": "FIND_SOURCE_ASCII2D_PROXY",
+    "trace.moe": "FIND_SOURCE_TRACEMOE_PROXY",
+}
+
+_QUOTA_HINTS = ("429", "403", "quota", "limit", "rate too high", "too many")
+
+
+@dataclass
+class Candidate:
+    """一条反查命中（跨引擎统一结构）。"""
+    engine: str
+    page_url: str = ""
+    title: str = ""
+    thumbnail: str = ""
+    similarity: float | None = 0.0
+    author: str = ""
+    author_url: str = ""
+    extra: dict = field(default_factory=dict)
+
+
+class EngineError(Exception):
+    """引擎级失败。code: ENGINE_ERROR / ENGINE_QUOTA / ENGINE_TIMEOUT"""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _classify(exc: Exception) -> EngineError:
+    if isinstance(exc, EngineError):
+        return exc
+    if isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)):
+        return EngineError("ENGINE_TIMEOUT", "引擎超时")
+    msg = str(exc)
+    low = msg.lower()
+    if any(h in low for h in _QUOTA_HINTS):
+        return EngineError("ENGINE_QUOTA", f"引擎限额/拒绝：{msg[:120]}")
+    return EngineError("ENGINE_ERROR", msg[:120] or exc.__class__.__name__)
+
+
+def _proxy_for(engine: str) -> str | None:
+    engine_env = _ENGINE_PROXY_ENV.get(engine)
+    names = [engine_env] if engine_env else []
+    names.append("FIND_SOURCE_PROXY")
+    if engine == "trace.moe":
+        names.append("FIND_SOURCE_LENS_PROXY")
+    return configured_proxy(*names)
+
+
+_engine_client: ContextVar[httpx.AsyncClient | None] = ContextVar("reverse_engine_client", default=None)
+
+# httpcore trace events are observed on the engine request itself, including
+# redirects and any follow-up metadata request issued by PicImageSearch.
+_HTTP_PHASES = {
+    "connect_tcp": "connect",
+    "connect_unix_socket": "connect",
+    "start_tls": "tls",
+    "send_request_headers": "send_headers",
+    "send_request_body": "upload",
+    "receive_response_headers": "response_headers",
+    "receive_response_body": "response_body",
+}
+
+
+class _EngineTrace:
+    def __init__(self, engine: str, *, body_timeout: float | None = None):
+        self.engine = engine
+        self.body_timeout = body_timeout
+        self.host = "-"
+        self.stage = "prepare"
+        self.started = time.monotonic()
+
+    async def request(self, request: httpx.Request) -> None:
+        self.host = request.url.host or "-"
+        self.stage = "request"
+        logger.info("[找图] HTTP engine={} stage=request method={} host={}",
+                    self.engine, request.method, self.host)
+        request.extensions["trace"] = self.trace
+
+    async def response(self, response: httpx.Response) -> None:
+        logger.info("[找图] HTTP engine={} stage=response_status host={} status={}",
+                    self.engine, self.host, response.status_code)
+        if self.body_timeout is not None:
+            # HTTPX's read timeout is per socket read. Bound the entire body,
+            # including a chunked response which sends data before stalling.
+            self.stage = "response_body"
+            try:
+                await asyncio.wait_for(response.aread(), self.body_timeout)
+            except asyncio.TimeoutError as exc:
+                raise EngineError("ENGINE_TIMEOUT", f"{self.engine} 响应体读取超时") from exc
+
+    async def trace(self, event: str, info: dict) -> None:
+        name, _, state = event.rpartition(".")
+        name = name.rsplit(".", 1)[-1]
+        stage = _HTTP_PHASES.get(name)
+        if stage is None:
+            return
+        if state == "started":
+            self.stage = stage
+            self.started = time.monotonic()
+        else:
+            error = info.get("exception")
+            logger.info("[找图] HTTP engine={} stage={} host={} outcome={} elapsed={:.2f}s error={}",
+                        self.engine, stage, self.host, state, time.monotonic() - self.started,
+                        type(error).__name__ if error is not None else "-")
+            if stage == "response_body" and state == "complete":
+                self.stage = "parse"
+
+
+async def search_saucenao(data: bytes) -> list[Candidate]:
+    api_key = os.environ.get("SAUCENAO_API_KEY") or None
+    client = SauceNAO(api_key=api_key, numres=6, client=_engine_client.get(), proxies=_proxy_for("SauceNAO"))
+    resp = await client.search(file=data)
+    header = resp.origin.get("header", {}) if isinstance(resp.origin, dict) else {}
+    status = header.get("status", 0) or 0
+    if status != 0:
+        msg = str(header.get("message", "")) or f"status={status}"
+        if status < 0 or any(h in msg.lower() for h in _QUOTA_HINTS):
+            raise EngineError("ENGINE_QUOTA", f"SauceNAO：{msg[:120]}")
+        raise EngineError("ENGINE_ERROR", f"SauceNAO：{msg[:120]}")
+    out = []
+    for item in resp.raw:
+        ext = list(item.ext_urls or [])
+        out.append(Candidate(
+            engine="SauceNAO",
+            page_url=item.url or (ext[0] if ext else ""),
+            title=item.title,
+            thumbnail=item.thumbnail,
+            similarity=float(item.similarity),
+            author=item.author,
+            author_url=item.author_url,
+            extra={"index_name": item.index_name, "ext_urls": ext,
+                   "source": item.source},
+        ))
+    return out
+
+
+async def search_iqdb(data: bytes) -> list[Candidate]:
+    client = Iqdb(client=_engine_client.get(), proxies=_proxy_for("IQDB"))
+    resp = await client.search(file=data)
+    out = []
+    for item in resp.raw:
+        if not item.url:
+            continue  # 查询图自身 / 无来源分节
+        out.append(Candidate(
+            engine="IQDB",
+            page_url=item.url,
+            title=item.title or item.content,
+            thumbnail=item.thumbnail,
+            similarity=float(item.similarity),
+            extra={"source": item.source, "other_source": item.other_source},
+        ))
+    return out
+
+
+async def search_ascii2d(data: bytes) -> list[Candidate]:
+    client = Ascii2D(client=_engine_client.get(), proxies=_proxy_for("ascii2d"))
+    resp = await client.search(file=data)
+    out = []
+    for item in resp.raw:
+        urls = [(u.href, u.text) for u in (item.url_list or [])]
+        page = item.url or (urls[0][0] if urls else "")
+        if not page:
+            continue
+        out.append(Candidate(
+            engine="ascii2d",
+            page_url=page,
+            title=item.title,
+            thumbnail=item.thumbnail,
+            similarity=float(item.similarity),
+            author=item.author,
+            author_url=item.author_url,
+            extra={"url_list": urls, "detail": item.detail},
+        ))
+    return out
+
+
+async def search_tracemoe(data: bytes) -> list[Candidate]:
+    client = TraceMoe(client=_engine_client.get(), proxies=_proxy_for("trace.moe"))
+    resp = await client.search(file=data)
+    origin = resp.origin if isinstance(resp.origin, dict) else {}
+    if origin.get("error"):
+        raise EngineError("ENGINE_ERROR", f"trace.moe：{str(origin['error'])[:120]}")
+    out = []
+    for item in resp.raw:
+        title = (item.title_chinese or item.title_native
+                 or item.title_romaji or item.title_english)
+        out.append(Candidate(
+            engine="trace.moe",
+            page_url=f"https://anilist.co/anime/{item.anilist}" if item.anilist else "",
+            title=title,
+            thumbnail=item.image,
+            similarity=float(item.similarity),  # 库内已 ×100
+            extra={"episode": item.episode, "from": item.From, "to": item.To,
+                   "anilist": item.anilist, "filename": item.filename,
+                   "title_native": item.title_native,
+                   "title_romaji": item.title_romaji,
+                   "title_english": item.title_english},
+        ))
+    return out
+
+
+_ENGINES = (
+    ("SauceNAO", search_saucenao),
+    ("IQDB", search_iqdb),
+    ("ascii2d", search_ascii2d),
+    ("trace.moe", search_tracemoe),
+)
+
+
+ENGINE_NAMES = tuple(name for name, _ in _ENGINES)
+
+
+async def run_engines(data: bytes,
+                      timeout: float = ENGINE_TIMEOUT,
+                      ) -> tuple[list[Candidate], dict[str, str]]:
+    """并发跑四引擎。返回 (全部候选, {引擎名: 错误描述})。"""
+    async def _one(name, fn):
+        trace = _EngineTrace(name, body_timeout=IQDB_BODY_TIMEOUT if name == "IQDB" else None)
+        started = time.monotonic()
+        proxy = _proxy_for(name)
+        try:
+            tls = httpx.create_ssl_context()
+            tls.set_ciphers("DEFAULT")
+            async with httpx.AsyncClient(
+                    proxy=proxy, trust_env=False, timeout=timeout, verify=tls,
+                    headers=DEFAULT_HEADERS, follow_redirects=True,
+                    event_hooks={"request": [trace.request], "response": [trace.response]}) as client:
+                token = _engine_client.set(client)
+                try:
+                    return await asyncio.wait_for(fn(data), timeout)
+                finally:
+                    _engine_client.reset(token)
+        except Exception as exc:
+            logger.warning("[找图] HTTP engine={} stage={} host={} elapsed={:.2f}s error={} proxy={}",
+                           name, trace.stage, trace.host, time.monotonic() - started,
+                           type(exc).__name__, bool(proxy))
+            raise
+
+    results = await asyncio.gather(
+        *(_one(name, fn) for name, fn in _ENGINES), return_exceptions=True)
+    candidates: list[Candidate] = []
+    errors: dict[str, str] = {}
+    for (name, _), res in zip(_ENGINES, results):
+        if isinstance(res, BaseException):
+            errors[name] = _classify(res).message
+        else:
+            candidates.extend(res)
+    return candidates, errors

@@ -27,7 +27,8 @@ fi
 echo -e "${GREEN}[INFO]${NC} 运行所有测试..."
 echo ""
 
-python -m unittest test_context_memory_phase1 test_reliability_p1 test_cognition_p23 test_experience_p4 test_legacy_migration test_mail_buttons test_group_behavior test_group_admin test_group_resources test_media_runtime -v
+python -m unittest test_context_memory_phase1 test_reliability_p1 test_cognition_p23 test_experience_p4 test_legacy_migration test_mail_buttons test_group_behavior test_reverse_source test_group_admin test_group_resources test_media_runtime -v
+python -m unittest test_gacha_official -v
 COGNITION_EXIT=$?
 
 python test_agent.py
@@ -68,10 +69,24 @@ python test/test_redeem_code.py
 REDEEM_EXIT=$?
 python test/test_redeem_panel.py
 REDEEMPANEL_EXIT=$?
+python test/test_redeem_x_source.py
+REDEEMX_EXIT=$?
 python test/test_webui_wiki_gamedata.py
 WIKIGD_EXIT=$?
 python test/test_web_fetch.py
 WEBFETCH_EXIT=$?
+python test/test_survey_model.py
+SURVEY_MODEL_EXIT=$?
+python test/test_survey_draft.py
+SURVEY_DRAFT_EXIT=$?
+python test/test_survey_flow.py
+SURVEY_FLOW_EXIT=$?
+python test/test_browser_action.py
+SURVEY_BROWSER_EXIT=$?
+python test/test_find_source.py
+FINDSRC_EXIT=$?
+python test/test_lens.py
+LENS_EXIT=$?
 cd "$SCRIPT_DIR/QQBot"
 
 EXIT_CODE=0
@@ -90,8 +105,15 @@ if [ $TASKREC_EXIT -ne 0 ]; then EXIT_CODE=$TASKREC_EXIT; fi
 if [ $CHARHEAL_EXIT -ne 0 ]; then EXIT_CODE=$CHARHEAL_EXIT; fi
 if [ $REDEEM_EXIT -ne 0 ]; then EXIT_CODE=$REDEEM_EXIT; fi
 if [ $REDEEMPANEL_EXIT -ne 0 ]; then EXIT_CODE=$REDEEMPANEL_EXIT; fi
+if [ $REDEEMX_EXIT -ne 0 ]; then EXIT_CODE=$REDEEMX_EXIT; fi
 if [ $WIKIGD_EXIT -ne 0 ]; then EXIT_CODE=$WIKIGD_EXIT; fi
 if [ $WEBFETCH_EXIT -ne 0 ]; then EXIT_CODE=$WEBFETCH_EXIT; fi
+if [ $SURVEY_MODEL_EXIT -ne 0 ]; then EXIT_CODE=$SURVEY_MODEL_EXIT; fi
+if [ $SURVEY_DRAFT_EXIT -ne 0 ]; then EXIT_CODE=$SURVEY_DRAFT_EXIT; fi
+if [ $SURVEY_FLOW_EXIT -ne 0 ]; then EXIT_CODE=$SURVEY_FLOW_EXIT; fi
+if [ $SURVEY_BROWSER_EXIT -ne 0 ]; then EXIT_CODE=$SURVEY_BROWSER_EXIT; fi
+if [ $FINDSRC_EXIT -ne 0 ]; then EXIT_CODE=$FINDSRC_EXIT; fi
+if [ $LENS_EXIT -ne 0 ]; then EXIT_CODE=$LENS_EXIT; fi
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}=========================================${NC}"

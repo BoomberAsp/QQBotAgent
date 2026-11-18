@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "kbs": {
+    "ark_re": {
+      "game": "ark_re",
+      "driver": "ark_legacy"
+    },
+    "hsr": {
+      "game": "hsr",
+      "driver": "hsr_local",
+      "path": "story_kb/hsr/releases/p2-chapter-105010-01/story.db",
+      "sha256": "a19260d97f80ef5e1c1f2f4438f2736842ccba4cfe1503c1fc873d2d6d21c32e",
+      "build_id": "local-v2-d1b17302dbcc3121"
+    }
+  },
+  "bindings": {
+    "rubi": {
+      "kb_id": "ark_re",
+      "auto_inject": true
+    },
+    "assistant": {
+      "kb_id": "ark_re",
+      "neutral": true,
+      "auto_inject": true
+    },
+    "herta": {
+      "kb_id": "hsr",
+      "neutral": true,
+      "auto_inject": true
+    },
+    "nous": {
+      "kb_id": "hsr",
+      "neutral": true,
+      "auto_inject": true
+    }
+  }
+}

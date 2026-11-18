@@ -31,6 +31,11 @@ easyocr
 opencv-python-headless
 numpy
 
+# ── Reverse Image Search (找图反查一期) ──────────────────────────
+# SauceNAO / IQDB / ascii2d / trace.moe 纯 HTTP 引擎封装（file=bytes 直传）。
+# 二期 Google Lens 走系统 Chrome + 裸 CDP，不引入 playwright。
+PicImageSearch>=3.12.11
+
 # ── Audio Processing ─────────────────────────────────────────────
 pilk
 

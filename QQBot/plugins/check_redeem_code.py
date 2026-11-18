@@ -10,12 +10,22 @@ Supports:
     entries (_source="panel") are authoritative: the scraper never
     overwrites them and cleanup never removes them.
 
-Data source:
-  - https://ucngame.com/codes/ark-recode-redeem-codes/ — the only
-    high-timeliness aggregator, but behind a Cloudflare JS challenge
-    since ~2026-09. Plain HTTP cannot pass it; the optional ruyiPage
-    browser engine can (see below). (gamevoyant / cofregamers were
-    removed 2026-10: incomplete data.)
+Data sources:
+  - X/Twitter official account (@Arkrecode_ZH) — opt-in via REDEEM_CODE_X=on
+    (see redeem_x_source.py). Codes are posted as self-replies under
+    announcement tweets; discovered through SearXNG search indexing and
+    fetched anonymously from the syndication CDN. Highest timeliness
+    (official, index delay <= 6h). A periodic poll (redeem_x_poll.py)
+    keeps the cache fresh every ~2h while enabled.
+  - https://ucngame.com/codes/ark-recode-redeem-codes/ — aggregator behind
+    a Cloudflare JS challenge since ~2026-09. Plain HTTP cannot pass it;
+    the optional ruyiPage browser engine can (see below). (gamevoyant /
+    cofregamers were removed 2026-10: incomplete data.) NOTE: with the X
+    source on, its ~2h refresh keeps the cache fresh, so ucngame's
+    staleness-triggered lazy refresh no longer fires — X supersedes it.
+  The ucngame page injects a runtime "Copy" button into every code cell
+  (Copy The Code plugin); tag-stripping would glue its label onto the code
+  ("CopyArk3rdVvqYfU"), so _strip_copy_button_label removes it.
 
 Browser engine (Cloudflare bypass, opt-in): ucngame's JS challenge defeats
 curl_cffi/httpx (403 direct and via proxy). Setting REDEEM_CODE_BROWSER=
@@ -208,15 +218,16 @@ async def check_and_refresh() -> bool:
     Returns True if a refresh was triggered (not whether it succeeded).
     Call get_redeem_codes() afterwards to get the best available data.
 
-    With the browser engine enabled the refresh runs as a non-blocking
-    background task (a cold Firefox+Cloudflare fetch can take >60s and must
-    not hang the caller); a single in-flight refresh is deduplicated. The
-    default HTTP path is awaited inline as before.
+    With the browser engine or the X source enabled the refresh runs as a
+    non-blocking background task (a cold Firefox+Cloudflare fetch can take
+    >60s, and X discovery queries SearXNG for 10-40s — neither may hang the
+    caller); a single in-flight refresh is deduplicated. The default
+    HTTP-only path is awaited inline as before.
     """
     if not _is_stale():
         return False
 
-    if _browser_engine_enabled():
+    if _browser_engine_enabled() or _x_source().enabled():
         global _refresh_in_flight, _refresh_task
         if _refresh_in_flight:
             # Already refreshing in the background; don't stack another
@@ -266,7 +277,8 @@ def is_refresh_in_flight() -> bool:
 def _load_cache() -> list[dict]:
     """Load the raw list of all redeem code entries from cache.
 
-    On read, entries are normalized: missing `valid` dates are backfilled
+    On read, entries are normalized: a stale injected "Copy" button label
+    is removed from scraped codes, missing `valid` dates are backfilled
     from English prose in `content` (e.g. "(Valid until September 30th,
     2026)"), and generic filler content is stripped. Normalization is
     idempotent and persisted on the next _save_cache.
@@ -281,6 +293,15 @@ def _load_cache() -> list[dict]:
     except (json.JSONDecodeError, IOError):
         return []
     for entry in entries:
+        code = entry.get("code", "") or ""
+        # Repair caches written before the injected "Copy" label was
+        # stripped in _parse_html ("CopyArk3rdVvqYfU" -> "Ark3rdVvqYfU").
+        # Scraped entries only: panel codes are admin-authored and must
+        # never be rewritten here.
+        if code and entry.get("_source") != "panel":
+            cleaned = _strip_copy_button_label(code)
+            if cleaned:
+                entry["code"] = cleaned
         content = entry.get("content", "") or ""
         if not entry.get("valid"):
             parsed = _parse_prose_date(content)
@@ -357,9 +378,25 @@ async def _refresh():
               file=sys.stderr)
         return
 
-    # Merge: update existing entries, add new ones, preserve unmatched
+    added = _merge_scraped(scraped)
+    print(f"[RedeemCode] Refresh complete: {len(scraped)} scraped, "
+          f"{added} new codes", file=sys.stderr)
+
+
+def _merge_scraped(scraped: list[dict]) -> int:
+    """Merge scraped entries into the cache; return count of NEW codes.
+
+    Panel-authored entries stay authoritative (scraper may only max-merge
+    _added). Synchronous on purpose: no await inside means the merge is
+    atomic within the event loop, so the periodic X poll and a lazy
+    background refresh can never interleave read-modify-write steps.
+    Also used directly by redeem_x_poll for X-only passes (an empty list
+    is a successful check: it still freshens scraped_at and clears the
+    alert, keeping the "自动更新失败" banner honest).
+    """
     existing = _load_cache()
     existing_by_code = {e["code"]: e for e in existing}
+    before = len(existing_by_code)
 
     for entry in scraped:
         code = entry["code"]
@@ -391,8 +428,7 @@ async def _refresh():
     # the alert's premise was "scraping failed", which is no longer true.
     _clear_admin_alert()
 
-    print(f"[RedeemCode] Refresh complete: {len(scraped)} scraped, "
-          f"{len(merged)} total in cache", file=sys.stderr)
+    return len(existing_by_code) - before
 
 
 def _get_proxy_url() -> str:
@@ -564,6 +600,15 @@ _SOURCES = [
 ]
 
 
+def _x_source():
+    """Lazy import of the X/Twitter source (avoids import cycles)."""
+    try:
+        from plugins import redeem_x_source as xs
+    except ImportError:  # pragma: no cover - QQBot/ not on sys.path
+        from QQBot.plugins import redeem_x_source as xs
+    return xs
+
+
 async def _scrape() -> list[dict] | None:
     """Scrape redeem codes from all reachable sources and merge.
 
@@ -573,7 +618,23 @@ async def _scrape() -> list[dict] | None:
     all_entries = []
     ok_any = False
 
-    for src in _SOURCES:
+    sources = list(_SOURCES)
+    xs = _x_source()
+    if xs.enabled():
+        sources.append({"name": "x"})
+
+    for src in sources:
+        if src["name"] == "x":
+            # X source discovers + fetches + parses on its own; entries
+            # already carry _source="x". None = discovery failed/in flight.
+            entries = await xs.scrape()
+            if entries is None:
+                continue
+            ok_any = True
+            print(f"[RedeemCode] x: parsed {len(entries)} codes",
+                  file=sys.stderr)
+            all_entries.extend(entries)
+            continue
         html = await _fetch_for_source(src)
         if html is None:
             continue
@@ -622,6 +683,29 @@ def _fullwidth_to_ascii(text: str) -> str:
     )
 
 
+# The source page injects a "Copy" button into every code cell at render
+# time (Copy The Code plugin rule: `.wp-block-table tbody tr td:first-child
+# strong`, button_text "Copy"). The plugin prepends the button to the cell,
+# so stripping HTML tags glues the label onto the code:
+#   <td><div class="ctc-wrapper">...<button>...Copy...</button>
+#       <strong>Ark3rdVvqYfU</strong></div></td>  ->  "CopyArk3rdVvqYfU"
+# Left in, that label becomes part of the stored code and no player can
+# redeem it. Only a leading label is removed (the button is always inserted
+# before the code) so genuine code characters are never touched.
+_COPY_BUTTON_LABEL_RE = re.compile(r'^(?:cop(?:y|ied))\s*!?\s*', re.IGNORECASE)
+
+
+def _strip_copy_button_label(text: str) -> str:
+    """Drop a leading "Copy"/"Copied!" button label from cell text.
+
+    No-op for any text that does not start with the injected label, so real
+    codes and reward prose pass through unchanged.
+    """
+    if not text:
+        return text
+    return _COPY_BUTTON_LABEL_RE.sub("", text)
+
+
 def _parse_html(html: str) -> list[dict]:
     """Extract redeem codes from HTML table.
 
@@ -642,8 +726,13 @@ def _parse_html(html: str) -> list[dict]:
         if len(cells) < 2:
             continue
 
-        # Clean HTML tags from cells
-        clean_cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+        # Clean HTML tags from cells. The page injects a "Copy" button as
+        # each code cell's first child (see _strip_copy_button_label), so
+        # its label has to go before any code matching.
+        clean_cells = [
+            _strip_copy_button_label(re.sub(r'<[^>]+>', '', c).strip())
+            for c in cells
+        ]
 
         # Find the code cell and content cell
         code = None

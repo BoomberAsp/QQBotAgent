@@ -1,21 +1,33 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="card">
-<h2>知识库管理</h2>
-<p class="muted">JSON知识库的查询表为 documents。SQL只读，最多返回200行、单元格2000字，查询预算2秒。</p>
-<label>知识库 <select id="kb"></select></label>
-<button class="btn" id="refresh">刷新</button>
-<textarea id="sql" rows="4" style="width:100%">SELECT id, title, chapter, visibility FROM documents LIMIT 50</textarea>
-<button class="btn btn-primary" id="query">执行查询</button>
-<pre id="status" role="status"></pre><div style="overflow:auto;max-height:500px"><table id="results"></table></div>
+  <h2>知识库管理</h2>
+  <p class="muted">剧情库与机器人使用相同的人格绑定和发布版本。JSON 资料仍按原有绑定管理。</p>
+  <label>知识库 <select id="kb" aria-label="知识库"></select></label>
+  <button class="btn" id="refresh">刷新状态</button>
+  <pre id="kb-info" style="white-space:pre-wrap;overflow-wrap:anywhere" role="status"></pre>
+  <label id="source-label">数据库来源 <select id="source" aria-label="数据库来源"></select></label>
+  <div id="story-search-panel" style="margin-top:12px">
+    <label>查询人格 <select id="story-persona" aria-label="查询人格"></select></label>
+    <label>剧情关键词 <input id="story-keywords" maxlength="400" placeholder="例如：卡芙卡 道别" style="width:min(100%,360px)"></label>
+    <button class="btn btn-primary" id="story-search">检索剧情</button>
+    <pre id="story-result" style="white-space:pre-wrap;overflow-wrap:anywhere" role="status"></pre>
+  </div>
+  <h3>只读 SQL 查询</h3>
+  <p class="muted">按所选数据库查询，最多返回 200 行，每格最多 2000 字，执行预算 2 秒。</p>
+  <textarea id="sql" aria-label="SQL 查询" rows="4" style="width:100%"></textarea>
+  <button class="btn btn-primary" id="query">执行查询</button>
+  <pre id="status" role="status"></pre>
+  <div style="overflow:auto;max-height:500px"><table id="results"></table></div>
 </div>
-<div class="card"><h3>发布/更新JSON知识库</h3>
-<p>同ID发布会切换到新文档版本并替换人格绑定；旧文件保留。文档必须包含 id、text、chapter 和 visibility。</p>
-<label>知识库ID <input id="kid" placeholder="hsr"></label>
-<label>人格ID（逗号分隔）<input id="personas" placeholder="herta"></label>
-<input type="file" id="docs" accept="application/json,.json">
-<button class="btn btn-primary" id="publish">发布文档与绑定</button>
-<pre id="publish-status" role="status"></pre>
+<div class="card">
+  <h3>发布/更新 JSON 知识库</h3>
+  <p>文档数组至少包含 id、text、chapter 和 visibility。发布仅更新 JSON 资料及其人格绑定；剧情库版本由剧情注册表管理。</p>
+  <label>知识库 ID <input id="kid" placeholder="custom_lore"></label>
+  <label>人格 ID（逗号分隔）<input id="personas" placeholder="herta"></label>
+  <input type="file" id="docs" accept="application/json,.json">
+  <button class="btn btn-primary" id="publish">发布文档与绑定</button>
+  <pre id="publish-status" role="status"></pre>
 </div>
-<script src="/static/resources.js"></script>
+<script src="/static/knowledge.js"></script>
 {% endblock %}

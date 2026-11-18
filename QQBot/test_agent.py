@@ -4045,12 +4045,12 @@ class TestModelRouterClassify:
         r = self._router_with("complexity: simple")
         out = asyncio.run(r.classify("x"))
         assert out == {"plane": "social", "complexity": "simple"}, out
-        # unparsable → safe fallback (task/complex)
+        # unparsable → safe fallback (social/complex; tools via delegate_task)
         r = self._router_with("hello world")
-        assert asyncio.run(r.classify("x")) == {"plane": "task", "complexity": "complex"}
+        assert asyncio.run(r.classify("x")) == {"plane": "social", "complexity": "complex"}
         # exception → safe fallback
         r = self._router_with(raises=True)
-        assert asyncio.run(r.classify("x")) == {"plane": "task", "complexity": "complex"}
+        assert asyncio.run(r.classify("x")) == {"plane": "social", "complexity": "complex"}
         print_pass("classify parses plane+complexity, legacy & error fallbacks")
 
 

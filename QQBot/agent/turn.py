@@ -60,7 +60,8 @@ from agent.context import (
     _personality_transition, _on_file_created, _current_quota_bytes,
     _pending_task_fold, _current_bond_context, _delegate_depth,
     _current_story_context, _current_story_char_id, _current_render_context,
-    _turn_keyboard,
+    _turn_keyboard, _current_task_persona, _current_survey_context,
+    _current_survey_view,
 )
 from lib.button_spec import max_rows as _button_max_rows, max_per_row as _button_max_per_row
 from lib.button_spec import Btn, Rows, to_text as _buttons_to_text
@@ -113,6 +114,7 @@ from tools.builtin_tools import (
     _ensure_workspace_dirs,
 )
 from tools.file_tools import read_file
+from tools import image_source_followup, image_source_tools
 from tools.map_tools import (
     geocode,
     reverse_geocode,
@@ -124,6 +126,7 @@ from tools.legacy_tools import (
     calculate_speed,
     compare_speed_probability,
     explain_code_tool,
+    gacha_pool_rows,
     gacha_pull,
     play_gacha_animation,
     translate_text,
@@ -316,6 +319,19 @@ def _build_tool_registry() -> ToolRegistry:
                 "num_results": {"type": "integer", "description": "返回结果数量，默认5条", "default": 5},
             },
             "required": ["query"],
+        },
+    )
+    registry.register(
+        image_source_tools.TOOL_NAME, image_source_tools.find_image_source,
+        "反查用户已同意查询的单张图片，返回结构化证据。"
+        "先用 search（无需参数），再按返回的可用动作与 ID 有限复查。",
+        {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "action": {"type": "string", "enum": ["search", "lookup_watermark", "verify_source"],
+                           "description": "首查、水印检索或同图页面核验", "default": "search"},
+                "target_id": {"type": "string", "description": "复查时传入本轮返回的可用 ID"},
+            },
         },
     )
     registry.register(
@@ -1815,6 +1831,25 @@ async def _auto_cleanup_after(user_id: str, deadline: float) -> None:
 
 
 
+# ── Survey Status Tool (read-only) ────────────────────────────────
+
+def _survey_status() -> str:
+    """Read-only snapshot of the current user's survey task."""
+    view = _current_survey_view.get()
+    if view is None:
+        return json.dumps(
+            {"active": False, "message": "当前没有问卷任务上下文。"},
+            ensure_ascii=False,
+        )
+    try:
+        from .survey_flow import status_payload
+        payload = status_payload(view)
+    except Exception as exc:                      # noqa: BLE001 - tool never raises
+        payload = {"active": False,
+                   "message": f"无法读取问卷状态：{type(exc).__name__}"}
+    return json.dumps(payload, ensure_ascii=False)
+
+
 # ── User Info Tool ─────────────────────────────────────────────────
 
 def _get_user_info() -> str:
@@ -1936,6 +1971,14 @@ def _get_user_info() -> str:
 
 # Register user info tool (must happen after _get_user_info definition and after
 # singletons like _workspace_manager, _special_sessions are initialized)
+_tool_registry.register(
+    "survey_status", _survey_status,
+    "只读查询当前用户的问卷任务：草稿编号、标题、已填/跳过题数、提交状态、"
+    "群聊剩余时间、是否可提交。当用户询问「问卷填到哪了」「还差什么」"
+    "「提交成功了吗」「还有草稿吗」时调用。不会修改答案、不会提交、不会取消。",
+    {"type": "object", "properties": {}, "required": []},
+)
+
 _tool_registry.register(
     "get_user_info", _get_user_info,
     "获取当前用户的系统信息，包括：权限级别、特殊会话列表、工作区用量与目录快照"
@@ -2265,25 +2308,13 @@ def _story_log(message: str) -> None:
 
 
 def _story_persona_allowed(persona_key: str) -> bool:
-    """True when this persona may use story memory (config/story_personas.json)."""
-    if not persona_key:
-        return False
-    try:
-        from lib.story_kb import story_personas
-        return persona_key in story_personas()
-    except Exception:  # noqa: BLE001 — never block a turn on config issues
-        return persona_key in ("rubi", "assistant")
+    from lib.story_router import binding
+    return bool(binding(persona_key))
 
 
 def _story_neutral_persona(persona_key: str) -> bool:
-    """True when this persona may inject without a story character mapping."""
-    if not persona_key:
-        return False
-    try:
-        from lib.story_kb import story_neutral_personas
-        return persona_key in story_neutral_personas()
-    except Exception:  # noqa: BLE001
-        return persona_key == "assistant"
+    from lib.story_router import binding
+    return bool((binding(persona_key) or {}).get("neutral", False))
 
 
 def _story_char_id_for(persona_key: str, pm) -> str:
@@ -2304,6 +2335,21 @@ def _build_story_context(persona_key: str, query: str, pm) -> tuple:
         # 逐人格白名单：不在 config/story_personas.json 里的人格完全不注入。
         if not _story_persona_allowed(persona_key):
             return "", ""
+        from lib.story_router import binding, current_story_scope, hsr_injection, make_scope, active
+        item = binding(persona_key)
+        if not item:
+            return "", ""
+        if not item.get("auto_inject", True):
+            return "", ""
+        if item and item["kb_id"]:
+            scope = current_story_scope.get()
+            if scope is None or scope.persona != persona_key:
+                scope = make_scope(persona_key)
+            if not active(scope):
+                return "", ""
+            if scope.game == "hsr":
+                q = _story_query_from(query)
+                return (hsr_injection(persona_key, q, scope, 3200) if q else ""), ""
         kb = get_story_kb()
         if not kb.available:
             return "", ""
@@ -2330,7 +2376,7 @@ def _build_story_context(persona_key: str, query: str, pm) -> tuple:
         if block:
             _story_log(f"[story-kb] inject {len(block)}c persona={persona_key} "
                        f"char={char_id or '-'} q={q[:40]!r}")
-        return block or "", char_id
+        return (block or "", char_id) if active(scope) else ("", "")
     except Exception:  # noqa: BLE001 — never break a reply
         return "", ""
 
@@ -2341,43 +2387,26 @@ def _story_search(query: str = "", limit: int = 4) -> str:
     if current_group_run.get() is not None:
         from .group_resources import story_search
         return story_search(query,limit)
-    try:
-        from lib.story_kb import get_story_kb
+    from lib.story_router import tool_search
+    return tool_search(query, limit)
 
-        kb = get_story_kb()
-        if not kb.available:
-            return (f"[story_search] 剧情知识库尚未构建（{kb.db_path} 不存在）。"
-                    f"管理员可运行 python scripts/build_story_kb.py --all 生成。")
-        q = (query or "").strip()
-        if not q:
-            return "[story_search] 请提供要查询的关键词（角色名、事件名、章节等）。"
-        try:
-            limit = max(1, min(int(limit), 8))
-        except (TypeError, ValueError):
-            limit = 4
-        out = kb.format_tool_result(
-            q, limit=limit, persona_char_id=_current_story_char_id.get(),
-        )
-        _story_log(f"[story-kb] tool q={q[:40]!r} limit={limit} "
-                   f"-> {len(out)}c{' (miss)' if '没有找到' in out else ''}")
-        return out
-    except Exception as exc:  # noqa: BLE001
-        return f"[story_search] 检索失败：{type(exc).__name__}: {exc}"
+
+async def _story_search_async(query: str = "", limit: int = 4) -> str:
+    # Copy request ContextVars into the worker; first activation may hash a large DB.
+    return await asyncio.to_thread(_story_search, query, limit)
 
 
 _tool_registry.register(
-    "story_search", _story_search,
-    "人格所属知识库检索（群内按人格映射与群剧透进度过滤；私聊兼容原剧情库）。当用户询问游戏剧情、角色过往、"
-    "活动故事或世界观事件（如「第一次方舟战争」「谁是指挥官高文」「露比的过去」）时，"
-    "用此工具取回台词原文（英文）与中文梗概。返回内容含场景出处、单元梗概、"
-    "本段梗概与对白摘录；回复时请把英文台词译成中文转述，不要整段照抄。"
-    "查不到时换用角色名/事件名的其他说法重试。",
+    "story_search", _story_search_async,
+    "查询当前来源人格绑定的原作资料库。工具不能切换作品；委派继承来源人格。"
+    "星穹铁道返回中文语音、阅读物或任务资料及来源/分支条件，不能当作角色亲历。"
+    "旧 Ark 资料可能包含英文对白，应中文转述。保留对象、现在或当时、任务名与原文要求；允许完整问句，查不到就说明资料不足。",
     {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "剧情检索关键词：角色名、事件名、章节号或情节描述",
+                "description": "剧情检索问题：保留角色、事件、章节、时间要求；追问先补全本会话指代",
             },
             "limit": {
                 "type": "integer",
@@ -2483,6 +2512,14 @@ async def run_agent_turn(view: InboundMessage):
         _user_busy.discard(user_id)
 
 
+def _survey_prompt_hint(view):
+    try:
+        from .survey_flow import prompt_hint
+        return prompt_hint(view)
+    except Exception:
+        return ""
+
+
 def _view_scope(view):
     from agent.cognitive_state import scope_key
     if view.is_group:
@@ -2557,6 +2594,9 @@ async def handle_agent_turn(view: InboundMessage):
     _on_file_created.set(lambda p: _record_session_file(user_id, p))
 
     text_content = view.text
+    from agent.cognitive_state import current_scope
+    image_scope = current_scope.get()
+    image_offer = image_source_tools.take_offer(view, image_scope)
     if await _handle_memory_control(view):
         return
 
@@ -2658,6 +2698,11 @@ async def handle_agent_turn(view: InboundMessage):
         # are appended, so it sits directly after the old-persona turns.
         _inject_personality_transition_into_history(user_id)
 
+    # ── Survey flow (P0: collect answers only, never submits) ───────
+    from .survey_flow import try_handle as _survey_try_handle
+    if await _survey_try_handle(view):
+        return
+
     # ── Handle feedback / bug report (before agent, zero token cost) ─
     if text_content.startswith(("#反馈", "#bug", "#建议")):
         await _handle_feedback(text_content, user_id)
@@ -2718,6 +2763,10 @@ async def handle_agent_turn(view: InboundMessage):
         cmd_handled = await _handle_changelog_command(text_content, user_id)
         if cmd_handled:
             return
+        # /抽卡 / /十连抽 空参：官方私聊返回卡池按钮（直连，零 token）
+        cmd_handled = await _handle_gacha_pool_prompt(text_content, view=view)
+        if cmd_handled:
+            return
         # /personality / /人格切换 command
         cmd_handled = await _handle_personality_command(text_content, user_id, view)
         if cmd_handled:
@@ -2740,6 +2789,10 @@ async def handle_agent_turn(view: InboundMessage):
             return
         # /设形象 /形象 /清除形象 — 自创角色的参考立绘（直连，零 token）
         cmd_handled = await _handle_portrait_command(text_content, user_id, view)
+        if cmd_handled:
+            return
+        # /找图 /找源 /找作者 /找图帮助 — 找图反查一期（直连，零 token）
+        cmd_handled = await _handle_find_source_command(text_content, user_id, view)
         if cmd_handled:
             return
 
@@ -2777,7 +2830,26 @@ async def handle_agent_turn(view: InboundMessage):
     # supports_vision 时随 user message 以 image_url parts 直传模型。
     # 占位文本行照旧保留（工具/后续轮次的 read_file 懒分析回退仍靠它）。
     vision_image_paths: list = []
-    for att in await view.load_attachments():
+    attachments = await view.load_attachments()
+    active_special = _special_sessions.get_active(user_id)
+    active_metadata = (active_special.metadata or {}) if active_special else {}
+    active_kind = active_metadata.get("kind")
+    workspace = _current_user_workspace.get()
+    if any(att.kind == "image" for att in attachments):
+        image_source_followup.forget(view, image_scope)
+    if active_kind == "char_creation" or (
+            active_kind == SCENE_KIND
+            and not (_scene_archive_enabled() and active_metadata.get("completed"))):
+        image_search = image_source_tools.ImageSearchTurn(user_id, workspace)
+    else:
+        followup = image_source_followup.resolve(view, image_scope, text_content) if not attachments else None
+        if followup and image_source_tools.TOOL_NAME in _perm_manager.get_allowed_tools(
+                _perm_manager.get_role(user_id)):
+            await _safe_send(await image_source_followup.run(followup, workspace))
+            return
+        image_search = image_source_tools.prepare(
+            view, workspace, attachments, image_offer, text=text_content)
+    for att in attachments:
         has_quoted_attachment = has_quoted_attachment or att.quoted
         if att.kind == "image":
             if att.path:
@@ -2841,9 +2913,12 @@ async def handle_agent_turn(view: InboundMessage):
             ack = f"已收到 {'、'.join(names)}，需要分析的话引用这条消息告诉我~"
         else:
             ack = "已收到文件，需要分析的话引用这条消息告诉我~"
+        if image_search.question:
+            ack = f"收到图片。{image_search.question}"
         if quota_warn:
             ack += f"\n\n{quota_warn}"
-        await _safe_send(ack)
+        if await _safe_send(ack):
+            image_source_tools.remember_offer(view, image_scope, image_search)
         return
 
     # ── Build augmented message ────────────────────────────────────
@@ -2882,6 +2957,9 @@ async def handle_agent_turn(view: InboundMessage):
             augmented_message = f"{context_prefix}\n用户引用了文件/语音消息，请根据用户意图选择合适的工具查看内容。"
     else:
         augmented_message = text_content
+
+    if image_search.question:
+        augmented_message += "\n[系统提示] 回复后会附上找图确认问题，请自然回应即可。"
 
     # Guard: nothing to process
     if not augmented_message:
@@ -2946,7 +3024,6 @@ async def handle_agent_turn(view: InboundMessage):
                 pass
 
         # Detect session type (also gates the UGC creation interview below)
-        active_special = _special_sessions.get_active(user_id)
         session_type = "special" if active_special else "temporary"
         is_creation = bool(active_special) and (
             (active_special.metadata or {}).get("kind") == "char_creation"
@@ -2987,7 +3064,7 @@ async def handle_agent_turn(view: InboundMessage):
             client = _model_router.flash_client
         elif not is_special:
             if persona_mode == "split":
-                _cls = await _model_router.classify(augmented_message)
+                _cls = await _model_router.classify(augmented_message, persona_key=persona_key, persona_name=pm.get_display_name(persona_key), persona_aliases=(pm.get_short_name(persona_key),))
                 plane = _cls.get("plane", "task")
                 complexity = _cls.get("complexity", "complex")
             else:
@@ -3060,6 +3137,9 @@ async def handle_agent_turn(view: InboundMessage):
             _current_group_id.set("")
             _current_group_context.set("")
 
+        can_search_image = image_source_tools.TOOL_NAME in allowed_tools
+        allowed_tools = allowed_tools - {image_source_tools.TOOL_NAME}
+
         # Set permission contextvars for downstream tools
         _current_user_id.set(user_id)
         _current_user_role.set(role.value)
@@ -3069,6 +3149,9 @@ async def handle_agent_turn(view: InboundMessage):
         if code_limits:
             _current_code_limits.set(code_limits.to_dict())
 
+        from lib.hsr_policy import native_story_turn
+        _hsr_native = (not is_creation and not is_scene and 'story_search' in allowed_tools
+                       and native_story_turn(persona_key, text_content or augmented_message))
         # ── Plane context (Bond-System-Design.md §3) ──
         # character_plane: split persona routed to social → L2 = 角色卡,
         #   tools = SOCIAL_TOOLS only (delegate_task fallback), bond state
@@ -3085,6 +3168,9 @@ async def handle_agent_turn(view: InboundMessage):
         # Personas not on the list get neither the L4 injection nor the
         # story_search tool, so UGC characters never recite the game's canon.
         _story_persona_ok = _story_persona_allowed(persona_key)
+        from lib.story_router import current_story_scope, make_scope
+        current_story_scope.set(None if (is_creation or is_scene) else make_scope(
+            persona_key, "private:" + _current_platform.get() + ":" + str(user_id)))
         if is_creation:
             # UGC creation interview: neutral assistant persona (globally-shared
             # cache prefix), only the create_character tool exposed, no bond.
@@ -3113,6 +3199,14 @@ async def handle_agent_turn(view: InboundMessage):
             _current_personality.set(
                 "assistant" if persona_mode == "split" else persona_key
             )
+        if _hsr_native:
+            _current_personality.set(persona_key)
+            allowed_tools = set(allowed_tools) | {"story_search"}
+        image_search_authorized = image_search.authorized and can_search_image and not (is_creation or is_scene)
+        if image_search_authorized:
+            allowed_tools = {image_source_tools.TOOL_NAME}
+            augmented_message += "\n[系统提示] " + image_source_tools.SEARCH_HINT
+        _current_task_persona.set(persona_key if persona_mode == "split" and not character_plane and not is_creation and not is_scene and not _hsr_native else "")
         # story_search only for allowlisted personas (schema filtering; the
         # executor additionally refuses tools outside allowed_tools).
         if not _story_persona_ok:
@@ -3128,9 +3222,9 @@ async def handle_agent_turn(view: InboundMessage):
         # neutral Roxy and reaches the KB through story_search instead.
         _story_block, _story_char = "", ""
         if _story_persona_ok and not is_creation and not is_scene:
-            if character_plane or persona_mode != "split":
-                _story_block, _story_char = _build_story_context(
-                    persona_key, text_content or augmented_message, pm)
+            if character_plane or persona_mode != "split" or _hsr_native:
+                _story_block, _story_char = await asyncio.to_thread(
+                    _build_story_context, persona_key, text_content or augmented_message, pm)
         _current_story_context.set(_story_block)
         _current_story_char_id.set(_story_char)
 
@@ -3148,6 +3242,10 @@ async def handle_agent_turn(view: InboundMessage):
                 )
 
         try:
+            _survey_token = _current_survey_context.set(
+                _survey_prompt_hint(view))
+            _survey_view_token = _current_survey_view.set(view)
+            image_search_token = image_source_tools.current.set(image_search)
             response = await asyncio.wait_for(
                 agent.run(
                     augmented_message, user_id,
@@ -3166,11 +3264,17 @@ async def handle_agent_turn(view: InboundMessage):
                     # streamer opened this turn (None keeps every other
                     # route on the non-streaming LLM call, byte-identical).
                     content_callback=(_content_delta
-                                      if streamer is not None else None),
+                                      if streamer is not None and not image_search_authorized else None),
+                    finalize_answer=image_search.finalize_answer if image_search_authorized else None,
                 ),
                 timeout=300.0,
             )
+            response = image_search.finalize_answer(response)
         finally:
+            image_source_followup.remember_turn(view, image_scope, image_search)
+            _current_survey_context.reset(_survey_token)
+            _current_survey_view.reset(_survey_view_token)
+            image_source_tools.current.reset(image_search_token)
             _current_sender.reset(token)
 
         # ── Revoicing layer (Bond-System-Design.md §3.3) ──
@@ -3179,11 +3283,12 @@ async def handle_agent_turn(view: InboundMessage):
         # character's voice (opening line) while passing the body verbatim.
         # The social plane already speaks in character; unified personas are
         # never re-voiced. Creation interviews stay neutral (no revoice).
-        if (persona_mode == "split" and not character_plane
-                and not is_creation and not is_scene):
-            # Restore persona so _send_response's disclaimer is signed by the
-            # character and revoice speaks in the character's voice.
+        revoice = (persona_mode == "split" and not character_plane
+                   and not is_creation and not is_scene and not _hsr_native)
+        if revoice:
+            # Restore the character for delivery, including tool-owned replies.
             _current_personality.set(persona_key)
+        if revoice and image_search.query is None:
             _use_llm_voice = (
                 not group_id and pm.get_task_voice(persona_key) == "character"
             )
@@ -3199,7 +3304,10 @@ async def handle_agent_turn(view: InboundMessage):
             # Best-effort: rewrite the persisted assistant turn so stored
             # session history reads in the character's voice (verbatim-match
             # guard inside skips it if the turn was already folded/compressed).
-            if session_type == "temporary":
+            if session_type == "special" and active_special:
+                _special_sessions.replace_last_assistant(user_id, raw_response, response,
+                    expected_session_id=active_special.session_id)
+            else:
                 repatch_last_assistant(_session_manager, user_id, raw_response, response)
 
         # ── Stream close / fallback tree (§6.10.11.2, 2026-10-30 重写) ──
@@ -3217,6 +3325,9 @@ async def handle_agent_turn(view: InboundMessage):
         #      允许整篇发送的情形。
         # 前提：close() 现在对断流也补发 state=10 收尾片（平台侧未收尾的流
         # 会被回滚到首包），否则 ② 的"只补尾巴"会丢内容。
+        question = image_search.question
+        if question:
+            response = "\n\n".join(part for part in (response, question) if part)
         sent_via_stream = False
         _decision = "buffered_full"
         _remainder = ""
@@ -3231,7 +3342,8 @@ async def handle_agent_turn(view: InboundMessage):
                 _disc = ""
             # 还活着的流：末片一次送完（尾巴 + 免责），不留第二条消息。
             if streamer.answer_opened and not streamer.broken:
-                await streamer.finish_answer(_disc)
+                tail = "\n\n".join(part for part in (question, _disc) if part)
+                await streamer.finish_answer(tail)
             _happy = streamer.answer_opened and not streamer.broken
             await streamer.close()      # 断流也补 state=10（防平台回滚）
             _decision, _remainder = _plan_stream_delivery(
@@ -3260,6 +3372,9 @@ async def handle_agent_turn(view: InboundMessage):
         if not sent_via_stream:
             # Send response (split long messages)
             await _send_response(response)
+        if question and (not sent_via_stream or question in _remainder
+                         or question in streamer.answer_sent):
+            image_source_tools.remember_offer(view, image_scope, image_search)
 
         # ── Creation session auto-close (scene-session-archive-design.md §5.2/D6):
         # create_character 本轮成功 → 访谈会话无保留价值（设定已完整落入角色卡），
@@ -3308,7 +3423,10 @@ async def handle_agent_turn(view: InboundMessage):
                 await streamer.close()   # never leave a stream generating
             except Exception:
                 pass
-        await _safe_send("抱歉，超时了。请尝试用更简单的方式提问~")
+        if image_search.query is not None:
+            await _send_response(image_search.query.result.render())
+        else:
+            await _safe_send("抱歉，超时了。请尝试用更简单的方式提问~")
     except Exception as e:
         if streamer is not None:
             try:
@@ -3516,7 +3634,7 @@ async def handle_continuous_turn(view: InboundMessage):
 
         plane = "task"
         if persona_mode == "split":
-            _cls = await _model_router.classify(augmented_message)
+            _cls = await _model_router.classify(augmented_message, persona_key=persona_key, persona_name=pm.get_display_name(persona_key), persona_aliases=(pm.get_short_name(persona_key),))
             plane = _cls.get("plane", "task")
             complexity = _cls.get("complexity", "complex")
         else:
@@ -3526,6 +3644,8 @@ async def handle_continuous_turn(view: InboundMessage):
         else:
             client = _model_router.reasoning_client
 
+        _survey_token = None
+        _survey_view_token = None
         token = _current_sender.set(_ToolSender(continuous_sender))
         try:
             # Resolve user permissions
@@ -3563,9 +3683,14 @@ async def handle_continuous_turn(view: InboundMessage):
                     f"{augmented_message}"
                 )
 
+            from lib.hsr_policy import native_story_turn
+            _hsr_native = ('story_search' in allowed_tools and
+                           native_story_turn(persona_key, text_content or augmented_message))
             # ── Plane context ──
             character_plane = (persona_mode == "split" and plane == "social")
             _story_persona_ok = _story_persona_allowed(persona_key)
+            from lib.story_router import current_story_scope, make_scope
+            current_story_scope.set(make_scope(persona_key, "private:" + _current_platform.get() + ":" + str(user_id)))
             if character_plane:
                 client = _model_router.flash_client
                 # Social plane keeps only delegate_task (+ window control).
@@ -3579,6 +3704,10 @@ async def handle_continuous_turn(view: InboundMessage):
                 _current_personality.set(
                     "assistant" if persona_mode == "split" else persona_key
                 )
+            if _hsr_native:
+                _current_personality.set(persona_key)
+                allowed_tools = set(allowed_tools) | {"story_search"}
+            _current_task_persona.set(persona_key if persona_mode == "split" and not character_plane and not _hsr_native else "")
             _delegate_depth.set(0)
             _personality_transition.set(_personality_switch_marker.get(user_id, ""))
 
@@ -3587,12 +3716,15 @@ async def handle_continuous_turn(view: InboundMessage):
             if not _story_persona_ok:
                 allowed_tools = set(allowed_tools) - {"story_search"}
             _story_block, _story_char = "", ""
-            if _story_persona_ok and (character_plane or persona_mode != "split"):
-                _story_block, _story_char = _build_story_context(
-                    persona_key, text_content or augmented_message, pm)
+            if _story_persona_ok and (character_plane or persona_mode != "split" or _hsr_native):
+                _story_block, _story_char = await asyncio.to_thread(
+                    _build_story_context, persona_key, text_content or augmented_message, pm)
             _current_story_context.set(_story_block)
             _current_story_char_id.set(_story_char)
 
+            _survey_token = _current_survey_context.set(
+                _survey_prompt_hint(view))
+            _survey_view_token = _current_survey_view.set(view)
             response = await asyncio.wait_for(
                 agent.run(augmented_message, user_id, client=client,
                            progress_callback=lambda msg: _safe_send(OutProgress(msg), sender=continuous_sender),
@@ -3606,10 +3738,14 @@ async def handle_continuous_turn(view: InboundMessage):
                 timeout=300.0,
             )
         finally:
+            if _survey_token is not None:
+                _current_survey_context.reset(_survey_token)
+            if _survey_view_token is not None:
+                _current_survey_view.reset(_survey_view_token)
             _current_sender.reset(token)
 
         # ── Revoicing layer (task plane of split persona; group → template) ──
-        if persona_mode == "split" and not character_plane:
+        if persona_mode == "split" and not character_plane and not _hsr_native:
             _current_personality.set(persona_key)
             raw_response = response
             response = await revoice_task_result(
@@ -3648,6 +3784,8 @@ async def _safe_send(message, max_retries: int = 2, sender=None):
         sender: Optional Sender to use. Falls back to the _turn_sender
             contextvar (QQ official entry binds a per-event sender there)
             and then to default_sender.
+
+    Returns True when the sender accepts the payload.
     """
     s = sender or _turn_sender.get() or default_sender
     last_error = None
@@ -3675,7 +3813,7 @@ async def _safe_send(message, max_retries: int = 2, sender=None):
                 await s.send_progress(message.text, immediate=message.immediate)
             else:
                 await s.send_text(message)
-            return
+            return True
         except SendFailed as e:
             last_error = e
             if attempt < max_retries - 1:
@@ -3844,6 +3982,12 @@ def _redeem_long_md(lt_codes: list, stale_note: str) -> str:
     if stale_note:
         lines.append(stale_note)
     return "\n".join(lines)
+
+
+async def _handle_survey_command(text: str, user_id: str) -> bool:
+    """Public-command fallback; the real survey flow runs before the kernel."""
+    from .survey_flow import handle_public_command
+    return await handle_public_command(text, user_id)
 
 
 async def _handle_redeem_code_command(text: str, user_id: str) -> bool:
@@ -5407,6 +5551,32 @@ async def _handle_changelog_command(text: str, user_id: str, *, allow_images: bo
     return True
 
 
+_GACHA_POOL_CMD_RE = re.compile(r"^\s*[/#](?P<cmd>抽卡|单抽|十连抽)\s*$")
+
+
+async def _handle_gacha_pool_prompt(text: str, *, view, sender=None) -> bool:
+    """官方私聊空参抽卡：返回带卡池按钮的提示（零 token）。
+
+    只拦截严格空参的 /抽卡、/单抽、/十连抽；带参数的请求继续走
+    agent + gacha_pull，文本结果链路完全不变。OneBot 私聊不拦截。
+    """
+    match = _GACHA_POOL_CMD_RE.match(text or "")
+    if not match or getattr(view, "platform", "") != "qq_official":
+        return False
+
+    ten = match.group("cmd") == "十连抽"
+    rows = gacha_pool_rows(ten=ten, as_command=False)
+    if _channel_supports_keyboard(sender):
+        await _safe_send_kb(
+            "## 选择卡池\n请选择要抽取的卡池；几率UP招募需要补充 UP 角色名。",
+            rows, sender=sender, label="gacha-pool-picker")
+    else:
+        # 无键盘能力时仍给出可直接发送的指令，避免“请点按钮”但没有按钮。
+        body = "选择卡池：请发送对应指令。\n" + _buttons_to_text(rows)
+        await _safe_send(body, sender=sender)
+    return True
+
+
 async def _handle_toggle_command(text: str, user_id: str, view: InboundMessage) -> bool:
     """Handle /toggle command for group feature management.
 
@@ -5804,6 +5974,150 @@ async def _handle_portrait_command(text: str, user_id: str, view) -> bool:
     else:
         tail = "，之后按文字外观设定作画"
     await _safe_send(f"已清除「{display}」的参考立绘{tail}{global_note}。")
+    return True
+
+
+# ── 找图反查：/找图 · /找源 · /找作者（一期，零 token）──────────────
+# 设计见 docs/找图反查-方案.md。一期纯 HTTP 引擎（SauceNAO/IQDB/ascii2d/
+# trace.moe）+ VLM 识别 + 同名共识，不碰浏览器。命令直连，不进 agent 循环。
+_FIND_SOURCE_CMDS = ("/找图", "#找图", "/找源", "#找源", "/找作者", "#找作者")
+_FIND_SOURCE_HELP_CMDS = ("/找图帮助", "#找图帮助")
+
+
+def _log_find_source_pick(view, source: str, path: str, data: bytes,
+                          quoted: bool) -> None:
+    """记录 /找图 实际选中的图（来源/文件名/字节/sha256/消息号）。
+
+    用于核对「平台递交的图」与「用户以为发的图」是否一致——2026-11-17
+    用户报找图偏移，落盘文件证实当条消息附件本身就是上一张图（客户端/
+    平台递交错图），非选图逻辑问题；此日志让下次可直接对证。
+    """
+    import hashlib
+    from loguru import logger
+    logger.info(
+        f"[找图] 选图 source={source} quoted={quoted} "
+        f"file={os.path.basename(path)} bytes={len(data)} "
+        f"sha256={hashlib.sha256(data).hexdigest()[:12]} "
+        f"msg_id={getattr(view, 'message_id', '')}")
+
+
+async def _find_source_image(view, args: str):
+    """Find the image for /找图 → (data_bytes, local_path, error_msg).
+
+    Priority: URL arg > 本条消息新发的图 > 引用图。local_path 供 VLM 用，
+    URL 下载时没有本地路径（VLM 分支自动跳过）。
+    """
+    from lib.reverse_search.net import safe_download
+    args = args.strip()
+    if args.startswith(("http://", "https://")):
+        try:
+            data = await safe_download(args)
+            return data, "", ""
+        except ValueError as e:
+            return b"", "", str(e)
+        except Exception:  # noqa: BLE001
+            return b"", "", "图片下载失败，换个链接或直接把图发给我试试。"
+
+    atts = await view.load_attachments()
+    images = [a for a in atts if a.kind == "image"]
+    for att in images:
+        if att.path and os.path.isfile(att.path):
+            try:
+                data = await asyncio.to_thread(_read_bytes, att.path)
+                _log_find_source_pick(view, "本条上传", att.path, data, att.quoted)
+                return data, att.path, ""
+            except OSError:
+                continue
+    if images:
+        return b"", "", (
+            f"图片下载失败了（{images[0].error or '未知原因'}），重新发一次试试")
+    if getattr(view, "platform", "") == "onebot":
+        try:
+            from adapters.onebot import quoted_file_paths
+            for path in quoted_file_paths(view.raw):
+                if path.lower().endswith(_IMAGE_EXTS) and os.path.isfile(path):
+                    data = await asyncio.to_thread(_read_bytes, path)
+                    _log_find_source_pick(view, "引用图", path, data, True)
+                    return data, path, ""
+        except Exception:  # noqa: BLE001
+            pass
+    return b"", "", (
+        "没看到图片。把图片和命令一起发（图片 + `/找图`），"
+        "或引用那张图再发 `/找图`，也可以 `/找图 <图片URL>`。")
+
+
+async def _handle_find_source_command(text: str, user_id: str, view) -> bool:
+    """`/找图` / `/找源` / `/找作者` / `/找图帮助` —— 找图反查（零 token）。
+
+    热读开关 FIND_SOURCE_ENABLED（默认 on，设 off 关闭）。配额/冷却/缓存
+    由 lib.reverse_search.service 统一管；这里只负责取图、回话。
+    """
+    cmd = text.partition(" ")[0]
+    if cmd not in (_FIND_SOURCE_CMDS + _FIND_SOURCE_HELP_CMDS):
+        return False
+    if not image_source_tools.enabled():
+        return False
+
+    if cmd in _FIND_SOURCE_HELP_CMDS:
+        await _safe_send(
+            "🔍 找图反查\n"
+            "用法：图片 + `/找图`（或引用那张图再发 `/找图`），"
+            "也可以 `/找图 <图片URL>`；群聊里 @我 后同样可用。\n"
+            "别名：/找源 /找作者\n"
+            "能找什么：二次元画作/插画的出处与画师账号、番剧截图的作品与集数、"
+            "真人照片/coser 的社交账号（Google Lens 视觉匹配 + AI 概览识别）。\n"
+            "限额：每人每天 20 次、全服每天 100 次、同用户 30 秒冷却；"
+            "同图 30 天内重查走缓存不耗次数。图片最大 20MB，"
+            "大图会自动压缩后再送引擎（不影响匹配精度）。\n"
+            "⚠️ 图片会上传到第三方反查引擎（SauceNAO/IQDB/ascii2d/trace.moe/Google Lens），"
+            "请勿发送涉及隐私的图片。结果可能认错，请自行核实。")
+        return True
+
+    if view.is_group:
+        from .group_runtime import get_store, scope_for
+        scope = scope_for(view)
+        groups = get_store()
+        image_scope = (scope, groups.group(scope)["generation"])
+    else:
+        groups = None
+        image_scope = _view_scope(view)
+    _, _, args = text.partition(" ")
+    data, path, err = await _find_source_image(view, args)
+    if err:
+        await _safe_send(err)
+        return True
+    image_source_followup.forget(view, image_scope)
+    from lib.reverse_search.net import validate_image
+    err = validate_image(data)
+    if err:
+        await _safe_send(err)
+        return True
+
+    try:
+        from lib.reverse_search.service import QuotaDenied, precheck, run
+        from lib.reverse_search.lens import lens_enabled
+    except ImportError:
+        await _safe_send("找图组件未安装（缺 PicImageSearch），请联系管理员。")
+        return True
+    reason = await precheck(data, user_id=user_id)
+    if reason:
+        await _safe_send(reason)
+        return True
+
+    wait = "60" if lens_enabled() else "30"
+    await _safe_send(f"收到，开始找图，稍等（最多约 {wait} 秒）…")
+    try:
+        result = await run(data, image_path=path or None, user_id=user_id)
+    except QuotaDenied as e:
+        await _safe_send(str(e))
+        return True
+    except Exception as e:  # noqa: BLE001
+        code = log_exception("find_source failed", e)
+        await _safe_send(f"找图出错了（诊断编号 {code}），稍后再试。")
+        return True
+    if groups is None or groups.group(scope)["generation"] == image_scope[1]:
+        image_source_followup.remember(view, image_scope, path, data, result)
+    await _safe_send(result.render())
     return True
 
 

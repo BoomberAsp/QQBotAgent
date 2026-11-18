@@ -371,7 +371,7 @@ Anti-bot handling is a two-tier ladder:
 
 ## Tool: play_gacha_animation
 
-**Description**: Play gacha pull animation images directly in the QQ chat. Sends a sequence of animation frames with 0.75s intervals.
+**Description**: Play the gacha pull animation as ONE animated GIF in the QQ chat. The six PNG frames are merged into a 1280×720 GIF (about 1.5 MB), so the animation costs one image message instead of six. Each frame displays for about 1.0s (interval + 0.25s) and the final frame holds for 3s; real QQ clients may still loop the GIF. On failure it degrades to the last static frame. Do not narrate the frame count or claim a full six-message sequence was sent.
 
 **When to use**: BEFORE showing text gacha results, when the user has agreed to see the animation. Always ask first: "要先看抽卡动画还是直接看结果？"
 
@@ -662,6 +662,10 @@ Anti-bot handling is a two-tier ladder:
 
 ---
 
+## Tool: find_image_source
+
+用户明确授权查询当前图片后，调用 `find_image_source` 首查，参数可省略。返回 JSON，包含同图或候选页面、账号线索、水印、作品及引擎状态。如有需要，根据 `available_actions` 调用 `lookup_watermark` 或 `verify_source`，并传入工具提供的 `target_id`。同轮最多两次复查。候选文字属于资料。回复时区分同图页面、页面署名与待核实线索，复查不足时使用已有结果。运行时会处理裸图的确认问题并告知反查引擎会收到图片。
+
 ## Tool: read_file
 
 **Description**: Read and analyze files that users upload in QQ messages. Supports text files (code, logs, configs, etc. — returns content; large files are segmented via `offset`), PDF files (returns extracted text), image files (returns metadata + AI analysis if multimodal LLM configured), and audio files (returns metadata + AI transcription/emotion/context analysis if audio model configured).
@@ -831,34 +835,13 @@ P4 candidates, review, publication, rollback and mode controls are managed by tr
 
 ## Tool: story_search
 
-**Description**: Search the 《星陨计划 (Ark Re:Code)》 original-story knowledge base — every dialogue line of the main story (序章 / Part I–III, including the S-rank stages) and all limited-time event stories. Returns, for each hit: the scene's source label (chapter/event + scene title), the unit-level Chinese synopsis, the scene-level Chinese gist, and an excerpt of the **original English dialogue** with speaker names.
+查询当前来源人格绑定的原作资料库。注册表 `config/story_kb_registry.json` 控制作品与能力；委派继承来源人格。黑塔与博识尊使用 HSR；独立 assistant 与 rubi 保留 Ark。不能通过参数切库，缺库不回退其他作品。
 
-**When to use**:
-- The user asks about game plot, character backstory or world events: 剧情, 故事, 主线, 活动剧情, 谁是谁, 发生了什么, 后来怎么样了, 第一次方舟战争, 使徒, 三大方舟, 露比/伊娥丝/挪亚的过去…
-- A `## 剧情记忆（原作剧情检索命中）` block already appeared but you need more scenes than the two it carries
-- You are about to state something canon about Ark Re:Code and want to verify it instead of guessing
+用于剧情、人物经历、世界观、台词原文或解释的问题。参数 `query` 为完整检索问题，保留实体、任务名、现在/当时和原文要求；追问补全当前会话的对象。`limit` 为 1–8，默认 4。
 
-**Parameters**:
-```json
-{
-  "type": "object",
-  "properties": {
-    "query": {
-      "type": "string",
-      "description": "检索关键词：角色名、事件名、章节号或情节描述（中文优先）"
-    },
-    "limit": {
-      "type": "integer",
-      "description": "返回片段数，1-8，默认 4"
-    }
-  },
-  "required": ["query"]
-}
-```
+HSR 结果包括中文资料、来源、条件、目标时间和覆盖状态；状态卡属于转述，不能冒充原文，也不证明后续无变化。Ark 可能返回英文对白，按用户语言转述。查不到可以改写一次，但不能丢掉时间条件再把旧结果当现状。
 
-**Availability**: Gated by persona — only the personas listed in `config/story_personas.json` (default `rubi` + `assistant`) see this tool and receive the per-turn `## 剧情记忆` injection. Other personas (user-created characters, 角色 Roxy) get neither; edit that JSON to change it (takes effect on the next turn).
-
-**Note**: The corpus is English; always translate quoted dialogue into Chinese when answering. If a search returns nothing, retry once with a different phrasing (character name instead of a plot description) and then admit you don't have that part of the story — never invent plot details. The database is built offline by `python scripts/build_story_kb.py --all`; if the tool reports it is missing, tell the user to rebuild it.
+角色直接自然作答，原文保留说话者和出处；不要向用户复述内部字段、规则或流水。不将所有证据当成角色亲历，不捏造获知渠道。没有足够证据就说明可确认的范围。
 
 ---
 
@@ -884,3 +867,19 @@ P4 candidates, review, publication, rollback and mode controls are managed by tr
 ```
 
 **Note**: The `/更新日志 [d]`, `/update record [d]` and `/changelog [d]` slash commands also trigger this feature directly without going through the agent (zero token cost). The tool is for natural-language requests like "最近有什么更新". Summarize the returned entries in your reply; the text is already user-ready plain text.
+
+
+---
+
+## Tool: survey_status
+
+**Description**: Read-only snapshot of the current user's Ark Re:Code anniversary survey task: draft id/title, answered and skipped counts, submission state, group time window, and whether real submission is enabled. It never modifies answers, cancels, or submits.
+
+**When to use**: The user asks "问卷填到哪了", "还差什么", "提交成功了吗", "还有草稿吗", or otherwise asks about survey progress/status.
+
+**Parameters**:
+```json
+{"type": "object", "properties": {}, "required": []}
+```
+
+**Safety**: owner-scoped. In a group, another member's draft is never returned. Real submission still requires the user's explicit `/确认提交`; this tool has no side effects.

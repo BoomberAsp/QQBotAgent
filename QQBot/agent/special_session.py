@@ -429,6 +429,24 @@ class SpecialSessionManager:
         # Update index
         self._update_index(user_id, session)
 
+    @_session_locked
+    def replace_last_assistant(self, user_id, raw_response, final_text, expected_session_id=None):
+        """CAS update of the final visible answer, keeping snapshots/metadata intact."""
+        session = self.get_active(user_id)
+        if session is None or (expected_session_id and session.session_id != expected_session_id):
+            return False
+        if not session.context or session.context[-1].get("role") != "assistant":
+            return False
+        if session.context[-1].get("content") != raw_response:
+            return False
+        context = [dict(message) for message in session.context]
+        context[-1]["content"] = final_text
+        directory = self._session_dir(user_id, session.name)
+        self._atomic_context(os.path.join(directory, "committed_context.json"), context)
+        session.context = context
+        self._update_index(user_id, session)
+        return True
+
     # ── Context Compression (PLAN.md Idea 4, Phase A) ──────────────
 
     @_session_locked

@@ -164,6 +164,13 @@ _turn_keyboard: contextvars.ContextVar[Optional[list]] = (
     contextvars.ContextVar("_turn_keyboard", default=None)
 )
 
+# Last gacha pull's highest star (3/4/5/6; 0 = no valid pull).
+# gacha_pull sets it; the group command path reads it to choose the GIF
+# animation branch without changing gacha_pull's user-visible text result.
+_last_gacha_star: contextvars.ContextVar[int] = (
+    contextvars.ContextVar("_last_gacha_star", default=0)
+)
+
 # ── Story knowledge base (Ark Re:Code 原作剧情) ────────────────────
 # Per-turn retrieved original-story block. Built by agent/turn.py from the
 # local FTS index when a character persona is about to speak, then injected by
@@ -182,3 +189,18 @@ _current_story_char_id: contextvars.ContextVar[str] = (
 )
 
 _current_evidence_id = contextvars.ContextVar("_current_evidence_id", default="")
+
+# Internal execution persona must not replace the user-selected public identity.
+_current_task_persona = contextvars.ContextVar("_current_task_persona", default="")
+
+# Per-turn survey task hint (owner-only). Injected into the L4 volatile tail
+# (private) or the group prompt; never into the cached prefix.
+_current_survey_context: contextvars.ContextVar[str] = (
+    contextvars.ContextVar("_current_survey_context", default="")
+)
+
+# Current turn's inbound message for the read-only survey_status tool; it
+# carries the actual group member identity that the group agent does not see.
+_current_survey_view: contextvars.ContextVar[object] = (
+    contextvars.ContextVar("_current_survey_view", default=None)
+)

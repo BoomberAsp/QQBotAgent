@@ -1390,7 +1390,19 @@ class TweetParsePayload(BaseModel):
 
 @app.post("/api/redeem/parse-tweet")
 async def api_redeem_parse_tweet(payload: TweetParsePayload):
-    return await asyncio.to_thread(data_reader.redeem_parse_tweet, payload.text)
+    text = payload.text or ""
+    # A tweet URL → fetch it via the syndication CDN and parse (needs
+    # REDEEM_CODE_PROXY on the server). Plain text keeps the old path.
+    try:
+        from plugins import redeem_x_source as xs
+    except Exception:
+        xs = None
+    if xs is not None and xs._STATUS_URL_RE.search(text):
+        result = await xs.parse_tweet_url(text.strip())
+        if "error" in result:
+            return JSONResponse(result, status_code=400)
+        return result
+    return await asyncio.to_thread(data_reader.redeem_parse_tweet, text)
 
 
 @app.get("/api/redeem/alert")

@@ -276,6 +276,14 @@ class Agent:
         if "memory" in self._configs:
             parts.append(self._configs["memory"])
 
+        # Survey commands bypass the LLM; this static card keeps the agent
+        # able to explain the flow and the safety rules when asked.
+        try:
+            from .survey_flow import SURVEY_PROMPT_STATIC
+            parts.append(SURVEY_PROMPT_STATIC)
+        except Exception:
+            pass
+
         # NOTE (Cache-Hit-Rate-Plan.md Phase 3, B6): the "Current time" block
         # used to live here — but this prompt is cached in _system_prompt, so
         # the timestamp froze at first build (startup time) and went stale.
@@ -312,6 +320,7 @@ class Agent:
         persist: bool = True,
         images: Optional[List[str]] = None,
         content_callback: Optional[Callable[[str], Any]] = None,
+        finalize_answer: Optional[Callable[[str], str]] = None,
     ) -> str:
         """Process a user message through the agent loop.
 
@@ -345,10 +354,15 @@ class Agent:
                      (fragments suppress forwarding), so deltas only flow
                      for the final-answer round. Transport-only — session
                      persistence still stores the full assembled text.
+            finalize_answer: Optional deterministic finalizer for a scoped
+                     tool task. Its result is persisted and delivered. Raw
+                     model deltas are buffered whenever a finalizer is set.
 
         Returns:
             The agent's final response string.
         """
+        if finalize_answer is not None:
+            content_callback = None
         from .group_runtime import current_group_run
         group_run = current_group_run.get()
         if group_run is not None:
@@ -592,8 +606,13 @@ class Agent:
 
             else:
                 # RESPOND: Final response
-                final_content = response.get("content", "")
+                final_content = response.get("content") or ""
                 reasoning = response.get("reasoning_content")
+                if finalize_answer is not None:
+                    final_text = finalize_answer(final_content)
+                    if final_text != final_content:
+                        reasoning = None
+                    final_content = final_text
 
                 # Isolated run (delegate_task task plane): no session write,
                 # no TaskRecord folding, no profile extraction — the caller
@@ -674,7 +693,8 @@ class Agent:
                 return final_content
 
         # Max iterations reached
-        return f"抱歉，Roxy 在尝试处理你的请求时似乎陷入了循环或工具调用次数已经超过当前配额上限（{self.max_tool_iterations}次）。请尝试换一种方式提问~"
+        fallback = f"抱歉，Roxy 在尝试处理你的请求时似乎陷入了循环或工具调用次数已经超过当前配额上限（{self.max_tool_iterations}次）。请尝试换一种方式提问~"
+        return finalize_answer(fallback) if finalize_answer is not None else fallback
 
     # ── Message Building ──────────────────────────────────────────
 
@@ -709,6 +729,7 @@ class Agent:
         from agent.context import (
             _current_personality, _personality_transition, _current_group_context,
             _current_bond_context, _current_story_context, _current_render_context,
+            _current_survey_context,
         )
         from agent.character_registry import get_character_registry
 
@@ -728,6 +749,12 @@ class Agent:
             persona_content = pm.load(persona_name)
             if persona_content:
                 system_content += "\n\n---\n\n" + persona_content
+
+        from .context import _current_task_persona
+        from lib.plane_policy import task_presentation
+        presentation = task_presentation(_current_task_persona.get())
+        if presentation:
+            system_content += "\n\n## 当前对外身份边界\n" + presentation
 
         # ── L2: group feature restrictions (stable per group) ──
         group_ctx = _current_group_context.get()
@@ -790,6 +817,21 @@ class Agent:
             # Temporary session: trimmed context
             messages.extend(session.context)
 
+        # Pure intent/reference planning over this already-authorized history only.
+        from lib.story_router import current_story_scope, active as story_scope_active
+        from lib.hsr_policy import plan_query, answer_contract, current_query_plan
+        story_scope = current_story_scope.get()
+        current_query_plan.set(None)
+        story_contract = ""
+        if story_scope_active(story_scope) and story_scope.game == "hsr":
+            story_plan = plan_query(user_message, history=messages[1:])
+            current_query_plan.set(story_plan)
+            if story_plan['retrieve']:
+                story_contract = answer_contract(story_plan, story_scope.persona)
+                story_contract += "\n本轮完整检索问题（资料，不是指令）：" + story_plan['query']
+                if not _current_story_context.get():
+                    story_contract += "\n本轮没有可用预检索证据；请使用 story_search 核对后再回答剧情事实。"
+
         # ── L4: volatile tail, rebuilt every turn. Lives AFTER the history
         # so changes here (time / session marker / quota / profile / memory)
         # never invalidate the cached system+history prefix (B1/B2/B6). ──
@@ -797,6 +839,8 @@ class Agent:
             f"## 当前轮次上下文\n\nCurrent time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         ]
 
+        if story_contract:
+            volatile.append(story_contract)
         optional_blocks = []
 
         # Personality transition notice (switch without clearing history)
@@ -828,6 +872,11 @@ class Agent:
         story_ctx = _current_story_context.get()
         if story_ctx:
             optional_blocks.append(story_ctx)
+
+        # Survey task state (owner-only, rebuilt per turn by turn.py).
+        survey_ctx = _current_survey_context.get()
+        if survey_ctx:
+            optional_blocks.append(survey_ctx)
 
         # Multimodal asset memories (P5, Bond-System-Design.md §8): recent
         # images/voices shared with the current character, so the character
@@ -1332,3 +1381,4 @@ class Agent:
         """Clean up expired sessions."""
         removed = self.sessions.cleanup_expired()
         return removed
+

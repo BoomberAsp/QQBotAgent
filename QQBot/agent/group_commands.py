@@ -23,20 +23,35 @@ COMMANDS=(
  GroupCommand('/群面板','group_or_bot','打开管理卡片',('/toggle',)),
  GroupCommand('/群功能',usage='gacha|image|voice 开|关'),GroupCommand('/群参与',usage='仅召唤|跟随|自然'),
  GroupCommand('/群接收',usage='开|关'),GroupCommand('/群安静',usage='22:00-08:00|关'),
- GroupCommand('/群主动贴图',usage='开|关'),GroupCommand('/群剧情进度',usage='知识库ID 章节'),
+ GroupCommand('/群主动贴图',usage='开|关'),
  GroupCommand('/群记忆',usage='[添加 内容|清空 确认]'),GroupCommand('/群重置',usage='重置历史（确认后执行）'),
  GroupCommand('/群清除数据',usage='清除群历史、记忆和来源事实（确认后执行）'),
  GroupCommand('/取消','any','取消自己的当前任务',('/结束',)),GroupCommand('/群操作','any','操作令牌'),
+ GroupCommand('/问卷答案','any','查看当前问卷草稿'),
+ GroupCommand('/问卷详情','any','查看问卷审阅卡'),
+ GroupCommand('/确认提交','any','提交当前问卷'),
+ GroupCommand('/取消问卷','any','放弃当前问卷草稿',('/退出问卷',)),
+ GroupCommand('/重试提交','any','[确认] 重试提交'),
+ GroupCommand('/问卷选','any','<草稿> <题号> <选项号>'),
+ GroupCommand('/问卷跳过','any','[草稿] [题号]'),
+ GroupCommand('/问卷释放','admin','释放本群问卷锁'),
+ GroupCommand('/问卷诊断','any','问卷命令诊断'),
 )
 COMMANDS += tuple(GroupCommand(c.name,'any',c.usage,c.aliases) for c in PUBLIC_COMMANDS)
 IDENTITY_COMMANDS=('/绑定身份','/绑定群身份','/确认绑定','/解除身份绑定','/个人记忆','/记住','/删除记忆','/公开记忆')
 
 # QQ can leave the mention in event.content even on a genuine group-@ event.
 # Stripping a textual envelope classifies the message; it never grants permission.
-_COMMAND_START = re.compile(
-    r"^[\s\u200b\ufeff]*(?:(?:<@!?[\w.-]+>|\[CQ:at,[^\]\r\n]+\]|@[^\s/／＃#<>]+(?=\s))"
-    r"[\s\u200b\ufeff]*)*([/／#＃])"
+_MENTION_PREFIX = (
+    r"^[\s\u200b\ufeff]*(?:(?:<@!?[\w.-]+>|\[CQ:at,[^\]\r\n]+\]|@[^\s/／＃#<>]+(?=\s|$))"
+    r"[\s\u200b\ufeff]*)*"
 )
+_COMMAND_START = re.compile(_MENTION_PREFIX + r"([/／#＃])")
+
+
+def without_mention_prefix(text):
+    return re.sub(_MENTION_PREFIX, "", text, count=1)
+
 
 def command_text(text):
     match = _COMMAND_START.match(text)
@@ -99,6 +114,17 @@ async def dispatch(view,sender,role,store):
         if text=='/取消' and store.group(scope_for(view))['config']['receive_all']:
             await dispatch_game(view,sender,store,'/取消')
         return True
+    # Survey commands need the full view (group/scope/sender) — the generic
+    # dispatch_public path only passes text+user_id and cannot start a draft.
+    from . import survey_flow
+    if survey_flow.is_survey_command(text):
+        # command_text() already removed the <@openid>/CQ:at prefix that
+        # QQ official group content keeps; pass that cleaned text on.
+        if await survey_flow.try_handle(replace(view, text=text), sender):
+            return True
+        await GroupReply('问卷功能当前未启用',
+                         ['请管理员开启 SURVEY_ENABLED=1 后重启机器人。']).send(sender)
+        return True
     if text.partition(' ')[0] in IDENTITY_COMMANDS:
         await runtime.manage_identity(replace(view,text=text),sender);return True
     if text.split()[0].lower() in PRIVATE_ONLY:
@@ -107,6 +133,15 @@ async def dispatch(view,sender,role,store):
     cmd,rest,alias=parse(text)
     if cmd is None:
         await GroupReply('未知命令',['发送 /群帮助 查看本群可用命令。']).send(sender);return True
+    if survey_flow.is_survey_command(cmd.name):
+        # Defence in depth for registered survey commands: never let them
+        # fall through to the generic service.patch() branch.
+        rewritten=cmd.name+((' '+rest) if rest else '')
+        if await survey_flow.try_handle(replace(view,text=rewritten), sender):
+            return True
+        await GroupReply('问卷功能当前未启用',
+                         ['请管理员开启 SURVEY_ENABLED=1 后重启机器人。']).send(sender)
+        return True
     if not authorized(cmd.who,role,view.actor_role):
         await GroupReply('权限不足',['此操作需要机器人管理员权限。' if cmd.who=='admin' else '此操作需要群主、群管理员或机器人管理员权限。']).send(sender);return True
     if cmd.name in GAMES or cmd.name=='/取消':
@@ -119,7 +154,7 @@ async def dispatch(view,sender,role,store):
         group_token=_current_group_id.set(view.group_id)
         try:
             images=store.group(scope_for(view))['config']['features'].get('image',True)
-            if not await dispatch_public(public,rest,view.user_id,allow_images=images):
+            if not await dispatch_public(public,rest,view.user_id,allow_images=images,view=view):
                 await GroupReply('命令参数有误',[cmd.name+' '+cmd.usage]).send(sender)
         finally:
             _current_group_id.reset(group_token)
@@ -161,8 +196,6 @@ async def dispatch(view,sender,role,store):
             elif name=='/群接收':patch={'receive_all':onoff(rest)}
             elif name=='/群主动贴图':patch={'proactive_stickers':onoff(rest)}
             elif name=='/群安静':patch={'quiet':'' if rest=='关' else rest}
-            elif name=='/群剧情进度':
-                kb,n=rest.split();patch={'story_progress':{kb:int(n)}}
             service.patch(scope,patch,actor,effective,rev)
     except (ValueError,KeyError,PermissionError,TypeError) as exc:
         reply=GroupReply('操作未完成',[str(exc) if isinstance(exc,(ValueError,PermissionError)) else '参数错误，请查看 /群帮助'])
