@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
-from .service import Bridge, TASK_NAMES, TICKET_TTL, Vault, Worker
+from .service import APPROVALS, Bridge, TASK_NAMES, TICKET_TTL, Vault, Worker
 
 
 FILES = Path(__file__).resolve().parent
@@ -22,6 +22,7 @@ COOKIE = "__Host-lucima"
 TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 CODE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 PIN = re.compile(r"[0-9]{8}\Z")
+OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{16}\Z")
 
 
 def public_origin() -> str:
@@ -211,8 +212,23 @@ async def command(request: Request):
         return answer(bridge.cancel(owner))
     if action == "unbind":
         return answer(bridge.unbind(owner))
-    if action in TASK_NAMES and (action != "redeem" or isinstance(arg, str) and CODE.fullmatch(arg)):
-        return answer(bridge.submit(owner, action, arg if action == "redeem" else "", event))
+    if action == "approve" and isinstance(arg, str) and OPERATION_ID.fullmatch(arg):
+        return bridge.approve(owner, arg, event)
+    if action == "discard" and isinstance(arg, str) and OPERATION_ID.fullmatch(arg):
+        return answer(bridge.discard(owner, arg))
+    if action == "receipt" and isinstance(arg, str) and (not arg or OPERATION_ID.fullmatch(arg)):
+        return bridge.receipt(owner, arg)
+    if isinstance(arg, str) and (action, arg) in APPROVALS:
+        return bridge.prepare(owner, action, arg)
+    if action in TASK_NAMES and isinstance(arg, str):
+        valid_arg = (
+            (action == "redeem" and CODE.fullmatch(arg))
+            or (action == "stages" and arg in {"hunt", "elf"})
+            or (action == "equipment" and (not arg or valid(arg, 24)))
+            or (action not in {"recruit", "donate", "redeem", "stages", "equipment"} and not arg)
+        )
+        if valid_arg:
+            return bridge.submit(owner, action, arg, event)
     if action == "encyclopedia" and valid(arg, 64) and arg.strip():
         query = arg.strip().casefold()
         catalog = request.app.state.catalog

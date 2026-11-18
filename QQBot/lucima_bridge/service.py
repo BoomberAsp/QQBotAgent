@@ -10,7 +10,7 @@ import sqlite3
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -22,16 +22,27 @@ SESSION_TTL = 15 * 60
 REMEMBER_TTL = 30 * 86400
 QUEUE_TTL = 5 * 60
 QUEUE_SIZE = 5
-TASK_NAMES = {"signin": "签到", "mail": "领邮件", "base": "领基地", "redeem": "兑换"}
+TASK_NAMES = {
+    "signin": "签到", "mail": "领邮件", "base": "领基地", "redeem": "兑换",
+    "dispatch": "派遣领取", "achievement": "成就奖励", "guild": "佣兵团签到",
+    "guild_weekly": "佣兵团周奖励", "donate": "佣兵团捐赠", "recruit": "免费招募",
+    "stages": "扫荡关卡查询", "equipment": "装备筛选",
+}
+APPROVALS = {
+    ("donate", "gold"): "佣兵团捐赠 1 次，最多消耗 5000 金币。",
+    ("donate", "courage"): "佣兵团捐赠 1 次，最多消耗 1 个英勇证明。",
+    ("recruit", ""): "使用当日免费招募 1 次。执行前会核对免费额度，额度不明或已用时停止。",
+}
 OUTCOMES = {
     "ok": "完成。",
-    "skipped": "没有待领取的奖励。",
+    "skipped": "本次没有可执行项目。",
     "deferred": "受游戏维护、日切或账号状态限制，任务未全部执行。",
     "unconfirmed": "任务结果未能完整确认，请先在游戏内核对。",
     "worker_error": "任务结果未知，请先在游戏内核对。",
     "timeout": "任务超时，请先在游戏内核对结果。",
     "auth_expired": "登录授权已失效，请重新扫码。",
     "invalid_code": "兑换码无效或已过期。",
+    "unexpected_cost": "游戏返回了意外消耗，请核对账户。",
     "duplicate_login": "检测到重复登录，已停止。请退出游戏客户端后再手动发起。",
 }
 
@@ -153,6 +164,15 @@ class Job:
     task: str
     code: str
     created: float
+    id: str = field(default_factory=lambda: secrets.token_urlsafe(12))
+
+
+@dataclass
+class Plan:
+    id: str
+    task: str
+    code: str
+    expires: float
 
 
 class Worker:
@@ -217,7 +237,10 @@ class Bridge:
         self.sessions: dict[str, tuple[float, dict]] = {}
         self.queue: deque[Job] = deque()
         self.active: str | None = None
+        self.active_job: Job | None = None
         self.last: dict[str, tuple[float, str]] = {}
+        self.receipts: dict[str, tuple[str, float, dict]] = {}
+        self.plans: dict[str, Plan] = {}
         self.submitted: dict[tuple[str, str], float] = {}
         self.wake = asyncio.Event()
 
@@ -227,10 +250,12 @@ class Bridge:
         self.attempts = {key: expiry for key, expiry in self.attempts.items() if expiry > now}
         self.sessions = {key: session for key, session in self.sessions.items() if session[0] > now}
         self.last = {key: result for key, result in self.last.items() if result[0] > now}
+        self.receipts = {key: result for key, result in self.receipts.items() if result[1] > now}
+        self.plans = {key: plan for key, plan in self.plans.items() if plan.expires > now}
         self.submitted = {key: expiry for key, expiry in self.submitted.items() if expiry > now}
         while self.queue and now - self.queue[0].created >= QUEUE_TTL:
             job = self.queue.popleft()
-            self.result(job.owner, "排队已超时，请重新提交。")
+            self.result(job, "排队已超时，请重新提交。", "queue_expired")
 
     def drop_tickets(self, owner: str) -> None:
         self.tickets = {key: ticket for key, ticket in self.tickets.items() if ticket.owner != owner}
@@ -303,6 +328,7 @@ class Bridge:
                 return 409, "该账号无法与此 QQ 身份绑定。若要切换已有绑定，请先在私聊解绑。"
             self.sessions[owner] = (time.monotonic() + SESSION_TTL, auth)
             self.last.pop(owner, None)
+            self.plans.pop(owner, None)
             if remember and not saved:
                 return 200, "绑定成功。游戏未返回续期令牌，本次仅保留临时登录。"
             return 200, "绑定成功。请返回 QQ 私聊执行任务。"
@@ -314,22 +340,49 @@ class Bridge:
         session = self.sessions.get(owner)
         return session[1] if session and session[0] > time.monotonic() else self.vault.load(owner)
 
-    def submit(self, owner: str, task: str, code: str, message_id: str) -> str:
+    def prepare(self, owner: str, task: str, code: str) -> dict:
+        self.prune()
+        if not self.auth_for(owner):
+            return {"message": "请先用 /璐茜玛 登录 完成扫码。"}
+        plan = Plan(secrets.token_urlsafe(12), task, code, time.monotonic() + 300)
+        self.plans[owner] = plan
+        return {"message": APPROVALS[(task, code)], "approval": plan.id}
+
+    def approve(self, owner: str, token: str, event: str) -> dict:
+        self.prune()
+        plan = self.plans.get(owner)
+        if not plan or not hmac.compare_digest(plan.id, token):
+            return {"message": "执行确认无效、已使用或已过期，请重新发起。"}
+        result = self.submit(owner, plan.task, plan.code, event)
+        if "job" in result:
+            self.plans.pop(owner, None)
+        return result
+
+    def discard(self, owner: str, token: str) -> str:
+        self.prune()
+        plan = self.plans.get(owner)
+        if not plan or not hmac.compare_digest(plan.id, token):
+            return "这份待确认操作已失效。"
+        del self.plans[owner]
+        return "已放弃这份待确认操作。"
+
+    def submit(self, owner: str, task: str, code: str, message_id: str) -> dict:
         self.prune()
         anchor = (owner, message_id)
         if anchor in self.submitted:
-            return "这条消息已经提交过。"
+            return {"message": "这条消息已经提交过。"}
         if self.active == owner or any(job.owner == owner for job in self.queue):
-            return "你已有待处理的操作，请用 /璐茜玛 状态 查询。"
+            return {"message": "你已有待处理的操作，请用 /璐茜玛 状态 查询。"}
         if not self.auth_for(owner):
-            return "请先用 /璐茜玛 登录 完成扫码。"
+            return {"message": "请先用 /璐茜玛 登录 完成扫码。"}
         if len(self.queue) >= QUEUE_SIZE:
-            return "游戏任务队列已满，请稍后再试。"
+            return {"message": "游戏任务队列已满，请稍后再试。"}
         self.submitted[anchor] = time.monotonic() + 600
         self.last.pop(owner, None)
-        self.queue.append(Job(owner, task, code, time.monotonic()))
+        job = Job(owner, task, code, time.monotonic())
+        self.queue.append(job)
         self.wake.set()
-        return f"已提交{TASK_NAMES[task]}。用 /璐茜玛 状态 查看结果。"
+        return {"message": f"已提交{TASK_NAMES[task]}。用 /璐茜玛 状态 查看进度。", "job": job.id}
 
     def status(self, owner: str) -> str:
         self.prune()
@@ -345,11 +398,14 @@ class Bridge:
 
     def cancel(self, owner: str) -> str:
         self.prune()
+        plan = self.plans.pop(owner, None)
         for job in self.queue:
             if job.owner == owner:
                 self.queue.remove(job)
-                self.result(owner, "已取消排队任务。")
+                self.result(job, "已取消排队任务。", "cancelled")
                 return "已取消排队任务。"
+        if plan:
+            return "已取消待确认操作。"
         return "本次操作正在执行。" if self.active == owner else "没有待取消的任务。"
 
     def unbind(self, owner: str) -> str:
@@ -360,10 +416,32 @@ class Bridge:
         self.drop_tickets(owner)
         self.sessions.pop(owner, None)
         self.last.pop(owner, None)
+        self.receipts = {key: row for key, row in self.receipts.items() if row[0] != owner}
         return "已解除绑定并清除本服务的登录授权。"
 
-    def result(self, owner: str, message: str) -> None:
-        self.last[owner] = (time.monotonic() + 3600, message)
+    def result(self, job: Job, message: str, status: str, details=None) -> None:
+        expires = time.monotonic() + 3600
+        facts = details if isinstance(details, list) else []
+        clean = [" ".join(item.split())[:120] for item in facts[:8] if isinstance(item, str)]
+        payload = {"id": job.id, "task": TASK_NAMES[job.task], "status": status,
+                   "message": message, "details": clean, "completed_at": int(time.time())}
+        self.last[job.owner] = (expires, message)
+        self.receipts[job.id] = (job.owner, expires, payload)
+        if len(self.receipts) > 512:
+            self.receipts.pop(next(iter(self.receipts)))
+
+    def receipt(self, owner: str, job_id: str) -> dict:
+        self.prune()
+        if job_id:
+            stored = self.receipts.get(job_id)
+        else:
+            stored = next((row for row in reversed(self.receipts.values()) if row[0] == owner), None)
+        if stored and stored[0] == owner:
+            return {"message": stored[2]["message"], "receipt": stored[2]}
+        if job_id and any(job and job.id == job_id and job.owner == owner
+                          for job in (self.active_job, *self.queue)):
+            return {"message": "任务正在处理。", "pending": True}
+        return {"message": "没有可领取的回执，或回执已过期。"}
 
     async def consume(self) -> None:
         while True:
@@ -378,20 +456,24 @@ class Bridge:
                 continue
             job = self.queue.popleft()
             self.active = job.owner
+            self.active_job = job
             try:
                 await self.run_job(job)
             except Exception:
-                self.result(job.owner, OUTCOMES["worker_error"])
+                self.result(job, OUTCOMES["worker_error"], "worker_error")
             finally:
                 self.active = None
+                self.active_job = None
 
     async def run_job(self, job: Job) -> None:
         auth = self.auth_for(job.owner)
         if not auth:
-            self.result(job.owner, OUTCOMES["auth_expired"])
+            self.result(job, OUTCOMES["auth_expired"], "auth_expired")
             return
         result = await self.worker({"action": "run", "auth": auth, "task": job.task, "code": job.code}, 100)
         status = result.get("status")
+        if not isinstance(status, str) or status not in OUTCOMES:
+            status = "worker_error"
         refreshed = read_auth(result)
         if status == "auth_expired":
             self.sessions.pop(job.owner, None)
@@ -402,4 +484,4 @@ class Bridge:
                 self.sessions[job.owner] = (session[0], refreshed)
             if refreshed != auth:
                 self.vault.update(job.owner, refreshed)
-        self.result(job.owner, f"{TASK_NAMES[job.task]}：{OUTCOMES.get(status, OUTCOMES['worker_error'])}")
+        self.result(job, f"{TASK_NAMES[job.task]}：{OUTCOMES[status]}", status, result.get("details"))

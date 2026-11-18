@@ -92,6 +92,28 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertIn("清除", self.command("unbind")["message"])
         self.assertIn("无有效授权", self.command("status")["message"])
 
+    def test_spending_approval_bound_to_owner_and_consumed_once(self):
+        self.command("confirm", arg=self.open_ticket())
+        body = {"account": "test-account", "password": "test-password"}
+        self.assertEqual(self.post("/api/login", body).status_code, 200)
+        superseded = self.command("recruit")["approval"]
+        ticket = self.command("donate", arg="gold")["approval"]
+        self.assertIn("已失效", self.command("discard", arg=superseded)["message"])
+        self.assertIn("已失效", self.command("discard", user="other", arg=ticket)["message"])
+        self.assertNotIn("job", self.command("approve", user="other", arg=ticket))
+        self.assertNotIn("job", self.command("approve", platform="qq_official", arg=ticket))
+        task = self.command("approve", arg=ticket, event="submit")["job"]
+        self.assertNotIn("job", self.command("approve", arg=ticket, event="replay"))
+        for _ in range(40):
+            result = self.command("receipt", arg=task)
+            if "receipt" in result:
+                break
+        self.assertEqual(result["receipt"]["task"], "佣兵团捐赠")
+        self.assertNotIn("receipt", self.command("receipt", user="other", arg=task))
+        self.assertNotIn("auth", result["receipt"])
+        payload = self.worker.await_args.args[0]
+        self.assertEqual((payload["task"], payload["code"]), ("donate", "gold"))
+
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_queue_limits_and_reaps_before_next_job(self):
@@ -110,15 +132,15 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         bridge = Bridge(vault, worker, ORIGIN)
         for index in range(7):
             vault.bind(str(index), {**AUTH, "user_id": str(index)}, True)
-        self.assertIn("已提交", bridge.submit("0", "mail", "", "event"))
+        self.assertIn("已提交", bridge.submit("0", "mail", "", "event")["message"])
         consumer = asyncio.create_task(bridge.consume())
         try:
             await asyncio.wait_for(entered.wait(), 2)
-            self.assertIn("已经提交", bridge.submit("0", "mail", "", "event"))
-            self.assertIn("已有", bridge.submit("0", "mail", "", "another"))
+            self.assertIn("已经提交", bridge.submit("0", "mail", "", "event")["message"])
+            self.assertIn("已有", bridge.submit("0", "mail", "", "another")["message"])
             for index in range(1, 6):
-                self.assertIn("已提交", bridge.submit(str(index), "mail", "", "event"))
-            self.assertIn("队列已满", bridge.submit("6", "mail", "", "event"))
+                self.assertIn("已提交", bridge.submit(str(index), "mail", "", "event")["message"])
+            self.assertIn("队列已满", bridge.submit("6", "mail", "", "event")["message"])
             self.assertEqual(ran, ["0"])
             self.assertIn("已取消", bridge.cancel("2"))
             release.set()
