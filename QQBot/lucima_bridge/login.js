@@ -4,6 +4,9 @@ const form = document.querySelector("#login");
 const account = document.querySelector("#account");
 const password = document.querySelector("#password");
 const button = document.querySelector("#submit");
+const savedLogin = document.querySelector("#saved-login");
+const savedAccount = document.querySelector("#saved-account");
+const resume = document.querySelector("#resume");
 
 function post(path, body) {
   return fetch(path, {
@@ -25,6 +28,12 @@ async function showState(response) {
     statusLine.textContent = "已核对 QQ 身份。";
     confirmation.hidden = true;
     form.hidden = false;
+    if (data.saved_login) {
+      const saved = data.saved_login.account;
+      savedAccount.textContent = saved || "已记住的游戏账号";
+      if (saved && !account.value) account.value = saved;
+      savedLogin.hidden = false;
+    }
     return;
   }
   statusLine.textContent = "等待 QQ 确认。";
@@ -42,32 +51,44 @@ async function poll() {
   }
 }
 
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
+async function submitLogin(body, usingSaved) {
   if (button.disabled) return;
   button.disabled = true;
-  statusLine.textContent = "正在验证游戏账号…";
+  resume.disabled = true;
+  statusLine.textContent = usingSaved ? "正在恢复已保存的授权…" : "正在验证游戏账号…";
   try {
-    const request = post("/api/login", {
-      account: account.value,
-      password: password.value,
-      remember: document.querySelector("#remember").checked,
-    });
+    const request = post("/api/login", body);
     password.value = "";
     const response = await request;
     statusLine.textContent = (await response.json()).message;
-    if (response.status !== 429) {
+    if (usingSaved && response.status === 409) {
+      savedLogin.hidden = true;
+      password.focus();
+    } else if (response.status !== 429) {
       form.reset();
       form.hidden = true;
+      savedLogin.hidden = true;
     }
   } catch {
     form.reset();
     form.hidden = true;
+    savedLogin.hidden = true;
     statusLine.textContent = "结果暂时未知。请回 QQ 查询状态，必要时重新扫码。";
   } finally {
     button.disabled = false;
+    resume.disabled = false;
   }
+}
+
+form.addEventListener("submit", (event) => {
+  event.preventDefault();
+  return submitLogin({
+    account: account.value,
+    password: password.value,
+    remember: document.querySelector("#remember").checked,
+  }, false);
 });
+resume.addEventListener("click", () => submitLogin({ use_saved: true }, true));
 
 async function start() {
   const ticket = location.hash.slice(1);

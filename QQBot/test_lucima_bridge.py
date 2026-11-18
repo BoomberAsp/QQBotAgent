@@ -1,6 +1,7 @@
 """Offline regressions for the Lucima authorization and process boundaries."""
 import asyncio
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -105,6 +106,50 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertEqual(failed.status_code, 400)
         self.assertEqual(self.command("login_notice", arg=issue["login_notice"], event="original"), {})
         self.assertEqual(self.command("lobby")["menu"], "login")
+
+    def test_remembered_login_autofills_only_after_qq_confirmation_and_preserves_expiry(self):
+        account = "remembered@example.invalid"
+        self.command("confirm", arg=self.open_ticket())
+        self.assertEqual(self.post("/api/login", {"account": account, "password": "dummy-pass", "remember": True}).status_code, 200)
+        self.assertNotIn(account.encode(), self.db_path.read_bytes())
+        self.assertNotIn(b"dummy-pass", self.db_path.read_bytes())
+        self.client.portal.call(app.state.bridge.attempts.clear)
+        issue = self.command("login", event="resume-request")
+        pin = self.claim_ticket(issue["login_url"])
+        self.assertNotIn("saved_login", self.client.get("/api/session").json())
+        self.assertEqual(self.post("/api/login", {"use_saved": True}).status_code, 403)
+        self.command("confirm", arg=pin)
+        candidate = self.client.get("/api/session").json()["saved_login"]
+        self.assertEqual(candidate["account"], account)
+        self.assertNotIn("fake-refresh", str(candidate))
+        self.worker.return_value = {"status": "ok", "auth": {**AUTH, "refresh_token": "rotated-fake-refresh"}}
+        self.assertEqual(self.post("/api/login", {"use_saved": True}).status_code, 200)
+        args = self.worker.await_args.args[0]
+        self.assertEqual(args, {"action": "resume", "auth": AUTH})
+        notice = self.command("login_notice", arg=issue["login_notice"], event="resume-request")
+        self.assertIn("已恢复记住的登录", notice["message"])
+        with sqlite3.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT expires FROM binding").fetchone()[0], candidate["expires"])
+
+    def test_legacy_remembered_login_has_candidate_and_falls_back_without_new_qr(self):
+        def put_legacy_record():
+            vault = app.state.bridge.vault
+            owner = vault.index('["onebot","bot","owner"]')
+            self.assertTrue(vault.bind(owner, AUTH, True))
+            game, _, _ = vault.record(owner)
+            with vault.db:
+                vault.db.execute("UPDATE binding SET credential = ? WHERE owner = ?", (vault.seal(owner, game, AUTH), owner))
+
+        self.client.portal.call(put_legacy_record)
+        issue = self.command("login", event="legacy")
+        self.command("confirm", arg=self.claim_ticket(issue["login_url"]))
+        self.assertEqual(self.client.get("/api/session").json()["saved_login"]["account"], "")
+        self.worker.return_value = {"status": "login_failed"}
+        self.assertEqual(self.post("/api/login", {"use_saved": True}).status_code, 409)
+        self.assertNotIn("saved_login", self.client.get("/api/session").json())
+        self.worker.return_value = {"status": "ok", "auth": AUTH}
+        self.assertEqual(self.post("/api/login", {"account": "dummy-account", "password": "dummy-pass"}).status_code, 200)
+        self.assertEqual(self.command("login_notice", arg=issue["login_notice"], event="legacy")["menu"], "lobby")
 
     def test_remembered_authorization_is_encrypted_and_cannot_be_taken_over(self):
         self.command("confirm", arg=self.open_ticket())

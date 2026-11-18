@@ -96,13 +96,13 @@ class Vault:
             "SELECT game, credential, expires FROM binding WHERE owner = ?", (owner,),
         ).fetchone()
 
-    def bind(self, owner: str, auth: dict, remember: bool) -> bool:
+    def bind(self, owner: str, auth: dict, remember: bool, *, account: str = "") -> bool:
         game = self.index("game:" + auth["user_id"])
         current = self.record(owner)
         if current and current[0] != game:
             return False
         expires = int(time.time()) + REMEMBER_TTL if remember else 0
-        sealed = self.seal(owner, game, auth) if remember else None
+        sealed = self.seal(owner, game, {**auth, "account": account}) if remember else None
         try:
             with self.db:
                 self.db.execute(
@@ -117,8 +117,7 @@ class Vault:
     def seal(self, owner: str, game: str, auth: dict) -> bytes:
         return self.cipher.encrypt(json.dumps([owner, game, auth]).encode())
 
-    def load(self, owner: str) -> dict | None:
-        record = self.record(owner)
+    def open_credential(self, owner: str, record: tuple | None) -> tuple[dict, str] | None:
         if not record:
             return None
         game, sealed, expires = record
@@ -128,15 +127,35 @@ class Vault:
             saved_owner, saved_game, auth = json.loads(self.cipher.decrypt(sealed))
         except (InvalidToken, ValueError):
             return None
-        return read_auth({"auth": auth}) if (saved_owner, saved_game) == (owner, game) else None
+        if (saved_owner, saved_game) != (owner, game):
+            return None
+        usable = read_auth({"auth": auth})
+        if not usable or self.index("game:" + usable["user_id"]) != game:
+            return None
+        account = auth.get("account", "")
+        return usable, account if isinstance(account, str) and len(account) <= 254 else ""
 
-    def update(self, owner: str, auth: dict) -> None:
+    def load(self, owner: str) -> dict | None:
+        opened = self.open_credential(owner, self.record(owner))
+        return opened[0] if opened else None
+
+    def candidate(self, owner: str) -> dict | None:
         record = self.record(owner)
-        if record and record[1] and record[2] > time.time():
-            with self.db:
-                self.db.execute("UPDATE binding SET credential = ? WHERE owner = ?", (
-                    self.seal(owner, record[0], auth), owner,
-                ))
+        opened = self.open_credential(owner, record)
+        if opened is None or not opened[0]["refresh_token"]:
+            return None
+        return {"account": opened[1], "expires": record[2]}
+
+    def update(self, owner: str, auth: dict) -> bool:
+        record = self.record(owner)
+        opened = self.open_credential(owner, record)
+        if opened is None or auth["user_id"] != opened[0]["user_id"]:
+            return False
+        with self.db:
+            self.db.execute("UPDATE binding SET credential = ? WHERE owner = ?", (
+                self.seal(owner, record[0], {**auth, "account": opened[1]}), owner,
+            ))
+        return True
 
     def forget(self, owner: str) -> None:
         with self.db:
@@ -159,6 +178,7 @@ class Ticket:
     pin: str = ""
     confirmed: bool = False
     failures: int = 0
+    saved_attempted: bool = False
 
 
 @dataclass
@@ -353,7 +373,13 @@ class Bridge:
             break
         return "核对码无效或已过期，请检查网页或重新申请。"
 
-    async def login(self, browser: str, account: str, password: str, remember: bool) -> tuple[int, str]:
+    def saved_candidate(self, ticket: Ticket) -> dict | None:
+        if not ticket.confirmed or ticket.saved_attempted:
+            return None
+        return self.vault.candidate(ticket.owner)
+
+    async def login(self, browser: str, account: str, password: str, remember: bool,
+                    *, use_saved: bool = False) -> tuple[int, str]:
         ticket = self.browser_ticket(browser)
         if not ticket or not ticket.confirmed:
             return 403, "请从原私聊完成核对，或重新获取二维码。"
@@ -362,28 +388,42 @@ class Bridge:
             return 429, "执行服务正忙，请稍等后再提交。"
         if owner in self.attempts:
             return 429, "刚尝试过登录，请稍等后再提交。"
+        saved_auth = self.vault.load(owner) if use_saved and not ticket.saved_attempted else None
+        if use_saved and (saved_auth is None or not saved_auth["refresh_token"]):
+            return 409, "已保存的授权暂不可用，请填写账号密码登录。"
         notice = self.login_notices.get(owner)
         if notice is not None:
             notice.expires = time.monotonic() + LOGIN_TIMEOUT + 10
-        self.drop_tickets(owner)
+        if use_saved:
+            ticket.saved_attempted = True
+            payload = {"action": "resume", "auth": saved_auth}
+        else:
+            self.drop_tickets(owner)
+            self.attempts[owner] = time.monotonic() + 30
+            device_id = self.vault.index("device:" + owner)[:40]
+            payload = {"action": "login", "account": account, "password": password, "device_id": device_id}
         self.active = owner
-        self.attempts[owner] = time.monotonic() + 30
-        device_id = self.vault.index("device:" + owner)[:40]
         try:
-            result = await self.worker({
-                "action": "login", "account": account, "password": password, "device_id": device_id,
-            }, LOGIN_TIMEOUT)
+            result = await self.worker(payload, LOGIN_TIMEOUT)
             auth = read_auth(result)
             if result.get("status") != "ok" or not auth:
+                if use_saved:
+                    return 409, "无法恢复已保存授权，请填写账号密码登录。"
                 return 400, "登录失败，请检查账号密码或稍后重新扫码。"
-            saved = remember and bool(auth["refresh_token"])
-            if not self.vault.bind(owner, auth, saved):
+            saved = use_saved or remember and bool(auth["refresh_token"])
+            if use_saved:
+                if not auth["refresh_token"] or not self.vault.update(owner, auth):
+                    return 409, "已保存授权已失效，请填写账号密码登录。"
+                self.drop_tickets(owner)
+            elif not self.vault.bind(owner, auth, saved, account=account):
                 return 409, "该账号无法与此 QQ 身份绑定。若要切换已有绑定，请先在私聊解绑。"
             self.sessions[owner] = (time.monotonic() + SESSION_TTL, auth)
             self.last.pop(owner, None)
             self.plans.pop(owner, None)
             if notice is not None:
                 authorization = "已加密记住登录，最长 30 天。" if saved else "本次临时授权有效 15 分钟。"
+                if use_saved:
+                    authorization = "已恢复记住的登录，保留原授权到期时间。"
                 notice.message = lobby_message(f"登录成功。{authorization}")
                 notice.expires = time.monotonic() + 60
                 notice.ready.set()
@@ -392,7 +432,10 @@ class Bridge:
             return 200, "绑定成功。请返回 QQ 私聊查看大厅，或发送 /璐茜玛 大厅。"
         finally:
             if notice is not None and notice.message is None and self.login_notices.get(owner) is notice:
-                self.dismiss_login_notice(owner)
+                if use_saved:
+                    notice.expires = ticket.created + TICKET_TTL
+                else:
+                    self.dismiss_login_notice(owner)
             self.active = None
             self.wake.set()
 

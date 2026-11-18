@@ -158,12 +158,16 @@ async def claim(request: Request):
 
 @app.get("/api/session")
 async def session(request: Request):
-    ticket = request.app.state.bridge.browser_ticket(browser_id(request))
+    bridge = request.app.state.bridge
+    ticket = bridge.browser_ticket(browser_id(request))
     if not ticket:
         return answer("请在 QQ 私聊发送 /璐茜玛 登录 获取二维码。", 410)
     if not ticket.confirmed:
         return {"state": "waiting", "pin": ticket.pin}
-    return {"state": "ready"}
+    ready = {"state": "ready"}
+    if saved := bridge.saved_candidate(ticket):
+        ready["saved_login"] = saved
+    return ready
 
 
 @app.post("/api/login")
@@ -177,14 +181,18 @@ async def login(request: Request):
         return answer("请先完成私聊核对。", 403)
     body = await json_body(request) or {}
     account, password, remember = body.get("account"), body.get("password"), body.get("remember", False)
-    if not valid(account, 254) or not account.strip() or not valid(password, 512) or type(remember) is not bool:
+    use_saved = body.get("use_saved", False)
+    if use_saved is True and set(body) == {"use_saved"}:
+        account, password, remember = "", "", False
+    elif (use_saved is not False or not valid(account, 254) or not account.strip()
+          or not valid(password, 512) or type(remember) is not bool):
         return answer("请检查账号和密码。", 400)
     try:
-        status, message = await bridge.login(browser, account.strip(), password, remember)
+        status, message = await bridge.login(browser, account.strip(), password, remember, use_saved=use_saved)
     except Exception:
         status, message = 503, "暂时无法登录，请稍后重新扫码。"
     response = answer(message, status)
-    if status != 429:
+    if status != 429 and not (use_saved and status == 409):
         response.delete_cookie(COOKIE, secure=True, httponly=True, samesite="strict", path="/")
     return response
 
