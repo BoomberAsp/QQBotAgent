@@ -47,7 +47,10 @@ class WebAuthorizationTests(unittest.TestCase):
         return self.client.post(path, headers={"Origin": origin}, json=body)
 
     def open_ticket(self, user="owner"):
-        ticket = self.command("login", user=user)["login_url"].split("#")[1]
+        return self.claim_ticket(self.command("login", user=user)["login_url"])
+
+    def claim_ticket(self, url):
+        ticket = url.split("#")[1]
         claim = self.post("/api/claim", {"ticket": ticket})
         self.assertEqual(claim.status_code, 200)
         self.assertIn("HttpOnly", claim.headers["set-cookie"])
@@ -71,6 +74,37 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertIn("无有效授权", self.command("status", platform="qq_official")["message"])
         for secret in ("dummy-account", "dummy-password", "fake-access", "fake-refresh", AUTH["user_id"]):
             self.assertNotIn(secret.encode(), self.db_path.read_bytes())
+
+    def test_login_success_delivers_one_lobby_to_original_event(self):
+        self.assertEqual(self.command("lobby")["menu"], "login")
+        issue = self.command("login", event="original")
+        notice = issue["login_notice"]
+        self.assertNotEqual(notice, issue["login_url"].split("#")[1])
+        self.assertEqual(self.command("login_notice", user="other", arg=notice, event="original"), {})
+        self.assertEqual(self.command("login_notice", platform="qq_official", arg=notice, event="original"), {})
+        self.assertEqual(self.command("login_notice", arg=notice, event="different"), {})
+        with patch("lucima_bridge.service.LOGIN_NOTICE_WAIT", 0.01):
+            self.assertEqual(self.command("login_notice", arg=notice, event="original"), {"pending": True})
+        self.command("confirm", arg=self.claim_ticket(issue["login_url"]))
+        result = self.post("/api/login", {"account": "dummy-account", "password": "dummy-password"})
+        self.assertEqual(result.status_code, 200)
+        self.assertNotIn(notice, result.text)
+        lobby = self.command("login_notice", arg=notice, event="original")
+        self.assertEqual(lobby["menu"], "lobby")
+        self.assertIn("登录成功", lobby["message"])
+        self.assertIn("15 分钟", lobby["message"])
+        self.assertNotIn(AUTH["user_id"], str(lobby))
+        self.assertEqual(self.command("login_notice", arg=notice, event="original"), {})
+        self.assertEqual(self.command("lobby")["menu"], "lobby")
+
+    def test_failed_login_does_not_notify_success(self):
+        issue = self.command("login", event="original")
+        self.command("confirm", arg=self.claim_ticket(issue["login_url"]))
+        self.worker.return_value = {"status": "login_failed"}
+        failed = self.post("/api/login", {"account": "dummy-account", "password": "dummy-password"})
+        self.assertEqual(failed.status_code, 400)
+        self.assertEqual(self.command("login_notice", arg=issue["login_notice"], event="original"), {})
+        self.assertEqual(self.command("lobby")["menu"], "login")
 
     def test_remembered_authorization_is_encrypted_and_cannot_be_taken_over(self):
         self.command("confirm", arg=self.open_ticket())
@@ -154,6 +188,25 @@ class WebAuthorizationTests(unittest.TestCase):
 
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_waiting_login_notifications_wake_and_only_one_collects(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())
+        self.addCleanup(vault.db.close)
+        worker = AsyncMock(return_value={"status": "ok", "auth": AUTH})
+        bridge = Bridge(vault, worker, ORIGIN)
+        issue = bridge.new_ticket("owner", "event")
+        browser, pin = bridge.claim(issue["login_url"].split("#")[1])
+        bridge.confirm("owner", pin)
+        waiters = [asyncio.create_task(bridge.wait_login_notice("owner", issue["login_notice"], "event"))
+                   for _ in range(2)]
+        await asyncio.sleep(0)
+        self.assertTrue(all(not waiter.done() for waiter in waiters))
+        self.assertEqual((await bridge.login(browser, "dummy-user", "dummy-pass", True))[0], 200)
+        results = await asyncio.wait_for(asyncio.gather(*waiters), 2)
+        lobbies = [result for result in results if result.get("menu") == "lobby"]
+        self.assertEqual(len(lobbies), 1)
+        self.assertIn("最长 30 天", lobbies[0]["message"])
+
     async def test_queue_limits_and_reaps_before_next_job(self):
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())

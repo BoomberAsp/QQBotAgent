@@ -18,6 +18,9 @@ from cryptography.fernet import Fernet, InvalidToken
 
 
 TICKET_TTL = 300
+LOGIN_TIMEOUT = 110
+LOGIN_NOTICE_WAIT = 20
+LOGIN_NOTICE_LIMIT = 256
 SESSION_TTL = 15 * 60
 REMEMBER_TTL = 30 * 86400
 QUEUE_TTL = 5 * 60
@@ -159,6 +162,21 @@ class Ticket:
 
 
 @dataclass
+class LoginNotice:
+    event: str
+    expires: float
+    id: str = field(default_factory=lambda: secrets.token_urlsafe(12))
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    message: str | None = None
+
+
+def lobby_message(summary: str) -> str:
+    return (f"璐茜玛大厅\n{summary}\n\n"
+            "/璐茜玛 签到 · 领邮件 · 领基地\n"
+            "/璐茜玛 进阶 · 状态 · 回执")
+
+
+@dataclass
 class Job:
     owner: str
     task: str
@@ -235,6 +253,7 @@ class Bridge:
         self.worker = worker
         self.public_origin = public_origin
         self.tickets: dict[str, Ticket] = {}
+        self.login_notices: dict[str, LoginNotice] = {}
         self.attempts: dict[str, float] = {}
         self.sessions: dict[str, tuple[float, dict]] = {}
         self.queue: deque[Job] = deque()
@@ -249,6 +268,9 @@ class Bridge:
     def prune(self) -> None:
         now = time.monotonic()
         self.tickets = {key: ticket for key, ticket in self.tickets.items() if now - ticket.created < TICKET_TTL}
+        for owner, notice in list(self.login_notices.items()):
+            if notice.expires <= now:
+                self.dismiss_login_notice(owner)
         self.attempts = {key: expiry for key, expiry in self.attempts.items() if expiry > now}
         self.sessions = {key: session for key, session in self.sessions.items() if session[0] > now}
         self.last = {key: result for key, result in self.last.items() if result[0] > now}
@@ -262,17 +284,42 @@ class Bridge:
     def drop_tickets(self, owner: str) -> None:
         self.tickets = {key: ticket for key, ticket in self.tickets.items() if ticket.owner != owner}
 
-    def new_ticket(self, owner: str) -> dict:
+    def dismiss_login_notice(self, owner: str) -> None:
+        notice = self.login_notices.pop(owner, None)
+        if notice is not None:
+            notice.ready.set()
+
+    def new_ticket(self, owner: str, event: str) -> dict:
         self.prune()
         now = time.monotonic()
+        if self.active == owner and self.active_job is None:
+            return {"message": "正在验证这次登录申请，请稍等。"}
         if any(ticket.owner == owner and now - ticket.created < 10 for ticket in self.tickets.values()):
             return {"message": "请使用刚发送的二维码，或稍等后重新申请。"}
-        if len(self.tickets) >= 256:
+        if owner not in self.login_notices and len(self.login_notices) >= LOGIN_NOTICE_LIMIT:
             return {"message": "登录申请暂时已满，请稍后重试。"}
         self.drop_tickets(owner)
+        self.dismiss_login_notice(owner)
         secret = secrets.token_urlsafe(32)
         self.tickets[fingerprint(secret)] = Ticket(owner, now)
-        return {"login_url": self.public_origin + "/#" + secret}
+        notice = LoginNotice(event, now + TICKET_TTL)
+        self.login_notices[owner] = notice
+        return {"login_url": self.public_origin + "/#" + secret, "login_notice": notice.id}
+
+    async def wait_login_notice(self, owner: str, notice_id: str, event: str) -> dict:
+        self.prune()
+        notice = self.login_notices.get(owner)
+        if notice is None or notice.event != event or not hmac.compare_digest(notice.id, notice_id):
+            return {}
+        try:
+            await asyncio.wait_for(notice.ready.wait(), LOGIN_NOTICE_WAIT)
+        except asyncio.TimeoutError:
+            self.prune()
+            return {"pending": self.login_notices.get(owner) is notice}
+        if self.login_notices.get(owner) is not notice or notice.message is None:
+            return {}
+        self.dismiss_login_notice(owner)
+        return {"message": notice.message, "menu": "lobby"}
 
     def claim(self, secret: str) -> tuple[str, str] | None:
         self.prune()
@@ -302,6 +349,7 @@ class Bridge:
             ticket.failures += 1
             if ticket.failures >= 5:
                 del self.tickets[key]
+                self.dismiss_login_notice(owner)
             break
         return "核对码无效或已过期，请检查网页或重新申请。"
 
@@ -314,6 +362,9 @@ class Bridge:
             return 429, "执行服务正忙，请稍等后再提交。"
         if owner in self.attempts:
             return 429, "刚尝试过登录，请稍等后再提交。"
+        notice = self.login_notices.get(owner)
+        if notice is not None:
+            notice.expires = time.monotonic() + LOGIN_TIMEOUT + 10
         self.drop_tickets(owner)
         self.active = owner
         self.attempts[owner] = time.monotonic() + 30
@@ -321,7 +372,7 @@ class Bridge:
         try:
             result = await self.worker({
                 "action": "login", "account": account, "password": password, "device_id": device_id,
-            }, 110)
+            }, LOGIN_TIMEOUT)
             auth = read_auth(result)
             if result.get("status") != "ok" or not auth:
                 return 400, "登录失败，请检查账号密码或稍后重新扫码。"
@@ -331,16 +382,28 @@ class Bridge:
             self.sessions[owner] = (time.monotonic() + SESSION_TTL, auth)
             self.last.pop(owner, None)
             self.plans.pop(owner, None)
+            if notice is not None:
+                authorization = "已加密记住登录，最长 30 天。" if saved else "本次临时授权有效 15 分钟。"
+                notice.message = lobby_message(f"登录成功。{authorization}")
+                notice.expires = time.monotonic() + 60
+                notice.ready.set()
             if remember and not saved:
-                return 200, "绑定成功。游戏未返回续期令牌，本次仅保留临时登录。"
-            return 200, "绑定成功。请返回 QQ 私聊执行任务。"
+                return 200, "绑定成功。游戏未返回续期令牌，本次仅保留临时登录。请返回 QQ 私聊查看大厅。"
+            return 200, "绑定成功。请返回 QQ 私聊查看大厅，或发送 /璐茜玛 大厅。"
         finally:
+            if notice is not None and notice.message is None and self.login_notices.get(owner) is notice:
+                self.dismiss_login_notice(owner)
             self.active = None
             self.wake.set()
 
     def auth_for(self, owner: str) -> dict | None:
         session = self.sessions.get(owner)
         return session[1] if session and session[0] > time.monotonic() else self.vault.load(owner)
+
+    def lobby(self, owner: str) -> dict:
+        if not self.auth_for(owner):
+            return {"message": "当前没有有效授权。发送 /璐茜玛 登录 重新扫码。", "menu": "login"}
+        return {"message": lobby_message("当前游戏账号已授权。"), "menu": "lobby"}
 
     def prepare(self, owner: str, task: str, code: str, *, preview: str | None = None, event: str = "") -> dict:
         self.prune()
@@ -433,6 +496,7 @@ class Bridge:
         self.vault.unbind(owner)
         self.cancel(owner)
         self.drop_tickets(owner)
+        self.dismiss_login_notice(owner)
         self.sessions.pop(owner, None)
         self.last.pop(owner, None)
         self.receipts = {key: row for key, row in self.receipts.items() if row[0] != owner}

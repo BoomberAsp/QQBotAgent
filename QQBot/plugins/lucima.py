@@ -20,12 +20,13 @@ from agent.outbound import OutKeyboard
 from lib.button_spec import Btn
 from lucima_bridge.client import approval_card, enabled, request_lucima
 from lucima_bridge.receipt import render_receipt
+from lucima_bridge.service import LOGIN_NOTICE_LIMIT, LOGIN_TIMEOUT, TICKET_TTL
 
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 PREFIX = re.compile(r"^/(?:璐茜玛|璐西玛|露西玛|lucima)(?:\s+|$)", re.IGNORECASE)
 COMMANDS = {
-    "登录": "login", "确认": "confirm", "状态": "status", "取消": "cancel", "解绑": "unbind",
+    "登录": "login", "大厅": "lobby", "确认": "confirm", "状态": "status", "取消": "cancel", "解绑": "unbind",
     "签到": "signin", "领邮件": "mail", "领基地": "base", "兑换": "redeem", "图鉴": "encyclopedia",
     "领派遣": "dispatch", "领成就": "achievement", "团签到": "guild", "团周奖": "guild_weekly", "免费招募": "recruit",
     "筛装备": "equipment", "执行": "approve", "放弃": "discard", "回执": "receipt",
@@ -35,7 +36,7 @@ SHORTCUTS = {"捐赠金币": ("donate", "gold"), "捐赠证明": ("donate", "cou
 HELP = (
     "璐茜玛命令\n"
     "别名 /璐西玛、/露西玛、/lucima\n"
-    "/璐茜玛 登录 · 扫码绑定\n"
+    "/璐茜玛 登录 · 扫码绑定 · /璐茜玛 大厅\n"
     "/璐茜玛 签到 · 领邮件 · 领基地\n"
     "/璐茜玛 兑换 <兑换码>\n"
     "/璐茜玛 图鉴 <角色名>\n"
@@ -51,12 +52,16 @@ MORE = (
 MENUS = {
     "main": [[Btn("扫码登录", "/璐茜玛 登录"), Btn("任务状态", "/璐茜玛 状态"), Btn("查看回执", "/璐茜玛 回执")],
              [Btn("签到", "/璐茜玛 签到"), Btn("领邮件", "/璐茜玛 领邮件"), Btn("领基地", "/璐茜玛 领基地")],
-             [Btn("进阶任务", "/璐茜玛 进阶")]],
+             [Btn("打开大厅", "/璐茜玛 大厅"), Btn("进阶任务", "/璐茜玛 进阶")]],
+    "login": [[Btn("扫码登录", "/璐茜玛 登录")]],
+    "lobby": [[Btn("签到", "/璐茜玛 签到"), Btn("领邮件", "/璐茜玛 领邮件"), Btn("领基地", "/璐茜玛 领基地")],
+              [Btn("进阶任务", "/璐茜玛 进阶"), Btn("任务状态", "/璐茜玛 状态"), Btn("查看回执", "/璐茜玛 回执")]],
     "more": [[Btn("领派遣", "/璐茜玛 领派遣"), Btn("领成就", "/璐茜玛 领成就"), Btn("团签到", "/璐茜玛 团签到")],
              [Btn("捐赠金币", "/璐茜玛 捐赠金币"), Btn("捐赠证明", "/璐茜玛 捐赠证明"), Btn("免费招募", "/璐茜玛 免费招募")],
              [Btn("讨伐关卡", "/璐茜玛 讨伐关卡"), Btn("元素关卡", "/璐茜玛 元素关卡"), Btn("筛装备", "/璐茜玛 筛装备")]],
 }
 WATCHERS: set[asyncio.Task] = set()
+LOGIN_WATCHERS: dict[str, asyncio.Task] = {}
 
 
 def command_text(event: Event) -> str:
@@ -138,6 +143,35 @@ async def watch_receipt(bot, event, actor: tuple[str, str, str, str], job: str, 
         return
 
 
+async def send_menu(bot, event, actor: tuple[str, str, str, str], message: str, rows: list) -> None:
+    if rows and actor[0] == "qq_official":
+        from adapters.qq_official import QQOfficialSender
+
+        sender = QQOfficialSender(bot, event, False)
+        await sender.send_keyboard(OutKeyboard(message, rows, label="lucima"))
+        await sender.flush()
+    else:
+        await bot.send(event, message)
+
+
+async def watch_login(bot, event, actor: tuple[str, str, str, str], notice: str) -> None:
+    deadline = asyncio.get_running_loop().time() + TICKET_TTL + LOGIN_TIMEOUT + 15
+    try:
+        while asyncio.get_running_loop().time() < deadline:
+            result = await request_lucima(actor, "login_notice", notice)
+            if result.get("menu") == "lobby":
+                await send_menu(bot, event, actor, result["message"], MENUS["lobby"])
+                return
+            if result.get("pending"):
+                continue
+            if "暂不可用" not in result.get("message", ""):
+                return
+            await asyncio.sleep(2)
+    except Exception:
+        # /大厅 reopens the authorized menu when the original reply cannot be delivered.
+        return
+
+
 async def reply(bot, event, result: dict, image_segment, actor: tuple[str, str, str, str]) -> None:
     url = result.get("login_url")
     if isinstance(url, str) and url.startswith("https://"):
@@ -147,11 +181,20 @@ async def reply(bot, event, result: dict, image_segment, actor: tuple[str, str, 
             qr_sent = True
         except Exception:
             pass
-        instructions = "请在 5 分钟内扫码，并回到本私聊核对。"
+        instructions = "请在 5 分钟内扫码，并回到本私聊核对。登录后在这里查看大厅。"
+        delivered = qr_sent
         try:
             await bot.send(event, instructions + "也可打开：\n" + url)
+            delivered = True
         except Exception:
             await bot.send(event, instructions if qr_sent else "登录二维码和链接均未能送达，请稍后再试。")
+        finally:
+            notice = result.get("login_notice")
+            if (delivered and isinstance(notice, str) and notice not in LOGIN_WATCHERS
+                    and len(LOGIN_WATCHERS) < LOGIN_NOTICE_LIMIT):
+                watcher = asyncio.create_task(watch_login(bot, event, actor, notice))
+                LOGIN_WATCHERS[notice] = watcher
+                watcher.add_done_callback(lambda _: LOGIN_WATCHERS.pop(notice, None))
         return
     if receipt := result.get("receipt"):
         await send_receipt(bot, event, receipt, image_segment)
@@ -163,14 +206,7 @@ async def reply(bot, event, result: dict, image_segment, actor: tuple[str, str, 
         message, rows = card.markdown, card.rows
     if job := result.get("job"):
         rows = [[Btn("任务状态", "/璐茜玛 状态"), Btn("查看回执", "/璐茜玛 回执")]]
-    if rows and actor[0] == "qq_official":
-        from adapters.qq_official import QQOfficialSender
-
-        sender = QQOfficialSender(bot, event, False)
-        await sender.send_keyboard(OutKeyboard(message, rows, label="lucima"))
-        await sender.flush()
-    else:
-        await bot.send(event, message)
+    await send_menu(bot, event, actor, message, rows)
     if job and len(WATCHERS) < 12:
         watcher = asyncio.create_task(watch_receipt(bot, event, actor, job, image_segment))
         WATCHERS.add(watcher)

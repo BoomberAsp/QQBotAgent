@@ -18,7 +18,8 @@ async def request_lucima(actor: tuple[str, str, str, str], action: str, arg: str
     base_url = os.environ.get("LUCIMA_INTERNAL_URL", "http://127.0.0.1:8092").rstrip("/")
     route = "/internal/propose" if propose else "/internal/command"
     try:
-        async with httpx.AsyncClient(timeout=4, trust_env=False) as client:
+        timeout = httpx.Timeout(25, connect=4) if action == "login_notice" and not propose else 4
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.post(
                 base_url + route,
                 headers={"Authorization": "Bearer " + os.environ["LUCIMA_INTERNAL_TOKEN"]},

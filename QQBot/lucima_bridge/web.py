@@ -236,7 +236,7 @@ def operation_preview(action: str, arg: str) -> str | None:
 
 def execute_operation(bridge, owner: str, action: str, arg: str, event: str, catalog):
     if action == "login":
-        return bridge.new_ticket(owner)
+        return bridge.new_ticket(owner, event)
     if action == "status":
         return {"message": bridge.status(owner)}
     if action == "cancel":
@@ -280,6 +280,10 @@ async def command(request: Request):
 
     if action == "confirm" and PIN.fullmatch(arg):
         return answer(bridge.confirm(owner, arg))
+    if action == "login_notice" and OPERATION_ID.fullmatch(arg):
+        return await bridge.wait_login_notice(owner, arg, event)
+    if action == "lobby" and not arg:
+        return bridge.lobby(owner)
     if action == "approve" and OPERATION_ID.fullmatch(arg):
         return bridge.approve(owner, arg, event, execute)
     if action == "discard" and OPERATION_ID.fullmatch(arg):
