@@ -38,6 +38,9 @@ async function showState(response) {
   }
   statusLine.textContent = "等待 QQ 确认。";
   confirmation.hidden = false;
+  document.querySelector("#confirm-instructions").textContent = data.group
+    ? "请回到发起登录的群，先 @ 机器人，再发送本页的核对命令。"
+    : "请在发起登录的机器人私聊发送这条命令，再回到本页。";
   document.querySelector("#pin").textContent = `/璐茜玛 确认 ${data.pin}`;
   setTimeout(poll, 2200);
 }

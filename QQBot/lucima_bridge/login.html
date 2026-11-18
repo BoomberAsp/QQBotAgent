@@ -12,7 +12,7 @@
     <h1>游戏账号授权</h1>
     <p id="status" role="status">正在检查登录申请…</p>
     <section id="confirm" hidden>
-      <p>请在发起登录的机器人私聊发送这条命令，再回到本页。</p>
+      <p id="confirm-instructions">请在发起登录的机器人私聊发送这条命令，再回到本页。</p>
       <code id="pin"></code>
     </section>
     <section id="saved-login" class="saved-login" hidden>
@@ -26,7 +26,7 @@
       <label for="password">游戏密码</label>
       <input id="password" name="password" type="password" autocomplete="current-password" maxlength="512" required>
       <label class="remember"><input id="remember" type="checkbox"> 记住登录 30 天</label>
-      <p class="note">密码只用于当次验证。勾选后，服务会加密保存账号和续期令牌。下次核对 QQ 身份后可直接使用授权。未勾选时登录凭证仅在内存保留 15 分钟。可在 QQ 私聊解除绑定。</p>
+      <p class="note">密码只用于当次验证。勾选后，服务会加密保存账号和续期令牌。下次核对 QQ 身份后可直接使用授权。未勾选时登录凭证仅在内存保留 15 分钟。可在原 QQ 会话解除绑定。</p>
       <button id="submit" type="submit">授权给 QQ 机器人</button>
     </form>
   </main>

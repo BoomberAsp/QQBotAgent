@@ -41,11 +41,16 @@ class WebAuthorizationTests(unittest.TestCase):
         self.enterContext(patch("lucima_bridge.web.Worker", return_value=self.worker))
         self.client = self.enterContext(TestClient(app, base_url=ORIGIN))
 
-    def command(self, action, user="owner", arg="", event="1", platform="onebot", *, proposal=False):
+    def command(self, action, user="owner", arg="", event="1", platform="onebot", *, proposal=False, group=None):
         path = "/internal/propose" if proposal else "/internal/command"
-        return self.client.post(path, headers={"Authorization": "Bearer " + TOKEN}, json={
+        body = {
             "platform": platform, "bot": "bot", "user": user, "event": event, "action": action, "arg": arg,
-        }).json()
+        }
+        if group is not None:
+            body["group"] = group
+            if not proposal:
+                path = "/internal/group-command"
+        return self.client.post(path, headers={"Authorization": "Bearer " + TOKEN}, json=body).json()
 
     def post(self, path, body, origin=ORIGIN):
         return self.client.post(path, headers={"Origin": origin}, json=body)
@@ -78,6 +83,66 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertIn("无有效授权", self.command("status", platform="qq_official")["message"])
         for secret in ("dummy-account", "dummy-password", "fake-access", "fake-refresh", AUTH["user_id"]):
             self.assertNotIn(secret.encode(), self.db_path.read_bytes())
+
+    def test_shared_group_qr_only_authorizes_the_owners_selected_browser(self):
+        scope = {"group": "room", "platform": "qq_official"}
+        issue = self.command("login", event="original", **scope)
+        ticket = {"ticket": issue["login_url"].split("#")[1]}
+        first = self.post("/api/claim", ticket).json()
+        unselected = self.client.cookies.get("__Host-lucima")
+        self.client.cookies.clear()
+        selected = self.post("/api/claim", ticket).json()
+        chosen = self.client.cookies.get("__Host-lucima")
+        self.assertTrue(selected["group"])
+        self.assertNotEqual(first["pin"], selected["pin"])
+        for extra in ({"user": "other"}, {"group": "other-room"}, {"group": None}, {"platform": "onebot"}):
+            result = self.command("confirm", arg=selected["pin"], **(scope | extra))
+            self.assertIn("无效", result["message"])
+        self.assertIn("已确认", self.command("confirm", arg=selected["pin"], **scope)["message"])
+        self.assertEqual(self.post("/api/claim", ticket).status_code, 410)
+        for session_id, status in ((unselected, 403), (chosen, 200)):
+            self.client.cookies.clear()
+            self.client.cookies.set("__Host-lucima", session_id)
+            result = self.post("/api/login", {"account": "stub", "password": "stub", "remember": True})
+            self.assertEqual(result.status_code, status)
+        self.worker.assert_awaited_once()
+        self.assertIn("发起登录的 QQ 群", result.json()["message"])
+        self.assertEqual(self.command("login_notice", arg=issue["login_notice"], event="original", **scope)["menu"], "lobby")
+        self.assertEqual(self.command("lobby", **scope)["menu"], "lobby")
+        self.assertEqual(self.command("lobby", **(scope | {"user": "other"}))["menu"], "login")
+        self.assertEqual(self.command("lobby", **(scope | {"group": None}))["menu"], "login")
+
+    def test_group_confirmation_and_receipt_stay_in_owner_and_group_scope(self):
+        scope = {"group": "room"}
+        issue = self.command("login", **scope)
+        claim = self.post("/api/claim", {"ticket": issue["login_url"].split("#")[1]}).json()
+        self.command("confirm", arg=claim["pin"], **scope)
+        self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub"}).status_code, 200)
+        proposal = self.command("donate", arg="gold", event="proposed", **scope)
+        ticket = proposal["approval"]
+        wrong_scopes = ({"group": "room", "user": "other"}, {"group": "other-room"}, {})
+        for other in wrong_scopes:
+            self.assertNotIn("job", self.command("approve", arg=ticket, event="confirm", **other))
+        self.assertNotIn("job", self.command("approve", arg=ticket, event="proposed", **scope))
+        self.worker.assert_awaited_once()
+        job = self.command("approve", arg=ticket, event="confirm", **scope)["job"]
+        self.assertNotIn("job", self.command("approve", arg=ticket, event="repeat", **scope))
+        for _ in range(50):
+            answer = self.command("receipt", arg=job, **scope)
+            if "receipt" in answer:
+                break
+            time.sleep(0.01)
+        self.assertEqual(answer["receipt"]["id"], job)
+        for other in wrong_scopes:
+            self.assertNotIn("receipt", self.command("receipt", arg=job, **other))
+        self.assertNotIn("approval", self.command("mail", proposal=True, **scope))
+
+    def test_group_route_rejects_missing_scope_and_private_route_rejects_group_scope(self):
+        body = {"platform": "onebot", "bot": "bot", "user": "owner", "event": "event", "action": "login"}
+        headers = {"Authorization": "Bearer " + TOKEN}
+        self.assertEqual(self.client.post("/internal/group-command", json=body).status_code, 403)
+        self.assertEqual(self.client.post("/internal/group-command", headers=headers, json=body).status_code, 400)
+        self.assertEqual(self.client.post("/internal/command", headers=headers, json={**body, "group": "room"}).status_code, 400)
 
     def test_login_success_delivers_one_lobby_to_original_event(self):
         self.assertEqual(self.command("lobby")["menu"], "login")

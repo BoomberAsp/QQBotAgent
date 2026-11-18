@@ -1,4 +1,4 @@
-"""Private Lucima transport shared by explicit commands and proposal-only tools."""
+"""Lucima transport shared by explicit commands and private proposal tools."""
 from __future__ import annotations
 
 import os
@@ -9,21 +9,27 @@ from agent.outbound import OutKeyboard
 from lib.button_spec import Btn
 
 
+Actor = tuple[str, str, str, str] | tuple[str, str, str, str, str]
+
+
 def enabled() -> bool:
     return bool(os.environ.get("LUCIMA_INTERNAL_TOKEN"))
 
 
-async def request_lucima(actor: tuple[str, str, str, str], action: str, arg: str, *, propose=False) -> dict:
-    platform, bot, user, event = actor
+async def request_lucima(actor: Actor, action: str, arg: str, *, propose=False) -> dict:
+    platform, bot, user, event, *group = actor
+    payload = {"platform": platform, "bot": bot, "user": user, "event": event, "action": action, "arg": arg}
+    if group:
+        payload["group"] = group[0]
     base_url = os.environ.get("LUCIMA_INTERNAL_URL", "http://127.0.0.1:8092").rstrip("/")
-    route = "/internal/propose" if propose else "/internal/command"
+    route = "/internal/propose" if propose else ("/internal/group-command" if group else "/internal/command")
     try:
         timeout = httpx.Timeout(25, connect=4) if action == "login_notice" and not propose else 4
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.post(
                 base_url + route,
                 headers={"Authorization": "Bearer " + os.environ["LUCIMA_INTERNAL_TOKEN"]},
-                json={"platform": platform, "bot": bot, "user": user, "event": event, "action": action, "arg": arg},
+                json=payload,
             )
             if response.status_code == 400:
                 return {"message": "Lucima 操作或参数无效。"}

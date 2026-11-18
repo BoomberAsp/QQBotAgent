@@ -18,7 +18,7 @@ from nonebot.adapters.qq.event import C2CMessageCreateEvent, GroupMessageCreateE
 
 from agent.outbound import OutKeyboard
 from lib.button_spec import Btn
-from lucima_bridge.client import approval_card, enabled, request_lucima
+from lucima_bridge.client import Actor, approval_card, enabled, request_lucima
 from lucima_bridge.long_tasks import LONG_QUEUE_TTL, TASK_TIMEOUT
 from lucima_bridge.receipt import render_receipt
 from lucima_bridge.service import LOGIN_NOTICE_LIMIT, LOGIN_TIMEOUT, TICKET_TTL
@@ -61,6 +61,7 @@ LONG_HELP = (
     "/璐茜玛 托管 <签到|领邮件|领基地> <北京时间HH:MM>\n"
     "/璐茜玛 状态 · 取消 · 回执 [编号]"
 )
+GROUP_HELP = "请先 @ 机器人再发命令。群内发起的任务结果会显示在本群，账号密码只在登录网页填写。"
 MENUS = {
     "main": [[Btn("扫码登录", "/璐茜玛 登录"), Btn("任务状态", "/璐茜玛 状态"), Btn("查看回执", "/璐茜玛 回执")],
              [Btn("签到", "/璐茜玛 签到"), Btn("领邮件", "/璐茜玛 领邮件"), Btn("领基地", "/璐茜玛 领基地")],
@@ -85,7 +86,7 @@ def command_text(event: Event) -> str:
     if isinstance(event, (PrivateMessageEvent, OneBotGroup)):
         return event.get_plaintext().strip()
     if isinstance(event, (C2CMessageCreateEvent, GroupMessageCreateEvent)):
-        return event.content.strip()
+        return event.get_plaintext().strip()
     return ""
 
 
@@ -96,7 +97,7 @@ async def is_command(event: Event) -> bool:
 matcher = on_message(rule=is_command, priority=0, block=True)
 
 
-async def call_service(text: str, platform: str, bot: str, user: str, event: str) -> dict:
+async def call_service(text: str, platform: str, bot: str, user: str, event: str, group: str | None = None) -> dict:
     command, *args = PREFIX.sub("", text, count=1).split(maxsplit=1) or [""]
     action = COMMANDS.get(command)
     arg = args[0] if args else ""
@@ -132,8 +133,9 @@ async def call_service(text: str, platform: str, bot: str, user: str, event: str
     else:
         valid = bool(action) and not arg
     if not valid:
-        return {"message": HELP, "menu": "main"}
-    return await request_lucima((platform, bot, user, event), action, arg)
+        return {"message": f"{HELP}\n\n{GROUP_HELP}" if group else HELP, "menu": "main"}
+    actor = (platform, bot, user, event)
+    return await request_lucima((*actor, group) if group else actor, action, arg)
 
 
 def render_qr(url: str) -> bytes:
@@ -156,7 +158,7 @@ async def send_receipt(bot, event, receipt: dict, image_segment) -> None:
         pass
 
 
-async def watch_receipt(bot, event, actor: tuple[str, str, str, str], job: str, image_segment, *, long_job=False) -> None:
+async def watch_receipt(bot, event, actor: Actor, job: str, image_segment, *, long_job=False) -> None:
     horizon = LONG_QUEUE_TTL + TASK_TIMEOUT + 30 if long_job else 420
     deadline = asyncio.get_running_loop().time() + horizon
     try:
@@ -169,22 +171,22 @@ async def watch_receipt(bot, event, actor: tuple[str, str, str, str], job: str, 
             if not result.get("pending") and "暂不可用" not in result.get("message", ""):
                 return
     except Exception:
-        # A later private /回执 command can retrieve the same result.
+        # A later /回执 in the same conversation can retrieve the result.
         return
 
 
-async def send_menu(bot, event, actor: tuple[str, str, str, str], message: str, rows: list) -> None:
+async def send_menu(bot, event, actor: Actor, message: str, rows: list) -> None:
     if rows and actor[0] == "qq_official":
         from adapters.qq_official import QQOfficialSender
 
-        sender = QQOfficialSender(bot, event, False)
+        sender = QQOfficialSender(bot, event, is_group=len(actor) == 5)
         await sender.send_keyboard(OutKeyboard(message, rows, label="lucima"))
         await sender.flush()
     else:
         await bot.send(event, message)
 
 
-async def watch_login(bot, event, actor: tuple[str, str, str, str], notice: str) -> None:
+async def watch_login(bot, event, actor: Actor, notice: str) -> None:
     deadline = asyncio.get_running_loop().time() + TICKET_TTL + LOGIN_TIMEOUT + 15
     try:
         while asyncio.get_running_loop().time() < deadline:
@@ -202,7 +204,7 @@ async def watch_login(bot, event, actor: tuple[str, str, str, str], notice: str)
         return
 
 
-async def reply(bot, event, result: dict, image_segment, actor: tuple[str, str, str, str]) -> None:
+async def reply(bot, event, result: dict, image_segment, actor: Actor) -> None:
     url = result.get("login_url")
     if isinstance(url, str) and url.startswith("https://"):
         qr_sent = False
@@ -212,6 +214,9 @@ async def reply(bot, event, result: dict, image_segment, actor: tuple[str, str, 
         except Exception:
             pass
         instructions = "请在 5 分钟内扫码，并回到本私聊核对。登录后在这里查看大厅。"
+        if len(actor) == 5:
+            instructions = ("请发起人在 5 分钟内扫码，回到本群 @ 机器人发送自己网页显示的核对命令。"
+                            "账号密码只在网页填写，登录结果会显示在本群。")
         delivered = qr_sent
         try:
             await bot.send(event, instructions + "也可打开：\n" + url)
@@ -246,24 +251,26 @@ async def reply(bot, event, result: dict, image_segment, actor: tuple[str, str, 
 
 @matcher.handle()
 async def handle_onebot(bot: OneBot, event: PrivateMessageEvent | OneBotGroup):
-    if isinstance(event, OneBotGroup):
-        if event.is_tome() or any(seg.type == "at" and seg.data.get("qq") == str(bot.self_id) for seg in event.message):
-            await bot.send(event, "请在私聊使用 /璐茜玛，账号和密码只填写在登录网页。")
-        return
     if str(event.user_id) == str(bot.self_id):
         return
     actor = ("onebot", str(bot.self_id), str(event.user_id), str(event.message_id))
+    if isinstance(event, OneBotGroup):
+        at_bot = any(seg.type == "at" and seg.data.get("qq") == str(bot.self_id) for seg in event.message)
+        if not event.is_tome() and not at_bot:
+            return
+        actor = (*actor, str(event.group_id))
     result = await call_service(command_text(event), *actor)
     await reply(bot, event, result, OneBotSegment.image, actor)
 
 
 @matcher.handle()
 async def handle_official(bot: OfficialBot, event: C2CMessageCreateEvent | GroupMessageCreateEvent):
-    if isinstance(event, GroupMessageCreateEvent):
-        await bot.send(event, "请在私聊使用 /璐茜玛，账号和密码只填写在登录网页。")
-        return
-    user = event.author.user_openid
+    user = event.get_user_id()
     if user and str(user) != str(bot.self_id) and not getattr(event.author, "bot", False):
         actor = ("qq_official", str(bot.self_id), str(user), str(event.id))
+        if isinstance(event, GroupMessageCreateEvent):
+            if not event.is_tome() or not event.group_openid:
+                return
+            actor = (*actor, event.group_openid)
         result = await call_service(command_text(event), *actor)
         await reply(bot, event, result, OfficialSegment.file_image, actor)

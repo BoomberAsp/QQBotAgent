@@ -152,7 +152,10 @@ async def claim(request: Request):
     if not claimed:
         return answer("二维码已失效或已被打开，请回 QQ 重新申请。", 410)
     browser, pin = claimed
-    response = JSONResponse({"state": "waiting", "pin": pin})
+    selected = bridge.browser_ticket(browser)
+    if selected is None:
+        return answer("二维码已失效，请回 QQ 重新申请。", 410)
+    response = JSONResponse({"state": "waiting", "pin": pin, "group": selected.group})
     response.set_cookie(COOKIE, browser, max_age=TICKET_TTL, secure=True, httponly=True, samesite="strict", path="/")
     return response
 
@@ -162,9 +165,9 @@ async def session(request: Request):
     bridge = request.app.state.bridge
     ticket = bridge.browser_ticket(browser_id(request))
     if not ticket:
-        return answer("请在 QQ 私聊发送 /璐茜玛 登录 获取二维码。", 410)
+        return answer("请在 QQ 发送 /璐茜玛 登录 获取二维码。", 410)
     if not ticket.confirmed:
-        return {"state": "waiting", "pin": ticket.pin}
+        return {"state": "waiting", "pin": ticket.pin, "group": ticket.group}
     ready = {"state": "ready"}
     if saved := bridge.saved_candidate(ticket):
         ready["saved_login"] = saved
@@ -179,7 +182,7 @@ async def login(request: Request):
     browser = browser_id(request)
     ticket = bridge.browser_ticket(browser)
     if not ticket or not ticket.confirmed:
-        return answer("请先完成私聊核对。", 403)
+        return answer("请先在发起登录的 QQ 会话完成核对。", 403)
     body = await json_body(request) or {}
     account, password, remember = body.get("account"), body.get("password"), body.get("remember", False)
     use_saved = body.get("use_saved", False)
@@ -198,18 +201,21 @@ async def login(request: Request):
     return response
 
 
-async def command_context(request: Request):
+async def command_context(request: Request, *, group_command: bool = False):
     provided = request.headers.get("authorization", "").encode()
     if not hmac.compare_digest(provided, b"Bearer " + request.app.state.internal_token):
         return PlainTextResponse("Forbidden", status_code=403)
     body = await json_body(request) or {}
     platform, bot, user = body.get("platform"), body.get("bot"), body.get("user")
-    action, event = body.get("action"), body.get("event")
+    action, event, group = body.get("action"), body.get("event"), body.get("group")
     if (platform not in ("onebot", "qq_official") or not valid(bot, 128) or not valid(user, 128)
             or not valid(event, 128) or not isinstance(action, str)):
         return answer("命令无效。", 400)
+    if (group_command and not valid(group, 128)) or (not group_command and "group" in body):
+        return answer("命令无效。", 400)
     bridge = request.app.state.bridge
-    owner = bridge.vault.index(json.dumps([platform, bot, user], separators=(",", ":")))
+    identity = ["group", platform, bot, group, user] if group else [platform, bot, user]
+    owner = bridge.vault.index(json.dumps(identity, separators=(",", ":")))
     return bridge, owner, action, body.get("arg", ""), event
 
 
@@ -249,8 +255,6 @@ def operation_preview(action: str, arg: str) -> str | None:
 
 
 def execute_operation(bridge, owner: str, action: str, arg: str, event: str, catalog):
-    if action == "login":
-        return bridge.new_ticket(owner, event)
     if action == "status":
         return {"message": bridge.status(owner)}
     if action == "cancel":
@@ -288,7 +292,16 @@ async def propose(request: Request):
 
 @app.post("/internal/command")
 async def command(request: Request):
-    context = await command_context(request)
+    return await run_command(request, group=False)
+
+
+@app.post("/internal/group-command")
+async def group_command(request: Request):
+    return await run_command(request, group=True)
+
+
+async def run_command(request: Request, *, group: bool):
+    context = await command_context(request, group_command=group)
     if isinstance(context, (JSONResponse, PlainTextResponse)):
         return context
     bridge, owner, action, arg, event = context
@@ -296,6 +309,8 @@ async def command(request: Request):
         return answer("命令无效。", 400)
 
     def execute(operation, argument):
+        if operation == "login":
+            return bridge.new_ticket(owner, event, group=group)
         return execute_operation(bridge, owner, operation, argument, event, request.app.state.catalog)
 
     if action == "confirm" and PIN.fullmatch(arg):

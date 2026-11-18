@@ -23,6 +23,7 @@ TICKET_TTL = 300
 LOGIN_TIMEOUT = 110
 LOGIN_NOTICE_WAIT = 20
 LOGIN_NOTICE_LIMIT = 256
+GROUP_BROWSER_LIMIT = 8
 SESSION_TTL = 15 * 60
 REMEMBER_TTL = 30 * 86400
 QUEUE_TTL = 5 * 60
@@ -184,6 +185,7 @@ class Ticket:
     confirmed: bool = False
     failures: int = 0
     saved_attempted: bool = False
+    group: bool = False
 
 
 @dataclass
@@ -377,7 +379,7 @@ class Bridge:
         if notice is not None:
             notice.ready.set()
 
-    def new_ticket(self, owner: str, event: str) -> dict:
+    def new_ticket(self, owner: str, event: str, *, group: bool = False) -> dict:
         self.prune()
         now = time.monotonic()
         if self.active == owner and self.active_job is None:
@@ -389,7 +391,7 @@ class Bridge:
         self.drop_tickets(owner)
         self.dismiss_login_notice(owner)
         secret = secrets.token_urlsafe(32)
-        self.tickets[fingerprint(secret)] = Ticket(owner, now)
+        self.tickets[fingerprint(secret)] = Ticket(owner, now, group=group)
         notice = LoginNotice(event, now + TICKET_TTL)
         self.login_notices[owner] = notice
         return {"login_url": self.public_origin + "/#" + secret, "login_notice": notice.id}
@@ -414,9 +416,20 @@ class Bridge:
         ticket = self.tickets.get(fingerprint(secret))
         if not ticket or ticket.browser:
             return None
+        pins = set()
+        if ticket.group:
+            pins = {row.pin for row in self.tickets.values() if row.owner == ticket.owner and row.browser}
+            if len(pins) >= GROUP_BROWSER_LIMIT:
+                return None
+            ticket = Ticket(ticket.owner, ticket.created, group=True)
         browser = secrets.token_urlsafe(32)
         ticket.browser = fingerprint(browser)
         ticket.pin = f"{secrets.randbelow(100_000_000):08d}"
+        while ticket.pin in pins:
+            ticket.pin = f"{secrets.randbelow(100_000_000):08d}"
+        if ticket.group:
+            # Scanning the shared QR only creates an unconfirmed browser candidate.
+            self.tickets[ticket.browser] = ticket
         return browser, ticket.pin
 
     def browser_ticket(self, browser: str) -> Ticket | None:
@@ -428,17 +441,22 @@ class Bridge:
 
     def confirm(self, owner: str, pin: str) -> str:
         self.prune()
-        for key, ticket in self.tickets.items():
-            if ticket.owner != owner or not ticket.browser:
+        candidates = [(key, ticket) for key, ticket in self.tickets.items() if ticket.owner == owner]
+        for key, ticket in candidates:
+            if not ticket.browser:
                 continue
             if hmac.compare_digest(ticket.pin, pin):
                 ticket.confirmed = True
+                for other, _ in candidates:
+                    if other != key:
+                        del self.tickets[other]
                 return "已确认。请回到刚打开的网页填写登录信息。"
-            ticket.failures += 1
-            if ticket.failures >= 5:
-                del self.tickets[key]
+        if any(ticket.browser for _, ticket in candidates):
+            _, first = candidates[0]
+            first.failures += 1
+            if first.failures >= 5:
+                self.drop_tickets(owner)
                 self.dismiss_login_notice(owner)
-            break
         return "核对码无效或已过期，请检查网页或重新申请。"
 
     def saved_candidate(self, ticket: Ticket) -> dict | None:
@@ -450,7 +468,7 @@ class Bridge:
                     *, use_saved: bool = False) -> tuple[int, str]:
         ticket = self.browser_ticket(browser)
         if not ticket or not ticket.confirmed:
-            return 403, "请从原私聊完成核对，或重新获取二维码。"
+            return 403, "请在发起登录的会话完成核对，或重新获取二维码。"
         owner = ticket.owner
         if self.active or self.queue:
             return 429, "执行服务正忙，请稍等后再提交。"
@@ -485,7 +503,7 @@ class Bridge:
                     return 409, "已保存授权已失效，请填写账号密码登录。"
                 self.drop_tickets(owner)
             elif not self.vault.bind(owner, auth, saved, account=account):
-                return 409, "该账号无法与此 QQ 身份绑定。若要切换已有绑定，请先在私聊解绑。"
+                return 409, "该游戏账号无法绑定到当前会话。若已有绑定，请从原会话解绑后再登录。"
             if not saved or not had_remembered:
                 self.stop_schedule(owner)
             self.sessions[owner] = (time.monotonic() + SESSION_TTL, auth)
@@ -498,9 +516,10 @@ class Bridge:
                 notice.message = lobby_message(f"登录成功。{authorization}")
                 notice.expires = time.monotonic() + 60
                 notice.ready.set()
+            destination = "发起登录的 QQ 群" if ticket.group else "原 QQ 私聊"
             if remember and not saved:
-                return 200, "绑定成功。游戏未返回续期令牌，本次仅保留临时登录。请返回 QQ 私聊查看大厅。"
-            return 200, "绑定成功。请返回 QQ 私聊查看大厅，或发送 /璐茜玛 大厅。"
+                return 200, f"绑定成功。游戏未返回续期令牌，本次仅保留临时登录。请返回{destination}查看大厅。"
+            return 200, f"绑定成功。请返回{destination}查看大厅，或发送 /璐茜玛 大厅。"
         finally:
             if notice is not None and notice.message is None and self.login_notices.get(owner) is notice:
                 if use_saved:
