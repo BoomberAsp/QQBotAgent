@@ -173,6 +173,8 @@ class Plan:
     task: str
     code: str
     expires: float
+    game: str | None
+    source_event: str
 
 
 class Worker:
@@ -340,23 +342,38 @@ class Bridge:
         session = self.sessions.get(owner)
         return session[1] if session and session[0] > time.monotonic() else self.vault.load(owner)
 
-    def prepare(self, owner: str, task: str, code: str) -> dict:
+    def prepare(self, owner: str, task: str, code: str, *, preview: str | None = None, event: str = "") -> dict:
         self.prune()
-        if not self.auth_for(owner):
+        if preview is None and not self.auth_for(owner):
             return {"message": "请先用 /璐茜玛 登录 完成扫码。"}
-        plan = Plan(secrets.token_urlsafe(12), task, code, time.monotonic() + 300)
+        if owner not in self.plans and len(self.plans) >= 256:
+            return {"message": "待确认操作已满，请稍后再试。"}
+        binding = self.vault.record(owner)
+        if task == "cancel":
+            code = next((job.id for job in self.queue if job.owner == owner), "")
+        plan = Plan(secrets.token_urlsafe(12), task, code, time.monotonic() + 300,
+                    binding[0] if binding else None, event)
         self.plans[owner] = plan
-        return {"message": APPROVALS[(task, code)], "approval": plan.id}
+        return {"message": preview if preview is not None else APPROVALS[(task, code)], "approval": plan.id}
 
-    def approve(self, owner: str, token: str, event: str) -> dict:
+    def approve(self, owner: str, token: str, event: str, execute) -> dict:
         self.prune()
         plan = self.plans.get(owner)
-        if not plan or not hmac.compare_digest(plan.id, token):
+        if not plan or plan.source_event == event or not hmac.compare_digest(plan.id, token):
             return {"message": "执行确认无效、已使用或已过期，请重新发起。"}
-        result = self.submit(owner, plan.task, plan.code, event)
-        if "job" in result:
-            self.plans.pop(owner, None)
-        return result
+        binding = self.vault.record(owner)
+        if plan.game != (binding[0] if binding else None):
+            self.plans.pop(owner)
+            return {"message": "游戏账号绑定已变更，请重新发起。"}
+        if plan.task in TASK_NAMES:
+            result = self.submit(owner, plan.task, plan.code, event)
+            if "job" in result:
+                self.plans.pop(owner, None)
+            return result
+        self.plans.pop(owner)
+        if plan.task == "cancel":
+            return {"message": self.cancel(owner, job_id=plan.code)}
+        return execute(plan.task, plan.code)
 
     def discard(self, owner: str, token: str) -> str:
         self.prune()
@@ -396,16 +413,18 @@ class Bridge:
             return "账号已授权，当前没有任务。"
         return "当前无有效授权。请用 /璐茜玛 登录 扫码。"
 
-    def cancel(self, owner: str) -> str:
+    def cancel(self, owner: str, *, job_id: str | None = None) -> str:
         self.prune()
-        plan = self.plans.pop(owner, None)
+        plan = self.plans.pop(owner, None) if job_id is None else None
         for job in self.queue:
-            if job.owner == owner:
+            if job.owner == owner and (job_id is None or job.id == job_id):
                 self.queue.remove(job)
                 self.result(job, "已取消排队任务。", "cancelled")
                 return "已取消排队任务。"
         if plan:
             return "已取消待确认操作。"
+        if job_id is not None:
+            return "原任务已开始、完成或退出队列。"
         return "本次操作正在执行。" if self.active == owner else "没有待取消的任务。"
 
     def unbind(self, owner: str) -> str:

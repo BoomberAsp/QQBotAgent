@@ -3,11 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import io
-import os
 import re
 from pathlib import Path
 
-import httpx
 from dotenv import load_dotenv
 from nonebot import on_message
 from nonebot.adapters import Event
@@ -20,6 +18,7 @@ from nonebot.adapters.qq.event import C2CMessageCreateEvent, GroupMessageCreateE
 
 from agent.outbound import OutKeyboard
 from lib.button_spec import Btn
+from lucima_bridge.client import approval_card, enabled, request_lucima
 from lucima_bridge.receipt import render_receipt
 
 
@@ -58,10 +57,6 @@ MENUS = {
              [Btn("讨伐关卡", "/璐茜玛 讨伐关卡"), Btn("元素关卡", "/璐茜玛 元素关卡"), Btn("筛装备", "/璐茜玛 筛装备")]],
 }
 WATCHERS: set[asyncio.Task] = set()
-
-
-def enabled() -> bool:
-    return bool(os.environ.get("LUCIMA_INTERNAL_TOKEN"))
 
 
 def command_text(event: Event) -> str:
@@ -104,21 +99,7 @@ async def call_service(text: str, platform: str, bot: str, user: str, event: str
         valid = bool(action) and not arg
     if not valid:
         return {"message": HELP, "menu": "main"}
-    base_url = os.environ.get("LUCIMA_INTERNAL_URL", "http://127.0.0.1:8092").rstrip("/")
-    try:
-        async with httpx.AsyncClient(timeout=4, trust_env=False) as client:
-            response = await client.post(
-                base_url + "/internal/command",
-                headers={"Authorization": "Bearer " + os.environ["LUCIMA_INTERNAL_TOKEN"]},
-                json={"platform": platform, "bot": bot, "user": user, "event": event, "action": action, "arg": arg},
-            )
-            response.raise_for_status()
-            result = response.json()
-            if isinstance(result, dict):
-                return result
-    except (httpx.HTTPError, ValueError):
-        pass
-    return {"message": "璐茜玛服务暂不可用，请稍后再试。"}
+    return await request_lucima((platform, bot, user, event), action, arg)
 
 
 def render_qr(url: str) -> bytes:
@@ -178,10 +159,8 @@ async def reply(bot, event, result: dict, image_segment, actor: tuple[str, str, 
     message = result.get("message", "璐茜玛服务暂不可用。")
     rows = MENUS.get(result.get("menu"), [])
     if ticket := result.get("approval"):
-        confirm = f"/璐茜玛 执行 {ticket}"
-        discard = f"/璐茜玛 放弃 {ticket}"
-        message += f"\n5 分钟内确认执行。\n{confirm}\n{discard}"
-        rows = [[Btn("确认执行", confirm), Btn("取消", discard, style=0)]]
+        card = approval_card(message, ticket)
+        message, rows = card.markdown, card.rows
     if job := result.get("job"):
         rows = [[Btn("任务状态", "/璐茜玛 状态"), Btn("查看回执", "/璐茜玛 回执")]]
     if rows and actor[0] == "qq_official":
@@ -204,6 +183,8 @@ async def handle_onebot(bot: OneBot, event: PrivateMessageEvent | OneBotGroup):
         if event.is_tome() or any(seg.type == "at" and seg.data.get("qq") == str(bot.self_id) for seg in event.message):
             await bot.send(event, "请在私聊使用 /璐茜玛，账号和密码只填写在登录网页。")
         return
+    if str(event.user_id) == str(bot.self_id):
+        return
     actor = ("onebot", str(bot.self_id), str(event.user_id), str(event.message_id))
     result = await call_service(command_text(event), *actor)
     await reply(bot, event, result, OneBotSegment.image, actor)
@@ -215,7 +196,7 @@ async def handle_official(bot: OfficialBot, event: C2CMessageCreateEvent | Group
         await bot.send(event, "请在私聊使用 /璐茜玛，账号和密码只填写在登录网页。")
         return
     user = event.author.user_openid
-    if user:
+    if user and str(user) != str(bot.self_id) and not getattr(event.author, "bot", False):
         actor = ("qq_official", str(bot.self_id), str(user), str(event.id))
         result = await call_service(command_text(event), *actor)
         await reply(bot, event, result, OfficialSegment.file_image, actor)

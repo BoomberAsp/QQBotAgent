@@ -189,51 +189,105 @@ async def login(request: Request):
     return response
 
 
-@app.post("/internal/command")
-async def command(request: Request):
+async def command_context(request: Request):
     provided = request.headers.get("authorization", "").encode()
     if not hmac.compare_digest(provided, b"Bearer " + request.app.state.internal_token):
         return PlainTextResponse("Forbidden", status_code=403)
     body = await json_body(request) or {}
     platform, bot, user = body.get("platform"), body.get("bot"), body.get("user")
-    action, arg, event = body.get("action"), body.get("arg", ""), body.get("event")
+    action, event = body.get("action"), body.get("event")
     if (platform not in ("onebot", "qq_official") or not valid(bot, 128) or not valid(user, 128)
             or not valid(event, 128) or not isinstance(action, str)):
         return answer("命令无效。", 400)
     bridge = request.app.state.bridge
     owner = bridge.vault.index(json.dumps([platform, bot, user], separators=(",", ":")))
+    return bridge, owner, action, body.get("arg", ""), event
+
+
+def operation_preview(action: str, arg: str) -> str | None:
+    if not isinstance(arg, str):
+        return None
+    display_arg = re.sub(r"([\\`*_\[\]()<>])", r"\\\1", arg.strip())
+    if (action, arg) in APPROVALS:
+        return APPROVALS[(action, arg)]
+    if action == "redeem" and CODE.fullmatch(arg):
+        return f"在绑定的游戏账号兑换一次指定兑换码 `{arg}`。"
+    if action == "stages" and arg in {"hunt", "elf"}:
+        return "查询已解锁的讨伐关卡。" if arg == "hunt" else "查询已解锁的元素探索关卡。"
+    if action == "equipment" and (not arg or valid(arg, 24)):
+        return "读取装备并按副属性分数排序。" + (f"套装筛选条件 {display_arg}。" if arg else "")
+    if action == "encyclopedia" and valid(arg, 64) and arg.strip():
+        return f"查询 Lucima 图鉴中的 {display_arg}。"
+    if arg:
+        return None
+    labels = {
+        "login": "生成私聊扫码登录链接。账号密码在登录网页填写。",
+        "status": "查看你的 Lucima 授权和任务状态。",
+        "receipt": "在原私聊取回最近一张 Lucima 任务回执。",
+        "cancel": "取消此刻仍在排队的任务。已经开始的任务会继续运行。",
+        "unbind": "解除当前游戏账号绑定并清除 Lucima 保存的登录授权。",
+    }
+    if action in labels:
+        return labels[action]
+    if action in TASK_NAMES and action not in {"recruit", "donate", "redeem", "stages", "equipment"}:
+        return f"为当前绑定的游戏账号执行一次「{TASK_NAMES[action]}」。"
+    return None
+
+
+def execute_operation(bridge, owner: str, action: str, arg: str, event: str, catalog):
     if action == "login":
         return bridge.new_ticket(owner)
-    if action == "confirm" and isinstance(arg, str) and PIN.fullmatch(arg):
-        return answer(bridge.confirm(owner, arg))
     if action == "status":
-        return answer(bridge.status(owner))
+        return {"message": bridge.status(owner)}
     if action == "cancel":
-        return answer(bridge.cancel(owner))
+        return {"message": bridge.cancel(owner)}
     if action == "unbind":
-        return answer(bridge.unbind(owner))
-    if action == "approve" and isinstance(arg, str) and OPERATION_ID.fullmatch(arg):
-        return bridge.approve(owner, arg, event)
-    if action == "discard" and isinstance(arg, str) and OPERATION_ID.fullmatch(arg):
-        return answer(bridge.discard(owner, arg))
-    if action == "receipt" and isinstance(arg, str) and (not arg or OPERATION_ID.fullmatch(arg)):
+        return {"message": bridge.unbind(owner)}
+    if action == "receipt":
         return bridge.receipt(owner, arg)
-    if isinstance(arg, str) and (action, arg) in APPROVALS:
-        return bridge.prepare(owner, action, arg)
-    if action in TASK_NAMES and isinstance(arg, str):
-        valid_arg = (
-            (action == "redeem" and CODE.fullmatch(arg))
-            or (action == "stages" and arg in {"hunt", "elf"})
-            or (action == "equipment" and (not arg or valid(arg, 24)))
-            or (action not in {"recruit", "donate", "redeem", "stages", "equipment"} and not arg)
-        )
-        if valid_arg:
-            return bridge.submit(owner, action, arg, event)
-    if action == "encyclopedia" and valid(arg, 64) and arg.strip():
+    if action == "encyclopedia":
         query = arg.strip().casefold()
-        catalog = request.app.state.catalog
         matches = [line for names, line in catalog if query in names]
         if not matches:
             matches = [line for names, line in catalog if any(query in name for name in names)]
-        return answer("\n".join(matches[:5]) or "图鉴暂未找到匹配的角色。")
+        return {"message": "\n".join(matches[:5]) or "图鉴暂未找到匹配的角色。"}
+    return bridge.submit(owner, action, arg, event)
+
+
+@app.post("/internal/propose")
+async def propose(request: Request):
+    context = await command_context(request)
+    if isinstance(context, (JSONResponse, PlainTextResponse)):
+        return context
+    bridge, owner, action, arg, event = context
+    preview = operation_preview(action, arg)
+    if preview is None:
+        return answer("操作或参数无效。", 400)
+    return bridge.prepare(owner, action, arg, preview=preview, event=event)
+
+
+@app.post("/internal/command")
+async def command(request: Request):
+    context = await command_context(request)
+    if isinstance(context, (JSONResponse, PlainTextResponse)):
+        return context
+    bridge, owner, action, arg, event = context
+    if not isinstance(arg, str):
+        return answer("命令无效。", 400)
+
+    def execute(operation, argument):
+        return execute_operation(bridge, owner, operation, argument, event, request.app.state.catalog)
+
+    if action == "confirm" and PIN.fullmatch(arg):
+        return answer(bridge.confirm(owner, arg))
+    if action == "approve" and OPERATION_ID.fullmatch(arg):
+        return bridge.approve(owner, arg, event, execute)
+    if action == "discard" and OPERATION_ID.fullmatch(arg):
+        return answer(bridge.discard(owner, arg))
+    if action == "receipt" and OPERATION_ID.fullmatch(arg):
+        return execute(action, arg)
+    if (action, arg) in APPROVALS:
+        return bridge.prepare(owner, action, arg, event=event)
+    if operation_preview(action, arg) is not None:
+        return execute(action, arg)
     return answer("命令无效。", 400)

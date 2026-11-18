@@ -37,8 +37,9 @@ class WebAuthorizationTests(unittest.TestCase):
         self.enterContext(patch("lucima_bridge.web.Worker", return_value=self.worker))
         self.client = self.enterContext(TestClient(app, base_url=ORIGIN))
 
-    def command(self, action, user="owner", arg="", event="1", platform="onebot"):
-        return self.client.post("/internal/command", headers={"Authorization": "Bearer " + TOKEN}, json={
+    def command(self, action, user="owner", arg="", event="1", platform="onebot", *, proposal=False):
+        path = "/internal/propose" if proposal else "/internal/command"
+        return self.client.post(path, headers={"Authorization": "Bearer " + TOKEN}, json={
             "platform": platform, "bot": "bot", "user": user, "event": event, "action": action, "arg": arg,
         }).json()
 
@@ -113,6 +114,43 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertNotIn("auth", result["receipt"])
         payload = self.worker.await_args.args[0]
         self.assertEqual((payload["task"], payload["code"]), ("donate", "gold"))
+
+    def test_natural_language_action_waits_for_a_distinct_private_event(self):
+        self.command("confirm", arg=self.open_ticket())
+        self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub"}).status_code, 200)
+        proposed = self.command("mail", proposal=True, event="natural-request")
+        ticket = proposed["approval"]
+        self.worker.assert_awaited_once()  # only the login, no game task
+        self.assertNotIn("job", self.command("approve", arg=ticket, event="natural-request"))
+        self.assertNotIn("job", self.command("approve", user="other", arg=ticket, event="click"))
+        self.assertNotIn("job", self.command("approve", platform="qq_official", arg=ticket, event="click"))
+        self.assertNotIn("job", self.command("approve", proposal=True, arg=ticket, event="click"))
+        self.assertIn("job", self.command("approve", arg=ticket, event="click"))
+        self.assertNotIn("job", self.command("approve", arg=ticket, event="replay"))
+
+    def test_queries_and_login_links_are_created_only_after_approval(self):
+        proposed = self.command("login", proposal=True, event="natural-request")
+        self.assertNotIn("login_url", proposed)
+        approved = self.command("approve", arg=proposed["approval"], event="click")
+        self.assertIn("login_url", approved)
+        with patch("lucima_bridge.service.Bridge.status", return_value="TEST_AUTHORIZED_RESULT") as status:
+            proposed = self.command("status", proposal=True, event="query-request")
+            status.assert_not_called()
+            self.assertNotIn("TEST_AUTHORIZED_RESULT", str(proposed))
+            approved = self.command("approve", arg=proposed["approval"], event="query-click")
+            self.assertEqual(approved["message"], "TEST_AUTHORIZED_RESULT")
+            status.assert_called_once()
+
+    def test_expired_natural_language_proposal_is_rejected(self):
+        proposed = self.command("login", proposal=True, event="expiry-request")
+
+        def expire():
+            for plan in app.state.bridge.plans.values():
+                plan.expires = 0
+
+        self.client.portal.call(expire)
+        refused = self.command("approve", arg=proposed["approval"], event="later-click")
+        self.assertNotIn("login_url", refused)
 
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):

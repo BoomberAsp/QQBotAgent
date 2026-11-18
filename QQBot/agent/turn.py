@@ -301,7 +301,10 @@ _init_workspace()
 
 def _build_tool_registry() -> ToolRegistry:
     """Register all available tools."""
+    from .lucima_tools import register_lucima_tools
+
     registry = ToolRegistry()
+    register_lucima_tools(registry)
 
     # Built-in tools
     registry.register(
@@ -2507,7 +2510,10 @@ async def run_agent_turn(view: InboundMessage):
         return
     _user_busy.add(user_id)
     try:
-        return await handle_agent_turn(view)
+        from .lucima_tools import lucima_private_turn
+
+        with lucima_private_turn(view, _turn_sender.get() or default_sender):
+            return await handle_agent_turn(view)
     finally:
         _user_busy.discard(user_id)
 
@@ -3111,7 +3117,9 @@ async def handle_agent_turn(view: InboundMessage):
 
         # Resolve user permissions
         role = _perm_manager.get_role(user_id)
-        allowed_tools = _perm_manager.get_allowed_tools(role)
+        from .lucima_tools import lucima_tool_names
+
+        allowed_tools = _perm_manager.get_allowed_tools(role) | lucima_tool_names()
         code_limits = _perm_manager.get_code_limits(role)
 
         # Resolve group feature restrictions
