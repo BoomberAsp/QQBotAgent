@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lucima · 游戏账号授权</title>
+  <link rel="stylesheet" href="/login.css">
+  <script src="/login.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>游戏账号授权</h1>
+    <p id="status" role="status">正在检查登录申请…</p>
+    <section id="confirm" hidden>
+      <p>请在发起登录的机器人私聊发送这条命令，再回到本页。</p>
+      <code id="pin"></code>
+    </section>
+    <form id="login" autocomplete="off" method="post" action="/api/login" hidden>
+      <p>只提交你本人有权使用的游戏账号。执行任务时可能导致当前游戏客户端下线。</p>
+      <label for="account">游戏账号</label>
+      <input id="account" autocomplete="username" maxlength="254" required>
+      <label for="password">游戏密码</label>
+      <input id="password" type="password" autocomplete="current-password" maxlength="512" required>
+      <label class="remember"><input id="remember" type="checkbox"> 记住登录 30 天</label>
+      <p class="note">密码只用于当次验证。勾选后，服务会加密保存续期令牌。未勾选时登录凭证仅在内存保留 15 分钟。可在 QQ 私聊解除绑定。</p>
+      <button id="submit" type="submit">授权给 QQ 机器人</button>
+    </form>
+  </main>
+</body>
+</html>

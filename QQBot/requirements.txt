@@ -27,6 +27,8 @@ python-dotenv
 
 # ── Image Processing ─────────────────────────────────────────────
 Pillow
+qrcode[pil]
+cryptography>=43
 easyocr
 opencv-python-headless
 numpy

@@ -1,0 +1,14 @@
+:root { color-scheme: light; font-family: system-ui, sans-serif; color: #182923; background: #f1f5f3; }
+body { margin: 0; padding: 7vh 1rem 2rem; }
+main { max-width: 28rem; margin: auto; background: white; border: 1px solid #d7e3dd; border-radius: 1rem; padding: 1.6rem; }
+h1 { margin: 0 0 1.25rem; font-size: 1.65rem; }
+p { line-height: 1.55; }
+#status { color: #14533e; font-weight: 600; }
+code { display: block; padding: 0.8rem; background: #e8f2ed; border-radius: 0.4rem; user-select: all; }
+label { display: block; padding-top: 0.6rem; }
+input:not([type=checkbox]) { box-sizing: border-box; width: 100%; margin: 0.3rem 0 0.55rem; padding: 0.7rem; border: 1px solid #779186; border-radius: 0.4rem; }
+input, button { font: inherit; }
+.remember { display: flex; align-items: center; gap: 0.45rem; }
+.note { color: #435850; font-size: 0.875rem; }
+button { width: 100%; border: 0; border-radius: 0.4rem; padding: 0.75rem; background: #14533e; color: white; cursor: pointer; }
+button:disabled { opacity: 0.65; }
