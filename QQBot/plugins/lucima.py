@@ -19,13 +19,14 @@ from nonebot.adapters.qq.event import C2CMessageCreateEvent, GroupMessageCreateE
 
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-PREFIX = re.compile(r"^/璐茜玛(?:\s+|$)")
+PREFIX = re.compile(r"^/(?:璐茜玛|璐西玛|露西玛|lucima)(?:\s+|$)", re.IGNORECASE)
 COMMANDS = {
     "登录": "login", "确认": "confirm", "状态": "status", "取消": "cancel", "解绑": "unbind",
     "签到": "signin", "领邮件": "mail", "领基地": "base", "兑换": "redeem", "图鉴": "encyclopedia",
 }
 HELP = (
     "璐茜玛命令\n"
+    "别名 /璐西玛、/露西玛、/lucima\n"
     "/璐茜玛 登录 · 扫码绑定\n"
     "/璐茜玛 签到 · 领邮件 · 领基地\n"
     "/璐茜玛 兑换 <兑换码>\n"
