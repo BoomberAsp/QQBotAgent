@@ -86,7 +86,8 @@ class WebAuthorizationTests(unittest.TestCase):
 
     def test_shared_group_qr_only_authorizes_the_owners_selected_browser(self):
         scope = {"group": "room", "platform": "qq_official"}
-        issue = self.command("login", event="original", **scope)
+        event = "ROBOT1.0_" + "A" * 128
+        issue = self.command("login", event=event, **scope)
         ticket = {"ticket": issue["login_url"].split("#")[1]}
         first = self.post("/api/claim", ticket).json()
         unselected = self.client.cookies.get("__Host-lucima")
@@ -107,7 +108,7 @@ class WebAuthorizationTests(unittest.TestCase):
             self.assertEqual(result.status_code, status)
         self.worker.assert_awaited_once()
         self.assertIn("发起登录的 QQ 群", result.json()["message"])
-        self.assertEqual(self.command("login_notice", arg=issue["login_notice"], event="original", **scope)["menu"], "lobby")
+        self.assertEqual(self.command("login_notice", arg=issue["login_notice"], event=event, **scope)["menu"], "lobby")
         self.assertEqual(self.command("lobby", **scope)["menu"], "lobby")
         self.assertEqual(self.command("lobby", **(scope | {"user": "other"}))["menu"], "login")
         self.assertEqual(self.command("lobby", **(scope | {"group": None}))["menu"], "login")
@@ -142,6 +143,8 @@ class WebAuthorizationTests(unittest.TestCase):
         headers = {"Authorization": "Bearer " + TOKEN}
         self.assertEqual(self.client.post("/internal/group-command", json=body).status_code, 403)
         self.assertEqual(self.client.post("/internal/group-command", headers=headers, json=body).status_code, 400)
+        oversized = {**body, "group": "room", "event": "E" * 513}
+        self.assertEqual(self.client.post("/internal/group-command", headers=headers, json=oversized).status_code, 400)
         self.assertEqual(self.client.post("/internal/command", headers=headers, json={**body, "group": "room"}).status_code, 400)
 
     def test_login_success_delivers_one_lobby_to_original_event(self):

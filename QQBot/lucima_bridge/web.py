@@ -24,6 +24,8 @@ TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 CODE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 PIN = re.compile(r"[0-9]{8}\Z")
 OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{16}\Z")
+# QQ Official message IDs can exceed the limits for member and group IDs.
+EVENT_ID_MAX_LENGTH = 512
 
 
 def public_origin() -> str:
@@ -209,7 +211,7 @@ async def command_context(request: Request, *, group_command: bool = False):
     platform, bot, user = body.get("platform"), body.get("bot"), body.get("user")
     action, event, group = body.get("action"), body.get("event"), body.get("group")
     if (platform not in ("onebot", "qq_official") or not valid(bot, 128) or not valid(user, 128)
-            or not valid(event, 128) or not isinstance(action, str)):
+            or not valid(event, EVENT_ID_MAX_LENGTH) or not isinstance(action, str)):
         return answer("命令无效。", 400)
     if (group_command and not valid(group, 128)) or (not group_command and "group" in body):
         return answer("命令无效。", 400)
