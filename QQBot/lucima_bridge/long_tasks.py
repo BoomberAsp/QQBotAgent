@@ -8,7 +8,12 @@ from zoneinfo import ZoneInfo
 
 
 LONG_NAMES = {"activity": "活动推进", "abyss": "虚构深渊", "buy_batch": "批量购买"}
-SCHEDULE_TASKS = {"signin": "签到", "mail": "领邮件", "base": "领基地"}
+SCHEDULE_TASKS = {
+    "signin": "签到", "mail": "领邮件", "base": "领基地", "friend_support": "助战好友",
+    "send_meal": "每日体力", "reactor": "动力转换", "potion": "成长药剂", "starforce": "升星水晶",
+    "dispatch": "领派遣", "achievement": "领成就", "recruit": "免费招募", "guild": "团签到",
+    "guild_weekly": "团周奖", "refresh_secret": "刷新秘密商店",
+}
 CONFIRMED_OPERATIONS = LONG_NAMES.keys() | {"schedule_set", "schedule_stop"}
 TASK_TIMEOUT = 12 * 60
 LONG_QUEUE_TTL = 30 * 60
@@ -52,10 +57,12 @@ def preview(action, arg):
         return "批量购买\n" + "\n".join(rows.values()) + f"\n扣款上限 {budget}。报价或购买资格变化时停止。"
     if action == "schedule_set" and (args := schedule_arguments(arg)):
         task, hhmm = args
-        return (f"每天北京时间 {hhmm} 执行一次{SCHEDULE_TASKS[task]}。此计划会替换现有托管，"
-                "只在记住登录授权有效时执行。到点后一小时内排队，回执可在私聊查询。")
+        return (f"每天北京时间 {hhmm} 执行一次{SCHEDULE_TASKS[task]}，并替换这个任务之前的时间。"
+                "只在记住登录授权有效时执行。到点后一小时内排队，回执可在原会话查询。")
     if action == "schedule_stop" and not arg:
         return "停止当前每日托管并取消尚在队列中的托管任务。已提交给游戏的操作将在本次回执中记录。"
+    if action == "schedule_stop" and arg in SCHEDULE_TASKS:
+        return f"停止「{SCHEDULE_TASKS[arg]}」计划并取消该任务尚在队列中的托管执行。"
     return None
 
 
@@ -68,11 +75,8 @@ class LongTasks:
                 state TEXT NOT NULL, updated INTEGER NOT NULL, payload TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS lucima_receipt_owner ON lucima_task_receipt(owner, updated);
-            CREATE TABLE IF NOT EXISTS lucima_schedule (
-                owner TEXT PRIMARY KEY, game TEXT NOT NULL, task TEXT NOT NULL, hhmm TEXT NOT NULL,
-                first_day TEXT NOT NULL, last_day TEXT NOT NULL DEFAULT '', revision TEXT NOT NULL
-            );
         """)
+        self._migrate_schedule()
         for job_id, owner, task, state, payload in db.execute(
                 "SELECT id, owner, task, state, payload FROM lucima_task_receipt WHERE state != 'done'").fetchall():
             status = "unconfirmed" if state == "running" else "cancelled"
@@ -83,6 +87,22 @@ class LongTasks:
                        "details": details, "completed_at": now}
             self.finish(job_id, receipt)
         self.prune(now)
+
+    def _migrate_schedule(self):
+        columns = self.db.execute("PRAGMA table_info(lucima_schedule)").fetchall()
+        has_legacy_key = bool(columns) and not any(row[1] == "task" and row[5] for row in columns)
+        with self.db:
+            self.db.execute("BEGIN")
+            if has_legacy_key:
+                self.db.execute("ALTER TABLE lucima_schedule RENAME TO lucima_schedule_old")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS lucima_schedule (
+                owner TEXT NOT NULL, game TEXT NOT NULL, task TEXT NOT NULL, hhmm TEXT NOT NULL,
+                first_day TEXT NOT NULL, last_day TEXT NOT NULL DEFAULT '', revision TEXT NOT NULL,
+                PRIMARY KEY (owner, task)
+            )""")
+            if has_legacy_key:
+                self.db.execute("INSERT INTO lucima_schedule SELECT * FROM lucima_schedule_old")
+                self.db.execute("DROP TABLE lucima_schedule_old")
 
     def enqueue(self, job, name, now, scheduled=None):
         with self.db:
@@ -115,20 +135,33 @@ class LongTasks:
                               " AND state = 'done'" + where + " ORDER BY updated DESC, rowid DESC LIMIT 1", args).fetchone()
         return json.loads(row[0]) if row else None
 
+    def history(self, owner, now, *, after=0):
+        rows = self.db.execute("""SELECT payload FROM lucima_task_receipt
+            WHERE owner = ? AND state = 'done' AND updated > ?
+            ORDER BY updated DESC, rowid DESC LIMIT 100""", (owner, max(after, now - RECEIPT_TTL)))
+        return [json.loads(row[0]) for row in rows]
+
     def prune(self, now):
         with self.db:
             self.db.execute("DELETE FROM lucima_task_receipt WHERE state = 'done' AND updated <= ?", (now - RECEIPT_TTL,))
 
-    def schedule(self, owner):
+    def schedule(self, owner, task=None):
+        if task is not None:
+            return self.db.execute("""SELECT game, task, hhmm, first_day, last_day, revision FROM lucima_schedule
+                WHERE owner = ? AND task = ?""", (owner, task)).fetchone()
         return self.db.execute("SELECT game, task, hhmm, first_day, last_day, revision FROM lucima_schedule WHERE owner = ?",
                                (owner,)).fetchone()
+
+    def schedules(self, owner):
+        return self.db.execute("""SELECT game, task, hhmm, first_day, last_day, revision FROM lucima_schedule
+            WHERE owner = ? ORDER BY hhmm, task""", (owner,)).fetchall()
 
     def replace_schedule(self, owner, game, task, hhmm, revision, now):
         local = datetime.fromtimestamp(now, LOCAL)
         first = local.date() + timedelta(days=int(local.strftime("%H:%M") >= hhmm))
         with self.db:
             self.db.execute("""INSERT INTO lucima_schedule VALUES (?, ?, ?, ?, ?, '', ?)
-                ON CONFLICT(owner) DO UPDATE SET game = excluded.game, task = excluded.task,
+                ON CONFLICT(owner, task) DO UPDATE SET game = excluded.game,
                 hhmm = excluded.hhmm, first_day = excluded.first_day, revision = excluded.revision""",
                 (owner, game, task, hhmm, first.isoformat(), revision))
 
@@ -143,15 +176,20 @@ class LongTasks:
         for day, earliest, latest in windows:
             rows = self.db.execute("""SELECT s.owner, s.task, s.revision FROM lucima_schedule s
                 JOIN binding b ON b.owner = s.owner AND b.game = s.game
+                LEFT JOIN lucima_account_slot a ON a.owner = s.owner
                 WHERE s.first_day <= ? AND s.last_day < ? AND s.hhmm BETWEEN ? AND ?
-                      AND b.credential IS NOT NULL AND b.expires > ? ORDER BY s.hhmm, s.owner LIMIT ?""",
+                      AND b.credential IS NOT NULL AND b.expires > ? AND COALESCE(a.signed_out, 0) = 0
+                      ORDER BY s.hhmm, s.owner LIMIT ?""",
                 (day, day, earliest, latest, now, limit - len(result))).fetchall()
             result.extend((owner, task, day, revision) for owner, task, revision in rows)
         return result
 
-    def stop(self, owner):
+    def stop(self, owner, task=None):
         with self.db:
-            self.db.execute("DELETE FROM lucima_schedule WHERE owner = ?", (owner,))
+            if task is None:
+                self.db.execute("DELETE FROM lucima_schedule WHERE owner = ?", (owner,))
+            else:
+                self.db.execute("DELETE FROM lucima_schedule WHERE owner = ? AND task = ?", (owner, task))
 
     def clear(self, owner):
         self.stop(owner)

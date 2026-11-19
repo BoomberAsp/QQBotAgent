@@ -19,8 +19,9 @@ from nonebot.adapters.qq.event import C2CMessageCreateEvent, GroupMessageCreateE
 from agent.outbound import OutKeyboard
 from lib.button_spec import Btn
 from lucima_bridge.client import Actor, approval_card, enabled, request_lucima
-from lucima_bridge.long_tasks import LONG_QUEUE_TTL, TASK_TIMEOUT
-from lucima_bridge.receipt import render_receipt
+from lucima_bridge.long_tasks import LONG_QUEUE_TTL, SCHEDULE_TASKS, TASK_TIMEOUT
+from lucima_bridge.menu import HOME_LINKS, NAV_NAMES, PAGES
+from lucima_bridge.receipt import render_panel, render_receipt
 from lucima_bridge.service import LOGIN_NOTICE_LIMIT, LOGIN_TIMEOUT, TICKET_TTL
 
 
@@ -35,7 +36,25 @@ COMMANDS = {
     "托管": "schedule_set", "托管状态": "schedule_status", "停止托管": "schedule_stop",
     "刷新秘密商店": "refresh_secret", "秘密商店刷新": "refresh_secret",
     "刷新星源商店": "refresh_star_source", "星源商店刷新": "refresh_star_source",
+    "菜单": "navigate", "添加账号": "add_account", "账号别名": "rename_account", "主题": "theme", "界面": "view_card",
+    "分页": "view_page",
+    "任务历史": "history", "清空日志": "clear_logs", "刷新信息": "account_view", "查看资源": "account_view",
+    "查看团员": "account_view", "查看物品": "account_view", "查看队伍": "account_view",
+    "查看团概况": "account_view", "查看团周任务": "account_view",
+    "助战好友": "friend_support", "每日体力": "send_meal", "动力转换": "reactor",
+    "成长药剂": "potion", "升星水晶": "starforce",
+    "查看团店": "account_view", "后台计时": "timer",
+    "技能模块": "tesseract", "查看幻境": "account_view", "幻境扫荡": "sweep_illusion", "购买团店": "member_purchase",
+    "查看竞技场": "account_view", "查看投票": "account_view", "查看装备活动": "account_view",
+    "查看援助": "account_view", "查看团长店": "account_view",
+    "保存装备方案": "filter_save", "复制装备方案": "filter_copy", "导出装备方案": "filter_export",
+    "预览装备方案": "filter_preview", "删除装备方案": "filter_drop",
 }
+VIEW_NAMES = {"刷新信息": "summary", "查看资源": "resources", "查看团员": "heroes", "查看物品": "items",
+              "查看队伍": "teams", "查看团概况": "guild", "查看团周任务": "weekly", "查看团店": "guild_shop",
+              "查看幻境": "abyss_sweep", "查看竞技场": "arena", "查看投票": "vote", "查看装备活动": "equip_event",
+              "查看援助": "guild_aid", "查看团长店": "guild_captain"}
+SCHEDULE_ALIASES = {label: task for task, label in SCHEDULE_TASKS.items()}
 SHORTCUTS = {"捐赠金币": ("donate", "gold"), "捐赠证明": ("donate", "courage"),
              "讨伐关卡": ("stages", "hunt"), "元素关卡": ("stages", "elf")}
 HELP = (
@@ -70,10 +89,8 @@ MENUS = {
              [Btn("签到", "/璐茜玛 签到"), Btn("领邮件", "/璐茜玛 领邮件"), Btn("领基地", "/璐茜玛 领基地")],
              [Btn("打开大厅", "/璐茜玛 大厅"), Btn("进阶任务", "/璐茜玛 进阶")]],
     "login": [[Btn("扫码登录", "/璐茜玛 登录")]],
-    "lobby": [[Btn("签到", "/璐茜玛 签到"), Btn("领邮件", "/璐茜玛 领邮件"), Btn("领基地", "/璐茜玛 领基地")],
-              [Btn("进阶任务", "/璐茜玛 进阶"), Btn("任务状态", "/璐茜玛 状态"), Btn("查看回执", "/璐茜玛 回执")],
-              [Btn("长任务", "/璐茜玛 长任务"), Btn("刷秘密店", "/璐茜玛 刷新秘密商店"),
-               Btn("刷星源店", "/璐茜玛 刷新星源商店")]],
+    "lobby": [[Btn(label, "/璐茜玛 " + command) for label, command in HOME_LINKS[index:index + 3]]
+              for index in range(0, len(HOME_LINKS), 3)],
     "more": [[Btn("领派遣", "/璐茜玛 领派遣"), Btn("领成就", "/璐茜玛 领成就"), Btn("团签到", "/璐茜玛 团签到")],
              [Btn("捐赠金币", "/璐茜玛 捐赠金币"), Btn("捐赠证明", "/璐茜玛 捐赠证明"), Btn("免费招募", "/璐茜玛 免费招募")],
              [Btn("讨伐关卡", "/璐茜玛 讨伐关卡"), Btn("元素关卡", "/璐茜玛 元素关卡"), Btn("筛装备", "/璐茜玛 筛装备")]],
@@ -109,7 +126,30 @@ async def call_service(text: str, platform: str, bot: str, user: str, event: str
         return {"message": MORE, "menu": "more"}
     if command == "长任务" and not arg:
         return {"message": LONG_HELP, "menu": "long"}
-    if command in SHORTCUTS and not arg:
+    if not command:
+        action, valid = "lobby", True
+    elif command == "切换账号" and arg:
+        action, valid = "switch_account", bool(re.fullmatch(r"[1-5]", arg))
+    elif command in {"退出当前账号", "退出账号"} and arg == "确认":
+        action, arg, valid = "logout", "", True
+    elif command in NAV_NAMES and not arg and command != "大厅":
+        action, arg, valid = "navigate", NAV_NAMES[command], True
+    elif action == "navigate":
+        valid = arg in PAGES
+    elif action == "view_page":
+        valid = 0 < len(arg) <= 45
+    elif action == "account_view":
+        view = VIEW_NAMES[command]
+        valid = (view in {"heroes", "items", "teams"} and (not arg or len(arg) <= 36)) or not arg
+        arg = f"{view} {arg or '1'}" if view in {"heroes", "items", "teams"} else view
+    elif action in {"refresh_secret", "refresh_star_source", "theme", "rename_account"}:
+        valid = len(arg) <= 24
+    elif action == "history":
+        arg = arg or "1"
+        valid = bool(re.fullmatch(r"[1-9][0-9]{0,2}", arg))
+    elif action and action.startswith("filter_"):
+        valid = 0 < len(arg) <= 2200
+    elif command in SHORTCUTS and not arg:
         action, arg = SHORTCUTS[command]
         valid = True
     elif action == "confirm":
@@ -124,16 +164,19 @@ async def call_service(text: str, platform: str, bot: str, user: str, event: str
         valid = not arg or bool(re.fullmatch(r"[A-Za-z0-9_-]{16}", arg))
     elif action == "equipment":
         valid = len(arg) <= 24
-    elif action in {"activity", "abyss", "buy_batch"}:
+    elif action in {"activity", "abyss", "buy_batch", "sweep_illusion", "member_purchase"}:
         valid = 0 < len(arg) <= 255
     elif action == "long_info":
         arg = {"活动": "activity", "深渊": "abyss", "商店": "shop"}.get(arg, arg)
         valid = arg in {"activity", "abyss", "shop"}
     elif action == "schedule_set":
         task, when = (arg.split(maxsplit=1) + ["", ""])[:2]
-        task = {"签到": "signin", "领邮件": "mail", "领基地": "base"}.get(task, task)
+        task = SCHEDULE_ALIASES.get(task, task)
         arg = f"{task} {when.strip()}"
         valid = 0 < len(arg) <= 24
+    elif action == "schedule_stop":
+        arg = SCHEDULE_ALIASES.get(arg, arg)
+        valid = not arg or arg in SCHEDULE_TASKS
     else:
         valid = bool(action) and not arg
     if not valid:
@@ -151,9 +194,28 @@ def render_qr(url: str) -> bytes:
         return buffer.getvalue()
 
 
-async def send_receipt(bot, event, receipt: dict, image_segment) -> None:
+def result_buttons(result: dict) -> list:
+    buttons = result.get("buttons")
+    if not isinstance(buttons, list):
+        return MENUS.get(result.get("menu"), [])
+    eligible = [(item[0], item[1]) for item in buttons[:15]
+                if isinstance(item, list) and len(item) == 2 and all(isinstance(part, str) for part in item)]
+    return [[Btn(label, "/璐茜玛 " + command) for label, command in eligible[index:index + 3]]
+            for index in range(0, len(eligible), 3)]
+
+
+async def send_receipt(bot, event, receipt: dict, image_segment, actor: Actor) -> None:
     detail = "\n".join([receipt["message"], *receipt["details"]])
-    await bot.send(event, detail)
+    if view := receipt.get("view"):
+        position, kind, page, pages, query = view
+        query = " " + query if query else ""
+        # Long search text must fit the keyboard's command size.
+        controls = [Btn(label, f"/璐茜玛 分页 {position} {kind} {number}{query}") for label, number in
+                    (("上一页", page - 1), ("下一页", page + 1)) if 1 <= number <= pages]
+        controls.append(Btn("基本信息", "/璐茜玛 基本信息"))
+        await send_menu(bot, event, actor, detail, [controls], include_commands=True)
+    else:
+        await bot.send(event, detail)
     await send_receipt_image(bot, event, receipt, image_segment)
 
 
@@ -174,7 +236,7 @@ async def watch_receipt(bot, event, actor: Actor, job: str, image_segment, *, lo
             await asyncio.sleep(10 if long_job else 3)
             result = await call_service(f"/璐茜玛 回执 {job}", *actor)
             if receipt := result.get("receipt"):
-                await send_receipt(bot, event, receipt, image_segment)
+                await send_receipt(bot, event, receipt, image_segment, actor)
                 return
             if not result.get("pending") and "暂不可用" not in result.get("message", ""):
                 return
@@ -183,15 +245,21 @@ async def watch_receipt(bot, event, actor: Actor, job: str, image_segment, *, lo
         return
 
 
-async def send_menu(bot, event, actor: Actor, message: str, rows: list) -> None:
+async def send_menu(bot, event, actor: Actor, message: str, rows: list, *, include_commands=False) -> None:
+    def fallback():
+        return message + "\n\n" + "\n".join(btn.data for row in rows for btn in row)
+
     if rows and actor[0] == "qq_official":
         from adapters.qq_official import QQOfficialSender
 
         sender = QQOfficialSender(bot, event, is_group=len(actor) == 5)
-        await sender.send_keyboard(OutKeyboard(message, rows, label="lucima"))
+        if include_commands and not sender.supports_keyboard:
+            await sender.send_text(fallback())
+        else:
+            await sender.send_keyboard(OutKeyboard(message, rows, label="lucima"))
         await sender.flush()
     else:
-        await bot.send(event, message)
+        await bot.send(event, fallback() if rows and include_commands else message)
 
 
 async def watch_login(bot, event, actor: Actor, notice: str, image_segment) -> None:
@@ -205,7 +273,7 @@ async def watch_login(bot, event, actor: Actor, notice: str, image_segment) -> N
                 if receipt:
                     message += f"\n登录回执 /璐茜玛 回执 {receipt['id']}"
                 try:
-                    await send_menu(bot, event, actor, message, MENUS["lobby"])
+                    await send_menu(bot, event, actor, message, result_buttons(result), include_commands=True)
                 finally:
                     if receipt:
                         await send_receipt_image(bot, event, receipt, image_segment)
@@ -248,16 +316,22 @@ async def reply(bot, event, result: dict, image_segment, actor: Actor) -> None:
                 watcher.add_done_callback(lambda _: LOGIN_WATCHERS.pop(notice, None))
         return
     if receipt := result.get("receipt"):
-        await send_receipt(bot, event, receipt, image_segment)
+        await send_receipt(bot, event, receipt, image_segment, actor)
         return
     message = result.get("message", "璐茜玛服务暂不可用。")
-    rows = MENUS.get(result.get("menu"), [])
+    rows = result_buttons(result)
     if ticket := result.get("approval"):
         card = approval_card(message, ticket)
         message, rows = card.markdown, card.rows
     if job := result.get("job"):
         rows = [[Btn("任务状态", "/璐茜玛 状态"), Btn("查看回执", f"/璐茜玛 回执 {job}")]]
-    await send_menu(bot, event, actor, message, rows)
+    await send_menu(bot, event, actor, message, rows, include_commands="buttons" in result)
+    if result.get("picture"):
+        try:
+            data = await asyncio.to_thread(render_panel, result)
+            await bot.send(event, image_segment(data))
+        except Exception:
+            pass
     if job and len(WATCHERS) < 12:
         watcher = asyncio.create_task(watch_receipt(bot, event, actor, job, image_segment,
                                                    long_job=result.get("long_job") is True))

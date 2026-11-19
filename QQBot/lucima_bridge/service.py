@@ -16,6 +16,10 @@ from tempfile import TemporaryDirectory
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from .accounts_ui import AccountSlots
+from .filters import Filters
+from .menu import PAGES, THEME_NAMES, menu_data
+
 from .long_tasks import LONG_NAMES, LONG_QUEUE_TTL, SCHEDULE_TASKS, TASK_TIMEOUT, LongTasks, schedule_arguments
 
 
@@ -34,6 +38,10 @@ TASK_NAMES = {
     "guild_weekly": "佣兵团周奖励", "donate": "佣兵团捐赠", "recruit": "免费招募",
     "stages": "扫荡关卡查询", "equipment": "装备筛选",
     "long_info": "长任务查询", "refresh_secret": "刷新秘密商店", "refresh_star_source": "刷新星源商店",
+    "account_view": "基本信息", "friend_support": "助战好友", "send_meal": "每日体力",
+    "reactor": "动力转换", "potion": "成长药剂", "starforce": "升星水晶",
+    "filter_preview": "装备方案预览",
+    "tesseract": "技能模块", "sweep_illusion": "虚拟幻境扫荡", "member_purchase": "团员商店购买",
     **LONG_NAMES,
 }
 APPROVALS = {
@@ -52,6 +60,7 @@ OUTCOMES = {
     "timeout": "任务超时，请先在游戏内核对结果。",
     "auth_expired": "登录授权已失效，请重新扫码。",
     "game_login_failed": "未能建立游戏会话，本次操作尚未开始。请稍后重试。",
+    "quote_unavailable": "当前无法核实刷新价格，本次未提交刷新。",
     "invalid_code": "兑换码无效或已过期。",
     "unexpected_cost": "游戏返回了意外消耗，请核对账户。",
     "duplicate_login": "检测到重复登录，已停止。请退出游戏客户端后再手动发起。",
@@ -202,12 +211,6 @@ class LoginNotice:
     receipt: dict | None = None
 
 
-def lobby_message(summary: str) -> str:
-    return (f"璐茜玛大厅\n{summary}\n\n"
-            "/璐茜玛 签到 · 领邮件 · 领基地\n"
-            "/璐茜玛 进阶 · 长任务 · 状态 · 回执")
-
-
 @dataclass
 class Job:
     owner: str
@@ -343,6 +346,8 @@ class Worker:
 class Bridge:
     def __init__(self, vault: Vault, worker: Worker, public_origin: str):
         self.vault = vault
+        self.accounts = AccountSlots(vault)
+        self.filters = Filters(vault.db)
         self.long_tasks = LongTasks(vault.db, int(time.time()))
         self.worker = worker
         self.public_origin = public_origin
@@ -387,14 +392,16 @@ class Bridge:
     def new_ticket(self, owner: str, event: str, *, group: bool = False) -> dict:
         self.prune()
         now = time.monotonic()
-        if self.active == owner and self.active_job is None:
+        slots = self.accounts.owners(self.accounts.scope_for(owner))
+        if self.active in slots and self.active_job is None:
             return {"message": "正在验证这次登录申请，请稍等。"}
         if any(ticket.owner == owner and now - ticket.created < 10 for ticket in self.tickets.values()):
             return {"message": "请使用刚发送的二维码，或稍等后重新申请。"}
         if owner not in self.login_notices and len(self.login_notices) >= LOGIN_NOTICE_LIMIT:
             return {"message": "登录申请暂时已满，请稍后重试。"}
-        self.drop_tickets(owner)
-        self.dismiss_login_notice(owner)
+        for slot in slots:
+            self.drop_tickets(slot)
+            self.dismiss_login_notice(slot)
         secret = secrets.token_urlsafe(32)
         self.tickets[fingerprint(secret)] = Ticket(owner, now, group=group)
         notice = LoginNotice(event, now + TICKET_TTL)
@@ -414,7 +421,8 @@ class Bridge:
         if self.login_notices.get(owner) is not notice or notice.message is None:
             return {}
         self.dismiss_login_notice(owner)
-        return {"message": notice.message, "menu": "lobby", "receipt": notice.receipt}
+        view = self.navigation(self.accounts.scope_for(owner), "home", notice.message, remember=False)
+        return {**view, "menu": "lobby", "receipt": notice.receipt}
 
     def claim(self, secret: str) -> tuple[str, str] | None:
         self.prune()
@@ -511,6 +519,8 @@ class Bridge:
                 return 409, "该游戏账号无法绑定到当前会话。若已有绑定，请从原会话解绑后再登录。"
             if not saved or not had_remembered:
                 self.stop_schedule(owner)
+            self.accounts.set_signed_out(owner, False)
+            self.accounts.activate(self.accounts.scope_for(owner), self.accounts.position_for(owner))
             self.sessions[owner] = (time.monotonic() + SESSION_TTL, auth)
             self.last.pop(owner, None)
             self.plans.pop(owner, None)
@@ -519,10 +529,10 @@ class Bridge:
                 authorization = "已恢复记住的登录，保留原授权到期时间。"
             receipt = {"id": secrets.token_urlsafe(12), "task": "登录", "kind": "login", "status": "ok",
                        "message": "登录成功 · QQ 会话已绑定", "details": [authorization],
-                       "completed_at": int(time.time())}
+                       "completed_at": int(time.time()), "theme": self.accounts.preferences(self.accounts.scope_for(owner))[1]}
             self.save_receipt(owner, receipt)
             if notice is not None:
-                notice.message = lobby_message(f"登录成功。{authorization}")
+                notice.message = f"登录成功。{authorization}"
                 notice.receipt = receipt
                 notice.expires = time.monotonic() + 60
                 notice.ready.set()
@@ -540,13 +550,103 @@ class Bridge:
             self.wake.set()
 
     def auth_for(self, owner: str) -> dict | None:
+        if self.accounts.is_signed_out(owner):
+            return None
         session = self.sessions.get(owner)
         return session[1] if session and session[0] > time.monotonic() else self.vault.load(owner)
 
     def lobby(self, owner: str) -> dict:
-        if not self.auth_for(owner):
-            return {"message": "当前没有有效授权。发送 /璐茜玛 登录 重新扫码。", "menu": "login"}
-        return {"message": lobby_message("当前游戏账号已授权。"), "menu": "lobby"}
+        authorized = bool(self.auth_for(owner))
+        message = "当前游戏账号已授权。" if authorized else "当前没有有效授权。发送 /璐茜玛 登录 重新扫码。"
+        result = self.navigation(self.accounts.scope_for(owner), "home", message)
+        result["menu"] = "lobby" if authorized else "login"
+        return result
+
+    def navigation(self, scope: str, page: str, summary: str = "", *, remember=True, links=(), replace=False) -> dict:
+        if page not in PAGES:
+            return {"message": "目录不存在。发送 /璐茜玛 大厅 返回。"}
+        owner = self.accounts.active(scope)
+        _, theme, _ = self.accounts.preferences(scope)
+        if remember and page not in {"accounts", "theme", "logout"}:
+            self.accounts.set_page(scope, page)
+        account = ""
+        if self.vault.record(owner):
+            state = "授权有效" if self.auth_for(owner) else "待授权"
+            account = f"当前账号 {self.accounts.label(owner)} · {state}"
+        if page == "accounts":
+            rows, account_links = [], []
+            for slot in self.accounts.owners(scope):
+                if not self.vault.record(slot):
+                    continue
+                pos = self.accounts.position_for(slot)
+                status = ("当前 · " if slot == owner else "") + ("已授权" if self.auth_for(slot) else "待授权")
+                rows.append(f"{pos}  {self.accounts.label(slot)} · {status}")
+                account_links.append((f"切换 {pos}", f"切换账号 {pos}"))
+            summary = "\n".join(rows or ["当前会话还没有游戏账号。"])
+            summary += "\n发送 /璐茜玛 账号别名 <名称> 修改当前别名。"
+            links = (*account_links, ("添加账号", "添加账号"), ("重新扫码", "登录"))
+        elif page == "theme":
+            summary = f"当前主题 {THEME_NAMES[theme]}。用于 Lucima 生成的图片。"
+            links = (*links, ("预览界面", "界面"))
+        elif page.startswith("auto_"):
+            rule = self.long_tasks.schedule(owner, page.removeprefix("auto_"))
+            enabled = rule and self.vault.candidate(owner) and not self.accounts.is_signed_out(owner)
+            status = f"托管已启用 · 每天 {rule[2]}" if enabled else "托管未启用"
+            summary = f"{status}。\n{PAGES[page].body}"
+        elif page == "filter":
+            names = self.filters.names(owner)
+            summary = "当前账号的方案\n" + (" · ".join(names) if names else "暂无方案")
+            summary += ("\n发送 /璐茜玛 预览装备方案 <名称> 或 /璐茜玛 导出装备方案 <名称>。"
+                        "\n新建、导入和复制可在下一级查看用法。")
+            links = (*links, ("方案管理", "菜单 filter_manage"))
+        elif page in {"secret", "starshop"} and not replace:
+            names = self.filters.names(owner)
+            command = "刷新秘密商店 1 免费 " if page == "secret" else "刷新星源商店 1 "
+            if names:
+                choices = list(enumerate(names[:5], 1))
+                summary = (summary or PAGES[page].body) + "\n" + " · ".join(f"方案 {i} {name}" for i, name in choices)
+                links = (*links, *((f"方案 {i}", command + name) for i, name in choices))
+        elif page == "home" and not self.auth_for(owner):
+            links = (*links, ("扫码授权", "登录"))
+        return menu_data(page, account, summary, theme=theme, links=tuple(links), replace=replace)
+
+    def add_account(self, scope: str, event: str, *, group: bool) -> dict:
+        slot = self.accounts.reserve(scope)
+        if slot is None:
+            return {"message": f"当前会话最多可绑定 {self.accounts.LIMIT} 个游戏账号。"}
+        return self.new_ticket(slot, event, group=group)
+
+    def switch_account(self, scope: str, position: int) -> dict:
+        old = self.accounts.active(scope)
+        owner = self.accounts.select(scope, position)
+        if not owner or not self.vault.record(owner):
+            return {"message": "这个账号还没有绑定。发送 /璐茜玛 切换账号 查看列表。"}
+        if owner != old:
+            self.plans.pop(old, None)
+            self.plans.pop(owner, None)
+            self.accounts.activate(scope, position)
+        result = self.navigation(scope, self.accounts.preferences(scope)[2], remember=False)
+        result["message"] += f"\n已选择 {self.accounts.label(owner)}。"
+        return result
+
+    def logout(self, owner: str) -> dict:
+        if not self.vault.record(owner):
+            return {"message": "当前没有已绑定账号。"}
+        if self.active == owner and self.active_job is None:
+            return {"message": "登录正在验证，请在验证完成后退出。"}
+        scope = self.accounts.scope_for(owner)
+        self.accounts.set_signed_out(owner, True)
+        self.sessions.pop(owner, None)
+        self.cancel(owner)
+        self.cancel_queued_schedule(owner)
+        self.drop_tickets(owner)
+        self.dismiss_login_notice(owner)
+        alternatives = [slot for slot in self.accounts.owners(scope) if slot != owner and self.auth_for(slot)]
+        if alternatives:
+            self.accounts.activate(scope, self.accounts.position_for(alternatives[0]))
+        response = self.navigation(scope, "accounts")
+        response["message"] = f"已退出 {self.accounts.label(owner)}。\n" + response["message"]
+        return response
 
     def prepare(self, owner: str, task: str, code: str, *, preview: str | None = None, event: str = "") -> dict:
         self.prune()
@@ -555,7 +655,7 @@ class Bridge:
         if owner not in self.plans and len(self.plans) >= 256:
             return {"message": "待确认操作已满，请稍后再试。"}
         binding = self.vault.record(owner)
-        if task in LONG_NAMES and (binding is None or not self.auth_for(owner)):
+        if task in TASK_NAMES and (task, code) != ("long_info", "shop") and not self.auth_for(owner):
             return {"message": "请先用 /璐茜玛 登录 完成扫码。"}
         if task == "schedule_set" and not self.vault.candidate(owner):
             return {"message": "请在登录网页勾选记住 30 天，再设置托管。"}
@@ -565,7 +665,10 @@ class Bridge:
         plan = Plan(secrets.token_urlsafe(12), task, code, time.monotonic() + 300,
                     binding[0] if binding else None, event)
         self.plans[owner] = plan
-        return {"message": preview if preview is not None else APPROVALS[(task, code)], "approval": plan.id}
+        message = preview if preview is not None else APPROVALS[(task, code)]
+        if (task in TASK_NAMES or task in {"logout", "unbind", "clear_logs", "filter_drop"}) and binding is not None:
+            message = f"当前账号 {self.accounts.label(owner)}\n" + message
+        return {"message": message, "approval": plan.id}
 
     def approve(self, owner: str, token: str, event: str, execute) -> dict:
         self.prune()
@@ -596,10 +699,12 @@ class Bridge:
 
     def submit(self, owner: str, task: str, code: str, message_id: str, *, scheduled=None) -> dict:
         self.prune()
-        anchor = (owner, message_id)
+        scope = self.accounts.scope_for(owner)
+        anchor = (scope, message_id)
         if anchor in self.submitted:
             return {"message": "这条消息已经提交过。"}
-        if self.active == owner or any(job.owner == owner for job in self.queue):
+        slots = self.accounts.owners(scope)
+        if self.active in slots or any(job.owner in slots for job in self.queue):
             return {"message": "你已有待处理的操作，请用 /璐茜玛 状态 查询。"}
         if (task, code) != ("long_info", "shop") and not self.auth_for(owner):
             return {"message": "请先用 /璐茜玛 登录 完成扫码。"}
@@ -669,6 +774,7 @@ class Bridge:
         self.last.pop(owner, None)
         self.receipts = {key: row for key, row in self.receipts.items() if row[0] != owner}
         self.long_tasks.clear(owner)
+        self.filters.drop(owner)
         return "已解除绑定并清除本服务的登录授权。"
 
     def set_schedule(self, owner: str, code: str) -> str:
@@ -676,36 +782,40 @@ class Bridge:
         if not binding or not args or not self.vault.candidate(owner):
             return "记住的登录授权不可用，请重新扫码。"
         task, hhmm = args
-        self.cancel_queued_schedule(owner)
+        self.cancel_queued_schedule(owner, task)
         self.long_tasks.replace_schedule(owner, binding[0], task, hhmm, secrets.token_urlsafe(12), int(time.time()))
         self.wake.set()
         return f"托管已启用。每天北京时间 {hhmm} 执行{SCHEDULE_TASKS[task]}。"
 
     def schedule_status(self, owner: str) -> str:
-        record = self.long_tasks.schedule(owner)
+        records = self.long_tasks.schedules(owner)
         receipt = self.long_tasks.receipt(owner, "", int(time.time()), scheduled_only=True)
         result = f"\n最近托管回执 /璐茜玛 回执 {receipt['id']}" if receipt else ""
-        if not record or not self.vault.candidate(owner):
+        if not records or not self.vault.candidate(owner):
             return "当前没有有效的托管计划。" + result
-        _, task, hhmm, first, last, _ = record
-        recent = f"\n最近排队日期 {last}" if last else ""
-        return f"每天北京时间 {hhmm} 执行{SCHEDULE_TASKS[task]}，自 {first} 起。{recent}{result}"
+        if self.accounts.is_signed_out(owner):
+            return "账号已退出，托管暂停。" + result
+        rows = [f"{hhmm} {SCHEDULE_TASKS[task]} · 自 {first} 起" + (f" · 上次 {last}" if last else "")
+                for _, task, hhmm, first, last, _ in records]
+        return "每日托管（北京时间）\n" + "\n".join(rows) + result
 
-    def cancel_queued_schedule(self, owner: str) -> None:
+    def cancel_queued_schedule(self, owner: str, task: str | None = None) -> None:
         for job in tuple(self.queue):
-            if job.owner == owner and job.schedule:
+            if job.owner == owner and job.schedule and (task is None or job.task == task):
                 self.queue.remove(job)
                 self.result(job, "已取消排队中的托管任务。", "cancelled")
 
-    def stop_schedule(self, owner: str) -> str:
-        self.long_tasks.stop(owner)
-        self.cancel_queued_schedule(owner)
+    def stop_schedule(self, owner: str, task: str | None = None) -> str:
+        self.long_tasks.stop(owner, task)
+        self.cancel_queued_schedule(owner, task)
         return "已停止托管，并取消排队中的托管任务。"
 
     def enqueue_due(self, now: int) -> None:
         if len(self.queue) >= QUEUE_SIZE:
             return
         for owner, task, day, revision in self.long_tasks.due(now, QUEUE_SIZE + 1):
+            if self.accounts.is_signed_out(owner):
+                continue
             if not self.vault.candidate(owner):
                 self.stop_schedule(owner)
                 continue
@@ -717,7 +827,14 @@ class Bridge:
         facts = details if isinstance(details, list) else []
         clean = [" ".join(item.split())[:120] for item in facts[:8] if isinstance(item, str)]
         payload = {"id": job.id, "task": job.label, "status": status,
-                   "message": message, "details": clean, "completed_at": int(time.time())}
+                   "message": message, "details": clean, "completed_at": int(time.time()),
+                   "theme": self.accounts.preferences(self.accounts.scope_for(job.owner))[1]}
+        if job.task == "account_view" and status == "ok" and clean:
+            part = job.code.split(maxsplit=2)
+            match = re.match(r"第 (\d+)/(\d+) 页", clean[0])
+            if match and part[0] in {"heroes", "items", "teams"}:
+                payload["view"] = [self.accounts.position_for(job.owner), part[0], *map(int, match.groups()),
+                                   part[2] if len(part) > 2 else ""]
         if job.durable:
             self.long_tasks.finish(job.id, payload)
         self.last[job.owner] = (time.monotonic() + 3600, message)
@@ -727,6 +844,25 @@ class Bridge:
         self.receipts[payload["id"]] = (owner, time.monotonic() + 3600, payload)
         if len(self.receipts) > 512:
             self.receipts.pop(next(iter(self.receipts)))
+
+    def history(self, owner: str, page: int) -> dict:
+        self.prune()
+        now = int(time.time())
+        cutoff = self.accounts.history_cutoff(owner)
+        rows = {row["id"]: row for row in self.long_tasks.history(owner, now, after=cutoff)}
+        rows.update({data["id"]: data for actor, _, data in self.receipts.values()
+                     if actor == owner and data["completed_at"] > cutoff})
+        ordered = sorted(rows.values(), key=lambda row: row["completed_at"], reverse=True)
+        start = (page - 1) * 5
+        visible = ordered[start:start + 5]
+        messages = [f"任务历史 · 第 {page} 页", *[f"{row['message']}\n回执 {row['id']}" for row in visible]]
+        buttons = [(f"回执 {i}", f"回执 {row['id']}") for i, row in enumerate(visible, 1)]
+        if page > 1:
+            buttons.append(("上一页", f"任务历史 {page - 1}"))
+        if start + 5 < len(ordered):
+            buttons.append(("下一页", f"任务历史 {page + 1}"))
+        return self.navigation(self.accounts.scope_for(owner), "logs", "\n".join(messages) if visible else "本页没有记录。",
+                               links=buttons, replace=True)
 
     def receipt(self, owner: str, job_id: str) -> dict:
         self.prune()
@@ -777,7 +913,7 @@ class Bridge:
             self.result(job, OUTCOMES["auth_expired"], "auth_expired")
             return
         if job.schedule:
-            schedule = self.long_tasks.schedule(job.owner)
+            schedule = self.long_tasks.schedule(job.owner, job.task)
             auth = self.vault.load(job.owner)
             if not schedule or schedule[-1] != job.schedule or not auth or not auth["refresh_token"]:
                 self.result(job, "托管授权已失效或计划已变化，本次任务已取消。", "cancelled")

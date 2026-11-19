@@ -173,6 +173,90 @@ class WebAuthorizationTests(unittest.TestCase):
             self.assertEqual(result["receipt"]["status"], "ok")
             self.worker.assert_awaited_once_with({"action": "run", "task": action, "code": "", "auth": AUTH}, 100)
 
+    def test_full_navigation_and_theme_are_available_without_a_game_login(self):
+        group = {"group": "layout"}
+        home = self.command("lobby", **group)
+        self.assertEqual([row[0] for row in home["buttons"][:9]], [
+            "基本信息", "自动任务", "主动任务", "佣兵团", "工具箱", "运行日志", "退出账号", "切换明暗", "切换账号",
+        ])
+        for label, command in home["buttons"][:9]:
+            view = self.command("navigate", arg=command.split()[1], **group)
+            self.assertIn(["大厅", "菜单 home"], view["buttons"])
+            self.assertLessEqual(len(view["buttons"]), 15)
+        changed = self.command("theme", arg="亮色", **group)
+        self.assertEqual(changed["theme"], "light")
+        self.assertTrue(changed["picture"])
+        self.assertEqual(self.command("lobby")["theme"], "default")
+        self.worker.assert_not_called()
+
+    def test_multiple_slots_keep_old_jobs_and_invalidates_pending_confirmations(self):
+        scope = {"group": "room"}
+        first = self.command("login", **scope)
+        pin = self.post("/api/claim", {"ticket": first["login_url"].split("#")[1]}).json()["pin"]
+        self.command("confirm", arg=pin, **scope)
+        body = {"account": "fixture", "password": "fixture", "remember": True}
+        self.assertEqual(self.post("/api/login", body).status_code, 200)
+        self.command("navigate", arg="info", **scope)
+        first_receipt = self.command("receipt", **scope)["receipt"]["id"]
+        plan = self.command("mail", event="draft", **scope)["approval"]
+        second = self.command("add_account", **scope, event="adding")
+        pin2 = self.post("/api/claim", {"ticket": second["login_url"].split("#")[1]}).json()["pin"]
+        self.assertIn("无效", self.command("confirm", arg=pin2, group="elsewhere")["message"])
+        self.command("confirm", arg=pin2, **scope)
+        self.worker.return_value = {"status": "ok", "auth": {**AUTH, "user_id": "second"}}
+        self.assertEqual(self.post("/api/login", body).status_code, 200)
+        self.assertIn("账号 2", self.command("navigate", arg="accounts", **scope)["message"])
+        self.assertNotEqual(self.command("receipt", **scope)["receipt"]["id"], first_receipt)
+        self.assertIn("receipt", self.command("receipt", arg=first_receipt, **scope))
+        self.assertNotIn("receipt", self.command("receipt", arg=first_receipt, group="elsewhere"))
+        self.assertNotIn("job", self.command("approve", arg=plan, event="accept", **scope))
+        self.assertIn("基本信息", self.command("switch_account", arg="1", **scope)["message"])
+        self.assertNotIn("job", self.command("approve", arg=plan, event="accept", **scope))
+        logout = self.command("logout", event="logout", **scope)["approval"]
+        self.assertIn("已退出 账号 1", self.command("approve", arg=logout, event="accept-logout", **scope)["message"])
+        self.assertIn("账号 2", self.command("lobby", **scope)["message"])
+
+    def test_integer_shop_order_keeps_free_cap_and_stops_without_verified_quotes(self):
+        self.command("confirm", arg=self.open_ticket())
+        self.assertEqual(self.post("/api/login", {"account": "fixture", "password": "fixture"}).status_code, 200)
+        self.worker.reset_mock()
+        choose = self.command("refresh_secret", arg="５")
+        self.assertIn(["选择免费", "刷新秘密商店 5 免费"], choose["buttons"])
+        plan = self.command("refresh_secret", arg="５ 免费", event="plan")
+        self.assertIn("申请 5 次", plan["message"])
+        self.assertIn("扣款上限 0", plan["message"])
+        self.assertNotIn("approval", self.command("refresh_star_source", arg="5"))
+        self.assertNotIn("approval", self.command("refresh_secret", arg="5 钻石"))
+        self.assertIn("整数", self.command("refresh_secret", arg="1.5")["message"])
+        self.worker.assert_not_called()
+        job = self.command("approve", arg=plan["approval"], event="approve")["job"]
+        for _ in range(50):
+            result = self.command("receipt", arg=job)
+            if "receipt" in result:
+                break
+            time.sleep(0.01)
+        self.assertEqual(result["receipt"]["status"], "ok")
+        self.worker.assert_awaited_once_with({"action": "run", "task": "refresh_secret", "code": "5 free", "auth": AUTH}, 100)
+
+    def test_equipment_scheme_is_scoped_and_frozen_into_the_shop_confirmation(self):
+        self.command("confirm", arg=self.open_ticket())
+        self.assertEqual(self.post("/api/login", {"account": "fixture", "password": "fixture"}).status_code, 200)
+        speed = '{"name":"筛选","slots":{"ring":[{"sets":["Speed"]}]}}'
+        attack = '{"name":"筛选","slots":{"ring":[{"sets":["Attack"]}]}}'
+        self.assertIn("保存", self.command("filter_save", arg=speed)["message"])
+        self.assertEqual(self.command("filter_export", arg="筛选")["message"], speed)
+        self.assertNotIn("Speed", self.command("filter_export", arg="筛选", user="other")["message"])
+        order = self.command("refresh_star_source", arg="1 筛选", event="prepare")
+        self.assertIn("筛选", order["message"])
+        self.command("filter_save", arg=attack, event="mutate")
+        job = self.command("approve", arg=order["approval"], event="execute")["job"]
+        for _ in range(50):
+            if "receipt" in self.command("receipt", arg=job):
+                break
+            time.sleep(0.01)
+        self.assertIn("Speed", self.worker.await_args.args[0]["code"])
+        self.assertNotIn("Attack", self.worker.await_args.args[0]["code"])
+
     def test_group_route_rejects_missing_scope_and_private_route_rejects_group_scope(self):
         body = {"platform": "onebot", "bot": "bot", "user": "owner", "event": "event", "action": "login"}
         headers = {"Authorization": "Bearer " + TOKEN}
@@ -282,7 +366,8 @@ class WebAuthorizationTests(unittest.TestCase):
                 self.assertEqual(vault.load(owner), AUTH)
             finally:
                 vault.db.close()
-        self.assertIn("清除", self.command("unbind")["message"])
+        unbind = self.command("unbind", event="unbind")["approval"]
+        self.assertIn("清除", self.command("approve", arg=unbind, event="confirm-unbind")["message"])
         self.assertIn("无有效授权", self.command("status")["message"])
 
     def test_spending_approval_bound_to_owner_and_consumed_once(self):
@@ -387,6 +472,23 @@ class WebAuthorizationTests(unittest.TestCase):
 
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_schedule_migrates_and_retains_every_independent_rule(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())
+        self.addCleanup(vault.db.close)
+        vault.bind("alice", AUTH, True)
+        game = vault.record("alice")[0]
+        with vault.db:
+            vault.db.execute("""CREATE TABLE lucima_schedule (owner TEXT PRIMARY KEY, game TEXT, task TEXT,
+                hhmm TEXT, first_day TEXT, last_day TEXT, revision TEXT)""")
+            vault.db.execute("INSERT INTO lucima_schedule VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             ("alice", game, "mail", "08:00", "2025-01-01", "2025-01-03", "old"))
+        bridge = Bridge(vault, AsyncMock(), ORIGIN)
+        self.assertEqual(bridge.long_tasks.schedule("alice", "mail")[4], "2025-01-03")
+        self.assertIn("已启用", bridge.set_schedule("alice", "base 20:00"))
+        self.assertEqual({row[1] for row in bridge.long_tasks.schedules("alice")}, {"mail", "base"})
+        bridge.stop_schedule("alice", "mail")
+        self.assertEqual(bridge.long_tasks.schedule("alice")[1], "base")
     async def test_schedule_is_deduplicated_across_restart_and_never_replays_started_jobs(self):
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())

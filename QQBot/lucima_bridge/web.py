@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -15,6 +16,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from .long_tasks import CONFIRMED_OPERATIONS, preview as long_preview
+from .filters import NAME as FILTER_NAME, parse_scheme
+from .menu import PAGES, THEMES, shop_arguments
 from .service import APPROVALS, Bridge, TASK_NAMES, TICKET_TTL, Vault, Worker
 
 
@@ -24,6 +27,12 @@ TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 CODE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 PIN = re.compile(r"[0-9]{8}\Z")
 OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{16}\Z")
+READ_TASKS = {"long_info", "account_view", "stages", "equipment"}
+SHOP_ACTIONS = {"refresh_secret", "refresh_star_source"}
+ACCOUNT_VIEWS = {"summary", "resources", "heroes", "items", "teams", "guild", "weekly", "guild_shop",
+                 "abyss_sweep", "arena", "vote", "equip_event", "guild_aid", "guild_captain"}
+ACCOUNT_PAGE = re.compile(r"([a-z_]+)(?: ([1-9][0-9]{0,2})(?: ([^\x00-\x1f]{1,32}))?)?\Z")
+GUILD_ORDER = re.compile(r"([A-Za-z0-9_]{1,32}) ([1-9]|10) (29|30) ([1-9][0-9]{0,6})\Z")
 # QQ Official message IDs can exceed the limits for member and group IDs.
 EVENT_ID_MAX_LENGTH = 512
 
@@ -228,6 +237,32 @@ def operation_preview(action: str, arg: str) -> str | None:
         return long_preview(action, arg)
     if action == "long_info" and arg in {"activity", "abyss", "shop"}:
         return "查询长任务可用的关卡、队伍或商品报价。"
+    if action == "account_view" and (match := ACCOUNT_PAGE.fullmatch(arg)):
+        kind, page, _ = match.groups()
+        if kind in ACCOUNT_VIEWS and (not page or kind in {"heroes", "items", "teams"}):
+            return "读取当前游戏账号的指定快照。"
+        return None
+    if action == "member_purchase":
+        match = GUILD_ORDER.fullmatch(arg)
+        if not match:
+            return None
+        item, count, currency, unit = match.groups()
+        return f"团员商店购买 {item} × {count}，单价 {unit}，最多扣除货币 {currency} × {int(count) * int(unit)}。"
+    if action == "sweep_illusion":
+        return (f"扫荡已通关且符合条件的最高层，意识同步器上限 {arg}。"
+                "游戏预计使用当前持有量，执行前重新核对。") if re.fullmatch(r"[1-9][0-9]{0,2}", arg) else None
+    if action == "tesseract" and not arg:
+        return "检查技能模块并领取已完成的产物。加速次数上限 0。"
+    if action in SHOP_ACTIONS:
+        if not (order := shop_arguments(action, arg)):
+            return None
+        count, mode = order
+        if mode == "free":
+            return (f"使用免费额度刷新秘密商店 1 次。申请 {count} 次，本次可刷 0 或 1 次。"
+                    "冷却未结束时跳过，扣款上限 0，自动购买 0 件。")
+        if mode == "star" and count == 1:
+            return APPROVALS[(action, "")]
+        return None
     display_arg = re.sub(r"([\\`*_\[\]()<>])", r"\\\1", arg.strip())
     if (action, arg) in APPROVALS:
         return APPROVALS[(action, arg)]
@@ -247,6 +282,8 @@ def operation_preview(action: str, arg: str) -> str | None:
         "receipt": "在原私聊取回最近一张 Lucima 任务回执。",
         "cancel": "取消当前排队任务，或请求停止正在执行的长任务。",
         "unbind": "解除当前游戏账号绑定并清除 Lucima 保存的登录授权。",
+        "logout": "退出当前游戏账号，暂停托管并取消排队任务。保留账号配置。",
+        "clear_logs": "清空当前账号的日志显示，保留任务结算记录和按编号取回回执。",
         "schedule_status": "查看当前托管计划和最近排队日期。",
     }
     if action in labels:
@@ -263,12 +300,20 @@ def execute_operation(bridge, owner: str, action: str, arg: str, event: str, cat
         return {"message": bridge.cancel(owner)}
     if action == "unbind":
         return {"message": bridge.unbind(owner)}
+    if action == "logout":
+        return bridge.logout(owner)
+    if action == "clear_logs":
+        bridge.accounts.hide_history(owner, int(time.time()))
+        return bridge.navigation(bridge.accounts.scope_for(owner), "logs", "已清空当前账号的日志显示。")
+    if action == "filter_drop":
+        bridge.filters.drop(owner, arg)
+        return {"message": f"已删除装备方案「{arg}」。"}
     if action == "receipt":
         return bridge.receipt(owner, arg)
     if action == "schedule_set":
         return {"message": bridge.set_schedule(owner, arg)}
     if action == "schedule_stop":
-        return {"message": bridge.stop_schedule(owner)}
+        return {"message": bridge.stop_schedule(owner, arg or None)}
     if action == "schedule_status":
         return {"message": bridge.schedule_status(owner)}
     if action == "encyclopedia":
@@ -285,7 +330,8 @@ async def propose(request: Request):
     context = await command_context(request)
     if isinstance(context, (JSONResponse, PlainTextResponse)):
         return context
-    bridge, owner, action, arg, event = context
+    bridge, scope, action, arg, event = context
+    owner = bridge.accounts.active(scope)
     preview = operation_preview(action, arg)
     if preview is None:
         return answer("操作或参数无效。", 400)
@@ -306,7 +352,8 @@ async def run_command(request: Request, *, group: bool):
     context = await command_context(request, group_command=group)
     if isinstance(context, (JSONResponse, PlainTextResponse)):
         return context
-    bridge, owner, action, arg, event = context
+    bridge, scope, action, arg, event = context
+    owner = bridge.accounts.active(scope)
     if not isinstance(arg, str):
         return answer("命令无效。", 400)
 
@@ -316,22 +363,117 @@ async def run_command(request: Request, *, group: bool):
         return execute_operation(bridge, owner, operation, argument, event, request.app.state.catalog)
 
     if action == "confirm" and PIN.fullmatch(arg):
-        return answer(bridge.confirm(owner, arg))
+        ticket_owner = next((slot for slot in bridge.accounts.owners(scope) if slot in bridge.login_notices), owner)
+        return answer(bridge.confirm(ticket_owner, arg))
     if action == "login_notice" and OPERATION_ID.fullmatch(arg):
-        return await bridge.wait_login_notice(owner, arg, event)
+        notice_owner = next((slot for slot in bridge.accounts.owners(scope)
+                             if (notice := bridge.login_notices.get(slot)) and hmac.compare_digest(notice.id, arg)), owner)
+        return await bridge.wait_login_notice(notice_owner, arg, event)
     if action == "lobby" and not arg:
         return bridge.lobby(owner)
+    if action == "navigate" and arg in PAGES:
+        return bridge.navigation(scope, arg)
+    if action == "view_card" and not arg:
+        page = bridge.accounts.preferences(scope)[2]
+        return {**bridge.navigation(scope, page), "picture": True}
+    if action == "add_account" and not arg:
+        return bridge.add_account(scope, event, group=group)
+    if action == "switch_account" and re.fullmatch(r"[1-5]", arg):
+        return bridge.switch_account(scope, int(arg))
+    if action == "rename_account" and arg:
+        if not bridge.accounts.rename(owner, arg):
+            return answer("请先绑定账号，别名使用 1–12 个汉字、字母、数字或连字符。", 400)
+        return bridge.navigation(scope, "accounts")
+    if action == "theme" and arg in THEMES:
+        bridge.accounts.set_theme(scope, THEMES[arg])
+        return {**bridge.navigation(scope, bridge.accounts.preferences(scope)[2]), "picture": True}
+    if action == "history" and re.fullmatch(r"[1-9][0-9]{0,2}", arg):
+        return bridge.history(owner, int(arg))
+    if action == "view_page":
+        position, _, query = arg.partition(" ")
+        if position != str(bridge.accounts.position_for(owner)):
+            return {"message": "当前账号已切换。请重新打开要查看的账号页面。"}
+        match = ACCOUNT_PAGE.fullmatch(query)
+        if match and match.group(1) in {"heroes", "items", "teams"} and match.group(2):
+            return bridge.submit(owner, "account_view", query, event)
+        return answer("分页参数无效。", 400)
+    if action == "timer" and not arg:
+        start = time.perf_counter()
+        await asyncio.sleep(1)
+        elapsed = time.perf_counter() - start
+        return bridge.navigation(scope, "timer", f"目标 1 秒 · 实测 {elapsed:.3f} 秒 · 偏差 {(elapsed - 1)*1000:+.1f} 毫秒。")
+    if action.startswith("filter_"):
+        if not bridge.vault.record(owner):
+            return {"message": "请先绑定当前游戏账号。"}
+        if action == "filter_save":
+            scheme = parse_scheme(arg)
+            if not scheme:
+                return {"message": "方案格式无效。可在工具箱的方案管理页查看格式。"}
+            return {"message": "已保存方案。" if bridge.filters.save(owner, *scheme) else "当前账号的方案数量已达上限。"}
+        if action == "filter_copy":
+            names = arg.split()
+            if len(names) != 2 or not all(FILTER_NAME.fullmatch(name) for name in names):
+                return {"message": "请输入原方案名和新方案名。"}
+            original, copy = (bridge.filters.get(owner, name) for name in names)
+            if not original or copy:
+                return {"message": "原方案不存在，或新名称已使用。"}
+            payload = json.loads(original)
+            payload["name"] = names[1]
+            saved = bridge.filters.save(owner, names[1], json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            return {"message": "已复制方案。" if saved else "当前账号的方案数量已达上限。"}
+        if FILTER_NAME.fullmatch(arg) and (payload := bridge.filters.get(owner, arg)):
+            if action == "filter_export":
+                return {"message": payload}
+            if action == "filter_preview":
+                return bridge.submit(owner, "filter_preview", payload, event)
+            if action == "filter_drop":
+                return bridge.prepare(owner, action, arg, preview=f"删除当前账号的装备方案「{arg}」。", event=event)
+        return {"message": "未找到这个装备方案。"}
     if action == "approve" and OPERATION_ID.fullmatch(arg):
         return bridge.approve(owner, arg, event, execute)
     if action == "discard" and OPERATION_ID.fullmatch(arg):
         return answer(bridge.discard(owner, arg))
     if action == "receipt" and OPERATION_ID.fullmatch(arg):
+        for slot in bridge.accounts.owners(scope):
+            response = bridge.receipt(slot, arg)
+            if response.get("receipt") or response.get("pending"):
+                if slot != owner and (receipt := response.get("receipt")) and "view" in receipt:
+                    response["receipt"] = {k: v for k, v in receipt.items() if k != "view"}
+                return response
         return execute(action, arg)
-    if (action, arg) in APPROVALS:
-        return bridge.prepare(owner, action, arg, event=event)
+    if action in SHOP_ACTIONS:
+        scheme = None
+        scheme_name = ""
+        order = shop_arguments(action, arg)
+        if order is None:
+            base, separator, name = arg.rpartition(" ")
+            can_filter = action == "refresh_star_source" or len(base.split()) == 2
+            if separator and can_filter and FILTER_NAME.fullmatch(name):
+                order = shop_arguments(action, base)
+                if order:
+                    payload = bridge.filters.get(owner, name)
+                    if not payload:
+                        return {"message": "当前账号没有这个装备方案。"}
+                    scheme, scheme_name, arg = json.loads(payload), name, base
+        if order is None:
+            return {"message": "次数请输入 1–20 的整数。秘密商店可加 免费 或 钻石。"}
+        count, mode = order
+        if mode == "choose":
+            return bridge.navigation(scope, "secret", f"申请 {count} 次，先选择刷新方式。",
+                                     links=(("选择免费", f"刷新秘密商店 {count} 免费"),
+                                            ("选择钻石", f"刷新秘密商店 {count} 钻石")), replace=True)
+        if mode == "diamond" or (mode == "star" and count > 1):
+            page = "secret" if mode == "diamond" else "starshop"
+            return bridge.navigation(scope, page, f"申请 {count} 次。当前游戏数据缺少可核实的报价，本次未提交刷新。")
+        arg = (f"{count} free" if mode == "free" else str(count)) if arg else ""
+        if scheme is not None:
+            preview = operation_preview(action, arg) + f" 使用装备方案「{scheme_name}」。"
+            code = json.dumps({"order": arg, "scheme": scheme}, ensure_ascii=False, separators=(",", ":"))
+            return bridge.prepare(owner, action, code, preview=preview, event=event)
     preview = operation_preview(action, arg)
     if preview is not None:
-        if action in CONFIRMED_OPERATIONS:
+        if (action in CONFIRMED_OPERATIONS or action in {"logout", "unbind", "clear_logs"}
+                or action in TASK_NAMES and action not in READ_TASKS):
             return bridge.prepare(owner, action, arg, preview=preview, event=event)
         return execute(action, arg)
     return answer("命令无效。", 400)

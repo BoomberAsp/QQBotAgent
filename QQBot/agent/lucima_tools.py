@@ -31,22 +31,25 @@ TOOLS = {
         "redeem 填用户指定的一条兑换码；donate 填 gold（金币）或 courage（英勇证明）；其他留空。",
     ),
     "lucima_query": (
-        ("status", "receipt", "encyclopedia", "stages", "equipment"),
+        ("status", "receipt", "encyclopedia", "stages", "equipment", "account_view"),
         "查询 Lucima：status=授权和任务状态、receipt=最近回执、encyclopedia=星陨角色图鉴、"
-        "stages=已解锁关卡查询、equipment=按副属性分数筛装备。",
-        "encyclopedia 填角色名；stages 填 hunt（讨伐）或 elf（元素探索）；equipment 可填套装名；其他留空。",
+        "stages=已解锁关卡查询、equipment=按副属性分数筛装备、account_view=账号、资源、队伍或佣兵团快照。",
+        "encyclopedia 填角色名；stages 填 hunt 或 elf；equipment 可填套装名；"
+        "account_view 填 summary、resources、heroes 1、items 1、teams 1、guild、weekly 或 guild_shop；其他留空。",
     ),
     "lucima_long": (
         ("long_info", "activity", "abyss", "buy_batch", "refresh_secret", "refresh_star_source",
          "schedule_set", "schedule_status", "schedule_stop"),
         "处理长任务：long_info=查询活动、深渊或商店报价，activity=活动推进，abyss=单层虚构深渊，"
-        "buy_batch=批量购买，refresh_secret=免费刷新秘密商店一次，refresh_star_source=刷新星源商店一次，"
+        "buy_batch=批量购买，refresh_secret=秘密商店免费刷新，refresh_star_source=星源商店刷新，"
         "schedule_set=启用每日托管，schedule_status=查看托管，schedule_stop=停止托管。"
         "缺少关卡、队伍、角色或报价时询问用户或先查询，不猜测 ID、数量、预算或价格。",
         "long_info 填 activity、abyss 或 shop；activity 填‘活动ID 队伍ID 最多关数 体力上限’；"
         "abyss 填‘MysteriousRealm_层数 上半角色ID逗号列表 下半角色ID逗号列表’，空位用 -；"
-        "buy_batch 填空格分隔的‘商品ID:数量:货币ID:单价’；schedule_set 填‘signin|mail|base HH:MM’"
-        "（选择一项，北京时间）；其余留空。",
+        "buy_batch 填空格分隔的‘商品ID:数量:货币ID:单价’；"
+        "refresh_secret 填用户明确同意的‘次数 free’，免费可用时最多执行一次；refresh_star_source 填‘次数’。"
+        "次数为 1–20 的整数，星源多次需要可核实报价。schedule_set 填‘任务ID HH:MM’（北京时间）；"
+        "schedule_stop 可填单项任务ID，留空停止全部。",
     ),
 }
 
