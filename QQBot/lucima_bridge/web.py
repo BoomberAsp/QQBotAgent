@@ -207,7 +207,7 @@ async def login(request: Request):
     except Exception:
         status, message = 503, "暂时无法登录，请稍后重新扫码。"
     response = answer(message, status)
-    if status != 429 and not (use_saved and status == 409):
+    if status != 429 and not (use_saved and status in {409, 503}):
         response.delete_cookie(COOKIE, secure=True, httponly=True, samesite="strict", path="/")
     return response
 

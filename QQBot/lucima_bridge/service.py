@@ -62,6 +62,8 @@ OUTCOMES = {
     "worker_error": "任务结果未知，请先在游戏内核对。",
     "timeout": "任务超时，请先在游戏内核对结果。",
     "auth_expired": "登录授权已失效，请重新扫码。",
+    "auth_unavailable": "门户暂时无法续期，本次操作尚未开始。现有授权与托管计划已保留。",
+    "not_started": "本次游戏操作尚未开始。",
     "game_login_failed": "未能建立游戏会话，本次操作尚未开始。请稍后重试。",
     "game_login_unavailable": "连接游戏服务器失败，本次操作尚未开始。请稍后重试。",
     "game_login_rejected": "游戏服务器拒绝建立会话，本次操作尚未开始。",
@@ -514,6 +516,13 @@ class Bridge:
             auth = read_auth(result)
             if result.get("status") != "ok" or not auth:
                 if use_saved:
+                    status = result.get("status")
+                    if status in ("auth_unavailable", "timeout", "worker_error"):
+                        ticket.saved_attempted = False
+                        self.attempts[owner] = time.monotonic() + 30
+                        return 503, "门户暂时无法续期，已保存的授权仍保留。请稍后再试。"
+                    if status == "auth_expired":
+                        self.clear_expired_authorization(owner)
                     return 409, "无法恢复已保存授权，请填写账号密码登录。"
                 return 400, "登录失败，请检查账号密码或稍后重新扫码。"
             saved = use_saved or remember and bool(auth["refresh_token"])
@@ -554,6 +563,11 @@ class Bridge:
                     self.dismiss_login_notice(owner)
             self.active = None
             self.wake.set()
+
+    def clear_expired_authorization(self, owner: str) -> None:
+        self.sessions.pop(owner, None)
+        self.vault.forget(owner)
+        self.stop_schedule(owner)
 
     def auth_for(self, owner: str) -> dict | None:
         if self.accounts.is_signed_out(owner):
@@ -975,9 +989,7 @@ class Bridge:
             status = "worker_error"
         refreshed = read_auth(result)
         if auth and status == "auth_expired":
-            self.sessions.pop(job.owner, None)
-            self.vault.forget(job.owner)
-            self.stop_schedule(job.owner)
+            self.clear_expired_authorization(job.owner)
         elif auth and refreshed and refreshed["user_id"] == auth["user_id"]:
             session = self.sessions.get(job.owner)
             if session and session[0] > time.monotonic():

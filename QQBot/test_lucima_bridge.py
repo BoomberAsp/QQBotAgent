@@ -360,6 +360,23 @@ class WebAuthorizationTests(unittest.TestCase):
         with sqlite3.connect(self.db_path) as db:
             self.assertEqual(db.execute("SELECT expires FROM binding").fetchone()[0], candidate["expires"])
 
+    def test_temporary_saved_login_failure_preserves_confirmed_ticket_for_retry(self):
+        self.command("confirm", arg=self.open_ticket())
+        self.assertEqual(self.post("/api/login", {
+            "account": "remembered", "password": "dummy", "remember": True,
+        }).status_code, 200)
+        self.client.portal.call(app.state.bridge.attempts.clear)
+        self.command("confirm", arg=self.open_ticket())
+        self.worker.return_value = {"status": "auth_unavailable"}
+        failed = self.post("/api/login", {"use_saved": True})
+        self.assertEqual(failed.status_code, 503)
+        self.assertIn("授权仍保留", failed.json()["message"])
+        self.assertEqual(self.client.get("/api/session").json()["saved_login"]["account"], "remembered")
+        self.assertEqual(self.post("/api/login", {"use_saved": True}).status_code, 429)
+        self.client.portal.call(app.state.bridge.attempts.clear)
+        self.worker.return_value = {"status": "ok", "auth": AUTH}
+        self.assertEqual(self.post("/api/login", {"use_saved": True}).status_code, 200)
+
     def test_legacy_remembered_login_has_candidate_and_falls_back_without_new_qr(self):
         def put_legacy_record():
             vault = app.state.bridge.vault
@@ -504,6 +521,32 @@ class WebAuthorizationTests(unittest.TestCase):
 
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_confirmed_auth_expiry_clears_credentials_and_schedules(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())
+        self.addCleanup(vault.db.close)
+        vault.bind("alice", AUTH, True)
+        worker = AsyncMock(return_value={"status": "auth_unavailable", "auth": AUTH})
+        bridge = Bridge(vault, worker, ORIGIN)
+        self.assertIn("已启用", bridge.set_schedule("alice", "base 20:00"))
+        plan = bridge.long_tasks.schedule("alice", "base")
+        candidate = vault.candidate("alice")
+        first = bridge.submit("alice", "reactor", "", "first")["job"]
+        await bridge.run_job(bridge.queue.popleft())
+        receipt = bridge.receipt("alice", first)["receipt"]
+        self.assertEqual(receipt["status"], "auth_unavailable")
+        self.assertIn("托管计划已保留", receipt["message"])
+        self.assertEqual(vault.candidate("alice"), candidate)
+        self.assertEqual(bridge.long_tasks.schedule("alice", "base"), plan)
+
+        worker.return_value = {"status": "auth_expired"}
+        second = bridge.submit("alice", "reactor", "", "second")["job"]
+        await bridge.run_job(bridge.queue.popleft())
+        self.assertEqual(bridge.receipt("alice", second)["receipt"]["status"], "auth_expired")
+        self.assertIsNotNone(vault.record("alice"))
+        self.assertIsNone(vault.candidate("alice"))
+        self.assertIsNone(bridge.long_tasks.schedule("alice", "base"))
+
     async def test_equipment_hit_survives_restart_and_expires_without_replaying(self):
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())

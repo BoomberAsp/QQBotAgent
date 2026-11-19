@@ -67,7 +67,7 @@ async function submitLogin(body, usingSaved) {
     if (usingSaved && response.status === 409) {
       savedLogin.hidden = true;
       password.focus();
-    } else if (response.status !== 429) {
+    } else if (response.status !== 429 && !(usingSaved && response.status === 503)) {
       form.reset();
       form.hidden = true;
       savedLogin.hidden = true;
