@@ -48,7 +48,7 @@ TOOLS = {
         "abyss 填‘MysteriousRealm_层数 上半角色ID逗号列表 下半角色ID逗号列表’，空位用 -；"
         "buy_batch 填空格分隔的‘商品ID:数量:货币ID:单价’；"
         "refresh_secret 填用户明确同意的‘次数 free’，免费可用时最多执行一次；refresh_star_source 填‘次数’。"
-        "次数为 1–20 的整数，星源多次需要可核实报价。schedule_set 填‘任务ID HH:MM’（北京时间）；"
+        "次数为 1–200 的整数，星源多次需要可核实报价。schedule_set 填‘任务ID HH:MM’（北京时间）；"
         "schedule_stop 可填单项任务ID，留空停止全部。",
     ),
 }

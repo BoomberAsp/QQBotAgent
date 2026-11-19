@@ -8,7 +8,7 @@ import unicodedata
 from .long_tasks import SCHEDULE_TASKS
 
 
-SHOP_MAX = 20
+SHOP_MAX = 200
 THEMES = {"默认": "default", "亮色": "light", "暗色": "dark"}
 THEME_NAMES = {value: name for name, value in THEMES.items()}
 
@@ -185,7 +185,7 @@ def shop_arguments(action: str, arg: str):
     words = unicodedata.normalize("NFKC", arg).split()
     if not words:
         return 1, "free" if action == "refresh_secret" else "star"
-    if not re.fullmatch(r"[1-9][0-9]?", words[0]) or int(words[0]) > SHOP_MAX:
+    if not re.fullmatch(r"[1-9][0-9]{0,2}", words[0]) or int(words[0]) > SHOP_MAX:
         return None
     count = int(words[0])
     if action == "refresh_star_source":

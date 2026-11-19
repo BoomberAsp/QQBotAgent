@@ -437,10 +437,13 @@ async def run_command(request: Request, *, group: bool):
         for slot in bridge.accounts.owners(scope):
             response = bridge.receipt(slot, arg)
             if response.get("receipt") or response.get("pending"):
-                if slot != owner and (receipt := response.get("receipt")) and "view" in receipt:
-                    response["receipt"] = {k: v for k, v in receipt.items() if k != "view"}
+                if slot != owner and (receipt := response.get("receipt")):
+                    response["receipt"] = {k: v for k, v in receipt.items()
+                                           if k not in {"view", "shop_confirm_until"}}
                 return response
         return execute(action, arg)
+    if action == "confirm_shop_hit" and OPERATION_ID.fullmatch(arg):
+        return bridge.confirm_shop_hit(owner, arg)
     if action in SHOP_ACTIONS:
         scheme = None
         scheme_name = ""
@@ -456,7 +459,7 @@ async def run_command(request: Request, *, group: bool):
                         return {"message": "当前账号没有这个装备方案。"}
                     scheme, scheme_name, arg = json.loads(payload), name, base
         if order is None:
-            return {"message": "次数请输入 1–20 的整数。秘密商店可加 免费 或 钻石。"}
+            return {"message": "次数请输入 1–200 的整数。秘密商店可加 免费 或 钻石。"}
         count, mode = order
         if mode == "choose":
             return bridge.navigation(scope, "secret", f"申请 {count} 次，先选择刷新方式。",

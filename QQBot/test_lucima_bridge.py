@@ -220,14 +220,16 @@ class WebAuthorizationTests(unittest.TestCase):
         self.command("confirm", arg=self.open_ticket())
         self.assertEqual(self.post("/api/login", {"account": "fixture", "password": "fixture"}).status_code, 200)
         self.worker.reset_mock()
-        choose = self.command("refresh_secret", arg="５")
-        self.assertIn(["选择免费", "刷新秘密商店 5 免费"], choose["buttons"])
-        plan = self.command("refresh_secret", arg="５ 免费", event="plan")
-        self.assertIn("申请 5 次", plan["message"])
+        choose = self.command("refresh_secret", arg="２００")
+        self.assertIn(["选择免费", "刷新秘密商店 200 免费"], choose["buttons"])
+        plan = self.command("refresh_secret", arg="２００ 免费", event="plan")
+        self.assertIn("申请 200 次", plan["message"])
         self.assertIn("扣款上限 0", plan["message"])
-        self.assertNotIn("approval", self.command("refresh_star_source", arg="5"))
+        self.assertNotIn("approval", self.command("refresh_star_source", arg="200"))
+        self.assertIn("报价", self.command("refresh_star_source", arg="200")["message"])
         self.assertNotIn("approval", self.command("refresh_secret", arg="5 钻石"))
         self.assertIn("整数", self.command("refresh_secret", arg="1.5")["message"])
+        self.assertIn("1–200", self.command("refresh_secret", arg="201")["message"])
         self.worker.assert_not_called()
         job = self.command("approve", arg=plan["approval"], event="approve")["job"]
         for _ in range(50):
@@ -236,7 +238,37 @@ class WebAuthorizationTests(unittest.TestCase):
                 break
             time.sleep(0.01)
         self.assertEqual(result["receipt"]["status"], "ok")
-        self.worker.assert_awaited_once_with({"action": "run", "task": "refresh_secret", "code": "5 free", "auth": AUTH}, 100)
+        self.worker.assert_awaited_once_with({"action": "run", "task": "refresh_secret", "code": "200 free", "auth": AUTH}, 100)
+
+    def test_equipment_hit_pauses_same_shop_until_owner_confirms(self):
+        scope = {"group": "shop-room"}
+        ticket = self.command("login", **scope)["login_url"].split("#")[1]
+        pin = self.post("/api/claim", {"ticket": ticket}).json()["pin"]
+        self.command("confirm", arg=pin, **scope)
+        self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub", "remember": True}).status_code, 200)
+        self.worker.reset_mock()
+        self.worker.return_value = {"status": "shop_hit", "details": ["第 2 档 · 速度戒指"]}
+        plan = self.command("refresh_star_source", arg="1", event="prepare", **scope)["approval"]
+        job = self.command("approve", arg=plan, event="submit", **scope)["job"]
+        for _ in range(50):
+            result = self.command("receipt", arg=job, **scope)
+            if "receipt" in result:
+                break
+            time.sleep(0.01)
+        receipt = result["receipt"]
+        self.assertEqual(receipt["status"], "shop_hit")
+        self.assertGreater(receipt["shop_confirm_until"], time.time())
+        self.assertNotIn("receipt", self.command("confirm_shop_hit", arg=job, user="other", **scope))
+        self.assertNotIn("receipt", self.command("confirm_shop_hit", arg=job, group="elsewhere"))
+        self.assertNotIn("receipt", self.command("confirm_shop_hit", arg=job))
+        again = self.command("refresh_star_source", arg="1", event="prepare2", **scope)["approval"]
+        blocked = self.command("approve", arg=again, event="submit2", **scope)
+        self.assertNotIn("job", blocked)
+        self.assertEqual(blocked["receipt"]["id"], job)
+        self.assertEqual(self.command("confirm_shop_hit", arg=job, event="ending", **scope)["receipt"]["status"], "ok")
+        self.assertNotIn("receipt", self.command("confirm_shop_hit", arg=job, event="ending-again", **scope))
+        self.assertIn("命中已确认", self.command("receipt", arg=job, **scope)["message"])
+        self.worker.assert_awaited_once()
 
     def test_equipment_scheme_is_scoped_and_frozen_into_the_shop_confirmation(self):
         self.command("confirm", arg=self.open_ticket())
@@ -472,6 +504,24 @@ class WebAuthorizationTests(unittest.TestCase):
 
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_equipment_hit_survives_restart_and_expires_without_replaying(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())
+        self.addCleanup(vault.db.close)
+        vault.bind("alice", AUTH, True)
+        worker = AsyncMock(return_value={"status": "shop_hit", "details": ["匹配装备"]})
+        bridge = Bridge(vault, worker, ORIGIN)
+        job_id = bridge.submit("alice", "refresh_star_source", "1", "once")["job"]
+        await bridge.run_job(bridge.queue.popleft())
+        restarted = Bridge(vault, worker, ORIGIN)
+        receipt = restarted.receipt("alice", job_id)["receipt"]
+        self.assertEqual(receipt["status"], "shop_hit")
+        with patch("lucima_bridge.service.time.time", return_value=receipt["shop_confirm_until"] + 1):
+            self.assertNotIn("receipt", restarted.confirm_shop_hit("alice", job_id))
+            self.assertIn("超时", restarted.receipt("alice", job_id)["message"])
+            self.assertIn("job", restarted.submit("alice", "refresh_star_source", "1", "next"))
+        worker.assert_awaited_once()
+
     async def test_legacy_schedule_migrates_and_retains_every_independent_rule(self):
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         vault = Vault(directory / "state.sqlite3", Fernet.generate_key().decode())

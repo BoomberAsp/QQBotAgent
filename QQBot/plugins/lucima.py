@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import io
 import re
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -39,6 +40,7 @@ COMMANDS = {
     "菜单": "navigate", "添加账号": "add_account", "账号别名": "rename_account", "主题": "theme", "界面": "view_card",
     "分页": "view_page",
     "任务历史": "history", "清空日志": "clear_logs", "刷新信息": "account_view", "查看资源": "account_view",
+    "确认命中": "confirm_shop_hit",
     "查看团员": "account_view", "查看物品": "account_view", "查看队伍": "account_view",
     "查看团概况": "account_view", "查看团周任务": "account_view",
     "助战好友": "friend_support", "每日体力": "send_meal", "动力转换": "reactor",
@@ -158,7 +160,7 @@ async def call_service(text: str, platform: str, bot: str, user: str, event: str
         valid = bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", arg))
     elif action == "encyclopedia":
         valid = 0 < len(arg) <= 64
-    elif action in {"approve", "discard"}:
+    elif action in {"approve", "discard", "confirm_shop_hit"}:
         valid = bool(re.fullmatch(r"[A-Za-z0-9_-]{16}", arg))
     elif action == "receipt":
         valid = not arg or bool(re.fullmatch(r"[A-Za-z0-9_-]{16}", arg))
@@ -206,7 +208,11 @@ def result_buttons(result: dict) -> list:
 
 async def send_receipt(bot, event, receipt: dict, image_segment, actor: Actor) -> None:
     detail = "\n".join([receipt["message"], *receipt["details"]])
-    if view := receipt.get("view"):
+    if receipt.get("status") == "shop_hit" and receipt.get("shop_confirm_until", 0) > time.time():
+        confirm = f"/璐茜玛 确认命中 {receipt['id']}"
+        await send_menu(bot, event, actor, detail + "\n请在 5 分钟内由发起人确认结束。",
+                        [[Btn("确认结束", confirm)]], include_commands=True)
+    elif view := receipt.get("view"):
         position, kind, page, pages, query = view
         query = " " + query if query else ""
         # Long search text must fit the keyboard's command size.
@@ -231,9 +237,12 @@ async def send_receipt_image(bot, event, receipt: dict, image_segment) -> None:
 async def watch_receipt(bot, event, actor: Actor, job: str, image_segment, *, long_job=False) -> None:
     horizon = LONG_QUEUE_TTL + TASK_TIMEOUT + 30 if long_job else 420
     deadline = asyncio.get_running_loop().time() + horizon
+    interval = 3
     try:
         while asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(10 if long_job else 3)
+            await asyncio.sleep(interval)
+            if long_job:
+                interval = 10
             result = await call_service(f"/璐茜玛 回执 {job}", *actor)
             if receipt := result.get("receipt"):
                 await send_receipt(bot, event, receipt, image_segment, actor)

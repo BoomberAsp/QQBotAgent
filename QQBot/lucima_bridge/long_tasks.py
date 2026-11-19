@@ -18,6 +18,8 @@ CONFIRMED_OPERATIONS = LONG_NAMES.keys() | {"schedule_set", "schedule_stop"}
 TASK_TIMEOUT = 12 * 60
 LONG_QUEUE_TTL = 30 * 60
 RECEIPT_TTL = 24 * 3600
+SHOP_HIT_TTL = 5 * 60
+SHOP_REFRESHES = {"refresh_secret", "refresh_star_source"}
 LOCAL = ZoneInfo("Asia/Shanghai")
 
 
@@ -140,6 +142,16 @@ class LongTasks:
             WHERE owner = ? AND state = 'done' AND updated > ?
             ORDER BY updated DESC, rowid DESC LIMIT 100""", (owner, max(after, now - RECEIPT_TTL)))
         return [json.loads(row[0]) for row in rows]
+
+    def pending_shop_hit(self, owner, task_label, now):
+        rows = self.db.execute("""SELECT payload FROM lucima_task_receipt
+            WHERE owner = ? AND task = ? AND state = 'done' AND updated > ?
+            ORDER BY updated DESC, rowid DESC""", (owner, task_label, now - SHOP_HIT_TTL))
+        for (payload,) in rows:
+            receipt = json.loads(payload)
+            if receipt.get("status") == "shop_hit" and receipt.get("shop_confirm_until", 0) > now:
+                return receipt["id"]
+        return None
 
     def prune(self, now):
         with self.db:

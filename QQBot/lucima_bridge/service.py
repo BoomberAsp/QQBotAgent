@@ -20,7 +20,10 @@ from .accounts_ui import AccountSlots
 from .filters import Filters
 from .menu import PAGES, THEME_NAMES, menu_data
 
-from .long_tasks import LONG_NAMES, LONG_QUEUE_TTL, SCHEDULE_TASKS, TASK_TIMEOUT, LongTasks, schedule_arguments
+from .long_tasks import (
+    LONG_NAMES, LONG_QUEUE_TTL, SCHEDULE_TASKS, SHOP_HIT_TTL, SHOP_REFRESHES, TASK_TIMEOUT,
+    LongTasks, schedule_arguments,
+)
 
 
 TICKET_TTL = 300
@@ -61,6 +64,7 @@ OUTCOMES = {
     "auth_expired": "登录授权已失效，请重新扫码。",
     "game_login_failed": "未能建立游戏会话，本次操作尚未开始。请稍后重试。",
     "quote_unavailable": "当前无法核实刷新价格，本次未提交刷新。",
+    "shop_hit": "筛选命中，刷新已停止，等待确认结束。",
     "invalid_code": "兑换码无效或已过期。",
     "unexpected_cost": "游戏返回了意外消耗，请核对账户。",
     "duplicate_login": "检测到重复登录，已停止。请退出游戏客户端后再手动发起。",
@@ -225,7 +229,7 @@ class Job:
 
     @property
     def durable(self) -> bool:
-        return self.task in LONG_NAMES or self.schedule is not None
+        return self.task in LONG_NAMES or self.task in SHOP_REFRESHES or self.schedule is not None
 
     @property
     def label(self) -> str:
@@ -708,6 +712,10 @@ class Bridge:
             return {"message": "你已有待处理的操作，请用 /璐茜玛 状态 查询。"}
         if (task, code) != ("long_info", "shop") and not self.auth_for(owner):
             return {"message": "请先用 /璐茜玛 登录 完成扫码。"}
+        if task in SHOP_REFRESHES:
+            pending = self.long_tasks.pending_shop_hit(owner, TASK_NAMES[task], int(time.time()))
+            if pending:
+                return self.receipt(owner, pending)
         if len(self.queue) >= QUEUE_SIZE:
             return {"message": "游戏任务队列已满，请稍后再试。"}
         job = Job(owner, task, code, time.monotonic())
@@ -737,10 +745,13 @@ class Bridge:
             if job.owner == owner:
                 return f"{job.label}正在排队，前面还有 {index - 1 + int(self.active is not None)} 项。"
         if owner in self.last:
+            receipt = self.receipt(owner, "").get("receipt")
+            if receipt and "shop_confirm_until" in receipt:
+                return receipt["message"]
             return self.last[owner][1]
         previous = self.long_tasks.receipt(owner, "", int(time.time()))
         if previous:
-            return previous["message"]
+            return self.display_receipt(previous)["message"]
         if self.auth_for(owner):
             return "账号已授权，当前没有任务。"
         return "当前无有效授权。请用 /璐茜玛 登录 扫码。"
@@ -835,6 +846,8 @@ class Bridge:
             if match and part[0] in {"heroes", "items", "teams"}:
                 payload["view"] = [self.accounts.position_for(job.owner), part[0], *map(int, match.groups()),
                                    part[2] if len(part) > 2 else ""]
+        if status == "shop_hit" and job.task in SHOP_REFRESHES:
+            payload["shop_confirm_until"] = payload["completed_at"] + SHOP_HIT_TTL
         if job.durable:
             self.long_tasks.finish(job.id, payload)
         self.last[job.owner] = (time.monotonic() + 3600, message)
@@ -844,6 +857,24 @@ class Bridge:
         self.receipts[payload["id"]] = (owner, time.monotonic() + 3600, payload)
         if len(self.receipts) > 512:
             self.receipts.pop(next(iter(self.receipts)))
+
+    @staticmethod
+    def display_receipt(payload: dict) -> dict:
+        if payload.get("status") == "shop_hit" and payload.get("shop_confirm_until", 0) <= time.time():
+            return {**payload, "status": "ok", "message": f"{payload['task']}：命中确认已超时，本轮已结束。"}
+        return payload
+
+    def confirm_shop_hit(self, owner: str, job_id: str) -> dict:
+        if not self.auth_for(owner):
+            return {"message": "请回到原会话并选择发起刷新的账号。"}
+        now = int(time.time())
+        receipt = self.long_tasks.receipt(owner, job_id, now)
+        if not receipt or receipt.get("status") != "shop_hit" or receipt.get("shop_confirm_until", 0) <= now:
+            return {"message": "此命中确认无效、已处理或已过期。可输入回执编号查询结果。"}
+        finished = {**receipt, "status": "ok", "message": f"{receipt['task']}：命中已确认，本轮已结束。"}
+        self.long_tasks.finish(job_id, finished)
+        self.save_receipt(owner, finished)
+        return {"message": finished["message"], "receipt": finished}
 
     def history(self, owner: str, page: int) -> dict:
         self.prune()
@@ -855,7 +886,9 @@ class Bridge:
         ordered = sorted(rows.values(), key=lambda row: row["completed_at"], reverse=True)
         start = (page - 1) * 5
         visible = ordered[start:start + 5]
-        messages = [f"任务历史 · 第 {page} 页", *[f"{row['message']}\n回执 {row['id']}" for row in visible]]
+        messages = [f"任务历史 · 第 {page} 页", *[
+            f"{self.display_receipt(row)['message']}\n回执 {row['id']}" for row in visible
+        ]]
         buttons = [(f"回执 {i}", f"回执 {row['id']}") for i, row in enumerate(visible, 1)]
         if page > 1:
             buttons.append(("上一页", f"任务历史 {page - 1}"))
@@ -872,9 +905,11 @@ class Bridge:
             stored = next((row for row in reversed(self.receipts.values()) if row[0] == owner), None)
         durable = self.long_tasks.receipt(owner, job_id, int(time.time()))
         if durable and (not stored or stored[0] != owner or durable["completed_at"] > stored[2]["completed_at"]):
-            return {"message": durable["message"], "receipt": durable}
+            data = self.display_receipt(durable)
+            return {"message": data["message"], "receipt": data}
         if stored and stored[0] == owner:
-            return {"message": stored[2]["message"], "receipt": stored[2]}
+            data = self.display_receipt(stored[2])
+            return {"message": data["message"], "receipt": data}
         if job_id and any(job and job.id == job_id and job.owner == owner
                           for job in (self.active_job, *self.queue)):
             return {"message": "任务正在处理。", "pending": True}
@@ -933,6 +968,8 @@ class Bridge:
             result = await self.worker(payload, 100)
         status = result.get("status")
         if not isinstance(status, str) or status not in OUTCOMES:
+            status = "worker_error"
+        elif status == "shop_hit" and job.task not in SHOP_REFRESHES:
             status = "worker_error"
         refreshed = read_auth(result)
         if auth and status == "auth_expired":
