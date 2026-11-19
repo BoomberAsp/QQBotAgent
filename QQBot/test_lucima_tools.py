@@ -30,6 +30,17 @@ class LucimaProposalToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(request.await_count, 1)
         self.assertEqual(lucima_tool_names(), set())
 
+    async def test_unavailable_star_source_quote_is_reported_without_a_confirmation_card(self):
+        view = InboundMessage(user_id="user", self_id="bot", message_id="request", platform="qq_official")
+        sender = AsyncMock()
+        unavailable = "星源商店暂无可核实的刷新报价。"
+        request = AsyncMock(return_value={"status": "quote_unavailable", "message": unavailable})
+        with patch("agent.lucima_tools.request_lucima", request), lucima_private_turn(view, sender):
+            result = await self.registry.execute("lucima_long", {"operation": "refresh_star_source", "arg": "1"})
+        self.assertEqual(result, unavailable)
+        sender.send_keyboard.assert_not_awaited()
+        sender.send_text.assert_not_awaited()
+
     async def test_group_and_agent_confirmation_attempts_never_reach_bridge(self):
         sender = AsyncMock()
         sender.supports_keyboard = False

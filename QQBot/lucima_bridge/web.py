@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from .long_tasks import CONFIRMED_OPERATIONS, preview as long_preview
 from .filters import NAME as FILTER_NAME, parse_scheme
 from .menu import PAGES, THEMES, shop_arguments
-from .service import APPROVALS, Bridge, TASK_NAMES, TICKET_TTL, Vault, Worker
+from .service import APPROVALS, Bridge, STAR_SOURCE_QUOTE_UNAVAILABLE, TASK_NAMES, TICKET_TTL, Vault, Worker
 
 
 FILES = Path(__file__).resolve().parent
@@ -30,7 +30,7 @@ OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{16}\Z")
 READ_TASKS = {"long_info", "account_view", "stages", "equipment"}
 SHOP_ACTIONS = {"refresh_secret", "refresh_star_source"}
 ACCOUNT_VIEWS = {"summary", "resources", "heroes", "items", "teams", "guild", "weekly", "guild_shop",
-                 "abyss_sweep", "arena", "vote", "equip_event", "guild_aid", "guild_captain"}
+                 "abyss_sweep", "arena", "vote", "equip_event", "guild_aid", "guild_captain", "star_source"}
 ACCOUNT_PAGE = re.compile(r"([a-z_]+)(?: ([1-9][0-9]{0,2})(?: ([^\x00-\x1f]{1,32}))?)?\Z")
 GUILD_ORDER = re.compile(r"([A-Za-z0-9_]{1,32}) ([1-9]|10) (29|30) ([1-9][0-9]{0,6})\Z")
 # QQ Official message IDs can exceed the limits for member and group IDs.
@@ -260,8 +260,6 @@ def operation_preview(action: str, arg: str) -> str | None:
         if mode == "free":
             return (f"使用免费额度刷新秘密商店 1 次。申请 {count} 次，本次可刷 0 或 1 次。"
                     "冷却未结束时跳过，扣款上限 0，自动购买 0 件。")
-        if mode == "star" and count == 1:
-            return APPROVALS[(action, "")]
         return None
     display_arg = re.sub(r"([\\`*_\[\]()<>])", r"\\\1", arg.strip())
     if (action, arg) in APPROVALS:
@@ -332,6 +330,8 @@ async def propose(request: Request):
         return context
     bridge, scope, action, arg, event = context
     owner = bridge.accounts.active(scope)
+    if action == "refresh_star_source" and isinstance(arg, str) and shop_arguments(action, arg):
+        return bridge.prepare(owner, action, arg, event=event)
     preview = operation_preview(action, arg)
     if preview is None:
         return answer("操作或参数无效。", 400)
@@ -465,9 +465,11 @@ async def run_command(request: Request, *, group: bool):
             return bridge.navigation(scope, "secret", f"申请 {count} 次，先选择刷新方式。",
                                      links=(("选择免费", f"刷新秘密商店 {count} 免费"),
                                             ("选择钻石", f"刷新秘密商店 {count} 钻石")), replace=True)
-        if mode == "diamond" or (mode == "star" and count > 1):
-            page = "secret" if mode == "diamond" else "starshop"
-            return bridge.navigation(scope, page, f"申请 {count} 次。当前游戏数据缺少可核实的报价，本次未提交刷新。")
+        if mode == "star":
+            panel = bridge.navigation(scope, "starshop", f"申请 {count} 次。{STAR_SOURCE_QUOTE_UNAVAILABLE}")
+            return {**panel, "status": "quote_unavailable"}
+        if mode == "diamond":
+            return bridge.navigation(scope, "secret", f"申请 {count} 次。当前游戏数据缺少可核实的报价，本次未提交刷新。")
         arg = (f"{count} free" if mode == "free" else str(count)) if arg else ""
         if scheme is not None:
             preview = operation_preview(action, arg) + f" 使用装备方案「{scheme_name}」。"

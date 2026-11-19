@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import sys
@@ -35,6 +36,10 @@ SESSION_TTL = 15 * 60
 REMEMBER_TTL = 30 * 86400
 QUEUE_TTL = 5 * 60
 QUEUE_SIZE = 5
+STAR_SOURCE_QUOTE_UNAVAILABLE = (
+    "当前缺少可核实的星源商店刷新报价，本次未提交刷新。"
+    "可用 /璐茜玛 查看星源商店 查询刷新计数。"
+)
 TASK_NAMES = {
     "signin": "签到", "mail": "领邮件", "base": "领基地", "redeem": "兑换",
     "dispatch": "派遣领取", "achievement": "成就奖励", "guild": "佣兵团签到",
@@ -52,7 +57,6 @@ APPROVALS = {
     ("donate", "courage"): "佣兵团捐赠 1 次，最多消耗 1 个英勇证明。",
     ("recruit", ""): "使用当日免费招募 1 次。执行前会核对免费额度，额度不明或已用时停止。",
     ("refresh_secret", ""): "使用免费额度刷新秘密商店 1 次。冷却未结束时跳过，自动购买 0 件。",
-    ("refresh_star_source", ""): "刷新星源商店 1 次，自动购买 0 件。刷新费用按游戏当次规则结算，请核对后确认。",
 }
 OUTCOMES = {
     "ok": "完成。",
@@ -669,6 +673,8 @@ class Bridge:
         return response
 
     def prepare(self, owner: str, task: str, code: str, *, preview: str | None = None, event: str = "") -> dict:
+        if task == "refresh_star_source":
+            return {"status": "quote_unavailable", "message": STAR_SOURCE_QUOTE_UNAVAILABLE}
         self.prune()
         if preview is None and not self.auth_for(owner):
             return {"message": "请先用 /璐茜玛 登录 完成扫码。"}
@@ -718,6 +724,8 @@ class Bridge:
         return "已放弃这份待确认操作。"
 
     def submit(self, owner: str, task: str, code: str, message_id: str, *, scheduled=None) -> dict:
+        if task == "refresh_star_source":
+            return {"status": "quote_unavailable", "message": STAR_SOURCE_QUOTE_UNAVAILABLE}
         self.prune()
         scope = self.accounts.scope_for(owner)
         anchor = (scope, message_id)

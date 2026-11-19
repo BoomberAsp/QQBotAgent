@@ -35,7 +35,7 @@ TOOLS = {
         "查询 Lucima：status=授权和任务状态、receipt=最近回执、encyclopedia=星陨角色图鉴、"
         "stages=已解锁关卡查询、equipment=按副属性分数筛装备、account_view=账号、资源、队伍或佣兵团快照。",
         "encyclopedia 填角色名；stages 填 hunt 或 elf；equipment 可填套装名；"
-        "account_view 填 summary、resources、heroes 1、items 1、teams 1、guild、weekly 或 guild_shop；其他留空。",
+        "account_view 填 summary、resources、heroes 1、items 1、teams 1、guild、weekly、guild_shop 或 star_source（星源商店计数）；其他留空。",
     ),
     "lucima_long": (
         ("long_info", "activity", "abyss", "buy_batch", "refresh_secret", "refresh_star_source",
@@ -48,7 +48,8 @@ TOOLS = {
         "abyss 填‘MysteriousRealm_层数 上半角色ID逗号列表 下半角色ID逗号列表’，空位用 -；"
         "buy_batch 填空格分隔的‘商品ID:数量:货币ID:单价’；"
         "refresh_secret 填用户明确同意的‘次数 free’，免费可用时最多执行一次；refresh_star_source 填‘次数’。"
-        "次数为 1–200 的整数，星源多次需要可核实报价。schedule_set 填‘任务ID HH:MM’（北京时间）；"
+        "次数为 1–200 的整数。星源缺少可核实报价，当前可用 account_view 的 star_source 查询计数。"
+        "schedule_set 填‘任务ID HH:MM’（北京时间）；"
         "schedule_stop 可填单项任务ID，留空停止全部。",
     ),
 }
@@ -82,6 +83,8 @@ def proposal_tool(allowed: tuple[str, ...], max_length: int = 64):
             return "这一条私聊消息已有待确认操作，请先让用户处理确认。"
         turn.proposed = True
         result = await request_lucima(turn.actor, operation, arg.strip(), propose=True)
+        if result.get("status") == "quote_unavailable":
+            return result["message"]
         ticket = result.get("approval")
         if not isinstance(ticket, str):
             return "确认卡暂未生成，请核对参数或请用户稍后重试。"

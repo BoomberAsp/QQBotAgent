@@ -48,14 +48,14 @@ COMMANDS = {
     "查看团店": "account_view", "后台计时": "timer",
     "技能模块": "tesseract", "查看幻境": "account_view", "幻境扫荡": "sweep_illusion", "购买团店": "member_purchase",
     "查看竞技场": "account_view", "查看投票": "account_view", "查看装备活动": "account_view",
-    "查看援助": "account_view", "查看团长店": "account_view",
+    "查看援助": "account_view", "查看团长店": "account_view", "查看星源商店": "account_view",
     "保存装备方案": "filter_save", "复制装备方案": "filter_copy", "导出装备方案": "filter_export",
     "预览装备方案": "filter_preview", "删除装备方案": "filter_drop",
 }
 VIEW_NAMES = {"刷新信息": "summary", "查看资源": "resources", "查看团员": "heroes", "查看物品": "items",
               "查看队伍": "teams", "查看团概况": "guild", "查看团周任务": "weekly", "查看团店": "guild_shop",
               "查看幻境": "abyss_sweep", "查看竞技场": "arena", "查看投票": "vote", "查看装备活动": "equip_event",
-              "查看援助": "guild_aid", "查看团长店": "guild_captain"}
+              "查看援助": "guild_aid", "查看团长店": "guild_captain", "查看星源商店": "star_source"}
 SCHEDULE_ALIASES = {label: task for task, label in SCHEDULE_TASKS.items()}
 SHORTCUTS = {"捐赠金币": ("donate", "gold"), "捐赠证明": ("donate", "courage"),
              "讨伐关卡": ("stages", "hunt"), "元素关卡": ("stages", "elf")}

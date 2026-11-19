@@ -156,22 +156,22 @@ class WebAuthorizationTests(unittest.TestCase):
         pin = self.post("/api/claim", {"ticket": issue["login_url"].split("#")[1]}).json()["pin"]
         self.command("confirm", arg=pin, **scope)
         self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub"}).status_code, 200)
-        for action in ("refresh_secret", "refresh_star_source"):
-            self.worker.reset_mock()
-            plan = self.command(action, event="prepare", **scope)
-            ticket = plan["approval"]
-            self.assertIn("1 次", plan["message"])
-            self.assertIn("自动购买 0 件", plan["message"])
-            self.worker.assert_not_called()
-            self.assertNotIn("job", self.command("approve", arg=ticket, event="accept", group="other-room"))
-            job = self.command("approve", arg=ticket, event=f"accept-{action}", **scope)["job"]
-            for _ in range(50):
-                result = self.command("receipt", arg=job, **scope)
-                if "receipt" in result:
-                    break
-                time.sleep(0.01)
-            self.assertEqual(result["receipt"]["status"], "ok")
-            self.worker.assert_awaited_once_with({"action": "run", "task": action, "code": "", "auth": AUTH}, 100)
+        action = "refresh_secret"
+        self.worker.reset_mock()
+        plan = self.command(action, event="prepare", **scope)
+        ticket = plan["approval"]
+        self.assertIn("1 次", plan["message"])
+        self.assertIn("自动购买 0 件", plan["message"])
+        self.worker.assert_not_called()
+        self.assertNotIn("job", self.command("approve", arg=ticket, event="accept", group="other-room"))
+        job = self.command("approve", arg=ticket, event=f"accept-{action}", **scope)["job"]
+        for _ in range(50):
+            result = self.command("receipt", arg=job, **scope)
+            if "receipt" in result:
+                break
+            time.sleep(0.01)
+        self.assertEqual(result["receipt"]["status"], "ok")
+        self.worker.assert_awaited_once_with({"action": "run", "task": action, "code": "", "auth": AUTH}, 100)
 
     def test_full_navigation_and_theme_are_available_without_a_game_login(self):
         group = {"group": "layout"}
@@ -240,6 +240,35 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertEqual(result["receipt"]["status"], "ok")
         self.worker.assert_awaited_once_with({"action": "run", "task": "refresh_secret", "code": "200 free", "auth": AUTH}, 100)
 
+    def test_star_source_single_and_batch_stop_before_queue_in_group_and_agent(self):
+        for scope in ({}, {"group": "shop-room"}):
+            for arg in ("", "1", "200"):
+                result = self.command("refresh_star_source", arg=arg, **scope)
+                self.assertEqual(result["status"], "quote_unavailable")
+                self.assertNotIn("approval", result)
+                self.assertNotIn("job", result)
+                self.assertIn("查看星源商店", result["message"])
+        proposal = self.command("refresh_star_source", arg="1", proposal=True)
+        self.assertEqual(proposal["status"], "quote_unavailable")
+        self.assertNotIn("approval", proposal)
+        self.worker.assert_not_awaited()
+
+    def test_star_source_status_reaches_only_the_read_only_query(self):
+        self.command("confirm", arg=self.open_ticket())
+        self.assertEqual(self.post("/api/login", {"account": "fixture", "password": "fixture"}).status_code, 200)
+        self.worker.reset_mock()
+        self.worker.return_value = {"status": "ok", "details": ["星源商店刷新计数 2。"]}
+        result = self.command("account_view", arg="star_source", event="query")
+        self.assertNotIn("approval", result)
+        for _ in range(50):
+            receipt = self.command("receipt", arg=result["job"])
+            if "receipt" in receipt:
+                break
+            time.sleep(0.01)
+        self.assertEqual(receipt["receipt"]["details"], ["星源商店刷新计数 2。"])
+        self.worker.assert_awaited_once_with({"action": "run", "task": "account_view",
+                                            "code": "star_source", "auth": AUTH}, 100)
+
     def test_equipment_hit_pauses_same_shop_until_owner_confirms(self):
         scope = {"group": "shop-room"}
         ticket = self.command("login", **scope)["login_url"].split("#")[1]
@@ -248,7 +277,7 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub", "remember": True}).status_code, 200)
         self.worker.reset_mock()
         self.worker.return_value = {"status": "shop_hit", "details": ["第 2 档 · 速度戒指"]}
-        plan = self.command("refresh_star_source", arg="1", event="prepare", **scope)["approval"]
+        plan = self.command("refresh_secret", arg="1 免费", event="prepare", **scope)["approval"]
         job = self.command("approve", arg=plan, event="submit", **scope)["job"]
         for _ in range(50):
             result = self.command("receipt", arg=job, **scope)
@@ -261,7 +290,7 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertNotIn("receipt", self.command("confirm_shop_hit", arg=job, user="other", **scope))
         self.assertNotIn("receipt", self.command("confirm_shop_hit", arg=job, group="elsewhere"))
         self.assertNotIn("receipt", self.command("confirm_shop_hit", arg=job))
-        again = self.command("refresh_star_source", arg="1", event="prepare2", **scope)["approval"]
+        again = self.command("refresh_secret", arg="1 免费", event="prepare2", **scope)["approval"]
         blocked = self.command("approve", arg=again, event="submit2", **scope)
         self.assertNotIn("job", blocked)
         self.assertEqual(blocked["receipt"]["id"], job)
@@ -278,7 +307,7 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertIn("保存", self.command("filter_save", arg=speed)["message"])
         self.assertEqual(self.command("filter_export", arg="筛选")["message"], speed)
         self.assertNotIn("Speed", self.command("filter_export", arg="筛选", user="other")["message"])
-        order = self.command("refresh_star_source", arg="1 筛选", event="prepare")
+        order = self.command("refresh_secret", arg="1 免费 筛选", event="prepare")
         self.assertIn("筛选", order["message"])
         self.command("filter_save", arg=attack, event="mutate")
         job = self.command("approve", arg=order["approval"], event="execute")["job"]
@@ -554,7 +583,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         vault.bind("alice", AUTH, True)
         worker = AsyncMock(return_value={"status": "shop_hit", "details": ["匹配装备"]})
         bridge = Bridge(vault, worker, ORIGIN)
-        job_id = bridge.submit("alice", "refresh_star_source", "1", "once")["job"]
+        job_id = bridge.submit("alice", "refresh_secret", "1 free", "once")["job"]
         await bridge.run_job(bridge.queue.popleft())
         restarted = Bridge(vault, worker, ORIGIN)
         receipt = restarted.receipt("alice", job_id)["receipt"]
@@ -562,7 +591,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         with patch("lucima_bridge.service.time.time", return_value=receipt["shop_confirm_until"] + 1):
             self.assertNotIn("receipt", restarted.confirm_shop_hit("alice", job_id))
             self.assertIn("超时", restarted.receipt("alice", job_id)["message"])
-            self.assertIn("job", restarted.submit("alice", "refresh_star_source", "1", "next"))
+            self.assertIn("job", restarted.submit("alice", "refresh_secret", "1 free", "next"))
         worker.assert_awaited_once()
 
     async def test_legacy_schedule_migrates_and_retains_every_independent_rule(self):
