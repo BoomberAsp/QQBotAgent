@@ -37,9 +37,11 @@ TOOLS = {
         "encyclopedia 填角色名；stages 填 hunt（讨伐）或 elf（元素探索）；equipment 可填套装名；其他留空。",
     ),
     "lucima_long": (
-        ("long_info", "activity", "abyss", "buy_batch", "schedule_set", "schedule_status", "schedule_stop"),
+        ("long_info", "activity", "abyss", "buy_batch", "refresh_secret", "refresh_star_source",
+         "schedule_set", "schedule_status", "schedule_stop"),
         "处理长任务：long_info=查询活动、深渊或商店报价，activity=活动推进，abyss=单层虚构深渊，"
-        "buy_batch=批量购买，schedule_set=启用每日托管，schedule_status=查看托管，schedule_stop=停止托管。"
+        "buy_batch=批量购买，refresh_secret=免费刷新秘密商店一次，refresh_star_source=刷新星源商店一次，"
+        "schedule_set=启用每日托管，schedule_status=查看托管，schedule_stop=停止托管。"
         "缺少关卡、队伍、角色或报价时询问用户或先查询，不猜测 ID、数量、预算或价格。",
         "long_info 填 activity、abyss 或 shop；activity 填‘活动ID 队伍ID 最多关数 体力上限’；"
         "abyss 填‘MysteriousRealm_层数 上半角色ID逗号列表 下半角色ID逗号列表’，空位用 -；"

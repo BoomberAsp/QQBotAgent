@@ -138,6 +138,41 @@ class WebAuthorizationTests(unittest.TestCase):
             self.assertNotIn("receipt", self.command("receipt", arg=job, **other))
         self.assertNotIn("approval", self.command("mail", proposal=True, **scope))
 
+    def test_shop_reference_is_public_and_does_not_forward_auth(self):
+        self.worker.return_value = {"status": "ok", "details": ["静态商品参考价"]}
+        scope = {"group": "shop-room"}
+        job = self.command("long_info", arg="shop", **scope)["job"]
+        for _ in range(50):
+            result = self.command("receipt", arg=job, **scope)
+            if "receipt" in result:
+                break
+            time.sleep(0.01)
+        self.assertEqual(result["receipt"]["details"], ["静态商品参考价"])
+        self.worker.assert_awaited_once_with({"action": "run", "task": "long_info", "code": "shop"}, 100)
+
+    def test_shop_refreshes_require_scoped_confirmation(self):
+        scope = {"group": "shop-room"}
+        issue = self.command("login", **scope)
+        pin = self.post("/api/claim", {"ticket": issue["login_url"].split("#")[1]}).json()["pin"]
+        self.command("confirm", arg=pin, **scope)
+        self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub"}).status_code, 200)
+        for action in ("refresh_secret", "refresh_star_source"):
+            self.worker.reset_mock()
+            plan = self.command(action, event="prepare", **scope)
+            ticket = plan["approval"]
+            self.assertIn("1 次", plan["message"])
+            self.assertIn("自动购买 0 件", plan["message"])
+            self.worker.assert_not_called()
+            self.assertNotIn("job", self.command("approve", arg=ticket, event="accept", group="other-room"))
+            job = self.command("approve", arg=ticket, event=f"accept-{action}", **scope)["job"]
+            for _ in range(50):
+                result = self.command("receipt", arg=job, **scope)
+                if "receipt" in result:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(result["receipt"]["status"], "ok")
+            self.worker.assert_awaited_once_with({"action": "run", "task": action, "code": "", "auth": AUTH}, 100)
+
     def test_group_route_rejects_missing_scope_and_private_route_rejects_group_scope(self):
         body = {"platform": "onebot", "bot": "bot", "user": "owner", "event": "event", "action": "login"}
         headers = {"Authorization": "Bearer " + TOKEN}
@@ -166,6 +201,13 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertIn("登录成功", lobby["message"])
         self.assertIn("15 分钟", lobby["message"])
         self.assertNotIn(AUTH["user_id"], str(lobby))
+        receipt = lobby["receipt"]
+        self.assertEqual(receipt["kind"], "login")
+        self.assertEqual(self.command("receipt", arg=receipt["id"])["receipt"], receipt)
+        self.assertNotIn("receipt", self.command("receipt", arg=receipt["id"], user="other"))
+        self.assertNotIn("dummy-account", str(receipt))
+        from lucima_bridge.receipt import render_receipt
+        self.assertTrue(render_receipt(receipt).startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertEqual(self.command("login_notice", arg=notice, event="original"), {})
         self.assertEqual(self.command("lobby")["menu"], "lobby")
 

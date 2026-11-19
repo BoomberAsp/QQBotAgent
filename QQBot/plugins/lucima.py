@@ -33,6 +33,8 @@ COMMANDS = {
     "筛装备": "equipment", "执行": "approve", "放弃": "discard", "回执": "receipt",
     "活动推进": "activity", "虚构深渊": "abyss", "批量购买": "buy_batch", "长任务查询": "long_info",
     "托管": "schedule_set", "托管状态": "schedule_status", "停止托管": "schedule_stop",
+    "刷新秘密商店": "refresh_secret", "秘密商店刷新": "refresh_secret",
+    "刷新星源商店": "refresh_star_source", "星源商店刷新": "refresh_star_source",
 }
 SHORTCUTS = {"捐赠金币": ("donate", "gold"), "捐赠证明": ("donate", "courage"),
              "讨伐关卡": ("stages", "hunt"), "元素关卡": ("stages", "elf")}
@@ -55,6 +57,7 @@ MORE = (
 )
 LONG_HELP = (
     "先查询：/璐茜玛 长任务查询 活动、深渊 或 商店\n"
+    "/璐茜玛 刷新秘密商店 · 刷新星源商店\n"
     "/璐茜玛 活动推进 <活动ID> <队伍ID> <最多关数> <体力上限>\n"
     "/璐茜玛 虚构深渊 <关卡ID> <上半角色ID列表> <下半角色ID列表>，队内用逗号分隔，空位填 -\n"
     "/璐茜玛 批量购买 <商品ID:数量:货币ID:单价>，多档用空格隔开\n"
@@ -69,7 +72,8 @@ MENUS = {
     "login": [[Btn("扫码登录", "/璐茜玛 登录")]],
     "lobby": [[Btn("签到", "/璐茜玛 签到"), Btn("领邮件", "/璐茜玛 领邮件"), Btn("领基地", "/璐茜玛 领基地")],
               [Btn("进阶任务", "/璐茜玛 进阶"), Btn("任务状态", "/璐茜玛 状态"), Btn("查看回执", "/璐茜玛 回执")],
-              [Btn("长任务", "/璐茜玛 长任务")]],
+              [Btn("长任务", "/璐茜玛 长任务"), Btn("刷秘密店", "/璐茜玛 刷新秘密商店"),
+               Btn("刷星源店", "/璐茜玛 刷新星源商店")]],
     "more": [[Btn("领派遣", "/璐茜玛 领派遣"), Btn("领成就", "/璐茜玛 领成就"), Btn("团签到", "/璐茜玛 团签到")],
              [Btn("捐赠金币", "/璐茜玛 捐赠金币"), Btn("捐赠证明", "/璐茜玛 捐赠证明"), Btn("免费招募", "/璐茜玛 免费招募")],
              [Btn("讨伐关卡", "/璐茜玛 讨伐关卡"), Btn("元素关卡", "/璐茜玛 元素关卡"), Btn("筛装备", "/璐茜玛 筛装备")]],
@@ -150,6 +154,10 @@ def render_qr(url: str) -> bytes:
 async def send_receipt(bot, event, receipt: dict, image_segment) -> None:
     detail = "\n".join([receipt["message"], *receipt["details"]])
     await bot.send(event, detail)
+    await send_receipt_image(bot, event, receipt, image_segment)
+
+
+async def send_receipt_image(bot, event, receipt: dict, image_segment) -> None:
     try:
         data = await asyncio.to_thread(render_receipt, receipt)
         await bot.send(event, image_segment(data))
@@ -186,13 +194,21 @@ async def send_menu(bot, event, actor: Actor, message: str, rows: list) -> None:
         await bot.send(event, message)
 
 
-async def watch_login(bot, event, actor: Actor, notice: str) -> None:
+async def watch_login(bot, event, actor: Actor, notice: str, image_segment) -> None:
     deadline = asyncio.get_running_loop().time() + TICKET_TTL + LOGIN_TIMEOUT + 15
     try:
         while asyncio.get_running_loop().time() < deadline:
             result = await request_lucima(actor, "login_notice", notice)
             if result.get("menu") == "lobby":
-                await send_menu(bot, event, actor, result["message"], MENUS["lobby"])
+                receipt = result.get("receipt")
+                message = result["message"]
+                if receipt:
+                    message += f"\n登录回执 /璐茜玛 回执 {receipt['id']}"
+                try:
+                    await send_menu(bot, event, actor, message, MENUS["lobby"])
+                finally:
+                    if receipt:
+                        await send_receipt_image(bot, event, receipt, image_segment)
                 return
             if result.get("pending"):
                 continue
@@ -227,7 +243,7 @@ async def reply(bot, event, result: dict, image_segment, actor: Actor) -> None:
             notice = result.get("login_notice")
             if (delivered and isinstance(notice, str) and notice not in LOGIN_WATCHERS
                     and len(LOGIN_WATCHERS) < LOGIN_NOTICE_LIMIT):
-                watcher = asyncio.create_task(watch_login(bot, event, actor, notice))
+                watcher = asyncio.create_task(watch_login(bot, event, actor, notice, image_segment))
                 LOGIN_WATCHERS[notice] = watcher
                 watcher.add_done_callback(lambda _: LOGIN_WATCHERS.pop(notice, None))
         return

@@ -33,12 +33,15 @@ TASK_NAMES = {
     "dispatch": "派遣领取", "achievement": "成就奖励", "guild": "佣兵团签到",
     "guild_weekly": "佣兵团周奖励", "donate": "佣兵团捐赠", "recruit": "免费招募",
     "stages": "扫荡关卡查询", "equipment": "装备筛选",
-    "long_info": "长任务查询", **LONG_NAMES,
+    "long_info": "长任务查询", "refresh_secret": "刷新秘密商店", "refresh_star_source": "刷新星源商店",
+    **LONG_NAMES,
 }
 APPROVALS = {
     ("donate", "gold"): "佣兵团捐赠 1 次，最多消耗 5000 金币。",
     ("donate", "courage"): "佣兵团捐赠 1 次，最多消耗 1 个英勇证明。",
     ("recruit", ""): "使用当日免费招募 1 次。执行前会核对免费额度，额度不明或已用时停止。",
+    ("refresh_secret", ""): "使用免费额度刷新秘密商店 1 次。冷却未结束时跳过，自动购买 0 件。",
+    ("refresh_star_source", ""): "刷新星源商店 1 次，自动购买 0 件。刷新费用按游戏当次规则结算，请核对后确认。",
 }
 OUTCOMES = {
     "ok": "完成。",
@@ -48,6 +51,7 @@ OUTCOMES = {
     "worker_error": "任务结果未知，请先在游戏内核对。",
     "timeout": "任务超时，请先在游戏内核对结果。",
     "auth_expired": "登录授权已失效，请重新扫码。",
+    "game_login_failed": "未能建立游戏会话，本次操作尚未开始。请稍后重试。",
     "invalid_code": "兑换码无效或已过期。",
     "unexpected_cost": "游戏返回了意外消耗，请核对账户。",
     "duplicate_login": "检测到重复登录，已停止。请退出游戏客户端后再手动发起。",
@@ -195,6 +199,7 @@ class LoginNotice:
     id: str = field(default_factory=lambda: secrets.token_urlsafe(12))
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     message: str | None = None
+    receipt: dict | None = None
 
 
 def lobby_message(summary: str) -> str:
@@ -409,7 +414,7 @@ class Bridge:
         if self.login_notices.get(owner) is not notice or notice.message is None:
             return {}
         self.dismiss_login_notice(owner)
-        return {"message": notice.message, "menu": "lobby"}
+        return {"message": notice.message, "menu": "lobby", "receipt": notice.receipt}
 
     def claim(self, secret: str) -> tuple[str, str] | None:
         self.prune()
@@ -509,11 +514,16 @@ class Bridge:
             self.sessions[owner] = (time.monotonic() + SESSION_TTL, auth)
             self.last.pop(owner, None)
             self.plans.pop(owner, None)
+            authorization = "已加密记住登录，最长 30 天。" if saved else "本次临时授权有效 15 分钟。"
+            if use_saved:
+                authorization = "已恢复记住的登录，保留原授权到期时间。"
+            receipt = {"id": secrets.token_urlsafe(12), "task": "登录", "kind": "login", "status": "ok",
+                       "message": "登录成功 · QQ 会话已绑定", "details": [authorization],
+                       "completed_at": int(time.time())}
+            self.save_receipt(owner, receipt)
             if notice is not None:
-                authorization = "已加密记住登录，最长 30 天。" if saved else "本次临时授权有效 15 分钟。"
-                if use_saved:
-                    authorization = "已恢复记住的登录，保留原授权到期时间。"
                 notice.message = lobby_message(f"登录成功。{authorization}")
+                notice.receipt = receipt
                 notice.expires = time.monotonic() + 60
                 notice.ready.set()
             destination = "发起登录的 QQ 群" if ticket.group else "原 QQ 私聊"
@@ -591,7 +601,7 @@ class Bridge:
             return {"message": "这条消息已经提交过。"}
         if self.active == owner or any(job.owner == owner for job in self.queue):
             return {"message": "你已有待处理的操作，请用 /璐茜玛 状态 查询。"}
-        if not self.auth_for(owner):
+        if (task, code) != ("long_info", "shop") and not self.auth_for(owner):
             return {"message": "请先用 /璐茜玛 登录 完成扫码。"}
         if len(self.queue) >= QUEUE_SIZE:
             return {"message": "游戏任务队列已满，请稍后再试。"}
@@ -704,15 +714,17 @@ class Bridge:
                 break
 
     def result(self, job: Job, message: str, status: str, details=None) -> None:
-        expires = time.monotonic() + 3600
         facts = details if isinstance(details, list) else []
         clean = [" ".join(item.split())[:120] for item in facts[:8] if isinstance(item, str)]
         payload = {"id": job.id, "task": job.label, "status": status,
                    "message": message, "details": clean, "completed_at": int(time.time())}
         if job.durable:
             self.long_tasks.finish(job.id, payload)
-        self.last[job.owner] = (expires, message)
-        self.receipts[job.id] = (job.owner, expires, payload)
+        self.last[job.owner] = (time.monotonic() + 3600, message)
+        self.save_receipt(job.owner, payload)
+
+    def save_receipt(self, owner: str, payload: dict) -> None:
+        self.receipts[payload["id"]] = (owner, time.monotonic() + 3600, payload)
         if len(self.receipts) > 512:
             self.receipts.pop(next(iter(self.receipts)))
 
@@ -758,9 +770,10 @@ class Bridge:
                 self.active_job = None
 
     async def run_job(self, job: Job) -> None:
-        auth = self.auth_for(job.owner)
+        public_reference = (job.task, job.code) == ("long_info", "shop")
+        auth = None if public_reference else self.auth_for(job.owner)
         binding = self.vault.record(job.owner)
-        if not auth or job.game != (binding[0] if binding else None):
+        if not public_reference and (not auth or job.game != (binding[0] if binding else None)):
             self.result(job, OUTCOMES["auth_expired"], "auth_expired")
             return
         if job.schedule:
@@ -769,7 +782,9 @@ class Bridge:
             if not schedule or schedule[-1] != job.schedule or not auth or not auth["refresh_token"]:
                 self.result(job, "托管授权已失效或计划已变化，本次任务已取消。", "cancelled")
                 return
-        payload = {"action": "run", "auth": auth, "task": job.task, "code": job.code}
+        payload = {"action": "run", "task": job.task, "code": job.code}
+        if auth is not None:
+            payload["auth"] = auth
         if job.durable:
             def update(message):
                 job.progress = " ".join(message.split())[:160]
@@ -784,11 +799,11 @@ class Bridge:
         if not isinstance(status, str) or status not in OUTCOMES:
             status = "worker_error"
         refreshed = read_auth(result)
-        if status == "auth_expired":
+        if auth and status == "auth_expired":
             self.sessions.pop(job.owner, None)
             self.vault.forget(job.owner)
             self.stop_schedule(job.owner)
-        elif refreshed and refreshed["user_id"] == auth["user_id"]:
+        elif auth and refreshed and refreshed["user_id"] == auth["user_id"]:
             session = self.sessions.get(job.owner)
             if session and session[0] > time.monotonic():
                 self.sessions[job.owner] = (session[0], refreshed)
@@ -797,4 +812,7 @@ class Bridge:
         details = result.get("details")
         if not details and job.progress and status in {"timeout", "worker_error", "unconfirmed"}:
             details = [f"停止前进度：{job.progress}"]
-        self.result(job, f"{job.label}：{OUTCOMES[status]}", status, details)
+        outcome = OUTCOMES[status]
+        if public_reference and status in {"worker_error", "timeout"}:
+            outcome = "暂时无法读取商品参考价，请稍后重试。"
+        self.result(job, f"{job.label}：{outcome}", status, details)
