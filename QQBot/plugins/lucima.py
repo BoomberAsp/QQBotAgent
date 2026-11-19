@@ -40,7 +40,7 @@ COMMANDS = {
     "菜单": "navigate", "添加账号": "add_account", "账号别名": "rename_account", "主题": "theme", "界面": "view_card",
     "分页": "view_page",
     "任务历史": "history", "清空日志": "clear_logs", "刷新信息": "account_view", "查看资源": "account_view",
-    "确认命中": "confirm_shop_hit",
+    "确认命中": "confirm_shop_hit", "购买命中": "buy_shop_hit",
     "查看团员": "account_view", "查看物品": "account_view", "查看队伍": "account_view",
     "查看团概况": "account_view", "查看团周任务": "account_view",
     "助战好友": "friend_support", "每日体力": "send_meal", "动力转换": "reactor",
@@ -144,7 +144,9 @@ async def call_service(text: str, platform: str, bot: str, user: str, event: str
         view = VIEW_NAMES[command]
         valid = (view in {"heroes", "items", "teams"} and (not arg or len(arg) <= 36)) or not arg
         arg = f"{view} {arg or '1'}" if view in {"heroes", "items", "teams"} else view
-    elif action in {"refresh_secret", "refresh_star_source", "theme", "rename_account"}:
+    elif action in {"refresh_secret", "refresh_star_source"}:
+        valid = len(arg) <= 96
+    elif action in {"theme", "rename_account"}:
         valid = len(arg) <= 24
     elif action == "history":
         arg = arg or "1"
@@ -162,6 +164,8 @@ async def call_service(text: str, platform: str, bot: str, user: str, event: str
         valid = 0 < len(arg) <= 64
     elif action in {"approve", "discard", "confirm_shop_hit"}:
         valid = bool(re.fullmatch(r"[A-Za-z0-9_-]{16}", arg))
+    elif action == "buy_shop_hit":
+        valid = bool(re.fullmatch(r"[A-Za-z0-9_-]{16} [1-6]", arg))
     elif action == "receipt":
         valid = not arg or bool(re.fullmatch(r"[A-Za-z0-9_-]{16}", arg))
     elif action == "equipment":
@@ -209,9 +213,17 @@ def result_buttons(result: dict) -> list:
 async def send_receipt(bot, event, receipt: dict, image_segment, actor: Actor) -> None:
     detail = "\n".join([receipt["message"], *receipt["details"]])
     if receipt.get("status") == "shop_hit" and receipt.get("shop_confirm_until", 0) > time.time():
-        confirm = f"/璐茜玛 确认命中 {receipt['id']}"
-        await send_menu(bot, event, actor, detail + "\n请在 5 分钟内由发起人确认结束。",
-                        [[Btn("确认结束", confirm)]], include_commands=True)
+        job = receipt["id"]
+        choices = receipt.get("shop_choices", [])
+        controls = [Btn(f"买第{slot}档", f"/璐茜玛 购买命中 {job} {slot}") for slot, _ in choices]
+        controls.append(Btn("结束本轮", f"/璐茜玛 确认命中 {job}", style=0))
+        prices = "\n".join(f"第 {slot} 档 · {quote}" for slot, quote in choices)
+        hint = "请在 5 分钟内由发起人选择购买或结束。"
+        if len(actor) == 5:
+            hint += "使用文字命令时请 @ 机器人。"
+        body = "\n".join(filter(None, (detail, prices, hint)))
+        rows = [controls[index:index + 3] for index in range(0, len(controls), 3)]
+        await send_menu(bot, event, actor, body, rows, include_commands=True)
     elif view := receipt.get("view"):
         position, kind, page, pages, query = view
         query = " " + query if query else ""

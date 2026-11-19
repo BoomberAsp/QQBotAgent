@@ -8,7 +8,8 @@ from zoneinfo import ZoneInfo
 
 
 LONG_NAMES = {"activity": "活动推进", "abyss": "虚构深渊", "buy_batch": "批量购买",
-              "refresh_secret_paid": "刷新秘密商店"}
+              "refresh_secret_paid": "刷新秘密商店", "refresh_star_source": "刷新星源商店",
+              "buy_shop_equipment": "购买命中装备"}
 SCHEDULE_TASKS = {
     "signin": "签到", "mail": "领邮件", "base": "领基地", "friend_support": "助战好友",
     "send_meal": "每日体力", "reactor": "动力转换", "potion": "成长药剂", "starforce": "升星水晶",

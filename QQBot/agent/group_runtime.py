@@ -10,6 +10,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .group_state import GroupStore, scope_for, identity_for
+from .lucima_tools import (
+    GROUP_PROMPT as LUCIMA_GROUP_PROMPT, GROUP_PROPOSAL_PROMPT, TOOLS as LUCIMA_TOOLS,
+    enabled as lucima_enabled, lucima_group_turn, lucima_tool_names,
+)
 
 current_group_run = ContextVar("current_group_run", default=None)
 # Public, stateless tools only. File, shell, personal retrieval and social-media
@@ -99,6 +103,12 @@ class GroupRun:
             _survey_card = ""
         if _survey_card:
             messages.append(dict(role="system", content=_survey_card))
+        if lucima_enabled() and not _delegate_depth.get():
+            lucima_hint = (
+                GROUP_PROPOSAL_PROMPT if self.tools.intersection(LUCIMA_TOOLS)
+                else "这一轮可以解释璐茜玛用法。需要查询账号或执行时，请发起成员在原群 @ 机器人提出请求。"
+            )
+            messages.append(dict(role="system", content=LUCIMA_GROUP_PROMPT + lucima_hint))
         if _delegate_depth.get():
             from lib.plane_policy import task_presentation
             messages.append(dict(role="system",content=task_presentation(self.persona)))
@@ -436,6 +446,8 @@ async def run_group_turn(view, sender=None):
                             prompt += "\n" + image_source_tools.SEARCH_HINT
                         elif image_search.question:
                             prompt += "\n回复后会附上找图确认问题，请自然回应即可。"
+                if not (image_search and image_search.authorized):
+                    allowed.update(lucima_tool_names())
                 token = image_source_tools.current.set(image_search)
                 try:
                     answer = await turn.agent.run(f"成员[{member_tag(view)}]：{prompt[:5000]}",
@@ -446,27 +458,52 @@ async def run_group_turn(view, sender=None):
                     if valid():
                         image_source_followup.remember_turn(view, image_scope, image_search)
                     image_source_tools.current.reset(token)
-            task = asyncio.create_task(execute())
+            with lucima_group_turn(view, sender, direct=reason == "direct", valid=valid) as lucima:
+                task = asyncio.create_task(execute())
             _jobs[scope]=(identity_for(view),task)
             try:
                 answer = await asyncio.wait_for(task,240)
             except asyncio.CancelledError:
                 return
             except asyncio.TimeoutError:
-                if image_search is not None and image_search.query is not None:
+                if lucima and (lucima.card or lucima.reply):
+                    answer = ""
+                elif image_search is not None and image_search.query is not None:
                     answer = image_search.query.result.render()
                 else:
                     if reason == "direct" and valid():
                         await send_text(sender,"这次处理超时了，请缩小问题范围后再试。")
                     return
             except Exception:
-                if reason == "direct" and valid():
-                    await send_text(sender,"这次处理未能完成，请稍后重试。")
-                return
+                if not lucima or not (lucima.card or lucima.reply):
+                    if reason == "direct" and valid():
+                        await send_text(sender,"这次处理未能完成，请稍后重试。")
+                    return
+                answer = ""
             finally:
                 if _jobs.get(scope,(None,None))[1] is task:
                     _jobs.pop(scope,None)
             if not valid():
+                return
+            if lucima and (lucima.card or lucima.reply):
+                if view.platform == "qq_official" and time.time() - view.received_at > 270:
+                    store.delivery(scope, view.message_id, "expired")
+                    return
+                ticket = store.delivery(scope, view.message_id, "queued")
+                try:
+                    card = lucima.card
+                    keyboard = getattr(sender, "send_group_keyboard", None)
+                    if card and keyboard:
+                        status = await keyboard(card.markdown, card.rows, card.markdown)
+                    else:
+                        status = await send_text(sender, card.markdown if card else lucima.reply)
+                except Exception:
+                    status = "uncertain"
+                store.delivery(scope, view.message_id, status, ticket)
+                if status == "sent" and valid():
+                    # Record the exchange without feeding the confirmation ID back to the model.
+                    summary = "已发送璐茜玛待确认卡。" if card else lucima.reply
+                    store.commit(scope, generation, view.message_id, member_tag(view), message, summary)
                 return
             question = image_search.question if image_search else ""
             if not isinstance(answer,str) or not answer.strip():

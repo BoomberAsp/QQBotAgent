@@ -49,8 +49,7 @@ class WebAuthorizationTests(unittest.TestCase):
         }
         if group is not None:
             body["group"] = group
-            if not proposal:
-                path = "/internal/group-command"
+            path = "/internal/group-propose" if proposal else "/internal/group-command"
         return self.client.post(path, headers={"Authorization": "Bearer " + TOKEN}, json=body).json()
 
     def post(self, path, body, origin=ORIGIN):
@@ -114,15 +113,16 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.command("lobby", **(scope | {"user": "other"}))["menu"], "login")
         self.assertEqual(self.command("lobby", **(scope | {"group": None}))["menu"], "login")
 
-    def test_group_confirmation_and_receipt_stay_in_owner_and_group_scope(self):
+    def test_group_proposal_confirmation_and_receipt_stay_in_owner_and_group_scope(self):
         scope = {"group": "room"}
         issue = self.command("login", **scope)
         claim = self.post("/api/claim", {"ticket": issue["login_url"].split("#")[1]}).json()
         self.command("confirm", arg=claim["pin"], **scope)
         self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub"}).status_code, 200)
-        proposal = self.command("donate", arg="gold", event="proposed", **scope)
+        proposal = self.command("donate", arg="gold", event="proposed", proposal=True, **scope)
         ticket = proposal["approval"]
-        wrong_scopes = ({"group": "room", "user": "other"}, {"group": "other-room"}, {})
+        wrong_scopes = ({"group": "room", "user": "other"}, {"group": "other-room"},
+                        {"group": "room", "platform": "qq_official"}, {})
         for other in wrong_scopes:
             self.assertNotIn("job", self.command("approve", arg=ticket, event="confirm", **other))
         self.assertNotIn("job", self.command("approve", arg=ticket, event="proposed", **scope))
@@ -137,7 +137,22 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertEqual(answer["receipt"]["id"], job)
         for other in wrong_scopes:
             self.assertNotIn("receipt", self.command("receipt", arg=job, **other))
-        self.assertNotIn("approval", self.command("mail", proposal=True, **scope))
+        self.assertNotIn("approval", self.command("mail", proposal=True, group="other-room"))
+
+    def test_group_natural_login_only_issues_qr_after_user_confirmation(self):
+        scope = {"group": "room", "platform": "qq_official"}
+        plan = self.command("login", event="request", proposal=True, **scope)
+        self.assertIn("原群", plan["message"])
+        self.assertNotIn("login_url", plan)
+        for action in ("approve", "confirm", "confirm_shop_hit", "login_notice", "discard", "clear_logs"):
+            rejected = self.command(action, arg=plan["approval"], event="agent", proposal=True, **scope)
+            self.assertNotIn("approval", rejected)
+            self.assertNotIn("login_url", rejected)
+        self.assertNotIn("login_url", self.command("approve", arg=plan["approval"], event="request", **scope))
+        issue = self.command("approve", arg=plan["approval"], event="confirmed", **scope)
+        self.assertIn("login_url", issue)
+        self.assertIn("login_notice", issue)
+        self.worker.assert_not_awaited()
 
     def test_shop_reference_is_public_and_does_not_forward_auth(self):
         self.worker.return_value = {"status": "ok", "details": ["静态商品参考价"]}
@@ -162,7 +177,7 @@ class WebAuthorizationTests(unittest.TestCase):
         plan = self.command(action, event="prepare", **scope)
         ticket = plan["approval"]
         self.assertIn("1 次", plan["message"])
-        self.assertIn("自动购买 0 件", plan["message"])
+        self.assertIn("自动按货架金币价购买", plan["message"])
         self.worker.assert_not_called()
         self.assertNotIn("job", self.command("approve", arg=ticket, event="accept", group="other-room"))
         job = self.command("approve", arg=ticket, event=f"accept-{action}", **scope)["job"]
@@ -172,7 +187,11 @@ class WebAuthorizationTests(unittest.TestCase):
                 break
             time.sleep(0.01)
         self.assertEqual(result["receipt"]["status"], "ok")
-        self.worker.assert_awaited_once_with({"action": "run", "task": action, "code": "", "auth": AUTH}, 100)
+        self.worker.assert_awaited_once()
+        payload, timeout = self.worker.await_args.args
+        self.assertEqual((payload["task"], timeout), (action, 100))
+        self.assertEqual(json.loads(payload["code"]), {"order": "1 free", "scheme": None,
+                                                       "targets": ["recruit", "mystery", "chip"]})
 
     def test_full_navigation_and_theme_are_available_without_a_game_login(self):
         group = {"group": "layout"}
@@ -239,7 +258,10 @@ class WebAuthorizationTests(unittest.TestCase):
                 break
             time.sleep(0.01)
         self.assertEqual(result["receipt"]["status"], "ok")
-        self.worker.assert_awaited_once_with({"action": "run", "task": "refresh_secret", "code": "200 free", "auth": AUTH}, 100)
+        self.worker.assert_awaited_once()
+        payload = self.worker.await_args.args[0]
+        self.assertEqual(json.loads(payload["code"]),
+                         {"order": "200 free", "scheme": None, "targets": ["recruit", "mystery", "chip"]})
 
     def test_paid_secret_shop_freezes_90_rounds_and_270_diamond_budget(self):
         scope = {"group": "shop-room"}
@@ -250,7 +272,8 @@ class WebAuthorizationTests(unittest.TestCase):
         self.worker.reset_mock()
         quote = {"gameVersion": "5.0.0.116271", "catalog": "catalog_116310", "currency": "2", "unitPrice": 3}
         self.client.portal.call(setattr, app.state.bridge, "secret_shop_quote", quote)
-        plan = self.command("refresh_secret", arg="９０ 钻石", event="prepare", **scope)
+        self.assertNotIn("approval", self.command("refresh_secret", arg="201 diamond", proposal=True, **scope))
+        plan = self.command("refresh_secret", arg="90 diamond", event="prepare", proposal=True, **scope)
         self.assertIn("每次 3 颗钻石", plan["message"])
         self.assertIn("270 颗钻石", plan["message"])
         self.worker.assert_not_awaited()
@@ -266,7 +289,8 @@ class WebAuthorizationTests(unittest.TestCase):
         payload, timeout = self.worker.await_args.args
         self.assertEqual(timeout, TASK_TIMEOUT)
         self.assertEqual(payload["task"], "refresh_secret_paid")
-        self.assertEqual(json.loads(payload["code"]), {"count": 90, "quote": quote, "budget": 270, "scheme": None})
+        self.assertEqual(json.loads(payload["code"]), {"count": 90, "quote": quote, "budget": 270, "scheme": None,
+                                                       "targets": ["recruit", "mystery", "chip"]})
 
     def test_star_source_single_and_batch_stop_before_queue_in_group_and_agent(self):
         for scope in ({}, {"group": "shop-room"}):
@@ -276,9 +300,9 @@ class WebAuthorizationTests(unittest.TestCase):
                 self.assertNotIn("approval", result)
                 self.assertNotIn("job", result)
                 self.assertIn("查看星源商店", result["message"])
-        proposal = self.command("refresh_star_source", arg="1", proposal=True)
-        self.assertEqual(proposal["status"], "quote_unavailable")
-        self.assertNotIn("approval", proposal)
+            proposal = self.command("refresh_star_source", arg="1", proposal=True, **scope)
+            self.assertEqual(proposal["status"], "quote_unavailable")
+            self.assertNotIn("approval", proposal)
         self.worker.assert_not_awaited()
 
     def test_star_source_status_reaches_only_the_read_only_query(self):
@@ -296,6 +320,56 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertEqual(receipt["receipt"]["details"], ["星源商店刷新计数 2。"])
         self.worker.assert_awaited_once_with({"action": "run", "task": "account_view",
                                             "code": "star_source", "auth": AUTH}, 100)
+
+    def test_star_source_plan_and_equip_selection_stay_in_original_scope(self):
+        scope = {"group": "shop-room"}
+        ticket = self.command("login", **scope)["login_url"].split("#")[1]
+        pin = self.post("/api/claim", {"ticket": ticket}).json()["pin"]
+        self.command("confirm", arg=pin, **scope)
+        self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub"}).status_code, 200)
+        policy = {"gameVersion": "5.0.0.116271", "catalog": "catalog_116310",
+                  "refresh": {"currency": "", "amount": 0}, "equipment": {"currency": "109", "amount": 5}}
+        self.client.portal.call(setattr, app.state.bridge, "star_source_quote", policy)
+        scheme = {"name": "速度", "slots": {"ring": [{"sets": ["Speed"]}]}}
+        self.command("filter_save", arg=json.dumps(scheme), **scope)
+        self.worker.reset_mock()
+        signature = "a" * 64
+        self.worker.return_value = {
+            "status": "shop_hit", "details": ["第 2 档 · 速度戒指"],
+            "shopOptions": [{"slot": 2, "key": signature, "price": policy["equipment"]}],
+        }
+        self.assertNotIn("approval", self.command("refresh_star_source", arg="3", **scope))
+        plan = self.command("refresh_star_source", arg="3 速度", event="request", proposal=True, **scope)
+        self.assertIn("免费刷新 3 次", plan["message"])
+        self.assertIn("5 个彩虹星源", plan["message"])
+        self.worker.assert_not_awaited()
+        job = self.command("approve", arg=plan["approval"], event="refresh", **scope)["job"]
+        for _ in range(50):
+            result = self.command("receipt", arg=job, **scope)
+            if "receipt" in result:
+                break
+            time.sleep(0.01)
+        self.assertEqual(result["receipt"]["shop_choices"], [[2, "5 彩虹星源"]])
+        self.assertNotIn(signature, str(result))
+        self.worker.assert_awaited_once()
+        self.assertEqual(json.loads(self.worker.await_args.args[0]["code"])["scheme"], scheme)
+        for other in ({"group": "elsewhere"}, {"user": "other", **scope}, {}):
+            self.assertNotIn("job", self.command("buy_shop_hit", arg=f"{job} 2", event="click", **other))
+        self.assertNotIn("job", self.command("buy_shop_hit", arg=f"{job} 2", proposal=True, **scope))
+        self.assertNotIn("job", self.command("buy_shop_hit", arg=f"{job} 1", event="unmatched", **scope))
+        self.worker.return_value = {"status": "ok", "details": ["已确认扣除 5 个彩虹星源"]}
+        purchase = self.command("buy_shop_hit", arg=f"{job} 2", event="bought", **scope)["job"]
+        self.assertNotIn("job", self.command("buy_shop_hit", arg=f"{job} 2", event="replay", **scope))
+        for _ in range(50):
+            result = self.command("receipt", arg=purchase, **scope)
+            if "receipt" in result:
+                break
+            time.sleep(0.01)
+        self.assertIn("彩虹星源", result["receipt"]["details"][0])
+        self.assertEqual(self.worker.await_count, 2)
+        payload = self.worker.await_args.args[0]
+        self.assertEqual(payload["task"], "buy_shop_equipment")
+        self.assertEqual(json.loads(payload["code"])["key"], signature)
 
     def test_equipment_hit_pauses_same_shop_until_owner_confirms(self):
         scope = {"group": "shop-room"}
@@ -353,7 +427,14 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.client.post("/internal/group-command", headers=headers, json=body).status_code, 400)
         oversized = {**body, "group": "room", "event": "E" * 513}
         self.assertEqual(self.client.post("/internal/group-command", headers=headers, json=oversized).status_code, 400)
-        self.assertEqual(self.client.post("/internal/command", headers=headers, json={**body, "group": "room"}).status_code, 400)
+        self.assertEqual(self.client.post("/internal/group-propose", json=body).status_code, 403)
+        self.assertEqual(self.client.post("/internal/group-propose", headers=headers, json=body).status_code, 400)
+        group_body = {**body, "group": "room"}
+        for path in ("/internal/command", "/internal/propose"):
+            self.assertEqual(self.client.post(path, headers=headers, json=group_body).status_code, 400)
+        accepted = self.client.post("/internal/group-propose", headers=headers, json=group_body)
+        self.assertEqual(accepted.status_code, 200)
+        self.assertIn("approval", accepted.json())
 
     def test_login_success_delivers_one_lobby_to_original_event(self):
         self.assertEqual(self.command("lobby")["menu"], "login")

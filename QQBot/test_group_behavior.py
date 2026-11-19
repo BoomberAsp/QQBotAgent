@@ -238,6 +238,85 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls[-1].history,[])
         self.assertEqual(self.fake._bond_manager.settle_turn.call_count,3)
 
+    async def test_lucima_direct_turn_delivers_card_without_leaking_token_to_group_history(self):
+        from agent.lucima_tools import register_lucima_tools
+        from agent.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+        register_lucima_tools(registry)
+        v = view()
+        v.text = "帮我用钻石刷秘密商店 90 次"
+        ticket = "Z" * 16
+        bridge = AsyncMock(return_value={"approval": ticket, "message": "预计最多扣除 270 钻石。"})
+        self.sender.send_group_keyboard = AsyncMock(return_value="sent")
+
+        async def model(text, *args, allowed_tools, **kwargs):
+            run = runtime.current_group_run.get()
+            self.assertIn("lucima_long", allowed_tools)
+            self.assertTrue(any("秘密商店怎么刷" in item["content"] for item in run.messages(None, text)))
+            result = await registry.execute("lucima_long", {"operation": "refresh_secret", "arg": "90 diamond"})
+            self.assertIn("待确认", result)
+            self.assertNotIn(ticket, result)
+            await registry.execute("lucima_query", {"operation": "status"})
+            return "模型误称已执行"
+
+        self.fake.agent.run = model
+        with patch.dict("os.environ", {"LUCIMA_INTERNAL_TOKEN": "test-only"}):
+            with patch("agent.lucima_tools.request_lucima", bridge):
+                await runtime.run_group_turn(v, self.sender)
+        bridge.assert_awaited_once_with(("qq_official", "bot", "a", "m", "g"),
+                                       "refresh_secret", "90 diamond", propose=True)
+        self.sender.send_group_text.assert_not_awaited()
+        self.sender.send_group_keyboard.assert_awaited_once()
+        text, rows, fallback = self.sender.send_group_keyboard.await_args.args
+        self.assertIn("270 钻石", text)
+        self.assertIn(f"/璐茜玛 执行 {ticket}", rows[0][0].data)
+        self.assertIn(ticket, fallback)
+        history = json.dumps(self.store.history(scope_for(v)), ensure_ascii=False)
+        self.assertNotIn(ticket, history)
+        self.assertNotIn("模型误称已执行", history)
+
+    async def test_lucima_help_followup_and_text_confirmation(self):
+        from agent.lucima_tools import register_lucima_tools
+        from agent.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+        register_lucima_tools(registry)
+        asked = view()
+        asked.text = "璐茜玛能做什么"
+        follow = view(message="follow")
+        follow.mentioned = False
+        follow.text = "签到"
+        explicit = view(message="reply", reply_to_bot=True)
+        explicit.mentioned = False
+        explicit.platform = "onebot"
+        explicit.text = "帮我领取邮件"
+        ticket = "Z" * 16
+        bridge = AsyncMock(return_value={"approval": ticket, "message": "领取邮件。"})
+
+        async def model(text, *args, allowed_tools, **kwargs):
+            if asked.text in text:
+                return "璐茜玛可以签到和领取奖励。"
+            if explicit.text in text:
+                self.assertIn("lucima_rewards", allowed_tools)
+                await registry.execute("lucima_rewards", {"operation": "mail"})
+                return ""
+            self.assertNotIn("lucima_rewards", allowed_tools)
+            await registry.execute("lucima_rewards", {"operation": "signin"})
+            return "发起操作请先 @ 机器人。"
+
+        self.fake.agent.run = model
+        with patch.dict("os.environ", {"LUCIMA_INTERNAL_TOKEN": "test-only"}):
+            with patch("agent.lucima_tools.request_lucima", bridge):
+                await runtime.run_group_turn(asked, self.sender)
+                self.assertIn("可以签到", self.sender.send_group_text.await_args.args[0])
+                await runtime.run_group_turn(follow, self.sender)
+                bridge.assert_not_awaited()
+                await runtime.run_group_turn(explicit, self.sender)
+        bridge.assert_awaited_once_with(("onebot", "bot", "a", "reply", "g"), "mail", "", propose=True)
+        self.assertIn(f"/璐茜玛 执行 {ticket}", self.sender.send_group_text.await_args.args[0])
+        self.assertIn(f"/璐茜玛 放弃 {ticket}", self.sender.send_group_text.await_args.args[0])
+
     async def test_failed_delivery_no_history_or_bond(self):
         self.sender.send_group_text.return_value='uncertain'
         await runtime.run_group_turn(view(),self.sender)

@@ -18,7 +18,8 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from .long_tasks import CONFIRMED_OPERATIONS, preview as long_preview
 from .filters import NAME as FILTER_NAME, parse_scheme
 from .menu import PAGES, THEMES, shop_arguments
-from .service import APPROVALS, Bridge, STAR_SOURCE_QUOTE_UNAVAILABLE, TASK_NAMES, TICKET_TTL, Vault, Worker
+from .proposals import ALLOWED_OPERATIONS
+from .service import APPROVALS, Bridge, SHOP_TARGETS, TASK_NAMES, TICKET_TTL, Vault, Worker
 
 
 FILES = Path(__file__).resolve().parent
@@ -27,6 +28,7 @@ TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 CODE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 PIN = re.compile(r"[0-9]{8}\Z")
 OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{16}\Z")
+SHOP_PICK = re.compile(r"([A-Za-z0-9_-]{16}) ([1-6])\Z")
 READ_TASKS = {"long_info", "account_view", "stages", "equipment"}
 SHOP_ACTIONS = {"refresh_secret", "refresh_star_source"}
 ACCOUNT_VIEWS = {"summary", "resources", "heroes", "items", "teams", "guild", "weekly", "guild_shop",
@@ -68,6 +70,20 @@ def load_secret_shop_quote(root: Path) -> dict | None:
     return quote
 
 
+def load_star_source_quote(root: Path) -> dict | None:
+    try:
+        quote = json.loads((root / "assets" / "star_source_shop_quote.json").read_bytes())
+    except (OSError, ValueError, RecursionError):
+        return None
+    if (isinstance(quote, dict) and set(quote) == {"gameVersion", "catalog", "refresh", "equipment"}
+            and all(isinstance(quote[key], str) and quote[key] for key in ("gameVersion", "catalog"))
+            and quote["refresh"] == {"currency": "", "amount": 0}
+            and quote["equipment"] == {"currency": "109", "amount": 5}
+            and all(type(quote[key]["amount"]) is int for key in ("refresh", "equipment"))):
+        return quote
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     internal_token = os.environ["LUCIMA_INTERNAL_TOKEN"]
@@ -94,7 +110,8 @@ async def lifespan(app: FastAPI):
         vault = Vault(data_dir / "binding.sqlite3", os.environ["LUCIMA_VAULT_KEY"])
         try:
             worker = Worker(root, str(python))
-            app.state.bridge = Bridge(vault, worker, origin, secret_shop_quote=load_secret_shop_quote(root))
+            app.state.bridge = Bridge(vault, worker, origin, secret_shop_quote=load_secret_shop_quote(root),
+                                      star_source_quote=load_star_source_quote(root))
             queue = asyncio.create_task(app.state.bridge.consume())
             try:
                 yield
@@ -337,22 +354,81 @@ def execute_operation(bridge, owner: str, action: str, arg: str, event: str, cat
     return bridge.submit(owner, action, arg, event)
 
 
+def shop_plan(bridge, scope, action, arg, event, *, propose=False):
+    owner = bridge.accounts.active(scope)
+    scheme = None
+    scheme_name = ""
+    targets = list(SHOP_TARGETS)
+    target_flag = ""
+    words = arg.split()
+    if words and words[-1].startswith("目标="):
+        if action != "refresh_secret":
+            return {"message": "星源商店使用装备筛选方案。"}
+        target_flag = words.pop()
+        target_text = target_flag.removeprefix("目标=")
+        names = {**{key: key for key in SHOP_TARGETS}, **{name: key for key, name in SHOP_TARGETS.items()},
+                 "强化芯片": "chip"}
+        choices = re.split("[,，、]", target_text)
+        if target_text in {"无", "none"}:
+            targets = []
+        elif all(choice in names for choice in choices):
+            targets = list(dict.fromkeys(names[choice] for choice in choices))
+        else:
+            return {"message": "普通购买目标可选招募契约、神秘契约、下级强化芯片，用逗号分隔，也可填目标=无。"}
+
+    order = shop_arguments(action, " ".join(words))
+    if order is None and len(words) >= 2 and FILTER_NAME.fullmatch(words[-1]):
+        order = shop_arguments(action, " ".join(words[:-1]))
+        if order and order[1] != "choose":
+            scheme_name = words[-1]
+            payload = bridge.filters.get(owner, scheme_name)
+            if not payload:
+                return {"message": "当前账号没有这个装备方案。"}
+            scheme = json.loads(payload)
+        else:
+            order = None
+    if order is None:
+        return {"message": "次数请输入 1–200 的整数。秘密商店支持 免费 或 钻石，可在末尾指定装备方案。"}
+    count, mode = order
+    if mode == "choose":
+        if propose:
+            return {"message": "请指定使用免费额度还是钻石刷新。"}
+        suffix = " " + target_flag if target_flag else ""
+        return bridge.navigation(scope, "secret", f"申请 {count} 次，先选择刷新方式。",
+                                 links=(("选择免费", f"刷新秘密商店 {count} 免费{suffix}"),
+                                        ("选择钻石", f"刷新秘密商店 {count} 钻石{suffix}")), replace=True)
+    if mode == "star":
+        return bridge.prepare_star_source(owner, count, event, scheme=scheme, scheme_name=scheme_name)
+    return bridge.prepare_secret_shop(owner, count, mode, event, scheme=scheme, scheme_name=scheme_name, targets=targets)
+
+
 @app.post("/internal/propose")
 async def propose(request: Request):
-    context = await command_context(request)
+    return await prepare_proposal(request, group=False)
+
+
+@app.post("/internal/group-propose")
+async def group_propose(request: Request):
+    return await prepare_proposal(request, group=True)
+
+
+async def prepare_proposal(request: Request, *, group: bool):
+    context = await command_context(request, group_command=group)
     if isinstance(context, (JSONResponse, PlainTextResponse)):
         return context
     bridge, scope, action, arg, event = context
+    if action not in ALLOWED_OPERATIONS:
+        return answer("操作或参数无效。", 400)
     owner = bridge.accounts.active(scope)
-    if action == "refresh_star_source" and isinstance(arg, str) and shop_arguments(action, arg):
-        return bridge.prepare(owner, action, arg, event=event)
-    if action == "refresh_secret" and isinstance(arg, str) and (order := shop_arguments(action, arg)):
-        count, mode = order
-        if mode == "diamond":
-            return bridge.prepare_secret_shop_paid(owner, count, event)
+    if action in SHOP_ACTIONS and isinstance(arg, str) and len(arg) <= 96:
+        return shop_plan(bridge, scope, action, arg, event, propose=True)
     preview = operation_preview(action, arg)
     if preview is None:
         return answer("操作或参数无效。", 400)
+    if group and action == "login":
+        preview = "在原群生成扫码登录链接。账号密码在登录网页填写。"
+    elif group and action == "receipt":
+        preview = "在原群取回你当前账号的最近一张 Lucima 任务回执。"
     return bridge.prepare(owner, action, arg, preview=preview, event=event)
 
 
@@ -457,42 +533,15 @@ async def run_command(request: Request, *, group: bool):
             if response.get("receipt") or response.get("pending"):
                 if slot != owner and (receipt := response.get("receipt")):
                     response["receipt"] = {k: v for k, v in receipt.items()
-                                           if k not in {"view", "shop_confirm_until"}}
+                                           if k not in {"view", "shop_confirm_until", "shop_choices"}}
                 return response
         return execute(action, arg)
     if action == "confirm_shop_hit" and OPERATION_ID.fullmatch(arg):
         return bridge.confirm_shop_hit(owner, arg)
-    if action in SHOP_ACTIONS:
-        scheme = None
-        scheme_name = ""
-        order = shop_arguments(action, arg)
-        if order is None:
-            base, separator, name = arg.rpartition(" ")
-            can_filter = action == "refresh_star_source" or len(base.split()) == 2
-            if separator and can_filter and FILTER_NAME.fullmatch(name):
-                order = shop_arguments(action, base)
-                if order:
-                    payload = bridge.filters.get(owner, name)
-                    if not payload:
-                        return {"message": "当前账号没有这个装备方案。"}
-                    scheme, scheme_name, arg = json.loads(payload), name, base
-        if order is None:
-            return {"message": "次数请输入 1–200 的整数。秘密商店可加 免费 或 钻石。"}
-        count, mode = order
-        if mode == "choose":
-            return bridge.navigation(scope, "secret", f"申请 {count} 次，先选择刷新方式。",
-                                     links=(("选择免费", f"刷新秘密商店 {count} 免费"),
-                                            ("选择钻石", f"刷新秘密商店 {count} 钻石")), replace=True)
-        if mode == "star":
-            panel = bridge.navigation(scope, "starshop", f"申请 {count} 次。{STAR_SOURCE_QUOTE_UNAVAILABLE}")
-            return {**panel, "status": "quote_unavailable"}
-        if mode == "diamond":
-            return bridge.prepare_secret_shop_paid(owner, count, event, scheme=scheme, scheme_name=scheme_name)
-        arg = (f"{count} free" if mode == "free" else str(count)) if arg else ""
-        if scheme is not None:
-            preview = operation_preview(action, arg) + f" 使用装备方案「{scheme_name}」。"
-            code = json.dumps({"order": arg, "scheme": scheme}, ensure_ascii=False, separators=(",", ":"))
-            return bridge.prepare(owner, action, code, preview=preview, event=event)
+    if action == "buy_shop_hit" and (pick := SHOP_PICK.fullmatch(arg)):
+        return bridge.buy_shop_hit(owner, pick.group(1), int(pick.group(2)), event)
+    if action in SHOP_ACTIONS and len(arg) <= 96:
+        return shop_plan(bridge, scope, action, arg, event)
     preview = operation_preview(action, arg)
     if preview is not None:
         if (action in CONFIRMED_OPERATIONS or action in {"logout", "unbind", "clear_logs"}

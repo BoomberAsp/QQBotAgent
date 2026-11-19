@@ -36,6 +36,8 @@ SESSION_TTL = 15 * 60
 REMEMBER_TTL = 30 * 86400
 QUEUE_TTL = 5 * 60
 QUEUE_SIZE = 5
+SHOP_TARGETS = {"recruit": "招募契约", "mystery": "神秘契约", "chip": "下级强化芯片"}
+SHOP_CURRENCIES = {"secret": ("1", "金币"), "star": ("109", "彩虹星源")}
 STAR_SOURCE_QUOTE_UNAVAILABLE = (
     "当前缺少可核实的星源商店刷新报价，本次未提交刷新。"
     "可用 /璐茜玛 查看星源商店 查询刷新计数。"
@@ -72,7 +74,7 @@ OUTCOMES = {
     "game_login_unavailable": "连接游戏服务器失败，本次操作尚未开始。请稍后重试。",
     "game_login_rejected": "游戏服务器拒绝建立会话，本次操作尚未开始。",
     "quote_unavailable": "当前无法核实刷新价格，本次未提交刷新。",
-    "shop_hit": "筛选命中，刷新已停止，等待确认结束。",
+    "shop_hit": "筛选命中，刷新已停止。",
     "invalid_code": "兑换码无效或已过期。",
     "unexpected_cost": "游戏返回了意外消耗，请核对账户。",
     "duplicate_login": "检测到重复登录，已停止。请退出游戏客户端后再手动发起。",
@@ -355,8 +357,18 @@ class Worker:
         await proc.wait()
 
 
+@dataclass
+class ShopHit:
+    owner: str
+    game: str
+    shop: str
+    expires: int
+    options: dict
+
+
 class Bridge:
-    def __init__(self, vault: Vault, worker: Worker, public_origin: str, *, secret_shop_quote: dict | None = None):
+    def __init__(self, vault: Vault, worker: Worker, public_origin: str, *, secret_shop_quote: dict | None = None,
+                 star_source_quote: dict | None = None):
         self.vault = vault
         self.accounts = AccountSlots(vault)
         self.filters = Filters(vault.db)
@@ -364,6 +376,8 @@ class Bridge:
         self.worker = worker
         self.public_origin = public_origin
         self.secret_shop_quote = secret_shop_quote
+        self.star_source_quote = star_source_quote
+        self.shop_hits: dict[str, ShopHit] = {}
         self.tickets: dict[str, Ticket] = {}
         self.login_notices: dict[str, LoginNotice] = {}
         self.attempts: dict[str, float] = {}
@@ -388,6 +402,8 @@ class Bridge:
         self.last = {key: result for key, result in self.last.items() if result[0] > now}
         self.receipts = {key: result for key, result in self.receipts.items() if result[1] > now}
         self.plans = {key: plan for key, plan in self.plans.items() if plan.expires > now}
+        current = int(time.time())
+        self.shop_hits = {key: hit for key, hit in self.shop_hits.items() if hit.expires > current}
         self.submitted = {key: expiry for key, expiry in self.submitted.items() if expiry > now}
         for job in tuple(self.queue):
             if now - job.created >= (LONG_QUEUE_TTL if job.durable else QUEUE_TTL):
@@ -673,23 +689,46 @@ class Bridge:
         response["message"] = f"已退出 {self.accounts.label(owner)}。\n" + response["message"]
         return response
 
-    def prepare_secret_shop_paid(self, owner: str, count: int, event: str, *, scheme=None, scheme_name="") -> dict:
-        quote = self.secret_shop_quote
-        if not quote:
-            return {"status": "quote_unavailable", "message": "秘密商店钻石刷新报价暂不可用，本次未提交刷新。"}
-        price = quote["unitPrice"]
-        budget = count * price
-        code = json.dumps({"count": count, "quote": quote, "budget": budget, "scheme": scheme},
-                          ensure_ascii=False, separators=(",", ":"))
-        preview = (f"秘密商店最多刷新 {count} 次，每次 {price} 颗钻石，扣款上限 {budget} 颗钻石。"
-                   "执行前核对游戏版本、当日剩余额度和余额。自动购买 0 件。")
+    @staticmethod
+    def purchase_notice(targets):
+        names = "、".join(SHOP_TARGETS[target] for target in targets)
+        return (f"自动按货架金币价购买命中的{names}。"
+                if names else "本轮普通道具自动购买上限 0 档。")
+
+    def prepare_secret_shop(self, owner, count, mode, event, *, scheme, scheme_name, targets):
+        if mode == "diamond":
+            quote = self.secret_shop_quote
+            if not quote:
+                return {"status": "quote_unavailable", "message": "秘密商店钻石刷新报价暂不可用，本次未提交刷新。"}
+            price = quote["unitPrice"]
+            budget = count * price
+            task = "refresh_secret_paid"
+            order = {"count": count, "quote": quote, "budget": budget, "scheme": scheme, "targets": targets}
+            preview = f"秘密商店最多刷新 {count} 次，每次 {price} 颗钻石，刷新扣款上限 {budget} 颗钻石。"
+        else:
+            task = "refresh_secret"
+            order = {"order": f"{count} free", "scheme": scheme, "targets": targets}
+            preview = (f"申请 {count} 次，使用免费额度刷新 0 或 1 次，刷新扣款上限 0。"
+                       "当前货架可先购买目标道具。")
+        preview += self.purchase_notice(targets)
         if scheme_name:
-            preview += f" 使用装备方案「{scheme_name}」，命中即停。"
-        return self.prepare(owner, "refresh_secret_paid", code, preview=preview, event=event)
+            preview += f" 使用装备方案「{scheme_name}」，命中即停，装备单独确认购买。"
+        code = json.dumps(order, ensure_ascii=False, separators=(",", ":"))
+        return self.prepare(owner, task, code, preview=preview, event=event)
+
+    def prepare_star_source(self, owner, count, event, *, scheme, scheme_name):
+        quote = self.star_source_quote
+        if not quote:
+            return {"status": "quote_unavailable", "message": STAR_SOURCE_QUOTE_UNAVAILABLE}
+        if not scheme:
+            return {"message": "请指定当前账号的装备筛选方案，例如 /璐茜玛 刷新星源商店 20 方案名。"}
+        order = {"count": count, "quote": quote, "budget": 0, "scheme": scheme}
+        preview = (f"星源商店最多免费刷新 {count} 次。使用装备方案「{scheme_name}」。"
+                   "命中即停。购买每件消耗 5 个彩虹星源，由本人按档单独确认。")
+        code = json.dumps(order, ensure_ascii=False, separators=(",", ":"))
+        return self.prepare(owner, "refresh_star_source", code, preview=preview, event=event)
 
     def prepare(self, owner: str, task: str, code: str, *, preview: str | None = None, event: str = "") -> dict:
-        if task == "refresh_star_source":
-            return {"status": "quote_unavailable", "message": STAR_SOURCE_QUOTE_UNAVAILABLE}
         self.prune()
         if preview is None and not self.auth_for(owner):
             return {"message": "请先用 /璐茜玛 登录 完成扫码。"}
@@ -739,8 +778,6 @@ class Bridge:
         return "已放弃这份待确认操作。"
 
     def submit(self, owner: str, task: str, code: str, message_id: str, *, scheduled=None) -> dict:
-        if task == "refresh_star_source":
-            return {"status": "quote_unavailable", "message": STAR_SOURCE_QUOTE_UNAVAILABLE}
         self.prune()
         scope = self.accounts.scope_for(owner)
         anchor = (scope, message_id)
@@ -824,6 +861,7 @@ class Bridge:
         self.last.pop(owner, None)
         self.receipts = {key: row for key, row in self.receipts.items() if row[0] != owner}
         self.long_tasks.clear(owner)
+        self.shop_hits = {key: hit for key, hit in self.shop_hits.items() if hit.owner != owner}
         self.filters.drop(owner)
         return "已解除绑定并清除本服务的登录授权。"
 
@@ -873,7 +911,7 @@ class Bridge:
             if len(self.queue) >= QUEUE_SIZE:
                 break
 
-    def result(self, job: Job, message: str, status: str, details=None) -> None:
+    def result(self, job: Job, message: str, status: str, details=None, *, shop_options=None) -> None:
         facts = details if isinstance(details, list) else []
         clean = [" ".join(item.split())[:120] for item in facts[:8] if isinstance(item, str)]
         payload = {"id": job.id, "task": job.label, "status": status,
@@ -886,7 +924,13 @@ class Bridge:
                 payload["view"] = [self.accounts.position_for(job.owner), part[0], *map(int, match.groups()),
                                    part[2] if len(part) > 2 else ""]
         if status == "shop_hit" and job.task in SHOP_REFRESHES:
-            payload["shop_confirm_until"] = payload["completed_at"] + SHOP_HIT_TTL
+            expires = payload["completed_at"] + SHOP_HIT_TTL
+            payload["shop_confirm_until"] = expires
+            shop = "star" if job.task == "refresh_star_source" else "secret"
+            options = self.valid_shop_options(shop, shop_options)
+            if options and job.game:
+                self.shop_hits[job.id] = ShopHit(job.owner, job.game, shop, expires, options)
+                payload["shop_choices"] = self.shop_choices(shop, options)
         if job.durable:
             self.long_tasks.finish(job.id, payload)
         self.last[job.owner] = (time.monotonic() + 3600, message)
@@ -898,19 +942,72 @@ class Bridge:
             self.receipts.pop(next(iter(self.receipts)))
 
     @staticmethod
-    def display_receipt(payload: dict) -> dict:
-        if payload.get("status") == "shop_hit" and payload.get("shop_confirm_until", 0) <= time.time():
-            return {**payload, "status": "ok", "message": f"{payload['task']}：命中确认已超时，本轮已结束。"}
-        return payload
+    def valid_shop_options(shop, options):
+        result = {}
+        for option in options[:6] if isinstance(options, list) else ():
+            if not isinstance(option, dict):
+                continue
+            slot, key, price = (option.get(field) for field in ("slot", "key", "price"))
+            if (type(slot) is int and 1 <= slot <= (3 if shop == "star" else 6)
+                    and isinstance(key, str) and re.fullmatch(r"[0-9a-f]{64}", key)
+                    and isinstance(price, dict) and set(price) == {"currency", "amount"}
+                    and price["currency"] == SHOP_CURRENCIES[shop][0]
+                    and (shop == "secret" and (price["amount"] is None
+                                               or type(price["amount"]) is int and 0 < price["amount"] <= 10**9)
+                         or shop == "star" and type(price["amount"]) is int and price["amount"] == 5)):
+                result[slot] = {"slot": slot, "key": key, "price": price}
+        return result
 
-    def confirm_shop_hit(self, owner: str, job_id: str) -> dict:
+    @staticmethod
+    def shop_choices(shop, options):
+        name = SHOP_CURRENCIES[shop][1]
+        choices = []
+        for slot, option in sorted(options.items()):
+            amount = option["price"]["amount"]
+            label = f"{amount} {name}" if amount is not None else "按游戏固定金币价扣款（当前金额未返回）"
+            choices.append([slot, label])
+        return choices
+
+    def display_receipt(self, payload: dict) -> dict:
+        if payload.get("status") != "shop_hit":
+            return payload
+        visible = {key: value for key, value in payload.items() if key != "shop_choices"}
+        if payload.get("shop_confirm_until", 0) <= time.time():
+            return {**visible, "status": "ok", "message": f"{payload['task']}：命中确认已超时，本轮已结束。"}
+        if "shop_choices" in payload:
+            hit = self.shop_hits.get(payload["id"])
+            if hit:
+                return {**visible, "shop_choices": self.shop_choices(hit.shop, hit.options)}
+            visible["message"] = f"{payload['task']}：购买选项已失效，本轮已结束。"
+            visible["status"] = "ok"
+        return visible
+
+    def buy_shop_hit(self, owner: str, job_id: str, slot: int, event: str) -> dict:
+        self.prune()
+        hit = self.shop_hits.get(job_id)
+        binding = self.vault.record(owner)
+        if (not hit or hit.owner != owner or not binding or binding[0] != hit.game or slot not in hit.options):
+            return {"message": "购买确认无效、已使用或已过期。"}
+        option = hit.options[slot]
+        code = json.dumps({**option, "shop": hit.shop, "expires": hit.expires}, separators=(",", ":"))
+        response = self.submit(owner, "buy_shop_equipment", code, event)
+        if "job" in response:
+            del hit.options[slot]
+            if not hit.options:
+                self.confirm_shop_hit(owner, job_id, purchased=True)
+        return response
+
+    def confirm_shop_hit(self, owner: str, job_id: str, *, purchased=False) -> dict:
         if not self.auth_for(owner):
             return {"message": "请回到原会话并选择发起刷新的账号。"}
         now = int(time.time())
         receipt = self.long_tasks.receipt(owner, job_id, now)
         if not receipt or receipt.get("status") != "shop_hit" or receipt.get("shop_confirm_until", 0) <= now:
             return {"message": "此命中确认无效、已处理或已过期。可输入回执编号查询结果。"}
-        finished = {**receipt, "status": "ok", "message": f"{receipt['task']}：命中已确认，本轮已结束。"}
+        self.shop_hits.pop(job_id, None)
+        finished = {key: value for key, value in receipt.items() if key not in {"shop_choices", "shop_confirm_until"}}
+        summary = "购买任务已提交，请查看购买回执。" if purchased else "命中已确认，本轮已结束。"
+        finished.update(status="ok", message=f"{receipt['task']}：{summary}")
         self.long_tasks.finish(job_id, finished)
         self.save_receipt(owner, finished)
         return {"message": finished["message"], "receipt": finished}
@@ -1025,4 +1122,4 @@ class Bridge:
         outcome = OUTCOMES[status]
         if public_reference and status in {"worker_error", "timeout"}:
             outcome = "暂时无法读取商品参考价，请稍后重试。"
-        self.result(job, f"{job.label}：{outcome}", status, details)
+        self.result(job, f"{job.label}：{outcome}", status, details, shop_options=result.get("shopOptions"))
