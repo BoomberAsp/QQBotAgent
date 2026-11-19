@@ -63,6 +63,8 @@ OUTCOMES = {
     "timeout": "任务超时，请先在游戏内核对结果。",
     "auth_expired": "登录授权已失效，请重新扫码。",
     "game_login_failed": "未能建立游戏会话，本次操作尚未开始。请稍后重试。",
+    "game_login_unavailable": "连接游戏服务器失败，本次操作尚未开始。请稍后重试。",
+    "game_login_rejected": "游戏服务器拒绝建立会话，本次操作尚未开始。",
     "quote_unavailable": "当前无法核实刷新价格，本次未提交刷新。",
     "shop_hit": "筛选命中，刷新已停止，等待确认结束。",
     "invalid_code": "兑换码无效或已过期。",
@@ -561,7 +563,7 @@ class Bridge:
 
     def lobby(self, owner: str) -> dict:
         authorized = bool(self.auth_for(owner))
-        message = "当前游戏账号已授权。" if authorized else "当前没有有效授权。发送 /璐茜玛 登录 重新扫码。"
+        message = "当前账号的门户授权可用。刷新信息时会连接游戏。" if authorized else "当前没有有效授权。发送 /璐茜玛 登录 重新扫码。"
         result = self.navigation(self.accounts.scope_for(owner), "home", message)
         result["menu"] = "lobby" if authorized else "login"
         return result
@@ -575,7 +577,7 @@ class Bridge:
             self.accounts.set_page(scope, page)
         account = ""
         if self.vault.record(owner):
-            state = "授权有效" if self.auth_for(owner) else "待授权"
+            state = "门户已授权" if self.auth_for(owner) else "待授权"
             account = f"当前账号 {self.accounts.label(owner)} · {state}"
         if page == "accounts":
             rows, account_links = [], []
@@ -753,7 +755,7 @@ class Bridge:
         if previous:
             return self.display_receipt(previous)["message"]
         if self.auth_for(owner):
-            return "账号已授权，当前没有任务。"
+            return "门户已授权，当前没有任务。"
         return "当前无有效授权。请用 /璐茜玛 登录 扫码。"
 
     def cancel(self, owner: str, *, job_id: str | None = None) -> str:
