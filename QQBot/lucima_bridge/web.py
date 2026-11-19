@@ -54,6 +54,20 @@ def load_catalog(root: Path) -> list[tuple[tuple[str, ...], str]]:
     ) for row in rows]
 
 
+def load_secret_shop_quote(root: Path) -> dict | None:
+    try:
+        policy = json.loads((root / "assets" / "secret_shop_diamond_quote.json").read_bytes())
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(policy, dict):
+        return None
+    quote = {key: policy.get(key) for key in ("gameVersion", "catalog", "currency", "unitPrice")}
+    if (quote["currency"] != "2" or type(quote["unitPrice"]) is not int or quote["unitPrice"] < 1
+            or not isinstance(quote["gameVersion"], str) or not isinstance(quote["catalog"], str)):
+        return None
+    return quote
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     internal_token = os.environ["LUCIMA_INTERNAL_TOKEN"]
@@ -80,7 +94,7 @@ async def lifespan(app: FastAPI):
         vault = Vault(data_dir / "binding.sqlite3", os.environ["LUCIMA_VAULT_KEY"])
         try:
             worker = Worker(root, str(python))
-            app.state.bridge = Bridge(vault, worker, origin)
+            app.state.bridge = Bridge(vault, worker, origin, secret_shop_quote=load_secret_shop_quote(root))
             queue = asyncio.create_task(app.state.bridge.consume())
             try:
                 yield
@@ -332,6 +346,10 @@ async def propose(request: Request):
     owner = bridge.accounts.active(scope)
     if action == "refresh_star_source" and isinstance(arg, str) and shop_arguments(action, arg):
         return bridge.prepare(owner, action, arg, event=event)
+    if action == "refresh_secret" and isinstance(arg, str) and (order := shop_arguments(action, arg)):
+        count, mode = order
+        if mode == "diamond":
+            return bridge.prepare_secret_shop_paid(owner, count, event)
     preview = operation_preview(action, arg)
     if preview is None:
         return answer("操作或参数无效。", 400)
@@ -469,7 +487,7 @@ async def run_command(request: Request, *, group: bool):
             panel = bridge.navigation(scope, "starshop", f"申请 {count} 次。{STAR_SOURCE_QUOTE_UNAVAILABLE}")
             return {**panel, "status": "quote_unavailable"}
         if mode == "diamond":
-            return bridge.navigation(scope, "secret", f"申请 {count} 次。当前游戏数据缺少可核实的报价，本次未提交刷新。")
+            return bridge.prepare_secret_shop_paid(owner, count, event, scheme=scheme, scheme_name=scheme_name)
         arg = (f"{count} free" if mode == "free" else str(count)) if arg else ""
         if scheme is not None:
             preview = operation_preview(action, arg) + f" 使用装备方案「{scheme_name}」。"

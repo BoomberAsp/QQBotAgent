@@ -1,5 +1,6 @@
 """Offline regressions for the Lucima authorization and process boundaries."""
 import asyncio
+import json
 import os
 import sqlite3
 import sys
@@ -239,6 +240,33 @@ class WebAuthorizationTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(result["receipt"]["status"], "ok")
         self.worker.assert_awaited_once_with({"action": "run", "task": "refresh_secret", "code": "200 free", "auth": AUTH}, 100)
+
+    def test_paid_secret_shop_freezes_90_rounds_and_270_diamond_budget(self):
+        scope = {"group": "shop-room"}
+        ticket = self.command("login", **scope)["login_url"].split("#")[1]
+        pin = self.post("/api/claim", {"ticket": ticket}).json()["pin"]
+        self.command("confirm", arg=pin, **scope)
+        self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub"}).status_code, 200)
+        self.worker.reset_mock()
+        quote = {"gameVersion": "5.0.0.116271", "catalog": "catalog_116310", "currency": "2", "unitPrice": 3}
+        self.client.portal.call(setattr, app.state.bridge, "secret_shop_quote", quote)
+        plan = self.command("refresh_secret", arg="９０ 钻石", event="prepare", **scope)
+        self.assertIn("每次 3 颗钻石", plan["message"])
+        self.assertIn("270 颗钻石", plan["message"])
+        self.worker.assert_not_awaited()
+        self.assertNotIn("job", self.command("approve", arg=plan["approval"], event="other", group="other"))
+        job = self.command("approve", arg=plan["approval"], event="approve", **scope)
+        self.assertTrue(job["long_job"])
+        for _ in range(50):
+            receipt = self.command("receipt", arg=job["job"], **scope)
+            if "receipt" in receipt:
+                break
+            time.sleep(0.01)
+        self.assertEqual(receipt["receipt"]["status"], "ok")
+        payload, timeout = self.worker.await_args.args
+        self.assertEqual(timeout, TASK_TIMEOUT)
+        self.assertEqual(payload["task"], "refresh_secret_paid")
+        self.assertEqual(json.loads(payload["code"]), {"count": 90, "quote": quote, "budget": 270, "scheme": None})
 
     def test_star_source_single_and_batch_stop_before_queue_in_group_and_agent(self):
         for scope in ({}, {"group": "shop-room"}):

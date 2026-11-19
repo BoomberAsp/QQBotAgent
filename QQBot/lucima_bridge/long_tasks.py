@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 
-LONG_NAMES = {"activity": "活动推进", "abyss": "虚构深渊", "buy_batch": "批量购买"}
+LONG_NAMES = {"activity": "活动推进", "abyss": "虚构深渊", "buy_batch": "批量购买",
+              "refresh_secret_paid": "刷新秘密商店"}
 SCHEDULE_TASKS = {
     "signin": "签到", "mail": "领邮件", "base": "领基地", "friend_support": "助战好友",
     "send_meal": "每日体力", "reactor": "动力转换", "potion": "成长药剂", "starforce": "升星水晶",
@@ -19,7 +20,7 @@ TASK_TIMEOUT = 12 * 60
 LONG_QUEUE_TTL = 30 * 60
 RECEIPT_TTL = 24 * 3600
 SHOP_HIT_TTL = 5 * 60
-SHOP_REFRESHES = {"refresh_secret", "refresh_star_source"}
+SHOP_REFRESHES = {"refresh_secret", "refresh_secret_paid", "refresh_star_source"}
 LOCAL = ZoneInfo("Asia/Shanghai")
 
 

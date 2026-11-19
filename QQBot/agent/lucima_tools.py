@@ -41,13 +41,14 @@ TOOLS = {
         ("long_info", "activity", "abyss", "buy_batch", "refresh_secret", "refresh_star_source",
          "schedule_set", "schedule_status", "schedule_stop"),
         "处理长任务：long_info=查询活动、深渊或商店报价，activity=活动推进，abyss=单层虚构深渊，"
-        "buy_batch=批量购买，refresh_secret=秘密商店免费刷新，refresh_star_source=星源商店刷新，"
+        "buy_batch=批量购买，refresh_secret=秘密商店刷新，refresh_star_source=星源商店刷新，"
         "schedule_set=启用每日托管，schedule_status=查看托管，schedule_stop=停止托管。"
         "缺少关卡、队伍、角色或报价时询问用户或先查询，不猜测 ID、数量、预算或价格。",
         "long_info 填 activity、abyss 或 shop；activity 填‘活动ID 队伍ID 最多关数 体力上限’；"
         "abyss 填‘MysteriousRealm_层数 上半角色ID逗号列表 下半角色ID逗号列表’，空位用 -；"
         "buy_batch 填空格分隔的‘商品ID:数量:货币ID:单价’；"
-        "refresh_secret 填用户明确同意的‘次数 free’，免费可用时最多执行一次；refresh_star_source 填‘次数’。"
+        "refresh_secret 填用户指定的‘次数 free’或‘次数 diamond’，钻石模式由系统展示报价并请求确认。"
+        "refresh_star_source 填‘次数’。"
         "次数为 1–200 的整数。星源缺少可核实报价，当前可用 account_view 的 star_source 查询计数。"
         "schedule_set 填‘任务ID HH:MM’（北京时间）；"
         "schedule_stop 可填单项任务ID，留空停止全部。",

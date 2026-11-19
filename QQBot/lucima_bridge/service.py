@@ -356,13 +356,14 @@ class Worker:
 
 
 class Bridge:
-    def __init__(self, vault: Vault, worker: Worker, public_origin: str):
+    def __init__(self, vault: Vault, worker: Worker, public_origin: str, *, secret_shop_quote: dict | None = None):
         self.vault = vault
         self.accounts = AccountSlots(vault)
         self.filters = Filters(vault.db)
         self.long_tasks = LongTasks(vault.db, int(time.time()))
         self.worker = worker
         self.public_origin = public_origin
+        self.secret_shop_quote = secret_shop_quote
         self.tickets: dict[str, Ticket] = {}
         self.login_notices: dict[str, LoginNotice] = {}
         self.attempts: dict[str, float] = {}
@@ -671,6 +672,20 @@ class Bridge:
         response = self.navigation(scope, "accounts")
         response["message"] = f"已退出 {self.accounts.label(owner)}。\n" + response["message"]
         return response
+
+    def prepare_secret_shop_paid(self, owner: str, count: int, event: str, *, scheme=None, scheme_name="") -> dict:
+        quote = self.secret_shop_quote
+        if not quote:
+            return {"status": "quote_unavailable", "message": "秘密商店钻石刷新报价暂不可用，本次未提交刷新。"}
+        price = quote["unitPrice"]
+        budget = count * price
+        code = json.dumps({"count": count, "quote": quote, "budget": budget, "scheme": scheme},
+                          ensure_ascii=False, separators=(",", ":"))
+        preview = (f"秘密商店最多刷新 {count} 次，每次 {price} 颗钻石，扣款上限 {budget} 颗钻石。"
+                   "执行前核对游戏版本、当日剩余额度和余额。自动购买 0 件。")
+        if scheme_name:
+            preview += f" 使用装备方案「{scheme_name}」，命中即停。"
+        return self.prepare(owner, "refresh_secret_paid", code, preview=preview, event=event)
 
     def prepare(self, owner: str, task: str, code: str, *, preview: str | None = None, event: str = "") -> dict:
         if task == "refresh_star_source":
