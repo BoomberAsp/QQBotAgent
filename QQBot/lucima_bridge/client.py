@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import httpx
 
@@ -10,6 +11,16 @@ from lib.button_spec import Btn
 
 
 Actor = tuple[str, str, str, str] | tuple[str, str, str, str, str]
+LOGIN_CONFIRM_COMMAND = "/璐茜玛 确认 <8 位核对码>"
+GROUP_LOGIN_CONFIRM_HINT = (
+    "请由登录发起人回到原群，先 @ 机器人，再发送登录网页显示的完整核对命令。\n"
+    + LOGIN_CONFIRM_COMMAND
+)
+
+
+def is_bare_login_confirmation(text: str) -> bool:
+    """Recognize a login PIN sent without the Lucima command prefix."""
+    return bool(re.fullmatch(r"[/／]?确认\s*[0-9]{8}", text.strip()))
 
 
 def enabled() -> bool:

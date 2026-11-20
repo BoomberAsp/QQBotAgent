@@ -9,6 +9,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from lucima_bridge.client import GROUP_LOGIN_CONFIRM_HINT, is_bare_login_confirmation
+
 from .group_state import GroupStore, scope_for, identity_for
 from .lucima_tools import (
     GROUP_PROMPT as LUCIMA_GROUP_PROMPT, GROUP_PROPOSAL_PROMPT, TOOLS as LUCIMA_TOOLS,
@@ -298,6 +300,10 @@ async def run_group_turn(view, sender=None):
         except Exception:
             pass
     if config["status"] != "active":
+        return
+    if lucima_enabled() and is_bare_login_confirmation(without_mention_prefix(view.text)):
+        if view.mentioned or view.reply_to_bot:
+            await send_text(sender, GROUP_LOGIN_CONFIRM_HINT)
         return
     image_scope = (scope, initial["generation"])
     image_offer = image_source_tools.take_offer(view, image_scope)

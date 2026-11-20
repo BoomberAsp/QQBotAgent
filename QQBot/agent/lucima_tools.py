@@ -6,7 +6,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Callable
 
-from lucima_bridge.client import Actor, approval_card, enabled, request_lucima
+from lucima_bridge.client import Actor, LOGIN_CONFIRM_COMMAND, approval_card, enabled, request_lucima
 from lucima_bridge.manual import MANUAL_TOPICS, manual_text
 from lucima_bridge.proposals import ACCOUNT, LONG, QUERY, REWARDS
 
@@ -35,7 +35,10 @@ GROUP_PROMPT = (
     "璐茜玛（Lucima、璐西玛、露西玛）是星陨账号工具，支持扫码绑定、账号快照、签到和奖励、装备筛选、"
     "商店刷新、活动、虚构深渊和每日托管。用法、可用功能、绑定规则可以直接解释。"
     "同一游戏账号只能绑定一个 QQ 会话里的一个槽位，群内按发起成员隔离；换群或转私聊须先在原会话解绑。"
-    "群内操作和回执会显示在原群。密码只在登录网页填写，不在群里索取或复述密码、令牌、核对码。"
+    "群内操作和回执会显示在原群。账号密码只在登录网页填写，门户令牌由系统处理。"
+    "群内发起登录后，网页会生成一次性核对命令。请明确告诉发起人回到原群 @ 机器人，"
+    f"发送网页上的完整命令 `{LOGIN_CONFIRM_COMMAND}`。这一步应在原群完成。"
+    "说明格式时只展示占位符，并请用户照抄网页命令。"
 )
 GROUP_PROPOSAL_PROMPT = (
     "只有当前成员明确要求为自己查询账号或执行操作时才使用操作提案工具。"
@@ -44,8 +47,9 @@ GROUP_PROPOSAL_PROMPT = (
     "说「帮我用钻石刷秘密商店 90 次」才准备确认卡。"
     "商店方式或数量不明时先问，别默认付费。秘密商店免费即时最多一次；钻石报价由确认卡给出。"
     "有多个任务时请用户选一项。确实缺少关卡、队伍等参数时先追问，别编造 ID。"
-    "工具只准备确认卡，账号查询、登录、修改和执行都等原发起人在本群点按钮或使用卡片上的编号命令。"
-    "自然语言的「确认」「继续」「好」不能批准执行；若它们指的是确认卡，引导使用原卡，不重建提案。"
+    "工具只准备操作确认卡。原发起人通过原卡按钮或 `/璐茜玛 执行 <卡片编号>` 确认提案。"
+    "登录提案获批会打开扫码入口，扫码后的网页核对仍使用网页提供的 8 位核对命令。"
+    "若用户只说「确认」「继续」「好」且是在问操作确认卡，引导使用原卡。"
     "账号切换、添加账号可指导使用 /璐茜玛 大厅。"
 )
 TOOLS = {
@@ -174,7 +178,9 @@ def register_lucima_tools(registry) -> None:
         registry.register(
             name, proposal_tool(operations, 255 if name == "lucima_long" else 64),
             context + "每次只准备一个用户明确要求的操作。系统发确认卡，等用户点击或输入确认。"
-            "用户只回复‘确认’时引导使用原卡，不重复提案。账户、密码、网页核对码和确认令牌均由系统界面处理。",
+            "若用户只回复‘确认’且指的是操作提案，引导使用原卡。"
+            f"网页登录使用网页提供的完整命令 {LOGIN_CONFIRM_COMMAND}，在发起登录的 QQ 会话发送。"
+            "群里发起时由本人在原群 @ 机器人发送。说明格式时只展示占位符。",
             {"type": "object", "properties": {
                 "operation": {"type": "string", "enum": list(operations)},
                 "arg": {"type": "string", "description": parameters},

@@ -253,7 +253,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         async def model(text, *args, allowed_tools, **kwargs):
             run = runtime.current_group_run.get()
             self.assertIn("lucima_long", allowed_tools)
-            self.assertTrue(any("秘密商店怎么刷" in item["content"] for item in run.messages(None, text)))
+            system = "\n".join(item["content"] for item in run.messages(None, text) if item["role"] == "system")
+            self.assertIn("秘密商店怎么刷", system)
+            self.assertIn("回到原群 @ 机器人", system)
+            self.assertIn("/璐茜玛 确认 <8 位核对码>", system)
+            self.assertIn("/璐茜玛 执行 <卡片编号>", system)
             result = await registry.execute("lucima_long", {"operation": "refresh_secret", "arg": "90 diamond"})
             self.assertIn("待确认", result)
             self.assertNotIn(ticket, result)
@@ -492,6 +496,31 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         v=view(message='chat');v.text='<@123> 今天讨论 /群状态 的用法'
         await runtime.run_group_turn(v,self.sender)
         self.assertEqual(len(self.calls),1)
+
+    async def test_bare_lucima_login_pin_is_handled_without_the_agent(self):
+        room = scope_for(view())
+        self.store.configure(room, receive_all=True, mode="natural")
+        pin = "12345678"
+        bridge = AsyncMock()
+        with patch.dict("os.environ", {"LUCIMA_INTERNAL_TOKEN": "test-only"}), \
+                patch("agent.lucima_tools.request_lucima", bridge):
+            for i, text in enumerate((f"确认 {pin}", f"<@bot> 确认{pin}", f"／确认 {pin}")):
+                v = view(message=f"bare-pin-{i}")
+                v.text = text
+                await runtime.run_group_turn(v, self.sender)
+                answer = self.sender.send_group_text.await_args.args[0]
+                self.assertIn("回到原群", answer)
+                self.assertIn("/璐茜玛 确认 <8 位核对码>", answer)
+                self.assertNotIn(pin, answer)
+
+            v = view(message="bare-pin-by-other")
+            v.text = f"<@another> 确认 {pin}"
+            v.mentioned = False
+            await runtime.run_group_turn(v, self.sender)
+            bridge.assert_not_awaited()
+        self.assertEqual(self.sender.send_group_text.await_count, 3)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.store.history(room), [])
 
     async def test_lucima_manual_is_discoverable_and_answers_mentions(self):
         with patch.dict("os.environ", {"BOT_PUBLIC_SITE_URL": "https://bot.example/", "LUCIMA_INTERNAL_TOKEN": ""}):

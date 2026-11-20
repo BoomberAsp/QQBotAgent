@@ -15,8 +15,9 @@ from nonebot.adapters.onebot.v11 import (
     PrivateMessageEvent,
 )
 from nonebot.adapters.qq import Bot as OfficialBot, MessageSegment as OfficialSegment
-from nonebot.adapters.qq.event import C2CMessageCreateEvent, GroupMessageCreateEvent
+from nonebot.adapters.qq.event import C2CMessageCreateEvent, GroupAtMessageCreateEvent, GroupMessageCreateEvent
 
+from agent.group_commands import without_mention_prefix
 from agent.outbound import OutKeyboard
 from lib.button_spec import Btn
 from lucima_bridge.client import Actor, approval_card, enabled, request_lucima
@@ -108,9 +109,9 @@ LOGIN_WATCHERS: dict[str, asyncio.Task] = {}
 
 
 def command_text(event: Event) -> str:
-    if isinstance(event, (PrivateMessageEvent, OneBotGroup)):
-        return event.get_plaintext().strip()
-    if isinstance(event, (C2CMessageCreateEvent, GroupMessageCreateEvent)):
+    if isinstance(event, (OneBotGroup, GroupMessageCreateEvent)):
+        return without_mention_prefix(event.get_plaintext()).strip()
+    if isinstance(event, (PrivateMessageEvent, C2CMessageCreateEvent)):
         return event.get_plaintext().strip()
     return ""
 
@@ -388,7 +389,7 @@ async def handle_official(bot: OfficialBot, event: C2CMessageCreateEvent | Group
     if user and str(user) != str(bot.self_id) and not getattr(event.author, "bot", False):
         actor = ("qq_official", str(bot.self_id), str(user), str(event.id))
         if isinstance(event, GroupMessageCreateEvent):
-            if not event.is_tome() or not event.group_openid:
+            if not event.group_openid or not (event.is_tome() or isinstance(event, GroupAtMessageCreateEvent)):
                 return
             actor = (*actor, event.group_openid)
         result = await call_service(command_text(event), *actor)
