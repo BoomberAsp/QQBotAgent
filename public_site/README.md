@@ -2,7 +2,7 @@
 
 面向**普通用户**的只读静态站（`https://bot.oneweblog.cn`）：介绍 + 使用说明 +
 互动案例与早期录屏 + 命令大全 + 自动同步的更新日志 + 反馈/招募入口。内容以 QQ 官方机器人为主。
-**独立于需登录的 admin WebUI**——无后端、无登录、纯静态。
+展示页、案例和手册由 nginx 直接提供静态文件。人格试聊通过单独的 API 服务运行。
 
 更新日志数据源 `changelog.json` **不由人工维护**：WebUI 面板每次保存更新日志时，
 `webui/data_reader.py::_export_public_changelog()` 会自动把**脱敏后**的
@@ -16,6 +16,7 @@ public_site/
 ├── style.css           深色科技感主题 + 动效（滚动入场 / 光晕 / 导航高亮）
 ├── app.js              导航高亮、chip 复制、视频互斥播放、拉取渲染 changelog.json
 ├── lucima/             从 Lucima 桥接服务的手册源导出的静态页面和样式
+├── try/                人格试聊页面，点击发送或测试连接时调用公开试聊 API
 ├── changelog.json      ← 自动生成（WebUI 保存时导出），勿手改
 └── examples/
     ├── mkv/            原始录屏（1920x1080，内容在左上 610x704 区域）
@@ -36,6 +37,19 @@ python -m http.server 8000
 ## 更新 Lucima 手册
 
 在 `QQBot/lucima_bridge/manual.py` 或 `manual.css` 更新正文和样式。从仓库根目录运行 `python3 scripts/export_lucima_manual.py`，随后提交生成的 `public_site/lucima/` 文件。
+
+## 人格试聊
+
+使用案例中的「试聊」会跳到 `/try/` 并预选人格。访客选择 DeepSeek 或 OpenAI，填写模型 ID 和 API Key 后先测试连接。探测沿用 WebUI 的最小 Chat Completions 请求。一次验证支持同一配置使用 30 分钟。站点进程重启后需要重测。密钥和对话仅保留在当前页面，服务端按请求转发给所选服务商，探测与试聊可能按服务商规则计费。
+
+从仓库根目录使用装有 FastAPI、Uvicorn 和 httpx 的 Python 环境启动独立进程：
+
+```sh
+ROXY_TRY_ORIGIN=https://bot.oneweblog.cn python -m uvicorn public_try:app \
+  --host 127.0.0.1 --port 8093 --workers 1 --limit-concurrency 16 --no-access-log
+```
+
+生产使用一个 API 进程，由 nginx 对试聊入口限流并转发。进程只需读取四份随代码发布的内置角色卡。静态站部署脚本会同步 `try/`，反代和限流见 [nginx 配置](../docs/bot-site-nginx.md)。
 
 ## 部署（nginx）
 

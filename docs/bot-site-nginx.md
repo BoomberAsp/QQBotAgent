@@ -53,9 +53,11 @@ bash deploy_public_site.sh --no-reload  # 只同步，不动 nginx
 
 生产用 `certbot --nginx -d bot.oneweblog.cn --redirect` 签发了 **bot 子域的独立
 证书**（不复用 `oneweblog.cn` apex 证书），并由 certbot 自动托管 443 的 SSL 行与
-80→443 跳转。手写部分只有 `root` 与三个 `location` 缓存策略：
+80→443 跳转。以下配置包含静态文件策略和独立的试聊 API 路由。把限流区声明放在 nginx 的 `http` 上下文。
 
 ```nginx
+limit_req_zone $binary_remote_addr zone=roxy_try:10m rate=10r/m;
+
 # 80：certbot --redirect 自动生成，仅做跳转
 server {
     listen 80;
@@ -82,6 +84,17 @@ server {
     location /assets/ {
         add_header Cache-Control "public, max-age=86400";
         try_files $uri =404;
+    }
+
+    # 公开人格试聊，只反代两个模型请求入口。
+    location ~ ^/try/api/(?:probe|chat)$ {
+        client_max_body_size 96k;
+        limit_req zone=roxy_try burst=4 nodelay;
+        limit_req_status 429;
+        access_log off;
+        proxy_connect_timeout 3s;
+        proxy_read_timeout 40s;
+        proxy_pass http://127.0.0.1:8093;
     }
 
     # 单页站点：其余请求回落 index.html

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self'; form-action 'none'; base-uri 'none'">
+  <title>人格试聊 · Roxy</title>
+  <link rel="stylesheet" href="../style.css">
+  <link rel="stylesheet" href="./try.css">
+  <script src="./try.js" defer></script>
+</head>
+<body class="try-page">
+  <header class="try-bar">
+    <a class="nav-logo" href="../">Roxy<span class="nav-logo-dot" aria-hidden="true"></span></a>
+    <a class="try-return" href="../#demos">返回使用案例</a>
+  </header>
+  <main class="try-shell">
+    <header class="try-title">
+      <h1>人格试聊</h1>
+      <p>选一个角色，用你自己的文字模型聊几句。</p>
+    </header>
+
+    <div class="try-layout">
+      <section class="try-panel try-config" aria-labelledby="config-title">
+        <h2 id="config-title">模型配置</h2>
+        <form id="config-form" method="post">
+          <label for="provider">服务商</label>
+          <select id="provider" required>
+            <option value="deepseek">DeepSeek</option>
+            <option value="openai">OpenAI</option>
+          </select>
+          <label for="model">模型 ID</label>
+          <input id="model" required maxlength="128" placeholder="服务商账户可用的模型 ID" autocomplete="off" spellcheck="false">
+          <label for="api-key">API Key</label>
+          <input id="api-key" type="password" required maxlength="512" autocomplete="off" spellcheck="false" aria-describedby="key-note">
+          <p class="try-note" id="key-note">密钥只保留在当前页。试聊服务按请求转发给所选服务商，测试与对话可能产生模型用量。</p>
+          <button type="submit" class="btn btn-primary try-test" id="probe" disabled>测试连接</button>
+        </form>
+        <p id="connection-status" class="try-status" role="status">等待配置</p>
+      </section>
+
+      <section class="try-panel try-chat" id="chat-panel" data-persona="assistant" aria-labelledby="chat-title">
+        <header class="try-chat-head">
+          <div class="try-avatar" id="persona-mark" aria-hidden="true">R</div>
+          <div>
+            <h2 id="chat-title">助手 Roxy</h2>
+            <p class="try-note">文字试聊</p>
+          </div>
+          <div class="try-persona">
+            <label for="personality">人格</label>
+            <select id="personality">
+              <option value="assistant">助手 Roxy</option>
+              <option value="roxy_character">角色 Roxy</option>
+              <option value="rubi">露比</option>
+              <option value="herta">大黑塔</option>
+            </select>
+          </div>
+        </header>
+
+        <div id="chat-log" class="try-log" role="log" aria-label="试聊对话" tabindex="0"></div>
+        <div id="starter" class="try-starter">
+          <p>不知道从哪句开始？</p>
+          <button type="button" class="chip" id="example" disabled>明早要早起，可我还想再玩十分钟。</button>
+        </div>
+        <form id="chat-form" class="try-composer" method="post">
+          <label for="message">消息</label>
+          <textarea id="message" rows="2" maxlength="2000" required disabled placeholder="请先测试模型连接"></textarea>
+          <div class="try-composer-actions">
+            <button type="button" id="clear-chat" class="btn btn-ghost" disabled>清空对话</button>
+            <button type="submit" id="send" class="btn btn-primary" disabled>发送</button>
+          </div>
+          <p id="chat-status" class="try-status" role="status"></p>
+        </form>
+      </section>
+    </div>
+    <noscript><p class="try-note">请启用 JavaScript 进行试聊，也可以返回使用案例阅读示例对话。</p></noscript>
+  </main>
+</body>
+</html>

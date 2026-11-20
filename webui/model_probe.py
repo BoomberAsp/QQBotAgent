@@ -44,18 +44,34 @@ PROBE_TIMEOUT = 15.0
 PROBE_MAX_TOKENS = 8
 
 
-async def _post(url: str, headers: dict, payload: dict, timeout: float,
-                grade) -> dict:
+def chat_message(response: httpx.Response) -> dict | None:
+    """Read the first assistant message from a chat completions response."""
+    try:
+        message = response.json()["choices"][0]["message"]
+    except (ValueError, KeyError, TypeError, IndexError, RecursionError):
+        return None
+    if not isinstance(message, dict) or message.get("role") != "assistant" or "content" not in message:
+        return None
+    return message if message["content"] is None or isinstance(message["content"], str) else None
+
+
+async def _post(url: str, headers: dict, payload: dict, timeout: float, grade,
+                *, client: httpx.AsyncClient | None = None, require_chat_response: bool = False) -> dict:
     """POST once and pass (status_code, body_text, elapsed_ms) to ``grade``.
 
     Shared transport + exception ladder for both probe flavors; never raises.
     """
     started = time.monotonic()
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, headers=headers, json=payload,
-                                     timeout=timeout)
+        if client is None:
+            async with httpx.AsyncClient() as default_client:
+                resp = await default_client.post(url, headers=headers, json=payload, timeout=timeout)
+        else:
+            resp = await client.post(url, headers=headers, json=payload, timeout=timeout)
         elapsed = int((time.monotonic() - started) * 1000)
+        if require_chat_response and resp.status_code == 200 and chat_message(resp) is None:
+            return {"ok": False, "status": "invalid_response", "elapsed_ms": elapsed,
+                    "detail": "API 没有返回有效的对话响应"}
         return grade(resp.status_code, resp.text[:200].replace("\n", " "),
                      elapsed)
     except (httpx.ConnectError, httpx.ConnectTimeout) as e:
@@ -73,17 +89,22 @@ async def _post(url: str, headers: dict, payload: dict, timeout: float,
 
 
 async def probe_model(api_key: str, api_base: str, model: str,
-                      *, section: str = "", timeout: float = PROBE_TIMEOUT) -> dict:
+                      *, section: str = "", timeout: float = PROBE_TIMEOUT,
+                      client: httpx.AsyncClient | None = None,
+                      chat_parameters: dict | None = None, require_chat_response: bool = False) -> dict:
     """Probe one model section. Never raises.
 
     Dispatches by section: chat models → ``{api_base}/chat/completions``
     with a minimal message; media sections (MEDIA_SECTIONS) → api_base
     verbatim with an empty-input body (zero billable generation).
 
+    A supplied client and provider-specific chat parameters let the public
+    Playground use the same probe and opt into chat response validation.
+
     Returns ``{"ok": bool, "status": str, "elapsed_ms": int, "detail": str}``
     where status is one of:
       ok | ok_with_warning | auth_failed | unreachable | bad_path |
-      rejected | missing_config
+      rejected | missing_config | invalid_response
     """
     api_key = (api_key or "").strip()
     api_base = (api_base or "").strip()
@@ -130,14 +151,14 @@ async def probe_model(api_key: str, api_base: str, model: str,
             return {"ok": False, "status": "rejected", "elapsed_ms": elapsed,
                     "detail": f"API 拒绝了请求 (HTTP {code}): {body}"}
 
-        return await _post(url, headers, payload, timeout, grade)
+        return await _post(url, headers, payload, timeout, grade, client=client)
 
     url = f"{api_base}/chat/completions"  # same join as deepseek_client.py
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": "Hi"}],
-        "max_tokens": PROBE_MAX_TOKENS,
         "stream": False,
+        **(chat_parameters if chat_parameters is not None else {"max_tokens": PROBE_MAX_TOKENS}),
     }
 
     def grade_chat(code, body, elapsed):
@@ -158,7 +179,8 @@ async def probe_model(api_key: str, api_base: str, model: str,
         return {"ok": False, "status": "rejected", "elapsed_ms": elapsed,
                 "detail": f"API 拒绝了请求 (HTTP {code}): {body}"}
 
-    return await _post(url, headers, payload, timeout, grade_chat)
+    return await _post(url, headers, payload, timeout, grade_chat, client=client,
+                       require_chat_response=require_chat_response)
 
 
 def section_needs_probe(new_section: dict, old_section: dict) -> bool:

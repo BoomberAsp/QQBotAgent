@@ -803,7 +803,7 @@ a { color: var(--accent-2); text-decoration: none; }
   border-color: var(--line-strong);
   background: var(--panel-2);
 }
-.case-stage:focus-visible, .case-buttons button:focus-visible, .persona-example button:focus-visible {
+.case-stage:focus-visible, .case-buttons button:focus-visible, .persona-actions .chip:focus-visible {
   outline: 2px solid var(--accent-2);
   outline-offset: 2px;
 }
@@ -829,7 +829,12 @@ a { color: var(--accent-2); text-decoration: none; }
   line-height: 1.65;
   font-size: .9rem;
 }
-.persona-example button { align-self: flex-start; max-width: 100%; white-space: normal; }
+.persona-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.persona-actions .chip { max-width: 100%; white-space: normal; }
+.persona-actions .persona-try {
+  border-color: var(--persona-accent, var(--accent-2));
+  color: var(--text);
+}
 
 .sample-sticker {
   display: grid;
