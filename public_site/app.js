@@ -108,11 +108,73 @@
   });
 
   /* ── 演示视频：同一时间只播放一个 ── */
+  var activeCase = null;
   var videos = Array.prototype.slice.call(document.querySelectorAll('.demo-card video'));
   videos.forEach(function (v) {
     v.addEventListener('play', function () {
+      if (activeCase) activeCase();
       videos.forEach(function (o) { if (o !== v && !o.paused) o.pause(); });
     });
+  });
+
+  /* 动画案例由 HTML 提供完整文字。只有读者点播放后才开始计时。 */
+  document.querySelectorAll('[data-case-player]').forEach(function (player) {
+    var stage = player.querySelector('.case-stage');
+    var steps = Array.from(stage.children);
+    var controls = player.querySelector('.case-controls');
+    var playButton = controls.querySelector('[data-case-play]');
+    var previous = controls.querySelector('[data-case-prev]');
+    var next = controls.querySelector('[data-case-next]');
+    var replay = controls.querySelector('[data-case-replay]');
+    var position = controls.querySelector('[data-case-position]');
+    var step = 0;
+    var timer = null;
+
+    function stop() {
+      clearTimeout(timer);
+      timer = null;
+      if (activeCase === stop) activeCase = null;
+      playButton.textContent = step === steps.length - 1 ? '再播放' : '播放';
+    }
+
+    function show(index, animate) {
+      step = index;
+      steps.forEach(function (item, at) {
+        item.hidden = at > step;
+        item.toggleAttribute('data-case-enter', animate && at === step);
+      });
+      previous.disabled = step === 0;
+      next.disabled = step === steps.length - 1;
+      position.value = (step + 1) + ' / ' + steps.length;
+      stage.scrollTop = animate ? stage.scrollHeight : 0;
+    }
+
+    function advance() {
+      show(step + 1, true);
+      if (step < steps.length - 1) timer = setTimeout(advance, 1850);
+      else stop();
+    }
+
+    function start(restart) {
+      if (activeCase) activeCase();
+      videos.forEach(function (video) { if (!video.paused) video.pause(); });
+      if (restart || step === steps.length - 1) show(0, false);
+      activeCase = stop;
+      playButton.textContent = '暂停';
+      timer = setTimeout(advance, 1850);
+    }
+
+    playButton.addEventListener('click', function () { if (timer !== null) stop(); else start(false); });
+    replay.addEventListener('click', function () { start(true); });
+    previous.addEventListener('click', function () { show(step - 1, true); stop(); });
+    next.addEventListener('click', function () { show(step + 1, true); stop(); });
+    show(0, false);
+    controls.hidden = false;
+    stage.tabIndex = 0;
+    player.classList.add('is-enhanced');
+  });
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && activeCase) activeCase();
   });
 
   /* ── 更新日志渲染 ── */

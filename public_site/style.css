@@ -679,6 +679,215 @@ a { color: var(--accent-2); text-decoration: none; }
 .demo-grid .reveal:nth-child(7) { transition-delay: .24s; }
 .demo-grid .reveal:nth-child(8) { transition-delay: .32s; }
 
+
+/* ── 人格对比与交互演示 ───────────────────────────────── */
+.lucima-intro {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  gap: 24px;
+  padding: clamp(18px, 4vw, 32px);
+  margin-bottom: 28px;
+  border: 1px solid rgba(232, 167, 208, .25);
+  border-radius: var(--radius);
+  background: radial-gradient(ellipse at 0 0, rgba(160, 79, 131, .22), transparent 72%), var(--panel);
+}
+.lucima-intro h3 { font-size: 1.18rem; }
+.lucima-intro p { margin-top: 8px; color: var(--text-dim); }
+.lucima-intro .btn { margin-top: 16px; }
+.lucima-details {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  border-left: 1px solid rgba(232, 167, 208, .2);
+  padding-left: 24px;
+}
+.lucima-details p { margin: 0; }
+.lucima-details strong { color: #f6c8e4; }
+
+.case-section-head { margin: 32px 0 14px; }
+#group-cases { scroll-margin-top: calc(var(--nav-h) + 16px); }
+.case-section-head h3 { font-size: 1.28rem; }
+.case-section-head p { margin-top: 4px; color: var(--text-dim); }
+.case-deck, .persona-grid { display: grid; gap: 14px; }
+.case-deck { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.case-deck--group { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.case-player, .persona-example {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.case-head { padding: 16px; }
+.case-head h3 { font-size: 1rem; }
+.case-head p { margin-top: 5px; color: var(--text-dim); font-size: .88rem; }
+.case-stage {
+  flex: 1;
+  list-style: none;
+  margin: 0;
+  padding: 14px 12px;
+  background: var(--bg-soft);
+  border-block: 1px solid var(--line);
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+.case-player.is-enhanced .case-stage {
+  flex: none;
+  height: 18rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: #45607d var(--bg-soft);
+  border-radius: 0;
+}
+.case-player.is-enhanced .case-head { flex: 1; }
+.case-step {
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+.case-step:last-child { margin-bottom: 0; }
+.case-step--user { justify-items: end; }
+.case-name { color: var(--text-dim); font-size: .75rem; }
+.case-bubble {
+  max-width: 96%;
+  padding: 8px 10px;
+  border-radius: 10px 10px 10px 3px;
+  background: #1b293b;
+  font-size: .89rem;
+  line-height: 1.52;
+  overflow-wrap: anywhere;
+}
+.case-step--user .case-bubble {
+  border-radius: 10px 10px 3px 10px;
+  background: #22395c;
+}
+.case-step--system .case-bubble {
+  max-width: 100%;
+  border: 1px dashed var(--line-strong);
+  background: none;
+  color: var(--text-dim);
+}
+.case-step[data-case-enter] { animation: case-enter .28s ease-out both; }
+@keyframes case-enter {
+  from { opacity: 0; transform: translateY(7px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.case-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+}
+.case-buttons { display: flex; flex-wrap: wrap; gap: 4px; }
+.case-buttons button {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 5px 7px;
+  min-height: 34px;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: .82rem;
+  cursor: pointer;
+}
+.case-buttons button:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+.case-buttons button:disabled { opacity: .5; cursor: default; }
+.case-buttons .case-play {
+  color: var(--text);
+  border-color: var(--line-strong);
+  background: var(--panel-2);
+}
+.case-stage:focus-visible, .case-buttons button:focus-visible, .persona-example button:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 2px;
+}
+.case-position { color: var(--text-dim); white-space: nowrap; font-size: .78rem; }
+.case-controls[hidden], .case-step[hidden] { display: none; }
+
+.persona-question {
+  margin-bottom: 12px;
+  padding: 13px 16px;
+  background: var(--bg-soft);
+  border-left: 3px solid var(--accent-2);
+  border-radius: 0 8px 8px 0;
+}
+.persona-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.persona-example { padding: 14px; border-top: 2px solid var(--persona-accent, var(--accent-2)); }
+.persona-example--roxy_character { --persona-accent: #7da7ff; }
+.persona-example--rubi { --persona-accent: #f4a9bf; }
+.persona-example--herta { --persona-accent: #bbaeff; }
+.persona-example blockquote {
+  flex: 1;
+  margin: 10px 0 14px;
+  color: var(--text-dim);
+  line-height: 1.65;
+  font-size: .9rem;
+}
+.persona-example button { align-self: flex-start; max-width: 100%; white-space: normal; }
+
+.sample-sticker {
+  display: grid;
+  width: 132px;
+  justify-items: center;
+  gap: 3px;
+  padding: 14px 8px 10px;
+  color: #4d2a50;
+  background: #ffe3ed;
+  border-radius: 24px 12px 20px 16px;
+  border: 2px solid #fff2f7;
+  transform: rotate(-3deg);
+}
+.sample-sticker-face {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  place-items: center;
+  width: 60px;
+  height: 44px;
+  border: 2px solid #704867;
+  border-radius: 43% 43% 52% 52%;
+  background: #fff7e8;
+}
+.sample-sticker-face::before, .sample-sticker-face::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  top: -8px;
+  width: 16px;
+  height: 17px;
+  border: 2px solid #704867;
+  border-radius: 6px 10px 5px 10px;
+  background: #ffd3dc;
+  transform: rotate(-28deg);
+}
+.sample-sticker-face::before { left: 2px; }
+.sample-sticker-face::after { right: 2px; transform: rotate(28deg); }
+.sample-sticker-face span {
+  width: 5px;
+  height: 5px;
+  margin-right: 19px;
+  border-radius: 50%;
+  background: #704867;
+  box-shadow: 19px 0 #704867, 9.5px 7px #d67891;
+}
+.sample-sticker strong { font-size: .95rem; line-height: 1.5; }
+.guide-body .channel-note { margin-top: 6px; color: var(--text-dim); }
+
+@media (max-width: 960px) {
+  .persona-grid, .case-deck { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 600px) {
+  .persona-grid, .case-deck, .case-deck--group, .lucima-intro { grid-template-columns: minmax(0, 1fr); }
+  .lucima-details { padding: 16px 0 0; border-left: 0; border-top: 1px solid var(--line-strong); }
+  .case-player.is-enhanced .case-stage { height: 16rem; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   *, *::before, *::after {

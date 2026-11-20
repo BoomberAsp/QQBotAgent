@@ -39,7 +39,7 @@ RELOAD=1
 
 # 需要同步的静态条目（不含 changelog.json —— 那是面板的产物；
 # examples 只同步网页播放用的 mp4 与封面，原始 mkv 不上站）
-ITEMS=(index.html style.css app.js assets examples/mp4 examples/posters)
+ITEMS=(index.html style.css app.js assets lucima examples/mp4 examples/posters)
 
 echo "源目录:   $SRC"
 echo "nginx root: $DST"

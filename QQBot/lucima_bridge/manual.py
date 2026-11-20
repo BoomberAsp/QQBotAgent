@@ -120,7 +120,7 @@ def command_row(command: str, description: str) -> str:
     return f'<p class="command"><code>{escape(command)}</code><span>{escape(description)}</span></p>'
 
 
-def render_manual() -> str:
+def render_manual(*, stylesheet: str = "/manual.css") -> str:
     links, sections = [], []
     for number, (topic, body) in enumerate(MANUAL_TOPICS.items(), start=1):
         anchor = f"topic-{number}"
@@ -143,7 +143,7 @@ def render_manual() -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{MANUAL_TITLE}</title>
-  <link rel="stylesheet" href="/manual.css">
+  <link rel="stylesheet" href="{escape(stylesheet)}">
 </head>
 <body>
   <a class="skip" href="#content">跳到手册正文</a>

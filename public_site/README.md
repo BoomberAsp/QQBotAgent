@@ -1,7 +1,7 @@
 # public_site — Roxy 公开使用站点
 
 面向**普通用户**的只读静态站（`https://bot.oneweblog.cn`）：介绍 + 使用说明 +
-录屏案例 + 命令大全 + 自动同步的更新日志 + 反馈/招募入口。
+互动案例与早期录屏 + 命令大全 + 自动同步的更新日志 + 反馈/招募入口。内容以 QQ 官方机器人为主。
 **独立于需登录的 admin WebUI**——无后端、无登录、纯静态。
 
 更新日志数据源 `changelog.json` **不由人工维护**：WebUI 面板每次保存更新日志时，
@@ -15,6 +15,7 @@ public_site/
 ├── index.html          单页（hero / 介绍 / 使用说明 / 案例 / 命令 / 更新日志 / 反馈 / 招募）
 ├── style.css           深色科技感主题 + 动效（滚动入场 / 光晕 / 导航高亮）
 ├── app.js              导航高亮、chip 复制、视频互斥播放、拉取渲染 changelog.json
+├── lucima/             从 Lucima 桥接服务的手册源导出的静态页面和样式
 ├── changelog.json      ← 自动生成（WebUI 保存时导出），勿手改
 └── examples/
     ├── mkv/            原始录屏（1920x1080，内容在左上 610x704 区域）
@@ -31,6 +32,10 @@ python -m http.server 8000
 ```
 
 删除 `changelog.json` 再刷新，页面应显示「暂无更新记录」而非报错（优雅降级）。
+
+## 更新 Lucima 手册
+
+在 `QQBot/lucima_bridge/manual.py` 或 `manual.css` 更新正文和样式。从仓库根目录运行 `python3 scripts/export_lucima_manual.py`，随后提交生成的 `public_site/lucima/` 文件。
 
 ## 部署（nginx）
 

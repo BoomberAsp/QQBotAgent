@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Roxy · QQ 群智能助手</title>
-<meta name="description" content="Roxy 是挂在 QQ 群里的 LLM 智能助手：问答、聚合搜索、翻译、地图路线、游戏资料与兑换码、文件与语音理解，还会记住你。本站提供使用说明、实际演示、命令大全与更新日志。">
+<meta name="description" content="在 QQ 官方机器人上体验 Roxy 的人格对话、群聊参与、找图反查和 Lucima 游戏工具。本站提供可播放案例、使用说明和可复制命令。">
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>
@@ -16,6 +16,7 @@
     <div class="nav-links" id="nav-links">
       <a href="#intro" class="nav-link">介绍</a>
       <a href="#guide" class="nav-link">使用说明</a>
+      <a href="#lucima" class="nav-link">Lucima</a>
       <a href="#demos" class="nav-link">使用案例</a>
       <a href="#commands" class="nav-link">命令大全</a>
       <a href="#changelog" class="nav-link">更新日志</a>
@@ -35,16 +36,15 @@
   <div class="hero-grid"></div>
   <div class="hero-inner">
     <div class="hero-copy">
-      <p class="hero-badge reveal">QQ 群智能助手 · LLM Agent 架构</p>
+      <p class="hero-badge reveal">QQ 官方机器人</p>
       <h1 class="reveal">Roxy</h1>
-      <p class="hero-slogan reveal">把 AI 装进你的 QQ 群</p>
+      <p class="hero-slogan reveal">在 QQ 里聊天、查资料和处理游戏任务</p>
       <p class="hero-sub reveal">
-        会聊天、会搜全网、会规划路线、会读 PDF 和语音，
-        还是 Ark Re:Code 的资料库与兑换码播报员——并且会记住你。
+        切换人格和 Roxy 聊天，在群里体验免 @ 追问，或用 Lucima 查询 Ark Re:Code 账号、领取奖励和设置每日托管。
       </p>
       <div class="hero-actions reveal">
         <a class="btn btn-primary" href="#guide">开始使用</a>
-        <a class="btn btn-ghost" href="#demos">看实际演示</a>
+        <a class="btn btn-ghost" href="#demos">看使用案例</a>
       </div>
     </div>
     <div class="hero-art reveal">
@@ -52,10 +52,10 @@
     </div>
   </div>
   <div class="hero-stats reveal">
-    <div class="stat"><b>20</b><span>轮工具调用 / 单次请求</span></div>
-    <div class="stat"><b>3</b><span>种可切换人格</span></div>
-    <div class="stat"><b>90s</b><span>群聊免 @ 追问窗口</span></div>
-    <div class="stat"><b>0</b><span>系统命令 token 消耗</span></div>
+    <div class="stat"><b>人格</b><span>内置角色与自创角色</span></div>
+    <div class="stat"><b>群聊</b><span>仅召唤、跟随和自然参与</span></div>
+    <div class="stat"><b>找图</b><span>从图片查作品和来源</span></div>
+    <div class="stat"><b>Lucima</b><span>游戏账号工具与每日托管</span></div>
   </div>
   <div class="hero-scroll-hint" aria-hidden="true"></div>
 </header>
@@ -82,16 +82,16 @@
       <p>三层记忆引擎自动从对话中提取事实：重复提及的会被强化记住，长期不用的逐渐衰减。</p>
     </div>
     <div class="card reveal">
-      <h3>三种人格</h3>
-      <p>助手 Roxy、角色 Roxy、露比三种人格提示词驱动，<code>/人格切换</code> 即时切换，群聊还可由机器人管理员绑定默认人格。</p>
+      <h3>内置与自创人格</h3>
+      <p>私聊用 <code>/人格切换</code> 查看可用人格。内置角色如角色 Roxy、露比和大黑塔，各有自己的回复风格。机器人管理员可用 <code>/群人格</code> 设置本群的内置人格。</p>
     </div>
     <div class="card reveal">
       <h3>专属工作区</h3>
       <p>每个 QQ 号拥有独立文件空间（代码 / 上传 / 输出 / 项目子目录），按权限分配 100MB 至 2GB 配额，互不可见。</p>
     </div>
     <div class="card reveal">
-      <h3>本地部署 · 隐私优先</h3>
-      <p>基于 NoneBot2 + NapCat（OneBot V11）自建部署，文件操作全部限制在沙箱工作区内，对话数据仅本地存储、不用于训练。你可以随时删除自己的文件/聊天记录。</p>
+      <h3>QQ 官方渠道</h3>
+      <p>通过 QQ 官方机器人在群聊或私聊使用。支持的场景可显示 Markdown 和按钮，官方私聊还可分段显示处理进度与回复。实际能力取决于部署开关和 QQ 客户端。</p>
     </div>
   </div>
 </section>
@@ -100,7 +100,7 @@
 <section class="section" id="guide">
   <div class="section-head reveal">
     <h2>使用说明</h2>
-    <p class="section-sub">从零到熟练：怎么说话、怎么用命令、会话怎么管。</p>
+    <p class="section-sub">以下操作以 QQ 官方机器人为准。NapCat 入口受风控影响，近期未验证稳定性。</p>
   </div>
 
   <div class="guide-stack">
@@ -109,7 +109,7 @@
       <div class="guide-num">01</div>
       <div class="guide-body">
         <h3>怎么开始对话</h3>
-        <p><b>私聊</b>：直接发消息即可，无需 @。<b>群聊</b>：发送 <code>@Roxy + 内容</code> 触发。</p>
+        <p><b>私聊</b>直接发消息即可。<b>群聊</b>先 @ Roxy 或引用回复机器人。使用群命令时建议先 @。</p>
         <p>不需要记任何命令。搜索、翻译、天气、路线、查资料……像和朋友说话一样直接提需求，它会自己决定调用哪些工具。</p>
       </div>
     </div>
@@ -118,13 +118,13 @@
       <div class="guide-num">02</div>
       <div class="guide-body">
         <h3>群聊免 @ 窗口（连续对话）</h3>
-        <p>在群里 @ 过它一次之后，会开启一个 <b>90 秒</b>的连续对话窗口：窗口内继续发消息<b>不需要再 @</b>，它会直接接话。</p>
+        <p>打开 <button class="chip chip-inline" data-copy="/群状态">/群状态</button> 查看本群的参与模式。默认仅在被 @ 或被引用回复时响应。</p>
         <ul>
-          <li>每发一条消息，90 秒倒计时<b>重新计满</b>——只要聊得够快，窗口一直续着。</li>
-          <li>90 秒内没人说话，窗口自动关闭，恢复「必须 @ 才理你」。</li>
-          <li>想提前退出：发送 <button class="chip chip-inline" data-copy="/取消">/取消</button> 或 <button class="chip chip-inline" data-copy="#取消">#取消</button>。</li>
-          <li>窗口按「群 + 人」独立计算，你在 A 群的窗口不影响 B 群。</li>
+          <li><strong>跟随</strong>模式下，被召唤且回复成功后，默认给同一位发起人 120 秒、最多 2 次免 @ 追问。追问不会重新计时。</li>
+          <li><strong>自然</strong>模式下，机器人可以根据对话决定是否加入。启用主动贴图且当前人格有可用群素材时，也可以只发一张表情包。</li>
+          <li>免 @ 需要群里开启非 @ 消息接收。QQ 官方渠道还需要平台向机器人推送普通群消息，群主可在机器人设置里检查全量推送。</li>
         </ul>
+        <p class="channel-note"><a href="#group-cases">查看免 @ 追问和主动贴图的演示</a></p>
       </div>
     </div>
 
@@ -136,7 +136,7 @@
         <ul>
           <li>符号必须是消息的<b>第一个字符</b>，前面不能有空格或其他内容。</li>
           <li>必须用<b>半角</b>符号。全角的 <code>／</code> 和 <code>＃</code> 不会被识别，会被当成普通聊天内容交给 AI。</li>
-          <li>命令由系统直接处理、<b>不经过 AI、零 token 消耗</b>，所以响应几乎即时；没命中命令的文本才会进入智能体循环。</li>
+          <li>按命令提示补齐参数。Lucima 的游戏操作有独立的确认、排队和回执流程。</li>
         </ul>
       </div>
     </div>
@@ -152,7 +152,7 @@
           </thead>
           <tbody>
             <tr><th>创建方式</th><td>发消息即存在，无需操作</td><td><code>/新会话 [名称]</code> 创建，或 <code>/保存为会话 &lt;名称&gt;</code> 把临时对话存档</td></tr>
-            <tr><th>上下文容量</th><td>只保留最近 <b>20 条</b>消息，更早的被挤掉</td><td>完整上下文持久保存，长对话不丢细节</td></tr>
+            <tr><th>上下文容量</th><td>默认带入近期对话，受请求预算约束</td><td>可持久保存，长会话可用 <code>/压缩会话</code> 生成摘要</td></tr>
             <tr><th>过期策略</th><td><b>30 分钟</b>不活跃自动过期清空</td><td>永久保存，直到你 <code>/删除会话</code></td></tr>
             <tr><th>数量限制</th><td>每人 1 个</td><td>按权限：管理员 10 个 / VIP 3 个 / 普通 1 个</td></tr>
             <tr><th>管理命令</th><td><code>/clear</code> 或发「新对话」清空重来</td><td><code>/切换会话</code> <code>/会话列表</code> <code>/重命名会话</code> <code>/删除会话</code> <code>/结束会话</code></td></tr>
@@ -195,6 +195,162 @@
       </div>
     </div>
 
+    <div class="guide-card reveal">
+      <div class="guide-body">
+        <h3>找图、剧情和问卷</h3>
+        <ul>
+          <li><strong>找图反查</strong> 随图片发送 <code>/找图</code>，或引用图片后发送。支持查询插画出处、画师或番剧线索。图片会交给第三方匹配服务，详情可用 <code>/找图帮助</code> 查看。</li>
+          <li><strong>原作剧情</strong> 部署了对应资料库后，大黑塔可查《崩坏：星穹铁道》剧情，助手 Roxy 和露比可查 Ark Re:Code 资料。群聊按本群人格使用对应资料。</li>
+          <li><strong>逐题填写问卷</strong> 功能启用时，可发送 <code>/问卷 &lt;链接&gt;</code> 填写支持的 SurveyCake 问卷。先查看草稿，再由本人确认提交。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Lucima -->
+<section class="section" id="lucima">
+  <div class="section-head">
+    <h2>在 QQ 里用 Lucima</h2>
+    <p class="section-sub">给 Ark Re:Code 账号查资源、领日常奖励、设置托管，也可以按报价刷新商店。</p>
+  </div>
+  <div class="lucima-intro">
+    <div>
+      <h3>从一条命令开始</h3>
+      <p>群里先 @ 机器人，私聊直接发送。使用手册无需绑定游戏账号。</p>
+      <div class="chips">
+        <button type="button" class="chip" data-copy="/lucima 使用手册">/lucima 使用手册</button>
+        <button type="button" class="chip" data-copy="/lucima 登录">/lucima 登录</button>
+        <button type="button" class="chip" data-copy="/lucima 大厅">/lucima 大厅</button>
+      </div>
+      <a class="btn btn-primary" href="./lucima/">阅读完整版手册</a>
+    </div>
+    <div class="lucima-details">
+      <p><strong>授权与执行</strong> 扫码后只获取门户授权。查询会临时连接游戏，操作由本人确认后入队。</p>
+      <p><strong>每日托管</strong> 需要记住登录并为该账号单独设置任务。按北京时间入队，冷却或额度未满足会跳过。</p>
+      <p><strong>执行结果</strong> 用 <code>/lucima 状态</code> 看进度，用 <code>/lucima 回执</code> 取结果。</p>
+    </div>
+  </div>
+  <div class="case-section-head">
+    <h3>操作演示</h3>
+    <p>模拟对话，按真实流程编写。可播放或逐步查看。</p>
+  </div>
+  <div class="case-deck">
+    <article class="case-player" data-case-player>
+      <header class="case-head">
+        <h3>从手册到游戏大厅</h3>
+        <p>演示在群里从查看手册到成功绑定游戏账号。</p>
+      </header>
+      <ol class="case-stage" aria-label="从手册到游戏大厅的演示步骤">
+        <li class="case-step case-step--user">
+          <span class="case-name">小满</span>
+          <div class="case-bubble"><code>@Roxy /lucima 使用手册</code></div>
+        </li>
+        <li class="case-step case-step--bot">
+          <span class="case-name">Roxy</span>
+          <div class="case-bubble">Lucima QQ 使用手册<br>发送概览与完整版网页入口。</div>
+        </li>
+        <li class="case-step case-step--user">
+          <span class="case-name">小满</span>
+          <div class="case-bubble"><code>@Roxy /lucima 登录</code></div>
+        </li>
+        <li class="case-step case-step--system">
+          <span class="case-name">网页登录</span>
+          <div class="case-bubble">小满打开二维码，在 QQ 原群发送网页显示的核对命令，再回网页授权。</div>
+        </li>
+        <li class="case-step case-step--bot">
+          <span class="case-name">Roxy</span>
+          <div class="case-bubble">登录成功 · QQ 会话已绑定<br>返回璐茜玛大厅，可查看账号或选择任务。</div>
+        </li>
+      </ol>
+      <div class="case-controls" role="group" aria-label="从手册到游戏大厅的播放控制" hidden>
+        <div class="case-buttons">
+          <button type="button" class="case-play" data-case-play>播放</button>
+          <button type="button" data-case-prev>上一步</button>
+          <button type="button" data-case-next>下一步</button>
+          <button type="button" data-case-replay>重播</button>
+        </div>
+        <output class="case-position" data-case-position aria-live="polite"></output>
+      </div>
+    </article>
+    <article class="case-player" data-case-player>
+      <header class="case-head">
+        <h3>自然语言发起任务</h3>
+        <p>在原群由发起人确认后执行。任务仍需满足游戏内的领取条件。</p>
+      </header>
+      <ol class="case-stage" aria-label="自然语言发起任务的演示步骤">
+        <li class="case-step case-step--user">
+          <span class="case-name">小满</span>
+          <div class="case-bubble">@Roxy 帮我执行一次动力转换。</div>
+        </li>
+        <li class="case-step case-step--bot">
+          <span class="case-name">Roxy</span>
+          <div class="case-bubble"><strong>动力转换 · 执行一次</strong><br>账号 1 · 等待发起人在 5 分钟内确认。</div>
+        </li>
+        <li class="case-step case-step--user">
+          <span class="case-name">小满</span>
+          <div class="case-bubble"><code>@Roxy /璐茜玛 执行 &lt;确认编号&gt;</code></div>
+        </li>
+        <li class="case-step case-step--bot">
+          <span class="case-name">Roxy</span>
+          <div class="case-bubble">已提交动力转换。用 /璐茜玛 状态 查看进度。</div>
+        </li>
+        <li class="case-step case-step--bot">
+          <span class="case-name">Roxy</span>
+          <div class="case-bubble"><strong>动力转换：本次没有可执行项目。</strong><br>这个例子中，距离上次领取的时间尚未达到领取间隔。</div>
+        </li>
+      </ol>
+      <div class="case-controls" role="group" aria-label="自然语言发起任务的播放控制" hidden>
+        <div class="case-buttons">
+          <button type="button" class="case-play" data-case-play>播放</button>
+          <button type="button" data-case-prev>上一步</button>
+          <button type="button" data-case-next>下一步</button>
+          <button type="button" data-case-replay>重播</button>
+        </div>
+        <output class="case-position" data-case-position aria-live="polite"></output>
+      </div>
+    </article>
+    <article class="case-player" data-case-player>
+      <header class="case-head">
+        <h3>核对商店报价和购买</h3>
+        <p>选择钻石刷新时先核对报价。命中装备后，在结果卡上单独确认购买。</p>
+      </header>
+      <ol class="case-stage" aria-label="核对商店报价和购买的演示步骤">
+        <li class="case-step case-step--user">
+          <span class="case-name">小满</span>
+          <div class="case-bubble"><code>@Roxy /lucima 刷新秘密商店 5 钻石 速度戒指 目标=无</code></div>
+        </li>
+        <li class="case-step case-step--bot">
+          <span class="case-name">Roxy</span>
+          <div class="case-bubble"><strong>刷新确认 · 最多 5 次</strong><br>确认卡列出单次报价和本轮钻石上限。普通道具购买目标为空。</div>
+        </li>
+        <li class="case-step case-step--user">
+          <span class="case-name">小满</span>
+          <div class="case-bubble"><code>@Roxy /璐茜玛 执行 &lt;确认编号&gt;</code></div>
+        </li>
+        <li class="case-step case-step--bot">
+          <span class="case-name">Roxy</span>
+          <div class="case-bubble"><strong>发现第 1 档命中装备</strong><br>本轮停止刷新。发起人可查看装备和报价，再选购买或结束。</div>
+        </li>
+        <li class="case-step case-step--user">
+          <span class="case-name">小满</span>
+          <div class="case-bubble"><code>@Roxy /lucima 购买命中 &lt;回执编号&gt; 1</code></div>
+        </li>
+        <li class="case-step case-step--bot">
+          <span class="case-name">Roxy</span>
+          <div class="case-bubble">购买回执显示已确认的结算和实际消耗。</div>
+        </li>
+      </ol>
+      <div class="case-controls" role="group" aria-label="核对商店报价和购买的播放控制" hidden>
+        <div class="case-buttons">
+          <button type="button" class="case-play" data-case-play>播放</button>
+          <button type="button" data-case-prev>上一步</button>
+          <button type="button" data-case-next>下一步</button>
+          <button type="button" data-case-replay>重播</button>
+        </div>
+        <output class="case-position" data-case-position aria-live="polite"></output>
+      </div>
+    </article>
   </div>
 </section>
 
@@ -202,7 +358,119 @@
 <section class="section" id="demos">
   <div class="section-head reveal">
     <h2>使用案例</h2>
-    <p class="section-sub">真实 QQ 录屏，无剪辑加速。点开即看 Roxy 怎么接话。</p>
+    <p class="section-sub">先看当前交互的模拟演示，也可以回看早期 QQ 实录。</p>
+  </div>
+  <div class="case-section-head">
+    <h3>同一句话，不同人格怎么回</h3>
+    <p>同一条消息的四种模拟回复。点击人格命令可复制，在 QQ 私聊切换体验。</p>
+  </div>
+  <div class="persona-compare">
+    <p class="persona-question">「明早要早起，可我还想再玩十分钟。」</p>
+    <div class="persona-grid">
+      <article class="persona-example persona-example--assistant">
+        <h4>助手 Roxy</h4>
+        <blockquote>设个十分钟倒计时，响了就关游戏。现在顺手把明早的闹钟设好。</blockquote>
+        <button type="button" class="chip" data-copy="/人格切换 assistant">切换到助手 Roxy</button>
+      </article>
+      <article class="persona-example persona-example--roxy_character">
+        <h4>角色 Roxy</h4>
+        <blockquote>那就再玩十分钟吧。等铃声响了，就把今天的冒险收个尾。明早还要留一点精神呢。</blockquote>
+        <button type="button" class="chip" data-copy="/人格切换 roxy_character">切换到角色 Roxy</button>
+      </article>
+      <article class="persona-example persona-example--rubi">
+        <h4>露比</h4>
+        <blockquote>欸，说好十分钟哦！再开一局可是会变成三局的。定个闹钟，响了我就来抓你下线啦。</blockquote>
+        <button type="button" class="chip" data-copy="/人格切换 rubi">切换到露比</button>
+      </article>
+      <article class="persona-example persona-example--herta">
+        <h4>大黑塔</h4>
+        <blockquote>既然明早的时间已经定了，就给今晚设个十分钟上限。倒计时结束就收手，别擅自加一轮实验。</blockquote>
+        <button type="button" class="chip" data-copy="/人格切换 herta">切换到大黑塔</button>
+      </article>
+    </div>
+  </div>
+  <div class="case-section-head">
+    <h3 id="group-cases">Roxy 在群里怎么参与</h3>
+    <p>两段模拟群聊。群设置和 QQ 平台推送决定能否接收免 @ 消息。</p>
+  </div>
+  <div class="case-deck case-deck--group">
+    <article class="case-player" data-case-player>
+      <header class="case-head">
+        <h3>@ 一次，继续追问</h3>
+        <p>本群开启了「跟随」与非 @ 消息接收。默认 120 秒内，同一位发起人可免 @ 追问最多 2 次。</p>
+      </header>
+      <ol class="case-stage" aria-label="@ 一次，继续追问的演示步骤">
+        <li class="case-step case-step--user">
+          <span class="case-name">小满</span>
+          <div class="case-bubble">@Roxy 帮我把周五聚餐通知缩成两句。晚上七点，大家先在楼下碰头。</div>
+        </li>
+        <li class="case-step case-step--bot">
+          <span class="case-name">Roxy</span>
+          <div class="case-bubble">周五晚上七点聚餐。大家先在楼下集合。</div>
+        </li>
+        <li class="case-step case-step--user">
+          <span class="case-name">小满</span>
+          <div class="case-bubble">集合地点换成二楼。</div>
+        </li>
+        <li class="case-step case-step--bot">
+          <span class="case-name">Roxy</span>
+          <div class="case-bubble">周五晚上七点聚餐。请到二楼集合。</div>
+        </li>
+        <li class="case-step case-step--system">
+          <span class="case-name">跟随规则</span>
+          <div class="case-bubble">追问不会重新计时。群聊平台也需把普通消息发送给机器人。</div>
+        </li>
+      </ol>
+      <div class="case-controls" role="group" aria-label="@ 一次，继续追问的播放控制" hidden>
+        <div class="case-buttons">
+          <button type="button" class="case-play" data-case-play>播放</button>
+          <button type="button" data-case-prev>上一步</button>
+          <button type="button" data-case-next>下一步</button>
+          <button type="button" data-case-replay>重播</button>
+        </div>
+        <output class="case-position" data-case-position aria-live="polite"></output>
+      </div>
+    </article>
+    <article class="case-player" data-case-player>
+      <header class="case-head">
+        <h3>群里的表情包</h3>
+        <p>本群开启了「自然」参与和主动贴图，并为当前人格配置了可用的群表情包。</p>
+      </header>
+      <ol class="case-stage" aria-label="群里的表情包的演示步骤">
+        <li class="case-step case-step--user">
+          <span class="case-name">小满</span>
+          <div class="case-bubble">今天居然准点下班了。</div>
+        </li>
+        <li class="case-step case-step--user">
+          <span class="case-name">阿洛</span>
+          <div class="case-bubble">快截个图，值得纪念。</div>
+        </li>
+        <li class="case-step case-step--bot">
+          <span class="case-name">露比</span>
+          <div class="case-bubble"><span class="sample-sticker" role="img" aria-label="示例表情包：准时下班">
+              <span class="sample-sticker-face" aria-hidden="true"><span></span></span>
+              <strong aria-hidden="true">准时下班！</strong>
+            </span></div>
+        </li>
+        <li class="case-step case-step--system">
+          <span class="case-name">自然参与</span>
+          <div class="case-bubble">机器人会根据群聊上下文决定是否接话，有合适的表情包时也可以只发表情。</div>
+        </li>
+      </ol>
+      <div class="case-controls" role="group" aria-label="群里的表情包的播放控制" hidden>
+        <div class="case-buttons">
+          <button type="button" class="case-play" data-case-play>播放</button>
+          <button type="button" data-case-prev>上一步</button>
+          <button type="button" data-case-next>下一步</button>
+          <button type="button" data-case-replay>重播</button>
+        </div>
+        <output class="case-position" data-case-position aria-live="polite"></output>
+      </div>
+    </article>
+  </div>
+  <div class="case-section-head">
+    <h3>早期 QQ 录屏</h3>
+    <p>历史界面和命令以当时版本为准。当前操作请参照上方指南。</p>
   </div>
   <div class="demo-grid">
 
@@ -277,7 +545,7 @@
 <section class="section" id="commands">
   <div class="section-head reveal">
     <h2>命令大全</h2>
-    <p class="section-sub">所有命令均为半角符号开头、系统直处理、零 token。点击命令可复制。</p>
+    <p class="section-sub">点击命令可复制。群聊发送前先 @ 机器人，并替换示例参数。</p>
   </div>
 
   <div class="cmd-groups">
@@ -321,12 +589,36 @@
     </div>
 
     <div class="cmd-group reveal">
+      <h3>Lucima</h3>
+      <div class="cmd-rows">
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/lucima 使用手册">/lucima 使用手册</button><span>群聊和私聊可查阅，返回网页入口</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/lucima 大厅">/lucima 大厅</button><span>打开账号与任务菜单</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/lucima 托管 动力转换 20:00">/lucima 托管 &lt;任务&gt; &lt;HH:MM&gt;</button><span>以北京时间设置每日计划，确认后启用</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/lucima 状态">/lucima 状态</button><span>查看当前任务进度</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/lucima 回执">/lucima 回执 [编号]</button><span>查看最近或指定任务回执</span></div>
+      </div>
+    </div>
+
+    <div class="cmd-group reveal">
+      <h3>找图与问卷</h3>
+      <div class="cmd-rows">
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/找图">/找图</button><span>随图发送或引用图片发送</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/找图帮助">/找图帮助</button><span>查看用法、额度和第三方上传说明</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/问卷 ">/问卷 &lt;链接&gt;</button><span>逐题填写已支持的问卷</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/问卷详情">/问卷详情</button><span>查看答题草稿和提交确认入口</span></div>
+      </div>
+    </div>
+
+    <div class="cmd-group reveal">
       <h3>群聊与群管理</h3>
       <div class="cmd-rows">
-        <div class="cmd-row"><button class="chip" data-copy="/取消">/取消</button><span>退出群聊连续对话（免 @ 窗口），<code>#取消</code> 同义</span></div>
-        <div class="cmd-row"><button class="chip" data-copy="/toggle">/toggle</button><span>查看本群功能开关与默认人格（仅群聊 + 管理员）</span></div>
-        <div class="cmd-row"><button class="chip" data-copy="/toggle ">/toggle &lt;功能&gt; &lt;on|off&gt;</button><span>开关 gacha / image / voice（仅管理员）</span></div>
-        <div class="cmd-row"><button class="chip" data-copy="/toggle personality ">/toggle personality &lt;名称&gt;</button><span>设置本群默认人格；参数填「默认」则清除</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/群状态">/群状态</button><span>查看本群人格、参与模式和消息接收状态</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/群面板">/群面板</button><span>群主、群管理员或机器人管理员查看管理选项</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/群接收 开">/群接收 开</button><span>管理员允许接收普通群消息，仍需 QQ 平台投递</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/群参与 跟随">/群参与 仅召唤|跟随|自然</button><span>管理员设置本群参与方式</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/群主动贴图 开">/群主动贴图 开</button><span>管理员允许机器人在主动参与时使用已配置的群表情包</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/群人格 ">/群人格 &lt;内置名&gt;</button><span>机器人管理员切换本群人格，并选择是否保留群聊上下文</span></div>
+        <div class="cmd-row"><button class="chip" type="button" data-copy="/取消">/取消</button><span>取消自己的当前群任务</span></div>
       </div>
     </div>
 
@@ -388,7 +680,7 @@
 
   <div class="join-hero card reveal">
     <h3>QQBotAgent · MIT License</h3>
-    <p>NoneBot2 + NapCat（OneBot V11）+ 多模型路由的 QQ 智能体框架。
+    <p>基于 NoneBot2 和多模型路由的 QQ 智能体框架。
        会写 Python、会调 Prompt、会前端、会运维、甚至只会提 Issue——都算数。</p>
     <div class="hero-actions">
       <a class="btn btn-primary" href="https://github.com/BoomberAsp/QQBotAgent" target="_blank" rel="noopener">GitHub 仓库</a>
@@ -397,7 +689,7 @@
     </div>
   </div>
 
-  <h3 class="roadmap-title reveal">路线规划：基于 RAG 的游戏专精智能体</h3>
+  <h3 class="roadmap-title reveal">游戏知识与后续方向</h3>
   <div class="grid grid-3">
     <div class="card roadmap reveal">
       <span class="roadmap-tag">规划中</span>
@@ -405,14 +697,14 @@
       <p>检索增强生成驱动的剧情问答：角色背景、事件脉络、文本细节，问啥答啥并给出出处。</p>
     </div>
     <div class="card roadmap reveal">
-      <span class="roadmap-tag">规划中</span>
-      <h3>崩坏：星穹铁道 · 强度玩法智能体</h3>
-      <p>配队、遗器、轴与伤害期望：基于结构化游戏数据的强度分析与玩法建议。</p>
+      <span class="roadmap-tag">已接入剧情检索</span>
+      <h3>崩坏：星穹铁道</h3>
+      <p>部署对应剧情库后，大黑塔能按人格检索原作资料。配队与强度分析仍是后续方向。</p>
     </div>
     <div class="card roadmap reveal">
-      <span class="roadmap-tag">规划中</span>
-      <h3>Ark Re:Code · 强度玩法智能体</h3>
-      <p>在现有兑换码 / 角色 / 羁绊资料库之上，叠加 RAG 检索的强度与玩法决策支持。</p>
+      <span class="roadmap-tag">已接入游戏工具</span>
+      <h3>Ark Re:Code</h3>
+      <p>已有剧情资料检索、角色与羁绊查询、兑换码和 <a href="#lucima">Lucima 账号操作</a>。强度与玩法决策仍是后续方向。</p>
     </div>
   </div>
 </section>
@@ -421,6 +713,7 @@
 
 <footer class="footer">
   <p class="footer-brand">Roxy · QQBotAgent</p>
+  <p class="muted">展示内容对应 <a href="https://github.com/BoomberAsp/QQBotAgent/commit/d24d1817f3ecd7d3cdeac61734e9f7729f1689ed"><code>QQBotAgent/dev · d24d181</code></a>。实际能力以当前部署配置为准。</p>
   <p class="muted">Roxy 的回答并非总是准确无误，请理性判断。</p>
   <p class="muted">本站为纯静态只读站点，不收集任何访问数据。</p>
 </footer>
