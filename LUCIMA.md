@@ -2,6 +2,8 @@
 
 机器人在私聊和群聊支持 `/璐茜玛`，也可使用 `/璐西玛`、`/露西玛`、`/lucima`。在群里先 @ 机器人。游戏命令在智能体处理之前执行。`/璐茜玛 图鉴 夏妮` 读取 Lucima 仓库内置图鉴，无需登录。`/璐茜玛 兑换 <兑换码>` 一次申请兑换一个码。现有 `/兑换码` 继续查询公开兑换码。
 
+私聊发送 `/lucima 使用手册`，群聊先 @ 机器人再发送。机器人返回概览及完整版网页入口，阅读无需授权游戏账号。完整版位于 `LUCIMA_PUBLIC_ORIGIN` 下的 `/manual`。智能体可按需读取对应章节来回答用法。
+
 ## 部署
 
 1. 使用两个仓库的 `dev` 版本。以下示例假设机器人、Nginx 和登录服务都在同一台 Linux 主机的同一个网络命名空间。桥接服务只监听 `127.0.0.1:8092`，容器部署需要让机器人和反代能访问这个私有监听地址。
@@ -19,7 +21,7 @@
    ```
 
 5. 创建 `LUCIMA_BRIDGE_DATA`，让服务账号拥有该目录并设置为 `0700`。从 `QQBotAgent/QQBot` 启动 `/path/to/bot-venv/bin/python -m lucima_bridge`。同一个数据目录只允许一个桥接实例。`LUCIMA_INTERNAL_URL` 默认 `http://127.0.0.1:8092`，机器人可配置自己的私有地址。
-6. 配置 `lucima.oneweblog.cn` 的 DNS 和 HTTPS。将下列配置放入该域名的 HTTPS `server` 块，再检查并重新加载 Nginx。登录服务使用独立域名和 Cookie，公开站点只转发此处列出的页面及登录接口。
+6. 配置 `lucima.oneweblog.cn` 的 DNS 和 HTTPS。将下列配置放入该域名的 HTTPS `server` 块，再检查并重新加载 Nginx。登录服务使用独立域名和 Cookie，公开站点只转发此处列出的页面、样式和登录接口。
 
    ```nginx
    access_log off;
@@ -27,7 +29,7 @@
    client_body_buffer_size 16k;
    client_body_timeout 10s;
 
-   location ~ ^/(?:$|login\.(?:js|css)$|api/(?:claim|session|login)$) {
+   location ~ ^/(?:$|manual(?:\.css)?$|login\.(?:js|css)$|api/(?:claim|session|login)$) {
        proxy_pass http://127.0.0.1:8092;
        proxy_http_version 1.1;
        proxy_set_header Host $host;

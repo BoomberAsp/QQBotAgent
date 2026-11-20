@@ -30,6 +30,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 PREFIX = re.compile(r"^/(?:璐茜玛|璐西玛|露西玛|lucima)(?:\s+|$)", re.IGNORECASE)
 COMMANDS = {
     "登录": "login", "大厅": "lobby", "确认": "confirm", "状态": "status", "取消": "cancel", "解绑": "unbind",
+    "使用手册": "manual",
     "签到": "signin", "领邮件": "mail", "领基地": "base", "兑换": "redeem", "图鉴": "encyclopedia",
     "领派遣": "dispatch", "领成就": "achievement", "团签到": "guild", "团周奖": "guild_weekly", "免费招募": "recruit",
     "筛装备": "equipment", "执行": "approve", "放弃": "discard", "回执": "receipt",
@@ -62,6 +63,7 @@ SHORTCUTS = {"捐赠金币": ("donate", "gold"), "捐赠证明": ("donate", "cou
 HELP = (
     "璐茜玛命令\n"
     "别名 /璐西玛、/露西玛、/lucima\n"
+    "/lucima 使用手册 · 获取完整版网页入口\n"
     "/璐茜玛 登录 · 扫码绑定 · /璐茜玛 大厅\n"
     "/璐茜玛 签到 · 领邮件 · 领基地\n"
     "/璐茜玛 兑换 <兑换码>\n"

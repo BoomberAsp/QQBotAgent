@@ -13,10 +13,11 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 
 from .long_tasks import CONFIRMED_OPERATIONS, preview as long_preview
 from .filters import NAME as FILTER_NAME, parse_scheme
+from .manual import MANUAL_INDEX, MANUAL_PATH, render_manual
 from .menu import PAGES, THEMES, shop_arguments
 from .proposals import ALLOWED_OPERATIONS
 from .service import APPROVALS, Bridge, SHOP_TARGETS, TASK_NAMES, TICKET_TTL, Vault, Worker
@@ -171,6 +172,16 @@ def browser_id(request: Request) -> str:
 @app.get("/")
 async def login_page():
     return FileResponse(FILES / "login.html", media_type="text/html")
+
+
+@app.get(MANUAL_PATH, response_class=HTMLResponse)
+async def manual_page():
+    return render_manual()
+
+
+@app.get("/manual.css")
+async def manual_css():
+    return FileResponse(FILES / "manual.css", media_type="text/css")
 
 
 @app.get("/login.js")
@@ -447,9 +458,11 @@ async def run_command(request: Request, *, group: bool):
     if isinstance(context, (JSONResponse, PlainTextResponse)):
         return context
     bridge, scope, action, arg, event = context
-    owner = bridge.accounts.active(scope)
     if not isinstance(arg, str):
         return answer("命令无效。", 400)
+    if action == "manual" and not arg:
+        return answer(f"{MANUAL_INDEX}\n完整版\n{bridge.public_origin}{MANUAL_PATH}")
+    owner = bridge.accounts.active(scope)
 
     def execute(operation, argument):
         if operation == "login":

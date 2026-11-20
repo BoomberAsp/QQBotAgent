@@ -3117,7 +3117,7 @@ async def handle_agent_turn(view: InboundMessage):
 
         # Resolve user permissions
         role = _perm_manager.get_role(user_id)
-        from .lucima_tools import lucima_tool_names
+        from .lucima_tools import MANUAL_TOOL, lucima_tool_names
 
         allowed_tools = _perm_manager.get_allowed_tools(role) | lucima_tool_names()
         code_limits = _perm_manager.get_code_limits(role)
@@ -3162,7 +3162,7 @@ async def handle_agent_turn(view: InboundMessage):
                        and native_story_turn(persona_key, text_content or augmented_message))
         # ── Plane context (Bond-System-Design.md §3) ──
         # character_plane: split persona routed to social → L2 = 角色卡,
-        #   tools = SOCIAL_TOOLS only (delegate_task fallback), bond state
+        #   tools = SOCIAL_TOOLS and public Lucima help when available, bond state
         #   injected into the L4 volatile tail.
         # Otherwise (split→task plane, or unified persona): L2 = neutral
         #   "assistant" for split task plane (globally-shared cache prefix),
@@ -3197,7 +3197,7 @@ async def handle_agent_turn(view: InboundMessage):
             )
         elif character_plane:
             client = _model_router.flash_client
-            allowed_tools = set(SOCIAL_TOOLS)
+            allowed_tools = set(SOCIAL_TOOLS) | (allowed_tools & {MANUAL_TOOL})
             _current_personality.set(persona_key)
             _current_bond_context.set(
                 _build_bond_context(user_id, persona_key, pm)

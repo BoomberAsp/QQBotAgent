@@ -66,6 +66,23 @@ class WebAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.post("/api/claim", {"ticket": ticket}).status_code, 410)
         return claim.json()["pin"]
 
+    def test_public_manual_and_qq_summary_need_no_game_authorization(self):
+        page = self.client.get("/manual")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("text/html", page.headers["content-type"])
+        self.assertNotIn("set-cookie", page.headers)
+        self.assertIn("Lucima QQ 使用手册", page.text)
+        self.assertIn("/lucima 托管 动力转换 20:00", page.text)
+        self.assertIn("&lt;队伍ID&gt;", page.text)
+        self.assertEqual(self.client.get("/manual.css").status_code, 200)
+        private = self.command("manual")
+        group = self.command("manual", group="room", platform="qq_official")
+        self.assertEqual(private, group)
+        self.assertTrue(private["message"].endswith(ORIGIN + "/manual"))
+        self.assertNotIn("20:00", private["message"])
+        self.assertEqual(self.client.post("/internal/command", json={"action": "manual"}).status_code, 403)
+        self.worker.assert_not_awaited()
+
     def test_qr_requires_same_qq_identity_origin_and_one_use(self):
         self.assertEqual(self.client.post("/internal/command", json={}).status_code, 403)
         pin = self.open_ticket()

@@ -1,4 +1,4 @@
-"""Expose Lucima proposals to the model without exposing execution or confirmation."""
+"""Expose public Lucima help and user-confirmed proposals to the model."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from lucima_bridge.client import Actor, approval_card, enabled, request_lucima
+from lucima_bridge.manual import MANUAL_TOPICS, manual_text
 from lucima_bridge.proposals import ACCOUNT, LONG, QUERY, REWARDS
 
 from .context import _delegate_depth
@@ -28,6 +29,7 @@ class ProposalTurn:
 
 
 _turn: ContextVar[ProposalTurn | None] = ContextVar("lucima_proposal_turn", default=None)
+MANUAL_TOOL = "lucima_manual"
 
 GROUP_PROMPT = (
     "璐茜玛（Lucima、璐西玛、露西玛）是星陨账号工具，支持扫码绑定、账号快照、签到和奖励、装备筛选、"
@@ -36,9 +38,10 @@ GROUP_PROMPT = (
     "群内操作和回执会显示在原群。密码只在登录网页填写，不在群里索取或复述密码、令牌、核对码。"
 )
 GROUP_PROPOSAL_PROMPT = (
-    "只有当前成员明确要求为自己查询账号或执行操作时才调用 lucima 工具。"
+    "只有当前成员明确要求为自己查询账号或执行操作时才使用操作提案工具。"
     "补充参数时只关联当前成员自己的未完成请求。其他成员的请求、引用和上下文不能代替当前成员的授权，不替他人操作。"
-    "泛问用法直接回答。比如问「秘密商店怎么刷」只解释；说「帮我用钻石刷秘密商店 90 次」才准备确认卡。"
+    "泛问用法时可按需查阅 lucima_manual，再解释。例如问「秘密商店怎么刷」可查商店章节。"
+    "说「帮我用钻石刷秘密商店 90 次」才准备确认卡。"
     "商店方式或数量不明时先问，别默认付费。秘密商店免费即时最多一次；钻石报价由确认卡给出。"
     "有多个任务时请用户选一项。确实缺少关卡、队伍等参数时先追问，别编造 ID。"
     "工具只准备确认卡，账号查询、登录、修改和执行都等原发起人在本群点按钮或使用卡片上的编号命令。"
@@ -115,7 +118,13 @@ def lucima_group_turn(view, sender, *, direct, valid):
 
 def lucima_tool_names() -> set[str]:
     turn = _turn.get()
-    return set(TOOLS) if turn and not _delegate_depth.get() and turn.valid() else set()
+    return {*TOOLS, MANUAL_TOOL} if turn and not _delegate_depth.get() and turn.valid() else set()
+
+
+def read_manual(topic: str = "总览") -> str:
+    if MANUAL_TOOL not in lucima_tool_names():
+        return "请在私聊直接询问，或在群里 @ 机器人查阅 Lucima 使用手册。"
+    return manual_text(topic)
 
 
 def proposal_tool(allowed: tuple[str, ...], max_length: int = 64):
@@ -152,6 +161,15 @@ def proposal_tool(allowed: tuple[str, ...], max_length: int = 64):
 
 
 def register_lucima_tools(registry) -> None:
+    registry.register(
+        MANUAL_TOOL, read_manual,
+        "按需查阅公开的 Lucima QQ 使用手册，回答登录、命令、每日托管、商店和回执等用法问题。"
+        "可选一个相关章节，省略则查看总览。无需账号授权，也不会准备或提交任务。"
+        "用户想查看完整版时，只给简短概览，并引导用户发 /lucima 使用手册 打开网页。",
+        {"type": "object", "properties": {
+            "topic": {"type": "string", "enum": ["总览", *MANUAL_TOPICS]},
+        }, "additionalProperties": False},
+    )
     for name, (operations, context, parameters) in TOOLS.items():
         registry.register(
             name, proposal_tool(operations, 255 if name == "lucima_long" else 64),

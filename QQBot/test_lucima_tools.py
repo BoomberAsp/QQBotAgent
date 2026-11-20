@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from agent.inbound import InboundMessage
-from agent.lucima_tools import lucima_private_turn, lucima_tool_names, register_lucima_tools
+from agent.lucima_tools import lucima_group_turn, lucima_private_turn, lucima_tool_names, register_lucima_tools
 from agent.tool_registry import ToolRegistry
 
 
@@ -12,6 +12,26 @@ class LucimaProposalToolsTests(unittest.IsolatedAsyncioTestCase):
         self.registry = ToolRegistry()
         register_lucima_tools(self.registry)
         self.enterContext(patch.dict(os.environ, {"LUCIMA_INTERNAL_TOKEN": "test-only"}))
+
+    async def test_manual_reads_requested_topic_without_creating_a_proposal(self):
+        view = InboundMessage(user_id="user", self_id="bot", message_id="request", platform="qq_official")
+        sender = AsyncMock()
+        request = AsyncMock()
+        with patch("agent.lucima_tools.request_lucima", request):
+            with lucima_private_turn(view, sender) as turn:
+                self.assertIn("lucima_manual", lucima_tool_names())
+                overview = await self.registry.execute("lucima_manual", {})
+                self.assertIn("Lucima QQ 使用手册", overview)
+                self.assertFalse(turn.proposed)
+            view.is_group, view.group_id = True, "room"
+            with lucima_group_turn(view, sender, direct=True, valid=lambda: True) as turn:
+                self.assertIn("lucima_manual", lucima_tool_names())
+                topic = await self.registry.execute("lucima_manual", {"topic": "托管"})
+                self.assertIn("/lucima 托管 动力转换 20:00", topic)
+                self.assertFalse(turn.proposed)
+            request.assert_not_awaited()
+        sender.send_keyboard.assert_not_awaited()
+        sender.send_text.assert_not_awaited()
 
     async def test_operation_only_posts_proposal_and_token_stays_in_private_confirmation(self):
         view = InboundMessage(user_id="user", self_id="bot", message_id="request", platform="qq_official")
