@@ -23,9 +23,11 @@
 - **代码执行** — 三层安全隔离（模式匹配 + `python3 -I` 隔离 + 资源限制，分级限制：管理员 60s，会员 15s；输出上限统一 16KB）
 - **文件阅读** — 支持文本 / PDF / 图片 / 音频（多模态 AI 分析，语音转文字+情绪识别）
 - **找图反查** — `/找图`（别名 `/找源` `/找作者`）以图找出处：SauceNAO/IQDB/ascii2d 反查画作出处与画师/社交账号、trace.moe 认番剧作品与集数、**Google Lens**（无头 Chrome 裸 CDP + 代理上传，/goto 卡片解链）反查真人/coser 社交账号并带 AI 概览识别，视觉模型并行识别作品/角色；**同名共识**（名字在 ≥2 条命中出现，或高相似度+作者主页链接，或 Lens 作者主页单独命中才采纳）过滤低置信账号，pixiv 标注「画师（非 coser 本人）」；配额（20/人/天、100/全服/天、30s 冷却）+ 同图 30 天缓存。HTTP 引擎直传无需图床；Lens 连续被拦截（验证码/静默限制）自动熔断 10 分钟。热读开关 `FIND_SOURCE_ENABLED` / `FIND_SOURCE_LENS` / `FIND_SOURCE_LENS_COOKIE`（可选真人 cookie 注入）
+- **璐茜玛（Lucima）星陨账号工具** — `/璐茜玛`（别名 `/璐西玛` `/露西玛` `/lucima`）命令族在智能体之前拦截（priority=0，零 token）：扫码绑定（二维码 5 分钟 + 网页 8 位核对码，密码只在网页填写；临时授权 15 分钟，「记住登录」Fernet 加密保存 30 天）、九宫格大厅（每会话最多 5 个账号槽）、签到/领邮件/领基地/兑换、进阶任务（派遣/成就/佣兵团/免费招募/装备筛选）、长任务（活动推进/虚构深渊/批量购买/秘密商店与星源商店刷新，命中装备按档确认购买）与每日托管（北京时间定时，14 类任务）；任务完成回传文字 + PNG 回执（短任务 1 小时 / 长任务 24 小时内可取回）。自然语言经 5 个智能体工具（`lucima_manual` / `lucima_rewards` / `lucima_account` / `lucima_query` / `lucima_long`）**只准备待确认卡、不直接执行**，由发起人在原会话 5 分钟内点按钮或发编号命令确认；群聊按成员隔离、回执发回原群。独立桥接进程 `python -m lucima_bridge`（127.0.0.1:8092，全站单执行槽 + 5 条队列），`LUCIMA_INTERNAL_TOKEN` 未配置时整族静默关闭。部署与完整命令见 [LUCIMA.md](LUCIMA.md)
+- **公开站人格试聊** — `bot.oneweblog.cn/try/` 访客自带 DeepSeek / OpenAI 的模型 ID 与 API Key，先「测试连接」（复用面板的最小真实探测 + 对话响应校验）再与 4 个内置人格（助手 Roxy / 角色 Roxy / 露比 / 大黑塔）纯文字试聊；验证票据 HMAC 签名 30 分钟有效，密钥与对话只留在当前页面、服务端按请求转发（可能按服务商规则计费）；无工具/记忆/QQ 能力。独立进程 `public_try.py`（127.0.0.1:8093），nginx 限流 10 次/分钟
 - **用户系统** — 三层记忆引擎（SHORT / MEDIUM / LONG，`TieredMemory`）+ LLM 驱动用户画像提取（含确定性事实过滤 `fact_filter`）
 - **Web 管理面板** — FastAPI 后台（`webui/`）：进程管理、配置热编辑（提示词/人格/.env/模型结构化表单+API 可用性探测）、记忆/画像编辑（与 bot 内存缓存 mtime 一致性校验）、**角色管理（用户自创角色的 card.md / meta.json 分区编辑 + 静态体检 + 版本回滚 + 立绘上传 + 注入预览）**、Wiki 别名管理（详情列表合并解包数据中 wiki 未收录的新角色，待补录含官方名占用冲突一键拆分）、Token 用量看板、反馈处理、更新记录/公告编辑与双渠道群发、**邮件管理（用户信箱只读查看 + 勾选发送系统邮件 + 信件撤回，经文件队列由 bot 执行回写状态）**、Playground
-- **更新记录与公告** — 结构化更新日志（版本/日期/分类变更条目），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询；管理员在面板编辑**更新记录**与**自由公告**，并可双渠道群发（OneBot 群 + QQ 官方群，图片卡片/markdown 呈现，官方群按登记表预检、退群自动标记）；更新内容自动同步到公开使用站点 `bot.oneweblog.cn`（使用说明+演示）
+- **更新记录与公告** — 结构化更新日志（版本/日期/分类变更条目），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询；管理员在面板编辑**更新记录**与**自由公告**，并可双渠道群发（OneBot 群 + QQ 官方群，图片卡片/markdown 呈现，官方群按登记表预检、退群自动标记）；更新内容自动同步到公开使用站点 `bot.oneweblog.cn`（使用说明+演示+人格试聊+Lucima 使用手册）
 - **游戏工具** — 抽卡模拟（Wiki 自动爬取卡池数据）、团战截图测速（OCR 解析战斗截图，轻量/全量两种模式）、乱速概率计算、角色/羁绊查询（面板/技能/倍率）、兑换码查询（X 官方推文自动更新 + 面板手动维护）
 - **地图服务** — 地址↔坐标转换、实时天气、POI搜索、路线规划（高德地图）
 - **群聊管理** — 按群开关功能（抽卡/图片/语音），超级用户可远程管理
@@ -124,6 +126,10 @@ BUFF_DETECTOR_WORKERS=2                # 团战测速 buff 图标匹配并行线
 # REDEEM_CODE_X=on                     # X 官方推文自动更新（SearXNG 发现 + syndication 抓取，
 #                                      #   需 REDEEM_CODE_PROXY 可达 X；详见 .env.example）
 # REDEEM_CODE_PROXY=http://127.0.0.1:1081
+
+# ── Lucima 桥接（可选，部署见 LUCIMA.md）──
+# LUCIMA_INTERNAL_TOKEN=...            # 与桥接服务共用的接口密钥；未设置时 /璐茜玛 命令族与智能体工具静默关闭
+# LUCIMA_INTERNAL_URL=http://127.0.0.1:8092   # 桥接私有地址（默认值）
 ```
 
 > 完整清单（含兑换码抓取代理、`web_fetch` 反爬浏览器、`WIKI_PROXY` 等可选段）见 `QQBot/.env.example` 的逐行注释。
@@ -161,7 +167,7 @@ bash start.sh
 @Roxy /status
 ```
 
-应返回已注册的工具列表（40 个）与机器人运行状态。
+应返回已注册的工具列表（51 个）与机器人运行状态。
 
 **官方渠道**（如已配置 `QQ_BOTS`）：把机器人添加到群或发起单聊后发 `/status`，并观察日志里的 `[qq_official] c2c message / group message` 行；WebUI 仪表盘的「QQ 官方路由」卡片会显示连接状态与消息计数。
 
@@ -232,6 +238,23 @@ bash start.sh
 
 也可以直接发一张图。私聊发图，或在群里 @ 机器人发图后，机器人会询问是否要反查来源，并告知第三方上传。回复「可以」或「查来源」即可确认，群里请回复机器人或 @ 它。带图直接说「帮我查这张图的出处」也可以。自然语言找图与命令共用配额和缓存。Lens 可在同一会话补查完全匹配，回复区分同图页面和待核实线索。智能体可以在同一轮按水印或候选页做有限复查。结果保留五分钟，在同一会话可继续问「帮我查那个账号」或「继续查原帖」。续查有 20 秒预算，最多读取两个候选页面。
 
+**璐茜玛（Lucima 星陨账号工具）**（命令在智能体之前执行，零 token；私聊直接发，群聊先 @机器人；需部署桥接服务并配置 `LUCIMA_INTERNAL_TOKEN`，详见 [LUCIMA.md](LUCIMA.md)）
+
+| 命令 | 说明 |
+|------|------|
+| `/璐茜玛`（别名 `/璐西玛` `/露西玛` `/lucima`） | 打开九宫格大厅（基本信息/自动任务/主动任务/佣兵团/工具箱/运行日志/退出账号/切换明暗/切换账号）；官方渠道显示原生按钮，OneBot 显示文字命令 |
+| `/lucima 使用手册` | 返回概览 + 完整版网页手册入口（阅读无需授权）；智能体也可按章节查阅回答用法问题 |
+| `/璐茜玛 登录` | 扫码绑定：二维码/链接 5 分钟有效，发起人在原会话发网页显示的 `/璐茜玛 确认 <8位核对码>`；账号密码只在网页填写。临时授权 15 分钟，勾选「记住登录」加密保存 30 天 |
+| `/璐茜玛 签到` / `领邮件` / `领基地` / `兑换 <兑换码>` | 日常领取与游戏内兑换（有实际游戏副作用，先经确认卡）；`/兑换码` 查询公开码不受影响 |
+| `/璐茜玛 图鉴 <角色名>` | 读取内置星陨角色图鉴，无需登录 |
+| `/璐茜玛 进阶` | 派遣/成就/佣兵团/免费招募/关卡查询/装备筛选入口（`领派遣` `领成就` `团签到` `团周奖` `捐赠金币` `捐赠证明` `免费招募` `讨伐关卡` `元素关卡` `筛装备 [套装名]`） |
+| `/璐茜玛 长任务` | 活动推进（≤3 关）/虚构深渊（单层）/批量购买（1–5 档）/秘密商店刷新（1–200 次，免费或钻石 3/次，按金币价自动购买契约芯片，可 `目标=…` 指定）/星源商店刷新（免费，命中装备每件 5 彩虹星源确认购买）；`长任务查询 活动\|深渊\|商店` 免登录查报价 |
+| `/璐茜玛 托管 <任务> <HH:MM>` | 每日托管（北京时间，需「记住登录」，逐项确认）；`托管状态` / `停止托管` 查询与撤销 |
+| `/璐茜玛 状态` / `取消` / `回执 [编号]` | 全站单执行槽 + 5 条队列、每身份 1 项待处理；短任务回执 1 小时、长任务/托管回执 24 小时内可取回（PNG 凭证） |
+| `/璐茜玛 添加账号` / `切换账号 <1-5>` / `退出账号 确认` / `解绑` | 每会话最多 5 个账号槽；同一游戏账号全站只能占一个槽，换群/转私聊先在原会话解绑；解绑删除绑定与保存的授权 |
+
+也可以直接用自然语言：私聊直接说、群聊 @机器人或引用回复机器人。问「璐茜玛能做什么」「秘密商店怎么刷」会直接解释；说「帮我领星陨邮件」「用钻石刷秘密商店 90 次」会收到**待确认卡**（5 分钟有效，绑定发起人/原会话/当前账号），点「确认执行」或发送卡上 `/璐茜玛 执行 <编号>` 才真正执行；只说「确认」不会批准。两个商店命中装备后在原会话发装备摘要 + 购买按钮（`购买命中 <回执编号> <档位>` / `确认命中 <回执编号>`，5 分钟内仅发起人可操作）。
+
 **连续对话**
 
 | 命令 | 说明 |
@@ -266,9 +289,9 @@ bash start.sh
 | `stop.sh` | 停止所有服务（NoneBot + SearXNG），并同步 WebUI 看门狗状态 |
 | `start_bot.sh` | 仅启动 NoneBot（SearXNG & NapCat 已运行时使用） |
 | `start_webui.sh` | Web 管理面板 启动/停止/重启/状态（`start\|stop\|restart\|status`，默认绑定 `127.0.0.1:8090`，经 SSH 隧道访问） |
-| `test.sh` | 运行测试套件：`test_agent.py` + `test_workspace.py` + `test_story_kb.py` + 记忆 benchmark + `test/` 下 11 个离线测试脚本 |
+| `test.sh` | 运行测试套件：12 个认知/群/媒体 unittest 模块 + `test_agent.py` + `test_workspace.py` + `test_story_kb.py` + 记忆 benchmark + `test/` 下 21 个离线测试脚本 |
 
-> ⚠️ **测试脚本说明**：`test.sh` 调用的 11 个 `test/*.py` 离线测试位于仓库根 `test/` 目录，该目录被 `.gitignore` 忽略（`.gitignore` 中 `/test/`），仅存在于开发机、不随仓库分发。clone 后直接 `bash test.sh` 会因缺少这些文件而报错；CI/新环境请先确认 `test/` 是否存在，或仅运行 `cd QQBot && python test_agent.py`。
+> ⚠️ **测试脚本说明**：`test.sh` 调用的 21 个 `test/*.py` 离线测试位于仓库根 `test/` 目录，该目录被 `.gitignore` 忽略（`.gitignore` 中 `/test/`），仅存在于开发机、不随仓库分发。clone 后直接 `bash test.sh` 会因缺少这些文件而报错；CI/新环境请先确认 `test/` 是否存在，或仅运行 `cd QQBot && python test_agent.py`。
 
 ## 目录结构
 
@@ -276,18 +299,21 @@ bash start.sh
 QQBotAgent/
 ├── setup.sh / start.sh / stop.sh / start_bot.sh   # 安装 / 启动 / 停止 / 仅启动 NoneBot
 ├── start_webui.sh              # Web 管理面板 启动|停止|重启|状态（127.0.0.1:8090）
-├── test.sh                     # 测试调度：3 个主测试 + 记忆 benchmark + 21 个离线脚本
+├── test.sh                     # 测试调度：12 个 unittest 模块 + 3 个主测试 + 记忆 benchmark + 21 个离线脚本
 ├── bot.py                      # NoneBot 备用入口（仅注册 OneBot 适配器；生产用 `cd QQBot && nb run`）
 ├── main.py                     # PyCharm 占位入口（非实际入口）
 ├── docker-compose.yml          # Docker 编排（searxng + qqbot 两服务）
 ├── Dockerfile / docker-entrypoint.sh
 ├── vllm-start.sh               # 手动拉起 vLLM 推理服务（可选，非 compose 服务）
 ├── napcat.sh                   # NapCat 安装脚本（Rootless / Docker）
-├── deploy_public_site.sh       # 公开站点发布脚本
+├── deploy_public_site.sh       # 公开站点发布脚本（含 lucima/ 手册与 try/ 试聊页）
+├── public_try.py               # ★ 公开站人格试聊 API（FastAPI 独立进程，127.0.0.1:8093）
+├── scripts/export_lucima_manual.py  # 从桥接手册源导出 public_site/lucima/ 静态页
+├── LUCIMA.md                   # Lucima 桥接部署与使用手册（命令/授权/长任务/托管）
 ├── searxng/settings.yml        # SearXNG 搜索引擎配置（国内可用引擎）
 │
 ├── webui/                      # ★ Web 管理面板（FastAPI 独立进程）
-│   ├── main.py                 #   入口（74 个 /api/ 端点 + 16 个页面路由 + 2 个 WebSocket）
+│   ├── main.py                 #   入口（109 个 /api/ 端点 + 21 个页面路由 + 2 个 WebSocket）
 │   ├── auth.py                 #   登录鉴权（scrypt 口令哈希 + 内存会话）
 │   ├── process_manager.py      #   启停 bot / 看门狗状态持久化
 │   ├── config_editor.py        #   提示词 / 人格 / .env / JSON 配置热编辑（密钥脱敏 + 原子写）
@@ -296,16 +322,20 @@ QQBotAgent/
 │   ├── log_viewer.py / audit.py / hardware_monitor.py / playground.py / napcat_login.py
 │   ├── official_status.py      #   QQ 官方路由状态（只读 official_status.json，mtime 判新鲜度）
 │   ├── config.py               #   面板配置（从 QQBot/.env 读 USER_DATA_ROOT 等）
-│   ├── templates/ static/      #   19 个页面模板与静态资源
+│   ├── templates/ static/      #   24 个页面模板与静态资源
 │   └── data/                   #   面板运行时数据（webui.pid / logs / watchdog_state.json / backups）
 │
-├── public_site/                # ★ 公开使用站点（bot.oneweblog.cn，纯静态只读）
+├── public_site/                # ★ 公开使用站点（bot.oneweblog.cn，静态页 + 独立试聊 API）
+│   ├── index.html / style.css / app.js  # 单页：介绍/使用说明/案例/命令/更新日志/反馈/招募
+│   ├── lucima/                 #   Lucima 使用手册静态导出（scripts/export_lucima_manual.py）
+│   ├── try/                    #   人格试聊页（调 public_try.py 的 /try/api/probe|chat）
+│   └── changelog.json          #   面板保存更新记录时自动导出的脱敏快照（勿手改）
 ├── docs/                       # 开发文档
 │   ├── qqbot-api-v2-full-docs.md          #   官方 API v2 离线全量文档（192 章）
 │   ├── qqbot-official-buttons-design.md   #   官方渠道按钮交互设计（功能盘点 + 接入方案）
 │   ├── 更新日志.md / aliyun_models_api.md / COMPARISON-QQBOTAGENT.md
 │   └── QQBOTAGENT-IMPROVEMENT-PLAN.md / openrubi_migration_plan.md / bot-site-nginx.md
-├── test/                       # 离线测试与实验脚本（gitignore，仅开发机；test.sh 调用其中 11 个）
+├── test/                       # 离线测试与实验脚本（gitignore，仅开发机；test.sh 调用其中 21 个）
 ├── evidence/                   # 验证证据 / 截图
 ├── *.md                        # 设计与计划文档（Bond / Story-KB / Voice / Cache-Hit-Rate / Memory 等）
 │
@@ -313,9 +343,11 @@ QQBotAgent/
     ├── .env / .env.example     # 环境配置（密钥）与逐行注释模板
     ├── requirements.txt / pyproject.toml
     ├── config.yml              # 历史遗留的 go-cqhttp 配置（与 NoneBot 无关，可忽略）
-    ├── test_agent.py           # 主测试套件（53 个 Test 类 / 316 个用例）
+    ├── test_agent.py           # 主测试套件（60 个 Test 类 / 378 个用例）
     ├── test_workspace.py       # 工作区 / 会话文件测试（11 个类）
     ├── test_story_kb.py        # 剧情知识库检索测试（37 个用例，无网络）
+    ├── test_lucima_bridge.py / test_lucima_tools.py  # Lucima 桥接/提案工具离线测试（虚拟凭证+受控子进程）
+    ├── test_public_try.py      # 公开试聊 API 离线测试（mock transport）
     ├── DOCUMENTATION.md / PLAN.md / README.md
     │
     ├── agent/                  # 智能体核心
@@ -340,6 +372,7 @@ QQBotAgent/
     │   ├── hardware.py / workspace.py / workspace_snapshot.py / quota_cleanup.py
     │   │                       #   硬件检测（bootstrap 时注入约束）/ 工作区配额 / 目录快照 / 清理协议
     │   ├── task_record.py / search_archive.py / group_features.py
+    │   ├── lucima_tools.py     #   Lucima 智能体工具：手册查阅 + 4 组操作提案（只准备确认卡，contextvar 回合门控）
     │   └── config/             #   SOUL/IDENTITY/AGENTS/MEMORY（注入）+ TOOLS/BOOTSTRAP/SESSION（加载）
     │                           #   + HELP/FEATURES（命令时读取）+ personalities/ + portraits/
     │
@@ -349,10 +382,21 @@ QQBotAgent/
     │   ├── qq_official_buttons.py  # 官方键盘 wire 格式 + 回调编解码 + 交互回执发送器 + 点击遥测
     │   └── qq_official_stream.py   # 官方 c2c 流式消息：MessageStreamer 双流传输 + 熔断器 + stream_snapshot
     │
+    ├── lucima_bridge/          # ★ Lucima 桥接服务（独立进程 `python -m lucima_bridge`，127.0.0.1:8092）
+    │   ├── web.py              #   FastAPI：登录页/手册 + /api/claim|session|login + /internal/(group-)command|propose
+    │   ├── service.py          #   Bridge/Vault（Fernet 凭证+SQLite）/Worker（单执行槽+队列）/授权与任务状态机
+    │   ├── long_tasks.py       #   长任务（活动/深渊/批购/商店刷新）+ 每日托管计划 + 24h 回执
+    │   ├── menu.py / accounts_ui.py  # 九宫格大厅页面树 / 每会话 5 账号槽与主题偏好
+    │   ├── filters.py / receipt.py   # 装备方案（桌面格式）/ PNG 回执渲染（明暗主题）
+    │   ├── manual.py           #   公开使用手册（QQ 命令、网页 /manual、智能体 lucima_manual 共用）
+    │   ├── proposals.py / client.py  # 智能体可提案操作集 / bot 侧 HTTP 传输 + 确认卡
+    │   └── login.html / login.js / login.css / manual.css  # 网页登录与手册样式
+    │
     ├── plugins/                # NoneBot 插件
     │   ├── agent_router.py     #   OneBot 入口 + 配置看门狗 + 更新记录/公告双渠道群发 + 群列表导出（OneBot+官方）
     │   ├── qq_official.py      #   官方入口 + 每日主动循环（角色信箱信封 + 主动发媒体，双向互斥）+ 拒收/恢复事件 + 状态心跳 + 邮件管理队列 worker（面板删信/系统邮件）
     │   ├── qq_official_buttons.py  # 官方 INTERACTION_CREATE 回调入口（幂等+限频+审计）
+    │   ├── lucima.py           #   /璐茜玛 命令族（priority=0 拦截，双渠道；二维码/回执 PNG/按钮菜单/登录与任务轮询）
     │   ├── pullingMonitor.py / check_redeem_code.py / ruyipage_fetch.py / offline_logger.py
     │   └── group.py / speed.py / photos.py / test.py / utils.py（旧插件，仅保留个别工具函数）
     │
@@ -439,6 +483,9 @@ QQ 消息
   ├─ OneBot 渠道（QQ 号）      adapters/onebot.py      ─┐
   └─ 官方渠道（openid）        adapters/qq_official.py  ─┤
                                                          ▼
+                          plugins/lucima.py（priority=0：/璐茜玛 命令族先行拦截，
+                            零 token 直达桥接服务，不进智能体与记忆管线）
+                                                         ▼
                                    agent/turn.py（平台无关内核）
    ├── 平台化身份：_current_platform → PermissionManager（SUPERUSERS/VIP_USERS 或 QQ_OFFICIAL_*）
    ├── 直连命令（零 token）：会话 / 人格 / 养成 / 游戏 / 群管理 / 反馈 …
@@ -498,7 +545,7 @@ QQ 消息
 
 ```
 用户消息
-  ├── 角色面（social）   —— 只有社交工具（delegate_task / give_gift / create_image / send_voice / recall_asset）
+  ├── 角色面（social）   —— 只有社交工具（delegate_task / give_gift / create_image / send_voice / recall_asset / send_sticker / fetch_image / discover_images）+ lucima_manual（如已启用）
   │     └── 角色自己以人设回应；要搜索/算数/读文件时调用 delegate_task
   └── 任务面（task）     —— delegate_task 以 Roxy 中立人格、隔离上下文（persist=False）运行，
                             按用户角色过滤工具、单层嵌套防递归；结果由 revoice_task_result 用角色口吻转述
@@ -623,9 +670,9 @@ class ContinuousSessionManager:
 | `QQOfficialSender` | `adapters/qq_official.py` | 官方渠道 Sender：缓冲 + 合并 + 配额控制、图片/语音 base64 上传、语音被拒降级文件卡、`/正在思考/` 即时进度 |
 | `TokenLedger` | `lib/token_ledger.py` | Token 用量记账（按日聚合，WebUI 看板数据源） |
 
-## 已注册工具（40 个）
+## 已注册工具（51 个）
 
-> 注册位置：`agent/turn.py`（`_build_tool_registry()` 33 个 + 模块级 7 个）；权限集合定义在 `agent/permissions.py`。
+> 注册位置：`agent/turn.py` 注册 46 个（`_build_tool_registry()` 内 34 个 + 模块级 12 个），并在 `_build_tool_registry()` 开头调用 `agent/lucima_tools.py::register_lucima_tools()` 追加 5 个；权限集合定义在 `agent/permissions.py`。
 
 **信息与通用（public）**
 
@@ -639,6 +686,7 @@ class ContinuousSessionManager:
 | `get_user_info` | 用户信息快照（权限/会话/工作区/工具范围） |
 | `recall_search_result` | 按 id 取回本人数日内的搜索/抓取存档 |
 | `get_changelog` | 查询机器人更新记录（与 `/更新日志` 共用 `tools/changelog.py`） |
+| `survey_status` | 当前问卷任务只读快照（无问卷上下文时返回 active=false） |
 
 **地图与天气（public）**：`geocode`、`reverse_geocode`、`get_weather`、`search_poi`、`plan_route`
 
@@ -646,16 +694,20 @@ class ContinuousSessionManager:
 
 **文本工具（public）**：`explain_code`、`translate_text`
 
+**图片获取（public）**：`fetch_image`（批准域 HTTPS 直链抓图，新图需人工审核）、`discover_images`（批准静态网页发现候选）、`find_image_source`（找图反查续查：首查/水印检索/同图核验，仅在用户已同意反查的回合下发）
+
 **会员工具（vip，4 个）**：`web_fetch`、`download_repo`、`get_system_load`、`execute_code`
 
 **管理员工具（admin，1 个）**：`shell_exec`
 
 **记忆与编排（public）**：`begin_task`、`finalize_subtask`、`recall_memory`、`story_search`
 
-**养成 / 多模态（动态下发，8 个）**：`delegate_task`、`give_gift`、`create_image`、`send_voice`、`recall_asset`、`complete_scene`、`create_character`、`end_continuous_mode`
+**养成 / 多模态 / 群（动态下发）**：`delegate_task`、`give_gift`、`create_image`、`send_voice`、`recall_asset`、`send_sticker`（人格已审核表情包）、`complete_scene`、`create_character`、`end_continuous_mode`、`group_media`（群已发布图片/表情包）
 
-> 📝 **权限分布**：静态工具 32 个 = 公共 27（`_PUBLIC_TOOLS`）+ 会员 4（`_VIP_TOOLS`）+ 管理员 1（`_ADMIN_TOOLS`）；角色可用数 admin 32 / vip 31 / regular 27。
-> 另外 8 个工具**不在任何权限集合**中，只经路由层的 `allowed_tools` 动态下发：`SOCIAL_TOOLS`（角色面：`delegate_task`/`give_gift`/`create_image`/`send_voice`/`recall_asset`）、仅创作会话的 `create_character`、仅剧情会话的 `complete_scene`、仅连续对话的 `end_continuous_mode`；越权调用由执行层硬拒绝。
+**璐茜玛（上下文动态下发，5 个）**：`lucima_manual`（公开手册按章节查阅）、`lucima_rewards`（奖励领取提案）、`lucima_account`（登录/兑换/捐赠/取消/解绑/退出提案）、`lucima_query`（状态/回执/图鉴/关卡/装备/账号快照提案）、`lucima_long`（长任务与托管提案）——工具**只准备待确认卡**，执行须发起人原会话确认；私聊回合与群聊 direct（@/回复）回合经 `ProposalTurn` contextvar 门控下发，委派任务面不下发，角色面仅 `lucima_manual`
+
+> 📝 **权限分布**：静态工具 36 个 = 公共 31（`_PUBLIC_TOOLS`）+ 会员 4（`_VIP_TOOLS`）+ 管理员 1（`_ADMIN_TOOLS`）；角色可用数 admin 36 / vip 35 / regular 31。
+> 另外 15 个工具**不在任何权限集合**中，只经路由层的 `allowed_tools` 动态下发：`SOCIAL_TOOLS` 角色面 8 个（`delegate_task`/`give_gift`/`create_image`/`send_voice`/`recall_asset`/`send_sticker`/`fetch_image`/`discover_images`，后两者同时在公共集合）、仅创作会话的 `create_character`、仅剧情会话的 `complete_scene`、仅连续对话的 `end_continuous_mode`、群聊的 `group_media`、Lucima 的 5 个；越权调用由执行层硬拒绝。
 > `story_search` 虽属 public，但只对剧情白名单人格出现在 schema 中（非白名单人格看不到、也用不了）。
 
 ## 智能体配置
@@ -740,16 +792,26 @@ bash test.sh
 cd QQBot && python test_agent.py
 ```
 
-`test_agent.py` 共 **53 个测试套件 / 316 个用例**（全部离线，mock client，无网络），`test_workspace.py` 另有 11 个类，`test_story_kb.py` 6 个类 / 37 个用例：
+`test_agent.py` 共 **60 个测试套件 / 378 个用例**（全部离线，mock client，无网络），`test_workspace.py` 另有 11 个类，`test_story_kb.py` 6 个类 / 37 个用例：
 
 | 分组 | 套件 |
 |---|---|
 | 基础架构（15） | `TestToolRegistry`、`TestSessionManager`、`TestMemorySystem`、`TestAgentCore`、`TestUserProfile`、`TestProfileExtraction`、`TestDeepSeekClientParsing`、`TestBuiltinTools`、`TestSearchArchive`、`TestPersonality`、`TestTokenLedger`、`TestCacheStability`、`TestTieredMemory`、`TestMergedExtraction`、`TestMemoryMigration` |
 | 养成与角色 / 会话人格（15） | `TestBondManager`、`TestBondContent`、`TestBondGiftPoke`、`TestBondEvents`、`TestBondScene`、`TestSceneSession`、`TestSceneArchive`、`TestBondReunionAnniversary`、`TestInitialBond`、`TestCharacterRegistry`、`TestSessionPersonaBinding`、`TestCreateCharacterTool`、`TestCharCreationInterview`、`TestPersonalityMeta`、`TestReferencePortrait` |
-| 渠道 / 多模态 / 面板（16） | `TestQQOfficialQuoteParsing`、`TestOfficialMarkdown`、`TestOfficialStatusHeartbeat`、`TestWebuiOfficialStatus`、`TestMediaGen`、`TestProactiveMedia`、`TestMediaQuota`、`TestAnchorVoiceId`、`TestDirectVision`、`TestDelegation`、`TestAgentPersist`、`TestActiveGreeting`、`TestModelRouterClassify`、`TestPersonalityMarkerPersistence`、`TestWebuiPermissionsEditor`、`TestWebuiModelSections` |
+| 渠道 / 多模态 / 面板（22） | `TestQQOfficialQuoteParsing`、`TestOfficialMarkdown`、`TestOfficialButtons`、`TestOfficialStream`、`TestOfficialStatusHeartbeat`、`TestWebuiOfficialStatus`、`TestMediaGen`、`TestProactiveMedia`、`TestMediaQuota`、`TestAnchorVoiceId`、`TestDirectVision`、`TestDelegation`、`TestAgentPersist`、`TestActiveGreeting`、`TestModelRouterClassify`、`TestPersonalityMarkerPersistence`、`TestWebuiPermissionsEditor`、`TestWebuiModelSections`、`TestProactiveMail`、`TestMailAdmin`、`TestAnnouncementBroadcast`、`TestWebuiWorkspace` |
 | 资产记忆 / 剧情（7） | `TestAssetCardsP4`、`TestAssetSearch`、`TestAssetRecall`、`TestUploadTextualization`、`TestEpisodeDistill`、`TestAssetEvictionInjection`、`TestStoryKbInjectionGate` |
+| 会话压缩（1） | `TestSessionCompression` |
 
-`test.sh` 还会跑 `benchmarks/memory/bench_engine.py`（确定性场景流的记忆引擎 benchmark）与 `test/` 下 21 个离线脚本（测速管线、别名、卡片渲染、兑换码/X 自动源、web_fetch、问卷、找图反查/Lens 等）。
+`test.sh` 还会跑 12 个 unittest 模块（记忆可靠性 / P2-P3 认知 / P4 经验 / 旧记忆迁移 / 邮件按钮 / 群行为 / 找图反查 / 群管理 / 群资源 / 媒体运行时 / 官方抽卡）、`benchmarks/memory/bench_engine.py`（确定性场景流的记忆引擎 benchmark）与 `test/` 下 21 个离线脚本（测速管线、别名、卡片渲染、兑换码/X 自动源、web_fetch、问卷、找图反查/Lens、资源管理、群 WebUI 等）。
+
+Lucima 与公开试聊的离线测试**不在 `test.sh` 中**，单独运行：
+
+```bash
+cd QQBot && python -m unittest test_lucima_bridge test_lucima_tools -v
+# 试聊测试在仓库根运行（public_try.py 与 webui/ 都在根目录）：
+PYTHONPATH=QQBot python -m unittest test_public_try -v
+# 群聊璐茜玛确认卡回归在 test_group_behavior 中（已含于 test.sh）
+```
 
 ## 安全模型
 
@@ -769,9 +831,9 @@ cd QQBot && python test_agent.py
 
 | 角色 | 配置方式 | 权限范围 |
 |------|---------|---------|
-| **管理员** | `SUPERUSERS` / `QQ_OFFICIAL_SUPERUSERS` | 32 个静态工具（含 `shell_exec`），`execute_code` 60s/16KB/256MB，2GB 工作区，10 个特殊会话，10 个自创角色，每日画图/语音各 50，影音资产 1GB |
-| **会员** | `VIP_USERS` / `QQ_OFFICIAL_VIP_USERS` | 31 个（含 `web_fetch`、`download_repo`、受限 `execute_code`），500MB 工作区，3 个特殊会话，3 个自创角色，每日画图/语音各 10，影音资产 300MB |
-| **普通用户** | 默认 | 27 个基础工具（搜索/天气/地图/文件/娱乐/养成查询），100MB 工作区，1 个特殊会话，1 个自创角色，每日画图/语音各 3，影音资产 100MB |
+| **管理员** | `SUPERUSERS` / `QQ_OFFICIAL_SUPERUSERS` | 36 个静态工具（含 `shell_exec`），`execute_code` 60s/16KB/256MB，2GB 工作区，10 个特殊会话，10 个自创角色，每日画图/语音各 50，影音资产 1GB |
+| **会员** | `VIP_USERS` / `QQ_OFFICIAL_VIP_USERS` | 35 个（含 `web_fetch`、`download_repo`、受限 `execute_code`），500MB 工作区，3 个特殊会话，3 个自创角色，每日画图/语音各 10，影音资产 300MB |
+| **普通用户** | 默认 | 31 个基础工具（搜索/天气/地图/文件/娱乐/养成查询），100MB 工作区，1 个特殊会话，1 个自创角色，每日画图/语音各 3，影音资产 100MB |
 
 工具权限通过请求时 **schema 过滤** 控制（LLM 只看到允许调用的工具），`_execute_tool_calls()` 中的硬拦截作为纵深防御；角色面/创作/剧情/连续对话等场景的工具另经 `allowed_tools` 动态下发（不进入上面的静态集合）。
 
@@ -987,6 +1049,7 @@ docker compose run --rm searxng cat /etc/searxng/settings.yml  # 验证挂载
 
 **设计与实施文档（仓库根目录）**
 
+- [LUCIMA.md](LUCIMA.md) — Lucima（璐茜玛）星陨账号工具：桥接部署、扫码授权、命令/自然语言确认卡、长任务与每日托管、商店刷新与命中购买
 - [Bond-System-Design.md](Bond-System-Design.md) — 角色养成 / 双平面路由 / 影音与剧情（P0–P5 全阶段已实施）
 - [Story-Knowledge-Base-Design.md](Story-Knowledge-Base-Design.md) — 原作剧情知识库（构建、检索、注入门控）
 - [Voice-System-Design.md](Voice-System-Design.md) — 三层音色架构（设计稿）
