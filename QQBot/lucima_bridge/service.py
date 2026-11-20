@@ -17,12 +17,13 @@ from tempfile import TemporaryDirectory
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from .account_card import normalize_profile, profile_summary
 from .accounts_ui import AccountSlots
 from .filters import Filters
 from .menu import PAGES, THEME_NAMES, menu_data
 
 from .long_tasks import (
-    LONG_NAMES, LONG_QUEUE_TTL, SCHEDULE_TASKS, SHOP_HIT_TTL, SHOP_REFRESHES, TASK_TIMEOUT,
+    BATTLE_IDS, ILLUSION_SWEEP_ORDER, LONG_NAMES, LONG_QUEUE_TTL, SCHEDULE_TASKS, SHOP_HIT_TTL, SHOP_REFRESHES, TASK_TIMEOUT,
     LongTasks, schedule_arguments,
 )
 
@@ -36,6 +37,7 @@ SESSION_TTL = 15 * 60
 REMEMBER_TTL = 30 * 86400
 QUEUE_TTL = 5 * 60
 QUEUE_SIZE = 5
+PROFILE_VIEWS = {"profile", "profile_full"}
 SHOP_TARGETS = {"recruit": "招募契约", "mystery": "神秘契约", "chip": "下级强化芯片"}
 SHOP_CURRENCIES = {"secret": ("1", "金币"), "star": ("109", "彩虹星源")}
 STAR_SOURCE_QUOTE_UNAVAILABLE = (
@@ -223,6 +225,7 @@ class LoginNotice:
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     message: str | None = None
     receipt: dict | None = None
+    group: bool = False
 
 
 @dataclass
@@ -243,6 +246,8 @@ class Job:
 
     @property
     def label(self) -> str:
+        if self.task == "account_view" and self.code in PROFILE_VIEWS:
+            return "账号信息"
         return ("托管·" if self.schedule else "") + TASK_NAMES[self.task]
 
 
@@ -433,7 +438,7 @@ class Bridge:
             self.dismiss_login_notice(slot)
         secret = secrets.token_urlsafe(32)
         self.tickets[fingerprint(secret)] = Ticket(owner, now, group=group)
-        notice = LoginNotice(event, now + TICKET_TTL)
+        notice = LoginNotice(event, now + TICKET_TTL, group=group)
         self.login_notices[owner] = notice
         return {"login_url": self.public_origin + "/#" + secret, "login_notice": notice.id}
 
@@ -451,7 +456,12 @@ class Bridge:
             return {}
         self.dismiss_login_notice(owner)
         view = self.navigation(self.accounts.scope_for(owner), "home", notice.message, remember=False)
-        return {**view, "menu": "lobby", "receipt": notice.receipt}
+        response = {**view, "menu": "lobby", "receipt": notice.receipt}
+        code = "profile" if notice.group else "profile_full"
+        profile = self.submit(owner, "account_view", code, "login-profile:" + notice.id)
+        if job := profile.get("job"):
+            response["profile_job"] = job
+        return response
 
     def claim(self, secret: str) -> tuple[str, str] | None:
         self.prune()
@@ -911,18 +921,36 @@ class Bridge:
             if len(self.queue) >= QUEUE_SIZE:
                 break
 
-    def result(self, job: Job, message: str, status: str, details=None, *, shop_options=None) -> None:
+    def result(self, job: Job, message: str, status: str, details=None, *, shop_options=None,
+               battle_options=None, illusion_quote=None, profile=None) -> None:
         facts = details if isinstance(details, list) else []
         clean = [" ".join(item.split())[:120] for item in facts[:8] if isinstance(item, str)]
         payload = {"id": job.id, "task": job.label, "status": status,
                    "message": message, "details": clean, "completed_at": int(time.time()),
                    "theme": self.accounts.preferences(self.accounts.scope_for(job.owner))[1]}
+        if job.task == "account_view" and job.code in PROFILE_VIEWS:
+            payload["kind"] = "profile"
+            if profile is not None:
+                payload["account_profile"] = profile
+                payload["profile_binding"] = job.game
         if job.task == "account_view" and status == "ok" and clean:
             part = job.code.split(maxsplit=2)
             match = re.match(r"第 (\d+)/(\d+) 页", clean[0])
             if match and part[0] in {"heroes", "items", "teams"}:
                 payload["view"] = [self.accounts.position_for(job.owner), part[0], *map(int, match.groups()),
                                    part[2] if len(part) > 2 else ""]
+        if (job.task == "account_view" and job.code == "abyss_sweep" and status == "ok"
+                and isinstance(illusion_quote, dict)):
+            count, floor = illusion_quote.get("count"), illusion_quote.get("floor")
+            if type(count) is int and type(floor) is int and ILLUSION_SWEEP_ORDER.fullmatch(f"{count} {floor}"):
+                payload["illusion_quote"] = {"count": count, "floor": floor}
+        if job.task == "long_info" and status == "ok" and isinstance(battle_options, list):
+            pattern = BATTLE_IDS.get(job.code)
+            if pattern:
+                choices = list(dict.fromkeys(value for value in battle_options[:10]
+                                             if isinstance(value, str) and pattern.fullmatch(value)))
+                if choices:
+                    payload["battle_choices"] = [job.code, choices]
         if status == "shop_hit" and job.task in SHOP_REFRESHES:
             expires = payload["completed_at"] + SHOP_HIT_TTL
             payload["shop_confirm_until"] = expires
@@ -1117,9 +1145,20 @@ class Bridge:
             if refreshed != auth:
                 self.vault.update(job.owner, refreshed)
         details = result.get("details")
+        profile = None
+        if job.task == "account_view" and job.code in PROFILE_VIEWS:
+            if status == "ok":
+                profile = normalize_profile(result.get("accountProfile"), full=job.code == "profile_full")
+                if profile is None:
+                    status = "not_started"
+            details = profile_summary(profile) if profile else [
+                "暂未取得游戏快照，可用 /lucima 刷新信息 重试。",
+            ]
         if not details and job.progress and status in {"timeout", "worker_error", "unconfirmed"}:
             details = [f"停止前进度：{job.progress}"]
         outcome = OUTCOMES[status]
         if public_reference and status in {"worker_error", "timeout"}:
             outcome = "暂时无法读取商品参考价，请稍后重试。"
-        self.result(job, f"{job.label}：{outcome}", status, details, shop_options=result.get("shopOptions"))
+        self.result(job, f"{job.label}：{outcome}", status, details,
+                    shop_options=result.get("shopOptions"), battle_options=result.get("battleOptions"),
+                    illusion_quote=result.get("illusionQuote"), profile=profile)

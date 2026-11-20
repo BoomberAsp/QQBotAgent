@@ -9,6 +9,7 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from cryptography.fernet import Fernet
@@ -182,6 +183,189 @@ class WebAuthorizationTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(result["receipt"]["details"], ["静态商品参考价"])
         self.worker.assert_awaited_once_with({"action": "run", "task": "long_info", "code": "shop"}, 100)
+
+    def test_login_profile_card_obeys_visibility_and_original_group_scope(self):
+        from lucima_bridge.account_card import render_account_card
+
+        for group in (None, "profile-room"):
+            with self.subTest(group=group):
+                scope = {"platform": "qq_official", "group": group}
+                auth = {**AUTH, "user_id": f"profile-{group}"}
+                snapshot = {
+                    "name": "示例团长", "level": 70, "sampled_at": 1_780_000_000,
+                    "uid": "123456789", "currencies": {"diamond": 31415},
+                    "heroes": [{"name": "样例团员", "level": 60}],
+                    "heroes_total": 12, "items_total": 25,
+                    "stamina": {"current": 38, "max": 296}, "flag": {"current": 0, "max": 5},
+                }
+                self.worker.return_value = {"status": "ok", "auth": auth, "accountProfile": snapshot}
+                issue = self.command("login", event="profile-login", **scope)
+                claim = self.post("/api/claim", {"ticket": issue["login_url"].split("#")[1]})
+                self.assertEqual(claim.status_code, 200)
+                self.command("confirm", arg=claim.json()["pin"], event="profile-check", **scope)
+                self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub",
+                                                          "remember": True}).status_code, 200)
+                notice = self.command("login_notice", arg=issue["login_notice"], event="profile-login", **scope)
+                self.assertEqual(notice["menu"], "lobby")
+                self.assertIn("profile_job", notice)
+                self.assertFalse(self.command("login_notice", arg=issue["login_notice"], event="profile-login", **scope))
+
+                def get_card(job):
+                    for _ in range(50):
+                        response = self.command("receipt", arg=job, **scope)
+                        if "receipt" in response:
+                            return response["receipt"]
+                        time.sleep(0.01)
+                    self.fail("账号卡回执未完成")
+
+                with patch("lucima_bridge.web.render_account_card", wraps=render_account_card) as renderer:
+                    card = get_card(notice["profile_job"])
+                    self.assertTrue(card["profile_png"].startswith("iVBORw"))
+                    self.assertNotIn("account_profile", card)
+                    self.assertNotIn("profile_binding", card)
+                    self.assertEqual(card["expand_profile"], group is not None)
+                    data = renderer.call_args.args[0]
+                    self.assertEqual(data.get("uid"), None if group else snapshot["uid"])
+                    self.assertEqual(data.get("currencies", {}).get("diamond"), None if group else 31415)
+                    self.worker.assert_awaited_with(
+                        {"action": "run", "task": "account_view", "code": "profile" if group else "profile_full",
+                         "auth": auth}, 100,
+                    )
+
+                    if group:
+                        receipt_id = card["id"]
+                        self.assertNotIn("approval", self.command("expand_profile", arg=receipt_id, user="other", **scope))
+                        self.assertNotIn("job", self.command("account_view", arg="profile_full", **scope))
+                        proposal = self.command("expand_profile", arg=receipt_id, event="profile-expand", **scope)
+                        self.assertIn("群成员都可以看到", proposal["message"])
+                        self.assertNotIn("job", self.command("approve", arg=proposal["approval"], user="other",
+                                                            event="profile-other", **scope))
+                        job = self.command("approve", arg=proposal["approval"], event="profile-confirm", **scope)["job"]
+                        self.assertNotIn("job", self.command("approve", arg=proposal["approval"],
+                                                            event="profile-replay", **scope))
+                        expanded = get_card(job)
+                        self.assertFalse(expanded["expand_profile"])
+                        self.assertEqual(renderer.call_args.args[0]["uid"], snapshot["uid"])
+                    else:
+                        saved = self.command("login", event="profile-resume", **scope)
+                        claim = self.post("/api/claim", {"ticket": saved["login_url"].split("#")[1]})
+                        self.command("confirm", arg=claim.json()["pin"], event="resume-check", **scope)
+                        with patch.dict(self.client.app.state.bridge.attempts, clear=True):
+                            self.assertEqual(self.post("/api/login", {"use_saved": True}).status_code, 200)
+                        returned = self.command(
+                            "login_notice", arg=saved["login_notice"], event="profile-resume", **scope,
+                        )
+                        self.assertIn("已恢复", returned["message"])
+                        self.assertTrue(get_card(returned["profile_job"])["profile_png"])
+
+                with patch("lucima_bridge.web.render_account_card", side_effect=OSError):
+                    fallback = get_card(notice["profile_job"])
+                self.assertNotIn("profile_png", fallback)
+                self.assertTrue(any("体力 38/296" in item for item in fallback["details"]))
+
+                self.worker.return_value = {"status": "game_login_unavailable", "auth": auth}
+                job = self.command("account_view", arg="profile", event="profile-refresh", **scope)["job"]
+                failed = get_card(job)
+                self.assertNotIn("profile_png", failed)
+                self.assertIn("刷新信息", failed["details"][0])
+                self.assertEqual(self.command("lobby", **scope)["menu"], "lobby")
+
+    def test_battle_choices_and_confirmations_in_qq_group_and_private(self):
+        cases = (
+            ("activity", "BH12", "BH12 0 1 30", {"group": "battle-room", "platform": "qq_official"}),
+            ("abyss", "MysteriousRealm_10", "MysteriousRealm_10 H001 H002", {"platform": "qq_official"}),
+        )
+        for kind, choice, code, scope in cases:
+            with self.subTest(kind=kind):
+                auth = {**AUTH, "user_id": f"mock-{kind}"}
+                self.worker.return_value = {"status": "ok", "auth": auth}
+                scope = {**scope, "user": kind}
+                issue = self.command("login", event="issue", **scope)
+                claim = self.post("/api/claim", {"ticket": issue["login_url"].split("#")[1]})
+                self.assertEqual(claim.status_code, 200)
+                pin = claim.json()["pin"]
+                self.command("confirm", arg=pin, event="confirm-login", **scope)
+                login = self.post("/api/login", {"account": "stub", "password": "stub"})
+                self.assertEqual(login.status_code, 200)
+
+                self.worker.return_value = {"status": "ok", "auth": auth, "battleOptions": [choice, "bad/id", choice]}
+                job = self.command("long_info", arg=kind, event="query", **scope)["job"]
+                for _ in range(50):
+                    receipt = self.command("receipt", arg=job, event="query-receipt", **scope).get("receipt")
+                    if receipt:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(receipt["battle_choices"], [kind, [choice]])
+
+                before = self.worker.await_count
+                proposal = self.command(kind, arg=code, event="propose", **scope)
+                token = proposal["approval"]
+                self.assertIn("体力上限", proposal["message"])
+                self.assertNotIn("job", self.command("approve", arg=token, event="propose", **scope))
+                wrong_scope = {**scope, "group": None} if "group" in scope else {**scope, "group": "battle-room"}
+                self.assertNotIn("job", self.command("approve", arg=token, event="outside", **wrong_scope))
+                self.assertEqual(self.worker.await_count, before)
+
+                self.worker.return_value = {"status": "ok", "auth": auth, "details": ["游戏结算已确认"]}
+                job = self.command("approve", arg=token, event="confirm-battle", **scope)["job"]
+                self.assertNotIn("job", self.command("approve", arg=token, event="repeat", **scope))
+                for _ in range(50):
+                    receipt = self.command("receipt", arg=job, event="battle-receipt", **scope).get("receipt")
+                    if receipt:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(receipt["details"], ["游戏结算已确认"])
+                self.assertEqual(self.worker.await_count, before + 1)
+                self.assertEqual(self.worker.await_args.args[0]["code"], code)
+
+    def test_illusion_sweep_quote_requires_separate_confirmation_in_each_qq_context(self):
+        for group in (None, "illusion-room"):
+            with self.subTest(group=group):
+                scope = {"platform": "qq_official", "group": group}
+                auth = {**AUTH, "user_id": f"illusion-{group}"}
+                self.worker.return_value = {"status": "ok", "auth": auth}
+                issue = self.command("login", event="illusion-login", **scope)
+                claim = self.post("/api/claim", {"ticket": issue["login_url"].split("#")[1]})
+                self.assertEqual(claim.status_code, 200)
+                self.command("confirm", arg=claim.json()["pin"], event="illusion-login-confirm", **scope)
+                response = self.post("/api/login", {"account": "stub", "password": "stub"})
+                self.assertEqual(response.status_code, 200)
+
+                self.worker.return_value = {"status": "ok", "auth": auth,
+                                            "illusionQuote": {"count": 3, "floor": 80}}
+                job = self.command("account_view", arg="abyss_sweep", event="illusion-query", **scope)["job"]
+                for _ in range(50):
+                    receipt = self.command("receipt", arg=job, event="illusion-quote", **scope).get("receipt")
+                    if receipt:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(receipt["illusion_quote"], {"count": 3, "floor": 80})
+                before = self.worker.await_count
+
+                prepared = self.command("sweep_illusion", arg="3 80", event="illusion-prepare", **scope)
+                self.assertIn("第 80 层", prepared["message"])
+                self.assertIn("全部 3 个意识同步器", prepared["message"])
+                self.assertIn("体力消耗 0", prepared["message"])
+                token = prepared["approval"]
+                self.assertNotIn("job", self.command("approve", arg=token, event="illusion-prepare", **scope))
+                self.assertNotIn("job", self.command("approve", arg=token, event="illusion-other", user="other", **scope))
+                self.assertEqual(self.worker.await_count, before)
+
+                self.worker.return_value = {"status": "ok", "auth": auth, "details": ["扫荡扣费已确认"]}
+                job = self.command("approve", arg=token, event="illusion-confirm", **scope)["job"]
+                self.assertNotIn("job", self.command("approve", arg=token, event="illusion-replay", **scope))
+                for _ in range(50):
+                    receipt = self.command("receipt", arg=job, event="illusion-result", **scope).get("receipt")
+                    if receipt:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(receipt["details"], ["扫荡扣费已确认"])
+                self.assertNotIn("illusion_quote", receipt)
+                self.worker.assert_awaited_with({"action": "run", "task": "sweep_illusion",
+                                                 "code": "3 80", "auth": auth}, 100)
+                self.assertEqual(self.worker.await_count, before + 1)
+
+
 
     def test_shop_refreshes_require_scoped_confirmation(self):
         scope = {"group": "shop-room"}

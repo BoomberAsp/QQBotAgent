@@ -7,7 +7,14 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 
-LONG_NAMES = {"activity": "活动推进", "abyss": "虚构深渊", "buy_batch": "批量购买",
+STAGE_QUERY = re.compile(
+    r"(?:hunt(?: (?:[火木水暗光]|Hunt(?:Fire|Earth|Ice|Dark|Light)_[0-9]{1,3}))?"
+    r"|elf(?: (?:[火木水暗光]|Elf(?:Fire|Earth|Ice|Dark|Light)_[0-9]{1,3}))?)"
+)
+ACTIVITY_SWEEP_QUERY = re.compile(r"activity_sweep(?: BH[0-9]{1,5}(?:_[0-9]{1,3}_[0-9]{1,3})?)?")
+ILLUSION_SWEEP_ORDER = re.compile(r"([1-9][0-9]{0,2})(?: ([1-9][0-9]{0,3}))?")
+BATTLE_IDS = {"activity": re.compile(r"BH[0-9]{1,5}"), "abyss": re.compile(r"MysteriousRealm_[0-9]{1,2}")}
+LONG_NAMES = {"activity": "活动推进", "abyss": "虚构深渊挑战", "buy_batch": "批量购买",
               "refresh_secret_paid": "刷新秘密商店", "refresh_star_source": "刷新星源商店",
               "buy_shop_equipment": "购买命中装备"}
 SCHEDULE_TASKS = {
@@ -37,15 +44,15 @@ def preview(action, arg):
     parts = arg.split()
     if action == "activity" and len(parts) == 4:
         family, team, count, energy = parts
-        if (re.fullmatch(r"BH[0-9]{1,5}", family) and re.fullmatch(r"[A-Za-z0-9_-]{1,24}", team)
+        if (BATTLE_IDS[action].fullmatch(family) and re.fullmatch(r"[A-Za-z0-9_-]{1,24}", team)
                 and re.fullmatch(r"[1-3]", count) and re.fullmatch(r"[0-9]{1,3}", energy)):
-            return f"以队伍 {team} 推进活动 {family}，最多 {count} 关，体力预算 {energy}。"
+            return f"以队伍 {team} 推进活动 {family}，最多 {count} 关，体力上限 {int(energy)}。\n超出预算、体力不足或活动结束时停止。"
     if action == "abyss" and len(parts) == 3:
         scene, *teams = parts
-        if re.fullmatch(r"MysteriousRealm_[0-9]{1,2}", scene) and all(
+        if BATTLE_IDS[action].fullmatch(scene) and all(
                 re.fullmatch(r"(?:[A-Za-z0-9_]{1,24}|-)(?:,(?:[A-Za-z0-9_]{1,24}|-)){0,3}", team)
                 and any(role != "-" for role in team.split(",")) for team in teams):
-            return f"挑战虚构深渊 {scene} 一次。\n上半 {teams[0]}\n下半 {teams[1]}\n禁止使用魂力和自动进入下一层。"
+            return f"挑战虚构深渊 {scene} 一次。\n上半 {teams[0]}\n下半 {teams[1]}\n体力上限 0。仅挑战本层，魂力消耗上限 0。"
     if action == "buy_batch" and 1 <= len(parts) <= 5:
         rows, totals = {}, {}
         for part in parts:

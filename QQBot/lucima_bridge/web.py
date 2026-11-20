@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import fcntl
 import hmac
 import json
@@ -15,7 +16,9 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 
-from .long_tasks import CONFIRMED_OPERATIONS, preview as long_preview
+from .account_card import render_account_card
+from .long_tasks import ACTIVITY_SWEEP_QUERY, CONFIRMED_OPERATIONS, ILLUSION_SWEEP_ORDER, STAGE_QUERY
+from .long_tasks import preview as long_preview
 from .filters import NAME as FILTER_NAME, parse_scheme
 from .manual import MANUAL_INDEX, MANUAL_PATH, render_manual
 from .menu import PAGES, THEMES, shop_arguments
@@ -107,6 +110,7 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("该数据目录已有运行中的 Lucima 服务") from None
         app.state.internal_token = internal_token.encode()
         app.state.catalog = load_catalog(root)
+        app.state.asset_root = root
         origin = public_origin()
         vault = Vault(data_dir / "binding.sqlite3", os.environ["LUCIMA_VAULT_KEY"])
         try:
@@ -277,7 +281,7 @@ def operation_preview(action: str, arg: str) -> str | None:
         return None
     if action in CONFIRMED_OPERATIONS:
         return long_preview(action, arg)
-    if action == "long_info" and arg in {"activity", "abyss", "shop"}:
+    if action == "long_info" and (arg in {"activity", "abyss", "shop"} or ACTIVITY_SWEEP_QUERY.fullmatch(arg)):
         return "查询长任务可用的关卡、队伍或商品报价。"
     if action == "account_view" and (match := ACCOUNT_PAGE.fullmatch(arg)):
         kind, page, _ = match.groups()
@@ -291,8 +295,14 @@ def operation_preview(action: str, arg: str) -> str | None:
         item, count, currency, unit = match.groups()
         return f"团员商店购买 {item} × {count}，单价 {unit}，最多扣除货币 {currency} × {int(count) * int(unit)}。"
     if action == "sweep_illusion":
-        return (f"扫荡已通关且符合条件的最高层，意识同步器上限 {arg}。"
-                "游戏预计使用当前持有量，执行前重新核对。") if re.fullmatch(r"[1-9][0-9]{0,2}", arg) else None
+        if not (match := ILLUSION_SWEEP_ORDER.fullmatch(arg)):
+            return None
+        count, floor = match.groups()
+        if floor:
+            return (f"扫荡虚拟幻境第 {floor} 层一次，消耗全部 {count} 个意识同步器，体力消耗 0。\n"
+                    "最高通关楼层或持有数量变化时停止。")
+        return (f"扫荡虚拟幻境已通关且符合条件的最高层，意识同步器上限 {count}，体力消耗 0。"
+                "游戏会使用执行时持有的全部意识同步器。")
     if action == "tesseract" and not arg:
         return "检查技能模块并领取已完成的产物。加速次数上限 0。"
     if action in SHOP_ACTIONS:
@@ -308,8 +318,8 @@ def operation_preview(action: str, arg: str) -> str | None:
         return APPROVALS[(action, arg)]
     if action == "redeem" and CODE.fullmatch(arg):
         return f"在绑定的游戏账号兑换一次指定兑换码 `{arg}`。"
-    if action == "stages" and arg in {"hunt", "elf"}:
-        return "查询已解锁的讨伐关卡。" if arg == "hunt" else "查询已解锁的元素探索关卡。"
+    if action == "stages" and STAGE_QUERY.fullmatch(arg):
+        return "查询已解锁的讨伐关卡与参考体力。" if arg.startswith("hunt") else "查询已解锁的元素探索关卡与参考体力。"
     if action == "equipment" and (not arg or valid(arg, 24)):
         return "读取装备并按副属性分数排序。" + (f"套装筛选条件 {display_arg}。" if arg else "")
     if action == "encyclopedia" and valid(arg, 64) and arg.strip():
@@ -443,6 +453,24 @@ async def prepare_proposal(request: Request, *, group: bool):
     return bridge.prepare(owner, action, arg, preview=preview, event=event)
 
 
+async def render_profile_receipt(response, root, *, group=False, current_account=True):
+    receipt = response.get("receipt")
+    if not receipt or receipt.get("kind") != "profile":
+        return response
+    card = receipt.get("account_profile")
+    display = {key: value for key, value in receipt.items() if key not in {"account_profile", "profile_binding"}}
+    if card:
+        display["expand_profile"] = group and current_account and not card["full"]
+        try:
+            png = await asyncio.to_thread(render_account_card, card, root, receipt.get("theme"))
+            if len(png) <= 512 * 1024:
+                display["profile_png"] = base64.b64encode(png).decode("ascii")
+        except Exception:
+            # The existing text summary is also the image fallback.
+            pass
+    return {**response, "receipt": display}
+
+
 @app.post("/internal/command")
 async def command(request: Request):
     return await run_command(request, group=False)
@@ -476,6 +504,18 @@ async def run_command(request: Request, *, group: bool):
         notice_owner = next((slot for slot in bridge.accounts.owners(scope)
                              if (notice := bridge.login_notices.get(slot)) and hmac.compare_digest(notice.id, arg)), owner)
         return await bridge.wait_login_notice(notice_owner, arg, event)
+    if action == "account_view" and arg == "profile":
+        return bridge.submit(owner, "account_view", "profile" if group else "profile_full", event)
+    if action == "expand_profile" and group and OPERATION_ID.fullmatch(arg):
+        receipt = bridge.receipt(owner, arg).get("receipt", {})
+        binding = bridge.vault.record(owner)
+        card = receipt.get("account_profile")
+        if not card or card["full"] or not binding or receipt.get("profile_binding") != binding[0]:
+            return answer("这张账号卡已失效，请在原会话重新刷新。")
+        return bridge.prepare(
+            owner, "account_view", "profile_full", event=event,
+            preview="在本群显示完整账号信息，包含 UID、详细资源和团员预览。群成员都可以看到。",
+        )
     if action == "lobby" and not arg:
         return bridge.lobby(owner)
     if action == "navigate" and arg in PAGES:
@@ -537,17 +577,19 @@ async def run_command(request: Request, *, group: bool):
                 return bridge.prepare(owner, action, arg, preview=f"删除当前账号的装备方案「{arg}」。", event=event)
         return {"message": "未找到这个装备方案。"}
     if action == "approve" and OPERATION_ID.fullmatch(arg):
-        return bridge.approve(owner, arg, event, execute)
+        return await render_profile_receipt(bridge.approve(owner, arg, event, execute),
+                                            request.app.state.asset_root, group=group)
     if action == "discard" and OPERATION_ID.fullmatch(arg):
         return answer(bridge.discard(owner, arg))
-    if action == "receipt" and OPERATION_ID.fullmatch(arg):
-        for slot in bridge.accounts.owners(scope):
+    if action == "receipt" and (not arg or OPERATION_ID.fullmatch(arg)):
+        for slot in bridge.accounts.owners(scope) if arg else (owner,):
             response = bridge.receipt(slot, arg)
             if response.get("receipt") or response.get("pending"):
                 if slot != owner and (receipt := response.get("receipt")):
                     response["receipt"] = {k: v for k, v in receipt.items()
-                                           if k not in {"view", "shop_confirm_until", "shop_choices"}}
-                return response
+                                           if k not in {"view", "shop_confirm_until", "shop_choices", "battle_choices", "illusion_quote"}}
+                return await render_profile_receipt(response, request.app.state.asset_root,
+                                                    group=group, current_account=slot == owner)
         return execute(action, arg)
     if action == "confirm_shop_hit" and OPERATION_ID.fullmatch(arg):
         return bridge.confirm_shop_hit(owner, arg)
