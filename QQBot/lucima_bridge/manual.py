@@ -1,10 +1,13 @@
 """Public Lucima help shared by QQ commands and the agent."""
 
+import os
 from html import escape
 
 
 MANUAL_PATH = "/manual"
 MANUAL_TITLE = "Lucima QQ 使用手册"
+MANUAL_COMMAND = "/lucima 使用手册"
+MANUAL_ALIASES = ("/璐茜玛 使用手册", "/璐西玛 使用手册", "/露西玛 使用手册")
 MANUAL_ACCESS_NOTE = "在群里先 @ 机器人，私聊可以直接发命令。阅读手册无需登录游戏。"
 MANUAL_TOPICS = {
     "登录": (
@@ -105,6 +108,15 @@ QUICK_START = (
     ("/lucima 登录", "获取网页登录入口"),
     ("/lucima 状态", "查看任务进度"),
 )
+
+
+def is_manual_command(text: str) -> bool:
+    return " ".join(text.split()).casefold() in (MANUAL_COMMAND, *MANUAL_ALIASES)
+
+
+def manual_qq_reply() -> str:
+    site = os.environ.get("BOT_PUBLIC_SITE_URL", "").strip().rstrip("/") or "https://bot.oneweblog.cn"
+    return f"{MANUAL_INDEX}\n完整版\n{site}/lucima/"
 
 
 def manual_text(topic: str = "总览") -> str:

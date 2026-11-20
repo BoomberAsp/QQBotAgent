@@ -493,6 +493,30 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await runtime.run_group_turn(v,self.sender)
         self.assertEqual(len(self.calls),1)
 
+    async def test_lucima_manual_is_discoverable_and_answers_mentions(self):
+        with patch.dict("os.environ", {"BOT_PUBLIC_SITE_URL": "https://bot.example/", "LUCIMA_INTERNAL_TOKEN": ""}):
+            help_view = view(message="manual-help")
+            help_view.text = "<@bot> /群帮助"
+            await runtime.run_group_turn(help_view, self.sender)
+            self.assertIn("/lucima 使用手册", self.sender.send_group_text.await_args.args[0])
+
+            for i, command in enumerate(("/lucima 使用手册", "/LUCIMA  使用手册", "/璐茜玛 使用手册",
+                                         "/璐西玛 使用手册", "/露西玛 使用手册")):
+                v = view(message=f"manual-{i}")
+                v.text = "<@bot> " + command
+                await runtime.run_group_turn(v, self.sender)
+                self.assertIn("Lucima QQ 使用手册", self.sender.send_group_text.await_args.args[0])
+                self.assertIn("https://bot.example/lucima/", self.sender.send_group_text.await_args.args[0])
+
+            v = view(message="manual-no-mention")
+            v.text = "<@another> /lucima 使用手册"
+            v.mentioned = False
+            await runtime.run_group_turn(v, self.sender)
+
+        self.assertEqual(self.sender.send_group_text.await_count, 6)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.store.history(scope_for(v)), [])
+
     async def test_public_group_commands_use_system_handlers(self):
         from agent.context import _turn_sender,_current_group_id
         from agent.public_commands import PUBLIC_COMMANDS

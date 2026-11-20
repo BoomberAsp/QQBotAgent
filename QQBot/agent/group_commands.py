@@ -1,6 +1,8 @@
 """Single group command registry, exact aliases and per-command authorization."""
 import re
 from dataclasses import dataclass,replace
+
+from lucima_bridge.manual import MANUAL_ALIASES, MANUAL_COMMAND, is_manual_command, manual_qq_reply
 from .group_state import scope_for,identity_for,Conflict
 from .group_service import GroupService
 from .group_reply import GroupReply
@@ -19,6 +21,7 @@ COMMANDS=(
  GroupCommand('/乱速','any','[速度1 速度2]',('/luansu',)),
  GroupCommand('/测速','any','[行动值模板或两张截图]',('/测个速','/cesu','/compute speed')),
  GroupCommand('/群状态','any','查看本群状态',('/status','/群信息','/groupinfo','/ginfo')),GroupCommand('/群帮助','any','查看命令',('/帮助','/help','/命令','/介绍','/hello','/Hello','/你是谁')),
+ GroupCommand(MANUAL_COMMAND,'any','查看 Lucima 概览与完整版手册',MANUAL_ALIASES),
  GroupCommand('/群人格','admin','内置名|默认',('/toggle personality',)),
  GroupCommand('/群面板','group_or_bot','打开管理卡片',('/toggle',)),
  GroupCommand('/群功能',usage='gacha|image|voice 开|关'),GroupCommand('/群参与',usage='仅召唤|跟随|自然'),
@@ -130,7 +133,7 @@ async def dispatch(view,sender,role,store):
     if text.split()[0].lower() in PRIVATE_ONLY:
         await GroupReply('此命令请在私聊中使用',['群内可用命令见 /群帮助。']).send(sender)
         return True
-    cmd,rest,alias=parse(text)
+    cmd,rest,alias=parse(MANUAL_COMMAND if is_manual_command(text) else text)
     if cmd is None:
         await GroupReply('未知命令',['发送 /群帮助 查看本群可用命令。']).send(sender);return True
     if survey_flow.is_survey_command(cmd.name):
@@ -144,6 +147,9 @@ async def dispatch(view,sender,role,store):
         return True
     if not authorized(cmd.who,role,view.actor_role):
         await GroupReply('权限不足',['此操作需要机器人管理员权限。' if cmd.who=='admin' else '此操作需要群主、群管理员或机器人管理员权限。']).send(sender);return True
+    if cmd.name == MANUAL_COMMAND:
+        await runtime.send_text(sender, manual_qq_reply() if not rest else "用法 " + MANUAL_COMMAND)
+        return True
     if cmd.name in GAMES or cmd.name=='/取消':
         if await dispatch_game(view,sender,store,cmd.name,rest):
             return True

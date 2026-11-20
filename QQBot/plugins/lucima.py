@@ -21,6 +21,7 @@ from agent.outbound import OutKeyboard
 from lib.button_spec import Btn
 from lucima_bridge.client import Actor, approval_card, enabled, request_lucima
 from lucima_bridge.long_tasks import LONG_QUEUE_TTL, SCHEDULE_TASKS, TASK_TIMEOUT
+from lucima_bridge.manual import is_manual_command, manual_qq_reply
 from lucima_bridge.menu import HOME_LINKS, NAV_NAMES, PAGES
 from lucima_bridge.receipt import render_panel, render_receipt
 from lucima_bridge.service import LOGIN_NOTICE_LIMIT, LOGIN_TIMEOUT, TICKET_TTL
@@ -30,7 +31,6 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 PREFIX = re.compile(r"^/(?:璐茜玛|璐西玛|露西玛|lucima)(?:\s+|$)", re.IGNORECASE)
 COMMANDS = {
     "登录": "login", "大厅": "lobby", "确认": "confirm", "状态": "status", "取消": "cancel", "解绑": "unbind",
-    "使用手册": "manual",
     "签到": "signin", "领邮件": "mail", "领基地": "base", "兑换": "redeem", "图鉴": "encyclopedia",
     "领派遣": "dispatch", "领成就": "achievement", "团签到": "guild", "团周奖": "guild_weekly", "免费招募": "recruit",
     "筛装备": "equipment", "执行": "approve", "放弃": "discard", "回执": "receipt",
@@ -116,13 +116,19 @@ def command_text(event: Event) -> str:
 
 
 async def is_command(event: Event) -> bool:
-    return enabled() and bool(PREFIX.match(command_text(event)))
+    text = command_text(event)
+    if is_manual_command(text):
+        # Groups use the shared command registry, including the @ check.
+        return not isinstance(event, (OneBotGroup, GroupMessageCreateEvent))
+    return enabled() and bool(PREFIX.match(text))
 
 
 matcher = on_message(rule=is_command, priority=0, block=True)
 
 
 async def call_service(text: str, platform: str, bot: str, user: str, event: str, group: str | None = None) -> dict:
+    if is_manual_command(text):
+        return {"message": manual_qq_reply()}
     command, *args = PREFIX.sub("", text, count=1).split(maxsplit=1) or [""]
     action = COMMANDS.get(command)
     arg = args[0] if args else ""
