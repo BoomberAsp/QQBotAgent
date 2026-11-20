@@ -365,7 +365,71 @@ class WebAuthorizationTests(unittest.TestCase):
                                                  "code": "3 80", "auth": auth}, 100)
                 self.assertEqual(self.worker.await_count, before + 1)
 
+    def test_sweep_choices_and_paid_sweep_confirmation_in_qq_group_and_private(self):
+        cases = (
+            ("sweep_hunt", "hunt", "stages", "hunt", "HuntFire_10", "HuntFire_10 team1 3 36",
+             {"platform": "qq_official"}),
+            ("sweep_elf", "elf", "stages", "elf", "ElfIce_4", "ElfIce_4 team1 2 20",
+             {"group": "sweep-room", "platform": "qq_official"}),
+            ("sweep_activity", "activity", "long_info", "activity_sweep", "BH188_1_13", "BH188_1_13 team1 2 30",
+             {"group": "sweep-room"}),
+        )
+        for task, kind, query, query_arg, choice, code, scope in cases:
+            with self.subTest(task=task):
+                auth = {**AUTH, "user_id": f"mock-{task}"}
+                self.worker.return_value = {"status": "ok", "auth": auth}
+                scope = {**scope, "user": task}
+                issue = self.command("login", event="issue", **scope)
+                claim = self.post("/api/claim", {"ticket": issue["login_url"].split("#")[1]})
+                self.assertEqual(claim.status_code, 200)
+                self.command("confirm", arg=claim.json()["pin"], event="confirm-login", **scope)
+                self.assertEqual(self.post("/api/login", {"account": "stub", "password": "stub"}).status_code, 200)
 
+                self.worker.return_value = {"status": "ok", "auth": auth,
+                                            "sweepOptions": [kind, [choice, "bad/id", choice]]}
+                job = self.command(query, arg=query_arg, event="query", **scope)["job"]
+                for _ in range(50):
+                    receipt = self.command("receipt", arg=job, event="query-receipt", **scope).get("receipt")
+                    if receipt:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(receipt["sweep_choices"], [kind, [choice]])
+
+                before = self.worker.await_count
+                proposal = self.command(task, arg=code, event="propose", **scope)
+                self.assertIn("体力上限", proposal["message"])
+                self.assertIn("正常扫荡", proposal["message"])
+                token = proposal["approval"]
+                self.assertNotIn("job", self.command("approve", arg=token, event="propose", **scope))
+                self.assertNotIn("job", self.command("approve", arg=token, event="other-user", **{**scope, "user": "other"}))
+                wrong_scope = {**scope, "group": None} if "group" in scope else {**scope, "group": "sweep-room"}
+                self.assertNotIn("job", self.command("approve", arg=token, event="outside", **wrong_scope))
+                self.assertEqual(self.worker.await_count, before)
+
+                self.worker.return_value = {"status": "ok", "auth": auth, "details": ["扫荡扣费已确认"]}
+                approved = self.command("approve", arg=token, event="confirm-sweep", **scope)
+                self.assertTrue(approved["long_job"])
+                job = approved["job"]
+                self.assertNotIn("job", self.command("approve", arg=token, event="repeat", **scope))
+                for _ in range(50):
+                    receipt = self.command("receipt", arg=job, event="sweep-receipt", **scope).get("receipt")
+                    if receipt:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(receipt["details"], ["扫荡扣费已确认"])
+                self.assertNotIn("sweep_choices", receipt)
+                self.assertEqual(self.worker.await_count, before + 1)
+                payload, timeout = self.worker.await_args.args
+                self.assertEqual(payload, {"action": "run", "task": task, "code": code, "auth": auth})
+                self.assertEqual(timeout, TASK_TIMEOUT)
+
+    def test_sweep_orders_with_wrong_kind_or_shape_are_rejected_before_login(self):
+        for task, arg in (("sweep_hunt", "ElfIce_4 team1 1 10"), ("sweep_activity", "BH188 team1 1 15"),
+                          ("sweep_elf", "ElfIce_4 team1 0 10"), ("sweep_hunt", "HuntFire_10 team1 1 10000"),
+                          ("sweep_hunt", "")):
+            with self.subTest(task=task, arg=arg):
+                self.assertEqual(self.command(task, arg=arg)["message"], "命令无效。")
+        self.worker.assert_not_awaited()
 
     def test_shop_refreshes_require_scoped_confirmation(self):
         scope = {"group": "shop-room"}
@@ -1095,3 +1159,65 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         pid, work = (directory / "worker-state").read_text().splitlines()
         self.assertFalse(Path("/proc", pid).exists())
         self.assertFalse(Path(work).exists())
+
+
+class SweepCommandTests(unittest.IsolatedAsyncioTestCase):
+    """QQ command surface for paid sweeps; the bridge HTTP call is stubbed."""
+
+    def setUp(self):
+        import plugins.lucima as plugin
+
+        self.plugin = plugin
+        self.request = AsyncMock(return_value={"message": "ok"})
+        self.enterContext(patch.object(plugin, "request_lucima", self.request))
+
+    async def call(self, text, group=None):
+        return await self.plugin.call_service(text, "onebot", "bot", "u", "e", group)
+
+    async def test_bare_sweep_commands_open_the_matching_stage_query(self):
+        for command, action, arg in (("讨伐扫荡", "stages", "hunt"), ("元素扫荡", "stages", "elf"),
+                                     ("元素探索扫荡", "stages", "elf"), ("活动扫荡", "long_info", "activity_sweep")):
+            with self.subTest(command=command):
+                await self.call(f"/璐茜玛 {command}")
+                self.assertEqual(self.request.await_args.args[1:], (action, arg))
+
+    async def test_bare_stage_id_asks_for_team_count_and_budget(self):
+        for command, scene in (("讨伐扫荡", "HuntFire_10"), ("元素扫荡", "ElfIce_4"), ("活动扫荡", "BH188_1_13")):
+            with self.subTest(command=command):
+                result = await self.call(f"/璐茜玛 {command} {scene}")
+                self.assertIn(f"/lucima {command} {scene} <队伍ID> <次数> <体力上限>", result["message"])
+                self.assertEqual(result["buttons"], [["查队伍", "查看队伍 1"]])
+                self.request.assert_not_awaited()
+
+    async def test_full_orders_pass_and_wrong_kind_or_shape_fall_back_to_help(self):
+        for command, code in (("讨伐扫荡", "HuntFire_10 team1 3 36"), ("元素扫荡", "ElfIce_4 team1 99 9999"),
+                              ("活动扫荡", "BH188_1_13 team1 2 30")):
+            with self.subTest(command=command):
+                await self.call(f"/璐茜玛 {command} {code}")
+                self.assertEqual(self.request.await_args.args[2], code)
+        for text in ("/璐茜玛 讨伐扫荡 ElfIce_4 team1 1 10", "/璐茜玛 活动扫荡 BH188 team1 1 15",
+                     "/璐茜玛 元素扫荡 ElfIce_4 team1 100 10", "/璐茜玛 讨伐扫荡 HuntFire_10 team1 1"):
+            with self.subTest(text=text):
+                self.assertEqual((await self.call(text)).get("menu"), "main")
+        await self.call("/璐茜玛 讨伐关卡 火")
+        self.assertEqual(self.request.await_args.args[1:], ("stages", "hunt 火"))
+
+    async def test_sweep_receipt_offers_stage_prefill_buttons(self):
+        cases = (("hunt", ["HuntFire_10", "HuntFire_9"], "讨伐扫荡", "火10"),
+                 ("elf", ["ElfIce_4"], "元素扫荡", "水4"),
+                 ("activity", ["BH188_1_13"], "活动扫荡", "1-13"))
+        for kind, ids, command, label in cases:
+            with self.subTest(kind=kind):
+                receipt = {"id": "x", "status": "ok", "message": "查询完成", "details": [],
+                           "sweep_choices": [kind, ids]}
+                with patch.object(self.plugin, "send_menu", new=AsyncMock()) as menu, patch.object(
+                        self.plugin, "render_receipt", side_effect=OSError):
+                    await self.plugin.send_receipt(object(), object(), receipt, lambda data: data,
+                                                   ("onebot", "bot", "u", "e"))
+                message, rows = menu.await_args.args[3], menu.await_args.args[4]
+                buttons = [btn for row in rows for btn in row]
+                self.assertIn(label, [btn.label for btn in buttons])
+                self.assertIn(f"/璐茜玛 {command} {ids[0]} ", [btn.data for btn in buttons])
+                self.assertIn("/璐茜玛 查看队伍 1", [btn.data for btn in buttons])
+                self.assertIn("<队伍ID> <次数> <体力上限>", message)
+                self.assertTrue(all(btn.enter is False for btn in buttons if btn.data.startswith(f"/璐茜玛 {command} ")))

@@ -14,9 +14,15 @@ STAGE_QUERY = re.compile(
 ACTIVITY_SWEEP_QUERY = re.compile(r"activity_sweep(?: BH[0-9]{1,5}(?:_[0-9]{1,3}_[0-9]{1,3})?)?")
 ILLUSION_SWEEP_ORDER = re.compile(r"([1-9][0-9]{0,2})(?: ([1-9][0-9]{0,3}))?")
 BATTLE_IDS = {"activity": re.compile(r"BH[0-9]{1,5}"), "abyss": re.compile(r"MysteriousRealm_[0-9]{1,2}")}
+SWEEP_TASKS = {"sweep_hunt": "hunt", "sweep_elf": "elf", "sweep_activity": "activity"}
+SWEEP_IDS = {"hunt": re.compile(r"Hunt(?:Fire|Earth|Ice|Dark|Light)_[0-9]{1,3}"),
+             "elf": re.compile(r"Elf(?:Fire|Earth|Ice|Dark|Light)_[0-9]{1,3}"),
+             "activity": re.compile(r"BH[0-9]{1,5}_[0-9]{1,3}_[0-9]{1,3}")}
+SWEEP_ORDER = re.compile(r"([A-Za-z0-9_]{1,32}) ([A-Za-z0-9_-]{1,24}) ([1-9][0-9]?) ([0-9]{1,4})")
 LONG_NAMES = {"activity": "活动推进", "abyss": "虚构深渊挑战", "buy_batch": "批量购买",
               "refresh_secret_paid": "刷新秘密商店", "refresh_star_source": "刷新星源商店",
-              "buy_shop_equipment": "购买命中装备"}
+              "buy_shop_equipment": "购买命中装备",
+              "sweep_hunt": "讨伐扫荡", "sweep_elf": "元素扫荡", "sweep_activity": "活动扫荡"}
 SCHEDULE_TASKS = {
     "signin": "签到", "mail": "领邮件", "base": "领基地", "friend_support": "助战好友",
     "send_meal": "每日体力", "reactor": "动力转换", "potion": "成长药剂", "starforce": "升星水晶",
@@ -42,6 +48,12 @@ def schedule_arguments(arg):
 
 def preview(action, arg):
     parts = arg.split()
+    if action in SWEEP_TASKS and (match := SWEEP_ORDER.fullmatch(arg)):
+        scene, team, count, budget = match.groups()
+        if SWEEP_IDS[SWEEP_TASKS[action]].fullmatch(scene):
+            stop = "超出上限、体力不足或活动结束时停止。" if action == "sweep_activity" else "超出上限或体力不足时停止。"
+            return (f"以队伍 {team} 正常扫荡 {scene}，最多 {int(count)} 次，体力上限 {int(budget)}。\n"
+                    f"按关卡表标价逐轮核对实际扣费，不消耗快速战斗券。{stop}")
     if action == "activity" and len(parts) == 4:
         family, team, count, energy = parts
         if (BATTLE_IDS[action].fullmatch(family) and re.fullmatch(r"[A-Za-z0-9_-]{1,24}", team)

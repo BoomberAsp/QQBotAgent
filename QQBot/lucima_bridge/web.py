@@ -587,7 +587,8 @@ async def run_command(request: Request, *, group: bool):
             if response.get("receipt") or response.get("pending"):
                 if slot != owner and (receipt := response.get("receipt")):
                     response["receipt"] = {k: v for k, v in receipt.items()
-                                           if k not in {"view", "shop_confirm_until", "shop_choices", "battle_choices", "illusion_quote"}}
+                                           if k not in {"view", "shop_confirm_until", "shop_choices", "battle_choices",
+                                                        "illusion_quote", "sweep_choices"}}
                 return await render_profile_receipt(response, request.app.state.asset_root,
                                                     group=group, current_account=slot == owner)
         return execute(action, arg)

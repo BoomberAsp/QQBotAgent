@@ -19,7 +19,7 @@
 - **三层记忆引擎**: `TieredMemory`（SHORT/MEDIUM/LONG），LLM judge 归类 + 频次晋升/年龄降级状态机；LONG 支持索引注入与 `recall_memory` 召回
 - **Web 管理面板**: FastAPI 独立服务（`webui/`，102 个 API + 18 个页面），进程管理、配置热编辑、记忆/画像/别名管理、**角色管理**（用户自创角色卡的浏览/编辑/体检/版本回滚/立绘）、Token 看板、反馈处理、更新记录/公告编辑与双渠道群发、**邮件管理**（信箱只读 + 系统邮件/撤回队列）、Playground、官方路由状态卡
 - **更新记录与公告**: 结构化更新日志（版本/日期/分类变更条目）+ 自由公告（标题/正文/markdown），用户经 `/更新日志 [d]`、`/update record [d]` 或自然语言查询，管理员在面板编辑并**双渠道群发**（OneBot 群 + QQ 官方群，可按渠道勾选或全选）；QQ 端以图片卡片/markdown 呈现，并同步脱敏快照到公开站点 `bot.oneweblog.cn`
-- **璐茜玛（Lucima）星陨账号工具**: `/璐茜玛` 命令族（priority=0 插件拦截，零 token）+ 独立桥接进程（`lucima_bridge/`，127.0.0.1:8092）：扫码绑定（网页核对码 + Fernet 加密凭证）、九宫格大厅（5 账号槽）、日常/进阶任务、长任务（活动/深渊/批购/商店刷新）与每日托管、PNG 回执；自然语言经 5 个提案工具只准备确认卡、发起人原会话确认后才执行（见 §2.18 与根目录 `LUCIMA.md`）
+- **璐茜玛（Lucima）星陨账号工具**: `/璐茜玛` 命令族（priority=0 插件拦截，零 token）+ 独立桥接进程（`lucima_bridge/`，127.0.0.1:8092）：扫码绑定（网页核对码 + Fernet 加密凭证）、九宫格大厅（5 账号槽）、日常/进阶任务、长任务（活动/深渊/批购/商店刷新/付体力扫荡）与每日托管、PNG 回执；自然语言经 5 个提案工具只准备确认卡、发起人原会话确认后才执行（见 §2.18 与根目录 `LUCIMA.md`）
 - **公开站人格试聊**: `bot.oneweblog.cn/try/` 访客自带 DeepSeek/OpenAI 密钥与 4 个内置人格纯文字试聊（`public_try.py` 独立进程，探测复用面板 `model_probe`，HMAC 票据 30 分钟；见「公开使用站点与人格试聊」节）
 - **部署方式**: Docker Compose（searxng + qqbot；vLLM 由 `vllm-start.sh` 可选单独拉起）或手动部署
 
@@ -116,7 +116,7 @@ QQBotAgent/
     ├── lucima_bridge/          # ★ Lucima 桥接服务（独立进程 `python -m lucima_bridge`，127.0.0.1:8092，§2.18）
     │   ├── web.py              #   FastAPI：登录页/手册 + /api/claim|session|login + /internal/(group-)command|propose
     │   ├── service.py          #   Bridge/Vault（Fernet 凭证+SQLite）/Worker（单执行槽+队列）/授权与任务状态机
-    │   ├── long_tasks.py       #   长任务（活动/深渊/批购/商店刷新）+ 每日托管计划 + 24h 回执
+    │   ├── long_tasks.py       #   长任务（活动/深渊/批购/商店刷新/付体力扫荡）+ 每日托管计划 + 24h 回执
     │   ├── menu.py / accounts_ui.py  # 九宫格大厅页面树 / 每会话 5 账号槽与主题偏好
     │   ├── filters.py / receipt.py   # 装备方案（桌面格式）/ PNG 回执渲染（明暗主题）
     │   ├── manual.py           #   公开使用手册（QQ 命令、网页 /manual、智能体 lucima_manual 共用）
@@ -999,7 +999,7 @@ QQ 消息（双渠道）
 |---|---|
 | `web.py` | FastAPI 应用。公开面只暴露登录页 `/`、手册 `/manual`（+css/js）与 `/api/claim`（领取登录票据）/`api/session`（轮询扫码状态）/`api/login`（网页提交账号密码 + 8 位核对码）；内部面 `/internal/command`、`/internal/propose`、`/internal/group-command`、`/internal/group-propose`（Bearer 共享密钥，nginx 不转发）。`fcntl` 锁保证同一数据目录单实例；QQ 官方消息 ID 放宽到 512 字符 |
 | `service.py` | `Bridge`（命令/提案状态机、确认票据 `Ticket` 5 分钟、登录通知 `LoginNotice`、任务 `Job`、托管 `Plan`、商店命中 `ShopHit`）；`Vault`（SQLite + Fernet 加密续期令牌，`LUCIMA_VAULT_KEY`）；`Worker`（**全站单执行槽**，队列最多 5、每身份 1 项待处理；短任务登录约 110s / 游戏约 100s 超时；受控子进程用 `LUCIMA_PYTHON` 解释器跑 `LUCIMA_ROOT` 仓库）。临时授权内存 15 分钟（`SESSION_TTL`），「记住登录」加密保留 30 天（`REMEMBER_TTL`），续期临时失败不立即吊销 |
-| `long_tasks.py` | 长任务：活动推进（≤3 关、体力预算）、虚构深渊（单层、禁魂力/自动推进）、批量购买（1–5 档 × 1–10 份、静态报价 + 逐档核对）、秘密商店刷新（1–200 次，免费当次最多 1 次 / 钻石核实单价 3，按货架金币价自动购买招募契约/神秘契约/下级强化芯片，可 `目标=…` 指定或 `目标=无`）、星源商店刷新（免费，命中装备每件 5 彩虹星源确认购买）；排队 30 分钟 / 执行 12 分钟上限；回执 24h（`RECEIPT_TTL`）；每日托管 `SCHEDULE_TASKS` 14 类任务，北京时间 HH:MM 到点后 1 小时内排队，需「记住登录」且逐项确认 |
+| `long_tasks.py` | 长任务：活动推进（≤3 关、体力预算）、虚构深渊（单层、禁魂力/自动推进）、批量购买（1–5 档 × 1–10 份、静态报价 + 逐档核对）、秘密商店刷新（1–200 次，免费当次最多 1 次 / 钻石核实单价 3，按货架金币价自动购买招募契约/神秘契约/下级强化芯片，可 `目标=…` 指定或 `目标=无`）、星源商店刷新（免费，命中装备每件 5 彩虹星源确认购买）、付体力扫荡（`sweep_hunt/sweep_elf/sweep_activity`：已通关 + 关卡表标价，1–99 次 + 体力上限，`SWEEP_ORDER` 校验，执行端逐轮核对扣费）；排队 30 分钟 / 执行 12 分钟上限；回执 24h（`RECEIPT_TTL`）；每日托管 `SCHEDULE_TASKS` 14 类任务，北京时间 HH:MM 到点后 1 小时内排队，需「记住登录」且逐项确认 |
 | `menu.py` / `accounts_ui.py` | 九宫格大厅页面树（基本信息/自动任务/主动任务/佣兵团/工具箱/运行日志/退出账号/切换明暗/切换账号）与桌面导航；`AccountSlots` 每会话最多 5 账号槽（旧绑定自动成账号 1）、别名、当前槽、主题与日志 cutoff（SQLite） |
 | `filters.py` | 每账号装备方案存储：桌面格式 JSON（≤2200 字符、6 部位、副属性分数规则），保存/复制/导出/预览/删除；星源商店按方案显示命中 |
 | `manual.py` | 公开使用手册单一来源：总览 + 8 章节（登录/查询/日常/托管/商店/装备方案/战斗/回执）。QQ `/lucima 使用手册`、网页 `/manual`、智能体 `lucima_manual` 工具共用；`scripts/export_lucima_manual.py` 导出静态版到 `public_site/lucima/` |
@@ -2666,7 +2666,7 @@ v2.29 基础上增加:
 群成员 @机器人或回复机器人后，可直接使用系统查询：/角色详情、/羁绊详情、/兑换码、/长期兑换码、/功能、/更新日志。/群帮助 列出命令；/status 查看本群状态。禁图群使用文字输出。个人会话、邮箱、画像管理及会读取私人上下文的反馈命令引导至私聊，未知斜杠命令由系统处理。
 
 
-## 璐茜玛（Lucima）星陨账号工具桥接（2026-11-18 → 11-19）
+## 璐茜玛（Lucima）星陨账号工具桥接（2026-11-18 → 11-20）
 
 把第三方桌面工具 LucimaTools（独立仓库）桥接进 QQ，双渠道可用。架构与模块分工见 §2.18，部署与完整命令见根目录 `LUCIMA.md`。按提交顺序：
 
@@ -2674,6 +2674,7 @@ v2.29 基础上增加:
 - **11-19 上午 长任务 + 每日托管 + 群聊**：`long_tasks.py`（活动推进/虚构深渊/批量购买，排队 30 分钟/执行 12 分钟/回执 24h；托管 14 类任务北京时间定时）；群聊 scoped 工作流（绑定/任务/确认卡/回执按 机器人×群×成员 隔离，只有发起人能确认）；官方消息 ID 放宽 512 字符；已记住的登录可从登录页恢复；`agent/lucima_tools.py` 5 个提案工具（**只准备确认卡不执行**，`ProposalTurn` contextvar 门控，委派面禁用，自然语言「确认」不能批准）。
 - **11-19 下午 商店刷新与命中购买**：秘密商店刷新（免费当次 1 次 / 钻石核实单价 3，按金币价自动购买契约芯片，`目标=…` 可指定）；星源商店免费刷新 + 命中装备每件 5 彩虹星源确认购买（`购买命中/确认命中`，5 分钟仅发起人）；未报价的星源刷新拒绝提交（`STAR_SOURCE_QUOTE_UNAVAILABLE`）并暴露只读计数查询；付费刷新必须引用确认卡；续期临时失败保留授权不立即吊销。
 - **11-19 晚 群聊智能体接入 + 购买能力**：`group_runtime.py` 注入 `GROUP_PROMPT`/`GROUP_PROPOSAL_PROMPT`，direct 回合下发提案工具，确认卡经群投递票据发送（超时/异常仍补投递，编号不回灌模型）；大厅购买入口。
+- **11-20 付体力扫荡执行**：`讨伐扫荡/元素扫荡/活动扫荡` 三个长任务（`sweep_hunt/sweep_elf/sweep_activity`）。无参命令打开选关查询（stages hunt/elf、long_info activity_sweep），查询回执带 `sweep_choices` 预填按钮；裸关卡 ID 提示补齐 `队伍ID 次数(1–99) 体力上限`。执行端 `backend/bot_sweep.py` 复用桌面 `sweep_once/activity_once`（`quick_battle=False` 正常扫荡），`_finish_scene` 增返 `costItems/dropItems`；逐轮核对 CostItems=={体力:关卡表标价}、预算/体力/活动当期复检，不符即停并保留已确认轮次与聚合掉落。活动关卡拒绝服务端战斗/剧情队伍/额外入场消耗。
 - 配套：`AGENTS.md` 增「璐茜玛绑定与授权」注入节，`HELP.md`/`FEATURES.md` 增条目；`requirements.txt` 增 `qrcode[pil]`、`cryptography>=43`；离线测试 `test_lucima_bridge.py`（39）+ `test_lucima_tools.py`（4）+ `test_group_behavior.py` 群卡用例（不在 test.sh）。
 - 开关：`LUCIMA_INTERNAL_TOKEN` 未配置时命令规则不命中、工具不下发，整族静默关闭；桥接进程全站单执行槽 + 队列 5 + 每身份 1 项待处理。
 

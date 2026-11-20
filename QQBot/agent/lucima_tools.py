@@ -76,12 +76,17 @@ TOOLS = {
     ),
     "lucima_long": (
         LONG,
-        "处理长任务：long_info=查询活动、深渊或商店报价，activity=活动推进，abyss=单层虚构深渊，"
+        "处理长任务：long_info=查询活动、深渊、活动扫荡或商店报价，activity=活动推进，abyss=单层虚构深渊，"
         "buy_batch=批量购买，refresh_secret=秘密商店刷新，refresh_star_source=星源商店刷新，"
         "schedule_set=启用每日托管，schedule_status=查看托管，schedule_stop=停止托管，"
-        "sweep_illusion=虚拟幻境扫荡，member_purchase=团员商店购买。"
+        "sweep_illusion=虚拟幻境扫荡，member_purchase=团员商店购买，"
+        "sweep_hunt=讨伐扫荡，sweep_elf=元素探索扫荡，sweep_activity=活动关卡扫荡（均为付体力正常扫荡）。"
         "缺少关卡、队伍、角色或报价时询问用户或先查询，不猜测 ID、数量、预算或价格。",
-        "long_info 填 activity、abyss 或 shop；activity 填‘活动ID 队伍ID 最多关数 体力上限’；"
+        "long_info 填 activity、abyss、activity_sweep 或 shop；activity 填‘活动ID 队伍ID 最多关数 体力上限’；"
+        "sweep_hunt/sweep_elf/sweep_activity 填‘关卡ID 队伍ID 次数 体力上限’，次数 1–99。"
+        "关卡必须已通关且体力标价已收录：讨伐如 HuntFire_10，元素如 ElfIce_4，活动如 BH188_1_13。"
+        "先用 stages（hunt/elf）或 long_info activity_sweep 查可扫荡关卡，用 account_view teams 1 查队伍 ID。"
+        "活动扫荡每轮校验活动仍在当期；实际扣费与标价不符时立即停止。"
         "abyss 填‘MysteriousRealm_层数 上半角色ID逗号列表 下半角色ID逗号列表’，空位用 -；"
         "buy_batch 填空格分隔的‘商品ID:数量:货币ID:单价’；"
         "refresh_secret 填用户指定的‘次数 free’或‘次数 diamond’，可追加装备方案名和目标=招募契约,神秘契约,下级强化芯片，"

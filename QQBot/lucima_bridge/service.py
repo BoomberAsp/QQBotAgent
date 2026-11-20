@@ -23,8 +23,8 @@ from .filters import Filters
 from .menu import PAGES, THEME_NAMES, menu_data
 
 from .long_tasks import (
-    BATTLE_IDS, ILLUSION_SWEEP_ORDER, LONG_NAMES, LONG_QUEUE_TTL, SCHEDULE_TASKS, SHOP_HIT_TTL, SHOP_REFRESHES, TASK_TIMEOUT,
-    LongTasks, schedule_arguments,
+    BATTLE_IDS, ILLUSION_SWEEP_ORDER, LONG_NAMES, LONG_QUEUE_TTL, SCHEDULE_TASKS, SHOP_HIT_TTL, SHOP_REFRESHES,
+    SWEEP_IDS, TASK_TIMEOUT, LongTasks, schedule_arguments,
 )
 
 
@@ -922,7 +922,7 @@ class Bridge:
                 break
 
     def result(self, job: Job, message: str, status: str, details=None, *, shop_options=None,
-               battle_options=None, illusion_quote=None, profile=None) -> None:
+               battle_options=None, illusion_quote=None, profile=None, sweep_options=None) -> None:
         facts = details if isinstance(details, list) else []
         clean = [" ".join(item.split())[:120] for item in facts[:8] if isinstance(item, str)]
         payload = {"id": job.id, "task": job.label, "status": status,
@@ -951,6 +951,17 @@ class Bridge:
                                              if isinstance(value, str) and pattern.fullmatch(value)))
                 if choices:
                     payload["battle_choices"] = [job.code, choices]
+        if status == "ok" and isinstance(sweep_options, list) and len(sweep_options) == 2:
+            kind, ids = sweep_options
+            source = (job.code.partition(" ")[0] if job.task == "stages"
+                      else "activity" if job.task == "long_info" and job.code.partition(" ")[0] == "activity_sweep"
+                      else None)
+            pattern = SWEEP_IDS.get(kind) if isinstance(kind, str) else None
+            if kind == source and pattern and isinstance(ids, list):
+                choices = list(dict.fromkeys(value for value in ids[:10]
+                                             if isinstance(value, str) and pattern.fullmatch(value)))
+                if choices:
+                    payload["sweep_choices"] = [kind, choices]
         if status == "shop_hit" and job.task in SHOP_REFRESHES:
             expires = payload["completed_at"] + SHOP_HIT_TTL
             payload["shop_confirm_until"] = expires
@@ -1161,4 +1172,5 @@ class Bridge:
             outcome = "暂时无法读取商品参考价，请稍后重试。"
         self.result(job, f"{job.label}：{outcome}", status, details,
                     shop_options=result.get("shopOptions"), battle_options=result.get("battleOptions"),
-                    illusion_quote=result.get("illusionQuote"), profile=profile)
+                    illusion_quote=result.get("illusionQuote"), profile=profile,
+                    sweep_options=result.get("sweepOptions"))

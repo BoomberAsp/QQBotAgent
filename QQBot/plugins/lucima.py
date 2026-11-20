@@ -23,7 +23,8 @@ from agent.outbound import OutKeyboard
 from lib.button_spec import Btn
 from lucima_bridge.client import Actor, approval_card, enabled, request_lucima
 from lucima_bridge.long_tasks import (
-    ACTIVITY_SWEEP_QUERY, BATTLE_IDS, ILLUSION_SWEEP_ORDER, LONG_QUEUE_TTL, SCHEDULE_TASKS, STAGE_QUERY, TASK_TIMEOUT,
+    ACTIVITY_SWEEP_QUERY, BATTLE_IDS, ILLUSION_SWEEP_ORDER, LONG_QUEUE_TTL, SCHEDULE_TASKS, STAGE_QUERY,
+    SWEEP_IDS, SWEEP_ORDER, SWEEP_TASKS, TASK_TIMEOUT,
 )
 from lucima_bridge.manual import is_manual_command, manual_qq_reply
 from lucima_bridge.menu import HOME_LINKS, NAV_NAMES, PAGES
@@ -53,6 +54,7 @@ COMMANDS = {
     "成长药剂": "potion", "升星水晶": "starforce",
     "查看团店": "account_view", "后台计时": "timer",
     "技能模块": "tesseract", "查看幻境": "account_view", "幻境扫荡": "sweep_illusion", "购买团店": "member_purchase",
+    "讨伐扫荡": "sweep_hunt", "元素扫荡": "sweep_elf", "元素探索扫荡": "sweep_elf", "活动扫荡": "sweep_activity",
     "查看竞技场": "account_view", "查看投票": "account_view", "查看装备活动": "account_view",
     "查看援助": "account_view", "查看团长店": "account_view", "查看星源商店": "account_view",
     "保存装备方案": "filter_save", "复制装备方案": "filter_copy", "导出装备方案": "filter_export",
@@ -87,11 +89,24 @@ BATTLE_INPUTS = {
     "activity": ("活动推进", "<队伍ID> <最多关数> <体力上限>", "查队伍", "查看队伍 1"),
     "abyss": ("虚构深渊", "<上半角色列表> <下半角色列表>", "查团员", "查看团员 1"),
 }
+SWEEP_COMMANDS = {"hunt": "讨伐扫荡", "elf": "元素扫荡", "activity": "活动扫荡"}
+SWEEP_ELEMENTS = {"Fire": "火", "Earth": "木", "Ice": "水", "Dark": "暗", "Light": "光"}
+SWEEP_FIELDS = "<队伍ID> <次数> <体力上限>"
+
+
+def sweep_label(kind: str, value: str) -> str:
+    if kind == "activity":
+        _, chapter, stage = value.split("_")
+        return f"{chapter}-{stage}"
+    element, floor = value.removeprefix("Hunt").removeprefix("Elf").split("_")
+    return f"{SWEEP_ELEMENTS[element]}{floor}"
 LONG_HELP = (
     "选择战斗：/璐茜玛 活动推进 或 /璐茜玛 虚构深渊\n"
+    "付体力扫荡：/璐茜玛 讨伐扫荡 · 元素扫荡 · 活动扫荡（先选关）\n"
     "/璐茜玛 长任务查询 活动扫荡 或 商店\n"
     "/璐茜玛 刷新秘密商店 · 刷新星源商店\n"
     "/璐茜玛 活动推进 <活动ID> <队伍ID> <最多关数> <体力上限>\n"
+    "/璐茜玛 讨伐扫荡 <关卡ID> <队伍ID> <次数> <体力上限>，元素/活动扫荡同格式\n"
     "/璐茜玛 虚构深渊 <关卡ID> <上半角色ID列表> <下半角色ID列表>，队内用逗号分隔，空位填 -\n"
     "/璐茜玛 批量购买 <商品ID:数量:货币ID:单价>，多档用空格隔开\n"
     "/璐茜玛 托管 <签到|领邮件|领基地> <北京时间HH:MM>\n"
@@ -110,6 +125,8 @@ MENUS = {
              [Btn("讨伐关卡", "/璐茜玛 讨伐关卡"), Btn("元素关卡", "/璐茜玛 元素关卡"), Btn("筛装备", "/璐茜玛 筛装备")]],
     "long": [[Btn("查活动", "/璐茜玛 长任务查询 活动"), Btn("查深渊", "/璐茜玛 长任务查询 深渊"),
               Btn("查商店", "/璐茜玛 长任务查询 商店")],
+             [Btn("讨伐扫荡", "/璐茜玛 讨伐扫荡"), Btn("元素扫荡", "/璐茜玛 元素扫荡"),
+              Btn("活动扫荡", "/璐茜玛 活动扫荡")],
              [Btn("托管状态", "/璐茜玛 托管状态"), Btn("停止托管", "/璐茜玛 停止托管")],
              [Btn("任务状态", "/璐茜玛 状态"), Btn("取消任务", "/璐茜玛 取消"), Btn("查看回执", "/璐茜玛 回执")]],
 }
@@ -155,6 +172,13 @@ async def call_service(text: str, platform: str, bot: str, user: str, event: str
             label, fields, lookup, lookup_command = BATTLE_INPUTS[action]
             return {"message": f"请补齐参数后发送。\n/lucima {label} {arg} {fields}",
                     "buttons": [[lookup, lookup_command]]}
+    if action in SWEEP_TASKS:
+        kind = SWEEP_TASKS[action]
+        if not arg:
+            action, arg = ("long_info", "activity_sweep") if kind == "activity" else ("stages", kind)
+        elif SWEEP_IDS[kind].fullmatch(arg):
+            return {"message": f"请补齐参数后发送。\n/lucima {command} {arg} {SWEEP_FIELDS}",
+                    "buttons": [["查队伍", "查看队伍 1"]]}
     if not command:
         action, valid = "lobby", True
     elif command == "切换账号" and arg:
@@ -207,6 +231,11 @@ async def call_service(text: str, platform: str, bot: str, user: str, event: str
         valid = ILLUSION_SWEEP_ORDER.fullmatch(arg) is not None
     elif action in {"activity", "abyss", "buy_batch", "member_purchase"}:
         valid = 0 < len(arg) <= 255
+    elif action in SWEEP_TASKS:
+        match = SWEEP_ORDER.fullmatch(arg)
+        valid = match is not None and SWEEP_IDS[SWEEP_TASKS[action]].fullmatch(match.group(1)) is not None
+    elif action == "stages":
+        valid = STAGE_QUERY.fullmatch(arg) is not None
     elif action == "long_info":
         parts = arg.split(maxsplit=1)
         if parts:
@@ -280,6 +309,14 @@ async def send_receipt(bot, event, receipt: dict, image_segment, actor: Actor) -
         controls = [Btn("准备扫荡", f"/璐茜玛 幻境扫荡 {quote['count']} {quote['floor']}"),
                     Btn("刷新状态", "/璐茜玛 幻境扫荡")]
         await send_menu(bot, event, actor, detail, [controls], include_commands=True)
+    elif choices := receipt.get("sweep_choices"):
+        kind, ids = choices
+        command = SWEEP_COMMANDS[kind]
+        controls = [Btn(sweep_label(kind, value), f"/璐茜玛 {command} {value} ", enter=False) for value in ids]
+        controls.append(Btn("查队伍", "/璐茜玛 查看队伍 1"))
+        rows = [controls[index:index + 3] for index in range(0, len(controls), 3)]
+        guide = f"选择已通关关卡后补齐参数再发送。\n/lucima {command} <关卡ID> {SWEEP_FIELDS}"
+        await send_menu(bot, event, actor, detail + "\n" + guide, rows, include_commands=True)
     elif choices := receipt.get("battle_choices"):
         kind, ids = choices
         command, fields, lookup, lookup_command = BATTLE_INPUTS[kind]
