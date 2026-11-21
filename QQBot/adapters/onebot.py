@@ -84,6 +84,30 @@ class OneBotSender:
         except ActionFailed as e:
             raise SendFailed(str(e), info=getattr(e, "info", None)) from e
 
+    async def send_group_reply_text(self, text: str, *, mention_user: str | None = None) -> str:
+        return await self._send_group_reply(MessageSegment.text(text), mention_user)
+
+    async def send_group_reply_image(self, img: OutImage, *, mention_user: str | None = None) -> str:
+        try:
+            segment = MessageSegment.image(Path(img.path) if img.path else img.url)
+        except (TypeError, ValueError, OSError):
+            return "failed"
+        return await self._send_group_reply(segment, mention_user)
+
+    async def _send_group_reply(self, segment: MessageSegment, mention_user: str | None) -> str:
+        try:
+            message = (MessageSegment.at(int(mention_user)) + MessageSegment.text(" ") + segment
+                       if mention_user else segment)
+        except (TypeError, ValueError):
+            return "failed"
+        try:
+            await self._matcher.send(message)
+            return "sent"
+        except ActionFailed:
+            return "failed"
+        except Exception:
+            return "uncertain"
+
     async def send_image(self, img: OutImage) -> None:
         if img.path:
             seg = MessageSegment.image(Path(img.path))
@@ -263,12 +287,13 @@ def _is_mentioned(event: MessageEvent) -> bool:
     """
     if not isinstance(event, GroupMessageEvent):
         return True
-    bot_qq = str(event.self_id)
-    is_at_bot = any(
-        seg.type == "at" and seg.data.get("qq") == bot_qq
-        for seg in event.message
-    )
-    return is_at_bot or event.is_tome()
+    return _explicitly_mentioned(event) or event.is_tome()
+
+
+def _explicitly_mentioned(event: MessageEvent) -> bool:
+    message = getattr(event, "original_message", None) or event.message
+    return any(seg.type == "at" and str(seg.data.get("qq")) == str(event.self_id)
+               for seg in message)
 
 
 class OneBotAttachmentResolver:
@@ -342,6 +367,7 @@ def build_view(bot: Bot, event: MessageEvent) -> InboundMessage:
         message_id=str(event.message_id),
         self_id=str(event.self_id),
         mentioned=_is_mentioned(event),
+        explicit_mention=is_group and _explicitly_mentioned(event),
         reply_context="" if is_group else build_reply_context(event),
         reply_message_id=reply_id,
         reply_author_id=author,

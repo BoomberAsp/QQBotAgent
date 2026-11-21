@@ -531,6 +531,10 @@ def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
     author = event.author
     user_id = author.member_openid if is_group else author.user_openid
     quoted = _quoted_message(event)
+    mentioned = is_group and (
+        isinstance(event, GroupAtMessageCreateEvent)
+        or any(getattr(m, "is_you", False) for m in (getattr(event, "mentions", None) or []))
+    )
     return InboundMessage(
         user_id=str(user_id),
         is_group=is_group,
@@ -538,8 +542,8 @@ def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
         text=_clean_content(event.content),
         message_id=str(event.id),
         self_id=str(bot.self_id),
-        mentioned=True if not is_group else (isinstance(event, GroupAtMessageCreateEvent)
-            or any(getattr(m, "is_you", False) for m in (getattr(event, "mentions", None) or []))),
+        mentioned=not is_group or mentioned,
+        explicit_mention=mentioned,
         received_at=(event.timestamp.timestamp() if hasattr(getattr(event,"timestamp",None),"timestamp") else __import__("time").time()),
         actor_role=str(getattr(author, "member_role", "member")),
         author_is_bot=bool(getattr(author, "bot", False)),
@@ -805,6 +809,42 @@ class QQOfficialSender:
             except Exception:
                 return "uncertain"
         return "failed"
+
+    @property
+    def group_reply_slots(self) -> int:
+        return max(0, self.max_messages_per_turn - self._sent) if self._is_group else 0
+
+    async def send_group_reply_text(self, text: str, *, mention_user: str | None = None) -> str:
+        # Keep mention-like markup in the model's body inert.
+        text = re.sub(r"<(?=@|qqbot-at-user\b)", "<\u200b", text, flags=re.I)
+        return await self._send_group_reply(MessageSegment.text(text), mention_user)
+
+    async def send_group_reply_image(self, img: OutImage, *, mention_user: str | None = None) -> str:
+        if not self.group_reply_slots:
+            return "dropped"
+        try:
+            segment = MessageSegment.file_image(Path(img.path))
+        except (TypeError, ValueError, OSError):
+            return "failed"
+        return await self._send_group_reply(segment, mention_user)
+
+    async def _send_group_reply(self, segment: MessageSegment, mention_user: str | None) -> str:
+        if not self.group_reply_slots:
+            return "dropped"
+        message = Message([MessageSegment.mention_user(mention_user), MessageSegment.text(" "), segment]
+                          if mention_user else [segment])
+        self._event._reply_seq += 1
+        try:
+            await self._bot.send_to_group(
+                group_openid=self._event.group_openid, message=message,
+                msg_id=self._event.id, msg_seq=self._event._reply_seq,
+            )
+            self._sent += 1
+            return "sent"
+        except ActionFailed:
+            return "failed"
+        except Exception:
+            return "uncertain"
 
     async def send_group_text(self, text: str) -> str:
         """Acknowledged group-only reply; never retry an uncertain delivery."""

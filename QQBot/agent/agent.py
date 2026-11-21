@@ -505,6 +505,8 @@ class Agent:
                 continue
 
             if response.get("tool_calls"):
+                if group_run is not None:
+                    group_run.used_tools = True
                 # ── Report progress (with deduplication) ────────────
                 if progress_callback:
                     tool_names = [_display_tool_name(tc) for tc in response["tool_calls"]]

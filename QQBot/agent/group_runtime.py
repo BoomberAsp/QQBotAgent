@@ -13,6 +13,7 @@ from lib.game_intent import GAMEPLAY_TOOLS, game_intent, game_reply_rule
 from lucima_bridge.client import GROUP_LOGIN_CONFIRM_HINT, is_bare_login_confirmation
 
 from . import image_context
+from .group_chatter import split_chatter
 from .group_state import GroupStore, scope_for, identity_for
 from .lucima_tools import (
     GROUP_PROMPT as LUCIMA_GROUP_PROMPT, GROUP_PROPOSAL_PROMPT, TOOLS as LUCIMA_TOOLS,
@@ -90,6 +91,7 @@ class GroupRun:
     autonomous: bool = False
     sticker_choices: list = field(default_factory=list)
     game_intent: str = ""
+    used_tools: bool = False
 
     def messages(self, agent, text, images=None):
         from .context import _delegate_depth
@@ -364,7 +366,9 @@ async def run_group_turn(view, sender=None):
                 return
             ident = store.identity(view)
             generation = state["generation"]
-            if not state["config"]["active_enabled"] and reason != "direct":
+            # A natural reply can still use the incoming message as its passive anchor.
+            has_active_permission = state["config"]["active_enabled"]
+            if not has_active_permission and reason == "follow":
                 return
             # The original passive window must still be valid after queueing.
             if view.platform == "qq_official" and time.time()-view.received_at > 270:
@@ -586,18 +590,65 @@ async def run_group_turn(view, sender=None):
                     await send_sticker(sticker_id=selected)
             if question:
                 answer = "\n\n".join(part for part in (answer[:1200 - len(question) - 2], question) if part)
-            sticker_only=bool(not question and prefer_sticker and run.media and not run.media[0][1].startswith("image:"))
-            async def deliver_text():
-                ticket = store.delivery(scope,view.message_id,"queued")
-                try:
-                    status = await send_text(sender,answer)
-                except Exception:
-                    store.delivery(scope,view.message_id,"uncertain",ticket)
-                    return False
-                store.delivery(scope,view.message_id,status,ticket)
-                return status=="sent" and valid()
-            if not sticker_only and (not answer or not await deliver_text()):
-                return
+            sticker_only = bool(not question and prefer_sticker and run.media
+                                and not run.media[0][1].startswith("image:"))
+            explicit = view.explicit_mention
+            if explicit is None:
+                explicit = view.mentioned and not view.reply_to_bot
+            mention_every = reason == "natural" and not has_active_permission
+            mention_first = reason == "direct" and explicit
+
+            def mention_for(position):
+                return view.user_id if mention_every or (mention_first and position == 0) else None
+
+            def can_deliver():
+                return valid() and (view.platform != "qq_official" or time.time() - view.received_at <= 270)
+
+            confirmed_parts = []
+
+            async def deliver_text(parts):
+                send_part = getattr(sender, "send_group_reply_text", None)
+                for part in parts:
+                    position = len(confirmed_parts)
+                    event = view.message_id if not position else f"{view.message_id}:text:{position + 1}"
+                    if not can_deliver():
+                        if valid():
+                            store.delivery(scope, event, "expired")
+                        break
+                    ticket = store.delivery(scope, event, "queued")
+                    try:
+                        status = (await send_part(part.strip(), mention_user=mention_for(position))
+                                  if send_part else await send_text(sender, part.strip()))
+                    except asyncio.CancelledError:
+                        store.delivery(scope, event, "uncertain", ticket)
+                        if confirmed_parts and valid():
+                            store.commit(scope, generation, view.message_id, member_tag(view),
+                                         message, "".join(confirmed_parts).rstrip())
+                        raise
+                    except Exception:
+                        status = "uncertain"
+                    store.delivery(scope, event, status, ticket)
+                    if status != "sent":
+                        break
+                    confirmed_parts.append(part)
+                return bool(confirmed_parts) and valid()
+
+            if not sticker_only:
+                if not answer:
+                    return
+                body = answer[:1200].strip()
+                slots = getattr(sender, "group_reply_slots", 3)
+                if not isinstance(slots, int):
+                    slots = 3
+                conversational = (
+                    not (run.used_tools or run.media or question or image_search and image_search.query is not None)
+                    and run.game_intent in {"", "undecided"}
+                )
+                parts = split_chatter(body, 3 if conversational else 1, mention_every_part=mention_every)
+                if len(parts) > slots:
+                    parts = [body]
+                if not await deliver_text(parts):
+                    return
             if question:
                 image_source_tools.remember_offer(view, image_scope, image_search)
             delivered=[]
@@ -612,11 +663,18 @@ async def run_group_turn(view, sender=None):
                     break
                 media_ticket=store.delivery(scope,view.message_id+":media","queued")
                 try:
-                    direct=getattr(sender,"send_group_image",None)
-                    if direct:
-                        media_status=await direct(OutImage(path=path))
+                    image = OutImage(path=path)
+                    send_picture = getattr(sender, "send_group_reply_image", None)
+                    direct = getattr(sender, "send_group_image", None)
+                    if send_picture:
+                        media_status = await send_picture(
+                            image, mention_user=mention_for(len(confirmed_parts) + len(delivered)),
+                        )
+                    elif direct:
+                        media_status = await direct(image)
                     else:
-                        await sender.send_image(OutImage(path=path)); media_status="sent"
+                        await sender.send_image(image)
+                        media_status = "sent"
                 except asyncio.CancelledError:
                     store.delivery(scope,view.message_id+":media","uncertain",media_ticket)
                     from .media_ledger import outcome
@@ -630,11 +688,15 @@ async def run_group_turn(view, sender=None):
                 if sticker_only and media_status=="uncertain":return
                 if media_status=="sent":
                     delivered.append(asset)
-            if sticker_only:
-                if delivered:answer=""
-                elif not valid() or not answer or (view.platform=="qq_official" and time.time()-view.received_at>270) or not await deliver_text():
+            if sticker_only and not delivered:
+                if not await deliver_text([answer[:1200].strip()] if answer else []):
                     return
-            store.commit(scope,generation,view.message_id,member_tag(view),message,answer[:1200]+("\n[已投递图片："+",".join(delivered)+"]" if delivered else ""))
+            if not valid():
+                return
+            sent_text = "".join(confirmed_parts).rstrip()
+            if delivered:
+                sent_text += "\n[已投递图片：" + ",".join(delivered) + "]"
+            store.commit(scope, generation, view.message_id, member_tag(view), message, sent_text)
             if reason == "direct":
                 _follow[scope]=(identity_for(view),time.time()+config["follow_seconds"],0)
             elif reason == "follow":

@@ -9,6 +9,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from agent.inbound import InboundMessage
+from agent.group_chatter import split_chatter
 from agent.group_state import GroupStore, scope_for, identity_for
 from agent import group_runtime as runtime
 
@@ -17,6 +18,27 @@ def view(user='a', group='g', message='m', **kw):
     return InboundMessage(user_id=user, group_id=group, is_group=bool(group),
                           self_id='bot', platform='qq_official', message_id=message,
                           mentioned=True, text='你好', **kw)
+
+
+class ChatterTests(unittest.TestCase):
+    def test_split_at_sentence_boundaries_and_keep_content(self):
+        text = "哈哈！它还知道把柜门关上。看这熟练度，估计不是第一次了。"
+        first = "哈哈！它还知道把柜门关上。"
+        self.assertEqual(split_chatter(text, 3), [first, text[len(first):]])
+        self.assertEqual(split_chatter(text, 1), [text])
+        self.assertEqual(split_chatter(text, 3, mention_every_part=True), [text])
+
+    def test_preserve_quotes_links_and_structured_content(self):
+        text = "它说「你又偷吃了吗？我都看到了！」笑死我了。看它那副理直气壮的样子。"
+        pieces = split_chatter(text, 3)
+        self.assertEqual(len(pieces), 2)
+        self.assertIn("你又偷吃了吗？我都看到了！", pieces[0])
+        for protected in (
+            "第一句够长可以切开。来源 https://example.com。",
+            "这里是代码块。"+chr(10)+chr(96)+"example"+chr(96),
+            "这里是说明。"+chr(10)+"1. 按原顺序使用。",
+        ):
+            self.assertEqual(split_chatter(protected, 3), [protected])
 
 
 class StoreTests(unittest.TestCase):
@@ -344,6 +366,71 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         bridge.assert_awaited_once_with(("onebot", "bot", "a", "reply", "g"), "mail", "", propose=True)
         self.assertIn(f"/璐茜玛 执行 {ticket}", self.sender.send_group_text.await_args.args[0])
         self.assertIn(f"/璐茜玛 放弃 {ticket}", self.sender.send_group_text.await_args.args[0])
+
+    async def test_group_chatter_mentions_follow_trigger_and_permission(self):
+        from agent import media_ledger
+        media_root = self.store.root / "test-media"
+        env = patch.dict("os.environ", {"MEDIA_DATA_ROOT": str(media_root)})
+        env.start()
+        self.addCleanup(env.stop)
+        media_ledger.set_policy({"auto_global_seconds": 0}, 0)
+        body = "这只猫开柜门的动作也太熟练了。它最后还转头看了你好几秒。下次记得把猫粮藏到另一个柜子里。"
+        parts = split_chatter(body, 3)
+        self.assertEqual(len(parts), 3)
+        send_part = AsyncMock(return_value="sent")
+        self.sender.send_group_reply_text = send_part
+        self.fake.agent.run = AsyncMock(return_value=body)
+        for group, active, direct, quote, mentions in (
+            ("has-active", True, False, False, [None, None, None]),
+            ("no-active", False, False, False, ["a", "a", "a"]),
+            ("direct-natural", False, True, False, ["a", None, None]),
+            ("quoted-only", False, False, True, [None, None, None]),
+        ):
+            event = view(group=group, explicit_mention=direct, reply_to_bot=quote)
+            event.mentioned = direct
+            scope = scope_for(event)
+            self.store.configure(scope, mode="natural", receive_all=True, active_enabled=active)
+            send_part.reset_mock()
+            await runtime.run_group_turn(event, self.sender)
+            self.assertEqual([call.args[0] for call in send_part.await_args_list], parts)
+            self.assertEqual([call.kwargs["mention_user"] for call in send_part.await_args_list], mentions)
+            self.assertEqual(self.store.history(scope)[-1]["content"], body)
+        self.sender.send_group_text.assert_not_awaited()
+
+    async def test_group_chatter_merges_for_capacity_or_tool_results(self):
+        body = "这只猫还知道把柜门关上。看这熟练度，估计不是第一次了。猫粮还是换个地方收起来吧。"
+        self.assertEqual(len(split_chatter(body, 3)), 3)
+        send_part = AsyncMock(return_value="sent")
+        self.sender.send_group_reply_text = send_part
+        self.fake.agent.run = AsyncMock(return_value=body)
+        for slots in (1, 2):
+            self.sender.group_reply_slots = slots
+            await runtime.run_group_turn(view(message=f"quota-{slots}"), self.sender)
+            send_part.assert_awaited_once_with(body, mention_user="a")
+            send_part.reset_mock()
+        self.sender.group_reply_slots = 3
+
+        async def tool_run(*args, **kwargs):
+            runtime.current_group_run.get().used_tools = True
+            return body
+
+        self.fake.agent.run = tool_run
+        await runtime.run_group_turn(view(message="tool"), self.sender)
+        send_part.assert_awaited_once_with(body, mention_user="a")
+
+    async def test_group_chatter_partial_delivery_only_stores_confirmed_prefix(self):
+        body = "这只猫开柜门的动作也太熟练了。它最后还转头看了你好几秒。下次记得把猫粮藏到另一个柜子里。"
+        send_part = AsyncMock(side_effect=["sent", "uncertain", "sent"])
+        self.sender.send_group_reply_text = send_part
+        self.fake.agent.run = AsyncMock(return_value=body)
+        event = view(message="split")
+        await runtime.run_group_turn(event, self.sender)
+        scope = scope_for(event)
+        self.assertEqual(send_part.await_count, 2)
+        self.assertEqual(self.store.history(scope)[-1]["content"], split_chatter(body, 3)[0])
+        with self.store.db() as db:
+            deliveries = db.execute("SELECT event,status FROM deliveries WHERE scope=? ORDER BY rowid", (scope,)).fetchall()
+        self.assertEqual([tuple(row) for row in deliveries], [("split", "sent"), ("split:text:2", "uncertain")])
 
     async def test_failed_delivery_no_history_or_bond(self):
         self.sender.send_group_text.return_value='uncertain'
