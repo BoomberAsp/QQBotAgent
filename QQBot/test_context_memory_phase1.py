@@ -6,7 +6,9 @@ import unittest
 from unittest.mock import patch
 from agent.profile import ProfileManager
 from agent.memory import TieredMemory
-from agent.request_budget import fit_request, ContextBudgetError, request_cost
+from agent.request_budget import (
+    ContextBudgetError, fit_request, image_token_limit, request_cost,
+)
 from test_agent import TestSessionCompression
 
 
@@ -43,6 +45,34 @@ class PhaseOne(unittest.TestCase):
             fit_request(fitted, [{"description":"中"*6000}], 5000, 100)
         with self.assertRaises(ContextBudgetError):
             fit_request([{"role":"tool", "tool_call_id":"missing", "content":"x"}], [])
+
+    def test_image_budget_uses_selected_model_and_preserves_payload(self):
+        def attachment(encoded):
+            return {"type": "image_url", "image_url": {
+                "url": "data:image/png;base64," + encoded, "detail": "high",
+            }}
+
+        small = attachment("A" * 4)
+        large = attachment("A" * 4_000_000)
+        text = {"type": "text", "text": "请描述图片。"}
+        large_request = [{"role": "user", "content": [text, large]}]
+        flash_tokens = image_token_limit("deepseek-v4-flash", "https://api.deepseek.com/v1")
+        fallback_tokens = image_token_limit("deepseek-v4-flash", "https://example.org/v1")
+        self.assertEqual((1024, 16384), (flash_tokens, fallback_tokens))
+        self.assertEqual(16386, image_token_limit("qwen3.7-plus", "https://dashscope.aliyuncs.com"))
+        self.assertEqual(
+            request_cost([{"role": "user", "content": [text, small]}], [], image_tokens=flash_tokens),
+            request_cost(large_request, [], image_tokens=flash_tokens),
+        )
+
+        fitted = fit_request(large_request, [], 3000, 100, image_tokens=flash_tokens)
+        self.assertIs(fitted[0]["content"][1], large)
+        self.assertEqual("data:image/png;base64," + "A" * 4_000_000, large["image_url"]["url"])
+        multiple_images = [{"role": "user", "content": [text, large, small]}]
+        with self.assertRaisesRegex(ContextBudgetError, "必要上下文过长"):
+            fit_request(multiple_images, [], 3000, 100, image_tokens=flash_tokens)
+        with self.assertRaises(ContextBudgetError):
+            fit_request(large_request, [], 3000, 100, image_tokens=fallback_tokens)
 
     def test_replay_and_conflicting_edit(self):
         async def run():

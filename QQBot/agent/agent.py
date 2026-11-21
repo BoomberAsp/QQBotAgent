@@ -439,12 +439,17 @@ class Agent:
                 if allowed_tools is not None
                 else self.tools.get_schemas()
             )
-            from .request_budget import fit_request, ContextBudgetError
+            from .request_budget import ContextBudgetError, fit_request, image_token_limit
             window = (self.special_sessions.get_context_window()
                       if self.special_sessions is not None else 128000)
             try:
-                messages = fit_request(messages, schemas, getattr(llm_client, "context_window", window),
-                                       getattr(llm_client, "output_reserve", 8192))
+                messages = fit_request(
+                    messages, schemas,
+                    getattr(llm_client, "context_window", window),
+                    getattr(llm_client, "output_reserve", 8192),
+                    image_tokens=image_token_limit(getattr(llm_client, "model", None),
+                                                   getattr(llm_client, "api_base", None)),
+                )
             except ContextBudgetError as exc:
                 return str(exc)
             # Streaming variant when a content_callback is wired AND the
