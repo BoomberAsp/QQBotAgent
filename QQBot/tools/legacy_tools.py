@@ -56,7 +56,7 @@ async def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -
         count: Number of pulls (1 or 10).
         up_character: Rate-up character name (optional, supports fuzzy matching).
     """
-    from plugins.pullingMonitor import drawing_cards, format_result
+    from plugins.pullingMonitor import draw_cards, format_result
 
     try:
         from agent.context import _last_gacha_star
@@ -78,8 +78,8 @@ async def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -
         return "[Gacha Error] count 必须是 1 (单抽) 或 10 (十连抽)"
 
     # Validate up_character for rate-up pools
-    if pool_type == "几率up招募" and not up_character:
-        return "[Gacha Error] 几率UP招募需要指定 up_character (UP角色名)"
+    if pool_type in {"几率up招募", "神秘招募"} and not (up_character or "").strip():
+        return f"[Gacha Error] {pool_type}需要指定 up_character (UP角色名)"
 
     # ── Fuzzy name resolution ──
     resolved_note = ""
@@ -92,8 +92,10 @@ async def gacha_pull(pool_type: str, count: int = 1, up_character: str = None) -
             resolved_note = f"[名称解析: 「{up_character}」→「{resolved}」]\n"
             actual_up = resolved
 
-    results = [drawing_cards(pool_type, actual_up) for _ in range(count)]
-    text_segment, star = format_result(results, count)
+    results = draw_cards(pool_type, actual_up, count)
+    if results[0][2] == "错误":
+        return f"[Gacha Error] {results[0][0]}"
+    text_segment, star = format_result(results[0] if count == 1 else results, count)
     try:
         from agent.context import _last_gacha_star
         _last_gacha_star.set(int(star))

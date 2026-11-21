@@ -11,8 +11,10 @@ Data sources:
   - Static config/gacha_data.json → banner probability weights (merged)
 """
 
-from lib.bond_names import load_artifacts, reconcile as reconcile_bond_name
-from lib.game_names import load_roles, reconcile as reconcile_character_name
+from lib.bond_names import artifact_path, load_artifacts, reconcile as reconcile_bond_name
+from lib.gacha_names import GachaNames, build_five_star_bonds
+from lib.game_names import file_stamp, load_roles, reconcile as reconcile_character_name
+from lib.game_names import roles_path
 import asyncio
 import copy
 import hashlib
@@ -20,6 +22,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
@@ -72,6 +75,7 @@ OPENRUBI_CHAR_DIR = os.path.join(
 OPENRUBI_CHAR_DIC = os.path.join(OPENRUBI_CHAR_DIR, "character_dic.json")
 OPENRUBI_MEMBERS_INFO = os.path.join(OPENRUBI_CHAR_DIR, "members_info.json")
 OPENRUBI_BONDS_INFO = os.path.join(OPENRUBI_CHAR_DIR, "bonds_info.json")
+OPENRUBI_BOND_DIC = os.path.join(OPENRUBI_CHAR_DIR, "bonds_search_dic.json")
 
 # Translation term tables (status terms, element/class/constellation maps,
 # discipline stats, bond economy values, stat multipliers, LLM prompt
@@ -140,9 +144,17 @@ class WikiScraper:
         except Exception:
             return None
 
-        data = cache.get("data", {})
-        pools = data.get("pools", {})
-        total_items = sum(len(p.get("items", [])) for p in pools.values())
+        data = cache.get("data") if isinstance(cache, dict) else None
+        pools = data.get("pools") if isinstance(data, dict) else None
+        if not isinstance(pools, dict) or any(
+            not isinstance(pool, dict) or not isinstance(pool.get("items"), list)
+            or pool.get("type") not in {"character", "bond"} or pool.get("star") not in (3, 4, 5, 6)
+            or any(not isinstance(item, dict) or not isinstance(item.get("name"), str)
+                   or not item["name"] for item in pool["items"])
+            for pool in pools.values()
+        ):
+            return None
+        total_items = sum(len(p["items"]) for p in pools.values())
         if total_items == 0:
             print("[WikiScraper] Cached data is empty, ignoring", file=sys.stderr)
             return None
@@ -153,6 +165,15 @@ class WikiScraper:
                   file=sys.stderr)
 
         return data
+
+    def gacha_stamp(self) -> tuple:
+        """Inputs that can change the active pool or its canonical names."""
+        return tuple(file_stamp(path) for path in (
+            self._cache_file, self._static_config, self._translation_cache,
+            self._character_detail_cache, self._bond_detail_cache,
+            OPENRUBI_CHAR_DIC, OPENRUBI_BOND_DIC, OPENRUBI_MEMBERS_INFO,
+            OPENRUBI_BONDS_INFO, roles_path(), artifact_path(),
+        ))
 
     def is_stale(self) -> bool:
         """Check whether the cache is stale (without loading full data)."""
@@ -251,6 +272,9 @@ class WikiScraper:
 
         print(f"[WikiScraper] Parsed {len(members)} members, {len(bonds)} bonds", file=sys.stderr)
 
+        if not members or not bonds:
+            return self.get_cached_data() or self._load_static_fallback()
+
         # 3. Classify into pools
         pools = self._classify_members(members)
         self._classify_bonds(bonds, pools)
@@ -263,8 +287,8 @@ class WikiScraper:
             print("[WikiScraper] WARNING: No items scraped, discarding empty result", file=sys.stderr)
             return self._load_static_fallback()
 
-        # 4. Translate English names to Chinese (hybrid: cache + LLM)
-        await self._translate_names(pools)
+        # Resolve identities and names before deriving the five-star bond pools.
+        self.normalize_gacha_pools(pools)
 
         # 5. Merge with static config (banner probabilities)
         result = self._merge_with_static(pools)
@@ -277,8 +301,17 @@ class WikiScraper:
             "data": result,
         }
         os.makedirs(self._cache_dir, exist_ok=True)
-        with open(self._cache_file, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=self._cache_dir, delete=False,
+        ) as f:
+            temp_path = f.name
+            try:
+                json.dump(cache, f, ensure_ascii=False, indent=2)
+                f.close()
+                os.replace(temp_path, self._cache_file)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
 
         return result
 
@@ -649,6 +682,7 @@ class WikiScraper:
 
         return {
             "name": title,
+            "id": (self._extract_param_value(member_block, "ID") or "").strip(),
             "stars": stars,
             "element": element.strip(),
             "bond": bond_value,
@@ -673,7 +707,8 @@ class WikiScraper:
         except (ValueError, TypeError):
             return None
 
-        return {"name": title, "stars": stars}
+        image = self._extract_param_value(bond_block, "Image") or ""
+        return {"name": title, "id": self._bond_id(image), "stars": stars}
 
     def _extract_template_block(self, wikitext: str, template_name: str) -> str | None:
         """Extract the content block of a specific template from wikitext.
@@ -1579,6 +1614,11 @@ class WikiScraper:
 
     # ── Bond Detail (full bond fields) ─────────────────────────────
 
+    @staticmethod
+    def _bond_id(image: str) -> str:
+        match = re.search(r"Icon_Head_S_([A-Za-z0-9]+)\.png", image, re.IGNORECASE)
+        return match.group(1).upper() if match else ""
+
     def _parse_bond_full(self, title: str, wikitext: str) -> dict | None:
         """Parse a {{Bond}} template into a full bond-detail entry.
 
@@ -1604,8 +1644,7 @@ class WikiScraper:
 
         # Bond id is embedded in the icon filename (Icon_Head_S_A0001.png).
         image = (p("Image") or "").strip()
-        m = re.search(r"Icon_Head_S_([A-Za-z0-9]+)\.png", image, re.IGNORECASE)
-        cid = m.group(1).upper() if m else ""
+        cid = self._bond_id(image)
 
         return {
             "title": title,
@@ -2292,8 +2331,11 @@ class WikiScraper:
             bond = m.get("bond", "")
             obtain = m.get("obtain", "")
 
-            item = {"name": m["name"]}
+            item = {"name": m["name"], "title": m["name"]}
+            if m.get("id"):
+                item["id"] = m["id"]
             if bond:
+                item["bond_title"] = bond
                 item["bond"] = bond
 
             if element in LIGHT_DARK_ELEMENTS:
@@ -2329,10 +2371,13 @@ class WikiScraper:
         bonds_three = []
         bonds_four = []
         for b in bonds:
+            item = {"name": b["name"], "title": b["name"]}
+            if b.get("id"):
+                item["id"] = b["id"]
             if b["stars"] == 3:
-                bonds_three.append({"name": b["name"]})
+                bonds_three.append(item)
             elif b["stars"] == 4:
-                bonds_four.append({"name": b["name"]})
+                bonds_four.append(item)
 
         bonds_three.sort(key=lambda x: x["name"])
         bonds_four.sort(key=lambda x: x["name"])
@@ -2350,34 +2395,6 @@ class WikiScraper:
             "items": bonds_four,
         }
 
-        # 5★ bonds derived from three-color five-star characters
-        bonds_all = []
-        bonds_tricolor = []
-        for pool_key in ("three_color_five_star", "special_three_color_five_star"):
-            for item in pools[pool_key]["items"]:
-                if "bond" in item:
-                    bonds_all.append({"name": item["bond"]})
-
-        for item in pools["three_color_five_star"]["items"]:
-            if "bond" in item:
-                bonds_tricolor.append({"name": item["bond"]})
-
-        bonds_all.sort(key=lambda x: x["name"])
-        bonds_tricolor.sort(key=lambda x: x["name"])
-
-        pools["bonds_five_star_all"] = {
-            "description": "五星羁绊（全部）",
-            "star": 5,
-            "type": "bond",
-            "items": bonds_all,
-        }
-        pools["bonds_five_star_tricolor"] = {
-            "description": "五星羁绊（三色）",
-            "star": 5,
-            "type": "bond",
-            "items": bonds_tricolor,
-        }
-
     @staticmethod
     def _make_pool(description: str, star: int, pool_type: str) -> dict:
         return {
@@ -2389,123 +2406,73 @@ class WikiScraper:
 
     # ── Translation ───────────────────────────────────────────────
 
-    async def _translate_names(self, pools: dict):
-        """Translate all English names in pools to Chinese (hybrid approach).
-
-        1. Load cached English→Chinese mapping
-        2. Collect all unmapped names from pools
-        3. If LLM client is available, batch-translate unmapped names
-        4. Save updated mapping
-        5. Apply translations to all pool items
-        """
-        # Collect all unique names from pools
-        all_names = set()
-        for pool in pools.values():
-            for item in pool.get("items", []):
-                all_names.add(item["name"])
-                if "bond" in item:
-                    all_names.add(item["bond"])
-
-        # Load existing translation map
-        name_map = self._load_translation_map()
-
-        # Find unmapped names
-        unmapped = [n for n in all_names if n not in name_map]
-
-        if unmapped and self.llm_client:
-            new_translations = await self._llm_translate(unmapped)
-            name_map.update(new_translations)
-            self._save_translation_map(name_map)
-
-        # Apply translations
-        self._apply_translations(pools, name_map)
+    @staticmethod
+    def _read_gacha_reference(path, default):
+        try:
+            with open(path, encoding="utf-8") as file:
+                value = json.load(file)
+            return value if isinstance(value, type(default)) else default
+        except (OSError, ValueError):
+            return default
 
     def _load_translation_map(self) -> dict:
-        """Load English→Chinese name mapping from cache file."""
-        if not os.path.exists(self._translation_cache):
-            return {}
-        try:
-            with open(self._translation_cache, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        return self._read_gacha_reference(self._translation_cache, {})
 
-    def _save_translation_map(self, name_map: dict):
-        """Save English→Chinese name mapping to cache file."""
-        os.makedirs(self._cache_dir, exist_ok=True)
-        try:
-            with open(self._translation_cache, "w", encoding="utf-8") as f:
-                json.dump(name_map, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    async def _llm_translate(self, names: list[str]) -> dict:
-        """Batch-translate English names to Chinese via LLM.
-
-        Returns a dict mapping English→Chinese.
-        """
-        if not names:
-            return {}
-
-        names_list = "\n".join(names)
-        prompt = (
-            "Translate the following Ark Re:Code game character names and bond names "
-            "into Simplified Chinese. These are from a gacha game, so use commonly "
-            "accepted Chinese translations where they exist. "
-            "Return ONLY a JSON object mapping each English name to its Chinese "
-            "translation. No explanation, no markdown formatting.\n\n"
-            f"{names_list}\n\n"
-            'Output format: {{"English Name": "中文名", ...}}'
+    def normalize_gacha_pools(self, pools: dict) -> None:
+        """Resolve both newly scraped and legacy cached names before drawing."""
+        translations = self._load_translation_map()
+        characters = GachaNames(
+            load_roles(), self._load_character_cache(),
+            self._read_gacha_reference(OPENRUBI_MEMBERS_INFO, []),
+            self._read_gacha_reference(OPENRUBI_CHAR_DIC, {}), translations,
         )
+        artifacts = load_artifacts()
+        # The game data confirms these legacy IDs refer to the same titled artifacts.
+        redirects = {old: current for old, current in (("A0129", "A0159"), ("A0165", "A0162"))
+                     if current in artifacts and old not in artifacts}
+        bonds = GachaNames(
+            artifacts, self._load_bond_cache(),
+            self._read_gacha_reference(OPENRUBI_BONDS_INFO, []),
+            self._read_gacha_reference(OPENRUBI_BOND_DIC, {}), translations, redirects=redirects,
+        )
+        # Legacy Member template titles identified by their owner and matching Bond page.
+        old_bond_titles = {
+            "H118": ({"Sister's Chemistry", "姐妹情缘"}, "Sisterly Chemistry"),
+            "H088": ({"Wicked Aphrodisiac", "邪恶催情药"}, "Malicious Symbol"),
+            "H082": ({"A Little Abuse", "轻微虐待"}, "A Little Pleasure"),
+        }
+        for pool_key, pool in pools.items():
+            if pool_key in {"bonds_five_star_all", "bonds_five_star_tricolor"}:
+                continue
+            is_bond = pool["type"] == "bond"
+            names = bonds if is_bond else characters
+            for item in pool["items"]:
+                old = item["name"]
+                rid, name, _, title = names.resolve(old, item.get("id"), item.get("title"), star=pool["star"])
+                item["name"] = name
+                if rid:
+                    item["id"] = rid
+                if title:
+                    item["title"] = title
+                if old != name and not is_bond:
+                    item["name_aliases"] = list(dict.fromkeys([*item.get("name_aliases", []), old]))
+                if not item.get("bond"):
+                    continue
+                old_bond = item["bond"]
+                bond_title = item.get("bond_title")
+                legacy_titles, official_title = old_bond_titles.get(rid, ((), ""))
+                if (bond_title or old_bond) in legacy_titles:
+                    bond_title = official_title
+                bond_id, name, rarity, title = bonds.resolve(old_bond, item.get("bond_id"), bond_title)
+                item["bond"] = name
+                if bond_id:
+                    item["bond_id"] = bond_id
+                if title:
+                    item["bond_title"] = title
+                if rarity:
+                    item["bond_star"] = rarity
 
-        try:
-            result = await self.llm_client.chat_completion(
-                prompt, timeout_set=30.0
-            )
-            if result:
-                # Try to extract JSON from the response
-                return self._parse_translation_response(result, names)
-        except Exception:
-            pass
-
-        return {}
-
-    @staticmethod
-    def _parse_translation_response(response: str, names: list[str]) -> dict:
-        """Parse LLM translation response into a dict, with fallback heuristics."""
-        import re as _re
-        # Try to extract a JSON object
-        json_match = _re.search(r"\{[^{}]*\}", response, _re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group(0))
-            except json.JSONDecodeError:
-                pass
-
-        # Fallback: try to parse line-by-line "English: Chinese" pairs
-        result = {}
-        for line in response.strip().split("\n"):
-            line = line.strip().strip(",").strip('"').strip("'")
-            for sep in (": ", "：", " → ", " - "):
-                if sep in line:
-                    en, cn = line.split(sep, 1)
-                    en = en.strip().strip('"').strip("'")
-                    cn = cn.strip().strip('"').strip("'")
-                    if en and cn and en in names:
-                        result[en] = cn
-                    break
-
-        return result
-
-    def _apply_translations(self, pools: dict, name_map: dict):
-        """Replace English names with Chinese names in all pool items."""
-        for pool in pools.values():
-            for item in pool.get("items", []):
-                en_name = item["name"]
-                if en_name in name_map:
-                    item["name"] = name_map[en_name]
-                if "bond" in item and item["bond"] in name_map:
-                    item["bond"] = name_map[item["bond"]]
+        build_five_star_bonds(pools)
 
     # ── Merge ─────────────────────────────────────────────────────
 

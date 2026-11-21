@@ -279,21 +279,15 @@ def quoted_file_paths(event: MessageEvent) -> list[str]:
 
 # ── View construction ──────────────────────────────────────────────
 
-def _is_mentioned(event: MessageEvent) -> bool:
-    """@-detection for group messages; private messages always count.
-
-    Manual segment check first (more reliable than to_me() on NapCat),
-    event.is_tome() as backup — same union the plugin guards use.
-    """
-    if not isinstance(event, GroupMessageEvent):
-        return True
-    return _explicitly_mentioned(event) or event.is_tome()
-
-
-def _explicitly_mentioned(event: MessageEvent) -> bool:
+def _group_mentions(event: GroupMessageEvent) -> tuple[bool, tuple[str, ...]]:
     message = getattr(event, "original_message", None) or event.message
-    return any(seg.type == "at" and str(seg.data.get("qq")) == str(event.self_id)
-               for seg in message)
+    targets = {}
+    for segment in message["at"]:
+        target = str(segment.data.get("qq") or "")
+        if target and target != "all":
+            targets.setdefault(target, str(segment.data.get("name") or ""))
+    bot_id = str(event.self_id)
+    return bot_id in targets, tuple(name for target, name in targets.items() if target != bot_id)
 
 
 class OneBotAttachmentResolver:
@@ -358,6 +352,7 @@ def build_view(bot: Bot, event: MessageEvent) -> InboundMessage:
     author = ""
     if reply_id and str(getattr(reply, "message_id", "") or "") == reply_id:
         author = str(getattr(getattr(reply, "sender", None), "user_id", "") or "")
+    explicit_mention, other_mentions = _group_mentions(event) if is_group else (False, ())
     media_segments = [seg.type for seg in event.message if seg.type not in {"at", "text", "reply"}]
     return InboundMessage(
         user_id=str(event.user_id),
@@ -366,14 +361,15 @@ def build_view(bot: Bot, event: MessageEvent) -> InboundMessage:
         text=event.get_plaintext().strip(),
         message_id=str(event.message_id),
         self_id=str(event.self_id),
-        mentioned=_is_mentioned(event),
-        explicit_mention=is_group and _explicitly_mentioned(event),
+        mentioned=not is_group or explicit_mention or event.is_tome(),
+        explicit_mention=explicit_mention,
+        other_mentions=other_mentions,
         reply_context="" if is_group else build_reply_context(event),
         reply_message_id=reply_id,
         reply_author_id=author,
         is_sticker=not reply_id and media_segments == ["mface"],
         actor_role=str(getattr(getattr(event, "sender", None), "role", "member")),
-        reply_to_bot=bool(event.is_tome()) if is_group else False,
+        reply_to_bot=bool(is_group and author == str(event.self_id)),
         attachment_kinds=tuple({'record':'voice','mface':'image'}.get(seg.type,seg.type)
                                for seg in event.message if seg.type not in ('text','at','reply')),
         resolver=OneBotAttachmentResolver(bot, event),

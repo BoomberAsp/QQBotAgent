@@ -253,6 +253,8 @@ async def group_command(view,sender,config,role):
 
 
 def participation(view, config, scope, now):
+    if view.addressed_elsewhere:
+        return ""
     direct = view.mentioned or view.reply_to_bot
     if direct:
         return "direct"
@@ -317,20 +319,22 @@ async def run_group_turn(view, sender=None):
             pass
     if config["status"] != "active":
         return
-    if lucima_enabled() and is_bare_login_confirmation(without_mention_prefix(view.text)):
+    addressed_elsewhere = view.addressed_elsewhere
+    if not addressed_elsewhere and lucima_enabled() and is_bare_login_confirmation(without_mention_prefix(view.text)):
         if view.mentioned or view.reply_to_bot:
             await send_text(sender, GROUP_LOGIN_CONFIRM_HINT)
         return
     image_scope = (scope, initial["generation"])
-    image_offer = image_source_tools.take_offer(view, image_scope)
+    image_offer = None if addressed_elsewhere else image_source_tools.take_offer(view, image_scope)
     tokens = [(ctx._current_platform,ctx._current_platform.set(view.platform))]
     try:
         role = turn._perm_manager.get_role(view.user_id).value
-        from .survey_flow import try_handle as _survey_try_handle
-        if await _survey_try_handle(view, sender):
-            return
-        if await group_command(view,sender,config,role):
-            return
+        if not addressed_elsewhere:
+            from .survey_flow import try_handle as _survey_try_handle
+            if await _survey_try_handle(view, sender):
+                return
+            if await group_command(view,sender,config,role):
+                return
         if getattr(view, "is_sticker", False):
             from .sticker_group import maybe_collect
             maybe_collect(view, store, initial)
@@ -344,7 +348,8 @@ async def run_group_turn(view, sender=None):
         while ring and now-ring[0][0]>1800:
             ring.popleft()
         summary=view.media_summary()
-        message=' '.join(part for part in (view.text,summary) if part) or '[无可解析正文的群消息]'
+        message = " ".join(part for part in (view.mention_summary(), view.text, summary) if part)
+        message = message or "[无可解析正文的群消息]"
         reason = participation(view,config,scope,now)
         has_image = "image" in view.attachment_kinds or bool(image_context.images_only(view.attachments))
         if config["receive_all"] or (reason == "direct" and has_image):

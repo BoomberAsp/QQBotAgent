@@ -22,9 +22,17 @@ otherwise re-run on every call).
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+
+# The official route may supply either generation of encoded member tags.
+QQ_MEMBER_MENTION = re.compile(
+    r'<@!?(?!all>)([\w.-]+)>|<qqbot-at-user\s+id="([\w.-]+)"\s*/>',
+    re.ASCII | re.IGNORECASE,
+)
 
 
 @dataclass
@@ -81,6 +89,22 @@ class InboundMessage:
     has_image_quote: bool = False
     is_sticker: bool = False
     explicit_mention: bool | None = None
+    other_mentions: tuple[str, ...] = ()  # display names, empty when QQ only identifies the target
+
+    @property
+    def addressed_elsewhere(self) -> bool:
+        explicit = self.mentioned if self.explicit_mention is None else self.explicit_mention
+        return bool(self.other_mentions) and not (explicit or self.reply_to_bot)
+
+    def mention_summary(self) -> str:
+        if not self.other_mentions:
+            return ""
+        names = [" ".join(name.split())[:40] for name in self.other_mentions[:5]]
+        targets = "、".join(f"「{name}」" if name else "昵称未知的成员" for name in names)
+        if len(self.other_mentions) > len(names):
+            targets += f"等共 {len(self.other_mentions)} 位成员"
+        return f"[此消息 @ 了其他群成员：{targets}]"
+
     def media_summary(self):
         kinds=self.attachment_kinds or tuple(a.kind for a in self.attachments)
         labels={'image':'图片','voice':'语音','video':'视频','file':'文件','face':'表情','other':'非文本消息'}

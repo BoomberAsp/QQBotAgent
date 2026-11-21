@@ -59,6 +59,15 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(s.group(a)['config']['receive_all'])
         self.assertEqual(s.group(a)['config']['persona'],'roxy')
 
+    def test_legacy_history_hides_encoded_mention_ids(self):
+        scope = scope_for(view())
+        generation = self.store.group(scope)["generation"]
+        self.store.commit(scope, generation, "old", "member", "<@old_openid> 来领票", "好")
+        for limit in (0, 20):
+            history = json.dumps(self.store.history(scope, limit=limit), ensure_ascii=False)
+            self.assertIn("[提及了群成员] 来领票", history)
+            self.assertNotIn("old_openid", history)
+
     def bind(self):
         s=self.store
         g,p=s.identity(view()),s.identity(view(user='dm',group=''))
@@ -396,6 +405,36 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([call.kwargs["mention_user"] for call in send_part.await_args_list], mentions)
             self.assertEqual(self.store.history(scope)[-1]["content"], body)
         self.sender.send_group_text.assert_not_awaited()
+
+    async def test_other_member_mention_is_context_only_until_bot_is_addressed(self):
+        event = view(message="other-at", explicit_mention=False, other_mentions=("华天崎",))
+        event.mentioned = False
+        event.text = "还没给我送票捏"
+        scope = scope_for(event)
+        self.store.configure(scope, mode="natural", receive_all=True)
+        survey = AsyncMock(return_value=False)
+        with patch("agent.survey_flow.try_handle", survey):
+            await runtime.run_group_turn(event, self.sender)
+            self.assertEqual(self.calls, [])
+            self.sender.send_group_text.assert_not_awaited()
+            survey.assert_not_awaited()
+
+            named_bot = view(message="direct", explicit_mention=True, other_mentions=("",))
+            prompts = []
+
+            async def model(text, *args, **kwargs):
+                run = runtime.current_group_run.get()
+                prompts.extend(message["content"] for message in run.messages(None, text))
+                self.assertFalse(run.autonomous)
+                return "公开回答"
+
+            self.fake.agent.run = model
+            await runtime.run_group_turn(named_bot, self.sender)
+
+        combined = "\n".join(prompts)
+        self.assertIn("[此消息 @ 了其他群成员：\u300c华天崎\u300d] 还没给我送票捏", combined)
+        self.assertIn("[此消息 @ 了其他群成员：昵称未知的成员] 你好", prompts[-1])
+        self.sender.send_group_text.assert_awaited_once()
 
     async def test_group_chatter_merges_for_capacity_or_tool_results(self):
         body = "这只猫还知道把柜门关上。看这熟练度，估计不是第一次了。猫粮还是换个地方收起来吧。"

@@ -80,7 +80,7 @@ async def dispatch_game(view,sender,store,command=None,argument=''):
             else:
                 pool=pool or dialog.pool
                 name=text[3:].strip() if up_reply else ' '.join(parts[1:])
-                if pool=='几率up招募' and not name:
+                if pool in ('几率up招募','神秘招募') and not name:
                     dialog.pool=pool
                     result='请回复 UP 角色名，或重新选择卡池。'
                 else:

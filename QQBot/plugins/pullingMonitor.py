@@ -1,24 +1,12 @@
 import time
-from datetime import timedelta
-from typing import Union
 import random
 
-import pandas as pd
-import numpy as np
-from nb_cli.cli.commands import self
 from nonebot.internal.matcher import Matcher
 # on_message, on_command, on_notice imports removed (handlers disabled)
-from nonebot.adapters.onebot.v11 import (
-    GroupMessageEvent,
-    Message,
-    MessageSegment,
-    GroupIncreaseNoticeEvent,
-    MessageEvent
-)
-from nonebot.typing import T_State
-from nonebot.params import CommandArg
-from nonebot.rule import to_me
+from nonebot.adapters.onebot.v11 import MessageSegment
 import os
+
+from lib.gacha_names import name_key
 
 # 使用项目相对路径
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -65,129 +53,77 @@ ten_pull_start = _safe_image("ten_pull_start.png")
 
 # ── Gacha Data Loading ─────────────────────────────────────────────
 
-_gacha_data = None  # Lazy-loaded cache
+_gacha_data = None
+_gacha_stamp = None
 
 
 def _load_gacha_data():
-    """Load gacha pools and banners.
-
-    Tries wiki cache first (via WikiScraper), falls back to static
-    config/gacha_data.json if cache is stale or unavailable.
-
-    Returns a dict with two keys:
-        pools:   dict[str, dict] — pool_name → {star, type, items: [{name, bond?}]}
-        banners: dict[str, dict] — banner_name → {up_required, categories: [{pool, prob, star?}]}
-
-    Derived pools are computed at load time:
-        bonds_five_star_all      — all bonds from 三色 + 限定 five-star characters
-        bonds_five_star_tricolor — bonds from 三色 five-star characters only
-    """
-    global _gacha_data
-    if _gacha_data is not None:
-        return _gacha_data
-
+    """Reload when the cache or the name references change on disk."""
+    global _gacha_data, _gacha_stamp
     from tools.wiki_scraper import WikiScraper
 
     scraper = WikiScraper()
+    stamp = scraper.gacha_stamp()
+    if _gacha_data is not None and stamp == _gacha_stamp:
+        return _gacha_data
+
+    static = scraper._load_static_fallback()
+    banners = static["banners"]
     wiki_data = scraper.get_cached_data()
-
-    if wiki_data is not None:
-        pools = wiki_data["pools"]
-        banners = wiki_data.get("banners", {})
-    else:
-        pools, banners = _load_static_gacha_data()
-
-    # ── Build derived bond pools ──────────────────────────────────
-    # These are already computed by WikiScraper, but we recompute here
-    # for the static fallback path and to ensure consistency.
-    _build_derived_pools(pools)
-
-    _gacha_data = {"pools": pools, "banners": banners}
+    pools = wiki_data["pools"] if wiki_data else static["pools"]
+    scraper.normalize_gacha_pools(pools)
+    _gacha_data = {"pools": pools, "banners": banners or (wiki_data or {}).get("banners", {})}
+    _gacha_stamp = stamp
     return _gacha_data
 
 
-def _load_static_gacha_data():
-    """Load gacha data from config/gacha_data.json (fallback path)."""
-    import json
-    config_path = os.path.join(CURRENT_DIR, "..", "config", "gacha_data.json")
-    config_path = os.path.abspath(config_path)
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    return data["pools"], data["banners"]
-
-
-def _build_derived_pools(pools):
-    """Build bonds_five_star_all and bonds_five_star_tricolor from character data."""
-    # Only build if not already present (WikiScraper already sets them)
-    if "bonds_five_star_all" in pools and "bonds_five_star_tricolor" in pools:
-        # Validate they are non-empty; if empty, rebuild
-        if pools["bonds_five_star_all"]["items"] and pools["bonds_five_star_tricolor"]["items"]:
-            return
-
-    bonds_all = []
-    for pool_key in ("three_color_five_star", "special_three_color_five_star"):
-        for item in pools[pool_key]["items"]:
-            if "bond" in item:
-                bonds_all.append({"name": item["bond"]})
-
-    bonds_tricolor = []
-    for item in pools["three_color_five_star"]["items"]:
-        if "bond" in item:
-            bonds_tricolor.append({"name": item["bond"]})
-
-    pools["bonds_five_star_all"] = {
-        "description": "五星羁绊（全部）",
-        "star": 5,
-        "type": "bond",
-        "items": bonds_all,
-    }
-    pools["bonds_five_star_tricolor"] = {
-        "description": "五星羁绊（三色）",
-        "star": 5,
-        "type": "bond",
-        "items": bonds_tricolor,
-    }
-
-
-def _find_character_bond(character_name: str, pools: dict) -> str | None:
-    """Look up a character's bond string from all five-star character pools."""
-    for pool_key in ("three_color_five_star", "special_three_color_five_star"):
-        for item in pools[pool_key]["items"]:
-            if item["name"] == character_name and "bond" in item:
-                return item["bond"]
-    return None
-
-
-def _is_special_five_star(character_name: str, pools: dict) -> bool:
-    """Check if a character is in the 光暗五星 pool."""
-    return any(
-        item["name"] == character_name
-        for item in pools["special_five_star"]["items"]
-    )
+def _up_entry(name: str | None, pools: dict, pool_keys: tuple[str, ...]):
+    wanted = name_key(name)
+    if not wanted:
+        return None
+    options = [item for key in pool_keys for item in pools.get(key, {}).get("items", ())]
+    for item in options:
+        if wanted == name_key(item["name"]):
+            return item
+    matches = [item for item in options if wanted in {
+        name_key(alias) for alias in (item.get("id"), item.get("title"), *item.get("name_aliases", []))
+        if alias
+    }]
+    return matches[0] if len(matches) == 1 else None
 
 
 # ── Drawing Cards ──────────────────────────────────────────────────
 
-def drawing_cards(pool_type: str, upper_character: str = None):
-    """Draw a gacha card from the given banner pool.
+def draw_cards(pool_type: str, upper_character: str | None = None, count: int = 1):
+    """Draw from a single snapshot of the given banner pool.
 
     Args:
         pool_type: Banner type ('常规招募', '几率up招募', '神秘招募', '银河招募').
         upper_character: Rate-up character name (required for 几率up/神秘).
 
     Returns:
-        (name, star_rating, type_string) — e.g. ("厄德莱雅", 5, "角色").
+        A list of (name, star_rating, type_string) tuples.
     """
     data = _load_gacha_data()
     pools = data["pools"]
     banners = data["banners"]
 
     if pool_type not in banners:
-        return (f"未知卡池: {pool_type}", 0, "错误")
+        return [(f"未知卡池: {pool_type}", 0, "错误")]
 
     banner = banners[pool_type]
+    three_color_pools = ("three_color_five_star", "special_three_color_five_star")
+    up_pools = {
+        "几率up招募": three_color_pools,
+        "神秘招募": ("special_five_star",),
+    }
+    up_item = _up_entry(upper_character, pools, up_pools.get(pool_type, ()))
+    if banner.get("up_required") and up_item is None:
+        expected = "光暗五星" if pool_type == "神秘招募" else "三色五星"
+        return [(f"{pool_type}需要指定卡池内的{expected}UP角色", 0, "错误")]
+
+    up_bond = (up_item or {}).get("bond") if (up_item or {}).get("bond_star", 5) == 5 else None
+    up_bond_id = (up_item or {}).get("bond_id")
     categories = []
     weights = []
 
@@ -197,47 +133,29 @@ def drawing_cards(pool_type: str, upper_character: str = None):
         star_override = cat.get("star")
 
         # ── Dynamic pools (depend on upper_character) ──────────
-        if pool_name == "up_character":
-            if not upper_character:
-                continue
-            star = star_override or 5
-            categories.append((upper_character, star, "角色"))
-            weights.append(prob)
-            continue
-
-        if pool_name == "up_character_special":
-            if not upper_character or not _is_special_five_star(upper_character, pools):
-                continue
-            star = star_override or 5
-            categories.append((upper_character, star, "角色"))
-            weights.append(prob)
+        if pool_name in {"up_character", "up_character_special"}:
+            if up_item:
+                default_star = 6 if pool_name == "up_character_special" else 5
+                categories.append((up_item["name"], star_override or default_star, "角色"))
+                weights.append(prob)
             continue
 
         if pool_name == "up_bond":
-            if not upper_character:
-                continue
-            bond = _find_character_bond(upper_character, pools)
-            if bond:
-                star = star_override or 5
-                categories.append((bond, star, "羁绊"))
+            if up_bond:
+                categories.append((up_bond, star_override or 5, "羁绊"))
                 weights.append(prob)
             continue
 
         if pool_name == "non_up_bonds_five_star":
-            if not upper_character:
-                continue
-            up_bond = _find_character_bond(upper_character, pools)
-            # Collect all five-star bonds except the UP character's bond
-            all_bonds = []
-            for pool_key in ("three_color_five_star", "special_three_color_five_star"):
-                for item in pools[pool_key]["items"]:
-                    if "bond" in item and item["bond"] != up_bond:
-                        all_bonds.append(item["bond"])
-            if all_bonds:
-                weight = prob / len(all_bonds)
-                for bond in all_bonds:
-                    categories.append((bond, 5, "羁绊"))
-                    weights.append(weight)
+            bonds = pools.get("bonds_five_star_all", {}).get("items", ())
+            other_bonds = [
+                bond for bond in bonds
+                if not up_bond or (bond.get("id") or bond["name"]) != (up_bond_id or up_bond)
+            ]
+            if other_bonds:
+                for bond in other_bonds:
+                    categories.append((bond["name"], 5, "羁绊"))
+                    weights.append(prob / len(other_bonds))
             continue
 
         # ── Static pools ───────────────────────────────────────
@@ -245,7 +163,7 @@ def drawing_cards(pool_type: str, upper_character: str = None):
         if not pool or not pool.get("items"):
             continue
 
-        star = star_override or pool["star"]
+        star = star_override or (6 if pool_name == "special_five_star" else pool["star"])
         item_type = "羁绊" if pool["type"] == "bond" else "角色"
         weight = prob / len(pool["items"])
 
@@ -254,10 +172,14 @@ def drawing_cards(pool_type: str, upper_character: str = None):
             weights.append(weight)
 
     if not categories:
-        return ("未找到可抽取角色", 0, "错误")
+        return [("未找到可抽取角色", 0, "错误")]
 
-    result = random.choices(categories, weights=weights, k=1)[0]
-    return result
+    return random.choices(categories, weights=weights, k=count)
+
+
+def drawing_cards(pool_type: str, upper_character: str | None = None):
+    """Draw a single (name, star, type) result."""
+    return draw_cards(pool_type, upper_character)[0]
 
 
 # @draw.handle()
@@ -295,20 +217,10 @@ def format_result(result, count):
         color = {3: "蓝色", 4: "紫色", 5: "金色", 6: "红色"}.get(star, "白色")
         result_text += f"{i}. {star_str} {color} {item_type}【{name}】\n"
 
-    # 添加统计信息
-    stars = [r[1] for r in result]
-    gold_count = sum(s == 5 for s in stars)
-    purple_count = sum(s == 4 for s in stars)
-    red_count = sum(s == 6 for s in stars)
-    result_text += f"\n统计: 6★×{red_count} | 5★×{gold_count} | 4★×{purple_count} | 3★×{10 - gold_count - purple_count - red_count}"
-    if red_count != 0:
-        return MessageSegment.text(result_text), 6
-    elif gold_count != 0:
-        return MessageSegment.text(result_text), 5
-    elif purple_count != 0:
-        return MessageSegment.text(result_text), 4
-    else:
-        return MessageSegment.text(result_text), 3
+    stars = [star for _, star, _ in result if star in (3, 4, 5, 6)]
+    stats = " | ".join(f"{star}★×{stars.count(star)}" for star in (6, 5, 4, 3))
+    result_text += f"\n统计: {stats}"
+    return MessageSegment.text(result_text), max(stars, default=0)
 
 
 async def pulling_anime(matcher: Matcher, level: int, single: bool, interval: float = 0.75):

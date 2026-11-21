@@ -285,15 +285,129 @@ class GachaStarTests(unittest.IsolatedAsyncioTestCase):
     async def test_gacha_pull_sets_last_star(self):
         from tools import legacy_tools
 
-        with patch("plugins.pullingMonitor.drawing_cards",
-                   return_value=("测试角色", 5, "角色")), \
-             patch("plugins.pullingMonitor.format_result",
-                   return_value=("抽卡结果", 5)), \
+        with patch("plugins.pullingMonitor.draw_cards",
+                   return_value=[("测试角色", 5, "角色")]), \
              patch("tools.wiki_scraper.WikiScraper.is_stale",
                    return_value=False):
             text = await legacy_tools.gacha_pull("常规招募", 1, None)
         self.assertIn("抽卡结果", text)
         self.assertEqual(legacy_tools.last_gacha_star(), 5)
+
+
+    async def test_red_light_dark_in_all_eligible_banners(self):
+        from plugins import pullingMonitor as monitor
+        from tools import legacy_tools
+        from tools.wiki_scraper import WikiScraper
+
+        static = WikiScraper()._load_static_fallback()
+        with patch.object(monitor, "_load_gacha_data", return_value=static), \
+             patch.object(WikiScraper, "is_stale", return_value=False), \
+             patch("tools.name_resolver.get_resolver") as resolver, \
+             patch.object(monitor.random, "choices", side_effect=lambda rows, *, k, **_: [
+                 next(row for row in rows if row[0] == "蝶子")] * k):
+            resolver.return_value.resolve_character.return_value = "蝶子"
+            for banner, up in (("常规招募", None), ("神秘招募", "蝶子"), ("银河招募", None)):
+                for count in (1, 10):
+                    with self.subTest(banner=banner, count=count):
+                        text = await legacy_tools.gacha_pull(banner, count, up)
+                        self.assertIn("★★★★★★ 红色 角色【蝶子】", text)
+                        self.assertEqual(legacy_tools.last_gacha_star(), 6)
+                        if count == 10:
+                            self.assertIn("6★×10", text)
+            self.assertIn("[Gacha Error]", await legacy_tools.gacha_pull("几率up招募", 1, "蝶子"))
+            self.assertIn("[Gacha Error]", await legacy_tools.gacha_pull("神秘招募", 10))
+
+    def test_reload_old_names_and_use_bond_rarity(self):
+        import json
+
+        from plugins import pullingMonitor as monitor
+        from tools import wiki_scraper
+
+        def pool(star, kind, *items):
+            return {"star": star, "type": kind, "items": list(items)}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            scraper = wiki_scraper.WikiScraper()
+            scraper._cache_file = str(path / "gacha.json")
+            scraper._translation_cache = str(path / "name_mapping.json")
+            scraper._character_detail_cache = str(path / "characters.json")
+            scraper._bond_detail_cache = str(path / "bonds.json")
+            (path / "name_mapping.json").write_text(
+                json.dumps({"Tiffany": "蒂芙尼", "Art of Temptation": "诱惑的艺术"}),
+                encoding="utf-8")
+            roles = {"H610": {"id": "H610", "names": {"en": "Tiffany", "zh_hans": "蒂芬妮"}}}
+            artifacts = {
+                "A0389": {"id": "A0389", "star": 5, "names": {
+                    "en": "Art of Temptation", "zh_hans": "欲擒和故纵"}},
+                "A0036": {"id": "A0036", "star": 4, "names": {
+                    "en": "Passionate Treatment", "zh_hans": "激情的治疗"}},
+            }
+            with patch.object(wiki_scraper, "WikiScraper", return_value=scraper), \
+                 patch.object(wiki_scraper, "load_roles", return_value=roles), \
+                 patch.object(wiki_scraper, "load_artifacts", return_value=artifacts), \
+                 patch.object(monitor, "_gacha_data", None), \
+                 patch.object(monitor, "_gacha_stamp", None):
+                before = monitor._load_gacha_data()
+                (path / "gacha.json").write_text(json.dumps({"data": {"pools": {
+                    "special_three_color_five_star": pool(
+                        5, "character", {"name": "蒂芙尼", "bond": "诱惑的艺术"},
+                        {"name": "茉伊拉", "bond": "激情的治疗"}),
+                    "bonds_four_star": pool(4, "bond", {"name": "激情的治疗"}),
+                }}}), encoding="utf-8")
+                after = monitor._load_gacha_data()
+                self.assertIsNot(after, before)
+                self.assertIs(after, monitor._load_gacha_data())
+                self.assertEqual(after["pools"]["bonds_five_star_all"]["items"],
+                                 [{"id": "A0389", "name": "欲擒和故纵", "title": "Art of Temptation"}])
+                self.assertEqual(after["pools"]["bonds_four_star"]["items"][0]["name"], "激情的治疗")
+                with patch.object(monitor.random, "choices", side_effect=lambda rows, **_: [
+                    next(row for row in rows if row[0] == "欲擒和故纵")]) as pick:
+                    result = monitor.drawing_cards("几率up招募", "蒂芙尼")
+                rows = pick.call_args.args[0]
+                self.assertEqual(result, ("欲擒和故纵", 5, "羁绊"))
+                self.assertEqual(pick.call_args.kwargs["weights"][rows.index(result)], 1.05)
+
+    async def test_refresh_writes_resolved_names_and_preserves_cache_on_partial_fetch(self):
+        import json
+
+        from tools import wiki_scraper
+
+        role_source = "{{Member\n|ID=H610\n|Stars=5\n|Element=Nature\n|Bond=Passionate Treatment\n}}"
+        bond_source = "{{Bond\n|Stars=4\n|Image=Icon_Head_S_A0036.png\n}}"
+        roles = {"H610": {"names": {"en": "Tiffany", "zh_hans": "蒂芬妮"}}}
+        artifacts = {"A0036": {"star": 4, "names": {
+            "en": "Passionate Treatment", "zh_hans": "激情的治疗"}}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scraper = wiki_scraper.WikiScraper()
+            scraper._cache_dir = tmp
+            cache_file = Path(tmp) / "gacha.json"
+            scraper._cache_file = str(cache_file)
+            scraper._translation_cache = str(Path(tmp) / "translations.json")
+            scraper._character_detail_cache = str(Path(tmp) / "characters.json")
+            scraper._bond_detail_cache = str(Path(tmp) / "bonds.json")
+            with patch.object(scraper, "_fetch_template_pages", new_callable=AsyncMock) as fetch, \
+                 patch.object(wiki_scraper, "load_roles", return_value=roles), \
+                 patch.object(wiki_scraper, "load_artifacts", return_value=artifacts):
+                fetch.side_effect = [[("Tiffany", role_source)], [("Passionate Treatment", bond_source)]]
+                saved = await scraper.refresh()
+                data = json.loads(cache_file.read_text(encoding="utf-8"))["data"]
+                self.assertEqual(saved, data)
+                pools = data["pools"]
+                self.assertEqual(pools["special_three_color_five_star"]["items"][0]["name"], "蒂芬妮")
+                self.assertEqual(pools["bonds_four_star"]["items"][0]["id"], "A0036")
+                self.assertEqual(pools["bonds_five_star_all"]["items"], [])
+                fetch.side_effect = [[("Tiffany", role_source)], []]
+                self.assertEqual(await scraper.refresh(), data)
+                self.assertEqual(list(Path(tmp).iterdir()), [cache_file])
+
+    def test_errors_do_not_count_as_blue(self):
+        from plugins.pullingMonitor import format_result
+
+        text, highest = format_result([("未找到可抽取角色", 0, "错误")] * 10, 10)
+        self.assertIn("3★×0", str(text))
+        self.assertEqual(highest, 0)
 
 
 class GroupGachaAnimationTests(unittest.IsolatedAsyncioTestCase):

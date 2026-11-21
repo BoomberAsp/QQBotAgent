@@ -52,7 +52,7 @@ from nonebot.adapters.qq.exception import (
 )
 from nonebot.adapters.qq.message import Message
 
-from agent.inbound import Attachment, InboundMessage
+from agent.inbound import QQ_MEMBER_MENTION, Attachment, InboundMessage
 from agent.outbound import OutAudio, OutImage, OutKeyboard
 from lib.button_spec import clip_rows, to_text
 from lib.button_spec import validate as validate_buttons
@@ -519,31 +519,49 @@ def _quote_context(quoted: _Quoted) -> str:
     return f'[用户引用了消息: "{text}"]'
 
 
-def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
-    """QQ official event -> platform-agnostic view (attachments stay lazy).
+def _group_mentions(event: GroupMessageCreateEvent, self_id: str, text: str) -> tuple[bool, tuple[str, ...]]:
+    mentioned = isinstance(event, GroupAtMessageCreateEvent)
+    seen = {self_id}
+    names = []
+    for target in event.mentions or ():
+        is_self = getattr(target, "is_you", False)
+        mentioned = mentioned or is_self
+        ids = {getattr(target, "id", None), getattr(target, "member_openid", None)} - {None, ""}
+        if ids and not is_self and seen.isdisjoint(ids):
+            name = (getattr(target, "username", "") or "").strip()
+            names.append("" if name in ids else name)
+        seen.update(ids)
 
-    Group content excludes the @bot mention itself (it lives in
-    event.mentions / the GROUP_AT_MESSAGE_CREATE dispatch), so
-    event.content is already the clean user text on both scopes
-    (modulo inline face tags — see _clean_content).
-    """
+    # Some events only identify the target through an inline QQ protocol tag.
+    for tag in QQ_MEMBER_MENTION.finditer(text):
+        target_id = tag.group(1) or tag.group(2)
+        if target_id not in seen:
+            names.append("")
+            seen.add(target_id)
+    return mentioned, tuple(names)
+
+
+def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
+    """QQ official event -> platform-agnostic view (attachments stay lazy)."""
     is_group = isinstance(event, GroupMessageCreateEvent)
     author = event.author
     user_id = author.member_openid if is_group else author.user_openid
     quoted = _quoted_message(event)
-    mentioned = is_group and (
-        isinstance(event, GroupAtMessageCreateEvent)
-        or any(getattr(m, "is_you", False) for m in (getattr(event, "mentions", None) or []))
-    )
+    text = _clean_content(event.content)
+    mentioned, other_mentions = False, ()
+    if is_group:
+        mentioned, other_mentions = _group_mentions(event, str(bot.self_id), text)
+        text = QQ_MEMBER_MENTION.sub(" ", text).strip()
     return InboundMessage(
         user_id=str(user_id),
         is_group=is_group,
         group_id=str(event.group_openid) if is_group else "",
-        text=_clean_content(event.content),
+        text=text,
         message_id=str(event.id),
         self_id=str(bot.self_id),
         mentioned=not is_group or mentioned,
         explicit_mention=mentioned,
+        other_mentions=other_mentions,
         received_at=(event.timestamp.timestamp() if hasattr(getattr(event,"timestamp",None),"timestamp") else __import__("time").time()),
         actor_role=str(getattr(author, "member_role", "member")),
         author_is_bot=bool(getattr(author, "bot", False)),

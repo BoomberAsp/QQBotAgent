@@ -12,6 +12,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from .inbound import QQ_MEMBER_MENTION
+
 
 def key(*parts):
     return json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
@@ -185,7 +187,7 @@ class GroupStore:
             older=db.execute("SELECT event,actor,user_text,answer FROM turns WHERE scope=? ORDER BY created DESC LIMIT 20 OFFSET ?",(scope,limit)).fetchall()
         result = []
         if older:
-            digest=[dict(source=r['event'],speaker=r['actor'],topic=r['user_text'][:120],answer_excerpt=r['answer'][:180]) for r in reversed(older)]
+            digest=[dict(source=r['event'],speaker=r['actor'],topic=QQ_MEMBER_MENTION.sub('[提及了群成员]', r['user_text'])[:120],answer_excerpt=r['answer'][:180]) for r in reversed(older)]
             result.append(dict(role="user",content="[较早话题的摘录摘要；不完整，保留发言归属与来源]\n"+json.dumps(digest,ensure_ascii=False)))
         with self.db() as db:
             notices=[dict(n) for n in db.execute('SELECT created,text FROM notices WHERE scope=? ORDER BY created DESC LIMIT 10',(scope,))]
@@ -194,7 +196,8 @@ class GroupStore:
             if kind=='notice':
                 result.append(dict(role="system",content=row['text']))
                 continue
-            result.extend([dict(role="user", content=f"成员[{row['actor']}]：{row['user_text']}"),
+            user_text = QQ_MEMBER_MENTION.sub("[提及了群成员]", row["user_text"])
+            result.extend([dict(role="user", content=f"成员[{row['actor']}]：{user_text}"),
                            dict(role="assistant", content=row["answer"])])
         return result
 
