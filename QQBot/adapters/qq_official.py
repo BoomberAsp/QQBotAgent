@@ -94,7 +94,7 @@ _MD_CHUNK_LIMIT = 2000
 _MD_REJECT_CODES = frozenset({
     50037, 50041, 50054, 50055, 50056, 50057,
     304036,
-    40034006, 40034008, 40034009, 40034010, 40034011,
+    40034006, 40034008, 40034009, 40034010, 40034011, 40034011,
     40034124, 40034127,
     40054010,
 })
@@ -815,36 +815,53 @@ class QQOfficialSender:
         return max(0, self.max_messages_per_turn - self._sent) if self._is_group else 0
 
     async def send_group_reply_text(self, text: str, *, mention_user: str | None = None) -> str:
-        # Keep mention-like markup in the model's body inert.
-        text = re.sub(r"<(?=@|qqbot-at-user\b)", "<\u200b", text, flags=re.I)
-        return await self._send_group_reply(MessageSegment.text(text), mention_user)
+        # Only the adapter may generate a mention. Strip model-generated tags
+        # so a plain-text fallback never displays their internal IDs.
+        text = re.sub(r"<@!?[\w-]+>|<qqbot-at-(?:user|everyone)\b[^>]*>", "", text, flags=re.I).strip()
+        if not text:
+            return "failed"
+        plain = MessageSegment.text(text)
+        if not mention_user or not re.fullmatch(r"[A-Za-z0-9_-]+", mention_user) or not self.supports_markdown:
+            return await self._send_group_reply(plain)
+
+        # Group member mentions render only in markdown on the official API.
+        body = re.sub(r"([\\\x60*_~\[\]<>])", r"\\\1", text)
+        markdown = MessageSegment.markdown(f'<qqbot-at-user id="{mention_user}" /> {body}')
+        return await self._send_group_reply(markdown, fallback=plain)
 
     async def send_group_reply_image(self, img: OutImage, *, mention_user: str | None = None) -> str:
+        # A native image message cannot carry a clickable group-member mention.
         if not self.group_reply_slots:
             return "dropped"
         try:
             segment = MessageSegment.file_image(Path(img.path))
         except (TypeError, ValueError, OSError):
             return "failed"
-        return await self._send_group_reply(segment, mention_user)
+        return await self._send_group_reply(segment)
 
-    async def _send_group_reply(self, segment: MessageSegment, mention_user: str | None) -> str:
-        if not self.group_reply_slots:
-            return "dropped"
-        message = Message([MessageSegment.mention_user(mention_user), MessageSegment.text(" "), segment]
-                          if mention_user else [segment])
-        self._event._reply_seq += 1
-        try:
-            await self._bot.send_to_group(
-                group_openid=self._event.group_openid, message=message,
-                msg_id=self._event.id, msg_seq=self._event._reply_seq,
-            )
+    async def _send_group_reply(self, segment: MessageSegment, *, fallback: MessageSegment | None = None) -> str:
+        messages = (segment, fallback) if fallback is not None else (segment,)
+        for message in messages:
+            if not self.group_reply_slots:
+                return "dropped"
+            self._event._reply_seq += 1
+            try:
+                await self._bot.send_to_group(
+                    group_openid=self._event.group_openid, message=message,
+                    msg_id=self._event.id, msg_seq=self._event._reply_seq,
+                )
+            except ActionFailed as exc:
+                if message.type == "markdown" and exc.code in _MD_REJECT_CODES:
+                    _md_record_reject()
+                    continue
+                return "failed"
+            except Exception:
+                return "uncertain"
             self._sent += 1
+            if message.type == "markdown":
+                _md_record_success()
             return "sent"
-        except ActionFailed:
-            return "failed"
-        except Exception:
-            return "uncertain"
+        return "failed"
 
     async def send_group_text(self, text: str) -> str:
         """Acknowledged group-only reply; never retry an uncertain delivery."""
