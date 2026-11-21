@@ -7,7 +7,14 @@ from html.parser import HTMLParser
 from urllib.parse import urlsplit,urljoin
 import aiohttp
 
-class MediaError(ValueError):pass
+class MediaError(ValueError):
+    pass
+
+
+class MediaHTTPError(MediaError):
+    def __init__(self, status):
+        super().__init__("来源返回错误或限流")
+        self.status = status
 
 def validate_url(url,hosts):
     if len(url)>2048:raise MediaError('URL过长')
@@ -15,6 +22,12 @@ def validate_url(url,hosts):
     if p.scheme!='https' or not p.hostname or p.username or p.password or p.port not in (None,443):raise MediaError('仅支持无凭据的HTTPS默认端口')
     host=p.hostname.encode('idna').decode().lower().rstrip('.')
     if host not in hosts:raise MediaError('来源域未批准')
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None and not ip.is_global:
+        raise MediaError('禁止访问非公网地址')
     return host
 
 class PublicResolver(aiohttp.abc.AbstractResolver):
@@ -36,10 +49,6 @@ async def download(url,hosts,max_bytes=8*1024*1024,before_request=None):
             for hop in range(4):
                 host=validate_url(url,hosts)
                 if before_request is not None:await before_request(url)
-                # IP literal bypasses aiohttp resolver; reject it here too.
-                try:ip=ipaddress.ip_address(host)
-                except ValueError:ip=None
-                if ip is not None and not ip.is_global:raise MediaError('禁止访问非公网地址')
                 now=time.monotonic()
                 if _paused.get(host,0)>now:raise MediaError('来源处于限流退避期')
                 due=max(now,_next_request.get(host,now));_next_request[host]=due+0.5
@@ -49,7 +58,7 @@ async def download(url,hosts,max_bytes=8*1024*1024,before_request=None):
                         if hop==3:raise MediaError('重定向过多')
                         url=urljoin(url,resp.headers.get('Location',''));continue
                     if resp.status in (429,567):_paused[host]=time.monotonic()+60
-                    if resp.status!=200:raise MediaError('来源返回错误或限流')
+                    if resp.status != 200:raise MediaHTTPError(resp.status)
                     if resp.headers.get('Content-Encoding','identity')!='identity':raise MediaError('不接受压缩传输')
                     if resp.content_length and resp.content_length>max_bytes:raise MediaError('响应超限')
                     data=bytearray()
@@ -59,8 +68,42 @@ async def download(url,hosts,max_bytes=8*1024*1024,before_request=None):
                     return bytes(data),resp.headers.get('Content-Type','').split(';')[0],url
     raise MediaError('下载失败')
 
+async def read_source_page(url, page_hosts):
+    """Get an approved public page, checking robots for each redirect origin."""
+    from urllib.parse import urlunsplit
+    from urllib.robotparser import RobotFileParser
+
+    validate_url(url, page_hosts)
+    policies = {}
+
+    async def robots_check(target):
+        parsed = urlsplit(target)
+        robots = urlunsplit((parsed.scheme, parsed.netloc, "/robots.txt", "", ""))
+        if robots not in policies:
+            robot = RobotFileParser()
+            try:
+                rules, _, _ = await download(robots, page_hosts, 256 * 1024)
+            except MediaHTTPError as error:
+                if error.status not in (404, 410):
+                    raise
+                robot.parse([])
+            else:
+                robot.parse(rules.decode("utf-8", errors="replace").splitlines())
+            policies[robots] = robot
+        if not policies[robots].can_fetch("QQBotAgent-Media", target):
+            raise MediaError("robots denied")
+
+    await robots_check(url)
+    return await download(url, page_hosts, 1024 * 1024, before_request=robots_check)
+
+
 class Candidates(HTMLParser):
-    def __init__(self,base):super().__init__();self.base=base;self.urls=[]
+    def __init__(self, base, allow_url=None):
+        super().__init__()
+        self.base = base
+        self.allow_url = allow_url
+        self.urls = []
+        self.descriptions = {}
     def handle_starttag(self,tag,attrs):
         a=dict(attrs);values=[]
         if tag=='meta' and a.get('property')=='og:image':values.append(a.get('content',''))
@@ -69,7 +112,10 @@ class Candidates(HTMLParser):
             values.extend(x.strip().split(' ')[0] for x in a.get('srcset','').split(',') if x.strip())
         for value in values:
             url=urljoin(self.base,value)
-            if value and url not in self.urls and len(self.urls)<6:self.urls.append(url)
+            if value and url not in self.urls and len(self.urls) < 6:
+                if self.allow_url is None or self.allow_url(url):
+                    self.urls.append(url)
+                    self.descriptions[url] = (a.get("alt") or a.get("title") or "")[:300]
 
 _next_request={}
 _paused={}

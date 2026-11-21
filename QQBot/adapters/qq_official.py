@@ -434,6 +434,7 @@ class _Quoted:
     text: str = ""
     attachments: list = field(default_factory=list)
     author_name: str = ""
+    author_id: str = ""
 
 
 def _scene_ext(event: QQMessageEvent) -> dict[str, str]:
@@ -490,10 +491,17 @@ def _quoted_message(event: QQMessageEvent) -> _Quoted:
                 attachments.append(att)
 
     author = getattr(target, "author", None)
+    # Attribute a quote only when all exposed media belongs to its selected message.
+    target_urls = {getattr(att, "url", "") for att in (getattr(target, "attachments", None) or [])}
+    author_id = ""
+    if attachments and seen <= target_urls:
+        author_id = str(getattr(author, "member_openid", "") or getattr(author, "user_openid", "") or
+                        getattr(author, "id", "") or "")
     return _Quoted(
         text=_clean_content(getattr(target, "content", "") or ""),
         attachments=attachments,
         author_name=(getattr(author, "username", "") or "").strip(),
+        author_id=author_id,
     )
 
 
@@ -537,6 +545,8 @@ def build_view(bot: QQBot, event: QQMessageEvent) -> InboundMessage:
         author_is_bot=bool(getattr(author, "bot", False)),
         reply_to_bot=bool(is_group and getattr(getattr(getattr(event, "reply", None), "author", None), "id", None) == str(bot.self_id)),
         reply_context=_quote_context(quoted),
+        reply_author_id=quoted.author_id,
+        has_image_quote=any(_classify_attachment(att, att.url or "")[0] == "image" for att in quoted.attachments),
         attachment_kinds=tuple(_classify_attachment(att,att.url or "")[0]
             for att in [*(event.attachments or []),*(quoted.attachments if quoted else [])]),
         resolver=QQOfficialAttachmentResolver(event, quoted),

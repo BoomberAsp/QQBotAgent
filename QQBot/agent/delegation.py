@@ -32,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 # recall_asset: 找回影音记忆（P5，§8.2）——检索 asset_memory 文本卡并重发
 #   二进制（或让角色凭文本描述已淡去的原件）。同为角色面专属。
 SOCIAL_TOOLS: frozenset = frozenset(
-    {"delegate_task", "give_gift", "create_image", "send_voice", "recall_asset", "send_sticker", "fetch_image", "discover_images"}
+    {"delegate_task", "give_gift", "create_image", "send_voice", "recall_asset", "send_sticker", "search_images", "fetch_image", "discover_images"}
 )
 
 DEFAULT_TASK_TIMEOUT = 240.0
@@ -176,6 +176,10 @@ async def revoice_task_result(
     """
     from lib.plane_policy import strip_worker_identity
     response = strip_worker_identity(response, user_request)
+    if response.startswith(_LLM_ERROR_PREFIXES + (
+        "[Error]", "[Permission]", "当前输入、工具或必要上下文过长", "工具历史缺少对应调用",
+    )):
+        return response
     opening: Optional[str] = None
     if use_llm and client is not None and persona_content:
         try:

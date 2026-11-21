@@ -138,6 +138,23 @@ async def _start_config_watcher():
     asyncio.create_task(_watch())
 
 
+_sticker_subscription_task = None
+
+
+@get_driver().on_startup
+async def _start_sticker_subscriptions():
+    global _sticker_subscription_task
+    from agent.sticker_subscriptions import watch
+    _sticker_subscription_task = asyncio.create_task(watch())
+
+
+@get_driver().on_shutdown
+async def _stop_sticker_subscriptions():
+    if _sticker_subscription_task is not None:
+        _sticker_subscription_task.cancel()
+        await asyncio.gather(_sticker_subscription_task, return_exceptions=True)
+
+
 @get_driver().on_startup
 async def _start_changelog_tasks():
     """更新日志后台任务。

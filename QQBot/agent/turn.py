@@ -2491,13 +2491,19 @@ async def run_agent_turn(view: InboundMessage):
     from .group_runtime import manage_identity
     if await manage_identity(view, _turn_sender.get() or default_sender):
         return
+    from .image_context import coalesce_private_images
+    scope = _view_scope(view)
+    if view.user_id not in _user_busy:
+        view = await coalesce_private_images(view, scope)
+        if view is None:
+            return
     # Platform identity (stage 4, §7.7): PermissionManager.get_role() picks
     # the openid tables for qq_official, the QQ-number tables for onebot.
     from agent.context import _current_evidence_id
     _current_evidence_id.set(json.dumps([view.platform, view.self_id, view.group_id, view.user_id, view.message_id], ensure_ascii=False) if view.message_id else "")
     _current_platform.set(view.platform)
     from agent.cognitive_state import current_scope
-    current_scope.set(_view_scope(view))
+    current_scope.set(scope)
     # Defensive per-turn reset: a keyboard reservation is strictly
     # turn-scoped (tools set it, _send_response consumes it once).
     _turn_keyboard.set(None)
@@ -2836,7 +2842,20 @@ async def handle_agent_turn(view: InboundMessage):
     # supports_vision 时随 user message 以 image_url parts 直传模型。
     # 占位文本行照旧保留（工具/后续轮次的 read_file 懒分析回退仍靠它）。
     vision_image_paths: list = []
+    from . import image_context
     attachments = await view.load_attachments()
+    image_key = (view.platform, view.self_id, user_id, image_scope)
+    referring, ordinal = image_context.reference(text_content)
+    if not image_context.images_only(attachments) and (referring or view.reply_message_id):
+        recalled = image_context.recall(image_key, view.reply_message_id)
+        if image_context.local_images(recalled, _current_user_workspace.get()):
+            attachments = [*attachments, *recalled]
+    image_context.remember(image_key, msg_id, attachments, _current_user_workspace.get())
+    if ordinal is not None:
+        attachments = image_context.select(attachments, ordinal)
+        if not attachments:
+            await _safe_send("我没对上你说的第几张，引用一下那张图？")
+            return
     active_special = _special_sessions.get_active(user_id)
     active_metadata = (active_special.metadata or {}) if active_special else {}
     active_kind = active_metadata.get("kind")
@@ -2863,7 +2882,7 @@ async def handle_agent_turn(view: InboundMessage):
                 vision_image_paths.append(att.path)
                 _record_file(msg_id, att.name, att.path)
                 _record_session_file(user_id, att.path)
-                if _upload_persona:
+                if _upload_persona and not att.quoted:
                     _spawn_textualize_upload(
                         user_id, _upload_persona, "image", att.path)
             elif att.error:
@@ -2964,6 +2983,12 @@ async def handle_agent_turn(view: InboundMessage):
     else:
         augmented_message = text_content
 
+    bare_image_turn = bool(vision_image_paths and not text_content)
+    if bare_image_turn:
+        augmented_message += (
+            "\n[回复风格] 像私聊一样回应一个看得见的细节，通常一两句。"
+            "暂时没有具体问题时可以只接话；无需逐项描述整张图。"
+        )
     if image_search.question:
         augmented_message += "\n[系统提示] 回复后会附上找图确认问题，请自然回应即可。"
 
@@ -3010,14 +3035,14 @@ async def handle_agent_turn(view: InboundMessage):
         _pm_think = get_character_registry()
         thinking_text = f"{_pm_think.get_short_name(persona_key)} 正在思考..."
         _sdr = _turn_sender.get() or default_sender
-        if (not view.is_group and _current_render_context.get()
+        if (not bare_image_turn and not view.is_group and _current_render_context.get()
                 and getattr(_sdr, "supports_stream", False)):
             _stream_attempted = True
             try:
                 streamer = await _sdr.open_stream(thinking_text)
             except Exception:
                 streamer = None
-        if streamer is None:
+        if streamer is None and not bare_image_turn:
             # Legacy path (non-critical, ignore send failures).
             # immediate=True: on the official route this is the one
             # progress line worth spending passive-reply quota on — it
@@ -3064,14 +3089,23 @@ async def handle_agent_turn(view: InboundMessage):
         # Creation interviews skip triage entirely: neutral assistant persona,
         # flash model, only create_character exposed (Bond-System-Design.md §5.1).
         # Scene sessions skip triage too: full-RP as the character on flash.
+        from lib.game_intent import GAMEPLAY_TOOLS, game_intent, game_reply_rule
+        from lib.story_router import make_scope
+        story_scope = make_scope(
+            persona_key, "private:" + _current_platform.get() + ":" + str(user_id)
+        ) if not (is_creation or is_scene) else None
+        game_question = (
+            (game_intent(text_content, in_character=persona_key not in {"assistant", "nous"}) or "undecided")
+            if story_scope else ""
+        )
         is_special = augmented_message in ["/clear", "清除上下文", "新对话", "/status"]
         plane = "task"
-        if is_creation or is_scene:
+        if is_creation or is_scene or game_question == "story":
             client = _model_router.flash_client
         elif not is_special:
             if persona_mode == "split":
                 _cls = await _model_router.classify(augmented_message, persona_key=persona_key, persona_name=pm.get_display_name(persona_key), persona_aliases=(pm.get_short_name(persona_key),))
-                plane = _cls.get("plane", "task")
+                plane = "task" if game_question in {"gameplay", "mixed"} else _cls.get("plane", "task")
                 complexity = _cls.get("complexity", "complex")
             else:
                 complexity = await _model_router.classify_complexity(augmented_message)
@@ -3176,9 +3210,8 @@ async def handle_agent_turn(view: InboundMessage):
         # Personas not on the list get neither the L4 injection nor the
         # story_search tool, so UGC characters never recite the game's canon.
         _story_persona_ok = _story_persona_allowed(persona_key)
-        from lib.story_router import current_story_scope, make_scope
-        current_story_scope.set(None if (is_creation or is_scene) else make_scope(
-            persona_key, "private:" + _current_platform.get() + ":" + str(user_id)))
+        from lib.story_router import current_story_scope
+        current_story_scope.set(story_scope)
         if is_creation:
             # UGC creation interview: neutral assistant persona (globally-shared
             # cache prefix), only the create_character tool exposed, no bond.
@@ -3207,14 +3240,22 @@ async def handle_agent_turn(view: InboundMessage):
             _current_personality.set(
                 "assistant" if persona_mode == "split" else persona_key
             )
-        if _hsr_native:
+        native_story = _hsr_native or game_question == "story"
+        if native_story or game_question == "mixed":
             _current_personality.set(persona_key)
             allowed_tools = set(allowed_tools) | {"story_search"}
+        if game_question == "story":
+            allowed_tools.difference_update(GAMEPLAY_TOOLS | {"delegate_task"})
+        elif game_question == "gameplay":
+            allowed_tools.discard("story_search")
         image_search_authorized = image_search.authorized and can_search_image and not (is_creation or is_scene)
         if image_search_authorized:
             allowed_tools = {image_source_tools.TOOL_NAME}
             augmented_message += "\n[系统提示] " + image_source_tools.SEARCH_HINT
-        _current_task_persona.set(persona_key if persona_mode == "split" and not character_plane and not is_creation and not is_scene and not _hsr_native else "")
+        _current_task_persona.set(
+            persona_key if persona_mode == "split" and not character_plane
+            and not is_creation and not is_scene and not native_story and game_question != "mixed" else ""
+        )
         # story_search only for allowlisted personas (schema filtering; the
         # executor additionally refuses tools outside allowed_tools).
         if not _story_persona_ok:
@@ -3229,11 +3270,11 @@ async def handle_agent_turn(view: InboundMessage):
         # rubi/assistant) the block goes in first-person; the task plane runs as
         # neutral Roxy and reaches the KB through story_search instead.
         _story_block, _story_char = "", ""
-        if _story_persona_ok and not is_creation and not is_scene:
-            if character_plane or persona_mode != "split" or _hsr_native:
+        if _story_persona_ok and game_question != "gameplay" and not is_creation and not is_scene:
+            if character_plane or persona_mode != "split" or native_story or game_question == "mixed":
                 _story_block, _story_char = await asyncio.to_thread(
                     _build_story_context, persona_key, text_content or augmented_message, pm)
-        _current_story_context.set(_story_block)
+        _current_story_context.set("\n\n".join(filter(None, (game_reply_rule(game_question), _story_block))))
         _current_story_char_id.set(_story_char)
 
         # Idea 3 — suggest upgrading a long temporary session to a special session.
@@ -3292,11 +3333,12 @@ async def handle_agent_turn(view: InboundMessage):
         # The social plane already speaks in character; unified personas are
         # never re-voiced. Creation interviews stay neutral (no revoice).
         revoice = (persona_mode == "split" and not character_plane
-                   and not is_creation and not is_scene and not _hsr_native)
+                   and not is_creation and not is_scene and not _hsr_native
+                   and not native_story and game_question != "mixed")
         if revoice:
             # Restore the character for delivery, including tool-owned replies.
             _current_personality.set(persona_key)
-        if revoice and image_search.query is None:
+        if not _hsr_native and revoice and image_search.query is None:
             _use_llm_voice = (
                 not group_id and pm.get_task_voice(persona_key) == "character"
             )
@@ -7296,7 +7338,18 @@ except ValueError:
 from .group_resources import group_media as _group_media
 _tool_registry.register("group_media",_group_media,"群已发布图片/表情包：空ID列出可用资源，指定ID排队发送。",{"type":"object","properties":{"asset_id":{"type":"string"}}})
 
-from .media_tools import send_sticker,fetch_image,discover_images
-_tool_registry.register("send_sticker",send_sticker,"发送当前人格已批准表情包。空参数列目录；显式ID不替换；mood按情绪选择。只有用户明确要求重发才设置repeat。",{"type":"object","properties":{"sticker_id":{"type":"string"},"mood":{"type":"string"},"repeat":{"type":"boolean"}}})
+from .media_tools import discover_images, fetch_image, search_images, send_sticker
+_tool_registry.register(
+    "search_images", search_images,
+    "按关键词搜索互联网图片，返回白名单内的图片候选和来源链接。可直接向用户分享来源。"
+    "用户要求实际发图时，选择候选ID后用fetch_image检查审核并尝试发送。",
+    {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+     "required": ["query"]},
+)
+_tool_registry.register("send_sticker", send_sticker,
+    "发送当前人格已批准表情包。use可指定安慰、庆祝、吐槽运气、问候、感谢、惊讶、无语、认输或接梗。"
+    "空参数列目录；显式ID不替换；只有用户明确要求重发才设置repeat。",
+    {"type":"object","properties":{"sticker_id":{"type":"string"},"mood":{"type":"string"},
+                                   "use":{"type":"string"},"repeat":{"type":"boolean"}}})
 _tool_registry.register("fetch_image",fetch_image,"抓取已批准域的HTTPS图片直链或当前会话候选ID。新图需审核，不可声称排队图片已发送。",{"type":"object","properties":{"url":{"type":"string"},"candidate_id":{"type":"string"}}})
 _tool_registry.register("discover_images",discover_images,"从已批准的静态网页发现至多6张候选，不自动发送。让用户选择候选后再fetch_image。",{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})

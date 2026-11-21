@@ -238,29 +238,19 @@ def build_reply_context(event: MessageEvent) -> str:
 
     return ""
 
-def quoted_file_paths(event: MessageEvent) -> list[str]:
-    """Local paths of the files carried by the message this event quotes.
+def reply_message_id(event: MessageEvent) -> str:
+    for segment in event.message:
+        if segment.type == "reply" and segment.data.get("id"):
+            return str(segment.data["id"])
+    reply = getattr(event, "reply", None)
+    if isinstance(reply, dict):
+        return str(reply.get("message_id") or reply.get("id") or "")
+    return str(getattr(reply, "message_id", "") or getattr(reply, "id", "") or "")
 
-    OneBot never inlines quoted content into the reply segment (it only
-    carries the quoted message id), so quoted attachments are resolved
-    through turn.py's recent-file registry — populated whenever this bot
-    downloaded that file. Used by /设形象 to accept "引用一张图 + 发命令".
-    """
-    reply_id = ""
-    for seg in event.message:
-        if seg.type == "reply":
-            reply_id = str(seg.data.get("id", ""))
-            break
-    if not reply_id:
-        reply = getattr(event, "reply", None)
-        if isinstance(reply, dict):
-            reply_id = str(reply.get("message_id") or reply.get("id") or "")
-        elif reply is not None:
-            reply_id = str(
-                getattr(reply, "message_id", "") or getattr(reply, "id", "") or "")
-    if not reply_id:
-        return []
-    return [f["path"] for f in _recent_files.get(reply_id, []) if f.get("path")]
+
+def quoted_file_paths(event: MessageEvent) -> list[str]:
+    """Read cached paths for existing image commands."""
+    return [f["path"] for f in _recent_files.get(reply_message_id(event), []) if f.get("path")]
 
 
 # ── View construction ──────────────────────────────────────────────
@@ -320,12 +310,30 @@ class OneBotAttachmentResolver:
                     self._bot, seg.data, message_id)
                 out.append(Attachment(kind="voice", path=saved_path or "",
                                       name="语音消息", error=error or ""))
+        reply = getattr(self._event, "reply", None)
+        quoted_segments = getattr(reply, "message", None) or ()
+        quoted_id = str(getattr(reply, "message_id", "") or getattr(reply, "id", "") or "")
+        if quoted_id and quoted_id == view.reply_message_id:
+            for seg in quoted_segments:
+                if getattr(seg, "type", None) not in {"image", "mface"}:
+                    continue
+                file_id = seg.data.get("file", "")
+                saved_path, error = await _download_and_save_file(
+                    seg.data.get("url", ""), f"image-{file_id}", bot=self._bot, file_id=file_id)
+                out.append(Attachment(kind="image", path=saved_path or "", name=f"image-{file_id}",
+                                      error=error or "", quoted=True))
         return out
 
 
 def build_view(bot: Bot, event: MessageEvent) -> InboundMessage:
     """OneBot event -> platform-agnostic view (attachments stay lazy)."""
     is_group = isinstance(event, GroupMessageEvent)
+    reply = getattr(event, "reply", None)
+    reply_id = reply_message_id(event)
+    author = ""
+    if reply_id and str(getattr(reply, "message_id", "") or "") == reply_id:
+        author = str(getattr(getattr(reply, "sender", None), "user_id", "") or "")
+    media_segments = [seg.type for seg in event.message if seg.type not in {"at", "text", "reply"}]
     return InboundMessage(
         user_id=str(event.user_id),
         is_group=is_group,
@@ -335,6 +343,9 @@ def build_view(bot: Bot, event: MessageEvent) -> InboundMessage:
         self_id=str(event.self_id),
         mentioned=_is_mentioned(event),
         reply_context="" if is_group else build_reply_context(event),
+        reply_message_id=reply_id,
+        reply_author_id=author,
+        is_sticker=not reply_id and media_segments == ["mface"],
         actor_role=str(getattr(getattr(event, "sender", None), "role", "member")),
         reply_to_bot=bool(event.is_tome()) if is_group else False,
         attachment_kinds=tuple({'record':'voice','mface':'image'}.get(seg.type,seg.type)

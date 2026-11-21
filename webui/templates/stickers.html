@@ -19,8 +19,8 @@ if(reviewButton)reviewButton.onclick=async()=>{const list=document.getElementByI
 </script>
 
 
-<div class="card"><h3>图片来源与主动贴图策略</h3><p>精确域名，一行一个。网页域需同时列入图片域；CDN域需单独批准。空列表禁用网络抓图。</p>
-<label>图片及网页下载域<textarea id="image-hosts" rows="3"></textarea></label><label>允许发现候选的网页域<textarea id="page-hosts" rows="3"></textarea></label>
+<div class="card"><h3>图片来源与主动贴图策略</h3><p>每行填写一个精确域名。来源网页填在网页域，图片直链和 CDN 填在图片域。白名单允许检索或抓取，实际发图还需审核。</p>
+<label>图片直链和 CDN 域<textarea id="image-hosts" rows="3"></textarea></label><label>允许作为来源的网页域<textarea id="page-hosts" rows="3"></textarea></label>
 <label><input type="checkbox" id="proactive-stickers">启用官方私聊每日主动贴图（复用现有调度、概率及配额）</label>
 <label>安静时段（服务器时间）<input id="proactive-quiet" value="22:00-08:00"></label><button class="btn" id="save-media-policy">保存策略</button><pre id="policy-status" role="status"></pre></div>
 <div class="card"><h3>最近媒体投递</h3><button class="btn" id="load-deliveries">刷新记录</button><pre id="deliveries" style="max-height:350px;overflow:auto"></pre></div>
@@ -30,4 +30,30 @@ document.getElementById('save-media-policy').onclick=async()=>{const status=docu
 document.getElementById('load-deliveries').onclick=async()=>{const r=await fetch('/api/resources/deliveries');document.getElementById('deliveries').textContent=r.ok?JSON.stringify(await r.json(),null,2):'加载失败';};
 </script>
 
+<div class="card">
+  <h3>表情包投稿与订阅候选</h3>
+  <p>群友可用 /收表情 投稿。群管理员和成员都开启自动投稿后，平台标记的表情包也会进入候选。群投稿审核后仅在原群使用。</p>
+  <button class="btn" id="intake-refresh" type="button">刷新候选</button>
+  <div id="intake-candidates"></div>
+  <label><input id="intake-confirmed" type="checkbox">已核对选中表情包的内容、复用许可和使用范围</label>
+  <button class="btn btn-primary" type="button" id="intake-approve">批准选中项</button>
+  <button class="btn" type="button" id="intake-reject">拒绝选中项</button>
+  <p id="intake-status" role="status"></p>
+</div>
+<div class="card">
+  <h3>互联网图集订阅</h3>
+  <p>支持白名单内的静态网页和 JSON 图集。机器人每 6 小时检查一次，每次最多采集 6 张到审核队列。</p>
+  <form id="intake-source-form">
+    <label>人格 ID <input name="persona" list="persona-list" required maxlength="80" placeholder="rubi"></label>
+    <label>来源页 <input name="url" type="url" required maxlength="2048" placeholder="https://"></label>
+    <label>图片地址前缀 <input name="image_prefix" type="url" maxlength="350" placeholder="可选，用来跳过站点图标"></label>
+    <label>作者 <input name="author" maxlength="120"></label>
+    <label>复用许可 <input name="license" maxlength="160"></label>
+    <label>用途 <input name="uses" maxlength="120" placeholder="安慰,庆祝"></label>
+    <button class="btn btn-primary" type="submit">保存订阅</button>
+  </form>
+  <div id="intake-sources"></div>
+  <p id="intake-source-status" role="status"></p>
+</div>
+<script src="/static/sticker_intake.js" defer></script>
 {% endblock %}

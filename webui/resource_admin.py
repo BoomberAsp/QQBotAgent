@@ -1,32 +1,20 @@
 """Admin resource registry operations; SQL executes read-only against approved sources."""
-import fcntl
 import io
 import json
 import os
 import re
 import sqlite3
 import uuid
-from contextlib import contextmanager
 from pathlib import Path
 from PIL import Image
 from . import config
 
 
 def registry_path():
-    return Path(config.bot_env('PERSONA_RESOURCE_REGISTRY',str(config.QQBOT_DIR/'data/persona_resources/registry.json'))).resolve()
+    from agent.group_resources import registry_path as bot_registry_path
+    return bot_registry_path()
 
-@contextmanager
-def edit_registry():
-    p=registry_path();p.parent.mkdir(parents=True,exist_ok=True)
-    with open(str(p)+'.lock','a') as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX)
-        data=json.loads(p.read_text()) if p.exists() else dict(personas={},knowledge_bases={},media=[])
-        yield data,p.parent
-        tmp=p.with_name(p.name+'.'+uuid.uuid4().hex+'.tmp')
-        try:
-            tmp.write_text(json.dumps(data,ensure_ascii=False,indent=2));os.replace(tmp,p)
-        finally:
-            tmp.unlink(missing_ok=True)
+from agent.group_resources import edit_registry
 
 
 def state():
@@ -139,7 +127,6 @@ def media_policy(payload):
     hosts=payload.get('image_hosts',[]);pages=payload.get('page_hosts',[])
     if not isinstance(hosts,list) or not isinstance(pages,list) or len(hosts)>100 or len(pages)>100:raise ValueError('域名列表无效')
     if any(not isinstance(h,str) or not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?',h) for h in hosts+pages):raise ValueError('请使用小写精确域名，不含协议、路径或通配符')
-    if set(pages)-set(hosts):raise ValueError('网页域也必须列入image_hosts')
     quiet=payload.get('proactive_quiet','22:00-08:00')
     if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d',quiet):raise ValueError('安静时段格式错误')
     if type(payload.get('proactive_private_stickers',False)) is not bool:raise ValueError('主动贴图开关必须为布尔值')

@@ -12,6 +12,8 @@ LIMITS = {
  'media_scope': ('同一会话图片 / 滚动窗口',2,0,10000),
  'media_window': ('会话图片窗口（秒）',300,1,86400),
  'recent_assets': ('同会话、同人格近期去重条数',8,0,100),
+ 'sticker_recent_seconds': ('表情包优先避开近期重复（秒）',86400,60,604800),
+ 'sticker_repeat_seconds': ('同一表情包最短重用间隔（秒）',1800,60,86400),
  'attempt_scope': ('单会话抓图尝试 / 滚动24小时',30,0,100000),
  'attempt_global': ('全局抓图尝试 / 滚动24小时',1000,0,1000000),
 }
@@ -41,6 +43,21 @@ def set_policy(patch,revision):
 def recent_assets(conn,scope,persona,limit):
  return {row[0] for row in conn.execute("SELECT asset FROM tickets WHERE scope=? AND persona=? AND status IN ('queued','sent','uncertain') ORDER BY created DESC LIMIT ?",(scope,persona,limit))}
 
+def sticker_history(conn, scope, persona, now=None):
+    now = time.time() if now is None else now
+    limits = policy(conn)["values"]
+    oldest = now - max(limits["sticker_recent_seconds"], limits["sticker_repeat_seconds"])
+    rows = conn.execute(
+        """SELECT asset, MAX(created) FROM tickets
+           WHERE scope=? AND persona=? AND created>? AND asset NOT LIKE 'image:%'
+             AND status IN ('queued','sent','uncertain') GROUP BY asset ORDER BY MAX(created) DESC""",
+        (scope, persona, oldest),
+    ).fetchall()
+    short = {asset for asset, created in rows if created > now - limits["sticker_repeat_seconds"]}
+    recent = [asset for asset, created in rows if created > now - limits["sticker_recent_seconds"]]
+    return dict(rows), short, set(recent[:limits["recent_assets"]])
+
+
 def root():
  p=Path(os.environ.get('MEDIA_DATA_ROOT',str(Path(__file__).resolve().parent.parent/'data/media_runtime')));p.mkdir(parents=True,exist_ok=True);return p
 @contextmanager
@@ -49,6 +66,7 @@ def db():
  try:
   c.execute('CREATE TABLE IF NOT EXISTS limits(id INTEGER PRIMARY KEY,revision INTEGER,settings TEXT)')
   c.execute('CREATE TABLE IF NOT EXISTS tickets(id TEXT PRIMARY KEY,scope TEXT,actor TEXT,persona TEXT,event TEXT,asset TEXT,status TEXT,created REAL)')
+  c.execute('CREATE INDEX IF NOT EXISTS ticket_sticker_recency ON tickets(scope,persona,created)')
   c.execute('CREATE TABLE IF NOT EXISTS attempts(scope TEXT,created REAL)')
   c.execute('CREATE TABLE IF NOT EXISTS candidates(id TEXT PRIMARY KEY,scope TEXT,url TEXT,expires REAL)')
   c.execute('CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY,path TEXT,hash TEXT,expires REAL,policy TEXT)')
@@ -64,19 +82,32 @@ def attempt(scope):
   if c.execute('SELECT count(*) FROM attempts').fetchone()[0]>=limits['attempt_global']:return False
   c.execute('INSERT INTO attempts VALUES (?,?)',(scope,now));return True
 
-def reserve(scope,actor,persona,event,asset,repeat=False):
- now=time.time();ticket=secrets.token_hex(12)
- with db() as c:
-  c.execute('BEGIN IMMEDIATE')
-  c.execute("UPDATE tickets SET status='uncertain' WHERE status='queued' AND created<?",(now-600,))
-  active="status IN ('queued','sent','uncertain')"
-  limits=policy(c)['values']
-  if c.execute(f'SELECT count(*) FROM tickets WHERE scope=? AND event=? AND {active}',(scope,event)).fetchone()[0]>=limits['media_event']:return ''
-  if c.execute(f'SELECT count(*) FROM tickets WHERE actor=? AND created>? AND {active}',(actor,now-86400)).fetchone()[0]>=limits['media_actor']:return ''
-  if c.execute(f'SELECT count(*) FROM tickets WHERE scope=? AND created>? AND {active}',(scope,now-limits['media_window'])).fetchone()[0]>=limits['media_scope']:return ''
-  if not repeat and asset in recent_assets(c,scope,persona,limits['recent_assets']):return ''
-  c.execute('INSERT INTO tickets VALUES (?,?,?,?,?,?,?,?)',(ticket,scope,actor,persona,event,asset,'queued',now))
- return ticket
+def reserve(scope, actor, persona, event, asset, repeat=False):
+    now = time.time()
+    ticket = secrets.token_hex(12)
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE tickets SET status='uncertain' WHERE status='queued' AND created<?", (now - 600,))
+        active = "status IN ('queued','sent','uncertain')"
+        limits = policy(conn)["values"]
+        if conn.execute(f"SELECT COUNT(*) FROM tickets WHERE scope=? AND event=? AND {active}",
+                        (scope, event)).fetchone()[0] >= limits["media_event"]:
+            return ""
+        if conn.execute(f"SELECT COUNT(*) FROM tickets WHERE actor=? AND created>? AND {active}",
+                        (actor, now - 86400)).fetchone()[0] >= limits["media_actor"]:
+            return ""
+        if conn.execute(f"SELECT COUNT(*) FROM tickets WHERE scope=? AND created>? AND {active}",
+                        (scope, now - limits["media_window"])).fetchone()[0] >= limits["media_scope"]:
+            return ""
+        if not repeat:
+            blocked = (recent_assets(conn, scope, persona, limits["recent_assets"]) if asset.startswith("image:")
+                       else sticker_history(conn, scope, persona, now)[1])
+            if asset in blocked:
+                return ""
+        conn.execute("INSERT INTO tickets VALUES (?,?,?,?,?,?,?,?)",
+                     (ticket, scope, actor, persona, event, asset, "queued", now))
+        return ticket
+
 
 def outcome(ticket,status):
  if status not in ('sent','failed','dropped','uncertain'):raise ValueError('invalid outcome')

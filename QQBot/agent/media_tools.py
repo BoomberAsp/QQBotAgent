@@ -73,62 +73,172 @@ async def deliver(path,asset,repeat=False):
  ledger.outcome(ticket,status)
  return {'sent':'图片已由平台确认接受。','uncertain':'发送结果不确定，不自动重试。'}.get(status,'图片未发送。')
 
-def group_sticker_candidates(persona,scope):
-    data,base=registry()
-    eligible=[a for a in data.get('media',[]) if persona in a.get('personas',[]) and
-              (a.get('visibility')=='public' or scope in a.get('scopes',[])) and
-              a.get('review_status')==a.get('rights_status')=='approved']
-    if not eligible:return []
+def sticker_candidates(persona, scope, text="", *, use="", mood="", include_cooling=False):
+    from lib.sticker_usage import asset_uses, infer_uses, parse_uses
+
+    data, base = registry()
+    requested = set(parse_uses(use)) if use else set(infer_uses(text))
+    eligible = [
+        item for item in data.get("media", [])
+        if persona in item.get("personas", [])
+        and (item.get("visibility") == "public" or scope in item.get("scopes", []))
+        and item.get("review_status") == item.get("rights_status") == "approved"
+        and (not mood or mood in item.get("mood", []))
+        and (not use or requested & asset_uses(item))
+    ]
+    if not eligible:
+        return [], base
     with ledger.db() as conn:
-        recent=ledger.recent_assets(conn,scope,persona,ledger.policy(conn)['values']['recent_assets'])
-    return [dict(id=a['id'],description=str(a.get('description',''))[:120],mood=a.get('mood',[])[:8])
-            for a in sorted(eligible,key=lambda a:a['id']) if a['id'] not in recent][:24]
+        last, cooling, recent = ledger.sticker_history(conn, scope, persona)
+
+    def rank(asset):
+        ident = asset["id"]
+        matches = asset_uses(asset) & requested
+        scoped = asset.get("visibility") == "scoped"
+        return (not matches, ident in recent, not scoped, last.get(ident, 0), ident)
+
+    return sorted((item for item in eligible if include_cooling or item["id"] not in cooling), key=rank), base
 
 
-async def send_sticker(sticker_id='',mood='',repeat=False):
- try:
-  scope,actor,persona,event,valid=context();data,base=registry()
-  assets=[a for a in data.get('media',[]) if persona in a.get('personas',[]) and (a.get('visibility')=='public' or scope in a.get('scopes',[]))]
-  assets.sort(key=lambda a:a.get('id',''))
-  if not sticker_id and not mood:
-   return json.dumps([dict(id=a['id'],description=a.get('description',''),mood=a.get('mood',[])) for a in assets if a.get('review_status')=='approved' and a.get('rights_status')=='approved'][:24],ensure_ascii=False)[:1800]
-  for a in assets:
-   if (sticker_id and a.get('id')!=sticker_id) or (not sticker_id and mood not in a.get('mood',[])):continue
-   path=str(local_file(base,a['path']))
-   if published(persona,scope,a['id'],path):
-    result=await deliver(path,a['id'],repeat)
-    if sticker_id or '限制' not in result:return result
-  return '当前人格没有符合条件且已批准的表情包。'
- except (ValueError,KeyError,OSError,TypeError):return '表情包上下文或资源不可用。'
+def group_sticker_candidates(persona, scope, text=""):
+    from lib.sticker_usage import USE_LABELS, asset_uses
+
+    assets, _ = sticker_candidates(persona, scope, text)
+    return [
+        {"id": item["id"], "description": str(item.get("description", ""))[:120],
+         "mood": item.get("mood", [])[:8],
+         "uses": [USE_LABELS[key] for key in sorted(asset_uses(item)) if key in USE_LABELS]}
+        for item in assets[:24]
+    ]
+
+
+async def send_sticker(sticker_id="", mood="", repeat=False, use=""):
+    try:
+        scope, _, persona, _, _ = context()
+        assets, base = sticker_candidates(
+            persona, scope, use=use, mood=mood, include_cooling=bool(sticker_id or repeat))
+        if not sticker_id and not mood and not use:
+            return json.dumps(group_sticker_candidates(persona, scope), ensure_ascii=False)[:3800]
+        for asset in assets:
+            ident = asset["id"]
+            if sticker_id and ident != sticker_id:
+                continue
+            try:
+                path = str(local_file(base, asset["path"]))
+            except (OSError, ValueError, KeyError):
+                continue
+            if not published(persona, scope, ident, path):
+                continue
+            result = await deliver(path, ident, repeat)
+            if sticker_id or "限制" not in result:
+                return result
+        return "当前人格没有符合条件且已批准的表情包。"
+    except (ValueError, KeyError, OSError, TypeError):
+        return "表情包上下文或资源不可用。"
+
+
+def approved_url(url, hosts):
+    from lib.media_download import validate_url
+    if not isinstance(url, str):
+        return ""
+    try:
+        validate_url(url, hosts)
+    except (ValueError, UnicodeError):
+        return ""
+    return url
+
+
+def _image_search_results(query):
+    from urllib.parse import urlencode
+    from urllib.request import Request, urlopen
+
+    endpoint = os.environ.get("SEARXNG_ENDPOINT", "http://localhost:8082").rstrip("/")
+    params = urlencode({"q": query, "format": "json", "categories": "images",
+                        "language": "zh-CN", "safesearch": "2"})
+    request = Request(f"{endpoint}/search?{params}", headers={"Accept": "application/json"})
+    with urlopen(request, timeout=12) as response:
+        data = json.loads(response.read(2 * 1024 * 1024 + 1))
+    return data.get("results", [])
+
+
+async def search_images(query="", limit=4):
+    """Find source links and scoped candidates without downloading image bytes."""
+    query = query.strip()[:300]
+    if not query:
+        return "请提供图片搜索关键词。"
+    async with _download_slots:
+        try:
+            scope, _, _, _, valid = context()
+            data, _ = registry()
+            page_hosts = set(data.get("page_hosts", []))
+            image_hosts = set(data.get("image_hosts", []))
+            if not page_hosts and not image_hosts:
+                return "当前未配置图片或来源网页的允许域名。"
+            if not valid() or not ledger.attempt(scope):
+                return "图片搜索暂不可用，或已达到本会话的图片处理额度。"
+            results = await asyncio.to_thread(_image_search_results, query)
+            if not valid():
+                return "图片搜索会话已失效。"
+            candidates = []
+            seen = set()
+            limit = max(1, min(int(limit), 6))
+            for item in results[:60]:
+                if not isinstance(item, dict):
+                    continue
+                source = approved_url(item.get("url"), page_hosts)
+                image = approved_url(item.get("img_src") or item.get("image"), image_hosts)
+                target = image or source
+                if not target or target in seen:
+                    continue
+                seen.add(target)
+                result = {"title": str(item.get("title") or "图片结果")[:150]}
+                if source:
+                    result["source_url"] = source
+                if image:
+                    result["image_url"] = image
+                    result["candidate_id"] = ledger.candidate(scope, image)
+                candidates.append(result)
+                if len(candidates) == limit:
+                    break
+            if not candidates:
+                return "没有找到符合当前域名白名单的图片结果。"
+            return json.dumps(candidates, ensure_ascii=False)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return "图片搜索暂时失败，可以换关键词或提供来源页。"
+
 
 async def discover_images(url=''):
- async with _download_slots:
-  return await _discover_images(url)
+    async with _download_slots:
+        return await _discover_images(url)
+
 
 async def _discover_images(url=''):
- try:
-  from lib.media_download import download,Candidates
-  scope,*_=context();data,_=registry();hosts=set(data.get('image_hosts',[]))
-  if not ledger.attempt(scope):return '图片处理额度已用完。'
-  # HTML fetching is opt-in per host; approved hosts are deployment policy.
-  if __import__('urllib.parse',fromlist=['urlsplit']).urlsplit(url).hostname not in data.get('page_hosts',[]):return '网页来源尚未批准采集。'
-  from urllib.parse import urlsplit,urlunsplit
-  from urllib.robotparser import RobotFileParser
-  checked=set()
-  async def robots_check(target):
-   if target in checked:return
-   parsed=urlsplit(target);robots=urlunsplit((parsed.scheme,parsed.netloc,'/robots.txt','',''))
-   rules,_,_=await download(robots,hosts,256*1024)
-   robot=RobotFileParser();robot.parse(rules.decode('utf-8',errors='replace').splitlines())
-   if not robot.can_fetch('QQBotAgent-Media',target):raise ValueError('robots denied')
-   checked.add(target)
-  # Initial check also ensures mocked/download backends cannot skip this gate.
-  await robots_check(url)
-  raw,mime,final=await download(url,set(data.get('page_hosts',[])),1024*1024,before_request=robots_check)
-  if mime not in ('text/html','application/xhtml+xml'):return '来源不是HTML页面。'
-  parser=Candidates(final);parser.feed(raw.decode('utf-8',errors='replace'))
-  return json.dumps([dict(candidate_id=ledger.candidate(scope,u),url=u) for u in parser.urls],ensure_ascii=False)
- except Exception:return '无法获取图片候选；来源或robots不允许、网络或响应不符合策略。'
+    from lib.media_download import Candidates, read_source_page
+
+    try:
+        scope, _, _, _, valid = context()
+        data, _ = registry()
+        page_hosts = set(data.get("page_hosts", []))
+        image_hosts = set(data.get("image_hosts", []))
+        if not approved_url(url, page_hosts):
+            return "网页来源尚未批准采集。"
+        if not valid() or not ledger.attempt(scope):
+            return "图片处理额度已用完，或会话已失效。"
+
+        raw, mime, final = await read_source_page(url, page_hosts)
+        if mime not in ("text/html", "application/xhtml+xml"):
+            return "来源不是HTML页面。"
+        parser = Candidates(final, allow_url=lambda image: bool(approved_url(image, image_hosts)))
+        parser.feed(raw.decode("utf-8", errors="replace"))
+        if not valid():
+            return "图片搜索会话已失效。"
+        if not parser.urls:
+            return "页面没有可用的白名单图片候选。"
+        return json.dumps([{"candidate_id": ledger.candidate(scope, image), "url": image,
+                            "source_url": final} for image in parser.urls], ensure_ascii=False)
+    except Exception:
+        return "无法获取图片候选；来源或robots不允许、网络或响应不符合策略。"
+
 
 async def fetch_image(url='',candidate_id=''):
  async with _download_slots:
@@ -141,13 +251,17 @@ async def _fetch_image(url='',candidate_id=''):
   if candidate_id:
    url=ledger.candidate_url(scope,candidate_id)
    if not url:return '候选已过期或不属于当前会话。'
+  hosts=set(data.get('image_hosts',[]))
+  if not approved_url(url, hosts):return '图片来源域未批准。'
   if not ledger.attempt(scope):return '图片处理额度已用完。'
-  key=hashlib.sha256((scope+'|'+url).encode()).hexdigest()
+  key=hashlib.sha256(json.dumps([scope, url, sorted(hosts)]).encode()).hexdigest()
   async with _locks.setdefault(key,asyncio.Lock()):
    with ledger.db() as c:cached=c.execute('SELECT path,hash,expires,policy FROM cache WHERE key=?',(key,)).fetchone()
    if cached and cached[2]>time.time() and cached[3]==policy and Path(cached[0]).is_file():
+    if data.get('approved_hashes',{}).get(cached[1])!=policy:
+     return '图片已进入人工审核队列，批准前不会发送。审核编号：'+cached[1]
     return await deliver(cached[0],'image:'+cached[1])
-   raw,mime,final=await download(url,set(data.get('image_hosts',[])))
+   raw,mime,final=await download(url,hosts)
    if mime not in ('image/png','image/jpeg','image/webp','image/gif'):return '响应不是允许的图片类型。'
    content=await asyncio.to_thread(normalize,raw,mime);digest=hashlib.sha256(content).hexdigest()
    folder=ledger.root()/'images';folder.mkdir(exist_ok=True)

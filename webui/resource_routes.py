@@ -1,5 +1,7 @@
+from functools import partial
+
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from starlette.concurrency import run_in_threadpool
 from . import resource_admin as service
 router=APIRouter(prefix='/api/resources')
@@ -99,3 +101,67 @@ async def media_policy(request:Request):
 
 @router.get('/deliveries')
 async def deliveries():return await call(service.delivery_records)
+
+
+async def object_body(request):
+    import json
+    try:
+        data = json.loads(await body(request))
+    except ValueError as error:
+        raise HTTPException(400, "JSON无效") from error
+    if not isinstance(data, dict):
+        raise HTTPException(400, "请求必须是 JSON 对象")
+    return data
+
+
+@router.get("/sticker-intake/candidates")
+async def sticker_candidates():
+    from agent import sticker_intake
+    from lib.sticker_usage import USE_LABELS
+    return {"candidates": await call(sticker_intake.pending), "uses": USE_LABELS}
+
+
+@router.get("/sticker-intake/candidates/{ident}")
+async def sticker_candidate_preview(ident: str):
+    from agent import sticker_intake
+    content = await call(sticker_intake.preview_bytes, ident)
+    return Response(content, media_type="image/png",
+                    headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@router.post("/sticker-intake/review")
+async def sticker_review(request: Request):
+    from agent import sticker_intake
+    payload = await object_body(request)
+    action = payload.get("action")
+    if action not in ("approve", "reject"):
+        raise HTTPException(400, "请选择批准或拒绝")
+    if action == "approve" and payload.get("confirmed") is not True:
+        raise HTTPException(400, "请确认内容及复用许可")
+    return await call(partial(sticker_intake.review, approve=action == "approve"), payload.get("items"))
+
+
+@router.get("/sticker-intake/sources")
+async def sticker_sources():
+    from agent import sticker_subscriptions
+    return await call(sticker_subscriptions.sources)
+
+
+@router.post("/sticker-intake/sources")
+async def sticker_source_save(request: Request):
+    from agent import sticker_subscriptions
+    return await call(sticker_subscriptions.save_source, await object_body(request))
+
+
+@router.delete("/sticker-intake/sources/{ident}")
+async def sticker_source_remove(ident: str, request: Request):
+    await body(request)
+    from agent import sticker_subscriptions
+    return await call(sticker_subscriptions.remove_source, ident)
+
+
+@router.post("/sticker-intake/sources/{ident}/sync")
+async def sticker_source_sync(ident: str, request: Request):
+    await body(request)
+    from agent import sticker_subscriptions
+    return await sticker_subscriptions.sync_source(ident, force=True)

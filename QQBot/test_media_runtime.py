@@ -39,7 +39,7 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
  async def test_group_feature_off_filters_all_media(self):
   from agent.group_features import GroupFeatureManager
   manager=GroupFeatureManager(str(self.root/'features'));manager.set_feature('g','image',False)
-  self.assertTrue({'send_sticker','fetch_image','discover_images','group_media'}<=manager.get_disabled_tools('g'))
+  self.assertTrue({'send_sticker','search_images','fetch_image','discover_images','group_media'}<=manager.get_disabled_tools('g'))
  async def test_url_constraints(self):
   for url in ['http://images.example/a','https://u:p@images.example/a','https://images.example:444/a','https://images.example.evil/a']:
    with self.assertRaises(ValueError):validate_url(url,{'images.example'})
@@ -75,6 +75,31 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
   with patch('lib.media_download.download',AsyncMock(return_value=(b'User-agent: *\nDisallow: /','text/plain','https://images.example/robots.txt'))):
    self.assertIn('不允许',await media.discover_images('https://images.example/page'))
   self.assertFalse(self.run.media)
+ async def test_keyword_search_returns_only_approved_sources_and_scoped_candidates(self):
+  self.data['page_hosts']=['pages.example'];self.save()
+  results=[
+   {'title':'合法图片','url':'https://pages.example/post','img_src':'https://images.example/art.png'},
+   {'title':'只有页面','url':'https://pages.example/other','img_src':'https://outside.example/art.png'},
+   {'title':'不在白名单域','url':'https://pages.example.evil/post','img_src':'https://images.example.evil/art.png'},
+  ]
+  with patch.object(media,'_image_search_results',return_value=results), patch.object(media,'deliver',AsyncMock()) as deliver:
+   out=json.loads(await media.search_images('露比 插画'))
+  self.assertEqual([x['title'] for x in out],['合法图片','只有页面'])
+  self.assertEqual(out[0]['source_url'],'https://pages.example/post')
+  self.assertEqual(ledger.candidate_url('g',out[0]['candidate_id']),'https://images.example/art.png')
+  self.assertEqual(ledger.candidate_url('other',out[0]['candidate_id']),'')
+  self.assertNotIn('image_url',out[1]);deliver.assert_not_awaited()
+
+ async def test_page_and_image_domains_are_independent(self):
+  from lib.media_download import MediaHTTPError
+  self.data['page_hosts']=['pages.example'];self.save()
+  page=b'<img src="https://outside.example/a.png">'*7+b'<img src="https://images.example/allowed.png">'
+  download=AsyncMock(side_effect=[MediaHTTPError(404),(page,'text/html','https://pages.example/post')])
+  with patch('lib.media_download.download',download):
+   out=json.loads(await media.discover_images('https://pages.example/post'))
+  self.assertEqual(out[0]['url'],'https://images.example/allowed.png')
+  self.assertEqual(download.await_args_list[0].args[1],{'pages.example'})
+
  async def test_fetch_review_cache_then_approval(self):
   self.sticker();raw=(self.root/'s.png').read_bytes()
   download=AsyncMock(return_value=(raw,'image/png','https://images.example/a'))
@@ -82,6 +107,9 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
    result=await media.fetch_image('https://images.example/a');self.assertIn('人工审核',result);self.assertFalse(self.run.media)
    digest=result.split('：')[-1];self.data['approved_hashes']={digest:'v1'};self.save()
    self.assertIn('排队',await media.fetch_image('https://images.example/a'));self.assertEqual(download.await_count,1)
+   self.data['image_hosts']=[];self.save()
+   self.assertIn('来源域未批准',await media.fetch_image('https://images.example/a'))
+   self.assertEqual(download.await_count,1)
  async def test_decode_invalid_and_mime(self):
   self.sticker();raw=(self.root/'s.png').read_bytes()
   with self.assertRaises(ValueError):await asyncio.to_thread(media.normalize,b'not image')

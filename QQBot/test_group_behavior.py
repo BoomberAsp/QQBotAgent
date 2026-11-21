@@ -103,6 +103,30 @@ class StoreTests(unittest.TestCase):
 
 
 class PrivateImageSourceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_caption_merges_but_keeps_reverse_search_offer(self):
+        from agent import image_context
+        from agent.inbound import Attachment
+        from tools.image_source_tools import prepare
+
+        with tempfile.TemporaryDirectory() as workspace:
+            path = Path(workspace) / "photo.png"
+            path.touch()
+            photo = InboundMessage(user_id="a", self_id="bot", message_id="p", platform="onebot",
+                                   attachments=[Attachment("image", str(path))])
+            caption = InboundMessage(user_id="a", self_id="bot", message_id="c", platform="onebot",
+                                     text="它怎么趴键盘上了")
+            waiting = asyncio.create_task(image_context.coalesce_private_images(photo, "private"))
+            await asyncio.sleep(0)
+            self.assertIsNone(await image_context.coalesce_private_images(caption, "private"))
+            grouped = await waiting
+            attachments = await grouped.load_attachments()
+            self.assertEqual(grouped.text, caption.text)
+            self.assertEqual([att.path for att in attachments], [str(path)])
+            with patch.dict("os.environ", {"FIND_SOURCE_ENABLED": "on"}):
+                offer = prepare(grouped, workspace, attachments, "", text=grouped.text)
+            self.assertIn("要帮你查", offer.question)
+            self.assertFalse(offer.authorized)
+
     async def test_private_photo_offer_and_natural_confirmation(self):
         from contextlib import ExitStack
         from agent import survey_flow
@@ -452,6 +476,69 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await runtime.run_group_turn(asked,self.sender)
         resolver.assert_awaited_once()
         self.assertEqual(self.store.history(scope_for(v))[-1]['content'],'绿色')
+
+    async def test_rubi_relationship_routes_to_ark_story_but_skills_stay_gameplay(self):
+        from agent.group_resources import story_search
+
+        base = view()
+        self.store.configure(scope_for(base), persona="rubi")
+        self.fake._perm_manager.get_allowed_tools = lambda role: {"character_detail", "bond_detail"}
+        results = []
+
+        async def run(text, *args, allowed_tools, **kw):
+            current = runtime.current_group_run.get()
+            results.append((current.game_intent, set(allowed_tools), current.context))
+            if current.game_intent == "story":
+                self.assertEqual(story_search("莱拉"), "Ark剧情证据")
+            return "答复"
+
+        self.fake.agent.run = run
+        with patch("lib.story_router.tool_search", return_value="Ark剧情证据") as story:
+            for i, text in enumerate(("你认识莱拉吗？", "莱拉技能怎么用？",
+                                      "你认识莱拉吗？她技能怎么用？")):
+                turn = view(message=f"rubi-{i}")
+                turn.text = text
+                await runtime.run_group_turn(turn, self.sender)
+        self.assertEqual([item[0] for item in results], ["story", "gameplay", "mixed"])
+        self.assertNotIn("character_detail", results[0][1])
+        self.assertNotIn("story_search", results[1][1])
+        self.assertTrue({"story_search", "character_detail"} <= results[2][1])
+        self.assertIn("Ark剧情证据", results[0][2])
+        self.assertNotIn("Ark剧情证据", results[1][2])
+        self.assertTrue(all(call.args[2].game == "ark_re" for call in story.call_args_list))
+
+    async def test_group_image_references_preserve_speaker_and_explicit_quote(self):
+        from hashlib import sha256
+        from PIL import Image
+        from agent.inbound import Attachment
+
+        scope = scope_for(view())
+        self.store.configure(scope, receive_all=True)
+        directory = self.store.root / "workspaces" / sha256(scope.encode()).hexdigest()
+        directory.mkdir(parents=True)
+        for sender in ("a", "b"):
+            path = directory / f"{sender}.png"
+            Image.new("RGB", (8, 8)).save(path)
+            photo = view(user=sender, message=f"image-{sender}")
+            photo.mentioned = False
+            photo.text = ""
+            photo.attachments = [Attachment("image", str(path))]
+            await runtime.run_group_turn(photo, self.sender)
+
+        seen = []
+
+        async def reply(text, user, **kwargs):
+            seen.extend(Path(path).stem for path in kwargs["images"])
+            return "看到了"
+
+        self.fake.agent.run = reply
+        self.fake._model_router.flash_client.supports_vision = True
+        for sender, mid, quote in (("a", "own", ""), ("a", "quoted", "image-b"), ("c", "other", "")):
+            follow = view(user=sender, message=mid, reply_message_id=quote)
+            follow.text = "刚才那张图是什么？"
+            await runtime.run_group_turn(follow, self.sender)
+        self.assertEqual(seen, ["a", "b"])
+        self.assertIn("没对上", self.sender.send_group_text.await_args.args[0])
 
     async def test_image_without_vision_is_never_an_empty_message(self):
         v=view();v.text='';v.attachment_kinds=('image',)

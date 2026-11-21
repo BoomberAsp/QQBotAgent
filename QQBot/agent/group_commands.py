@@ -27,6 +27,11 @@ COMMANDS=(
  GroupCommand('/群功能',usage='gacha|image|voice 开|关'),GroupCommand('/群参与',usage='仅召唤|跟随|自然'),
  GroupCommand('/群接收',usage='开|关'),GroupCommand('/群安静',usage='22:00-08:00|关'),
  GroupCommand('/群主动贴图',usage='开|关'),
+ GroupCommand('/收表情','any','引用自己发的图或附一张图投稿 [安慰|庆祝|吐槽运气等]，审核后仅本群可用'),
+ GroupCommand('/撤回表情','any','<投稿编号>，撤回本人投稿'),
+ GroupCommand('/我的表情','any','查看本人在本群的最近投稿编号和状态'),
+ GroupCommand('/群自动收表情',usage='开|关，群成员还需各自同意'),
+ GroupCommand('/表情投稿','any','开|关，允许自动投稿本人发送的平台表情包'),
  GroupCommand('/群记忆',usage='[添加 内容|清空 确认]'),GroupCommand('/群重置',usage='重置历史（确认后执行）'),
  GroupCommand('/群清除数据',usage='清除群历史、记忆和来源事实（确认后执行）'),
  GroupCommand('/取消','any','取消自己的当前任务',('/结束',)),GroupCommand('/群操作','any','操作令牌'),
@@ -147,6 +152,29 @@ async def dispatch(view,sender,role,store):
         return True
     if not authorized(cmd.who,role,view.actor_role):
         await GroupReply('权限不足',['此操作需要机器人管理员权限。' if cmd.who=='admin' else '此操作需要群主、群管理员或机器人管理员权限。']).send(sender);return True
+    if cmd.name in {"/收表情", "/撤回表情", "/我的表情", "/群自动收表情", "/表情投稿"}:
+        from . import sticker_group, sticker_intake
+        scope = scope_for(view)
+        owner = sticker_intake.owner_key(scope, view.user_id)
+        try:
+            if cmd.name == "/收表情":
+                result = await sticker_group.submit(view, store, store.group(scope), rest)
+            elif cmd.name == "/撤回表情":
+                result = ("已撤回，本群的候选和可发送列表已更新。"
+                          if sticker_intake.withdraw(rest, scope, owner) else "找不到可撤回的本人投稿。")
+            elif cmd.name == "/我的表情":
+                labels = {"pending": "待审核", "published": "已发布", "rejected": "已拒绝", "withdrawn": "已撤回"}
+                rows = sticker_intake.submissions(scope, owner)
+                result = "\n".join(f"{ident} · {labels.get(status, status)}" for ident, status in rows) or "你在本群还没有表情包投稿。"
+            else:
+                who = "" if cmd.name == "/群自动收表情" else owner
+                enabled = sticker_intake.consent(scope, who, onoff(rest))
+                result = ("自动投稿已开启。只有本群和投稿者都开启才会收录，审核后仅本群可用。"
+                          if enabled else "自动投稿已关闭。此前的投稿可以用 /撤回表情 撤回。")
+        except (ValueError, OSError) as error:
+            result = str(error) if isinstance(error, ValueError) else "表情包库暂时不可用。"
+        await runtime.send_text(sender, result)
+        return True
     if cmd.name == MANUAL_COMMAND:
         await runtime.send_text(sender, manual_qq_reply() if not rest else "用法 " + MANUAL_COMMAND)
         return True

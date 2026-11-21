@@ -1295,17 +1295,15 @@ async def handle_official_message(bot: QQBot, event: QQMessageEvent):
 
 async def _try_proactive_sticker(bot,openid,persona):
     """Uses the existing single media pass; no second loop or retry on uncertainty."""
-    from agent.group_resources import registry,local_file
-    from agent.media_tools import published
+    from agent.group_resources import local_file
+    from agent.media_tools import published, sticker_candidates
     from agent import media_ledger as ledger
     from agent.group_runtime import get_store
     from types import SimpleNamespace
-    data,root=registry()
     scope=json.dumps(['qq_official',str(bot.self_id),'private',openid])
     ident=get_store().identity(SimpleNamespace(platform='qq_official',self_id=str(bot.self_id),group_id='',is_group=False,user_id=openid))
-    for asset in sorted(data.get('media',[]),key=lambda a:a.get('id','')):
-        if persona not in asset.get('personas',[]) or 'greeting' not in asset.get('mood',[]):
-            continue
+    candidates, root = sticker_candidates(persona, scope, use="greeting")
+    for asset in candidates:
         try:path=str(local_file(root,asset['path']))
         except (OSError,ValueError,KeyError):continue
         if not published(persona,scope,asset['id'],path):continue

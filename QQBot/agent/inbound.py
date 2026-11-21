@@ -75,6 +75,11 @@ class InboundMessage:
     raw: Any = None                   # original event (escape hatch)
 
     attachment_kinds: tuple[str, ...] = ()
+    reply_message_id: str = ""
+    image_batch_started_bare: bool = False
+    reply_author_id: str = ""
+    has_image_quote: bool = False
+    is_sticker: bool = False
     def media_summary(self):
         kinds=self.attachment_kinds or tuple(a.kind for a in self.attachments)
         labels={'image':'图片','voice':'语音','video':'视频','file':'文件','face':'表情','other':'非文本消息'}

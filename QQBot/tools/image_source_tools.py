@@ -35,8 +35,10 @@ _CONFIRMATIONS = {
 _SOURCE_REQUEST = re.compile(
     r"(?:(?:好|好的|可以)[，,])?"
     r"(?:(?:请|麻烦|可以|能)?(?:帮我|帮忙)?(?:反查|查找|查|找)(?:一下)?"
-    r"(?:(?:这|那)张?(?:图片|图|照片)的?)?(?:来源|出处|作者)(?:吗|吧)?"
-    r"|(?:这|那)张?(?:图片|图|照片)(?:出自|来自)(?:哪里|哪儿|哪部作品)"
+    r"(?:(?:(?:刚才|上面|之前)?(?:这|那)张?|第[一二两三四五六七八九十0-9]+张)(?:图片|图|照片)的?)?"
+    r"(?:来源|出处|作者|原图)(?:吗|吧)?"
+    r"|(?:(?:刚才|上面|之前)?(?:这|那)张?|第[一二两三四五六七八九十0-9]+张)"
+    r"(?:图片|图|照片)(?:(?:出自|来自)(?:哪里|哪儿|哪部作品)|谁画的)"
     r"|找图|找源|找作者)"
 )
 _OFFER_SECONDS = 300
@@ -163,18 +165,21 @@ def prepare(view, workspace: str, attachments, previous: str, *, text: str) -> I
     explicit = bool(_SOURCE_REQUEST.fullmatch(text))
     uploads = [att for att in attachments if att.kind == "image" and not att.quoted]
     images = uploads or [att for att in attachments if att.kind == "image"]
-    bare_upload = bool(uploads) and not text and all(att.kind == "image" for att in attachments)
+    bare_upload = bool(uploads) and (not text or getattr(view, "image_batch_started_bare", False)) and all(
+        att.kind == "image" for att in attachments
+    )
     if len(images) > 1:
         if explicit or bare_upload:
             turn.question = _MULTIPLE
         return turn
     filename = images[0].path if images else previous
-    if explicit or bare_upload or (not attachments and text in _CONFIRMATIONS):
+    confirmed = not attachments and text in _CONFIRMATIONS
+    if explicit or bare_upload or confirmed:
         path = _in_workspace(filename, workspace)
         if path is not None:
             turn.path = str(path)
-            turn.authorized = bool(text)
-            if not text:
+            turn.authorized = bool(explicit or confirmed)
+            if not turn.authorized:
                 turn.question = _QUESTION
     return turn
 
