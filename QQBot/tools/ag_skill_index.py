@@ -132,9 +132,11 @@ _TRIGGER_RULES: list[tuple[str, tuple[str, ...]]] = [
                       "敌人发动全体攻击")),
     # 敌方追加回合触发 / 我方追加回合触发
     ("on_enemy_extra_turn", ("敌人产生追加回合", "敌方产生追加回合",
-                             "敌人获得追加回合")),
+                             "敌人获得追加回合", "敌人生成额外回合",
+                             "敌方生成额外回合")),
     ("on_ally_extra_turn", ("自身除外的我方成员产生追加回合",
-                            "我方成员产生追加回合", "我方产生追加回合")),
+                            "我方成员产生追加回合", "我方产生追加回合",
+                            "我方成员生成额外回合", "我方生成额外回合")),
     ("on_enemy_turn_end", ("敌方成员回合结束", "敌方回合结束", "敌人回合结束",
                            "任一敌人回合结束")),
     ("on_ally_turn_end", ("我方成员回合结束", "我方回合结束",
@@ -271,9 +273,10 @@ def _infer_category(des: str) -> str:
 _NO_COUNTER_RE = re.compile(r"不会被反击|无法反击|不可反击|不能反击|"
                             r"此攻击不会发动追击|不会发动追击")
 _FOLLOW_UP_RE = re.compile(r"追加攻击|进行反击|反击敌人|发动追击|受到追加")
-# 敌人产生追加回合 is REACTING to an enemy extra turn, not producing one
-# (猫祭「疯猫的混沌」) → negative lookbehind on the producer.
-_EXTRA_TURN_RE = re.compile(r"(?<!敌人)(?<!敌方)(?:产生|生成|获得)追加回合")
+# A passive that reacts when another unit gains a turn does not grant one.
+_EXTRA_TURN_RE = re.compile(
+    r"(?<!敌人)(?<!敌方)(?<!我方)(?<!成员)(?:产生|生成|获得)\s*(?:追加|额外)回合"
+)
 _SUBSKILL_CAST_RE = re.compile(r"施展「([^」]+)」")
 _SUBSKILL_HEAD_RE = re.compile(r"^「?([^：「」，,、\n]{1,12})」?：(.+)$")
 
@@ -461,7 +464,11 @@ def _parse_skill(skill: dict, char_name: str, slot: int) -> Skill:
         is_follow_up_skill=bool(_FOLLOW_UP_RE.search(text_cn)),
         can_be_counter=has_attack and not _NO_COUNTER_RE.search(text_cn)
         and not bool(_FOLLOW_UP_RE.search(text_cn)),
-        generates_extra_turn=bool(_EXTRA_TURN_RE.search(text_cn)),
+        # Wiki des is the awakened description when des2 is also present.
+        # Soul Burn (burst) needs a separate activation and is not assumed.
+        generates_extra_turn=bool(_EXTRA_TURN_RE.search(
+            skill.get("des") or skill.get("des2") or ""
+        )),
     )
 
     # ── Per-sentence trigger attribution ──
@@ -584,7 +591,7 @@ def build_index(cache_path: str | None = None) -> dict:
 
 # ── 解包数据源补充（P2b）──────────────────────────────────────────
 # 行动值操纵的**精确数值**来自 Skill 表的 Fun DSL（``Fun:"AddTime",Value:0.3``），
-# 而不是从中文文案里推断；这里把它合并进 wiki 解析出的 ag_effects（按值去重）。
+# wiki 提供触发语义和强化区间；同一个效果保留一条记录。
 _GD_TRIGGER_MAP = {
     "StartBattle": "battle_start",
     "FirstStartBattle": "battle_start",
@@ -621,7 +628,7 @@ def _gamedata_ag_effects(char_name: str, slot: int) -> list[dict]:
                     trigger = "conditional"
                 pct = op.get("magnitude") or ""
                 try:
-                    value = abs(float(op.get("value") or 0)) * 100
+                    value = round(abs(float(op.get("value") or 0)) * 100, 8)
                 except (TypeError, ValueError):
                     value = None
                 effects.append({
@@ -642,8 +649,28 @@ def _gamedata_ag_effects(char_name: str, slot: int) -> list[dict]:
 
 def _effect_key(e: dict) -> str:
     """ag_effect 的稳定去重键（magnitude 可能是 dict/str，不能直接入 set）。"""
-    return json.dumps([e.get("direction"), e.get("magnitude"), e.get("target")],
-                      sort_keys=True, ensure_ascii=False, default=str)
+    return json.dumps(
+        [e.get(key) for key in ("direction", "magnitude", "target", "trigger", "condition")],
+        sort_keys=True, ensure_ascii=False, default=str,
+    )
+
+
+def _matches_gamedata_effect(wiki: dict, data: dict) -> bool:
+    if wiki.get("direction") != data.get("direction"):
+        return False
+    if data.get("trigger") not in ("conditional", wiki.get("trigger")):
+        return False
+    for field in ("target", "condition"):
+        if wiki.get(field) and data.get(field) and wiki[field] != data[field]:
+            return False
+    # A base value corresponds to the lower end of a skill-level range.
+    wiki_mag = wiki.get("magnitude") or {}
+    data_mag = data.get("magnitude") or {}
+    if data_mag.get("kind") != "fixed":
+        return False
+    if wiki_mag.get("kind") == "range":
+        return wiki_mag["min"] == data_mag["value"]
+    return wiki_mag.get("kind") == "fixed" and wiki_mag["value"] == data_mag["value"]
 
 
 def _merge_gamedata_effects(skills: list, char_name: str) -> None:
@@ -654,13 +681,21 @@ def _merge_gamedata_effects(skills: list, char_name: str) -> None:
         extra = _gamedata_ag_effects(char_name, slot)
         if not extra:
             continue
-        seen = {_effect_key(e) for e in sk.ag_effects}
-        for e in extra:
-            key = _effect_key(e)
-            if key in seen:
+        unmatched_wiki = set(range(len(sk.ag_effects)))
+        seen_data = set()
+        for effect in extra:
+            key = _effect_key(effect)
+            if key in seen_data:
                 continue
-            seen.add(key)
-            sk.ag_effects.append(e)
+            seen_data.add(key)
+            matches = [
+                i for i in unmatched_wiki
+                if _matches_gamedata_effect(sk.ag_effects[i], effect)
+            ]
+            if len(matches) == 1:
+                unmatched_wiki.remove(matches[0])
+            else:
+                sk.ag_effects.append(effect)
 
 
 # ── Report ───────────────────────────────────────────────────────────

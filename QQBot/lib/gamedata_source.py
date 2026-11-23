@@ -221,8 +221,20 @@ class GameData:
         return sorted({g["id"] for g in (self.role_grants_of(role_code).get("grants") or [])})
 
     def pre_grants(self, role_code: str) -> list[str]:
-        """早于乱速即应可见的状态（blocking 候选）。"""
-        return self.role_grants_of(role_code).get("pre_grants") or []
+        """返回乱速前必定附加、可用于校验截图的状态。"""
+        role_grants = self.role_grants_of(role_code)
+        guaranteed = {
+            grant["id"]
+            for grant in role_grants.get("grants") or []
+            if grant.get("entry")
+            and grant.get("phase") == "pre"
+            and not grant.get("advisory")
+            and "rate" in grant
+            and grant["rate"] in (None, 1.0)
+            and not (grant.get("condition") or grant.get("conditions"))
+        }
+        # 已发布产物的 pre_grants 只记录时序，其中仍可能包含概率状态。
+        return [state for state in role_grants.get("pre_grants") or [] if state in guaranteed]
 
     def advisory_grants(self, role_code: str) -> list[str]:
         """时序/养成相关的进战状态（不能用于判 pre 无效）。"""

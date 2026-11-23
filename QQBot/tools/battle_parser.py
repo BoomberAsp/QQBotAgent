@@ -45,7 +45,7 @@ _CHAR_DETAIL_CACHE = os.path.join(
     wiki_cache_dir(), "character_details.json"
 )
 
-# Lazily built index: {name_cn: {has_entry_buff, has_immunity_skill, ...}}
+# Lazily built index: {name_cn: {has_immunity_skill, ...}}
 _skill_index: dict | None = None
 
 
@@ -79,7 +79,6 @@ def _load_character_skill_index() -> dict:
             continue
 
         skills = entry.get("skills") or []
-        entry_buff = False
         immunity = False
         action_gauge = False
         ag_skills: list[dict] = []
@@ -96,11 +95,6 @@ def _load_character_skill_index() -> dict:
             )
             text_lower = text.lower()
 
-            # ── Entry-battle buff: "at battle start" + visible status ──
-            if not entry_buff:
-                if _match_entry_buff(text, text_lower):
-                    entry_buff = True
-
             # ── Immunity skill ──
             if not immunity:
                 if _match_immunity(text, text_lower):
@@ -115,7 +109,6 @@ def _load_character_skill_index() -> dict:
                 })
 
         _skill_index[name] = {
-            "has_entry_buff": entry_buff,
             "has_immunity_skill": immunity,
             "has_action_gauge_skill": action_gauge,
             "action_gauge_skills": ag_skills,
@@ -132,62 +125,6 @@ def _invalidate_skill_index():
 
 
 # ── Keyword matchers ─────────────────────────────────────────────────
-
-# Phrases that indicate a buff is granted at the start of battle.
-_ENTRY_BATTLE_PHRASES = [
-    "at the start of battle",
-    "at the beginning of battle",
-    "when battle begins",
-    "when the battle begins",
-    "at the start of the battle",
-    "at the beginning of the battle",
-    "start of the battle",
-    "beginning of the battle",
-    "enter battle",
-    "entering battle",
-    "进入战斗时",
-    "战斗开始时",
-    "战斗开始",
-]
-
-# Sentence separators: Chinese sentence punctuation, newlines, and English
-# sentence boundaries (period/!/? followed by whitespace, so decimals like
-# "1.5" don't split).  Time scopes do NOT carry across sentences — effects
-# described in a later sentence belong to that sentence's own trigger.
-_SENTENCE_SPLIT_RE = re.compile(r"[。；;！!\n]|(?<=[.!?])\s+")
-
-# Clause separators inside a sentence.  Time scopes DO carry across comma
-# clauses ("首次战斗开始时，获得60点战意，自身附加追击强化" — the 追击强化
-# still belongs to the entry trigger).
-_CLAUSE_SPLIT_RE = re.compile(r"[，,、]")
-
-# Timing phrases that open a NON-entry effect scope (turn/attack/death
-# triggers).  A clause containing one of these is no longer attributed to
-# the battle-start scope.
-_NON_ENTRY_SCOPE_PHRASES = (
-    "回合结束", "回合开始", "每回合", "攻击前", "攻击后", "使用技能后",
-    "死亡时", "生命力低于",
-    "end of turn", "end of the turn", "start of turn", "start of the turn",
-    "each turn", "before attacking", "after attacking",
-    "after using a skill", "upon death", "on death",
-)
-
-# Verbs that grant a VISIBLE status effect (renders a row icon).
-_ENTRY_APPLY_VERBS = ("附加", "施加", "赋予", "applies", "apply")
-
-# Verbs that grant *something* — the object decides whether it is visible.
-_ENTRY_GAIN_VERBS = (
-    "获得", "得到",
-    "gains", "gain", "obtains", "obtain", "grants", "grant", "granted",
-)
-
-# Resources that render NO row icon when granted at battle start
-# (verified visually: 战意/集中力 and entry action-gauge pulls show no
-# status icon; 气魄 IS visible and therefore NOT in this list).
-_ENTRY_INVISIBLE_RESOURCES = (
-    "战意", "集中力", "行动值",
-    "morale", "focus", "combat readiness", "action gauge",
-)
 
 # Immunity keywords.
 _IMMUNITY_KEYWORDS = [
@@ -209,68 +146,6 @@ _ACTION_GAUGE_KEYWORDS = [
     "reduce combat readiness",
     "行动值",
 ]
-
-
-# Turn-duration markers on a granted status, e.g. 气魄(3回合) / [2回合].
-_DURATION_RE = re.compile(r"[(\[]\s*\d+\s*[-~]?\s*\d*\s*(回合|turns?)")
-
-# Periodic re-application triggers: a status re-granted at every turn
-# start/end is visible for the whole battle and therefore enforceable in
-# the pre-screenshot even when each grant carries a turn duration.
-_REAPPLY_PHRASES = (
-    "回合结束时", "回合开始时", "end of turn", "start of turn",
-)
-
-
-def _match_entry_buff(text: str, text_lower: str) -> bool:
-    """True if *text* grants a VISIBLE status at the start of battle that
-    is enforceable in pre-screenshot validation.
-
-    Judged clause-by-clause with time-scope tracking: a clause containing
-    an entry phrase ("首次战斗开始时") opens the entry scope, a clause with
-    a turn/attack/death trigger resets it, and a comma clause without any
-    time phrase inherits the previous scope ("…，自身附加看破" belongs to
-    the entry clause before it).  Scopes never carry across a sentence
-    break, so later triggered effects ("…获得50战意\\n敌人产生追加回合时…
-    附加X") do not count X as an entry buff.  Entry Morale/Focus
-    ("获得50战意") and entry action-gauge pulls ("行动值提升[10-20%]")
-    render no row icon, so they are NOT entry buffs and must not be
-    enforced by the pre-screenshot validation.
-
-    A battle-start-only grant with a turn duration (菲莉西娅 气魄(3回合))
-    expires naturally a few turns in, so its absence in a mid-battle
-    pre-screenshot proves nothing — not enforceable.  Grants without a
-    duration, or re-applied at every turn start/end (朱音 潜伏(1回合),
-    贝儿 反击(1回合)), are visible for the whole battle and enforceable.
-    """
-    reapply = any(p in text_lower for p in _REAPPLY_PHRASES)
-    for sentence in _SENTENCE_SPLIT_RE.split(text_lower):
-        scopes: set[str] = set()  # active time scopes: "entry" / "other"
-        for clause in _CLAUSE_SPLIT_RE.split(sentence):
-            if not clause.strip():
-                continue
-            has_entry = any(p in clause for p in _ENTRY_BATTLE_PHRASES)
-            has_other = any(p in clause for p in _NON_ENTRY_SCOPE_PHRASES)
-            if has_entry or has_other:
-                scopes = set()
-                if has_entry:
-                    scopes.add("entry")
-                if has_other:
-                    scopes.add("other")
-            if "entry" not in scopes:
-                continue
-            # 附加/施加/赋予 (applies) always introduce a visible status.
-            applies = any(v in clause for v in _ENTRY_APPLY_VERBS)
-            # 获得/得到 (gains) — only when the object is not an invisible
-            # resource.  气魄 counts (it renders an icon).
-            gains = any(v in clause for v in _ENTRY_GAIN_VERBS) and not any(
-                r in clause for r in _ENTRY_INVISIBLE_RESOURCES)
-            if not (applies or gains):
-                continue
-            if _DURATION_RE.search(clause) and not reapply:
-                continue  # transient: expires mid-battle, not enforceable
-            return True
-    return False
 
 
 def _match_immunity(text: str, text_lower: str) -> bool:
@@ -962,6 +837,8 @@ async def _parse_single(path: str) -> dict:
         img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         from lib.ocr_engine import BuffDetector, MoraleFocusDetector
         detector = BuffDetector()
+        # Status templates load lazily. Build the row filters from their actual source.
+        detector._load_templates()
         buff_source = detector.source
         rows_for_buffs = [
             [{"bbox": c["bbox"]}] if c.get("bbox") else [] for c in characters
@@ -1124,8 +1001,8 @@ def _fallback_missing_rows(detector, img_bgr, rows_for_buffs, frame,
         expected = {s for s in expected if src.has_row_icon(s)}
         if not expected:
             continue
-        got = set((out[i] if i < len(out) else {}) or {})
-        if got & expected:
+        existing = out[i] or {}
+        if existing.keys() & expected:
             continue
         try:
             # 只重扫这一行，但 cell 必须用全量行算出来的（否则该行会独占整个面板高度，
@@ -1137,7 +1014,7 @@ def _fallback_missing_rows(detector, img_bgr, rows_for_buffs, frame,
             region = _status_band_region(img_bgr, frame, y1, y2)
             hits = detector.detect_in_region(img_bgr, region, None)
             if hits:
-                merged = dict(got)
+                merged = dict(existing)
                 merged.update(hits)
                 out[i] = merged
                 print(f"[battle_parser] 行级回退全量模板: {c.get('name')} → "
@@ -1261,11 +1138,12 @@ def _post_process(characters: list[dict], image: Image.Image) -> list[dict]:
     if not characters:
         return []
 
-    # Identify the acting character: action value ≈ 0% and at the top
-    for c in characters:
-        av = c.get("action_value")
-        if av is not None and av <= 0.5:
-            c["acting"] = True
+    # A zero on the opening gauge is part of the speed roll.
+    if _detect_phase(characters) == "post":
+        for c in characters:
+            av = c.get("action_value")
+            if av is not None and av <= 0.5:
+                c["acting"] = True
 
     # Sort: acting character first, then by action value descending
     characters.sort(
@@ -1311,10 +1189,10 @@ def _validate_pre_screenshot(
 
     Implements the two rules from PLAN.md Idea 8:
 
-    1. **Entry-battle buffs** (blocking): Characters with skills that grant
-       a VISIBLE status at the start of battle must show buff icons in the
-       pre-screenshot.  If the character has no such skill, the row is
-       vacuously valid.
+    1. **Guaranteed pre-run buffs** (blocking in strict mode): Missing
+       icons are considered only when the game data and matched templates
+       establish the status should already be visible. Wiki text alone
+       cannot establish that guarantee.
     2. **Immunity gear** (advisory only): Characters with 免疫 in the
        post-screenshot but not in the pre-screenshot, and no immunity skill,
        *may* be wearing unloaded 免疫 gear — but post-only immunity is also
@@ -1346,8 +1224,8 @@ def _validate_pre_screenshot(
                 return row_buffs[i]
         return {}
 
-    # ── Rule 1a: 数据源驱动（P2）──
-    # blocking = 早于乱速即应可见的进战状态（role_grants.pre_grants）；
+    # ── Rule 1: 数据源驱动（P2）──
+    # blocking = 早于乱速且必定附加的进战状态；
     # advisory = 觉醒源 / PostStartBattle（时序在乱速之后），只提示不否决。
     rule1_ok = True
     src = _gamedata()
@@ -1392,23 +1270,6 @@ def _validate_pre_screenshot(
                     f"提示（时序/养成）：角色「{name}」的 {detail} 属觉醒或"
                     f"战斗开始后（PostStartBattle）授予，跑条前未出现属正常，不影响行动值。")
             continue
-
-    # ── Rule 1b: 回落 wiki 索引（gamedata 不可用时）──
-    if src is None or pre.get("buff_source") != "gamedata":
-        for c in pre_chars:
-            name = c.get("name", "")
-            info = get_character_skill_info(name)
-            if info is None:
-                continue
-            if not info.get("has_entry_buff"):
-                continue
-            row_buffs = _buffs_for_char(pre_chars, pre_row_buffs, name)
-            if not row_buffs:
-                warnings.append(
-                    f"规则1（进战buff）：角色「{name}」拥有进战buff技能，"
-                    f"但跑条前截图中未检测到buff图标（可能乱速尚未完成）"
-                )
-                rule1_ok = False
 
     # ── Rule 2 (advisory): immunity seen post but not pre ──
     # Not blocking: post-only immunity has two indistinguishable causes
@@ -1520,21 +1381,13 @@ def _has_battle_start_ag(name: str) -> bool:
 
 
 def _find_first_actor(results: list[dict]) -> tuple[str | None, str | None]:
-    """Return (name, side) of the first actor from the post screenshot.
-
-    The first actor is the row whose action value reset to 0 (``acting``).
-    Iterating ``reversed(results)`` prefers the post screenshot in pair mode.
-    """
-    for result in reversed(results):
-        chars = result.get("characters", [])
-        for c in chars:
-            if c.get("acting"):
-                return c.get("name"), c.get("side")
-        named = [c for c in chars
-                 if c.get("name") and c.get("action_value") is not None]
-        if named:
-            first = min(named, key=lambda c: c["action_value"])
-            return first.get("name"), first.get("side")
+    """Return the unique acting row from the first post-run screenshot."""
+    for result in results:
+        if result.get("phase") == "post":
+            acting = [c for c in result.get("characters", []) if c.get("acting")]
+            if len(acting) == 1:
+                return acting[0].get("name"), acting[0].get("side")
+            break
     return None, None
 
 

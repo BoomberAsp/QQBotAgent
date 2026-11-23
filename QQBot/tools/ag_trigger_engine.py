@@ -197,9 +197,9 @@ def _infer_output_events(sk: Skill | None, char: str, side: str) -> list[dict]:
     """Events a fired skill emits beyond its AG manipulation.
 
     A pure AG reactive passive emits nothing.  A skill that grants an extra
-    turn emits ``extra_turn`` (reacted to by 敌方/我方追加回合触发) plus a
-    ``follow_up``; a skill that is itself a follow-up/counter attack also
-    emits ``attack`` + ``hit`` so counter/被攻击 reactions chain onward.
+    turn emits an extra_turn event. A follow-up/counter attack emits its
+    own follow_up, attack and hit events so counter/被攻击 reactions chain
+    onward.
     """
     if sk is None:
         return []
@@ -207,7 +207,6 @@ def _infer_output_events(sk: Skill | None, char: str, side: str) -> list[dict]:
     negated = bool(_EXTRA_ACTION_NEGATE_RE.search(sk.text))
     if sk.generates_extra_turn:
         events.append({"kind": "extra_turn", "actor": char, "actor_side": side})
-        events.append({"kind": "follow_up", "actor": char, "actor_side": side})
     if sk.is_follow_up_skill and not negated:
         events.append({"kind": "follow_up", "actor": char, "actor_side": side})
         if sk.has_attack:
@@ -216,16 +215,7 @@ def _infer_output_events(sk: Skill | None, char: str, side: str) -> list[dict]:
                            "actor_side": side, "aoe": aoe})
             events.append({"kind": "hit", "victim_side": _opposite(side),
                            "aoe": aoe})
-    # de-dup identical events (both branches can emit follow_up)
-    seen: set[tuple] = set()
-    out: list[dict] = []
-    for ev in events:
-        key = (ev["kind"], ev.get("actor_side"), ev.get("victim_side"),
-               ev.get("aoe"))
-        if key not in seen:
-            seen.add(key)
-            out.append(ev)
-    return out
+    return events
 
 
 def _trigger_matches(trigger: str, ev: dict, char: str, side: str) -> bool:
@@ -738,6 +728,7 @@ def build_hypothesis(
         "first_actor": first_actor,
         "first_actor_skill": f"{_SLOT_LABEL[slot]} {skill_name}".strip(),
         "first_skill_observed": was_observed,
+        "first_skill_can_grant_extra_turn": bool(actual_sk and actual_sk.generates_extra_turn),
         "prediction": pred,
         "chain": chain["chain"],
         "not_triggered": chain["not_triggered"],
