@@ -60,12 +60,18 @@ class StickerIntakeTests(unittest.IsolatedAsyncioTestCase):
         duplicate = sticker_intake.submit(self.group_candidate(png((254, 0, 0), size=(24, 24))))
         self.assertEqual(duplicate, (ident, False))
         self.assertEqual(media_tools.group_sticker_candidates("rubi", self.scope), [])
-        details = [{"id": ident, "uses": "安慰,庆祝"}]
+        with self.assertRaisesRegex(ValueError, "描述"):
+            sticker_intake.review([{"id": ident, "description": "长" * 301}], approve=True)
+        self.assertEqual(sticker_intake.pending()[0]["description"], "拍拍安慰")
+        details = [{"id": ident, "uses": "安慰,庆祝", "description": " 通关庆祝时贴这张 "}]
         self.assertEqual(sticker_intake.review(details, approve=True)[0]["status"], "published")
         self.assertEqual(sticker_intake.review(details, approve=True)[0]["status"], "published")
         assets, base = registry()
         self.assertEqual(len(assets["media"]), 1)
         record = assets["media"][0]
+        self.assertEqual(record["description"], "通关庆祝时贴这张")
+        candidate, = media_tools.group_sticker_candidates("rubi", self.scope)
+        self.assertEqual(candidate["description"], record["description"])
         published_path = base / record["path"]
         self.assertTrue(media_tools.published("rubi", self.scope, ident, published_path))
         self.assertFalse(media_tools.published("rubi", "other", ident, published_path))

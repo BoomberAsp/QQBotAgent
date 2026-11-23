@@ -55,7 +55,7 @@
         img.alt = candidate.description || "候选表情包";
         img.loading = "lazy";
         img.style.cssText = "display:block;max-width:180px;max-height:140px;margin:6px 0";
-        if (candidate.description) element("p", candidate.description, card);
+        const description = field(card, "描述", candidate.description, 300);
         if (candidate.repeats) element("p", "群内重复使用 " + candidate.repeats + " 次", card);
         const tags = field(card, "用途", candidate.uses.map((use) => uses[use] || use).join(","), 120);
         const author = candidate.origin === "web" ? field(card, "作者", candidate.author, 120) : null;
@@ -67,7 +67,7 @@
           link.rel = "noopener noreferrer";
         }
         picked.onchange = () => {
-          if (picked.checked) selection.set(candidate.id, {tags, author, license});
+          if (picked.checked) selection.set(candidate.id, {description, tags, author, license});
           else selection.delete(candidate.id);
         };
       }
@@ -83,7 +83,7 @@
       const confirmed = byId("intake-confirmed").checked;
       if (action === "approve" && !confirmed) throw new Error("请勾选内容与复用许可确认");
       const items = Array.from(selection, ([id, fields]) => ({
-        id, uses: fields.tags.value,
+        id, description: fields.description.value, uses: fields.tags.value,
         ...(fields.author ? {author: fields.author.value, license: fields.license.value} : {}),
       }));
       const results = await api("/review", "POST", {action, confirmed, items});

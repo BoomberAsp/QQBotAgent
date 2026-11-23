@@ -92,10 +92,25 @@ def upload(persona,description,raw,mood=""):
     return {'ok':True,'id':sid}
 
 
+def _sticker_for_persona(data, persona, sid):
+    for item in data.get("media", []):
+        if item.get("id") == sid and persona in item.get("personas", []):
+            return item
+    raise ValueError("该人格下未找到表情包")
+
+
+def update_sticker_description(persona, sid, description):
+    from agent.sticker_intake import validate_description
+
+    description = validate_description(description)
+    with edit_registry() as (data, _):
+        _sticker_for_persona(data, persona, sid)["description"] = description
+    return {"ok": True, "description": description}
+
+
 def delete_sticker(persona,sid):
     with edit_registry() as (data,root):
-        item=next((a for a in data.get('media',[]) if a.get('id')==sid and persona in a.get('personas',[])),None)
-        if not item:raise ValueError('该人格下未找到表情包')
+        item = _sticker_for_persona(data, persona, sid)
         item['personas'].remove(persona)
         if not item['personas']:data['media'].remove(item)
     # Unpublish immediately. Keep the blob for in-flight operations and manual GC.

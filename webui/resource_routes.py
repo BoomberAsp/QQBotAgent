@@ -65,6 +65,12 @@ async def publish(request:Request):
 async def upload(persona:str,request:Request,description:str='',mood:str=''):
     return await call(service.upload,persona,description,await body(request),mood)
 
+@router.patch("/stickers/{persona}/{sid}")
+async def edit_sticker_description(persona: str, sid: str, request: Request):
+    payload = await object_body(request)
+    return await call(service.update_sticker_description, persona, sid, payload.get("description"))
+
+
 @router.delete('/stickers/{persona}/{sid}')
 async def delete(persona:str,sid:str,request:Request):
     await body(request)

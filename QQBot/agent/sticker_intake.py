@@ -182,6 +182,12 @@ def _install(folder, digest, content):
     return path
 
 
+def validate_description(value):
+    if not isinstance(value, str) or len(value) > 300:
+        raise ValueError("描述必须为文本，最多 300 字")
+    return value.strip()
+
+
 def review(items, *, approve):
     if not isinstance(items, list) or not 1 <= len(items) <= 30:
         raise ValueError("请每批选择 1 到 30 个候选")
@@ -192,6 +198,8 @@ def review(items, *, approve):
         changes = {}
         if "uses" in item:
             changes["uses"] = parse_uses(item["uses"])
+        if approve and "description" in item:
+            changes["description"] = validate_description(item["description"])
         for key, limit in (("author", 120), ("license", 160), ("source_url", 2048)):
             if key in item:
                 if not isinstance(item[key], str) or len(item[key]) > limit:
@@ -222,6 +230,8 @@ def review(items, *, approve):
                 fields = json.loads(metadata)
                 if approve:
                     fields["uses"] = changes.get("uses", fields.get("uses", []))
+                    if "description" in changes:
+                        fields["description"] = changes["description"]
                     if origin == "web":
                         fields.update(changes)
                         source = urlsplit(fields.get("source_url", ""))
