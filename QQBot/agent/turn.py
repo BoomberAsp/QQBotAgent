@@ -2606,6 +2606,13 @@ async def handle_agent_turn(view: InboundMessage):
     _on_file_created.set(lambda p: _record_session_file(user_id, p))
 
     text_content = view.text
+    from .sticker_help import GUIDE_COMMAND, SUBMIT_COMMAND, is_submission_question, submission_guide
+    command = text_content.split(maxsplit=1)
+    if (command and command[0] in {GUIDE_COMMAND, SUBMIT_COMMAND}) or is_submission_question(text_content):
+        guide = submission_guide(group=False, with_button=text_content.strip() != GUIDE_COMMAND)
+        await _send_receipt_kb(guide.plain(), guide.rows, label="表情包投稿")
+        return
+
     from agent.cognitive_state import current_scope
     image_scope = current_scope.get()
     image_offer = image_source_tools.take_offer(view, image_scope)

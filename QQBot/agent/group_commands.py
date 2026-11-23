@@ -6,6 +6,7 @@ from lucima_bridge.manual import MANUAL_ALIASES, MANUAL_COMMAND, is_manual_comma
 from .group_state import scope_for,identity_for,Conflict
 from .group_service import GroupService
 from .group_reply import GroupReply
+from .sticker_help import GUIDE_COMMAND, SUBMIT_COMMAND, submission_guide
 from .public_commands import PUBLIC_COMMANDS, PRIVATE_ONLY, dispatch_public
 
 @dataclass(frozen=True)
@@ -27,7 +28,8 @@ COMMANDS=(
  GroupCommand('/群功能',usage='gacha|image|voice 开|关'),GroupCommand('/群参与',usage='仅召唤|跟随|自然'),
  GroupCommand('/群接收',usage='开|关'),GroupCommand('/群安静',usage='22:00-08:00|关'),
  GroupCommand('/群主动贴图',usage='开|关'),
- GroupCommand('/收表情','any','引用自己发的图或附一张图投稿 [安慰|庆祝|吐槽运气等]，审核后仅本群可用'),
+ GroupCommand(SUBMIT_COMMAND,'any','[用途] [描述：文字]，附一张图或引用自己发的图投稿'),
+ GroupCommand(GUIDE_COMMAND,'any','查看表情包投稿用法'),
  GroupCommand('/撤回表情','any','<投稿编号>，撤回本人投稿'),
  GroupCommand('/我的表情','any','查看本人在本群的最近投稿编号和状态'),
  GroupCommand('/群自动收表情',usage='开|关，群成员还需各自同意'),
@@ -152,12 +154,18 @@ async def dispatch(view,sender,role,store):
         return True
     if not authorized(cmd.who,role,view.actor_role):
         await GroupReply('权限不足',['此操作需要机器人管理员权限。' if cmd.who=='admin' else '此操作需要群主、群管理员或机器人管理员权限。']).send(sender);return True
-    if cmd.name in {"/收表情", "/撤回表情", "/我的表情", "/群自动收表情", "/表情投稿"}:
+    if cmd.name == GUIDE_COMMAND or (cmd.name == SUBMIT_COMMAND and not (
+        view.attachments or view.attachment_kinds or view.has_image_quote or view.reply_message_id
+    )):
+        enabled = store.group(scope_for(view))["config"]["features"].get("image", True)
+        await submission_guide(group=True, image_enabled=enabled).send(sender)
+        return True
+    if cmd.name in {SUBMIT_COMMAND, "/撤回表情", "/我的表情", "/群自动收表情", "/表情投稿"}:
         from . import sticker_group, sticker_intake
         scope = scope_for(view)
         owner = sticker_intake.owner_key(scope, view.user_id)
         try:
-            if cmd.name == "/收表情":
+            if cmd.name == SUBMIT_COMMAND:
                 result = await sticker_group.submit(view, store, store.group(scope), rest)
             elif cmd.name == "/撤回表情":
                 result = ("已撤回，本群的候选和可发送列表已更新。"

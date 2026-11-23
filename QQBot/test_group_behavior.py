@@ -436,6 +436,25 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[此消息 @ 了其他群成员：昵称未知的成员] 你好", prompts[-1])
         self.sender.send_group_text.assert_awaited_once()
 
+    async def test_sticker_submission_question_provides_group_button(self):
+        from agent.sticker_help import SUBMIT_TEMPLATE
+
+        self.sender.send_group_keyboard = AsyncMock(return_value="sent")
+        original = view(message="upload-question", explicit_mention=True)
+        original.text = "怎么上传我自己的表情包？"
+        await runtime.run_group_turn(original, self.sender)
+        self.assertEqual(self.calls, [])
+        _, rows, plain = self.sender.send_group_keyboard.await_args.args
+        self.assertEqual(rows[0][0].data, SUBMIT_TEMPLATE)
+        self.assertIn("描述：拍拍肩膀", plain)
+
+        other = view(message="other-upload-question", explicit_mention=False, other_mentions=("朋友",))
+        other.mentioned = False
+        other.text = original.text
+        self.store.configure(scope_for(other), mode="natural", receive_all=True)
+        await runtime.run_group_turn(other, self.sender)
+        self.sender.send_group_keyboard.assert_awaited_once()
+
     async def test_group_chatter_merges_for_capacity_or_tool_results(self):
         body = "这只猫还知道把柜门关上。看这熟练度，估计不是第一次了。猫粮还是换个地方收起来吧。"
         self.assertEqual(len(split_chatter(body, 3)), 3)

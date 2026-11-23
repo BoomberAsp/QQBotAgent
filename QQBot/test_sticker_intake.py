@@ -16,6 +16,8 @@ from agent.group_commands import dispatch
 from agent.group_resources import registry
 from agent.group_state import GroupStore, scope_for
 from agent.inbound import Attachment, InboundMessage
+from agent.sticker_help import SUBMIT_TEMPLATE, is_submission_question
+from lib.button_spec import validate
 
 
 def png(color, size=(16, 16)):
@@ -102,6 +104,44 @@ class StickerIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.view.text = "/我的表情"
         self.assertTrue(await dispatch(self.view, self.sender, "regular", self.store))
         self.assertIn(item["id"] + " · 待审核", self.sender.send_group_text.await_args.args[0])
+
+    async def test_submission_guide_and_attached_sticker_description(self):
+        self.sender.send_group_keyboard = AsyncMock(return_value="sent")
+        self.view.text = "/收表情"
+        self.assertTrue(await dispatch(self.view, self.sender, "regular", self.store))
+        _, rows, plain = self.sender.send_group_keyboard.await_args.args
+        self.assertFalse(validate(rows))
+        self.assertEqual(rows[0][0].data, SUBMIT_TEMPLATE)
+        self.assertFalse(rows[0][0].enter)
+        self.assertFalse(rows[0][0].reply)
+        self.assertIn("引用你自己发的图", plain)
+        self.assertEqual(sticker_intake.pending(), [])
+
+        async def resolve(_):
+            path = Path(_current_user_workspace.get()) / "sticker.png"
+            path.write_bytes(png("purple"))
+            return [Attachment("image", str(path))]
+
+        resolver = AsyncMock(side_effect=resolve)
+        self.view.resolver = SimpleNamespace(resolve=resolver)
+        self.view.attachment_kinds = ("image",)
+        self.view.text = SUBMIT_TEMPLATE + "长" * 301
+        await dispatch(self.view, self.sender, "regular", self.store)
+        self.assertIn("最多 300 字", self.sender.send_group_text.await_args.args[0])
+        resolver.assert_not_awaited()
+
+        self.view.text = "/收表情 安慰 描述：拍拍肩膀"
+        await dispatch(self.view, self.sender, "regular", self.store)
+        item, = sticker_intake.pending()
+        self.assertEqual(item["description"], "拍拍肩膀")
+        self.assertEqual(item["uses"], ["comfort"])
+        self.assertIn(item["id"], self.sender.send_group_text.await_args.args[0])
+
+    def test_submission_question_does_not_match_search_or_existing_post(self):
+        for text in ("我怎么上传自己的表情包？", "我有张表情包，能发给你以后用吗？"):
+            self.assertTrue(is_submission_question(text), text)
+        for text in ("帮我找个表情包", "我上传的表情包审核通过了吗？", "/收表情 描述：安慰"):
+            self.assertFalse(is_submission_question(text), text)
 
     async def test_automatic_group_collection_requires_both_group_and_uploader_consent(self):
         async def resolve(_):

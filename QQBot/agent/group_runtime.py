@@ -14,6 +14,7 @@ from lucima_bridge.client import GROUP_LOGIN_CONFIRM_HINT, is_bare_login_confirm
 
 from . import image_context
 from .group_chatter import split_chatter
+from .sticker_help import GROUP_PROMPT, is_submission_question, submission_guide
 from .group_state import GroupStore, scope_for, identity_for
 from .lucima_tools import (
     GROUP_PROMPT as LUCIMA_GROUP_PROMPT, GROUP_PROPOSAL_PROMPT, TOOLS as LUCIMA_TOOLS,
@@ -111,6 +112,7 @@ class GroupRun:
                 "拿到实际结果后再说，群里无需播报内部委派。用户明确要网上找图时，可用可用的 "
                 "search_images 按关键词找来源；用户问图片内容或查此前图片的出处时，先确认所指图片。"
             )))
+            messages.append(dict(role="system", content=GROUP_PROMPT))
         rule = game_reply_rule(self.game_intent)
         if rule:
             messages.append(dict(role="system", content=rule))
@@ -377,6 +379,12 @@ async def run_group_turn(view, sender=None):
                 return
             # The original passive window must still be valid after queueing.
             if view.platform == "qq_official" and time.time()-view.received_at > 270:
+                return
+            if is_submission_question(view.text):
+                config = state["config"]
+                if reason == "natural" and not store.reserve_auto(scope, config):
+                    return
+                await submission_guide(group=True, image_enabled=config["features"].get("image", True)).send(sender)
                 return
             pm = get_character_registry()
             persona = state["config"]["persona"]

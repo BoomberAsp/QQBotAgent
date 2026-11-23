@@ -276,6 +276,9 @@ class Agent:
         if "memory" in self._configs:
             parts.append(self._configs["memory"])
 
+        from .sticker_help import PRIVATE_PROMPT
+        parts.append(PRIVATE_PROMPT)
+
         # Survey commands bypass the LLM; this static card keeps the agent
         # able to explain the flow and the safety rules when asked.
         try:

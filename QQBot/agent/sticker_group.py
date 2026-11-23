@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import logging
+import re
 import sqlite3
 import tempfile
 from dataclasses import replace
@@ -16,9 +17,10 @@ from .group_state import scope_for
 log = logging.getLogger(__name__)
 _jobs = set()
 _MAX_JOBS = 4
+_DESCRIPTION_MARKER = re.compile(r"(?<!\S)描述\s*[:：]")
 
 
-async def _collect(view, store, state, *, uses=(), automatic=False):
+async def _collect(view, store, state, *, uses=(), description="", automatic=False):
     scope = scope_for(view)
     owner = sticker_intake.owner_key(scope, view.user_id)
     config = state["config"]
@@ -50,7 +52,7 @@ async def _collect(view, store, state, *, uses=(), automatic=False):
             raw = image.read(sticker_intake.CANDIDATE_BYTES + 1)
         candidate = await asyncio.to_thread(
             sticker_intake.make_candidate, raw, persona=config["persona"], scope=scope,
-            owner=owner, origin="group",
+            owner=owner, origin="group", description=description,
             uses=list(uses) or (infer_uses(view.text) if automatic else []),
             author="本群投稿者",
             license="投稿者同意此机器人在本群复用；审核员确认可用范围",
@@ -62,10 +64,15 @@ async def _collect(view, store, state, *, uses=(), automatic=False):
     return await asyncio.to_thread(sticker_intake.submit, candidate, automatic=automatic)
 
 
-async def submit(view, store, state, use_text):
-    uses = parse_uses(use_text)
+async def submit(view, store, state, arguments):
+    marker = _DESCRIPTION_MARKER.search(arguments)
+    description = ""
+    if marker:
+        description = sticker_intake.validate_description(arguments[marker.end():].strip())
+        arguments = arguments[:marker.start()]
+    uses = parse_uses(arguments)
     try:
-        ident, fresh = await _collect(view, store, state, uses=uses)
+        ident, fresh = await _collect(view, store, state, uses=uses, description=description)
     except (OSError, TimeoutExpired) as error:
         raise ValueError("图片处理失败，请稍后重试") from error
     if not fresh:
