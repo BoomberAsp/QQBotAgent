@@ -2333,8 +2333,6 @@ def _story_char_id_for(persona_key: str, pm) -> str:
 def _build_story_context(persona_key: str, query: str, pm) -> tuple:
     """Return (injection_block, char_id) for the current turn."""
     try:
-        from lib.story_kb import get_story_kb
-
         # 逐人格白名单：不在 config/story_personas.json 里的人格完全不注入。
         if not _story_persona_allowed(persona_key):
             return "", ""
@@ -2346,13 +2344,15 @@ def _build_story_context(persona_key: str, query: str, pm) -> tuple:
             return "", ""
         if item and item["kb_id"]:
             scope = current_story_scope.get()
-            if scope is None or scope.persona != persona_key:
+            if scope is None:
                 scope = make_scope(persona_key)
-            if not active(scope):
+            if not active(scope) or scope.persona != persona_key:
                 return "", ""
             if scope.game == "hsr":
                 q = _story_query_from(query)
                 return (hsr_injection(persona_key, q, scope, 3200) if q else ""), ""
+        from lib.story_kb import get_story_kb
+
         kb = get_story_kb()
         if not kb.available:
             return "", ""
@@ -3200,7 +3200,7 @@ async def handle_agent_turn(view: InboundMessage):
 
         from lib.hsr_policy import native_story_turn
         _hsr_native = (not is_creation and not is_scene and 'story_search' in allowed_tools
-                       and native_story_turn(persona_key, text_content or augmented_message))
+                       and native_story_turn(persona_key, text_content or augmented_message, story_scope))
         # ── Plane context (Bond-System-Design.md §3) ──
         # character_plane: split persona routed to social → L2 = 角色卡,
         #   tools = SOCIAL_TOOLS and public Lucima help when available, bond state

@@ -47,11 +47,11 @@ def local_file(root, name):
     return p
 
 
-def retrieve(persona, query, scope, limit=4, valid=None, *, story_only=False):
+def retrieve(persona, query, scope, limit=4, valid=None, *, story_only=False, history=()):
     from lib.story_router import binding, hsr_injection, make_scope, tool_search
     story_scope = make_scope(persona, scope, valid)
     if story_scope and story_scope.game == "hsr":
-        return hsr_injection(persona, query, story_scope)
+        return hsr_injection(persona, query, story_scope, history=history)
     if story_scope and story_only:
         if binding(persona).get("auto_inject", True):
             return tool_search(query, min(limit, 2), story_scope)[:3200]

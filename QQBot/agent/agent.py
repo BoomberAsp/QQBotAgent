@@ -828,13 +828,13 @@ class Agent:
             messages.extend(session.context)
 
         # Pure intent/reference planning over this already-authorized history only.
-        from lib.story_router import current_story_scope, active as story_scope_active
-        from lib.hsr_policy import plan_query, answer_contract, current_query_plan
+        from lib.story_router import current_story_scope, active as story_scope_active, bound_query_plan
+        from lib.hsr_policy import answer_contract, current_query_plan
         story_scope = current_story_scope.get()
         current_query_plan.set(None)
         story_contract = ""
         if story_scope_active(story_scope) and story_scope.game == "hsr":
-            story_plan = plan_query(user_message, history=messages[1:])
+            story_plan = bound_query_plan(story_scope, user_message, history=messages[1:])
             current_query_plan.set(story_plan)
             if story_plan['retrieve']:
                 story_contract = answer_contract(story_plan, story_scope.persona)

@@ -32,6 +32,11 @@
       "kb_id": "hsr",
       "neutral": true,
       "auto_inject": true
+    },
+    "nousson": {
+      "kb_id": "hsr",
+      "neutral": true,
+      "auto_inject": true
     }
   }
 }

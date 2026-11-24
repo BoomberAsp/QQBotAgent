@@ -68,6 +68,23 @@ class StoreTests(unittest.TestCase):
             self.assertIn("[提及了群成员] 来领票", history)
             self.assertNotIn("old_openid", history)
 
+    def test_media_history_uses_delivery_records_instead_of_legacy_text(self):
+        scope = scope_for(view())
+        generation = self.store.group(scope)["generation"]
+        receipt = "[已投递图片：stick_old]"
+        self.store.commit(scope, generation, "text-only", "member", "来张图", receipt)
+        self.store.delivery(scope, "text-only", "sent")
+        self.store.commit(scope, generation, "real-image", "member", "第二张", "这张也行\n" + receipt)
+        self.store.delivery(scope, "real-image:media", "sent")
+
+        history = self.store.history(scope)
+        self.assertEqual([entry["content"] for entry in history if entry["role"] == "assistant"], ["这张也行"])
+        self.assertEqual([entry["role"] for entry in history], ["user", "user", "assistant", "system"])
+        self.assertIn("发送了图片", history[-1]["content"])
+        summary = json.loads(self.store.history(scope, limit=0)[0]["content"].split("\n", 1)[1])
+        self.assertEqual([turn["image_sent"] for turn in summary], [False, True])
+        self.assertNotIn("stick_old", json.dumps(history + summary, ensure_ascii=False))
+
     def bind(self):
         s=self.store
         g,p=s.identity(view()),s.identity(view(user='dm',group=''))
@@ -690,6 +707,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await runtime.run_group_turn(v,self.sender)
         self.assertIn('[图片×1]',self.store.history(scope_for(v))[0]['content'])
 
+    async def test_receipt_echo_never_reaches_group_as_text(self):
+        self.sender.send_group_image = AsyncMock(return_value="sent")
+        for n, (body, expected) in enumerate((
+            ("[已投递图片：stick_005955ba44a04611979e]", "这次没能发出表情包。"),
+            ("已投递图片: sticker_79b8923a8aa544d9915bbddfe89c4593", "这次没能发出表情包。"),
+            ("这张还挺有意思。\n[已投递图片：stick_old]", "这张还挺有意思。"),
+        )):
+            event = view(message=f"echo-{n}")
+            event.text = "来个哈气表情包"
+            self.fake.agent.run = AsyncMock(return_value=body)
+            self.sender.send_group_text.reset_mock()
+            await runtime.run_group_turn(event, self.sender)
+            self.sender.send_group_text.assert_awaited_once_with(expected)
+            self.assertEqual(self.store.history(scope_for(event))[-1]["content"], expected)
+        self.sender.send_group_image.assert_not_awaited()
+
     async def test_sticker_first_delivery_outcomes(self):
         async def choose(*args,**kwargs):
             self.assertEqual(runtime.current_group_run.get().sticker_choices,[{'id':'happy'}])
@@ -708,7 +741,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             if outcome=='failed':self.sender.send_group_text.assert_awaited_once_with('好耶')
             else:self.sender.send_group_text.assert_not_awaited()
             history=self.store.history(scope_for(v))
-            if outcome=='sent':self.assertNotIn('好耶',history[-1]['content'])
+            if outcome == "sent":
+                self.assertIn("发送了图片", history[-1]["content"])
+                self.assertNotIn("happy", json.dumps(history, ensure_ascii=False))
+                with self.store.db() as db:
+                    answer, = db.execute("SELECT answer FROM turns WHERE scope=?", (scope_for(v),)).fetchone()
+                self.assertEqual(answer, "")
             if outcome=='uncertain':self.assertEqual(history,[])
 
     async def test_mention_wrapped_commands_stop_before_agent(self):

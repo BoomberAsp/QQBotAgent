@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .hsr_story import HsrStoryKB, render_result
+from .hsr_perspective import profile, query_plan
 
 log=logging.getLogger(__name__)
 current_story_scope=contextvars.ContextVar('current_story_scope', default=None)
@@ -49,6 +50,11 @@ def registry():
                     raise ValueError('Invalid binding entry')
                 if binding.get('kb_id') not in data['kbs'] or not isinstance(binding.get('auto_inject',True),bool):
                     raise ValueError('Invalid story binding')
+                enabled = binding.get('character_perspective', False)
+                groups = binding.get('character_perspective_groups', [])
+                if (not isinstance(enabled, bool) or not isinstance(groups, list) or
+                        not all(isinstance(group, str) and group for group in groups)):
+                    raise ValueError('Invalid character perspective setting')
             value=(version,data)
             _registries[path]=value
             return value
@@ -87,6 +93,23 @@ def active(scope):
         return False
     version,data=registry()
     return version==scope.revision and data['bindings'].get(scope.persona,{}).get('kb_id')==scope.kb_id
+
+
+def character_perspective(scope):
+    if not scope or scope.persona != 'herta' or scope.game != 'hsr' or not active(scope):
+        return None
+    _, data = registry()
+    settings = data['bindings'][scope.persona]
+    if not settings.get('character_perspective'):
+        return None
+    if (scope.audience not in {'private', 'diagnostic'} and not scope.audience.startswith('private:')
+            and scope.audience not in settings.get('character_perspective_groups', [])):
+        return None
+    return profile(data['kbs'][scope.kb_id].get('build_id'))
+
+
+def bound_query_plan(scope, query, *, history=()):
+    return query_plan(query, character_perspective(scope), history=history)
 
 
 def hsr_database_path(kb_id):
@@ -141,9 +164,11 @@ def tool_search(query='',limit=4,scope=None):
             reader=_hsr(scope)
             from .hsr_policy import current_query_plan, plan_query
             request_plan = current_query_plan.get()
+            perspective = character_perspective(scope)
             # Preserve the user's time constraint even when a tool call abbreviates it.
             if request_plan and request_plan['retrieve']:
-                if plan_query(query, names=reader.entities)['unresolved']:
+                if (perspective and (request_plan.get('character_context') or request_plan.get('character_witness'))
+                        or plan_query(query, names=reader.entities)['unresolved']):
                     query = request_plan['query']
                 if request_plan['intent'] == 'quote' and not any(w in query for w in ('原文','逐字','台词','引用')):
                     query += ' 原文'
@@ -153,13 +178,14 @@ def tool_search(query='',limit=4,scope=None):
                     query += ' 现在'
                 elif request_plan['time'] == 'historical':
                     query = request_plan['query'] + ' ' + query
-            evidence=reader.retrieve(query,limit)
+            evidence=reader.retrieve(query, limit, perspective=perspective) if perspective else reader.retrieve(query, limit)
             hits=evidence['hits']
             result=render_result(evidence,persona=scope.persona,budget=6000)
             if not result:
                 result='[story_search] 该问题不属于剧情资料检索范围。'
-            audit('story evidence intent=%s time=%s status=%s cards=%s', evidence['plan']['intent'],
-                  evidence['plan']['time'], evidence['status'], [c['id'] for c in evidence['cards']])
+            audit('story evidence intent=%s time=%s status=%s cards=%s perspective=%s', evidence['plan']['intent'],
+                  evidence['plan']['time'], evidence['status'], [c['id'] for c in evidence['cards']],
+                  evidence.get('perspective_revision'))
             audit('story tool persona=%s game=hsr audience=%s build=%s chunks=%s',scope.persona,
                      hashlib.sha256(scope.audience.encode()).hexdigest()[:12],reader.meta['build_id'],[h['chunk_id'] for h in hits])
         else:
@@ -172,19 +198,22 @@ def tool_search(query='',limit=4,scope=None):
         return '[story_search] '+('HSR' if scope.game=='hsr' else 'Ark')+' 资料库不可用；未切换到其他作品。'
 
 
-def hsr_injection(persona,query,scope=None,budget=3200):
+def hsr_injection(persona,query,scope=None,budget=3200,*,history=()):
     scope=scope or make_scope(persona)
     if not active(scope) or scope.persona!=persona or scope.game!='hsr' or not binding(persona).get('auto_inject',True):
         return ''
     try:
         reader=_hsr(scope)
-        evidence=reader.retrieve(query,4,automatic=True)
+        perspective = character_perspective(scope)
+        evidence = (reader.retrieve(query, 4, automatic=True, history=history, perspective=perspective)
+                    if perspective else reader.retrieve(query, 4, automatic=True))
         hits=evidence['hits']
         # Automatic entry has no history; the message builder may resolve a
         # follow-up later. Do not inject a premature clarification instruction.
         result='' if evidence['status']=='needs_clarification' else render_result(evidence,persona=persona,budget=budget)
-        audit('story injection evidence intent=%s time=%s status=%s cards=%s', evidence['plan']['intent'],
-              evidence['plan']['time'], evidence['status'], [c['id'] for c in evidence['cards']])
+        audit('story injection evidence intent=%s time=%s status=%s cards=%s perspective=%s', evidence['plan']['intent'],
+              evidence['plan']['time'], evidence['status'], [c['id'] for c in evidence['cards']],
+              evidence.get('perspective_revision'))
         audit('story injection persona=%s game=hsr audience=%s build=%s chunks=%s',persona,
                  hashlib.sha256(scope.audience.encode()).hexdigest()[:12],reader.meta['build_id'],[h['chunk_id'] for h in hits])
         return result if active(scope) else ''

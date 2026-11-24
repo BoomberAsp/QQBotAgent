@@ -6,6 +6,7 @@ conversation generations and identity revisions prevent stale background commits
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -13,6 +14,25 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .inbound import QQ_MEMBER_MENTION
+
+
+_IMAGE_HISTORY_EVENT = "群聊历史事件：机器人在该轮发送了图片。"
+_MEDIA_RECEIPT = re.compile(
+    r"(?:\[{1,2}|【)\s*已投递图片\s*[:：][^\]】\r\n]*(?:\]{1,2}|】)"
+    r"|^[ \t]*已投递图片[ \t]*[:：][ \t]*[a-zA-Z0-9_.:-]+"
+    r"(?:[ \t]*[,，][ \t]*[a-zA-Z0-9_.:-]+)*[ \t]*[。.!！]?[ \t]*$",
+    re.MULTILINE,
+)
+
+
+def strip_media_receipts(text):
+    """Remove the legacy internal receipt from both history and model output."""
+    cleaned, count = _MEDIA_RECEIPT.subn("", text)
+    cleaned = cleaned.replace(_IMAGE_HISTORY_EVENT, "")
+    removed = bool(count or cleaned != text)
+    if removed and not cleaned.strip(" \t\r\n\u0060*\"'“”()（）:：。.!！"):
+        cleaned = ""
+    return cleaned, removed
 
 
 def key(*parts):
@@ -77,6 +97,7 @@ class GroupStore:
               last REAL, PRIMARY KEY(scope,day));
             CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY,scope TEXT,
               event TEXT,status TEXT,created REAL);
+            CREATE INDEX IF NOT EXISTS deliveries_sent_by_event ON deliveries(scope,event) WHERE status='sent';
             ''')
             db.execute('BEGIN IMMEDIATE')
             if 'source_persona' not in {r[1] for r in db.execute('PRAGMA table_info(facts)')}:
@@ -180,25 +201,41 @@ class GroupStore:
             return result.rowcount == 1
 
     def history(self, scope, limit=20):
+        query = """
+            SELECT t.event, t.actor, t.user_text, t.answer, t.created,
+                   EXISTS (
+                       SELECT 1 FROM deliveries d
+                       WHERE d.scope=t.scope AND d.event=t.event || ':media' AND d.status='sent'
+                   ) AS media_sent
+            FROM turns t WHERE t.scope=? ORDER BY t.created DESC LIMIT ? OFFSET ?
+        """
         with self.db() as db:
-            rows = db.execute("SELECT actor,user_text,answer,created FROM turns WHERE scope=? ORDER BY created DESC LIMIT ?",
-                              (scope, limit)).fetchall()
-        with self.db() as db:
-            older=db.execute("SELECT event,actor,user_text,answer FROM turns WHERE scope=? ORDER BY created DESC LIMIT 20 OFFSET ?",(scope,limit)).fetchall()
+            rows = db.execute(query, (scope, limit, 0)).fetchall()
+            older = db.execute(query, (scope, 20, limit)).fetchall()
+            notices = db.execute(
+                "SELECT created,text FROM notices WHERE scope=? ORDER BY created DESC LIMIT 10", (scope,),
+            ).fetchall()
         result = []
         if older:
-            digest=[dict(source=r['event'],speaker=r['actor'],topic=QQ_MEMBER_MENTION.sub('[提及了群成员]', r['user_text'])[:120],answer_excerpt=r['answer'][:180]) for r in reversed(older)]
+            digest = []
+            for row in reversed(older):
+                topic = QQ_MEMBER_MENTION.sub("[提及了群成员]", row["user_text"])
+                answer, _ = strip_media_receipts(row["answer"])
+                digest.append(dict(source=row["event"], speaker=row["actor"], topic=topic[:120],
+                                   answer_excerpt=answer.strip()[:180], image_sent=bool(row["media_sent"])))
             result.append(dict(role="user",content="[较早话题的摘录摘要；不完整，保留发言归属与来源]\n"+json.dumps(digest,ensure_ascii=False)))
-        with self.db() as db:
-            notices=[dict(n) for n in db.execute('SELECT created,text FROM notices WHERE scope=? ORDER BY created DESC LIMIT 10',(scope,))]
         timeline=[(r['created'],'turn',r) for r in rows]+[(n['created'],'notice',n) for n in notices]
         for _,kind,row in sorted(timeline,key=lambda item:item[0]):
             if kind=='notice':
                 result.append(dict(role="system",content=row['text']))
                 continue
             user_text = QQ_MEMBER_MENTION.sub("[提及了群成员]", row["user_text"])
-            result.extend([dict(role="user", content=f"成员[{row['actor']}]：{user_text}"),
-                           dict(role="assistant", content=row["answer"])])
+            result.append(dict(role="user", content=f"成员[{row['actor']}]：{user_text}"))
+            answer, _ = strip_media_receipts(row["answer"])
+            if answer.strip():
+                result.append(dict(role="assistant", content=answer.rstrip()))
+            if row["media_sent"]:
+                result.append(dict(role="system", content=_IMAGE_HISTORY_EVENT))
         return result
 
     def commit(self, scope, generation, event, actor, text, answer):

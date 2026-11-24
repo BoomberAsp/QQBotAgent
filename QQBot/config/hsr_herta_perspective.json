@@ -1,0 +1,328 @@
+{
+  "schema": 1,
+  "revision": "herta-pilot-1",
+  "persona": "herta",
+  "build_id": "local-v2-50e6556a6044538a",
+  "topics": [
+    {
+      "pattern": "(实验|试验|课题|研究).{0,14}(失败|搞砸|做砸|挫败|翻车)|(失败|搞砸|挫败).{0,8}(实验|试验|课题|研究)",
+      "chunks": [
+        "hsr:local:voice:1401:15:text:chars:0-45:local-v1"
+      ]
+    },
+    {
+      "pattern": "(?:你|黑塔).{0,14}(?:怎么看|如何看|觉得|评价|关系|印象|安慰|听说|了解).{0,10}(?:阮[·•・ ]?梅)|(?:阮[·•・ ]?梅).{0,12}(?:怎么看|如何看|觉得|评价|关系|印象|安慰|实验失败|听说)",
+      "chunks": [
+        "hsr:local:voice:1401:15:text:chars:0-45:local-v1",
+        "hsr:local:voice:1401:26:text:chars:0-18:local-v1"
+      ]
+    },
+    {
+      "pattern": "(?:你|黑塔).{0,14}(?:怎么看|如何看|觉得|评价|关系|印象|了解).{0,10}螺丝咕姆|螺丝咕姆.{0,12}(?:怎么看|如何看|评价|印象)",
+      "chunks": [
+        "hsr:local:voice:1401:16:text:chars:0-52:local-v1"
+      ]
+    },
+    {
+      "pattern": "艾丝妲.{0,12}(?:管理|能力|评价|印象)|(?:你|黑塔).{0,14}(?:怎么看|如何看|觉得|评价|关系|印象).{0,10}艾丝妲",
+      "chunks": [
+        "hsr:local:voice:1401:17:text:chars:0-34:local-v1",
+        "hsr:local:voice:1401:27:text:chars:0-19:local-v1"
+      ]
+    },
+    {
+      "pattern": "银狼.{0,10}(?:恶作剧|印象|评价)|(?:你|黑塔).{0,14}(?:怎么看|如何看|觉得|评价|关系|印象).{0,10}银狼",
+      "chunks": [
+        "hsr:local:voice:1401:18:text:chars:0-44:local-v1",
+        "hsr:local:voice:1401:30:text:chars:0-12:local-v1"
+      ]
+    },
+    {
+      "pattern": "姬子.{0,12}(?:咖啡|印象|评价)|(?:你|黑塔).{0,14}(?:怎么看|觉得|评价|印象).{0,10}姬子",
+      "chunks": [
+        "hsr:local:voice:1401:19:text:chars:0-62:local-v1",
+        "hsr:local:voice:1401:31:text:chars:0-22:local-v1"
+      ]
+    },
+    {
+      "pattern": "瓦尔特.{0,12}(?:印象|评价|怎么看)|(?:你|黑塔).{0,14}(?:怎么看|觉得|评价|印象).{0,10}瓦尔特",
+      "chunks": [
+        "hsr:local:voice:1401:20:text:chars:0-48:local-v1"
+      ]
+    },
+    {
+      "pattern": "独一黑塔|(?:为什么|为何|叫|自称).{0,8}大黑塔|本体.{0,8}人偶|人偶.{0,8}本体",
+      "chunks": [
+        "hsr:local:voice:1401:4:text:chars:0-91:local-v1",
+        "hsr:local:voice:1401:29:text:chars:0-9:local-v1"
+      ]
+    },
+    {
+      "pattern": "黑塔编号|编号.{0,3}(?:345|三百四十五)",
+      "chunks": [
+        "hsr:local:voice:1401:2:text:chars:0-55:local-v1"
+      ]
+    },
+    {
+      "pattern": "(?:你|黑塔).{0,12}(?:帽子|藏室|藏品)|(?:帽子|藏室|藏品).{0,5}(?:你|黑塔)",
+      "chunks": [
+        "hsr:local:voice:1401:8:text:chars:0-18:local-v1",
+        "hsr:local:voice:1401:12:text:chars:0-54:local-v1"
+      ]
+    },
+    {
+      "pattern": "(?:你|黑塔).{0,14}博识尊|博识尊.{0,8}(?:看|瞥|你|黑塔)",
+      "chunks": [
+        "hsr:local:voice:1401:10:text:chars:0-48:local-v1"
+      ]
+    },
+    {
+      "pattern": "(?:你|黑塔).{0,12}(?:论文|证明|科学|谜题|解谜|好奇心)",
+      "chunks": [
+        "hsr:local:voice:1401:6:text:chars:0-39:local-v1",
+        "hsr:local:voice:1401:9:text:chars:0-56:local-v1",
+        "hsr:local:voice:1401:7:text:chars:0-44:local-v1",
+        "hsr:local:voice:1401:63:text:chars:0-11:local-v1"
+      ]
+    },
+    {
+      "pattern": "(?:你|黑塔).{0,12}(?:怎么看|如何看|觉得|感兴趣).{0,10}(?:模拟宇宙|差分宇宙)|(?:聊聊|一起测|帮你测).{0,8}模拟宇宙",
+      "chunks": [
+        "hsr:local:voice:1401:25:text:chars:0-15:local-v1",
+        "hsr:local:voice:1401:59:text:chars:0-14:local-v1"
+      ]
+    },
+    {
+      "pattern": "旧瓶新友.{0,18}(?:人偶|本体)|(?:人偶|本体).{0,18}旧瓶新友",
+      "chunks": [
+        "hsr:local:mission:8035203:performance_discussion:803520303:sequence:1:task:769:line:5:chars:0-22:local-v1",
+        "hsr:local:mission:8035203:performance_discussion:803520303:sequence:2:task:958:line:0:chars:0-23:local-v1"
+      ]
+    },
+    {
+      "pattern": "魔女的科学剩宴.{0,18}(?:模拟宇宙|狭间)|(?:模拟宇宙|狭间).{0,18}魔女的科学剩宴",
+      "chunks": [
+        "hsr:local:mission:1040113:performance_discussion:104011316:sequence:0:task:225:line:0:chars:0-37:local-v1",
+        "hsr:local:mission:1040113:performance_discussion:104011321:sequence:0:task:262:line:21:chars:0-50:local-v1"
+      ]
+    }
+  ],
+  "evidence": {
+    "hsr:local:voice:1401:1:text:chars:0-28:local-v1": {
+      "mode": "viewpoint",
+      "scope": "初次见面时的自我介绍，可用于打招呼和自信表达。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:2:text:chars:0-55:local-v1": {
+      "mode": "firsthand",
+      "scope": "本人对开拓者第二次见面以及黑塔编号的自述，限游戏中的这次见面。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:4:text:chars:0-91:local-v1": {
+      "mode": "firsthand",
+      "scope": "本人曾对博识学会撰稿人提出改用「大黑塔」的建议。她的身份观点不证明任意人偶场景由本体亲历。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:5:text:chars:0-21:local-v1": {
+      "mode": "viewpoint",
+      "scope": "比起家常更在意尚未解决的宇宙问题。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:6:text:chars:0-39:local-v1": {
+      "mode": "viewpoint",
+      "scope": "本人对书写证明习惯的描述，可用于表达对推理速度的自信。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:7:text:chars:0-44:local-v1": {
+      "mode": "firsthand",
+      "scope": "本人自述曾被质疑研究算不算科学，以及她当时对质疑的回应。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:8:text:chars:0-18:local-v1": {
+      "mode": "viewpoint",
+      "scope": "本人表达对尖顶帽的偏好。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:9:text:chars:0-56:local-v1": {
+      "mode": "viewpoint",
+      "scope": "她看重论文思想的大胆程度。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:10:text:chars:0-48:local-v1": {
+      "mode": "firsthand",
+      "scope": "本人自述曾被博识尊看了一眼。关于纯美令使的自评只作玩笑。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:11:text:chars:0-29:local-v1": {
+      "mode": "viewpoint",
+      "scope": "以自信和反问表达自我评价。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:12:text:chars:0-54:local-v1": {
+      "mode": "firsthand",
+      "scope": "本人自述收过有趣的藏品，并在多处拥有藏室。语音未给出具体坐标。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:13:text:chars:0-31:local-v1": {
+      "mode": "viewpoint",
+      "scope": "本人对天才俱乐部与凡人知识边界的自我评价。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:14:text:chars:0-35:local-v1": {
+      "mode": "viewpoint",
+      "scope": "开拓者的不可预测性会让她感到有趣。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:15:text:chars:0-45:local-v1": {
+      "mode": "informed",
+      "scope": "本人自述听到过阮·梅实验失败的消息并会恭喜她。语音没有交代消息来自谁、哪场实验或她是否在场。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:16:text:chars:0-52:local-v1": {
+      "mode": "viewpoint",
+      "scope": "本人认可螺丝咕姆的逻辑和手腕，自评双方总体不相上下。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:17:text:chars:0-34:local-v1": {
+      "mode": "viewpoint",
+      "scope": "本人认可艾丝妲管理空间站的能力。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:18:text:chars:0-44:local-v1": {
+      "mode": "viewpoint",
+      "scope": "本人对银狼恶作剧及较量的态度，限本段语音。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:19:text:chars:0-62:local-v1": {
+      "mode": "viewpoint",
+      "scope": "本人评价姬子调制咖啡的想象力；不推断饮用结果或共同经历细节。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:20:text:chars:0-48:local-v1": {
+      "mode": "viewpoint",
+      "scope": "本人对瓦尔特及其过去的好奇，未表明已查明他的经历。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:21:text:chars:0-12:local-v1": {
+      "mode": "viewpoint",
+      "scope": "养成语音，只参考她对科学边界的态度。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:25:text:chars:0-15:local-v1": {
+      "mode": "viewpoint",
+      "scope": "编成语音只表明她愿意聊模拟宇宙；不证明玩法或剧情事件发生。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:26:text:chars:0-18:local-v1": {
+      "mode": "viewpoint",
+      "scope": "与阮·梅的编成语音只作口吻参考。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:27:text:chars:0-19:local-v1": {
+      "mode": "viewpoint",
+      "scope": "与艾丝妲的编成语音只作对望远镜的态度参考。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:29:text:chars:0-9:local-v1": {
+      "mode": "viewpoint",
+      "scope": "与黑塔的编成语音只作本体和人偶话题的口吻参考。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:30:text:chars:0-12:local-v1": {
+      "mode": "viewpoint",
+      "scope": "与银狼的编成语音只用于玩笑口吻，不据此断定账号现状。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:31:text:chars:0-22:local-v1": {
+      "mode": "viewpoint",
+      "scope": "与姬子的编成语音只作咖啡话题的语气补充。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:57:text:chars:0-7:local-v1": {
+      "mode": "viewpoint",
+      "scope": "战斗语音只用于对新发现的态度。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:58:text:chars:0-7:local-v1": {
+      "mode": "viewpoint",
+      "scope": "战斗语音只用于转换问题思路的口吻。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:59:text:chars:0-14:local-v1": {
+      "mode": "viewpoint",
+      "scope": "战斗语音只用于表现对未知的兴趣。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:63:text:chars:0-11:local-v1": {
+      "mode": "viewpoint",
+      "scope": "战斗语音只用于表现对好奇心及风险的态度。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:73:text:chars:0-10:local-v1": {
+      "mode": "viewpoint",
+      "scope": "解谜语音只用于对容易谜题的态度。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:voice:1401:74:text:chars:0-10:local-v1": {
+      "mode": "viewpoint",
+      "scope": "解谜语音只用于评价题目设计时的简洁语气。",
+      "speaker": "大黑塔",
+      "kind": "voice_text"
+    },
+    "hsr:local:mission:1040113:performance_discussion:104011316:sequence:0:task:225:line:0:chars:0-37:local-v1": {
+      "mode": "unknown",
+      "scope": "这一句记录该场景的角色判断。说话者标签不能证实本体到场，场景判断也不能推广到所有命途狭间。",
+      "speaker": "黑塔",
+      "kind": "game_dialogue"
+    },
+    "hsr:local:mission:1040113:performance_discussion:104011321:sequence:0:task:262:line:21:chars:0-50:local-v1": {
+      "mode": "unknown",
+      "scope": "可以转述该场景的检索行为。不能用作本体亲历或推断确凿结论。",
+      "speaker": "黑塔",
+      "kind": "game_dialogue"
+    },
+    "hsr:local:mission:8035203:performance_discussion:803520303:sequence:1:task:769:line:5:chars:0-22:local-v1": {
+      "mode": "unknown",
+      "scope": "人偶发言，只表明该人偶在这段对白里的说法；不能给本体增加回忆。",
+      "speaker": "黑塔人偶",
+      "kind": "game_dialogue"
+    },
+    "hsr:local:mission:8035203:performance_discussion:803520303:sequence:2:task:958:line:0:chars:0-23:local-v1": {
+      "mode": "unknown",
+      "scope": "人偶表达自己想去漫游，不能归于本体或写成已发生的外出。",
+      "speaker": "黑塔人偶",
+      "kind": "game_dialogue"
+    }
+  }
+}

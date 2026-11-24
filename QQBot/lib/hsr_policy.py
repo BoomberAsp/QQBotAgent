@@ -34,7 +34,7 @@ def policy():
         return {}
 
 
-def plan_query(query, *, history=(), names=(), explicit=False):
+def plan_query(query, *, history=(), names=(), explicit=False, alias_overrides=None):
     """History must already be limited to the active conversation by the caller."""
     text = str(query or '')[:400]
     data = policy()
@@ -42,6 +42,8 @@ def plan_query(query, *, history=(), names=(), explicit=False):
     for name, variants in data.get('aliases', {}).items():
         for alias in [name, *variants]:
             aliases[alias] = name
+    if alias_overrides:
+        aliases.update(alias_overrides)
     found = []
     occupied = []
     for alias in sorted(aliases, key=len, reverse=True):
@@ -61,7 +63,7 @@ def plan_query(query, *, history=(), names=(), explicit=False):
         for item in reversed(list(history)[-8:]):
             if item.get('role') != 'user' or not isinstance(item.get('content'), str):
                 continue
-            previous = plan_query(item['content'], names=names)
+            previous = plan_query(item['content'], names=names, alias_overrides=alias_overrides)
             if previous['entities'] and previous['retrieve']:
                 entities = previous['entities']
                 inherited_time = previous['time']
@@ -123,12 +125,16 @@ def matching_cards(plan):
     return cards[:3]
 
 
-def answer_contract(plan, persona):
-    mode = '中立资料口径，明确区分事实、角色说法和推断' if persona == 'nous' else '保持当前角色身份、判断方式和自然语气'
+def answer_contract(plan, persona, *, perspective=False):
+    from .hsr_perspective import instructions
+
+    neutral = persona in {'nous', 'nousson'}
+    mode = '中立资料口径，明确区分事实、角色说法和推断' if neutral else '保持当前角色身份、判断方式和自然语气'
     return ('【本轮剧情回答规则】' + mode + '。直接回答问题，不加“资料翻出来了”等任务开场白。'
             '用户问“现在”默认正式服最新开拓任务节点；库构建日期不等于剧情时间。'
             '阶段状态卡只证明标明的阶段，覆盖不足时简短说明可确认的时间范围，不能断言旧状态仍是现状。'
-            '检索资料非角色亲历记忆；不得声称未知事件亲历，也不得编造人偶转告等获知渠道。'
+            + (instructions(plan) if perspective else
+               '检索资料非角色亲历记忆；不得声称未知事件亲历，也不得编造人偶转告等获知渠道。') +
             '可自然陈述有据事实和判断，不要复述 knowledge_scope、互斥分支等内部规则。'
             '不把人物猜测当最终事实；不把推断当原文；引用必须保持原句和说话者。'
             '旧对话与人格卡中的动态剧情不是事实证据。资料不足不得凭模型记忆补成确定结论。'
@@ -138,11 +144,11 @@ def answer_contract(plan, persona):
             + '需要补证时调用 story_search，保留实体、现在/当时、任务名和原文要求，不只传人名。')
 
 
-def native_story_turn(persona, query):
+def native_story_turn(persona, query, scope=None):
     # Registry authorization is checked independently at every execution boundary.
-    from .story_router import binding, registry
+    from .story_router import binding, bound_query_plan, make_scope, registry
     item = binding(persona)
     if not item or registry()[1]['kbs'][item['kb_id']]['game'] != 'hsr':
         return False
-    plan = plan_query(query)
+    plan = bound_query_plan(scope or make_scope(persona), query)
     return plan['retrieve'] and plan['intent'] != 'creative'
