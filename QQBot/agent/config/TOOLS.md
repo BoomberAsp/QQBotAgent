@@ -483,6 +483,12 @@ Anti-bot handling is a two-tier ladder:
 
 ---
 
+## Tool: list_characters
+
+用这个只读工具筛选 Ark Re:Code 角色列表。属性和职业可以各自多选，两个字段同时满足。查询「最近上线」时传 `release_status="released"`，查询未上线角色时传 `release_status="unreleased"`。默认上线日期倒序，未上线角色始终同权在首组，未知日期或未知状态在末组。以工具返回的状态与日期为准。继续查询下一页时沿用原筛选条件并传 `next_offset`。追问单个角色详情时使用返回的 ID 调用 `character_detail`。
+
+---
+
 ## Tool: character_detail
 
 **Description**: 查询 Ark Re:Code 角色的详细资料（面板成长系数、技能、倍率、属性、天赋、潜能）。数据来自 wiki + LLM 翻译，缓存于本地。

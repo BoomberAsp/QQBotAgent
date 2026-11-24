@@ -11,10 +11,12 @@ Data sources:
   - Static config/gacha_data.json → banner probability weights (merged)
 """
 
-from lib.bond_names import artifact_path, load_artifacts, reconcile as reconcile_bond_name
+from lib.bond_names import artifact_id_redirects, artifact_path, load_artifacts
+from lib.bond_names import reconcile as reconcile_bond_name
 from lib.gacha_names import GachaNames, build_five_star_bonds
 from lib.game_names import file_stamp, load_roles, reconcile as reconcile_character_name
 from lib.game_names import roles_path
+from lib.wiki_catalog import record_wiki_refresh
 import asyncio
 import copy
 import hashlib
@@ -1038,6 +1040,9 @@ class WikiScraper:
         os.makedirs(self._cache_dir, exist_ok=True)
         with open(self._character_detail_cache, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
+        await asyncio.to_thread(
+            record_wiki_refresh, os.path.dirname(self._character_detail_cache), "char", existing, result,
+        )
 
         # Fire-and-forget image download + card rendering, serialized so cards
         # are never drawn before their portrait/icon lands (idempotent and
@@ -1803,6 +1808,9 @@ class WikiScraper:
         os.makedirs(self._cache_dir, exist_ok=True)
         with open(self._bond_detail_cache, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
+        await asyncio.to_thread(
+            record_wiki_refresh, os.path.dirname(self._bond_detail_cache), "bond", existing, result,
+        )
 
         # Fire-and-forget icon download + card rendering, serialized so bond
         # cards are never drawn before their icon lands (idempotent, non-fatal).
@@ -2428,8 +2436,7 @@ class WikiScraper:
         )
         artifacts = load_artifacts()
         # The game data confirms these legacy IDs refer to the same titled artifacts.
-        redirects = {old: current for old, current in (("A0129", "A0159"), ("A0165", "A0162"))
-                     if current in artifacts and old not in artifacts}
+        redirects = artifact_id_redirects(artifacts)
         bonds = GachaNames(
             artifacts, self._load_bond_cache(),
             self._read_gacha_reference(OPENRUBI_BONDS_INFO, []),

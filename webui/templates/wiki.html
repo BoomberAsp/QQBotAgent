@@ -39,6 +39,18 @@
     <button class="btn btn-sm" id="wk-alias-new" title="手动创建新分组（字典与缓存中都不存在的名称）">新建分组</button>
     <input type="text" id="wk-alias-q" placeholder="搜索名称或别名…" style="width:200px">
   </div>
+  <div class="row" id="wk-alias-filters" style="margin:10px 0;flex-wrap:wrap">
+    <details><summary data-facet-label="element">属性</summary>
+      <div class="row" data-facet="element" style="flex-wrap:wrap"></div>
+    </details>
+    <details><summary data-facet-label="job">职业</summary>
+      <div class="row" data-facet="job" style="flex-wrap:wrap"></div>
+    </details>
+    <label>排序 <select id="wk-alias-sort">
+      <option value="added_desc">最近加入</option>
+      <option value="added_asc">最早加入</option>
+    </select></label>
+  </div>
   <div id="wk-alias-missing"></div>
   <p class="muted" id="wk-alias-stat" style="margin:8px 0 0"></p>
   <div id="wk-alias-list" class="muted" style="margin-top:10px">加载中…</div>
@@ -70,6 +82,20 @@
     <button class="btn btn-sm wk-dt-kind active" data-kind="char">角色</button>
     <button class="btn btn-sm wk-dt-kind" data-kind="bond">羁绊</button>
     <input type="text" id="wk-dt-q" placeholder="搜索英文名 / 中文名…" style="width:220px">
+  </div>
+  <div class="row" id="wk-dt-filters" style="margin:10px 0;flex-wrap:wrap">
+    <details><summary data-facet-label="element">属性</summary>
+      <div class="row" data-facet="element" style="flex-wrap:wrap"></div>
+    </details>
+    <details><summary data-facet-label="job">职业</summary>
+      <div class="row" data-facet="job" style="flex-wrap:wrap"></div>
+    </details>
+    <label>排序 <select id="wk-dt-sort">
+      <option value="added_desc">最近加入</option>
+      <option value="added_asc">最早加入</option>
+      <option value="release_desc">上线时间从新到旧</option>
+      <option value="release_asc">上线时间从旧到新</option>
+    </select></label>
   </div>
   <div class="wk-dt-cols" style="margin-top:10px">
     <div id="wk-dt-list" class="muted">加载中…</div>

@@ -81,42 +81,108 @@
   document.getElementById('wk-refresh').addEventListener('click', load);
   load();
 
+  function catalogueFilters(prefix) {
+    return document.getElementById(prefix + '-filters');
+  }
+
+  function selectedFacet(prefix, field) {
+    return Array.from(
+      catalogueFilters(prefix).querySelectorAll(`[data-facet="${field}"] input:checked`),
+      input => input.value
+    );
+  }
+
+  function catalogueURL(prefix, kind, view, q) {
+    const params = new URLSearchParams({ kind, view, q, sort: document.getElementById(prefix + '-sort').value });
+    for (const field of ['element', 'job']) {
+      selectedFacet(prefix, field).forEach(value => params.append(field, value));
+    }
+    return '/api/wiki/catalog?' + params;
+  }
+
+  function renderFacets(prefix, kind, facets) {
+    for (const field of ['element', 'job']) {
+      const selected = new Set(selectedFacet(prefix, field));
+      const options = facets[field] || [];
+      const host = catalogueFilters(prefix);
+      host.querySelector(`[data-facet="${field}"]`).innerHTML = options.map(value =>
+        `<label><input type="checkbox" value="${attr(value)}"${selected.has(value) ? ' checked' : ''}> ${esc(value)}</label>`
+      ).join('');
+      const label = kind === 'bond' ? (field === 'element' ? '关联角色属性' : '适用职业')
+        : (field === 'element' ? '属性' : '职业');
+      const count = options.filter(value => selected.has(value)).length;
+      host.querySelector(`[data-facet-label="${field}"]`).textContent = label + (count ? `（${count}）` : '');
+    }
+  }
+
+  function resetFacets(prefix) {
+    catalogueFilters(prefix).querySelectorAll('input:checked').forEach(input => { input.checked = false; });
+  }
+
+  function addedDate(value) {
+    return value ? new Date(value).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '加入时间未知';
+  }
+
+  function catalogueMeta(item, showRelease = false) {
+    const status = { unreleased: '未上线', released: '已上线', unknown: '上线状态未知' }[item.release_status];
+    const fields = [item.elements?.join('、') || '属性未知', item.job || '职业未知', addedDate(item.added_at)];
+    if (showRelease && status) {
+      fields.push(item.release_date ? status + ' ' + item.release_date
+        : item.release_status === 'released' ? '已上线 · 日期未知' : status);
+    }
+    return fields.map(esc).join(' · ');
+  }
+
   /* ── Alias manager ─────────────────────────────────────────── */
 
   let aliasKind = 'char';        // 'char' | 'bond'
   let aliasSnapshot = {};        // {canonical: [alias...]} 全量快照
   let aliasQuery = '';
+  let aliasItems = [];
+  let aliasRequest = 0;
 
   function cloneSnapshot() { return JSON.parse(JSON.stringify(aliasSnapshot)); }
 
   async function loadAliases() {
     const list = document.getElementById('wk-alias-list');
     list.innerHTML = '<div class="muted">加载中…</div>';
+    const request = ++aliasRequest;
+    const kind = aliasKind;
     try {
-      aliasSnapshot = (await api('/api/wiki/aliases?kind=' + aliasKind)) || {};
+      const data = await api(catalogueURL('wk-alias', kind, 'aliases', aliasQuery));
+      if (request !== aliasRequest) return false;
+      aliasSnapshot = data.alias_snapshot || {};
+      aliasItems = data.items || [];
+      renderFacets('wk-alias', kind, data.facets || {});
       renderAliases();
+      return true;
     } catch (e) {
-      list.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+      if (request === aliasRequest) list.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+      return false;
     }
   }
 
   function renderAliases() {
     const list = document.getElementById('wk-alias-list');
     const canons = Object.keys(aliasSnapshot);
-    const q = aliasQuery.trim().toLowerCase();
-    const filtered = canons.filter(c => !q
-      || c.toLowerCase().includes(q)
-      || (aliasSnapshot[c] || []).some(a => a.toLowerCase().includes(q)));
+    const filtered = aliasItems;
     document.getElementById('wk-alias-stat').textContent =
       `共 ${canons.length} 组，显示 ${filtered.length} 组 · 修改名称输入框后点「保存本组」即重命名`;
     if (!filtered.length) {
       list.innerHTML = '<div class="muted">无匹配分组</div>';
       return;
     }
-    list.innerHTML = filtered.map(c => {
-      const aliases = aliasSnapshot[c] || [];
+    const oldestFirst = document.getElementById('wk-alias-sort').value === 'added_asc';
+    list.innerHTML = filtered.map(item => {
+      const c = item.canonical;
+      const aliases = [...(aliasSnapshot[c] || [])];
+      const dates = item.alias_added_at || {};
+      aliases.sort((a, b) => {
+        if (!dates[a] || !dates[b]) return Number(Boolean(dates[b])) - Number(Boolean(dates[a]));
+        return oldestFirst ? dates[a].localeCompare(dates[b]) : dates[b].localeCompare(dates[a]);
+      });
       const chips = aliases.map(a =>
-        `<span class="pill alias-chip">${esc(a)}<span class="x" data-canon="${attr(c)}" data-alias="${attr(a)}" title="删除别名">×</span></span>`
+        `<span class="pill alias-chip" title="${attr(addedDate(dates[a]))}">${esc(a)}<span class="x" data-canon="${attr(c)}" data-alias="${attr(a)}" title="删除别名">×</span></span>`
       ).join('');
       return `<div class="alias-group" data-canon="${attr(c)}">
         <div class="row">
@@ -127,21 +193,25 @@
           <button class="btn btn-sm alias-save">保存本组</button>
           <button class="btn btn-sm btn-danger alias-del-group">删除组</button>
         </div>
+        <div class="muted">${catalogueMeta(item, aliasKind === 'char')}</div>
         <div class="alias-chips">${chips || '<span class="muted">（无别名）</span>'}</div>
       </div>`;
     }).join('');
   }
 
   async function putAliases(nextSnapshot, okMsg) {
+    const kind = aliasKind;
     try {
       const r = await api('/api/wiki/aliases', {
         method: 'PUT',
-        body: { kind: aliasKind, aliases: nextSnapshot },
+        body: { kind, aliases: nextSnapshot },
       });
       if (r && r.warning) toast(r.warning, 'info', 6000);
       else toast(okMsg || '已保存', 'success');
-      await loadAliases();
-      loadMissing();   // 保存可能使「待补录」条目落组，同步刷新
+      if (kind === aliasKind) {
+        await loadAliases();
+        loadMissing();
+      }
     } catch (e) {
       toast(e.message, 'error', 5000);
     }
@@ -211,7 +281,7 @@
     if (!canon) return;
     const hints = (it.aliases_hint || []).filter(Boolean);
     if (!confirm(`「${canon}」当前是「${it.conflict_owner}」分组的别名。\n拆分为独立新组（预填别名：${hints.join('、')}）？\n拆分后「${canon}」将解析到新组，不再指向「${it.conflict_owner}」。`)) return;
-    await loadAliases();   // 以磁盘最新快照为基准，避免陈旧快照全量覆盖
+    if (!await loadAliases()) return;
     const next = cloneSnapshot();
     if (Object.prototype.hasOwnProperty.call(next, canon)) {
       toast(`「${canon}」组已存在`, 'error', 5000);
@@ -231,7 +301,7 @@
   async function createGroup(canon, hintAliases) {
     canon = String(canon || '').trim();
     if (!canon) { toast('名称不能为空', 'error'); return; }
-    await loadAliases();
+    if (!await loadAliases()) return;
     if (Object.prototype.hasOwnProperty.call(aliasSnapshot, canon)) {
       toast(`「${canon}」组已存在`, 'error', 5000);
       return;
@@ -332,6 +402,7 @@
     btn.addEventListener('click', () => {
       if (aliasKind === btn.dataset.kind) return;
       aliasKind = btn.dataset.kind;
+      resetFacets('wk-alias');
       document.querySelectorAll('.wk-kind').forEach(b =>
         b.classList.toggle('active', b === btn));
       loadAliases();
@@ -339,11 +410,13 @@
     });
   });
 
-  /* 搜索过滤（纯前端） */
-  document.getElementById('wk-alias-q').addEventListener('input', (ev) => {
-    aliasQuery = ev.target.value;
-    renderAliases();
+  let aliasDebounce = null;
+  document.getElementById('wk-alias-q').addEventListener('input', ev => {
+    aliasQuery = ev.target.value.trim();
+    clearTimeout(aliasDebounce);
+    aliasDebounce = setTimeout(loadAliases, 250);
   });
+  catalogueFilters('wk-alias').addEventListener('change', loadAliases);
 
   loadAliases();
   loadMissing();
@@ -570,43 +643,47 @@
   let dtQuery = '';
   let dtSelected = '';
   let dtSelectedGd = '';   // 选中的解包角色 rid（只读视图）
-  let dtGdTotal = 0;       // 列表里解包来源的总行数（未过滤）
+  let dtTotal = 0;
+  let dtRequest = 0;
   let dtEntry = null;
   let dtPollTimer = null;
 
   async function loadDetails() {
     const list = document.getElementById('wk-dt-list');
     list.innerHTML = '<div class="muted">加载中…</div>';
+    const request = ++dtRequest;
+    const kind = dtKind;
     try {
-      const d = await api(`/api/wiki/details?kind=${dtKind}&q=${encodeURIComponent(dtQuery)}`);
-      dtItems = (d && d.items) || [];
-      dtGdTotal = (d && d.gamedata_total) || 0;
-      if (d && d.note && !dtItems.length) {
-        list.innerHTML = `<div class="muted">${esc(d.note)}</div>`;
-        return;
-      }
-      renderDtList(d && d.total);
+      const data = await api(catalogueURL('wk-dt', kind, 'entries', dtQuery));
+      if (request !== dtRequest) return;
+      dtItems = data.items || [];
+      dtTotal = data.total ?? dtItems.length;
+      renderFacets('wk-dt', kind, data.facets || {});
+      renderDtList();
     } catch (e) {
-      list.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+      if (request === dtRequest) list.innerHTML = `<div class="err">${esc(e.message)}</div>`;
     }
   }
 
-  function renderDtList(total) {
+  function renderDtList() {
     const list = document.getElementById('wk-dt-list');
     document.getElementById('wk-dt-status').textContent =
-      `共 ${total != null ? total : dtItems.length} 条` +
-      (dtGdTotal ? `（含解包 ${dtGdTotal} 条，只读；同一羁绊可有 Wiki 与解包两种来源）` : '') +
-      (dtQuery ? `，过滤「${dtQuery}」后 ${dtItems.length} 条` : '');
+      `共 ${dtTotal} 条，显示 ${dtItems.length} 条`;
     if (!dtItems.length) {
       list.innerHTML = '<div class="muted">无匹配条目</div>';
       return;
     }
     list.innerHTML = dtItems.map(it => {
       const gd = it.source === 'gamedata';
-      const active = gd ? (it.id === dtSelectedGd) : (it.title === dtSelected);
-      return `<div class="dt-item${active ? ' active' : ''}" data-title="${attr(it.title)}" data-source="${attr(it.source || 'wiki')}" data-id="${attr(it.id || '')}">
-      <div><strong>${esc(it.name_cn || '(未翻译)')}</strong>${gd ? ' <span class="pill badge-warn" title="来自游戏解包数据，只读展示">解包</span>' : ''}${it.manual ? ' <span class="pill manual-pill" title="含人工修正字段">人工</span>' : ''}${it.has_cn ? '' : ' <span class="pill badge-warn" title="中文字段仍是英文原文">英</span>'}</div>
+      const active = (dtSelectedGd && (it.gamedata_id === dtSelectedGd || it.id === dtSelectedGd))
+        || it.title === dtSelected;
+      const gameView = !gd && (it.sources || []).includes('gamedata')
+        ? ' <button type="button" class="btn btn-sm btn-ghost dt-view-gamedata">解包详情</button>' : '';
+      const roster = it.source === 'roster' ? ' <span class="pill">名单</span>' : '';
+      return `<div class="dt-item${active ? ' active' : ''}" data-title="${attr(it.title)}" data-source="${attr(it.source || 'wiki')}" data-id="${attr(it.id || '')}" data-gamedata-id="${attr(it.gamedata_id || '')}">
+      <div><strong>${esc(it.name_cn || '(未翻译)')}</strong>${gd ? ' <span class="pill badge-warn" title="来自游戏解包数据，只读展示">解包</span>' : ''}${it.manual ? ' <span class="pill manual-pill" title="含人工修正字段">人工</span>' : ''}${it.has_cn ? '' : ' <span class="pill badge-warn" title="中文字段仍是英文原文">英</span>'}${roster}${gameView}</div>
       <div class="t2 mono muted">${esc(it.title)}${it.id ? ' · ' + esc(it.id) : ''}${it.stars ? ' · ' + '★'.repeat(it.stars) : ''}</div>
+      <div class="t2 muted">${catalogueMeta(it, true)}</div>
     </div>`;
     }).join('');
   }
@@ -845,8 +922,19 @@
   document.getElementById('wk-dt-list').addEventListener('click', ev => {
     const item = ev.target.closest('.dt-item');
     if (!item) return;
-    if (item.dataset.source === 'gamedata') selectGamedataEntry(item.dataset.id);
-    else selectEntry(item.dataset.title);
+    if (item.dataset.source === 'gamedata' || ev.target.closest('.dt-view-gamedata')) {
+      selectGamedataEntry(item.dataset.gamedataId || item.dataset.id);
+    } else if (item.dataset.source === 'roster') {
+      const row = dtItems.find(entry => entry.id === item.dataset.id);
+      if (!row) return;
+      dtSelectedGd = row.id;
+      dtSelected = '';
+      dtEntry = null;
+      renderDtList();
+      document.getElementById('wk-dt-editor').innerHTML =
+        `<strong>${esc(row.name_cn)}</strong><div class="muted">${esc(row.id)} · 名单（只读）</div>
+         <div>${catalogueMeta(row, true)}</div>`;
+    } else selectEntry(item.dataset.title);
   });
 
   document.getElementById('wk-dt-editor').addEventListener('click', async ev => {
@@ -872,10 +960,13 @@
     }, 300);
   });
 
+  catalogueFilters('wk-dt').addEventListener('change', loadDetails);
+
   document.querySelectorAll('.wk-dt-kind').forEach(btn => {
     btn.addEventListener('click', () => {
       if (dtKind === btn.dataset.kind) return;
       dtKind = btn.dataset.kind;
+      resetFacets('wk-dt');
       document.querySelectorAll('.wk-dt-kind').forEach(b =>
         b.classList.toggle('active', b === btn));
       dtSelected = '';

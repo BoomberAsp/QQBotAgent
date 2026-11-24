@@ -1214,6 +1214,21 @@ async def api_wiki_glossary_put(payload: GlossaryPayload, request: Request):
 
 # ── Wiki 详情缓存编辑 / LLM 重翻译 API ────────────────────────────
 
+@app.get("/api/wiki/catalog")
+async def api_wiki_catalog(
+    kind: str = "char", view: str = "entries", q: str = "",
+    element: list[str] | None = Query(None), job: list[str] | None = Query(None),
+    sort: str = "added_desc", release_status: str | None = None,
+):
+    result = await asyncio.to_thread(
+        data_reader.wiki_catalog_query, kind, view, q=q, element=element,
+        job=job, sort=sort, release_status=release_status,
+    )
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
 @app.get("/api/wiki/details")
 async def api_wiki_details_list(kind: str = "char", q: str = ""):
     result = await asyncio.to_thread(data_reader.wiki_details_list, kind, q)

@@ -132,6 +132,7 @@ from tools.legacy_tools import (
     translate_text,
 )
 from tools.character_detail import character_detail, character_detail_with_card
+from tools.character_list import list_characters
 from tools.bond_detail import bond_detail, bond_detail_with_card
 from tools.battle_parser import parse_battle_screenshots
 from tools.card_renderer import (
@@ -579,6 +580,29 @@ def _build_tool_registry() -> ToolRegistry:
                 "target_language": {"type": "string", "description": "目标语言，默认中文", "default": "Chinese"},
             },
             "required": ["text"],
+        },
+    )
+    registry.register(
+        "list_characters", list_characters,
+        "筛选 Ark Re:Code 角色列表。回答哪些角色属于某属性或职业、最近上线、以及未上线角色时使用。"
+        "同字段多选为任一匹配，属性和职业同时匹配。"
+        "问最近上线时传 release_status=released；结果已排序，未上线同权置顶。"
+        "根据返回的 ID 查询单个角色详情。",
+        {
+            "type": "object",
+            "properties": {
+                "q": {"type": "string", "description": "按名称、别名或角色 ID 搜索"},
+                "element": {"type": "array", "items": {
+                    "type": "string", "enum": ["火", "水", "木", "光", "暗", "未知"],
+                }},
+                "job": {"type": "array", "items": {
+                    "type": "string", "enum": ["战士", "术士", "重装", "医疗", "狙击", "先锋", "未知"],
+                }},
+                "release_status": {"type": "string", "enum": ["unreleased", "released", "unknown"]},
+                "sort": {"type": "string", "enum": ["release_desc", "release_asc"], "default": "release_desc"},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            },
         },
     )
     registry.register(
@@ -1945,7 +1969,7 @@ def _get_user_info() -> str:
     dev_tools = {"execute_code", "shell_exec", "web_fetch", "download_repo", "get_system_load"}
     fun_tools = {"gacha_pull", "play_gacha_animation", "calculate_speed",
                  "compare_speed_probability", "explain_code", "translate_text",
-                 "character_detail", "bond_detail", "parse_battle_screenshots"}
+                 "character_detail", "list_characters", "bond_detail", "parse_battle_screenshots"}
     misc = allowed - info_tools - dev_tools - fun_tools
 
     sections = [

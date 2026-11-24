@@ -26,7 +26,7 @@ current_group_run = ContextVar("current_group_run", default=None)
 # tools need explicit group-resource adapters before they may join this list.
 GROUP_TOOLS = frozenset({"search_web", "find_image_source", "get_time", "geocode", "reverse_geocode",
                         "survey_status",
-                        "search_poi", "get_weather", "character_detail", "bond_detail",
+                        "search_poi", "get_weather", "character_detail", "list_characters", "bond_detail",
                         "redeem_code", "get_changelog", "delegate_task", "story_search", "group_media", "send_sticker", "search_images", "fetch_image", "discover_images"})
 _store = None
 _locks = {}

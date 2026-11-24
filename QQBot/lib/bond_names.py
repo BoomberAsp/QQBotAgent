@@ -21,4 +21,10 @@ def load_artifacts():
         return {}
 
 
+def artifact_id_redirects(artifacts):
+    """Known legacy catalogue IDs superseded by the current game data."""
+    return {old: current for old, current in (("A0129", "A0159"), ("A0165", "A0162"))
+            if current in artifacts and old not in artifacts}
+
+
 from lib.game_names import reconcile  # backward-compatible artifact API

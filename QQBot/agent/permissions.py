@@ -65,6 +65,7 @@ _PUBLIC_TOOLS: Set[str] = {
     "explain_code",
     "translate_text",
     "character_detail",
+    "list_characters",
     "bond_detail",
     "parse_battle_screenshots",
     "redeem_code",

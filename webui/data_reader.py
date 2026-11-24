@@ -26,6 +26,7 @@ from pathlib import Path
 
 from . import config
 from lib.bond_names import reconcile as reconcile_bond_name
+from lib.wiki_catalog import WikiCatalog
 
 DATA = config.QQBOT_DIR / "data"
 TOKEN_DIR = DATA / "token_usage"
@@ -758,6 +759,29 @@ def wiki_aliases_read(kind: str) -> dict:
     return groups
 
 
+def _wiki_catalog():
+    return WikiCatalog(
+        WIKI_CACHE_DIR, config.GAMEDATA_DIR,
+        detail_files=_ALIAS_DETAILS_FILES, alias_files=_ALIAS_FILES,
+    )
+
+
+def wiki_catalog_query(kind: str, view: str, **filters) -> dict:
+    groups = wiki_aliases_read(kind) if view == "aliases" else None
+    if groups and isinstance(groups.get("error"), str):
+        if kind in _ALIAS_FILES and not _ALIAS_FILES[kind].is_file():
+            groups = {}
+        else:
+            return groups
+    try:
+        result = _wiki_catalog().query(kind, view=view, observe=True, groups=groups, **filters)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if view == "aliases":
+        result["alias_snapshot"] = groups
+    return result
+
+
 def wiki_aliases_save(kind: str, grouped: dict) -> dict:
     """Validate + flatten + atomically replace the alias dictionary.
 
@@ -789,6 +813,9 @@ def wiki_aliases_save(kind: str, grouped: dict) -> dict:
             owner[low] = canonical
             flat[alias] = canonical
 
+    previous = wiki_aliases_read(kind)
+    if isinstance(previous.get("error"), str):
+        previous = {}
     # ── backup + atomic write ──
     try:
         if path.exists():
@@ -800,6 +827,7 @@ def wiki_aliases_save(kind: str, grouped: dict) -> dict:
     except Exception as e:
         return {"error": f"写入失败: {e}"}
 
+    _wiki_catalog().record_alias_save(kind, previous, grouped)
     # ── rebuild pinyin index (bot side only reads it from disk) ──
     warning = None
     try:
