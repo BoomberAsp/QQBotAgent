@@ -1218,7 +1218,7 @@ async def api_wiki_glossary_put(payload: GlossaryPayload, request: Request):
 async def api_wiki_catalog(
     kind: str = "char", view: str = "entries", q: str = "",
     element: list[str] | None = Query(None), job: list[str] | None = Query(None),
-    sort: str = "added_desc", release_status: str | None = None,
+    sort: str = "release_desc", release_status: str | None = None,
 ):
     result = await asyncio.to_thread(
         data_reader.wiki_catalog_query, kind, view, q=q, element=element,
@@ -1245,8 +1245,7 @@ async def api_wiki_details_entry(kind: str = "char", title: str = ""):
     return result
 
 
-# 解包角色（gamedata）只读条目：wiki 未收录的新角色（如 H806 蜜拉贝儿）
-# 没有可编辑的详情缓存条目，面板展示 names/aliases/技能/卡面文案 的只读视图。
+# 默认只读详情使用解包数据与 Wiki 补充字段，Wiki 编辑继续走 entry 接口。
 @app.get("/api/wiki/details/gamedata")
 async def api_wiki_details_gamedata(rid: str = "", kind: str = "char"):
     result = await asyncio.to_thread(data_reader.wiki_details_gamedata_entry, rid, kind)

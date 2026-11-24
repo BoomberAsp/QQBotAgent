@@ -123,13 +123,12 @@
     return value ? new Date(value).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '加入时间未知';
   }
 
-  function catalogueMeta(item, showRelease = false) {
-    const status = { unreleased: '未上线', released: '已上线', unknown: '上线状态未知' }[item.release_status];
-    const fields = [item.elements?.join('、') || '属性未知', item.job || '职业未知', addedDate(item.added_at)];
-    if (showRelease && status) {
-      fields.push(item.release_date ? status + ' ' + item.release_date
-        : item.release_status === 'released' ? '已上线 · 日期未知' : status);
-    }
+  function catalogueMeta(item) {
+    const status = { unreleased: '未上线', released: '已上线', unknown: '上线状态未知' }[item.release_status]
+      || '上线状态未知';
+    const release = item.release_date ? status + ' ' + item.release_date
+      : item.release_status === 'released' ? '已上线 · 日期未知' : status;
+    const fields = [item.elements?.join('、') || '属性未知', item.job || '职业未知', release, addedDate(item.added_at)];
     return fields.map(esc).join(' · ');
   }
 
@@ -172,15 +171,10 @@
       list.innerHTML = '<div class="muted">无匹配分组</div>';
       return;
     }
-    const oldestFirst = document.getElementById('wk-alias-sort').value === 'added_asc';
     list.innerHTML = filtered.map(item => {
       const c = item.canonical;
-      const aliases = [...(aliasSnapshot[c] || [])];
+      const aliases = aliasSnapshot[c] || [];
       const dates = item.alias_added_at || {};
-      aliases.sort((a, b) => {
-        if (!dates[a] || !dates[b]) return Number(Boolean(dates[b])) - Number(Boolean(dates[a]));
-        return oldestFirst ? dates[a].localeCompare(dates[b]) : dates[b].localeCompare(dates[a]);
-      });
       const chips = aliases.map(a =>
         `<span class="pill alias-chip" title="${attr(addedDate(dates[a]))}">${esc(a)}<span class="x" data-canon="${attr(c)}" data-alias="${attr(a)}" title="删除别名">×</span></span>`
       ).join('');
@@ -193,7 +187,7 @@
           <button class="btn btn-sm alias-save">保存本组</button>
           <button class="btn btn-sm btn-danger alias-del-group">删除组</button>
         </div>
-        <div class="muted">${catalogueMeta(item, aliasKind === 'char')}</div>
+        <div class="muted">${catalogueMeta(item)}</div>
         <div class="alias-chips">${chips || '<span class="muted">（无别名）</span>'}</div>
       </div>`;
     }).join('');
@@ -676,14 +670,14 @@
     list.innerHTML = dtItems.map(it => {
       const gd = it.source === 'gamedata';
       const active = (dtSelectedGd && (it.gamedata_id === dtSelectedGd || it.id === dtSelectedGd))
-        || it.title === dtSelected;
-      const gameView = !gd && (it.sources || []).includes('gamedata')
-        ? ' <button type="button" class="btn btn-sm btn-ghost dt-view-gamedata">解包详情</button>' : '';
+        || (dtSelected && (it.wiki_title || it.title) === dtSelected);
+      const wikiEdit = gd && it.wiki_title
+        ? ' <button type="button" class="btn btn-sm btn-ghost dt-edit-wiki">编辑 Wiki</button>' : '';
       const roster = it.source === 'roster' ? ' <span class="pill">名单</span>' : '';
-      return `<div class="dt-item${active ? ' active' : ''}" data-title="${attr(it.title)}" data-source="${attr(it.source || 'wiki')}" data-id="${attr(it.id || '')}" data-gamedata-id="${attr(it.gamedata_id || '')}">
-      <div><strong>${esc(it.name_cn || '(未翻译)')}</strong>${gd ? ' <span class="pill badge-warn" title="来自游戏解包数据，只读展示">解包</span>' : ''}${it.manual ? ' <span class="pill manual-pill" title="含人工修正字段">人工</span>' : ''}${it.has_cn ? '' : ' <span class="pill badge-warn" title="中文字段仍是英文原文">英</span>'}${roster}${gameView}</div>
+      return `<div class="dt-item${active ? ' active' : ''}" data-title="${attr(it.wiki_title || (gd ? '' : it.title) || '')}" data-source="${attr(it.source || 'wiki')}" data-id="${attr(it.id || '')}" data-gamedata-id="${attr(it.gamedata_id || '')}">
+      <div><strong>${esc(it.name_cn || '(未翻译)')}</strong>${gd ? ' <span class="pill badge-warn" title="来自游戏解包数据，只读展示">解包</span>' : ''}${it.manual ? ' <span class="pill manual-pill" title="Wiki 含人工修正字段">Wiki 人工</span>' : ''}${it.has_cn ? '' : ' <span class="pill badge-warn" title="中文字段仍是英文原文">英</span>'}${roster}${wikiEdit}</div>
       <div class="t2 mono muted">${esc(it.title)}${it.id ? ' · ' + esc(it.id) : ''}${it.stars ? ' · ' + '★'.repeat(it.stars) : ''}</div>
-      <div class="t2 muted">${catalogueMeta(it, true)}</div>
+      <div class="t2 muted">${catalogueMeta(it)}</div>
     </div>`;
     }).join('');
   }
@@ -737,24 +731,28 @@
   }
 
   async function selectEntry(title) {
+    const kind = dtKind;
     dtSelected = title;
     dtSelectedGd = '';
     renderDtList();
     const ed = document.getElementById('wk-dt-editor');
     ed.innerHTML = '<div class="muted">加载中…</div>';
     try {
-      const d = await api(`/api/wiki/details/entry?kind=${dtKind}&title=${encodeURIComponent(title)}`);
+      const d = await api(`/api/wiki/details/entry?kind=${kind}&title=${encodeURIComponent(title)}`);
+      if (kind !== dtKind || title !== dtSelected) return;
       dtEntry = d.entry;
       renderDtEditor();
     } catch (e) {
+      if (kind !== dtKind || title !== dtSelected) return;
       dtEntry = null;
       ed.innerHTML = `<div class="err">${esc(e.message)}</div>`;
     }
   }
 
-  /* ── 解包角色只读视图（wiki 未收录，无缓存条目可编辑）────────── */
+  /* ── 默认只读详情 ───────────────────────────────────────────── */
 
-  async function selectGamedataEntry(rid) {
+  async function selectGamedataEntry(rid, wikiTitle) {
+    const kind = dtKind;
     dtSelected = '';
     dtSelectedGd = rid;
     dtEntry = null;
@@ -762,9 +760,15 @@
     const ed = document.getElementById('wk-dt-editor');
     ed.innerHTML = '<div class="muted">加载中…</div>';
     try {
-      const d = await api('/api/wiki/details/gamedata?rid=' + encodeURIComponent(rid) + '&kind=' + encodeURIComponent(dtKind));
+      const d = await api('/api/wiki/details/gamedata?rid=' + encodeURIComponent(rid) + '&kind=' + encodeURIComponent(kind));
+      if (kind !== dtKind || rid !== dtSelectedGd) return;
       renderGdEditor(d.entry || {});
     } catch (e) {
+      if (kind !== dtKind || rid !== dtSelectedGd) return;
+      if (wikiTitle) {
+        await selectEntry(wikiTitle);
+        return;
+      }
       ed.innerHTML = `<div class="err">${esc(e.message)}</div>`;
     }
   }
@@ -776,26 +780,32 @@
 
   function renderGdEditor(e) {
     if (dtKind === 'bond') {
-      const local = values => values && (values.zh_hans || values.zh_hant || values.en) || '';
-      const stat = stage => e.stats && e.stats[stage] || {};
+      const display = e.display || {};
+      const stats = stage => {
+        const atk = display['atk_' + stage], hp = display['hp_' + stage];
+        return atk == null && hp == null ? '' : (atk ?? '—') + ' / ' + (hp ?? '—');
+      };
       document.getElementById('wk-dt-editor').innerHTML = `
-        <div class="row"><strong>${esc(local(e.names) || e.id)}</strong>
+        <div class="row"><strong>${esc(display.name_cn || e.id)}</strong>
         <span class="mono muted">${esc(e.id)}</span><span class="pill badge-warn">解包 · 只读</span></div>
         <table class="kv-table">
-          ${gdRow('英文名', e.names && e.names.en)}
-          ${gdRow('星级 / 职业', [e.star, e.job].filter(Boolean).join(' / '))}
-          ${gdRow('初始攻击 / 生命', [stat('base').atk, stat('base').hp].join(' / '))}
-          ${gdRow('最大攻击 / 生命', [stat('max').atk, stat('max').hp].join(' / '))}
-          ${gdRow('别名', (e.aliases || []).join('、'))}
+          ${gdRow('英文名', display.title)}
+          ${gdRow('星级 / 职业', [display.stars, display.class_cn].filter(Boolean).join(' / '))}
+          ${gdRow('初始攻击 / 生命', stats('base'))}
+          ${gdRow('最大攻击 / 生命', stats('max'))}
+          ${gdRow('别名', (display.name_aliases || []).join('、'))}
+          ${gdRow('关联角色', display.member)}
+          ${gdRow('上线时间', display.release)}
+          ${gdRow('获取方式', display.obtain)}
         </table>
-        <h4>官方说明</h4><div style="white-space:pre-wrap">${esc(local(e.description))}</div>
-        <h4>官方效果模板</h4><div style="white-space:pre-wrap">${esc(local(e.effect))}</div>
-        <p class="muted">效果占位符保留游戏原始参数，不代表已经计算的满级数值。解包条目可能包含活动专用或未上线数据；Wiki 翻译条目仍可单独编辑。</p>
+        ${display.desc ? `<h4>${display.desc_source === 'gamedata' ? '官方说明' : '简介（Wiki）'}</h4><div style="white-space:pre-wrap">${esc(display.desc)}</div>` : ''}
+        ${display.effect ? `<h4>${display.effect_template ? '官方效果模板（保留参数占位）' : display.effect_source === 'gamedata' ? '官方效果' : '效果（Wiki）'}</h4><div style="white-space:pre-wrap">${esc(display.effect)}</div>` : ''}
+        ${display.notes ? `<h4>备注（Wiki）</h4><div style="white-space:pre-wrap">${esc(display.notes)}</div>` : ''}
         <details><summary>原始效果参数</summary><pre style="white-space:pre-wrap">${esc(JSON.stringify(e.parameters || {}, null, 2))}</pre></details>`;
       return;
     }
     const ed = document.getElementById('wk-dt-editor');
-    const zh = (e.names && (e.names.zh_hans || e.names.zh_hant)) || '';
+    const zh = e.display_name || '';
     const star = e.star ? '★'.repeat(e.star) : '';
     const portrait = e.portrait
       ? `<img src="/api/wiki/portrait?rid=${encodeURIComponent(e.id)}" alt="立绘"
@@ -819,13 +829,14 @@
         ${gdRow('别名', (e.aliases || []).join('、'))}
         ${gdRow('生日', e.card && e.card.birthday)}
         ${gdRow('身高 / 体重', [e.card && e.card.height, e.card && e.card.weight].filter(Boolean).join(' / '))}
+        ${gdRow('上线时间', e.release)}
         ${gdRow('游戏版本', e.build)}
       </table>
       ${e.card && e.card.signature ? `<div class="dt-field"><label>签名</label><div class="muted">${esc(e.card.signature)}</div></div>` : ''}
+      ${e.wiki_description ? `<div class="dt-field"><label>简介（Wiki）</label><div class="muted">${esc(e.wiki_description)}</div></div>` : ''}
       ${e.card && e.card.quote ? `<div class="dt-field"><label>台词</label><div class="muted">${esc(e.card.quote)}</div></div>` : ''}
       ${skills ? `<div class="dt-field"><label>技能</label><ul style="margin:4px 0 0;padding-left:18px">${skills}</ul></div>` : ''}
-      <p class="muted" style="margin-top:10px">解包数据没有可编辑的翻译字段（中文名即官方简中文案）。
-        bot 运行时（/角色详情）已优先使用该数据源；wiki 收录该角色后，此处自动让位给可编辑的 wiki 缓存条目。</p>`;
+      <p class="muted" style="margin-top:10px">解包资料只读，缺失字段由 Wiki 补充。</p>`;
   }
 
   function getByPath(obj, path) {
@@ -922,8 +933,10 @@
   document.getElementById('wk-dt-list').addEventListener('click', ev => {
     const item = ev.target.closest('.dt-item');
     if (!item) return;
-    if (item.dataset.source === 'gamedata' || ev.target.closest('.dt-view-gamedata')) {
-      selectGamedataEntry(item.dataset.gamedataId || item.dataset.id);
+    if (ev.target.closest('.dt-edit-wiki')) {
+      selectEntry(item.dataset.title);
+    } else if (item.dataset.source === 'gamedata') {
+      selectGamedataEntry(item.dataset.gamedataId || item.dataset.id, item.dataset.title);
     } else if (item.dataset.source === 'roster') {
       const row = dtItems.find(entry => entry.id === item.dataset.id);
       if (!row) return;
@@ -933,7 +946,7 @@
       renderDtList();
       document.getElementById('wk-dt-editor').innerHTML =
         `<strong>${esc(row.name_cn)}</strong><div class="muted">${esc(row.id)} · 名单（只读）</div>
-         <div>${catalogueMeta(row, true)}</div>`;
+         <div>${catalogueMeta(row)}</div>`;
     } else selectEntry(item.dataset.title);
   });
 

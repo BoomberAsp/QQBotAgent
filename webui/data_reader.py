@@ -25,7 +25,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import config
+from lib.bond_names import artifact_detail, artifact_id_redirects
 from lib.bond_names import reconcile as reconcile_bond_name
+from lib.game_names import official_chinese_name
 from lib.wiki_catalog import WikiCatalog
 
 DATA = config.QQBOT_DIR / "data"
@@ -922,42 +924,72 @@ def wiki_portrait_path(rid: str) -> Path | None:
     return p if p.is_file() else None
 
 
+def _wiki_details_fallback(kind, rid, official):
+    _, blob, _ = _details_load(kind)
+    redirects = artifact_id_redirects(official) if kind == "bond" else {}
+    def matches(row):
+        key = str(row.get("id") or "").strip().upper()
+        return redirects.get(key, key) == rid.upper()
+
+    candidates = (row for row in ((blob or {}).get("data") or {}).values()
+                  if isinstance(row, dict) and matches(row))
+    return max(candidates, key=lambda row: bool(row.get("_manual_fields")), default={})
+
+
 def wiki_details_gamedata_entry(rid: str, kind: str = "char") -> dict:
-    """解包角色的只读条目视图（wiki 未收录 → 无可编辑的详情缓存条目）。"""
+    """默认只读详情，以解包字段优先，Wiki 提供补充内容。"""
     if kind not in ("char", "bond"):
         return {"error": f"非法详情类型: {kind}"}
     rid = (rid or "").strip()
     if kind == "bond":
-        entry = _gamedata_artifacts().get(rid)
+        artifacts = _gamedata_artifacts()
+        entry = artifacts.get(rid)
         if not isinstance(entry, dict):
             return {"error": f"gamedata 无此羁绊: {rid}"}
-        return {"kind": "gamedata_bond", "rid": rid,
-                "entry": {**entry, "source": "gamedata"}}
+        wiki = _wiki_details_fallback(kind, rid, artifacts)
+        return {"kind": "gamedata_bond", "rid": rid, "entry": {
+            **entry, "source": "gamedata", "display": artifact_detail(rid, entry, wiki),
+        }}
     roles = _gamedata_roles()
     if not roles:
         return {"error": "gamedata 解包产物不可用（GAMEDATA_DIR 未配置或 roles.json 为空）"}
     role = roles.get(rid)
     if not isinstance(role, dict):
         return {"error": f"gamedata 无此角色: {rid}"}
+    wiki = _wiki_details_fallback(kind, rid, roles)
     names = role.get("names") or {}
     card = role.get("card") or {}
-    skills = [{"id": str(s.get("id") or ""),
-               "slot": s.get("slot"),
-               "name_cn": str((s.get("name") or {}).get("zh_hans") or ""),
-               "name_en": str((s.get("name") or {}).get("en") or "")}
-              for s in (role.get("skills") or []) if isinstance(s, dict)]
+    official_skills = [skill for skill in (role.get("skills") or ()) if isinstance(skill, dict)]
+    wiki_skills = [skill for skill in (wiki.get("skills") or ()) if isinstance(skill, dict)]
+    skills = []
+    for index, skill in enumerate(official_skills):
+        slot = skill.get("slot") or index + 1
+        fallback = wiki_skills[slot - 1] if isinstance(slot, int) and 1 <= slot <= len(wiki_skills) else {}
+        names_by_language = skill.get("name") or {}
+        skills.append({
+            "id": str(skill.get("id") or ""), "slot": slot,
+            "name_cn": str(names_by_language.get("zh_hans") or names_by_language.get("zh_hant") or fallback.get("name") or ""),
+            "name_en": str(names_by_language.get("en") or fallback.get("name_en") or ""),
+        })
+    if not skills:
+        skills = [{"id": skill.get("id") or "", "name_cn": skill.get("name") or "",
+                   "name_en": skill.get("name_en") or ""} for skill in wiki_skills]
     src = _gamedata_source()
     return {"kind": "gamedata_char", "rid": rid, "entry": {
         "id": rid,
         "names": {k: str(v) for k, v in names.items() if v},
-        "aliases": [str(a) for a in (role.get("aliases") or []) if a],
-        "star": role.get("star"),
-        "element": role.get("element") or "",
-        "job": role.get("job") or "",
-        "constellation": role.get("constellation") or "",
-        "card": {k: str(card[k]) for k in
-                 ("signature", "quote", "birthday", "height", "weight")
-                 if card.get(k)},
+        "display_name": official_chinese_name(role, rid) or wiki.get("name_cn") or names.get("en") or rid,
+        "aliases": list(dict.fromkeys(str(alias) for alias in (
+            *(role.get("aliases") or ()), *(wiki.get("name_aliases") or ()),
+        ) if alias)),
+        "star": role.get("star") if role.get("star") is not None else wiki.get("stars"),
+        "element": role.get("element") or wiki.get("element") or wiki.get("element_en") or "",
+        "job": role.get("job") or wiki.get("class_cn") or wiki.get("class_en") or "",
+        "constellation": role.get("constellation") or wiki.get("constellation") or "",
+        "release": role.get("release_date") or role.get("release") or wiki.get("release") or "",
+        "card": {k: str(card.get(k) or wiki.get(k) or "") for k in
+                 ("signature", "quote", "birthday", "height", "weight")},
+        "wiki_description": "" if card.get("signature") else wiki.get("desc") or "",
         "skills": skills,
         "variants": [str(v) for v in (role.get("variants") or []) if v],
         "build": str(((src.manifest if src else {}) or {}).get("game_build") or ""),

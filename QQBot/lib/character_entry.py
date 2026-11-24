@@ -128,5 +128,9 @@ def build_entry(name_or_id: str) -> dict | None:
     except Exception:  # noqa: BLE001
         return None
     if not entry.get("skills") and not wiki:
-        return None
+        from lib.game_names import official_chinese_name
+
+        english = str((g.get("names") or {}).get("en") or "").strip()
+        if not official_chinese_name(g, rid) and (not english or english.casefold() == rid.casefold() or english.startswith("T_")):
+            return None
     return entry

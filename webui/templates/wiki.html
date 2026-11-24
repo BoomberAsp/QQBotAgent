@@ -47,8 +47,8 @@
       <div class="row" data-facet="job" style="flex-wrap:wrap"></div>
     </details>
     <label>排序 <select id="wk-alias-sort">
-      <option value="added_desc">最近加入</option>
-      <option value="added_asc">最早加入</option>
+      <option value="release_desc">上线时间倒序</option>
+      <option value="release_asc">上线时间正序</option>
     </select></label>
   </div>
   <div id="wk-alias-missing"></div>
@@ -77,7 +77,7 @@
 <div class="card wk-pane" id="wk-details" data-pane="details" role="tabpanel" aria-labelledby="wk-tab-details" style="display:none">
   <div class="row">
     <h2 class="card-title" style="margin:0">详情编辑</h2>
-    <span class="muted">字段级人工修正 · 整条 LLM 重翻译 · <span class="pill badge-warn" title="来自解包产物（GAMEDATA_DIR），wiki 未收录">解包</span> 行为只读展示</span>
+    <span class="muted">默认查看解包资料 · Wiki 补充缺失字段 · 通过「编辑 Wiki」维护缓存</span>
     <span class="spacer"></span>
     <button class="btn btn-sm wk-dt-kind active" data-kind="char">角色</button>
     <button class="btn btn-sm wk-dt-kind" data-kind="bond">羁绊</button>
@@ -91,10 +91,8 @@
       <div class="row" data-facet="job" style="flex-wrap:wrap"></div>
     </details>
     <label>排序 <select id="wk-dt-sort">
-      <option value="added_desc">最近加入</option>
-      <option value="added_asc">最早加入</option>
-      <option value="release_desc">上线时间从新到旧</option>
-      <option value="release_asc">上线时间从旧到新</option>
+      <option value="release_desc">上线时间倒序</option>
+      <option value="release_asc">上线时间正序</option>
     </select></label>
   </div>
   <div class="wk-dt-cols" style="margin-top:10px">
@@ -102,7 +100,7 @@
     <div id="wk-dt-editor" class="muted">← 选择左侧条目进行编辑</div>
   </div>
   <p class="muted" id="wk-dt-status" style="margin:8px 0 0"></p>
-  <p class="muted" style="margin:4px 0 0">人工修正写回详情缓存 JSON，bot 侧按 mtime 热读即时生效；角色侧常规周刷新不会覆盖人工修正（merge guard），但「整条 LLM 重翻译」会覆盖全部中文字段。</p>
+  <p class="muted" style="margin:4px 0 0">人工修正写入 Wiki 缓存，用于补充解包缺失字段。整条 LLM 重翻译会覆盖 Wiki 中文字段。</p>
 </div>
 
 

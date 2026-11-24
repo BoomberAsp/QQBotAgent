@@ -61,7 +61,9 @@ class WikiCatalogueTests(unittest.TestCase):
         self.assertEqual([r["release_status"] for r in items], [
             "unreleased", "unreleased", "released", "released", "unknown", "released",
         ])
-        self.assertEqual(items[3]["name_cn"], "人工甲")
+        self.assertEqual(items[3]["name_cn"], "甲")
+        self.assertEqual(items[3]["source"], "gamedata")
+        self.assertEqual(items[3]["wiki_title"], "Alpha")
         self.assertEqual(items[3]["release_date"], "2025-03-19")
         asc = self.catalog.query(sort="release_asc", limit=3)
         self.assertEqual([r["id"] for r in asc["items"]], ["H003", "H004", "H001"])
@@ -81,9 +83,17 @@ class WikiCatalogueTests(unittest.TestCase):
         write_json(self.alias_files["bond"], {"A0165": "交易", "交易别名": "交易"})
         item, = self.catalog.query("bond", element=["木"], job=["全职业"], q="交易别名")["items"]
         self.assertEqual((item["id"], item["job"], set(item["elements"])), ("A0162", "全职业", {"木", "水"}))
-        self.assertEqual(item["sources"], ["wiki", "gamedata"])
+        self.assertEqual(item["sources"], ["gamedata", "wiki"])
+        self.assertEqual(item["source"], "gamedata")
         alias, = self.catalog.query("bond", view="aliases", element=["水"], job=["全职业"])["items"]
         self.assertEqual(alias["canonical"], "交易")
+
+    def test_gamedata_release_fields_win_over_wiki(self):
+        self.roles["H001"].update(release_date="2099-01-01", is_released=False)
+        write_json(self.game / "roles.json", {"roles": self.roles})
+        entry, = self.catalog.query(q="H001")["items"]
+        self.assertEqual((entry["release_date"], entry["release_status"]), ("2099-01-01", "unreleased"))
+        self.assertEqual(self.catalog.query(q="人工甲")["items"][0]["name_cn"], "甲")
 
     def test_dates_survive_import_refresh_and_alias_edits(self):
         initial = self.catalog.query(observe=True)
@@ -114,6 +124,42 @@ class WikiCatalogueTests(unittest.TestCase):
         self.assertEqual(top["id"], "H008")
         self.assertIsNotNone(top["added_at"])
 
+    def test_unpacked_http_details_win_and_fill_missing_fields(self):
+        from fastapi.testclient import TestClient
+        from webui import auth, data_reader
+        from webui.main import app
+
+        self.wiki_rows["Alpha"].update(desc="Wiki 角色简介", stars=4, element="火", class_en="Caster",
+                                       skills=[{"name": "Wiki 技能"}])
+        write_json(self.cache / "character_details.json", {"data": self.wiki_rows})
+        artifact = {"id": "A0001", "names": {"zh_hans": "官方羁绊"}, "job": "Defender", "star": 5,
+                    "stats": {"base": {"atk": 0}},
+                    "effect": {"zh_hans": "复活概率 [50.0%:A0001:Rate]"}}
+        bonds_path = self.cache / "bond_details.json"
+        write_json(bonds_path, {"data": {
+            "Bond": {"id": "A0001", "name_cn": "人工羁绊", "_manual_fields": ["name_cn"],
+                     "desc": "Wiki 羁绊简介", "effect": "Wiki 羁绊效果", "hp_base": 20, "atk_base": 8},
+        }})
+        with patch.object(auth, "require_setup", return_value=False), \
+             patch.object(auth, "is_authenticated", return_value=True), \
+             patch.object(data_reader, "_gamedata_roles", return_value=self.roles), \
+             patch.object(data_reader, "_gamedata_artifacts", return_value={"A0001": artifact}), \
+             patch.dict(data_reader._ALIAS_DETAILS_FILES, {
+                "char": self.cache / "character_details.json", "bond": bonds_path,
+             }):
+            client = TestClient(app)
+            role = client.get("/api/wiki/details/gamedata", params={"rid": "H001"}).json()["entry"]
+            self.assertEqual((role["display_name"], role["element"], role["job"]), ("甲", "Ice", "Defender"))
+            self.assertEqual((role["star"], role["wiki_description"], role["skills"][0]["name_cn"]),
+                             (4, "Wiki 角色简介", "Wiki 技能"))
+            bond = client.get("/api/wiki/details/gamedata", params={"kind": "bond", "rid": "A0001"}).json()["entry"]["display"]
+            self.assertEqual((bond["name_cn"], bond["atk_base"], bond["hp_base"]), ("官方羁绊", 0, 20))
+            self.assertEqual(bond["desc"], "Wiki 羁绊简介")
+            self.assertTrue(bond["effect_template"])
+            self.assertEqual(client.get("/api/wiki/details/entry", params={
+                "kind": "bond", "title": "Bond",
+            }).json()["entry"]["name_cn"], "人工羁绊")
+
     def test_tool_uses_shared_filters_and_does_not_write_metadata(self):
         with patch("tools.character_list.WikiCatalog", return_value=self.catalog):
             answer = json.loads(asyncio.run(list_characters(
@@ -136,6 +182,18 @@ class WikiCatalogueTests(unittest.TestCase):
              patch.dict(data_reader._ALIAS_FILES, self.alias_files), \
              patch("tools.name_resolver.build_index"):
             client = TestClient(app)
+            latest = client.get("/api/wiki/catalog").json()["items"]
+            oldest = client.get("/api/wiki/catalog", params={"sort": "release_asc"}).json()["items"]
+            self.assertEqual([entry["id"] for entry in latest[:4]], ["H003", "H004", "H002", "H001"])
+            self.assertEqual([entry["id"] for entry in oldest[:4]], ["H003", "H004", "H001", "H002"])
+
+            latest_aliases = client.get("/api/wiki/catalog", params={"view": "aliases"}).json()["items"]
+            oldest_aliases = client.get("/api/wiki/catalog", params={
+                "view": "aliases", "sort": "release_asc",
+            }).json()["items"]
+            self.assertEqual([entry["canonical"] for entry in latest_aliases], ["乙", "甲"])
+            self.assertEqual([entry["canonical"] for entry in oldest_aliases], ["甲", "乙"])
+
             response = client.get("/api/wiki/catalog", params=[
                 ("view", "aliases"), ("element", "水"), ("element", "火"), ("job", "重装"),
             ])
@@ -154,8 +212,15 @@ class WikiCatalogueTests(unittest.TestCase):
     def test_production_override_contains_all_confirmed_ids(self):
         overrides_path = ROOT / "QQBot/config/characters/wiki_release_overrides.json"
         overrides = json.loads(overrides_path.read_text(encoding="utf-8"))
-        self.assertEqual({rid for rid, row in overrides.items() if row["status"] == "unreleased"},
-                         {"H154", "H155", "H157", "H158", "H159", "H161", "H164", "H607"})
+        expected = {
+            "H154", "H155", "H157", "H158", "H159", "H161", "H164", "H191",
+            "H194", "H197", "H198", "H199", "H200", "H201", "H202", "H203",
+            "H204", "H205", "H206", "H207", "H208", "H209", "H210", "H211",
+            "H212", "H213", "H214", "H215", "H216", "H217", "H218", "H219",
+            "H222", "H223", "H224", "H225", "H229", "H232", "H235", "H237",
+            "H248", "H607", "H608", "H609", "H611", "H614",
+        }
+        self.assertTrue(expected <= {rid for rid, row in overrides.items() if row["status"] == "unreleased"})
 
 
 if __name__ == "__main__":

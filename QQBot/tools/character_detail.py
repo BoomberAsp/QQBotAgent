@@ -94,7 +94,7 @@ def _load() -> dict:
         if not isinstance(entry, dict):
             continue
         entry.setdefault("title", title_key)
-        reconcile(entry, roles)
+        reconcile(entry, roles, prefer_official=True)
         cn = entry.get("name_cn") or entry.get("title")
         if cn:
             _by_cn_name[cn] = entry
@@ -320,17 +320,21 @@ async def character_detail_with_card(character_name: str) -> tuple[str, str | No
     Shared by the agent tool and the direct ``/角色详情`` command so both
     render the card through the same lookup + refresh path.
     """
-    await _maybe_refresh_characters()
-
     entry = lookup_character(character_name)
-    # 游戏数据优先：wiki 未收录（如 H806 蜜拉贝儿）或 wiki 文案过旧时，用解包产物组装
     try:
-        from lib.character_entry import build_entry as _gd_entry
-        gd_entry = _gd_entry((entry or {}).get("id") or character_name)
+        from lib.character_entry import build_entry
+
+        gd_entry = build_entry(character_name)
+        if not gd_entry and entry and entry.get("id"):
+            gd_entry = build_entry(entry["id"])
     except Exception:  # noqa: BLE001
         gd_entry = None
+    await _maybe_refresh_characters(available=bool(gd_entry))
     if gd_entry:
-        entry = {**(entry or {}), **gd_entry}
+        # The unpacked builder already fills missing fields from its matching Wiki entry.
+        entry = gd_entry
+    elif not entry:
+        entry = lookup_character(character_name)
     if not entry:
         return (
             f"未找到角色「{character_name}」的详情。\n"
@@ -379,7 +383,7 @@ def _invalidate():
     _data = None
 
 
-async def _maybe_refresh_characters():
+async def _maybe_refresh_characters(*, available=False):
     """Refresh the character cache if it's stale or missing.
 
     Stale-but-present cache → background (fire-and-forget) refresh so the
@@ -404,7 +408,7 @@ async def _maybe_refresh_characters():
             return
 
         _refreshing = True
-        if os.path.exists(_CACHE_PATH):
+        if available or os.path.exists(_CACHE_PATH):
             asyncio.create_task(_do_refresh(scraper))
         else:
             await _do_refresh(scraper)

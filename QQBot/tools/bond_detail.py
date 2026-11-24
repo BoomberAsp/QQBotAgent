@@ -18,7 +18,10 @@ import os
 import sys
 
 from tools.name_resolver import get_resolver
-from lib.bond_names import artifact_path, load_artifacts, reconcile as reconcile_bond_name
+from lib.bond_names import (
+    artifact_detail, artifact_id_redirects, artifact_path, has_official_artifact_name,
+    load_artifacts, reconcile as reconcile_bond_name,
+)
 from lib.paths import wiki_cache_dir
 
 
@@ -47,12 +50,9 @@ def _load() -> dict:
         mtime = os.path.getmtime(_CACHE_PATH)
     except OSError:
         mtime = None
-    try:
-        stat = artifact_path().stat()
-        artifact_stamp = (stat.st_mtime_ns, stat.st_size)
-    except (OSError, AttributeError):
-        artifact_stamp = None
-    mtime = (mtime, artifact_stamp)
+    from lib.game_names import file_stamp
+
+    mtime = (mtime, file_stamp(artifact_path()))
     if _data is not None and mtime == _data_mtime:
         return _data
     _data_mtime = mtime
@@ -69,26 +69,44 @@ def _load() -> dict:
     _by_cn_name = {}
     _by_title = {}
     _by_id = {}
-    artifacts = load_artifacts()
-    for title, entry in _data.items():
+    entries = _data if isinstance(_data, dict) else {}
+    artifacts = {str(rid).upper(): row for rid, row in load_artifacts().items() if isinstance(row, dict)}
+    redirects = artifact_id_redirects(artifacts)
+    matched = set()
+    _data = {}
+    for title, entry in entries.items():
         if not isinstance(entry, dict):
             continue
         entry.setdefault("title", title)
+        rid = str(entry.get("id") or "").strip().upper()
+        if rid:
+            entry["id"] = redirects.get(rid, rid)
         reconcile_bond_name(entry, artifacts)
-        cn = entry.get("name_cn")
-        if cn:
-            _by_cn_name[cn] = entry
-        title = entry.get("title")
-        if title:
-            _by_title[title.strip().lower()] = entry
-        cid = entry.get("id")
-        if cid:
-            _by_id[str(cid).strip().upper()] = entry
+        rid = str(entry.get("id") or "").strip().upper()
+        official = artifacts.get(rid)
+        if official:
+            matched.add(rid)
+            entry = artifact_detail(rid, official, entry)
+        _data[title] = entry
+    for rid, artifact in artifacts.items():
+        if rid not in matched and has_official_artifact_name(rid, artifact):
+            _data.setdefault(rid, artifact_detail(rid, artifact))
 
     for entry in _data.values():
-        if isinstance(entry, dict):
-            for alias in entry.get("name_aliases", []):
-                _by_cn_name.setdefault(alias, entry)
+        if cn := entry.get("name_cn"):
+            _by_cn_name[cn] = entry
+        if title := entry.get("title"):
+            _by_title[title.strip().casefold()] = entry
+        if rid := entry.get("id"):
+            _by_id[str(rid).strip().upper()] = entry
+
+    for old, current in redirects.items():
+        if current in _by_id:
+            _by_id[old] = _by_id[current]
+    for entry in _data.values():
+        for alias in entry.get("name_aliases") or ():
+            _by_cn_name.setdefault(alias, entry)
+            _by_title.setdefault(str(alias).strip().casefold(), entry)
 
     return _data
 
@@ -110,8 +128,8 @@ def lookup_bond(query: str) -> dict | None:
         return _by_id[q.upper()]
 
     # 3. Exact English title match
-    if q.lower() in _by_title:
-        return _by_title[q.lower()]
+    if q.casefold() in _by_title:
+        return _by_title[q.casefold()]
 
     # 4. Fuzzy alias via pinyin resolver
     try:
@@ -161,7 +179,8 @@ def format_bond(entry: dict) -> str:
         lines.append(f"简介: {entry['desc']}")
 
     if entry.get("effect"):
-        lines.append("羁绊技能:")
+        label = "羁绊技能（官方模板，保留参数占位）" if entry.get("effect_template") else "羁绊技能"
+        lines.append(f"{label}:")
         lines.append(_indent(entry["effect"]))
 
     if entry.get("notes"):
@@ -212,9 +231,10 @@ async def bond_detail_with_card(bond_name: str) -> tuple[str, str | None]:
     Shared by the agent tool and the direct ``/羁绊详情`` command so both
     render the card through the same lookup + refresh path.
     """
-    await _maybe_refresh_bonds()
-
     entry = lookup_bond(bond_name)
+    await _maybe_refresh_bonds(available=bool(entry))
+    if not entry:
+        entry = lookup_bond(bond_name)
     if not entry:
         return (
             f"未找到羁绊「{bond_name}」的详情。\n"
@@ -229,6 +249,8 @@ def render_card(entry: dict) -> str | None:
     """Render a bond card PNG (if stale); return its path, or None."""
     try:
         from tools.card_renderer import render_bond_card_if_stale
+        if entry.get("effect_template"):
+            entry = {**entry, "effect": "官方效果模板（保留参数占位）\n" + entry["effect"]}
         return render_bond_card_if_stale(entry)
     except Exception:
         return None
@@ -262,7 +284,7 @@ def _invalidate():
     _data = None
 
 
-async def _maybe_refresh_bonds():
+async def _maybe_refresh_bonds(*, available=False):
     """Refresh the bond cache if it's stale or missing.
 
     Stale-but-present cache → background (fire-and-forget) refresh so the
@@ -282,7 +304,7 @@ async def _maybe_refresh_bonds():
             return
 
         _refreshing = True
-        if os.path.exists(_CACHE_PATH):
+        if available or os.path.exists(_CACHE_PATH):
             asyncio.create_task(_do_refresh(scraper))
         else:
             await _do_refresh(scraper)

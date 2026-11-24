@@ -30,10 +30,25 @@ class RoleNames(unittest.TestCase):
      self.assertEqual(ce.build_entry('更新的官方名')['name_cn'],'更新的官方名')
      self.assertEqual(cd.lookup_character('旧译名')['name_cn'],'更新的官方名')
      old.update(name_cn='人工名称',_manual_fields=['name_cn']);write_wiki()
-     self.assertEqual(ce.build_entry('H1')['name_cn'],'人工名称')
+     self.assertEqual(ce.build_entry('H1')['name_cn'],'更新的官方名')
      self.assertEqual(cd.lookup_character('人工名称')['id'],'H1')
      self.assertEqual(dr.wiki_details_entry('char','Title')['entry']['name_cn'],'人工名称')
     ce.invalidate()
+ def test_card_prefers_unpacked_fields_and_preserves_wiki_gaps(self):
+  game = {
+      'names': {'en': 'Title', 'zh_hans': '官方名'}, 'star': 5, 'element': 'Ice', 'job': 'Medic',
+      'talents': ['官方天赋'], 'potential': {'team': '官方潜能'}, 'stats': {'HP': 100},
+  }
+  wiki = {
+      'name_cn': '人工名', '_manual_fields': ['name_cn'], 'element': '火', 'class_cn': '重装',
+      'desc': 'Wiki 简介', 'discs': ['旧天赋'], 'team_pot': '旧潜能', 'self_pot': 'Wiki 自身潜能',
+      'stats': {'HP': 200, 'SPD': 99},
+  }
+  entry = cards.build_entry('H1', game, wiki, {})
+  self.assertEqual((entry['name_cn'], entry['element'], entry['class_cn']), ('官方名', '水', '医疗'))
+  self.assertEqual((entry['desc'], entry['discs'], entry['team_pot'], entry['self_pot']),
+                   ('Wiki 简介', ['官方天赋'], '官方潜能', 'Wiki 自身潜能'))
+  self.assertEqual(entry['stats'], {'HP': 100.0, 'SPD': 99})
  def test_heal_keeps_old_name(self):
   from tools.wiki_scraper import WikiScraper
   e={'id':'H1','title':'Title','name_cn':'旧译名'}

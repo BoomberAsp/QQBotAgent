@@ -29,8 +29,25 @@ def load_roles():
         return {}
 
 
-def reconcile(entry, artifacts, previous=None):
-    """Mutate a cache entry; manual > valid official Chinese > old name > title.
+def official_chinese_name(record, entry_id=""):
+    names = record.get("names") or {}
+    return next((str(names[k]).strip() for k in ("zh_hans", "zh_hant")
+                 if names.get(k) and str(names[k]).strip().casefold() != str(entry_id).casefold()
+                 and not str(names[k]).strip().startswith("T_")
+                 and re.search(r"[\u3400-\u9fff]", str(names[k]))), "")
+
+
+def localized_text(values):
+    if isinstance(values, str):
+        return values.strip()
+    return next((str(values[k]).strip() for k in ("zh_hans", "zh_hant", "en")
+                 if values.get(k) and not str(values[k]).strip().startswith("T_")), "") if isinstance(values, dict) else ""
+
+
+def reconcile(entry, artifacts, previous=None, *, prefer_official=False):
+    """Resolve names, retaining manual edits by default for Wiki storage and editing.
+
+    Effective game views pass prefer_official=True and still index the Wiki name.
 
     Match ID first. Only an absent ID allows unique exact English-title fallback;
     never guess across conflicting nonempty IDs.
@@ -46,14 +63,10 @@ def reconcile(entry, artifacts, previous=None):
             aid = str(artifact.get("id") or "")
             if aid:
                 entry["id"] = aid
-    names = artifact.get("names", {}) if isinstance(artifact, dict) else {}
-    official = next((str(names.get(k) or "").strip() for k in ("zh_hans", "zh_hant")
-                     if names.get(k) and str(names[k]).strip() != aid
-                     and not str(names[k]).startswith("T_")
-                     and re.search(r"[\u3400-\u9fff]", str(names[k]))), "")
+    official = official_chinese_name(artifact, aid) if isinstance(artifact, dict) else ""
     old = str(entry.get("name_cn") or "").strip()
     prior = str((previous or {}).get("name_cn") or "").strip()
-    if "name_cn" in (entry.get("_manual_fields") or []) and old:
+    if "name_cn" in (entry.get("_manual_fields") or []) and old and not (prefer_official and official):
         selected, source = old, "manual"
     elif official:
         selected, source = official, "official"

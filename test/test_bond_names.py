@@ -35,4 +35,22 @@ class Names(unittest.TestCase):
     saved=json.loads((p/'bond_details.json').read_text());self.assertIn('旧译名',saved['data']['Title']['name_aliases'])
     with patch.object(bd,'_CACHE_PATH',str(p/'bond_details.json')),patch.object(bd,'_data',None):
      self.assertEqual(bd.lookup_bond('旧译名')['id'],'A1');self.assertEqual(bd.lookup_bond('官方名')['id'],'A1')
+ def test_runtime_uses_unpacked_values_and_resolves_game_only_entries(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   p=Path(tmp);wp=p/'bond_details.json'
+   artifacts = {
+       'A1': {**A['A1'], 'star': 5, 'effect': {'zh_hans': '官方效果 [50.0%:A1:Rate]'}},
+       'A2': {'id': 'A2', 'names': {'en': 'Game only', 'zh_hans': '仅解包'}, 'job': 'Other'},
+   }
+   (p/'artifacts.json').write_text(json.dumps({'artifacts': artifacts}))
+   wp.write_text(json.dumps({'data': {'Wiki Title': {
+       'id': 'A1', 'name_cn': '人工名', '_manual_fields': ['name_cn'], 'stars': 4,
+       'desc': 'Wiki 简介', 'effect': 'Wiki 效果',
+   }}}))
+   with patch.dict(os.environ, GAMEDATA_DIR=tmp), patch.object(bd, '_CACHE_PATH', str(wp)), \
+        patch.object(bd, '_data', None):
+    entry = bd.lookup_bond('人工名')
+    self.assertEqual((entry['name_cn'], entry['stars'], entry['desc']), ('官方名', 5, 'Wiki 简介'))
+    self.assertIn('官方模板', bd.format_bond(entry))
+    self.assertEqual(bd.lookup_bond('Game only')['name_cn'], '仅解包')
 if __name__=='__main__':unittest.main()

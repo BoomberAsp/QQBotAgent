@@ -3,7 +3,7 @@
 字段归属：
   来自 gamedata：name_cn/title/id/stars/element/class_cn/constellation/desc(签名)/
                  birthday/height/weight/skills[].name/des/cd/stats(全部 7 维)
-  保留 wiki   ：skills[].multi/soul/focus/burst*、discs、team_pot/self_pot
+  保留 wiki   ：仅补充解包缺失字段及 skills[].multi/soul/focus/burst*
   新增        ：gamedata 有、wiki 无的角色也会出卡（缺的字段留空/隐藏）
 
 用法：
@@ -50,9 +50,11 @@ def _gamedata_dir() -> str:
 def load_gamedata(gd_dir: str) -> dict:
     with open(os.path.join(gd_dir, "roles.json"), encoding="utf-8") as f:
         roles = json.load(f).get("roles") or {}
-    skills = {}
-    with open(os.path.join(gd_dir, "skills.json"), encoding="utf-8") as f:
-        skills = json.load(f).get("skills") or {}
+    try:
+        with open(os.path.join(gd_dir, "skills.json"), encoding="utf-8") as f:
+            skills = json.load(f).get("skills") or {}
+    except (OSError, ValueError, AttributeError):
+        skills = {}
     grants = {}
     p = os.path.join(gd_dir, "skill_grants.json")
     if os.path.isfile(p):
@@ -96,32 +98,39 @@ def build_entry(rid: str, g: dict, wiki: dict | None, gd: dict) -> dict:
     entry["id"] = rid
     entry["title"] = names.get("en") or (wiki or {}).get("title") or rid
     from lib.game_names import reconcile
-    reconcile(entry, {rid: g})
+    from tools.wiki_glossary import load_glossary
+
+    reconcile(entry, {rid: g}, prefer_official=True)
     entry.pop("_card_hash", None)  # recompute from the complete merged card
-    entry["stars"] = g.get("star") or (wiki or {}).get("stars")
-    entry["element"] = ELEMENT_MAP_HINT.get(g.get("element") or "", (wiki or {}).get("element"))
-    entry["element_en"] = g.get("element") or (wiki or {}).get("element_en")
-    entry["class_cn"] = JOB_MAP_HINT.get(g.get("job") or "", (wiki or {}).get("class_cn"))
-    entry["class_en"] = g.get("job") or (wiki or {}).get("class_en")
-    entry["constellation"] = CONST_HINT.get(g.get("constellation") or "",
-                                            (wiki or {}).get("constellation"))
-    # 简介：签名优先；没有就留空（卡面会隐藏该区块）
-    entry["desc"] = card.get("signature") or ""
-    entry["desc_source"] = "signature" if card.get("signature") else "none"
-    entry["quote"] = card.get("quote") or ""
-    for k in ("birthday", "height", "weight"):
+    if g.get("star") is not None:
+        entry["stars"] = g["star"]
+    glossary = load_glossary()
+    if element := g.get("element"):
+        entry["element_en"] = element
+        unpacked = {"Fire": "火", "Ice": "水", "Earth": "木"}
+        entry["element"] = glossary["element"].get(element, unpacked.get(element, ELEMENT_MAP_HINT.get(element, element)))
+    if job := g.get("job"):
+        entry["class_en"] = job
+        entry["class_cn"] = glossary["class"].get(job, JOB_MAP_HINT.get(job, job))
+    if constellation := g.get("constellation"):
+        entry["constellation"] = glossary["constellation"].get(constellation, CONST_HINT.get(constellation, constellation))
+    if card.get("signature"):
+        entry["desc"] = card["signature"]
+        entry["desc_source"] = "signature"
+    for k in ("quote", "birthday", "height", "weight"):
         if card.get(k):
             entry[k] = card[k]
-    # 天赋/潜能：卡面渲染器只认 wiki 的 discs / team_pot / self_pot；
-    # 没有 wiki 词条的角色（实测 19 个新角色）用解包侧导出值兜底。
-    talents = g.get("talents") or []
-    if talents and not entry.get("discs"):
-        entry["discs"] = talents
+    if card.get("cup"):
+        entry["breast"] = card["cup"]
+    release = g.get("release_date") or g.get("release")
+    if release and release != "?":
+        entry["release"] = release
+    if g.get("talents"):
+        entry["discs"] = g["talents"]
     pot = g.get("potential") or {}
-    if pot.get("team") and not entry.get("team_pot"):
-        entry["team_pot"] = pot["team"]
-    if pot.get("self") and not entry.get("self_pot"):
-        entry["self_pot"] = pot["self"]
+    for field in ("team", "self"):
+        if pot.get(field):
+            entry[f"{field}_pot"] = pot[field]
     # 数值：方案甲 —— gamedata 全 7 维；卡面沿用 wiki 的 4 键版式，多余 3 维进 stats_ext
     if g.get("stats"):
         s = g["stats"]
@@ -132,10 +141,12 @@ def build_entry(rid: str, g: dict, wiki: dict | None, gd: dict) -> dict:
             except (TypeError, ValueError):
                 return v
 
-        entry["stats"] = {
-            "HP": _fmt(s.get("HP", "")), "ATK": _fmt(s.get("Attack", "")),
-            "DEF": _fmt(s.get("Defence", "")), "SPD": _fmt(s.get("Speed", "")),
-        }
+        stats = dict(entry.get("stats") or {})
+        stat_keys = {"HP": "HP", "ATK": "Attack", "DEF": "Defence", "SPD": "Speed"}
+        for key, game_key in stat_keys.items():
+            if s.get(game_key) is not None and s[game_key] != "":
+                stats[key] = _fmt(s[game_key])
+        entry["stats"] = stats
         entry["stats_ext"] = {k: _fmt(s.get(k)) for k in
                               ("CriticalRate", "CriticalDamageRate", "EffectHitRate")
                               if k in s}
@@ -143,7 +154,7 @@ def build_entry(rid: str, g: dict, wiki: dict | None, gd: dict) -> dict:
         base = (gd.get("stats_base") or {}).get("60") or {}
         if base:
             pairs = (("HP", "hp"), ("ATK", "atk"), ("DEF", "def"), ("SPD", "spd"))
-            mx = {}
+            mx = dict(entry.get("stats_max") or {})
             for key, bkey in pairs:
                 try:
                     mx[key] = round(float(base[bkey]) * float(s.get(
@@ -158,14 +169,20 @@ def build_entry(rid: str, g: dict, wiki: dict | None, gd: dict) -> dict:
     merged = []
     for i, gsk in enumerate(gskills):
         sid = gsk.get("id") or ""
-        w = wskills[i] if i < len(wskills) else {}
+        names = gsk.get("name") or {}
+        slot = gsk.get("slot") or i + 1
+        w = next((skill for skill in wskills
+                  if (sid and skill.get("id") == sid)
+                  or (names.get("en") and skill.get("name_en") == names["en"])), None)
+        if w is None:
+            w = wskills[slot - 1] if isinstance(slot, int) and 1 <= slot <= len(wskills) else {}
         item = dict(w)
-        item["name"] = (gsk.get("name") or {}).get("zh_hans") or w.get("name") or ""
+        item["name"] = names.get("zh_hans") or names.get("zh_hant") or w.get("name") or names.get("en") or ""
         item["name_en"] = (gsk.get("name") or {}).get("en") or w.get("name_en") or ""
-        item["des"] = skill_des(gd["skills"], sid) or w.get("des") or ""
-        cd = (gd["grants"].get(sid) or {}).get("cooldown")
+        item["des"] = skill_des(gd.get("skills") or {}, sid) or w.get("des") or ""
+        cd = ((gd.get("grants") or {}).get(sid) or {}).get("cooldown")
         item["cd"] = str(cd) if cd is not None else w.get("cd", "")
-        item["slot"] = gsk.get("slot")
+        item["slot"] = gsk.get("slot") or w.get("slot")
         merged.append(item)
     if merged:
         entry["skills"] = merged

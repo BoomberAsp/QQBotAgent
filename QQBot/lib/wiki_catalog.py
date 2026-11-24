@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from lib.bond_names import artifact_id_redirects
-from lib.game_names import file_stamp, reconcile
+from lib.game_names import file_stamp, official_chinese_name, reconcile
 from lib.gamedata_source import default_dir
 from lib.paths import repo_dir, wiki_cache_dir
 from tools.wiki_glossary import load_glossary
@@ -110,20 +110,26 @@ def _date(value):
 
 
 def _release(wiki, roster, game, override, today):
-    released_at = next((value for value in map(_date, (
-        override.get("date"), wiki.get("release"), roster.get("Released"),
-        game.get("release_date") or game.get("release"),
-    )) if value), None)
-    status = override.get("status") or wiki.get("release_status") or game.get("release_status")
-    if status not in RELEASE_STATUSES:
-        explicit = wiki.get("is_released", game.get("is_released"))
-        if isinstance(explicit, bool):
-            status = "released" if explicit else "unreleased"
-        elif released_at:
-            status = "released" if released_at <= today else "unreleased"
-        else:
-            status = "unknown"
-    return status, released_at
+    sources = (
+        (override, override.get("date"), override.get("status")),
+        (game, _date(game.get("release_date")) or game.get("release"), game.get("release_status")),
+        (wiki, wiki.get("release"), wiki.get("release_status")),
+        (roster, roster.get("Released"), None),
+    )
+    status = None
+    released_at = None
+    for source, value, explicit in sources:
+        parsed = _date(value)
+        released_at = released_at or parsed
+        if status:
+            continue
+        if explicit in {"unreleased", "released"}:
+            status = explicit
+        elif isinstance(source.get("is_released"), bool):
+            status = "released" if source["is_released"] else "unreleased"
+        elif parsed:
+            status = "released" if parsed <= today else "unreleased"
+    return status or "unknown", released_at
 
 
 def _label_index(table, variants=None):
@@ -210,10 +216,11 @@ class WikiCatalog:
             old, official, local = wiki.get(key, {}), game.get(key, {}), roster.get(key, {})
             rid = None if key.startswith("title:") else key
             localized = official.get("names") or {}
-            title = old.get("title") or localized.get("en") or rid
+            wiki_title = old.get("title")
+            official_title = localized.get("en")
+            title = official_title if _meaningful(official_title, rid) else wiki_title or rid
             name = next((value for value in (
-                old.get("name_cn") if "name_cn" in (old.get("_manual_fields") or ()) else None,
-                localized.get("zh_hans"), localized.get("zh_hant"), old.get("name_cn"), local.get("name"), title,
+                official_chinese_name(official, rid), old.get("name_cn"), local.get("name"), title,
             ) if _meaningful(value, rid)), None)
             if not name:
                 continue
@@ -228,16 +235,17 @@ class WikiCatalog:
             ) if _key(value) in self.jobs), None)
             status, released_at = _release(old, local, official, overrides.get(key) or {}, today)
             rows[key] = {
-                "key": key, "id": rid, "gamedata_id": raw_ids.get(key), "title": title, "name_cn": name,
+                "key": key, "id": rid, "gamedata_id": raw_ids.get(key), "title": title,
+                "wiki_title": wiki_title, "name_cn": name,
                 "elements": [attr] if attr else [], "job": job,
                 "stars": official.get("star") or old.get("stars") or local.get("Stars") or 0,
                 "release_date": released_at, "release_status": status,
-                "source": "wiki" if old else "gamedata" if official else "roster",
-                "sources": [value for value, present in (("wiki", old), ("gamedata", official), ("roster", local)) if present],
+                "source": "gamedata" if official else "wiki" if old else "roster",
+                "sources": [value for value, present in (("gamedata", official), ("wiki", old), ("roster", local)) if present],
                 "manual": bool(old.get("_manual_fields")),
                 "has_cn": any("\u3400" <= c <= "\u9fff" for c in str(name)),
                 "search_terms": [str(value) for value in (
-                    rid, title, name, old.get("name_cn"), local.get("name"), local.get("e7_name"),
+                    rid, title, wiki_title, name, old.get("name_cn"), local.get("name"), local.get("e7_name"),
                     *(localized.values()), *(old.get("name_aliases") or ()), *(local.get("other_names") or ()),
                 ) if value],
                 "related_names": [value for value in (old.get("member_en"), old.get("member"), local.get("Related")) if value],
