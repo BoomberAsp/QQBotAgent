@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -146,6 +147,26 @@ def get_hsr_reader(kb_id):
 
 def _hsr(scope):
     return get_hsr_reader(scope.kb_id)
+
+
+def story_entity_terms(scope):
+    """Names for intent routing from the same authorized corpus used for lookup."""
+    if not active(scope):
+        return ()
+    try:
+        if scope.game == 'hsr':
+            from .hsr_policy import policy
+            names = set(_hsr(scope).entities)
+            for name, variants in policy().get('aliases', {}).items():
+                names.update((name, *variants))
+        else:
+            from .story_kb import get_story_kb
+            kb = get_story_kb()
+            names = kb.entity_terms() if kb.available else ()
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
+        log.warning('story entity index unavailable game=%s error=%s', scope.game, type(error).__name__)
+        return ()
+    return names if active(scope) else ()
 
 
 def tool_search(query='',limit=4,scope=None):

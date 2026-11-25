@@ -92,7 +92,7 @@ def story_search(query='',limit=4):
     if inherited is not None and not active(inherited):
         return "当前群资料作用域已失效。"
     story_scope = make_scope(run.persona, run.scope, run.valid)
-    if story_scope and (story_scope.game == "hsr" or run.game_intent in {"story", "mixed"}):
+    if story_scope:
         if inherited is None or inherited.persona != run.persona or inherited.audience != run.scope:
             return "当前群资料作用域已失效。"
         return tool_search(query, limit, inherited)

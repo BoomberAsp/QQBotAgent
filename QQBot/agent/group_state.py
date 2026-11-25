@@ -238,6 +238,23 @@ class GroupStore:
                 result.append(dict(role="system", content=_IMAGE_HISTORY_EVENT))
         return result
 
+    def topic_anchor(self, scope, generation, *, actor, event, replied_event, since, now):
+        """Return a quoted user turn, or this speaker's latest adjacent turn."""
+        with self.db() as db:
+            if replied_event and replied_event != event:
+                quote = db.execute(
+                    "SELECT user_text FROM turns WHERE scope=? AND generation=? AND event=? AND created<=?",
+                    (scope, generation, replied_event, now),
+                ).fetchone()
+                if quote:
+                    return quote['user_text'], None
+            previous = db.execute(
+                "SELECT created,user_text FROM turns WHERE scope=? AND generation=? AND actor=? AND event!=? "
+                "AND created BETWEEN ? AND ? ORDER BY created DESC LIMIT 1",
+                (scope, generation, actor, event, since, now),
+            ).fetchone()
+        return '', (previous['created'], previous['user_text']) if previous else None
+
     def commit(self, scope, generation, event, actor, text, answer):
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")

@@ -669,6 +669,56 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Ark剧情证据", results[1][2])
         self.assertTrue(all(call.args[2].game == "ark_re" for call in story.call_args_list))
 
+    async def test_rubi_followups_use_scoped_topics_and_bound_story_tools(self):
+        from agent.group_resources import story_search
+
+        scope = scope_for(view())
+        self.store.configure(scope, persona="rubi")
+        self.fake._perm_manager.get_allowed_tools = lambda role: {"character_detail", "list_characters"}
+        results = {}
+
+        async def run(*args, allowed_tools, **kwargs):
+            current = runtime.current_group_run.get()
+            results[current.event] = (current.game_intent, set(allowed_tools), current.context)
+            if current.event == "undecided":
+                self.assertEqual(story_search("挪亚"), "Ark剧情证据")
+            return "答复"
+
+        async def ask(event, text, *, user='a', group='g', reply=''):
+            turn = view(user=user, group=group, message=event, reply_message_id=reply)
+            turn.text = text
+            await runtime.run_group_turn(turn, self.sender)
+
+        self.fake.agent.run = run
+        with (patch("lib.story_router.story_entity_terms", return_value=["挪亚", "莱拉"]),
+              patch("lib.story_router.tool_search", return_value="Ark剧情证据") as story):
+            await ask("lore", "挪亚怎么样了？")
+            self.assertEqual(story.call_args.args[0], "挪亚")
+            await ask("pool", "这期卡池谁值得抽？")
+            await ask("other-user", "挪亚怎么样了？", user='b')
+            await ask("same-user", "那挪亚呢？")
+            await ask("quote", "她后来怎么样了？", reply="lore")
+            self.assertEqual(story.call_args.args[0], "挪亚 后来怎么样了")
+            await ask("pair", "挪亚和莱拉最后的结局是什么？")
+            await ask("ambiguous", "她怎么样了？")
+            await ask("release", "挪亚什么时候上线？")
+            await ask("undecided", "今天怎么样？")
+            self.store.configure(scope_for(view(group='other')), persona="rubi")
+            await ask("other-group", "那她呢？", group='other')
+        for event in ("lore", "other-user", "quote"):
+            intent, tools, context = results[event]
+            self.assertEqual(intent, "story")
+            self.assertIn("Ark剧情证据", context)
+            self.assertIn("story_search", tools)
+            self.assertFalse({"character_detail", "list_characters"} & tools)
+        for event in ("same-user", "release"):
+            self.assertEqual(results[event][0], "gameplay")
+            self.assertNotIn("story_search", results[event][1])
+        self.assertEqual(results["ambiguous"][0], "clarify")
+        self.assertFalse({"story_search", "character_detail", "list_characters"} & results["ambiguous"][1])
+        self.assertEqual(results["undecided"][0], "undecided")
+        self.assertEqual(results["other-group"][0], "undecided")
+
     async def test_group_image_references_preserve_speaker_and_explicit_quote(self):
         from hashlib import sha256
         from PIL import Image
