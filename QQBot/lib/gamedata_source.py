@@ -109,6 +109,7 @@ class GameData:
         self.roles: dict[str, dict] = {}
         self.bonds: dict[str, dict] = {}
         self.locale: dict[str, dict[str, str]] = {}
+        self.character_effects: dict = {}
         self.manifest: dict = {}
         self._alias: dict[str, str] = {}
         self._role_alias: dict[str, str] = {}
@@ -136,6 +137,13 @@ class GameData:
         self.role_grants = self._read("role_grants.json") or {}
         self.roles = (self._read("roles.json") or {}).get("roles") or {}
         self.bonds = (self._read("bonds.json") or {}).get("bonds") or {}
+        effects = self._read("character_effects.json")
+        build = self.manifest.get("game_build")
+        if (isinstance(effects, dict) and effects.get("schema") == 1
+                and isinstance(effects.get("game_build"), str) and effects["game_build"]
+                and (not build or effects["game_build"] == build)
+                and isinstance(effects.get("roles"), dict) and isinstance(effects.get("records"), list)):
+            self.character_effects = effects
 
         for code in ("en", "zh_hans", "zh_hant"):
             table = self._read(os.path.join("locale", "slim", f"{code}.json"))
@@ -472,12 +480,16 @@ _SOURCE_STAMP: dict = {"stamp": None}
 
 
 def _source_stamp() -> tuple:
-    """产物版本指纹（manifest.json 的 mtime + size）。"""
-    try:
-        st = os.stat(os.path.join(os.path.abspath(default_dir()), "manifest.json"))
-        return (st.st_mtime, st.st_size)
-    except OSError:
-        return (None, None)
+    """产物版本指纹，支持独立发布的角色效果索引。"""
+    directory = os.path.abspath(default_dir())
+    stamp = [directory]
+    for filename in ("manifest.json", "character_effects.json"):
+        try:
+            st = os.stat(os.path.join(directory, filename))
+            stamp.append((st.st_ino, st.st_mtime_ns, st.st_size))
+        except OSError:
+            stamp.append(None)
+    return tuple(stamp)
 
 
 def get_source(refresh: bool = False) -> GameData:

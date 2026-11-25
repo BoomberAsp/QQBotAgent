@@ -133,6 +133,7 @@ from tools.legacy_tools import (
 )
 from tools.character_detail import character_detail, character_detail_with_card
 from tools.character_list import list_characters
+from tools.character_effects import search_character_effects
 from tools.bond_detail import bond_detail, bond_detail_with_card
 from tools.battle_parser import parse_battle_screenshots
 from tools.card_renderer import (
@@ -602,6 +603,28 @@ def _build_tool_registry() -> ToolRegistry:
                 "sort": {"type": "string", "enum": ["release_desc", "release_asc"], "default": "release_desc"},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            },
+        },
+    )
+    registry.register(
+        "search_character_effects", search_character_effects,
+        "按技能、被动、觉醒和特殊 Buff 反查 Ark Re:Code 角色。"
+        "问哪些角色能给队友上免疫，使用 effect=immunity,operation=grant,target=allies；"
+        "问自带命中率用 effect=hit_rate,target=self，效果命中用 effect=effect_hit。"
+        "问谁能解除敌方免疫用 effect=immunity,operation=remove,target=enemy。"
+        "已知 Buff 名可以传 status。按证据给出条件与来源，条件型加成不可写成常驻。",
+        {
+            "type": "object",
+            "properties": {
+                "effect": {"type": "string", "enum": ["immunity", "hit_rate", "effect_hit"], "description": "要查的效果；可只传 status"},
+                "operation": {"type": "string", "enum": ["auto", "grant", "increase", "decrease", "remove", "dispel", "any"]},
+                "target": {"type": "string", "enum": ["any", "self", "allies", "team", "enemy"], "description": "allies 包含能覆盖队友的单体或群体效果"},
+                "activation": {"type": "string", "enum": ["any", "constant", "conditional"]},
+                "status": {"type": "string", "description": "特殊 Buff 的名称或 ID"},
+                "role": {"type": "string", "description": "可选，核对单个角色的名称、别名或 ID"},
+                "release_status": {"type": "string", "enum": ["released", "unreleased", "unknown", "all"], "default": "released"},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8},
             },
         },
     )
@@ -1969,7 +1992,7 @@ def _get_user_info() -> str:
     dev_tools = {"execute_code", "shell_exec", "web_fetch", "download_repo", "get_system_load"}
     fun_tools = {"gacha_pull", "play_gacha_animation", "calculate_speed",
                  "compare_speed_probability", "explain_code", "translate_text",
-                 "character_detail", "list_characters", "bond_detail", "parse_battle_screenshots"}
+                 "character_detail", "list_characters", "search_character_effects", "bond_detail", "parse_battle_screenshots"}
     misc = allowed - info_tools - dev_tools - fun_tools
 
     sections = [
@@ -3126,7 +3149,8 @@ async def handle_agent_turn(view: InboundMessage):
             persona_key, "private:" + _current_platform.get() + ":" + str(user_id)
         ) if not (is_creation or is_scene) else None
         game_question = (
-            (game_intent(text_content, in_character=persona_key not in {"assistant", "nous"}) or "undecided")
+            (game_intent(text_content, in_character=persona_key not in {"assistant", "nous"}, game=story_scope.game)
+             or "undecided")
             if story_scope else ""
         )
         is_special = augmented_message in ["/clear", "清除上下文", "新对话", "/status"]

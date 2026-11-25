@@ -719,6 +719,23 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results["undecided"][0], "undecided")
         self.assertEqual(results["other-group"][0], "undecided")
 
+    async def test_effect_lookup_is_gameplay_in_ark_and_scoped_to_ark(self):
+        base = view()
+        self.store.configure(scope_for(base), persona='rubi')
+        self.fake._perm_manager.get_allowed_tools = lambda role: {'search_character_effects'}
+        ask = view(message='ark-effects')
+        ask.text = '哪些角色能给队友上免疫？'
+        await runtime.run_group_turn(ask, self.sender)
+        self.assertEqual(self.calls[-1].game_intent, 'gameplay')
+        self.assertIn('search_character_effects', self.calls[-1].tools)
+        self.assertNotIn('story_search', self.calls[-1].tools)
+
+        self.store.configure(scope_for(base), persona='herta')
+        ask = view(message='hsr-effects')
+        ask.text = '哪些角色自带命中率？'
+        await runtime.run_group_turn(ask, self.sender)
+        self.assertNotIn('search_character_effects', self.calls[-1].tools)
+
     async def test_group_image_references_preserve_speaker_and_explicit_quote(self):
         from hashlib import sha256
         from PIL import Image

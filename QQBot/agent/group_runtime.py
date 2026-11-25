@@ -26,7 +26,7 @@ current_group_run = ContextVar("current_group_run", default=None)
 # tools need explicit group-resource adapters before they may join this list.
 GROUP_TOOLS = frozenset({"search_web", "find_image_source", "get_time", "geocode", "reverse_geocode",
                         "survey_status",
-                        "search_poi", "get_weather", "character_detail", "list_characters", "bond_detail",
+                        "search_poi", "get_weather", "character_detail", "list_characters", "bond_detail", "search_character_effects",
                         "redeem_code", "get_changelog", "delegate_task", "story_search", "group_media", "send_sticker", "search_images", "fetch_image", "discover_images"})
 _store = None
 _locks = {}
@@ -435,12 +435,15 @@ async def run_group_turn(view, sender=None):
             from .group_resources import retrieve
             from lib.story_router import current_story_scope, make_scope, character_perspective, story_entity_terms
             story_scope = make_scope(persona, scope, valid)
+            if not story_scope or story_scope.game != 'ark_re':
+                allowed.discard('search_character_effects')
             question = without_mention_prefix(view.text)
             story_query = question
             topic_anchor = ""
             intent = ""
             if story_scope:
-                intent = game_intent(question, in_character=persona not in {"assistant", "nous", "nousson"})
+                intent = game_intent(question, in_character=persona not in {"assistant", "nous", "nousson"},
+                                     game=story_scope.game)
                 if not intent and "story_search" in allowed:
                     ring_snapshot = tuple(ring)
                     speaker = member_tag(view)
@@ -452,7 +455,7 @@ async def run_group_turn(view, sender=None):
 
                     intent, story_query = await asyncio.to_thread(
                         classify_group_followup, question, entity_terms=lambda: story_entity_terms(story_scope),
-                        related_context=related_context,
+                        related_context=related_context, game=story_scope.game,
                     )
                 intent = intent or "undecided"
             if intent in {"story", "clarify"}:

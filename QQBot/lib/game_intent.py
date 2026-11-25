@@ -4,12 +4,15 @@ import re
 
 GAMEPLAY_TOOLS = frozenset({
     "character_detail", "list_characters", "bond_detail", "calculate_speed", "parse_battle_screenshots",
+    "search_character_effects",
 })
 _MECHANICS = re.compile(
     r"玩法|攻略|游戏机制|配队|配装|装备推荐|抽不抽|值得抽|值得养|怎么养|怎么打|怎么配|强度|倍率|"
     r"面板|词条|材料|升星|培养|突破|数值|属性|战意|速度阈值|伤害计算|遗器|光锥推荐"
 )
 _SKILL = re.compile(r"技能|羁绊效果")
+_EFFECT = re.compile(r"免疫|命中率|效果命中|状态命中|基础命中|普通命中")
+_EFFECT_LOOKUP = re.compile(r"(?:哪些|什么|有哪|筛选).{0,24}角色|角色.{0,24}(?:哪些|有谁)|谁.{0,12}(?:能给|能解除|可驱散|自带)|反查|免疫\s*buff", re.I)
 _RELEASE = re.compile(r"卡池|复刻|上线时间|实装时间|(?:何时|什么时候|几号)(?:上线|实装|出(?=[？?\s]|$))|上线了吗|实装了吗")
 _STORY = re.compile(r"剧情|世界观|主线|支线|身世|设定|经历|结局|后来发生|人物关系|台词|对白|出场")
 _RELATIONSHIP = re.compile(
@@ -26,7 +29,7 @@ _REFERENCE = {"他", "她", "它", "这人", "那人", "这位", "那位", "这�
 _ORDINARY_SUBJECT = {"我", "你", "大家", "我们", "你们", "今天", "明天", "昨天", "天气", "今天天气"}
 
 
-def game_intent(text, *, in_character=True):
+def game_intent(text, *, in_character=True, game='ark_re'):
     """Classify explicit game cues and in-character relationship questions."""
     text = (text or "").strip()
     if not text or text.startswith(("/", "#", "／")):
@@ -38,7 +41,9 @@ def game_intent(text, *, in_character=True):
         relationship = match and (match["name"] or "") not in _GENERIC_TARGETS
         story_clause = bool(_STORY.search(clause) or relationship)
         story |= story_clause
-        gameplay |= bool(_MECHANICS.search(clause) or (not story_clause and (_SKILL.search(clause) or _RELEASE.search(clause))))
+        effect_lookup = game == 'ark_re' and _EFFECT.search(clause) and _EFFECT_LOOKUP.search(clause)
+        gameplay |= bool(_MECHANICS.search(clause) or effect_lookup
+                         or (not story_clause and (_SKILL.search(clause) or _RELEASE.search(clause))))
     if story and gameplay:
         return "mixed"
     return "story" if story else "gameplay" if gameplay else ""
@@ -60,7 +65,7 @@ def _mentioned_entities(text, entities):
     return found
 
 
-def classify_group_followup(text, *, entity_terms, related_context):
+def classify_group_followup(text, *, entity_terms, related_context, game='ark_re'):
     """Resolve undecided turns using the bound corpus and one scoped conversation anchor."""
     phrase = re.sub(r"^(?:请问|想问(?:一下)?|你觉得)[：:\s]*", "", text.strip()).rstrip("？?。！! ")
     if not phrase or len(phrase) > 80 or phrase.startswith(("/", "#", "／")):
@@ -83,7 +88,7 @@ def classify_group_followup(text, *, entity_terms, related_context):
     if target:
         same_target = target.casefold() in anchor.casefold()
         continuation = (stripped != subject and target.casefold() != subject.casefold()) or phrase.endswith("呢")
-        if (same_target or continuation) and game_intent(anchor, in_character=False) == "gameplay":
+        if (same_target or continuation) and game_intent(anchor, in_character=False, game=game) == "gameplay":
             return "gameplay", text
         return "story", target + time_context
 
@@ -92,7 +97,7 @@ def classify_group_followup(text, *, entity_terms, related_context):
     # Without a story entity or explicit game signal this may be an ordinary
     # conversation about a real person. Keep the ordinary model path in that case.
     matches = _mentioned_entities(anchor, entities)
-    prior = game_intent(anchor, in_character=False)
+    prior = game_intent(anchor, in_character=False, game=game)
     if len(matches) != 1:
         return ("clarify" if matches or prior else "undecided"), text
     return ("gameplay" if prior == "gameplay" else "story"), next(iter(matches)) + time_context

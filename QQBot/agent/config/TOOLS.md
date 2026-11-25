@@ -489,6 +489,12 @@ Anti-bot handling is a two-tier ladder:
 
 ---
 
+## Tool: search_character_effects
+
+按 Ark 技能、被动、觉醒和特殊 Buff 的效果反查角色。给队友上免疫使用 `effect="immunity"`、`operation="grant"`、`target="allies"`。自身普通命中率使用 `effect="hit_rate"`、`target="self"`，效果命中使用 `effect="effect_hit"`。指定 Buff 可以用 `status`。查驱散用 `operation="remove"`，答复中说明返回的 `dispel` 是通用驱散，按实际条件处理可解除状态。
+
+默认只查已上线角色。按 `next_offset` 翻页。保留技能、状态路径和触发条件；`selection="random"` 表示随机池，`base_chance` 是基础概率。多条养成或替代路径分别引用，合计需要单独核实。零结果用「当前索引未找到符合条件的记录」表述。
+
 ## Tool: character_detail
 
 **Description**: 查询 Ark Re:Code 角色的详细资料（面板成长系数、技能、倍率、属性、天赋、潜能）。数据来自 wiki + LLM 翻译，缓存于本地。
