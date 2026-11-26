@@ -65,3 +65,52 @@ def test_effect_search_stays_in_the_bound_game(monkeypatch):
     assert game_intent('哪些自带命中率的角色？') == 'gameplay'
     assert game_intent('谁能解除对方免疫？') == 'gameplay'
     assert game_intent('最近免疫力怎么样？') == ''
+
+
+def test_v2_search_matches_polarity_named_status_and_signed_effects(monkeypatch):
+    def record(rid, effect, operation, target, **fields):
+        return dict(role_id=rid, effect=effect, operation=operation, target=target,
+                    activation='conditional', conditions=[], value=None,
+                    path=[{'kind': 'role', 'id': rid}], evidence=[], **fields)
+
+    statuses = {
+        'Stun': {'names': {'zh_hans': '眩晕'}, 'descriptions': {'zh_hans': '无法行动。'}, 'polarity': 'negative', 'removable': True},
+        'Sticky': {'names': {'zh_hans': '不可解除的护盾'}, 'polarity': 'positive', 'removable': False},
+        'Hidden': {'names': {'zh_hans': '孤立标记'}, 'polarity': 'unclassified', 'removable': None},
+    }
+    records = [record('H001', 'status', 'grant', 'enemy', status_id='Stun', polarity='negative'),
+               record('H002', 'status', 'remove', 'enemy', status_id='Sticky', polarity='positive'),
+               record('H003', 'dispel', 'dispel', 'team', polarity='negative'),
+               record('H004', 'dispel', 'dispel', 'enemy', polarity='positive'),
+               record('H001', 'action_gauge', 'decrease', 'enemy'),
+               record('H002', 'action_gauge', 'increase', 'team'),
+               record('H003', 'action_gauge', 'decrease', 'unknown'),
+               record('H005', 'cooldown', 'increase', 'enemy'),
+               record('H006', 'status_duration', 'increase', 'team', polarity='positive')]
+    active = [{'id': f'H{i:03}', 'release_status': 'released', 'name_cn': f'角色{i}'} for i in range(1, 7)]
+    data = {'schema': 2, 'game_build': 'test', 'roles': {}, 'statuses': statuses, 'records': records}
+    monkeypatch.setattr(character_effects, 'get_source', lambda: SimpleNamespace(base_dir='unused', character_effects=data))
+    monkeypatch.setattr(character_effects, 'WikiCatalog', lambda **_: SimpleNamespace(query=lambda: {'items': active}))
+
+    def search(**args):
+        return json.loads(asyncio.run(character_effects.search_character_effects(**args)))
+
+    def roles(**args):
+        return [item['id'] for item in search(**args)['items']]
+
+    assert roles(effect='status', status='眩晕') == ['H001']
+    assert roles(effect='status', operation='remove', status='Stun') == ['H003']
+    assert roles(effect='status', operation='remove', status='不可解除的护盾') == ['H002']
+    hidden = search(status='孤立标记')
+    assert hidden['matched'] == 0 and hidden['status_definitions'][0]['id'] == 'Hidden'
+    assert roles(effect='净化') == ['H003']
+    assert set(roles(effect='驱散', polarity='positive')) == {'H002', 'H004'}
+    assert roles(effect='推条') == ['H001', 'H003']
+    assert roles(effect='推条', target='enemy') == ['H001']
+    assert roles(effect='拉条', target='allies') == ['H002']
+    assert roles(effect='技能延长') == ['H005']
+    assert roles(effect='状态延长', polarity='positive') == ['H006']
+
+    for text in ('哪些角色能给队友拉条？', '谁会推条？', '谁能延长技能冷却？',
+                 '有哪些角色可以附加眩晕？', '哪些角色能净化负向状态？'):
+        assert game_intent(text) == 'gameplay'

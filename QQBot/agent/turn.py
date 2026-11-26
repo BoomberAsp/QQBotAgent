@@ -611,16 +611,22 @@ def _build_tool_registry() -> ToolRegistry:
         "按技能、被动、觉醒和特殊 Buff 反查 Ark Re:Code 角色。"
         "问哪些角色能给队友上免疫，使用 effect=immunity,operation=grant,target=allies；"
         "问自带命中率用 effect=hit_rate,target=self，效果命中用 effect=effect_hit。"
-        "问谁能解除敌方免疫用 effect=immunity,operation=remove,target=enemy。"
-        "已知 Buff 名可以传 status。按证据给出条件与来源，条件型加成不可写成常驻。",
+        "具体正负状态用 effect=status,status=状态名或ID；施加用 grant，解除用 remove。"
+        "通用驱散正向状态或净化负向状态用 effect=dispel 和 polarity=positive 或 negative。"
+        "拉条/推条用 effect=action_gauge 加 increase/decrease；延长技能冷却用 effect=cooldown，"
+        "延长状态回合用 effect=status_duration，两项都传 increase。"
+        "按证据给出条件与来源。目标未知时说明；公式和条件型加成按原条件表述。",
         {
             "type": "object",
             "properties": {
-                "effect": {"type": "string", "enum": ["immunity", "hit_rate", "effect_hit"], "description": "要查的效果；可只传 status"},
+                "effect": {"type": "string", "enum": ["immunity", "hit_rate", "effect_hit", "status", "dispel",
+                                                              "action_gauge", "cooldown", "status_duration"],
+                           "description": "要查的效果；可只传 status"},
                 "operation": {"type": "string", "enum": ["auto", "grant", "increase", "decrease", "remove", "dispel", "any"]},
                 "target": {"type": "string", "enum": ["any", "self", "allies", "team", "enemy"], "description": "allies 包含能覆盖队友的单体或群体效果"},
                 "activation": {"type": "string", "enum": ["any", "constant", "conditional"]},
-                "status": {"type": "string", "description": "特殊 Buff 的名称或 ID"},
+                "status": {"type": "string", "description": "状态名称或内部 ID"},
+                "polarity": {"type": "string", "enum": ["any", "positive", "negative", "unclassified"], "default": "any"},
                 "role": {"type": "string", "description": "可选，核对单个角色的名称、别名或 ID"},
                 "release_status": {"type": "string", "enum": ["released", "unreleased", "unknown", "all"], "default": "released"},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},

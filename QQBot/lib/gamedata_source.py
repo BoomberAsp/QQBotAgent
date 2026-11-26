@@ -139,10 +139,11 @@ class GameData:
         self.bonds = (self._read("bonds.json") or {}).get("bonds") or {}
         effects = self._read("character_effects.json")
         build = self.manifest.get("game_build")
-        if (isinstance(effects, dict) and effects.get("schema") == 1
+        if (isinstance(effects, dict) and effects.get("schema") in (1, 2)
                 and isinstance(effects.get("game_build"), str) and effects["game_build"]
                 and (not build or effects["game_build"] == build)
-                and isinstance(effects.get("roles"), dict) and isinstance(effects.get("records"), list)):
+                and isinstance(effects.get("roles"), dict) and isinstance(effects.get("records"), list)
+                and (effects["schema"] == 1 or isinstance(effects.get("statuses"), dict))):
             self.character_effects = effects
 
         for code in ("en", "zh_hans", "zh_hant"):

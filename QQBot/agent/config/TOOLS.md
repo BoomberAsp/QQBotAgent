@@ -493,6 +493,12 @@ Anti-bot handling is a two-tier ladder:
 
 按 Ark 技能、被动、觉醒和特殊 Buff 的效果反查角色。给队友上免疫使用 `effect="immunity"`、`operation="grant"`、`target="allies"`。自身普通命中率使用 `effect="hit_rate"`、`target="self"`，效果命中使用 `effect="effect_hit"`。指定 Buff 可以用 `status`。查驱散用 `operation="remove"`，答复中说明返回的 `dispel` 是通用驱散，按实际条件处理可解除状态。
 
+- 施加任意已收录的正向或负向状态时用 `effect="status"` 和 `status="名称或ID"`。解除该状态时加 `operation="remove"`。仅传 `status` 可同时查看状态定义。
+- 通用驱散用 `effect="dispel"`，并按问题传 `polarity="positive"`（驱散增益）或 `"negative"`（净化减益）。保留定向移除、随机选择以及可解除限制。
+- 拉条和推条用 `effect="action_gauge"` 加 `operation="increase"` 或 `"decrease"`，固定值 `0.2` 表示 20%。`value_rule` 是公式，保留条件。
+- 延长技能冷却用 `effect="cooldown"`、`operation="increase"`。延长正向或负向状态持续时间用 `effect="status_duration"`、`operation="increase"`，可加 `polarity`。两类固定值的单位都是回合。
+- `target="unknown"` 表示来源未能确认对象。用户指定己方或敌方时使用目标筛选。
+
 默认只查已上线角色。按 `next_offset` 翻页。保留技能、状态路径和触发条件；`selection="random"` 表示随机池，`base_chance` 是基础概率。多条养成或替代路径分别引用，合计需要单独核实。零结果用「当前索引未找到符合条件的记录」表述。
 
 ## Tool: character_detail

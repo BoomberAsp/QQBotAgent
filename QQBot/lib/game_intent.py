@@ -11,8 +11,12 @@ _MECHANICS = re.compile(
     r"面板|词条|材料|升星|培养|突破|数值|属性|战意|速度阈值|伤害计算|遗器|光锥推荐"
 )
 _SKILL = re.compile(r"技能|羁绊效果")
-_EFFECT = re.compile(r"免疫|命中率|效果命中|状态命中|基础命中|普通命中")
-_EFFECT_LOOKUP = re.compile(r"(?:哪些|什么|有哪|筛选).{0,24}角色|角色.{0,24}(?:哪些|有谁)|谁.{0,12}(?:能给|能解除|可驱散|自带)|反查|免疫\s*buff", re.I)
+_EFFECT = re.compile(r"免疫|命中率|效果命中|状态命中|基础命中|普通命中|驱散|净化|推条|拉条|行动值|冷却|"
+                     r"[正负]向状态|增益|减益|眩晕|晕眩|沉睡|沉默|沉眠|灼烧|中毒|流血|禁疗|护盾|无敌|潜伏|"
+                     r"状态(?:回合|持续时间)|技能延长|\b(?:de)?buffs?\b", re.I)
+_EFFECT_LOOKUP = re.compile(r"(?:哪些|哪个|什么|有哪|筛选).{0,24}角色|角色.{0,24}(?:哪些|有谁)|"
+                            r"谁.{0,12}(?:能|会|可以|自带|有|推条|拉条|驱散|净化)|反查|免疫\s*buff", re.I)
+_STATUS_OPERATION = re.compile(r"施加|附加|驱散|净化|延长.{0,8}(?:技能|状态)")
 _RELEASE = re.compile(r"卡池|复刻|上线时间|实装时间|(?:何时|什么时候|几号)(?:上线|实装|出(?=[？?\s]|$))|上线了吗|实装了吗")
 _STORY = re.compile(r"剧情|世界观|主线|支线|身世|设定|经历|结局|后来发生|人物关系|台词|对白|出场")
 _RELATIONSHIP = re.compile(
@@ -41,7 +45,8 @@ def game_intent(text, *, in_character=True, game='ark_re'):
         relationship = match and (match["name"] or "") not in _GENERIC_TARGETS
         story_clause = bool(_STORY.search(clause) or relationship)
         story |= story_clause
-        effect_lookup = game == 'ark_re' and _EFFECT.search(clause) and _EFFECT_LOOKUP.search(clause)
+        effect_lookup = (game == 'ark_re' and _EFFECT_LOOKUP.search(clause)
+                         and (_EFFECT.search(clause) or _STATUS_OPERATION.search(clause)))
         gameplay |= bool(_MECHANICS.search(clause) or effect_lookup
                          or (not story_clause and (_SKILL.search(clause) or _RELEASE.search(clause))))
     if story and gameplay:
